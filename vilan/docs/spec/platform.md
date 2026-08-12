@@ -101,8 +101,11 @@ A `browser` entry declaring **`split = true`** emits **route chunks**
 instead of one file: `dist/<name>.js` carries every module-level binding
 (so §7.6's initialization order is untouched) and every function two or
 more route arms can reach, and `dist/<name>.<arm>.js` carries the
-functions exactly one arm of the entry's route `match` can reach. A
-`dist/<name>.chunks.json` lists them. Chunks are fetched when a
+functions exactly one arm of the entry's route `match` can reach. Every
+build of a `browser` entry writes `dist/<name>.chunks.json`, the leg's
+**build manifest**: its bundle's file name, the style sidecar's file name
+or `null`, whether the bundle must be loaded as a classic script, and the
+chunks it emitted (empty unless it split). Chunks are fetched when a
 navigation first reaches their arm, and the route value does not advance
 until one arrives; which functions land where is implementation-defined
 beyond that rule. Overlapping navigations resolve by order of DEPARTURE,

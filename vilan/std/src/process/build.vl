@@ -1,0 +1,175 @@
+// `std::build` — what a browser leg's build emitted, as the build itself knows
+// it (`fullstack-dx.md` §5.2, RATIFIED 2026-08-11).
+//
+// The compiler knows, at the moment it writes `dist/`, exactly what it wrote:
+// the bundle's file name, whether the leg compiled any styles, every route
+// chunk, and how the bundle must be loaded for chunk resolution to work.
+// Nothing carried that knowledge across the leg boundary, so every server in
+// this language restated it by hand — a `fs::read_file_to_str` per artifact
+// over a path typed from memory, and a `match request.path()` table nothing
+// checked against anything. Rename a leg and every one of those lines still
+// compiles.
+//
+// This module is the channel. `build_of(leg)` reads the leg's BUILD MANIFEST —
+// `dist/<leg>.chunks.json`, written on every build of a browser leg since
+// `fullstack-dx.md` §10.3 — and hands back the description.
+// `std::http`'s `ServerBuilder::serve_build` is its first consumer, and turns
+// the whole ceremony into one line.
+
+import pkg::fs;
+import pkg::io::panic;
+import pkg::json::{ JsonValue, coerce_bool, coerce_str };
+import pkg::option::Option::{ None, Some, self };
+import pkg::result::Result::{ Err, Ok, self };
+
+/// What one browser leg's build emitted, as the build itself knows it.
+struct LegBuild {
+	/// The leg's name — `client` for `[entry.client]`.
+	leg: str,
+	/// The directory holding this build's artifacts, which is what their file
+	/// names are relative to.
+	dist: str,
+	/// The eager bundle's file name, e.g. `client.js`.
+	bundle: str,
+	/// The style sidecar's file name, when the build emitted one. `None` means
+	/// the leg compiled no styles — a fact a hand-written shell must respect
+	/// and cannot see, and one `fs::exists` can only half-answer (it cannot
+	/// tell a missing stylesheet from a stale one a previous build left).
+	styles: Option<str>,
+	/// The route chunks' file names, in the build's own order. Empty for a leg
+	/// that does not `split` (`bundle-splitting.md` §4).
+	chunks: List<str>,
+	/// Whether the bundle must be loaded as a classic script — true exactly
+	/// when the leg splits, because chunk resolution reads
+	/// `document.currentScript`, which is `null` inside a module script.
+	classic_script: bool,
+}
+
+impl LegBuild {
+	/// Every artifact this build emitted, as `(url, file)` pairs in serving
+	/// order: the bundle, the style sidecar if there is one, then the chunks.
+	/// The url is `/<file name>` — what every shell in this tree already asks
+	/// for, so adopting `serve_build` moves no shell.
+	fun artifacts(self): List<(str, str)> {
+		mut names = [self.bundle];
+		match self.styles {
+			Some(let styles) => names.push(styles),
+			None => {},
+		}
+		for chunk in self.chunks {
+			names.push(chunk);
+		}
+		mut artifacts: List<(str, str)> = [];
+		for name in names {
+			artifacts.push((i"/{name}", i"{self.dist}/{name}"));
+		}
+		artifacts
+	}
+}
+
+/// Why a leg's build could not be described. Named, not a panic: a server that
+/// asks about a leg it never built has made a recoverable mistake, and the
+/// message says which one.
+enum BuildError {
+	/// No build manifest where one was expected — the payload is the path.
+	/// The leg was never built, or the process is running from a directory
+	/// that is not the project root.
+	NotBuilt(str),
+	/// A manifest is there but does not read as one this toolchain wrote — the
+	/// payload is the path.
+	Unreadable(str),
+}
+
+impl BuildError {
+	/// One sentence: what was looked for, and what would produce it.
+	fun message(self): str {
+		match self {
+			BuildError::NotBuilt(let path) => i"no build manifest at {path} — build the leg first (`vilan build .`), and run the server from the project root",
+			BuildError::Unreadable(let path) => i"{path} is not a build manifest this toolchain wrote — rebuild the leg (`vilan build .`)",
+		}
+	}
+}
+
+/// The description of `leg`'s most recent build, read from `dist/<leg>.chunks.json`.
+///
+/// A leg that was never built is `Err(BuildError::NotBuilt)` and not an empty
+/// build: since the manifest is written on EVERY build of a browser leg, its
+/// absence means one thing and `"chunks": []` means another, which is exactly
+/// the difference §5.9 argued the always-written manifest buys.
+fun build_of(leg: str): Result<LegBuild, BuildError> {
+	// `dist/` is where every multi-entry build puts a leg, and a server runs
+	// from the project root — the two facts the hand-written `"dist/client.js"`
+	// already assumed, now assumed in exactly one place.
+	let dist = "dist";
+	let path = i"{dist}/{leg}.chunks.json";
+	if !fs::exists(path) {
+		ret Err(BuildError::NotBuilt(path));
+	}
+	match fs::read_file_to_str(path).try_parse_json() {
+		None => Err(BuildError::Unreadable(path)),
+		Some(let manifest) => read_manifest(dist, path, manifest),
+	}
+}
+
+/// `build_of(leg)`'s value, or a stop naming the leg.
+///
+/// The server-boot idiom, and the reason it is worth a name of its own: a
+/// server that cannot describe its own build has nothing to serve, so refusing
+/// to start beats 404ing every asset for the life of the process
+/// (`fullstack-dx.md` §5.4, §10.7). `!` cannot express this at a boot site —
+/// it asserts-or-RETURNS, and `main` returns no `Result` to carry the residual.
+fun require_build(leg: str): LegBuild {
+	match build_of(leg) {
+		Ok(let build) => build,
+		Err(let error) => panic(error.message()),
+	}
+}
+
+/// A parsed manifest, or `Unreadable` if it does not carry the fields this
+/// toolchain writes. Checked rather than coerced: `coerce_str` over an absent
+/// field yields the string `"undefined"`, which would become a route.
+fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, BuildError> {
+	if !manifest.has_field("leg")
+		|| !manifest.has_field("entry")
+		|| !manifest.has_field("styles")
+		|| !manifest.has_field("classic_script")
+		|| !manifest.has_field("chunks")
+	{
+		ret Err(BuildError::Unreadable(path));
+	}
+	let styles = manifest.field("styles");
+	mut chunks: List<str> = [];
+	for chunk in manifest.field("chunks").elements() {
+		chunks.push(coerce_str(chunk.field("file")));
+	}
+	Ok(LegBuild {
+		leg = coerce_str(manifest.field("leg")),
+		dist = dist,
+		bundle = coerce_str(manifest.field("entry")),
+		styles = if styles.is_null() { None } else { Some(coerce_str(styles)) },
+		chunks = chunks,
+		classic_script = coerce_bool(manifest.field("classic_script")),
+	})
+}
+
+/// The content type `file`'s extension implies, or `None` for an extension
+/// this table does not name.
+///
+/// The table is fixed, short, and not user-facing, because `serve_build` serves
+/// A BUILD and not a directory (`fullstack-dx.md` §5.10): it covers exactly the
+/// kinds a vilan build emits, and an extension it does not name is not served
+/// rather than guessed at. (A directory server would need traversal, caching
+/// and binary reads — and `std::fs` cannot read bytes at all today.)
+fun content_type_of(file: str): Option<str> {
+	if file.ends_with(".js") || file.ends_with(".mjs") {
+		Some("text/javascript")
+	} else if file.ends_with(".css") {
+		Some("text/css")
+	} else if file.ends_with(".json") {
+		Some("application/json")
+	} else if file.ends_with(".html") {
+		Some("text/html")
+	} else {
+		None
+	}
+}

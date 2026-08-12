@@ -1,5 +1,8 @@
 {
+	"leg": "app",
 	"entry": "app.js",
+	"styles": null,
+	"classic_script": true,
 	"chunks": [
 		{ "arm": "Route::Home", "tag": 0, "file": "app.Route_Home.js" },
 		{ "arm": "Route::Docs(..)", "tag": 1, "file": "app.Route_Docs.js" },

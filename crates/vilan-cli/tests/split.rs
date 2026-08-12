@@ -179,10 +179,18 @@ fn splitting_moves_the_route_chunks_and_nothing_else() {
     let single = stage("whole", false);
     build(&single, &[]);
 
-    // Without the flag there is one artifact, and it is whole.
+    // Without the flag there is one bundle, and it is whole: no chunk FILES.
+    // The manifest still lands — since `fullstack-dx.md` §10.3 it is the leg's
+    // BUILD manifest, written on every build of a browser leg — and says so
+    // positively, with an empty chunk list.
     assert!(
-        !single.join("app.Route_Home.js").exists() && !single.join("app.chunks.json").exists(),
-        "single-file emission is the default: no flag, no chunk artifacts"
+        !single.join("app.Route_Home.js").exists(),
+        "single-file emission is the default: no flag, no chunk files"
+    );
+    let manifest = read(&single, "app.chunks.json");
+    assert!(
+        manifest.contains("\"chunks\": []") && manifest.contains("\"classic_script\": false"),
+        "a leg that does not split writes a manifest that says so: {manifest}"
     );
     let whole = read(&single, "app.js");
     for page in ["home_page", "docs_page", "docs_nav", "not_found_page"] {
@@ -562,7 +570,11 @@ fn a_build_owns_its_legs_chunk_namespace() {
     // `bundle-splitting.md` §S3, item 4. A leg's chunk files and its manifest
     // belong to its LAST build: a renamed route arm must not leave the old
     // arm's file beside the new one, and dropping `split` must not leave a
-    // manifest describing chunks the bundle no longer names.
+    // manifest describing chunks the bundle no longer names. Since
+    // `fullstack-dx.md` §10.3 the second half is stronger, not weaker: the
+    // manifest is REWRITTEN with an empty chunk list rather than removed, which
+    // is a positive statement where an absent file was an ambiguity between
+    // "did not split" and "was never built".
     let staged = stage("namespace", true);
     build(&staged, &[]);
     assert!(
@@ -602,11 +614,21 @@ fn a_build_owns_its_legs_chunk_namespace() {
         .expect("read the staged directory")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("app.") && name != "app.js" && name != "app.vl")
+        .filter(|name| {
+            name.starts_with("app.")
+                && name != "app.js"
+                && name != "app.vl"
+                && name != "app.chunks.json"
+        })
         .collect();
     assert!(
         left.is_empty(),
-        "a build with no chunks must leave none behind: {left:?}"
+        "a build with no chunks must leave no chunk FILE behind: {left:?}"
+    );
+    let manifest = read(&staged, "app.chunks.json");
+    assert!(
+        manifest.contains("\"chunks\": []") && !manifest.contains("Route_"),
+        "the manifest survives the drop, describing a leg that no longer splits: {manifest}"
     );
     let _ = std::fs::remove_dir_all(&staged);
 }
@@ -680,7 +702,11 @@ fn stage_workspace(tag: &str) -> PathBuf {
     staged
 }
 
-/// The leg's chunk artifacts currently on disk.
+/// The leg's chunk FILES currently on disk. The build manifest is deliberately
+/// not one of them: since `fullstack-dx.md` §10.3 `client.chunks.json` is
+/// written on every build of the leg, so it can no longer stand in for "this
+/// build split" — the manifest's own `chunks` list is what says that, and
+/// [`manifest_of`] reads it.
 fn chunk_artifacts(dist: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dist) else {
         return Vec::new();
@@ -688,10 +714,17 @@ fn chunk_artifacts(dist: &Path) -> Vec<String> {
     let mut names: Vec<String> = entries
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("client.") && name != "client.js")
+        .filter(|name| {
+            name.starts_with("client.") && name != "client.js" && name != "client.chunks.json"
+        })
         .collect();
     names.sort();
     names
+}
+
+/// The leg's build manifest, or `None` when this build wrote none.
+fn manifest_of(dist: &Path) -> Option<String> {
+    std::fs::read_to_string(dist.join("client.chunks.json")).ok()
 }
 
 #[test]
@@ -711,9 +744,14 @@ fn vilan_run_emits_the_leg_whole_and_clears_the_chunks_a_build_left() {
             "client.Route_Docs.js",
             "client.Route_Home.js",
             "client.Route_NotFound.js",
-            "client.chunks.json",
         ],
         "`vilan build` honours `split`"
+    );
+    assert!(
+        manifest_of(&dist)
+            .expect("the split build's manifest")
+            .contains("client.Route_Home.js"),
+        "and the manifest names what it wrote"
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
@@ -745,6 +783,13 @@ fn vilan_run_emits_the_leg_whole_and_clears_the_chunks_a_build_left() {
         chunk_artifacts(&dist),
         Vec::<String>::new(),
         "a whole-bundle build must sweep the leg's chunk namespace"
+    );
+    assert!(
+        manifest_of(&dist)
+            .expect("the run's manifest")
+            .contains("\"chunks\": []"),
+        "and its manifest must say the leg emitted none — a server reading it \
+         during the dev loop needs the description, not its absence"
     );
     let _ = std::fs::remove_dir_all(&staged);
 }
@@ -783,18 +828,28 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
     let deadline = Instant::now() + support::WATCH_LIVENESS;
     let mut cleared = false;
     while Instant::now() < deadline {
-        if chunk_artifacts(&dist).is_empty() && dist.join("client.js").is_file() {
+        // The manifest is REWRITTEN, not swept: a watch round is exactly when a
+        // running server asks what its client leg emitted, so the round that
+        // takes the chunks away must leave the description behind saying so.
+        let described_no_chunks =
+            manifest_of(&dist).is_some_and(|manifest| manifest.contains("\"chunks\": []"));
+        if chunk_artifacts(&dist).is_empty()
+            && dist.join("client.js").is_file()
+            && described_no_chunks
+        {
             cleared = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let left = chunk_artifacts(&dist);
+    let manifest = manifest_of(&dist).unwrap_or_else(|| "<no manifest>".to_string());
     support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&staged);
     assert!(
         cleared,
-        "a watch round emits the leg whole, so the previous build's chunks must go: {left:?}"
+        "a watch round emits the leg whole, so the previous build's chunks must go \
+         and its manifest must say so: {left:?}\n{manifest}"
     );
 }
 

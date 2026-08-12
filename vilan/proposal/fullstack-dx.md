@@ -1547,3 +1547,123 @@ big name for a small struct. Alternatives considered and not preferred:
 10. **Do not redesign E55.** `dev-refresh.md` §3's hook is the freshness
     mechanism; this paper supplies the call site that note says it is missing
     (§2(i)), and the two can ship in either order. (§5.9, §7.3)
+
+## 12. S2 shipped — the channel (2026-08-11)
+
+`LegBuild`, `build_of(leg)`, and the manifest extension §10.3 ruled on. The
+slice is deliberately small and entirely a *description*: no server surface
+moves here, and nothing consumes the value yet (S3 does).
+
+### 12.1 The manifest's final shape
+
+`dist/<leg>.chunks.json`, written by **every build of a browser leg**:
+
+```json
+{
+	"leg": "client",
+	"entry": "client.js",
+	"styles": "client.css",
+	"classic_script": false,
+	"chunks": []
+}
+```
+
+Three fields were added to the two `bundle-splitting.md` §3 already wrote,
+and the two it wrote are untouched — `entry` is still the eager bundle's
+file name and `chunks` is still the same `{ arm, tag, file }` rows in the
+same order. `leg` is the manifest's own name for the leg, so a reader needs
+no filename convention to know what it describes; `styles` is the sidecar's
+file name or `null`; `classic_script` is `!chunks.is_empty()`, spelled as
+the fact a shell needs rather than as the fact the compiler has (§3.5, F6).
+
+**The golden churned by exactly three inserted lines.**
+`crates/vilan-cli/tests/split/golden/app.chunks.json`, diffed:
+
+```
+ {
++	"leg": "app",
+ 	"entry": "app.js",
++	"styles": null,
++	"classic_script": true,
+ 	"chunks": [
+```
+
+No existing line moved a byte — the three fields are *inserted*, `"leg"`
+before `"entry"` and the other two after it, so the `"entry"` line, all
+three `chunks` rows and both closing braces are the bytes they were. The
+other four goldens (`app.js` and the three chunk files) are byte-identical:
+this slice changed no emitted JavaScript. `"styles": null` because the
+fixture compiles no styles; `"classic_script": true` because it splits.
+
+The empty case is spelled `"chunks": []` on one line rather than an empty
+multi-line array, which is the only formatting decision in the change.
+
+### 12.2 Where the manifest is written, and where it is not
+
+Three call sites write a leg, and all three now go through the same
+`write_chunks(output, chunks, styles, is_browser)`: `build_single`,
+`build_workspace_artifacts`, and the HMR watch round — which previously
+called `sweep_stale_chunks` directly and would otherwise have *deleted* the
+manifest on every round, exactly where a dev-loop server needs it most.
+`write_assets` now returns the style sidecar's file name so the two facts
+are collected at the one place that knows them.
+
+**A node leg writes none.** `classic_script` has no meaning off the browser
+and a node leg has no chunks; a manifest describing a `.mjs` nobody loads
+would be a value `build_of` could return and no consumer could use.
+
+**The build log is byte-identical** for every project that has one today:
+the manifest line is printed only when it describes chunks, which is exactly
+when it was printed before.
+
+### 12.3 What §9's invariant became
+
+Recorded as an appendix note in `bundle-splitting.md` (Appendix A) rather
+than as a Status edit, since it reverses one sentence of a shipped arc's
+record. The short form: the invariant is *the leg's last build owns the
+namespace*, and it is stronger now, not weaker — the sweep that used to
+DELETE the manifest now REWRITES it, and `"chunks": []` is a positive
+statement where an absent file was an ambiguity.
+
+### 12.4 The surface, and one addition beyond §5.2's sketch
+
+`std::build` (`vilan/std/src/process/build.vl`) — a new process-layer
+module, no twin, no shadow. `LegBuild` carries §5.2's five fields plus
+`dist`, the directory its file names are relative to, so `serve_build` reads
+a path off the value instead of re-deriving the `dist/` convention
+independently. `LegBuild::artifacts()` gives `(url, file)` pairs in serving
+order and `content_type_of(file)` is the extension table (§5.4): `js`/`mjs`,
+`css`, `json`, `html`, and `None` for anything else — not served rather than
+guessed at, because `serve_build` serves a build and not a directory (§5.10).
+
+`BuildError` is `NotBuilt(path)` / `Unreadable(path)` with a `message()`
+that names the path and the command that would produce it. **`require_build(leg)`
+is an addition**, and the reason is a language fact §6.2's sketch missed:
+`build_of("client")!` cannot be written in `async fun main()`, because `!`
+asserts-or-RETURNS and a void `main` has no residual to carry
+(`try-and-lift.md` §2 — "`!` in a bare-void function" is a pinned error). The
+alternative was `.expect("…")` with a hand-written string in every consumer,
+which is the ceremony this paper exists to delete. `require_build` is §10.7's
+"refuse to boot" doctrine spelled once, in std, where the message can name
+the leg.
+
+### 12.5 The gates
+
+`crates/vilan-cli/tests/build_manifest.rs`, five pins, each planted red:
+
+- a browser leg that does not split still writes its manifest, with an empty
+  chunk list and `classic_script: false`;
+- `styles` names the sidecar exactly when one was emitted, and is `null` when
+  the leg compiled none *and there is no file on disk to probe for*;
+- a node leg writes none;
+- `build_of` describes the leg the build wrote, reported from a real server
+  leg through `artifacts()`;
+- **`build_of` on a leg that was never built is a named error** — the process
+  keeps running, and the message names `dist/nosuchleg.chunks.json` and
+  `vilan build`.
+
+Planted: (a) restoring the `chunks.is_empty()` early return reddens three of
+the five; (b) suppressing the `styles` report reddens two. The split
+fixture's own goldens and the three `split.rs` pins that read the manifest's
+*absence* as "did not split" now read its `chunks` list, which is what they
+meant.

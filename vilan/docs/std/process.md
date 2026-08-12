@@ -137,6 +137,36 @@ fun read_file_to_str(path: str): str       // async, UTF-8
 fun write_file(path: str, contents: str)   // async
 ```
 
+## std::build
+
+What a browser leg's build emitted, as the build itself knows it — the
+value that lets a server stop restating `"dist/client.js"` from memory.
+
+```vilan,fragment
+struct LegBuild {
+	leg: str,               // `client`, for `[entry.client]`
+	dist: str,              // where its artifacts live — `dist`
+	bundle: str,            // `client.js`
+	styles: Option<str>,    // `client.css`, or None if the leg compiled no styles
+	chunks: List<str>,      // route chunks, empty unless the leg splits
+	classic_script: bool,   // true exactly when it splits
+}
+
+fun build_of(leg: str): Result<LegBuild, BuildError>   // async
+fun require_build(leg: str): LegBuild                  // async; stops if it can't
+```
+
+`build_of` reads `dist/<leg>.chunks.json`, which every build of a browser
+leg writes. A leg that was never built is `Err(BuildError::NotBuilt)` and
+not an empty build — the manifest's presence is the difference, which is
+why it is written even when the leg does not split. `require_build` is the
+boot idiom: a server that cannot describe its own build has nothing to
+serve, so it stops with the error's message instead of starting.
+
+`LegBuild::artifacts()` gives `(url, file)` pairs — `("/client.js",
+"dist/client.js")` — in serving order. `std::http`'s
+[`serve_build`](#stdhttp-the-server) is the consumer that makes them routes.
+
 ## std::process
 
 ```vilan,fragment

@@ -1,4 +1,6 @@
-# `vilan build .` writes the bundle (and any `const` style sidecar) beside the
-# entry it came from. Generated output is not checked in.
+# `vilan build .` writes the bundle (any `const` style sidecar, and the leg's
+# build manifest) beside the entry it came from. Generated output is not
+# checked in.
 *.js
 *.css
+*.chunks.json
