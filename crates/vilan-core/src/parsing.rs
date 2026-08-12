@@ -2448,9 +2448,16 @@ impl<'a, 'src> Parser<'a, 'src> {
             });
         }
         let span = self.span_from(start);
+        // S3 (editing-dx.md §3.5/§3.9): the closing brace itself — width one,
+        // exactly `}` — not the zero-width point one byte PAST it. `}` is a
+        // single ASCII byte, so `span.end - 1..span.end` IS the brace; the old
+        // `span.end..span.end` sat just after it, which an editor draws as
+        // nothing at all (a caret, not an underline) — the doc comment above
+        // already claimed "at the closing brace"; this is what makes it true.
+        let void_span = (span.end.saturating_sub(1)..span.end).into();
         let tail = tail
             .map(Box::new)
-            .unwrap_or_else(|| Box::new((Node::Void, (span.end..span.end).into())));
+            .unwrap_or_else(|| Box::new((Node::Void, void_span)));
         Some(((statements, tail), span))
     }
 

@@ -1792,3 +1792,182 @@ the pin says so rather than leaving it to be discovered.
   blackout as a contract ("the tail after a top-level stray token is not
   recovered"). It is now
   `a_top_level_error_keeps_the_items_on_both_sides`.
+
+## 16. What shipped — the anchors lane (S3/S4/S5, implementation record, 2026-08-11)
+
+The analyzer-span/message column, built against `next` in the `anchors`
+worktree while the recovery lane built S1/S2/S6 concurrently. Diff scoped to
+spans and messages in `analyzer.rs`/`parsing.rs`/`tests/inference.rs`, plus
+one LSP-side hover fix span/rendering forced (§15.1). Zero corpus golden
+movement (`cargo test -p vilan-cli --test corpus`) — diagnostics don't
+change emitted JS.
+
+### 15.1 S3 — the return-value re-anchor
+
+**Shipped**, with two deliberate scope cuts recorded below.
+
+- **The brace anchor** (§3.9's one-line fix): `parse_block_clean`'s
+  synthesized `Node::Void` now carries `span.end - 1..span.end` — the
+  closing brace itself — instead of the zero-width point past it. This
+  alone re-anchors regime 1 everywhere the tail is checked (named functions
+  today; closures per below) and closes the §10.4 drift: the doc comment's
+  "the value is void at the closing brace" is now literally true, not one
+  byte off. **Not touched**: `parse_block`'s *recovery* twin
+  (`recover_delimited`'s fallback) — that function is S1's territory
+  (`frontend.md:137-140`'s unclosed-region tolerance), left to the recovery
+  lane to avoid an append conflict on code it is actively rebuilding.
+- **Regime 1 vs 1' message.** `Constraint::ReturnType` gained an optional
+  `last_statement_id`, populated at the tail-construction site (walk time,
+  from the raw statement list) and left `None` at the `ret`-construction
+  site. `resolve_return_type` (renamed internals: the check now lives in
+  shared `check_return_position`, plus `missing_return_value_message`)
+  distinguishes "this body ends without producing a value" (regime 1) from
+  "the `;` discards this body's last value" (regime 1') by whether that
+  statement, inferred bare, reconciles with the declared type — excluding
+  `Type::Void`/`Type::Never` (a genuinely void statement, or a diverging one
+  like a bare `ret`) **and** `self.variables` (a `let`'s own id types as its
+  *binding*, e.g. `i32` for `let sum: i32 = a + b;`, which reconciles by
+  coincidence — `let` isn't an expression, and this is the bug the dev-time
+  probes P22 caught before the guard was added).
+- **Regime 3 — closures, both routes.** `analyzer::Closure` gained
+  `return_type_id: Option<TypeId>`, read from the closure's own annotation
+  (S3-iii, "gets rule 2 directly" — P26). `infer_type_path`'s `Expr::Closure`
+  arm additionally routes through `check_return_position` when the
+  *context's* expected closure type is known and every parameter already
+  reconciles (S3-ii — P23/P24), replacing the whole-value comparison at the
+  consuming site rather than adding to it: on a mismatch the closure's
+  *reported* type becomes the target it was held to, so the caller's own
+  reconcile trivially agrees and never double-reports (guarded further by an
+  exact span+message de-dup check, since `infer_type` has no memoization and
+  the same closure can in principle be inferred more than once per constraint
+  attempt). **The gate that makes this safe**: `type_is_ground` — a target is
+  only used when, after substitution, it carries no `Generic`/`Unknown`/
+  `Unresolved` anywhere in its structure. Without it, routing through a
+  still-abstract target (e.g. `Iterator::from_fn<T>`'s `Option<T>`) silently
+  swallowed the binding `reconcile_type` would otherwise have produced at the
+  caller, and four *unrelated* iterator tests broke during development before
+  the gate was added — the regression is what the gate's own doc comment
+  points at.
+- **LSP side-effect, fixed.** The wider `Expr::Void` span is now real code
+  for the first time, which meant it started winning hover's smallest-span
+  lookup at the closing brace (`entity_at`'s `min_by_key`), regressing
+  `a_body_brace_still_hovers_the_enclosing_function`. Fixed at the root: a
+  synthesized `Expr::Void` is not something the user wrote and is now
+  excluded from `entity_spans` entirely (hover, go-to-definition, semantic
+  tokens, document symbols all read that one list), so a cursor on the brace
+  still finds the next-smallest *real* entity around it. A new pin,
+  `a_missing_return_value_publishes_a_one_character_range_not_a_zero_width_one`
+  (`crates/vilan-lsp/src/publish.rs`), proves the exact editor-visible
+  regression the paper's §3.2 measured (`start == end`) no longer holds.
+
+**Not shipped, and why:**
+
+- **Regime 2's `if`-no-`else` refinement** (§3.6's "one refinement"). Left
+  on today's already-A1-compliant anchor (`missing_return_value_regime_2_
+  if_with_no_else_is_unchanged` pins it explicitly unchanged). The refinement
+  needs a provenance channel from `infer_type_path`'s `Expr::If` arm (which
+  drops straight to a bare `Type::Void` on a missing final else, §3.6 of the
+  exploration) through to whichever diagnostic reports the mismatch — new
+  plumbing, not a span/message edit, and out of this slice's scope per the
+  cross-lane instruction to keep the diff to spans and messages.
+- **P21 — the generic-propagation case.** `.map<U>`'s `U` is exactly the
+  shape `type_is_ground` is built to decline (§ above); the closure's void
+  return still surfaces one level out, on `List<void>`, unchanged. Pinned
+  `#[ignore]`d as a known residue
+  (`missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed`),
+  per CLAUDE.md's convention for a known-but-unfixed bug — tracing the root
+  cause back through a generic binding is a materially different mechanism
+  from the direct-target case this slice builds.
+- **P28 — the bare-`ret` duplicate.** The brace fix makes *both* of P28's
+  diagnostics correctly anchored and visible (previously one was an invisible
+  zero-width point); it does not deduplicate them — that is a B5 fix
+  requiring the tail-construction site to know a preceding `ret` already
+  diverged, which needs its own design. Pinned as today's true (still
+  doubled) behavior, not ignored, since nothing asserted is wrong on its own:
+  `a_bare_ret_still_duplicates_the_synthesized_tail_diagnostic`.
+- **The C3 "declared here" note** (§3.6's drawn example, recommendation 3).
+  Not built: it needs the declared/expected return type's own *span* threaded
+  to the checking site (`Function`/`Closure` carry a `TypeId` today, not a
+  span), a second field-and-plumbing exercise on top of `last_statement_id`.
+  The primary anchor and message — the load-bearing half of §3 — ship without
+  it.
+
+Ledger consequence (§13.5, the owner's call, left open): this slice's
+messages are what a hypothetical A4 amendment ("a missing return value → the
+callable's closing brace") would describe. No catalog row was added — that
+remains the owner's to rule on, unchanged by this record.
+
+### 15.2 S4 — the count messages name their subject
+
+**Shipped** exactly as specified, at the three sites the survey probed
+(P15/P16 function and method calls; P18 struct fields) — the closure-typed-
+value call and enum-variant-constructor arity sites (structurally identical
+`Expected N arguments…` pushes, not in the survey's probe set) were left
+untouched, in keeping with the scoped diff.
+
+- `` `distance` expects 2 arguments, but got 1 instead: `y: i32` is missing. ``
+  and the too-many form with no steer (B4), for both a plain function call
+  (`resolve_call_subject`) and a method call (`resolve_method_arg_check`) —
+  `callable_name` resolves the callee's declared name uniformly for both
+  (a `Function`/`ExternalFunction` id directly, or through a method's
+  `member_id` via `expr_id_to_expr_map`, mirroring `method_signature`'s own
+  indirection).
+- `` `Point` expects 2 fields, but got 1 instead: `y` is missing. `` and, the
+  asymmetric extra-field case struct fields get that call arguments don't
+  (fields are named): `` `Point` expects 2 fields, but got 3 instead: `z` is
+  not a field of `Point`. ``, re-anchored at the offending field's *name*
+  span (E58's `field_name_span`, reused) — a duplicate-named field with no
+  single unmatched name falls back to the bare count, never a guess.
+- The wrapped-argument-list clamp (§13.3, scoped here to the arity case only,
+  per the paper's own instruction not to build the general policy):
+  `clamp_span_to_first_line` trims `arguments_span` to its first line for
+  both call sites; struct-field spans are untouched (§7.1: the brace region
+  is already the right size for a missing-field gap).
+
+Two existing pins were **re-verdicted** to the new wording in the same
+commit (`a_fn_typed_binding_checks_its_arity`,
+`initializer_field_count_mismatch_is_unaffected_by_the_closest_name_scan`),
+per §7.5's standing rule — this is a re-verdict of an already-QUALIFIED
+message family, not a bug fix.
+
+### 15.3 S5 — the field-name span: VERIFY-FIRST VERDICT
+
+**RE-VERDICT — E58 (cycle 17) already fully satisfies S5 as specified.**
+Reproduced against today's compiler before writing anything: `Point { x = 3,
+yy = 40000 }` anchors `struct 'Point' has no field 'yy'` on `yy` (five
+columns left of where it anchored pre-E58), with a guarded `did you mean
+'entries'?`-style note present on a close typo and absent on a distant one.
+`StructInitializerConstraint::fields` already carries the `field_name_span`
+S5 asked to thread; `analyzer.rs`'s unknown-field arm already anchors there
+(not at `field_value_span`). **No fix shipped for S5** — the slice's own
+text scopes it to exactly this one diagnostic (the struct-initializer
+unknown-field case), and every part of that is already true.
+
+The one gap: the pin table (§12) names **both** P19 and P20 as owed pins —
+P20 specifically because a probe that reproduces the OLD bug's exact shape
+(a *wide* value next to a *short* name) is what proves the anchor moved,
+not merely that it currently sits somewhere plausible. Only a P19-shaped
+pin (`unknown_initializer_field_spans_the_name_not_the_value`, a one-
+character value) existed. Added
+`unknown_initializer_field_with_a_wide_value_still_spans_the_name` (P20's
+exact reproduction, `yy = 40000`) to close that gap — the only new test S5
+owes, per "add any pin the paper specifies that doesn't exist yet, and
+write no fix."
+
+### 15.4 Files touched
+
+`crates/vilan-core/src/parsing.rs` (the brace-span one-liner, main path
+only), `crates/vilan-core/src/analyzer.rs` (S3's `Constraint::ReturnType`
+field, `check_return_position`/`missing_return_value_message`/
+`type_is_ground`/`closure_block_tail`, `Closure::return_type_id`,
+`Expr::Closure`'s return-position routing; S4's `callable_name`/
+`argument_count_message`/`clamp_span_to_first_line`/
+`struct_field_count_message`), `crates/vilan-core/src/span.rs`
+(`Span::to_end()` deleted — confirmed zero callers, per §3.9's own
+recommendation), `crates/vilan-core/tests/inference.rs` (new S3/S4/S5 pins,
+two S4 re-verdicts, one stale-comment fix), `crates/vilan-lsp/src/
+document.rs` (`entity_spans` excludes synthesized `Expr::Void`),
+`crates/vilan-lsp/src/publish.rs` (the one-character-range pin). No docs
+page under `vilan/docs/` quoted the old message text for any changed
+diagnostic (checked by grep before closing the docs gate), so none needed
+updating in this commit.
