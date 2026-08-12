@@ -999,6 +999,35 @@ mod completion_item_tests {
             "{sort_text:?} must sort after a bare in-scope label"
         );
     }
+
+    // E59: `origin_tier` sorts BEFORE the label — a lower-tier candidate
+    // (`pkg`, tier 0) ranks ahead of a higher-tier one (`std`, tier 2) even
+    // when its label loses alphabetically. Plant-proof: swap the two tiers'
+    // digits (or drop the digit and fall back to the old `|{label}` form)
+    // and `"Apple"` (std) sorts first — this assertion goes red.
+    #[test]
+    fn origin_tier_outranks_the_label_within_the_auto_import_band() {
+        let index = LineIndex::new("fun main() {}\n");
+        let pkg_item = to_completion_item(
+            auto_import_candidate("zebra", &["pkg", "helper"], 0),
+            CompletionFunctionCall::Full,
+            true,
+            &index,
+        );
+        let std_item = to_completion_item(
+            auto_import_candidate("Apple", &["std", "prelude"], 2),
+            CompletionFunctionCall::Full,
+            true,
+            &index,
+        );
+        let pkg_sort_text = pkg_item.sort_text.expect("pkg candidate carries sort_text");
+        let std_sort_text = std_item.sort_text.expect("std candidate carries sort_text");
+        assert!(
+            pkg_sort_text < std_sort_text,
+            "pkg's `zebra` ({pkg_sort_text:?}) must outrank std's `Apple` \
+             ({std_sort_text:?}) despite losing alphabetically"
+        );
+    }
 }
 
 #[cfg(test)]
