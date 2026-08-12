@@ -30,6 +30,14 @@ Two deliberate limits. It checks a document against **one build** and has an opi
 
 ---
 
+**A view can no longer sit live across an implicit `await`.** The rule that a view may not be held across a suspension point — not as a parameter, not as a live binding, not as an async closure's capture — only ever looked for the `await` keyword. Calling an async function without it is the sanctioned spelling, and it suspends exactly the same way, so `async fun stash(viewed: &mut Point) { let beat = tick(); viewed.x = beat; }` compiled and emitted `const beat = await (tick());` with the caller's view live across the yield. All three forms of the rule had the same blind spot.
+
+The check now asks whether the call **can suspend** rather than whether you wrote the keyword: the callee is declared `async`, or reaches something that is. Writing `await` still refuses exactly what it refused before — every existing diagnostic is unchanged, down to the text — it simply is not the only way to be caught. A sync-looking function in between makes no difference: `fun hop(): i32 { tick() }` suspends too, and the caller is told so.
+
+What has *not* changed is that a declared-`async` function whose body never suspends keeps its view parameters. A body runs to its first suspension before yielding anything, so a view it never holds across one was never at risk — which is why an `async` implementation of a sync trait method stays legal. The declaration is read of the function you *call*, never of the one being checked.
+
+---
+
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
 
 `read_bytes(path): Bytes` is the true binary read — a host `Buffer` binds directly to `Bytes` (the same interop `std::http`'s `read_request_bytes` already relies on), with no decode in between. `read_dir(path): List<str>` lists a directory's immediate entries by name, flat and unordered (v1 deliberately does not recurse or expose file-vs-directory kind — call `stat` per entry for that). `stat(path): Option<Stat>` reads size, last-modified time (`modified_at_ms`, epoch milliseconds), and `is_directory`; unlike every other read in this module, a missing path is `None` rather than a thrown exception — `stat` exists for a caller that wants to ask "is this here yet", not one that already expects it to be. The misleadingly-named `read_file_bytes` is renamed to `read_file_encoded` (no alias kept — pre-1.0, and its only caller, `read_file_to_str`, moved with it in the same commit).

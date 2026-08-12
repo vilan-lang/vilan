@@ -16855,18 +16855,23 @@ fn an_async_method_with_a_shared_view_receiver_is_rejected() {
     assert_fails_spanning(source, "self", "cannot take '&' parameters");
 }
 
-// KNOWN BUG (found 2026-08-10 probing the `&` form; pre-existing, and it is the
-// GATE's, not the form's — both spellings escape). The signature rule fires only
-// when the body contains an explicit `await` token, so the IMPLICIT-await
-// spelling (`spec/execution.md` §7: calling an async function without `await`,
-// the sanctioned form) bypasses it entirely. The emission proves the suspension
-// is real — `const t = await (tick());` — with the caller's view live across it.
-// Tightening the gate to declared-asyncness is not a one-liner: it would also
-// reject `async fun m(&self)` bodies that never suspend, which
-// `a_declared_async_impl_of_a_sync_trait_method_is_permitted` pins as legal
-// (B29's declared-async impl of a sync trait). Its own measurement.
+// --- B119: the view gate asks the CALL GRAPH, not the `await` token ---------
+//
+// Filed 2026-08-10 probing the `&` form; the bug was the GATE's, not the
+// form's — both spellings escaped. The signature rule fired only when the body
+// held an explicit `await`, so the IMPLICIT-await spelling
+// (`spec/execution.md` §7: calling an async function without the keyword, the
+// sanctioned form) bypassed it entirely, and the emission proved the
+// suspension real: `const beat = await (tick());` with the caller's view live
+// across it.
+//
+// Ruled 2026-08-12: a call gates the view rule when it CAN SUSPEND — the
+// callee is declared `async`, or is transitively suspending. The token stays
+// SUFFICIENT (every pin above is untouched); it stops being NECESSARY.
+// Declared asyncness is read of the CALLEE at a call site, never of the body
+// being checked — which is what keeps B29's freedom below intact rather than
+// merely tolerated.
 #[test]
-#[ignore]
 fn an_implicit_await_does_not_lift_the_async_view_parameter_rule() {
     let source = r#"
         struct Point { x: i32, y: i32 }
@@ -16882,6 +16887,337 @@ fn an_implicit_await_does_not_lift_the_async_view_parameter_rule() {
         main();
         "#;
     assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
+#[test]
+fn an_implicit_await_does_not_lift_the_shared_view_parameter_rule() {
+    // The `&` spelling of the filed shape — the same gate, the other form.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun peek(viewed: &Point) {
+            let beat = tick();
+            let _seen = viewed.x + beat;
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            peek(&point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&' parameters");
+}
+
+#[test]
+fn an_implicit_await_through_a_sync_declared_hop_is_still_a_suspension() {
+    // The transitive half of the rule: `hop` declares nothing, but it calls
+    // `tick`, so `async_infer` makes it async and `stash` awaits it —
+    // `return await (tick());` inside `hop`, `await (hop())` inside `stash`.
+    // A gate keyed on the callee's DECLARATION would miss this entirely; the
+    // fixpoint's is what sees it.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        fun hop(): i32 { tick() }
+        async fun stash(viewed: &mut Point) {
+            let beat = hop();
+            viewed.x = beat;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            stash(&mut point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
+#[test]
+fn an_implicit_await_refuses_every_view_parameter_of_the_body() {
+    // Multi-parameter: one suspension point condemns the whole signature, and
+    // each form anchors at its own parameter with its own spelling.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        fun stash(viewed: &mut Point, other: &Point) {
+            let beat = tick();
+            viewed.x = beat + other.y;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            let seen = Point { x = 3, y = 4 };
+            stash(&mut point, &seen);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+    assert_fails_spanning(source, "other", "cannot take '&' parameters");
+}
+
+#[test]
+fn a_view_across_an_implicit_await_in_the_body_is_rejected() {
+    // E3's BODY rule had the identical hole, and the same answer closes it.
+    // The diagnostic anchors at the CALL — there is no token to point at — and
+    // names it, so the reader can see which call suspends.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow() {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let beat = tick();
+            view.x = beat;
+        }
+        fun main() { flow(); }
+        main();
+        "#;
+    // Occurrence 1 — occurrence 0 is `tick()` inside the declaration itself.
+    assert_fails_spanning_nth(source, "tick()", 1, "the implicit 'await' of 'tick'");
+    assert_fails_with(source, "'view' (a view into 'point') is still live here");
+}
+
+#[test]
+fn an_async_closure_capturing_a_view_across_an_implicit_await_is_rejected() {
+    // E3's CLOSURE rule, third arm of the same gate.
+    let source = r#"
+        async fun tick(): i32 { 1 }
+        fun main() {
+            mut a = 5;
+            let view = &mut a;
+            let task = async {
+                let beat = tick();
+                view = beat;
+            };
+        }
+        main();
+        "#;
+    assert_fails_with(source, "an async closure cannot capture the view 'view'");
+}
+
+#[test]
+fn an_explicit_await_reports_its_crossing_exactly_once() {
+    // The token path and the call-site path both see `await tick()` — the
+    // awaited call is the token's own suspension written out. Only the token
+    // reports it, or every existing `await` diagnostic would have doubled.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow() {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let beat = await tick();
+            view.x = beat;
+        }
+        fun main() { flow(); }
+        main();
+        "#;
+    let crossings = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("cannot hold a view across"))
+        .count();
+    assert_eq!(crossings, 1, "expected exactly one crossing diagnostic");
+}
+
+#[test]
+fn a_body_with_both_await_spellings_reports_its_signature_once() {
+    // Mixed: the token settles the signature rule, so the call-site path never
+    // records a candidate for this body and the parameter is named once.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun stash(viewed: &mut Point) {
+            let beat = await tick();
+            let more = tick();
+            viewed.x = beat + more;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            stash(&mut point);
+        }
+        main();
+        "#;
+    let refusals = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("cannot take '&mut' parameters"))
+        .count();
+    assert_eq!(refusals, 1, "expected exactly one signature diagnostic");
+}
+
+#[test]
+fn a_declared_async_body_that_never_suspends_keeps_its_view_parameters() {
+    // THE composition with B29, at function granularity. The gate asks what
+    // the BODY does, never what the declaration says: a JS `async function`
+    // runs synchronously to its first `await`, so a body with no suspension
+    // point never yields and its view parameter is safe for exactly as long as
+    // it is the body's own. Tightening the gate to declared asyncness — the
+    // reading the filing warned against — would redden this and, with it,
+    // `a_declared_async_impl_of_a_sync_trait_method_is_permitted`.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        async fun quiet(viewed: &mut Point) {
+            viewed.x = 5;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            quiet(&mut point);
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn calling_an_async_impl_of_a_sync_trait_method_suspends_the_caller() {
+    // The other side of the same composition, and the RUNTIME truth decides
+    // it: B29 lets `S`'s `m` be `async` under a sync trait declaration, and
+    // `async_infer` propagates that through the contract — the emission is
+    // `await (m(s))` inside `caller`. An `await` yields to the microtask queue
+    // even for an already-resolved promise, so `caller`'s views really are
+    // held across a suspension and the rule must say so. B29's own pin never
+    // calls `m`, which is why both hold.
+    let source = r#"
+        trait T { fun m(&self): void; }
+        struct S {}
+        impl S with T { async fun m(&self): void {} }
+        struct Point { x: i32, y: i32 }
+        fun caller(viewed: &mut Point, s: &S) {
+            s.m();
+            viewed.x = 5;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            let s = S {};
+            caller(&mut point, &s);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
+#[test]
+fn a_sync_call_with_a_view_live_across_it_stays_legal() {
+    // The NEGATIVE. Nothing in this program can suspend, so a view lives
+    // across the call untouched — the rule must not fire on a call merely for
+    // being a call.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        fun beat(): i32 { 7 }
+        fun flow() {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let value = beat();
+            view.x = value;
+        }
+        fun main() { flow(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a_sync_call_inside_an_async_body_keeps_a_live_view_legal() {
+    // The negative again, one frame in: an async CALLER is not a suspension —
+    // only the suspension points inside it are — so a purely sync call with a
+    // view live across it compiles inside an `async fun` too.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        fun beat(): i32 { 7 }
+        async fun flow() {
+            let _warm = tick();
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let value = beat();
+            view.x = value;
+        }
+        fun main() { flow(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a_view_declared_after_an_implicit_await_stays_legal() {
+    // Ordering: liveness runs from the declaration, so a suspension BEFORE the
+    // view is not a crossing. The same conservatism E3 has always had, now
+    // applied to the implicit spelling.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow() {
+            let beat = tick();
+            mut point = Point { x = beat, y = 2 };
+            let view = &mut point;
+            view.x = 9;
+        }
+        fun main() { flow(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn an_implicit_await_nested_in_a_branch_still_crosses_a_live_view() {
+    // Nested: the suspension is inside an `if` arm, the view outside it.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow(flag: bool) {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            if flag {
+                let beat = tick();
+                view.x = beat;
+            }
+        }
+        fun main() { flow(true); }
+        main();
+        "#;
+    assert_fails_with(source, "cannot hold a view across the implicit 'await'");
+}
+
+#[test]
+fn an_implicit_await_in_a_for_mut_loop_crosses_the_loop_binding() {
+    // Nested, and the view is the LOOP BINDING — live across every iteration.
+    let source = r#"
+        async fun tick(): i32 { 1 }
+        async fun stream() {
+            mut items = [ 1, 2, 3 ];
+            for e in &mut items {
+                let _beat = tick();
+            }
+        }
+        fun main() { stream(); }
+        main();
+        "#;
+    assert_fails_with(source, "cannot hold a view across the implicit 'await'");
+}
+
+#[test]
+fn an_implicit_await_of_a_method_names_the_method_in_the_crossing() {
+    // The diagnostic's voice on a receiver call: the callee is resolved
+    // through the wired subject, so the message names `tick`, not the
+    // receiver.
+    let source = r#"
+        struct Clock { ticks: i32 }
+        impl Clock {
+            async fun tick(&self): i32 { 1 }
+        }
+        struct Point { x: i32, y: i32 }
+        async fun flow(clock: Clock) {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let beat = clock.tick();
+            view.x = beat;
+        }
+        fun main() { flow(Clock { ticks = 0 }); }
+        main();
+        "#;
+    assert_fails_with(source, "the implicit 'await' of 'tick'");
 }
 
 #[test]

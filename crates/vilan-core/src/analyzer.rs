@@ -547,6 +547,87 @@ enum InvalidationViolation<'src> {
     },
 }
 
+/// The mutable state the rule-4 scan carries beside the live set.
+///
+/// `saw_await` is E3's original gate — the explicit `await` TOKEN — and the
+/// arms it drives are unchanged. `crossings` is B119's addition: a call site
+/// is a suspension point too when its CALLEE can suspend, which is a
+/// call-graph property the analyzer cannot answer (`async_infer` settles it
+/// after `analyze()` returns). So the scan, which owns view liveness, records
+/// the candidate sites and [`check_view_suspensions`] decides them.
+#[derive(Default)]
+struct InvalidationScanState {
+    saw_await: bool,
+    crossings: Vec<PendingViewCrossing>,
+    /// Call expressions that are the DIRECT operand of an `await`. The token
+    /// path already reports those, so the call-site path must not double up.
+    awaited_operands: HashSet<Id>,
+}
+
+/// A call site with a view live across it, pending the suspension verdict.
+struct PendingViewCrossing {
+    /// The `Expr::Call` entity — the diagnostic's span.
+    anchor: Id,
+    /// The call's `function_calls` key, which is also what
+    /// [`crate::call_graph::Call::call_id`] records.
+    call: Id,
+    view: Id,
+}
+
+/// B119: the E3 sites whose verdict needs the settled async facts. Recorded by
+/// the analyzer (which owns view liveness and the S1 frozen filter), decided by
+/// [`check_view_suspensions`] once `async_infer::infer` has run. Nothing here
+/// overlaps the explicit-`await` half, which `check_invalidation` still decides
+/// on its own: the token stays SUFFICIENT, it only stops being necessary.
+#[derive(Clone, Debug, Default)]
+pub struct ViewSuspensionChecks<'src> {
+    /// E3's body rule at a call site: `(anchor, call, view, the view's root)`.
+    pub crossings: Vec<(Id, Id, Id, Option<Id>)>,
+    /// E3's signature rule for a body with no explicit `await`:
+    /// `(function, the view parameter, the form's spelling)`.
+    pub signatures: Vec<(Id, Id, &'static str)>,
+    /// E3's closure rule for a closure body with no explicit `await`:
+    /// `(closure, the capturing reference, the view's name)`.
+    pub captures: Vec<(Id, Id, &'src str)>,
+}
+
+/// E3's crossing diagnostic (view-invalidation.md §3), in one voice for both
+/// spellings of the suspension: the `await` the user wrote, and the implicit
+/// one a call to a suspending callee performs (B119, §7). The token form is
+/// unchanged; the implicit form says WHICH call suspends, because there is no
+/// token under the span to make that obvious.
+fn view_crossing_message(view_name: &str, root_name: Option<&str>, callee: Option<&str>) -> String {
+    let what = match callee {
+        None => "'await'".to_string(),
+        Some(callee) => format!("the implicit 'await' of '{callee}'"),
+    };
+    let after = if callee.is_some() { "call" } else { "await" };
+    let subject = match root_name {
+        Some(root_name) => format!("'{view_name}' (a view into '{root_name}')"),
+        None => format!("'{view_name}'"),
+    };
+    format!(
+        "cannot hold a view across {what}: {subject} is still live here. Re-acquire the view after the {after}; the awaited turn may change what it points at."
+    )
+}
+
+/// E3's signature diagnostic (view-invalidation.md §3). One text for both
+/// gates: the explicit `await` token and B119's call-graph answer describe the
+/// same hazard, so they read identically.
+fn async_view_parameter_message(form: &str) -> String {
+    format!(
+        "an async function cannot take {form} parameters: the view would be held across its suspension points. Pass a value, or a Shared/handle."
+    )
+}
+
+/// E3's closure-capture diagnostic (view-invalidation.md §3), shared by the
+/// token gate and B119's call-graph gate.
+fn async_view_capture_message(name: &str) -> String {
+    format!(
+        "an async closure cannot capture the view '{name}': the capture would be held across the closure's suspension points. Re-acquire the view inside, or pass a value/handle."
+    )
+}
+
 /// The precomputed resource sets the affine move scan matches against
 /// (destruction.md §4, R1–R9): the resource-typed binding entities (variables
 /// and parameters), and the resource-typed *place* expressions (a `Field` /
@@ -2042,6 +2123,12 @@ pub struct Analyzer<'src> {
     /// so the check can run AFTER `async_infer` — an awaiting drop body is
     /// async only by inference. Populated by `check_drop_impls`.
     drop_method_checks: Vec<(Id, Span, String)>,
+    /// The E3 view sites awaiting the suspension verdict (B119,
+    /// view-invalidation.md §7): recorded by `check_invalidation`'s scan,
+    /// decided by `check_view_suspensions` after `async_infer` settles which
+    /// calls suspend. Moved onto the `Program` for the same reason
+    /// `drop_method_checks` is.
+    view_suspension_checks: ViewSuspensionChecks<'src>,
     /// `[rpc]` methods awaiting the Wire-signature check (`check_rpc_signatures`),
     /// collected as each is walked, validated once `wire_names` is complete.
     rpc_signatures_to_check: Vec<RpcSignatureCheck<'src>>,
@@ -2919,6 +3006,7 @@ impl<'src> Analyzer<'src> {
             wire_names: HashSet::default(),
             drop_impls_to_check: Vec::new(),
             drop_method_checks: Vec::new(),
+            view_suspension_checks: ViewSuspensionChecks::default(),
             wire_types_to_check: Vec::new(),
             hashable_names: HashSet::default(),
             hashable_types_to_check: Vec::new(),
@@ -14623,26 +14711,35 @@ impl<'src> Analyzer<'src> {
             .map(|(_, closure)| closure.return_)
             .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
+        let mut pending = ViewSuspensionChecks::default();
         for (function_id, statements, tail) in &bodies {
             let mut live = HashSet::default();
-            let mut saw_await = false;
+            let mut state = InvalidationScanState::default();
             self.scan_invalidation_block(
                 statements,
                 *tail,
                 &scanner,
                 &mut live,
                 &mut violations,
-                &mut saw_await,
+                &mut state,
             );
             // The SIGNATURE rule: a function that suspends may not take view
             // parameters — the caller's view would be held across the
-            // suspension one frame down. Sync functions (no await) pass
-            // views freely; that is what keeps the analysis local.
+            // suspension one frame down. A body that cannot suspend passes
+            // views freely.
+            //
+            // The explicit `await` TOKEN settles it here, as it always has.
+            // B119: when there is no token the answer is the call graph's —
+            // an IMPLICIT await (a call to something that can suspend) is the
+            // same suspension — so the view parameters become candidates and
+            // `check_view_suspensions` decides them once `async_infer` has
+            // said which calls suspend.
+            //
             // Collected first, reported after: placing a diagnostic reads the
             // whole analyzer (it resolves the anchor's file), so it cannot run
             // while `functions` is borrowed.
             let mut view_parameters: Vec<(Id, &'static str)> = Vec::new();
-            if saw_await && let Some(function) = self.functions.get(function_id) {
+            if let Some(function) = self.functions.get(function_id) {
                 for parameter_id in &function.parameters {
                     let Some(parameter) = self.parameters.get(parameter_id) else {
                         continue;
@@ -14654,31 +14751,40 @@ impl<'src> Analyzer<'src> {
                     }
                 }
             }
-            for (parameter_id, form) in view_parameters {
-                self.push_anchored(
-                    Error {
-                        note: None,
-                        span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "an async function cannot take {form} parameters: the view would be held across its suspension points. Pass a value, or a Shared/handle."
-                        ),
-                    },
-                    parameter_id,
+            if state.saw_await {
+                for (parameter_id, form) in view_parameters {
+                    self.push_anchored(
+                        Error {
+                            note: None,
+                            span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
+                            msg: async_view_parameter_message(form),
+                        },
+                        parameter_id,
+                    );
+                }
+            } else {
+                pending.signatures.extend(
+                    view_parameters
+                        .into_iter()
+                        .map(|(parameter_id, form)| (*function_id, parameter_id, form)),
                 );
             }
+            Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
         for return_id in closure_returns {
             let mut live = HashSet::default();
-            let mut saw_await = false;
+            let mut state = InvalidationScanState::default();
             self.scan_invalidation_block(
                 &[],
                 return_id,
                 &scanner,
                 &mut live,
                 &mut violations,
-                &mut saw_await,
+                &mut state,
             );
+            Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
+        self.view_suspension_checks = pending;
         self.check_async_closure_captures(&view_bindings);
         for violation in violations {
             let (anchor, msg) = match violation {
@@ -14716,20 +14822,12 @@ impl<'src> Analyzer<'src> {
                         .map(|v| v.name)
                         .or_else(|| self.parameters.get(&view).map(|p| p.name))
                         .unwrap_or("the view");
-                    let msg = match view_origins
+                    let root_name = view_origins
                         .get(&view)
                         .and_then(|roots| roots.first())
                         .and_then(|root| self.variables.get(root))
-                        .map(|root| root.name)
-                    {
-                        Some(root_name) => format!(
-                            "cannot hold a view across 'await': '{view_name}' (a view into '{root_name}') is still live here. Re-acquire the view after the await; the awaited turn may change what it points at."
-                        ),
-                        None => format!(
-                            "cannot hold a view across 'await': '{view_name}' is still live here. Re-acquire the view after the await; the awaited turn may change what it points at."
-                        ),
-                    };
-                    (anchor, msg)
+                        .map(|root| root.name);
+                    (anchor, view_crossing_message(view_name, root_name, None))
                 }
             };
             self.push_anchored(
@@ -14741,6 +14839,25 @@ impl<'src> Analyzer<'src> {
                 anchor,
             );
         }
+    }
+
+    /// Moves one body's B119 candidates onto the pending table, resolving each
+    /// view's root while `view_origins` is still in hand (the post-pass builds
+    /// the message from names alone).
+    fn record_pending_crossings(
+        pending: &mut ViewSuspensionChecks<'src>,
+        view_origins: &HashMap<Id, Vec<Id>>,
+        state: InvalidationScanState,
+    ) {
+        pending
+            .crossings
+            .extend(state.crossings.into_iter().map(|crossing| {
+                let root = view_origins
+                    .get(&crossing.view)
+                    .and_then(|roots| roots.first())
+                    .copied();
+                (crossing.anchor, crossing.call, crossing.view, root)
+            }));
     }
 
     /// E3's closure half: an `async { .. }` (or any closure whose body
@@ -14757,6 +14874,7 @@ impl<'src> Analyzer<'src> {
             .filter(|closure_id| !self.frozen_entity(*closure_id))
             .collect();
         let mut errors: Vec<(Id, &'src str)> = Vec::new();
+        let mut pending: Vec<(Id, Id, &'src str)> = Vec::new();
         for closure_id in closure_ids {
             let Some(closure) = self.closures.get(&closure_id) else {
                 continue;
@@ -14773,9 +14891,6 @@ impl<'src> Analyzer<'src> {
                 &mut captured,
                 &mut visited,
             );
-            if !saw_await {
-                continue;
-            }
             for reference_id in captured {
                 let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&reference_id)
                 else {
@@ -14789,16 +14904,26 @@ impl<'src> Analyzer<'src> {
                     .get(binding_id)
                     .map(|v| v.name)
                     .unwrap_or("the view");
-                errors.push((reference_id, name));
+                // The token settles it here; without one the closure may still
+                // suspend by calling something that does (B119) — a candidate
+                // `check_view_suspensions` decides against the call graph.
+                if saw_await {
+                    errors.push((reference_id, name));
+                } else {
+                    pending.push((closure_id, reference_id, name));
+                }
             }
         }
+        self.view_suspension_checks.captures = pending;
         for (reference_id, name) in errors {
-            self.push_anchored(Error { note: None,
-                span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
-                msg: format!(
-                    "an async closure cannot capture the view '{name}': the capture would be held across the closure's suspension points. Re-acquire the view inside, or pass a value/handle."
-                ),
-            }, reference_id);
+            self.push_anchored(
+                Error {
+                    note: None,
+                    span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: async_view_capture_message(name),
+                },
+                reference_id,
+            );
         }
     }
 
@@ -15238,13 +15363,13 @@ impl<'src> Analyzer<'src> {
         scan: &InvalidationScan<'_>,
         live: &mut HashSet<Id>,
         violations: &mut Vec<InvalidationViolation<'src>>,
-        saw_await: &mut bool,
+        state: &mut InvalidationScanState,
     ) {
         let outer = live.clone();
         for statement in statements {
-            self.scan_invalidation(*statement, scan, live, violations, saw_await);
+            self.scan_invalidation(*statement, scan, live, violations, state);
         }
-        self.scan_invalidation(tail, scan, live, violations, saw_await);
+        self.scan_invalidation(tail, scan, live, violations, state);
         live.retain(|view| outer.contains(view));
     }
 
@@ -15254,7 +15379,7 @@ impl<'src> Analyzer<'src> {
         scan: &InvalidationScan<'_>,
         live: &mut HashSet<Id>,
         violations: &mut Vec<InvalidationViolation<'src>>,
-        saw_await: &mut bool,
+        state: &mut InvalidationScanState,
     ) {
         let Some(expr) = self.expr_id_to_expr_map.get(&expr_id).cloned() else {
             return;
@@ -15262,14 +15387,14 @@ impl<'src> Analyzer<'src> {
         match expr {
             Expr::Variable(variable_id) => {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
-                    self.scan_invalidation(initial, scan, live, violations, saw_await);
+                    self.scan_invalidation(initial, scan, live, violations, state);
                 }
                 if scan.view_bindings.contains(&variable_id) {
                     live.insert(variable_id);
                 }
             }
             Expr::Assignment(target_id, value_id) => {
-                self.scan_invalidation(value_id, scan, live, violations, saw_await);
+                self.scan_invalidation(value_id, scan, live, violations, state);
                 // Reassigning a whole binding invalidates views into it (E1).
                 if let Some(Expr::Local(root_id)) = self.expr_id_to_expr_map.get(&target_id) {
                     if live.iter().any(|view| {
@@ -15283,36 +15408,34 @@ impl<'src> Analyzer<'src> {
                         });
                     }
                 }
-                self.scan_invalidation(target_id, scan, live, violations, saw_await);
+                self.scan_invalidation(target_id, scan, live, violations, state);
             }
             Expr::Block((statements, tail)) => {
-                self.scan_invalidation_block(&statements, tail, scan, live, violations, saw_await);
+                self.scan_invalidation_block(&statements, tail, scan, live, violations, state);
             }
             Expr::For(condition, (statements, tail)) => {
                 if let Some(condition) = condition {
-                    self.scan_invalidation(condition, scan, live, violations, saw_await);
+                    self.scan_invalidation(condition, scan, live, violations, state);
                 }
-                self.scan_invalidation_block(&statements, tail, scan, live, violations, saw_await);
+                self.scan_invalidation_block(&statements, tail, scan, live, violations, state);
             }
             Expr::ForEach(iterable, item, (statements, tail)) => {
-                self.scan_invalidation(iterable, scan, live, violations, saw_await);
+                self.scan_invalidation(iterable, scan, live, violations, state);
                 // A `for e in &mut c` binding is a view into `c` for the
                 // body's extent — live across every iteration.
                 let loop_view = item.filter(|item| scan.view_bindings.contains(item));
                 let newly_live = loop_view.is_some_and(|item| live.insert(item));
-                self.scan_invalidation_block(&statements, tail, scan, live, violations, saw_await);
+                self.scan_invalidation_block(&statements, tail, scan, live, violations, state);
                 if newly_live && let Some(item) = loop_view {
                     live.remove(&item);
                 }
             }
-            Expr::If(branch) => {
-                self.scan_invalidation_if(&branch, scan, live, violations, saw_await)
-            }
+            Expr::If(branch) => self.scan_invalidation_if(&branch, scan, live, violations, state),
             Expr::Match(subject_id, legs) => {
-                self.scan_invalidation(subject_id, scan, live, violations, saw_await);
+                self.scan_invalidation(subject_id, scan, live, violations, state);
                 for leg in legs {
                     if let Some(guard) = leg.guard {
-                        self.scan_invalidation(guard, scan, live, violations, saw_await);
+                        self.scan_invalidation(guard, scan, live, violations, state);
                     }
                     // A `Some(let v)` capture over a wrapped-view call is a
                     // view for its leg's extent.
@@ -15331,32 +15454,37 @@ impl<'src> Analyzer<'src> {
                         .copied()
                         .filter(|view| live.insert(*view))
                         .collect();
-                    self.scan_invalidation_block(&[], leg.body, scan, live, violations, saw_await);
+                    self.scan_invalidation_block(&[], leg.body, scan, live, violations, state);
                     for view in newly_live {
                         live.remove(&view);
                     }
                 }
             }
             Expr::Reference(operand, _) | Expr::Dereference(operand) | Expr::Unary(_, operand) => {
-                self.scan_invalidation(operand, scan, live, violations, saw_await);
+                self.scan_invalidation(operand, scan, live, violations, state);
             }
             Expr::Binary(_, lhs, rhs) => {
-                self.scan_invalidation(lhs, scan, live, violations, saw_await);
-                self.scan_invalidation(rhs, scan, live, violations, saw_await);
+                self.scan_invalidation(lhs, scan, live, violations, state);
+                self.scan_invalidation(rhs, scan, live, violations, state);
             }
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
-                self.scan_invalidation(subject, scan, live, violations, saw_await)
+                self.scan_invalidation(subject, scan, live, violations, state)
             }
             Expr::Index(subject, index) => {
-                self.scan_invalidation(subject, scan, live, violations, saw_await);
-                self.scan_invalidation(index, scan, live, violations, saw_await);
+                self.scan_invalidation(subject, scan, live, violations, state);
+                self.scan_invalidation(index, scan, live, violations, state);
             }
             Expr::FunctionReturn(Some(value)) => {
-                self.scan_invalidation(value, scan, live, violations, saw_await)
+                self.scan_invalidation(value, scan, live, violations, state)
             }
             Expr::Await(value) => {
-                self.scan_invalidation(value, scan, live, violations, saw_await);
-                *saw_await = true;
+                // The awaited call is this same suspension written out; the
+                // token reports it, so the call-site path below must not.
+                if matches!(self.expr_id_to_expr_map.get(&value), Some(Expr::Call(_))) {
+                    state.awaited_operands.insert(value);
+                }
+                self.scan_invalidation(value, scan, live, violations, state);
+                state.saw_await = true;
                 // E3: a suspension while any view is live — the writer set
                 // during an await is the whole program, and a local that
                 // survives a suspension is a field of the continuation.
@@ -15374,7 +15502,23 @@ impl<'src> Analyzer<'src> {
                 let argument_ids = function_call.argument_ids.clone();
                 let subject_id = function_call.subject_id;
                 for argument in &argument_ids {
-                    self.scan_invalidation(*argument, scan, live, violations, saw_await);
+                    self.scan_invalidation(*argument, scan, live, violations, state);
+                }
+                // E3, B119: the call is a suspension point in its own right
+                // when its CALLEE can suspend — the implicit await
+                // (`spec/execution.md` §7) is the same yield as the written
+                // one. Whether it does is the call graph's answer, settled
+                // only after `analyze()` returns, so the site is recorded
+                // with the views live at it and decided by
+                // `check_view_suspensions`.
+                if !state.awaited_operands.contains(&expr_id) {
+                    for view in live.iter() {
+                        state.crossings.push(PendingViewCrossing {
+                            anchor: expr_id,
+                            call: call_id,
+                            view: *view,
+                        });
+                    }
                 }
                 // E2: a call passing a viewed root by `&mut` convention (the
                 // wired receiver or an explicit `&mut` argument) may move,
@@ -15460,12 +15604,12 @@ impl<'src> Analyzer<'src> {
             }
             Expr::List(ids) | Expr::Tuple(ids) => {
                 for id in ids {
-                    self.scan_invalidation(id, scan, live, violations, saw_await);
+                    self.scan_invalidation(id, scan, live, violations, state);
                 }
             }
             Expr::StructInitializer(_, fields) => {
                 for value in fields.values() {
-                    self.scan_invalidation(*value, scan, live, violations, saw_await);
+                    self.scan_invalidation(*value, scan, live, violations, state);
                 }
             }
             _ => {}
@@ -15478,18 +15622,18 @@ impl<'src> Analyzer<'src> {
         scan: &InvalidationScan<'_>,
         live: &mut HashSet<Id>,
         violations: &mut Vec<InvalidationViolation<'src>>,
-        saw_await: &mut bool,
+        state: &mut InvalidationScanState,
     ) {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.scan_invalidation(*condition, scan, live, violations, saw_await);
-                self.scan_invalidation_block(statements, *tail, scan, live, violations, saw_await);
+                self.scan_invalidation(*condition, scan, live, violations, state);
+                self.scan_invalidation_block(statements, *tail, scan, live, violations, state);
                 if let Some(else_branch) = else_branch {
-                    self.scan_invalidation_if(else_branch, scan, live, violations, saw_await);
+                    self.scan_invalidation_if(else_branch, scan, live, violations, state);
                 }
             }
             ExprIfBranch::Else((statements, tail)) => {
-                self.scan_invalidation_block(statements, *tail, scan, live, violations, saw_await);
+                self.scan_invalidation_block(statements, *tail, scan, live, violations, state);
             }
         }
     }
@@ -30374,6 +30518,18 @@ pub struct Program<'src> {
     /// name)`. Read by `check_async_drops` AFTER `async_infer` fills
     /// `async_functions` — an awaiting drop body is async only by inference.
     pub drop_method_checks: Vec<(Id, Span, String)>,
+    /// The E3 view sites awaiting the suspension verdict (B119,
+    /// view-invalidation.md §7). Read by [`check_view_suspensions`] AFTER
+    /// `async_infer` fills [`Self::suspending_calls`] — whether a call
+    /// suspends is a call-graph property, not a token.
+    pub view_suspension_checks: ViewSuspensionChecks<'src>,
+    /// Every call site the emission will `await` — the `function_calls` key of
+    /// each. Filled by `async_infer::infer` from the same per-call test its
+    /// fixpoint propagates over, so this is the RUNTIME truth about suspension
+    /// rather than a re-derivation of it. Analysis-only: nothing in emission
+    /// reads it (`awaited_calls` / `async_functions` stay the emitter's
+    /// channels), so no golden depends on it.
+    pub suspending_calls: HashSet<Id>,
     /// Parameters/bindings whose declared closure type is `async || T` (J2):
     /// calls through them are implicitly awaited. The async inference pass
     /// ADDS adopted bindings — unannotated ones holding an async closure.
@@ -35140,6 +35296,8 @@ fn analyze_over_world<'src>(
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
+        view_suspension_checks: std::mem::take(&mut analyzer.view_suspension_checks),
+        suspending_calls: HashSet::default(),
         async_values: analyzer.async_values.clone(),
         sync_values: analyzer.sync_values.clone(),
         async_fields: analyzer.async_fields.clone(),
@@ -35166,6 +35324,118 @@ fn analyze_over_world<'src>(
         scalar_view_calls,
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
+    }
+}
+
+/// E3's implicit half (B119, view-invalidation.md §7): decide the view sites
+/// `check_invalidation` could not, now that `async_infer` has said which calls
+/// suspend.
+///
+/// **The rule.** A call is a suspension point when it CAN SUSPEND — when the
+/// emission awaits it, which `Program::suspending_calls` records: the callee is
+/// declared `async`, or is transitively suspending (its own body awaits, or it
+/// calls something suspending, to fixpoint), or the call goes through an async
+/// value / field / dispatch candidate. The explicit `await` token stays
+/// SUFFICIENT — `check_invalidation` reports those unchanged — it merely stops
+/// being NECESSARY. Then, as before:
+///
+/// - **body rule**: no view may be live across such a call;
+/// - **signature rule**: a body containing one may not take view parameters;
+/// - **closure rule**: a closure body containing one may not capture a view.
+///
+/// **Why a body's own `async` marker is not the test.** Declared asyncness is a
+/// property of the CALLEE, read at call sites. A JS `async function` runs
+/// synchronously to its first `await`, so an `async fun` whose body never
+/// suspends never yields, and its view parameters are safe for exactly as long
+/// as they are its own — which is what keeps B29's async-impl-of-a-sync-trait
+/// freedom (`a_declared_async_impl_of_a_sync_trait_method_is_permitted`) legal
+/// under this rule rather than in spite of it. A CALLER holding a view across
+/// its call is a different question, and this answers it yes: `await f()` yields
+/// to the microtask queue even when `f` returns an already-resolved promise.
+pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::CallGraph) {
+    let checks = std::mem::take(&mut program.view_suspension_checks);
+    if checks.crossings.is_empty() && checks.signatures.is_empty() && checks.captures.is_empty() {
+        return;
+    }
+    // Whether a node's OWN body holds a suspension point. `node_awaits` is the
+    // token (the same one the analyzer's scan saw — neither descends into a
+    // nested closure or `async` block, which is what keeps a spawn's awaits off
+    // its creator); the rest is B119's call-graph half.
+    let body_suspends = |node: Id| {
+        graph.node_awaits(node)
+            || graph
+                .calls_of(node)
+                .iter()
+                .any(|call| program.suspending_calls.contains(&call.call_id))
+    };
+    let mut violations: Vec<(Error, SourceId)> = Vec::new();
+    for (anchor, call, view, root) in &checks.crossings {
+        if !program.suspending_calls.contains(call) {
+            continue;
+        }
+        let view_name = program
+            .variables
+            .get(view)
+            .map(|variable| variable.name)
+            .or_else(|| program.parameters.get(view).map(|parameter| parameter.name))
+            .unwrap_or("the view");
+        let root_name = root
+            .and_then(|root| program.variables.get(&root))
+            .map(|root| root.name);
+        let callee = program
+            .function_calls
+            .get(call)
+            .and_then(|function_call| program.entity_map.get(&function_call.subject_id))
+            .and_then(|subject| match subject {
+                Expr::Local(target) => program
+                    .functions
+                    .get(target)
+                    .map(|function| function.name)
+                    .or_else(|| {
+                        program
+                            .external_functions
+                            .get(target)
+                            .map(|external| external.name)
+                    }),
+                _ => None,
+            });
+        violations.push(program.anchored(
+            Error {
+                note: None,
+                span: **program.span_map.get(anchor).unwrap_or(&&EMPTY_SPAN),
+                msg: view_crossing_message(view_name, root_name, callee),
+            },
+            *anchor,
+        ));
+    }
+    for (function_id, parameter_id, form) in &checks.signatures {
+        if !body_suspends(*function_id) {
+            continue;
+        }
+        violations.push(program.anchored(
+            Error {
+                note: None,
+                span: **program.span_map.get(parameter_id).unwrap_or(&&EMPTY_SPAN),
+                msg: async_view_parameter_message(form),
+            },
+            *parameter_id,
+        ));
+    }
+    for (closure_id, reference_id, name) in &checks.captures {
+        if !body_suspends(*closure_id) {
+            continue;
+        }
+        violations.push(program.anchored(
+            Error {
+                note: None,
+                span: **program.span_map.get(reference_id).unwrap_or(&&EMPTY_SPAN),
+                msg: async_view_capture_message(name),
+            },
+            *reference_id,
+        ));
+    }
+    for (error, source) in violations {
+        program.push_diagnostic(error, source);
     }
 }
 
