@@ -689,6 +689,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_column",
         "__db_is_null",
         "__db_close",
+        "__fs_stat",
         "__local_get",
         "__session_get",
         "__router_path",
@@ -927,6 +928,26 @@ fn helper_source(name: &str) -> &'static str {
         // `Database`'s `Drop` closes the handle (destruction.md §9). No public
         // `close()` surfaces this — the destructor is the only caller.
         "__db_close" => "function __db_close(database) {\n\tdatabase.close();\n}",
+        // `std::fs::stat` (F13, fullstack-dx.md §9.3): `fs.promises.stat`
+        // wrapped so a missing path reads back the `Option` array `None`
+        // instead of throwing — vilan has no `try`/`catch`, so the ENOENT
+        // catch has to live here. Every other failure re-throws, matching
+        // `read_bytes`/`read_dir`/`read_file_to_str`'s posture. The dynamic
+        // `import` is self-contained on purpose (no co-declared static
+        // import to coordinate with, the same reason `__hmac_sha512` reaches
+        // for the global `crypto` instead) and Node caches module resolution,
+        // so a hot loop does not re-resolve the module per call.
+        "__fs_stat" => {
+            "async function __fs_stat(path) {\n\
+             \tconst fsPromises = await import(\"node:fs/promises\");\n\
+             \ttry {\n\
+             \t\treturn [ 0, await fsPromises.stat(path) ];\n\
+             \t} catch (error) {\n\
+             \t\tif (error && error.code === \"ENOENT\") return [ 1 ];\n\
+             \t\tthrow error;\n\
+             \t}\n\
+             }"
+        }
         // Cryptographically random bytes.
         "__random_bytes" => {
             "function __random_bytes(length) {\n\treturn crypto.getRandomValues(new Uint8Array(length));\n}"

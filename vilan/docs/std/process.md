@@ -132,10 +132,24 @@ each handler runs in a turn (`AtEnd`). Details and the client side:
 ## std::fs
 
 ```vilan,fragment
-fun exists(path: str): bool                // sync
-fun read_file_to_str(path: str): str       // async, UTF-8
-fun write_file(path: str, contents: str)   // async
+fun exists(path: str): bool                     // sync
+fun read_file_to_str(path: str): str            // async, UTF-8
+fun read_bytes(path: str): Bytes                // async, true binary read
+fun write_file(path: str, contents: str)        // async
+fun read_dir(path: str): List<str>              // async, entry NAMES, flat (v1)
+fun stat(path: str): Option<Stat>               // async — None if `path` doesn't exist; every other failure throws
+struct Stat {
+    size: i32,
+    modified_at_ms: f64,   // epoch milliseconds
+    is_directory: bool,
+}
 ```
+
+`read_bytes`, `read_dir`, and `read_file_to_str` throw host-side on any
+failure, missing path included — the same posture `read_file_to_str` always
+had. `stat` alone is a non-throwing probe: it exists to let a caller ask
+"is this here yet, and what does it look like" (a poller's use case), so a
+missing path is `None`, not a thrown exception.
 
 ## std::process
 
