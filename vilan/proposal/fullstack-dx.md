@@ -1329,6 +1329,92 @@ S1 is independent of everything else; S2 gates S3; S3 gates S4 and S5.
    which needs a design: `ServerBuilder::on_stop` made real (§9.1), and
    `mount_root` naming the id it could not find (§9.5).
 
+### S1 — implementation record (server-grows lane, 2026-08-11)
+
+Shipped as designed in §4, with the two calls the design left to the
+implementer. **Mount routing is exact-route, not prefix-of-subtree**:
+`Service.mount` (default `"/"`) forms its three routes by plain
+concatenation (`mount + "events"`/`"send"`/`"rpc"`), so `.at("/admin/")`
+(trailing slash, matching §4.3's own example) claims exactly
+`/admin/events`, `/admin/send`, `/admin/rpc` and nothing else. Under
+exact-route matching two *different* mounts' routes can never collide, so
+the "longest mount first" tiebreak (`services_by_mount`, a stable sort) is
+implemented exactly as specified but is only ever load-bearing for two
+services sharing one mount — a misconfiguration, not a shape this survey's
+corpus produces; recorded rather than silently dropped, since the paper
+asked for it by name. **`Service` and the fold live in `rpc_server.vl`, not
+`http.vl`**: `ServerBuilder` gains `services: List<Service>`, and `Service`'s
+type is imported into `http.vl` from `rpc_server.vl` — the reverse of
+`rpc_server.vl`'s own existing import of `http.vl`, i.e. a cyclic *module*
+import. Confirmed accepted before relying on it (a throwaway two-module
+probe through `analyze_source`, mirroring `module_resolution.rs`'s harness):
+vilan's whole-program resolution is fine with it, and only per-binding
+*initialization* cycles are rejected (`init_order.rs`) — a function or type
+reference is not one. This keeps `http.vl` honestly ignorant of `RpcProtocol`
+et al.; only the one field's type crosses the seam. `build()`'s fold is
+unconditional except for `fold_service_upgrades`, which returns `fallback`
+untouched when there are no services — preserving the exact `None`/`Some`
+distinction `start()` reads to decide whether to register a node
+`'upgrade'` listener at all, so a plain HTTP app installs nothing beyond
+what it asked for, byte for byte. `serve_rpc` is untouched: §4.1 already
+names `rpc_response` "the honourable exception", and `serve_rpc` already
+*is* the minimal layer form (`on_request(rpc_response)`, no mount, no
+upgrade) — there was nothing to move it onto.
+
+**Gate.** `crates/vilan-cli/tests/rpc_http.rs` (6/6), `transport_robustness.rs`
+(3/3) and `streaming.rs` (1/1) pass unmodified — the wire pin. Five new pins
+in `crates/vilan-cli/tests/service_layer.rs`: order-independence
+(`with_service` before and after `on_request`, both routes), two services on
+distinct mounts (plus a cross-mount call proven to fail rather than
+silently answer through the wrong dispatcher), an upgrade routed by mount,
+the segment-match fix (`/rpcs`, `/sendmail`, `/events-archive` all reach
+`on_request`), and a raw-socket byte comparison of `serve_service`'s
+`/rpc`/`/send`/`/events`/fallback responses against bytes captured from the
+pre-layer implementation. Each planted red against the real implementation
+(not a stub) before being restored: the fold returning `fallback` only, an
+inert `.at()`, an upgrade picker that ignores the path, the segment match
+reverted to `path.starts_with`, and one flipped status code — each failed
+its own new pin and no other, then was reverted.
+
+### §9.1 — `Server::stop()`, made real
+
+**Design.** `stop()` closes the underlying `node:http` listener
+(`NodeServer::close`, a new extern binding) and fires `on_stop` from
+*close's own callback* — once the listener has actually finished closing,
+not merely been asked to. `Server` gains `node: Option<NodeServer>`,
+populated only on the copy `start()` hands to `on_start` — the same place
+`port()`/`url()` already become trustworthy — so calling `.stop()` on a
+`Server` value `start()` never touched (the raw `build()` output, or a copy
+taken before `on_start` ran) is a no-op rather than an error: the
+conservative reading, since there is no live listener to close. `on_stop`
+now rides on `Server` itself — previously only `ServerBuilder` carried it,
+and `build()` dropped it on the floor entirely (the bug) — so it fires from
+exactly the value that owns the listener.
+
+The one real decision: fire `on_stop` from the close callback rather than
+synchronously right after calling `close()`. `close()` stops accepting new
+connections immediately, but the callback (and the `'close'` event) waits
+for in-flight connections to end first — the more conservative "actually
+stopped," and the reading a caller doing teardown in `on_stop` (dispose
+sessions, close a database) needs to be true. The paper says only "closes
+the listener and fires `on_stop`"; this is the one place that sentence
+had to be read as an order rather than a pair, and it was read as the
+stricter one.
+
+**Gate.** Two pins in `crates/vilan-cli/tests/server_stop.rs`. *Fires*:
+triggered via an ordinary request (`/__stop`) rather than a fixed delay, so
+there is no race on when the trigger fires; the listener-closed assertion
+polls for up to 2s rather than checking once, because `node:net`'s
+`close()` marks the JS-level handle closed synchronously while libuv defers
+the OS-level unbind to its next event-loop tick — confirmed directly
+against a minimal `node:http` script with no vilan involved, so the poll is
+about that host scheduling gap, not a weaker claim about this layer.
+*Never fires*: a server left running, asserted absent from the whole run's
+output. Both planted red: an empty `stop()` body times out waiting for the
+"stopped" line — reproducing §9.1's own bug report, "reads correctly and
+never runs" — and a `build()` that fires `on_stop` unconditionally trips
+the never-fires pin.
+
 ## 9. Bycatch — found by the survey, not E56's to fix
 
 ### 9.1 `ServerBuilder::on_stop` is a documented no-op
@@ -1344,6 +1430,9 @@ so there is nothing that could fire it.
 This is a one-field fix plus a decision about what "stop" means (there is no
 shutdown path today), and it is squarely in seam (a)'s neighbourhood without
 being seam (a)'s problem. **File it.**
+
+**Shipped** — the §8 implementation record above (server-grows lane,
+2026-08-11) carries the decision and the pins.
 
 ### 9.2 The chunk base resolution has never executed
 
