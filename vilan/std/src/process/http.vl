@@ -1,12 +1,15 @@
 // `std::http` — a small HTTP server over `node:http`, exposed through an
 // abstract `Server`/`Response` API. The raw `node:http` calls are `[extern]`
 // host bindings used internally (and by `std::rpc_server`, which needs partial
-// writes for SSE); everything else is ordinary Vilan. This module is pure HTTP —
-// protocol mounts (RPC, the connected server) live in `std::rpc_server`.
+// writes for SSE); everything else is ordinary Vilan. The routing and protocol
+// machinery for a mounted RPC service lives in `std::rpc_server` — this module
+// only carries `ServerBuilder.services` and folds it in at `build()`
+// (`fullstack-dx.md` §4), so a plain HTTP app never has to know the type exists.
 
 import pkg::bytes::{ Bytes, new_text_decoder };
 import pkg::json::JsonValue;
 import pkg::option::Option::{ None, Some, self };
+import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
 
 // --- Raw node:http bindings ---
 
@@ -29,6 +32,12 @@ impl NodeServer {
 	/// arrives as `(request, raw socket, head)` instead of a normal request.
 	[extern(method, "on")]
 	external fun on_upgrade(self, event: str, handler: |NodeRequest, NodeSocket, Bytes| void);
+
+	/// Stop accepting new connections and close once existing ones end (node's
+	/// own `close([callback])`); `on_closed` fires once that has actually
+	/// happened — what `Server::stop` fires `on_stop` from (§9.1).
+	[extern(method, "close")]
+	external fun close(self, on_closed: || void);
 }
 
 /// The `AddressInfo` a listening server reports (`{ address, family, port }`).
@@ -250,9 +259,15 @@ struct Server {
 	port: i32,
 	request_handler: async |Request| Response,
 	on_start: |Server| void,
+	on_stop: |Server| void,
 	/// A WebSocket-style protocol upgrade handler, when the app mounted one
 	/// (`ServerBuilder::on_upgrade`): `(request, raw socket, head bytes)`.
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
+	/// The live listener, once bound — what `stop()` closes. `start()`
+	/// populates it on the copy of `Server` it hands to `on_start`, so
+	/// stopping a `Server` value that was never started (or started
+	/// elsewhere) is a no-op rather than an error (§9.1).
+	node: Option<NodeServer>,
 }
 
 struct ServerBuilder {
@@ -263,6 +278,11 @@ struct ServerBuilder {
 	on_start: |Server| void,
 	on_stop: |Server| void,
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
+	/// Rpc services installed with `with_service` (`std::rpc_server`,
+	/// `fullstack-dx.md` §4) — folded in front of `request_handler` and
+	/// `upgrade_handler` at `build()`. Empty for a plain HTTP app, which is
+	/// what keeps this module's own knowledge of `Service` to one field.
+	services: List<Service>,
 }
 
 impl Server {
@@ -273,6 +293,7 @@ impl Server {
 			on_start = |server| {},
 			on_stop = |server| {},
 			upgrade_handler = None,
+			services = [],
 		}
 	}
 
@@ -324,11 +345,29 @@ impl Server {
 		}
 		node_server.listen(port, || {
 			// The server handed to `on_start` carries the port it actually
-			// bound, which is the whole point of being allowed to request 0.
+			// bound, which is the whole point of being allowed to request 0 —
+			// and the live listener `stop()` needs (§9.1).
 			mut started = server;
 			started.port = bound_port(node_server);
+			started.node = Some(node_server);
 			on_start(started);
 		});
+	}
+
+	/// Stop listening and fire `on_stop` once the listener has actually
+	/// closed (§9.1) — a no-op on a `Server` value `start()` never populated
+	/// (built but not started, or a copy taken before `on_start` ran).
+	fun stop(self) {
+		match self.node {
+			Some(let node_server) => {
+				let on_stop = self.on_stop;
+				let stopped = self;
+				node_server.close(|| {
+					on_stop(stopped);
+				});
+			},
+			None => {},
+		}
 	}
 }
 
@@ -366,12 +405,21 @@ impl ServerBuilder {
 		self
 	}
 
+	/// Fold the installed services in front of `request_handler` and
+	/// `upgrade_handler` (`fullstack-dx.md` §4.2) and hand the result to
+	/// `Server`. Both folds are pure functions of `services` — with none
+	/// installed, `request_handler` and `upgrade_handler` come through as the
+	/// app wrote them (`fold_service_upgrades` returns `fallback` untouched
+	/// when there is nothing to fold in), so a plain HTTP app is unaffected
+	/// down to the wire.
 	fun build(self): Server {
 		Server {
 			port = self.port,
-			request_handler = self.request_handler,
+			request_handler = fold_service_requests(self.services, self.request_handler),
 			on_start = self.on_start,
-			upgrade_handler = self.upgrade_handler,
+			on_stop = self.on_stop,
+			upgrade_handler = fold_service_upgrades(self.services, self.upgrade_handler),
+			node = None,
 		}
 	}
 }

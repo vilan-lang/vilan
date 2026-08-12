@@ -333,6 +333,57 @@ app shell for anything else so deep links work (see
 [Routing](routing.md)). For custom per-connection state, drop down to
 `serve_connected` (see the [rpc reference](../std/rpc.md)).
 
+## Growing past one service
+
+`serve_service` is sugar over a `ServerBuilder` layer you can reach
+directly: `Service::new(protocol)`, installed with
+`ServerBuilder::with_service`. Its routes answer before `on_request`,
+which is what lets a page and a service sit on the same builder chain
+instead of one replacing the other:
+
+```vilan,norun
+import std::print;
+import std::shared::Shared;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+
+[service(TodosClient)]
+struct Todos {
+	count: Shared<i32>,
+}
+
+impl Todos {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.count.write() = self.count.read() + by;
+		self.count.read()
+	}
+}
+
+fun main() {
+	let todos = Todos { count = Shared::new(0) };
+	Server::builder()
+		.port(4600)
+		.with_service(Service::new(todos.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().body("app shell here").build())
+		.on_start(|server| print(i"listening on {server.url()}"))
+		.build()
+		.start();
+}
+```
+
+Delete the `.with_service(…)` line and the program still compiles and
+still serves the page — the property a boot function built around
+`serve_service` can't have. `with_service` is repeatable: a second
+service goes on its own mount, `.at("/admin/")`, so
+`Client::connect("/admin/", codec)` reaches it and the first service's
+routes are untouched. Two constants either way: services always answer
+before `on_request` (so an app route can't accidentally shadow a
+service route), and `serve_rpc`/`serve_service`/`serve_connected` keep
+working unchanged — they're this same layer with the registry lifecycle
+(or a custom one) already wired in.
+
 ## Traps
 
 - Mysterious contract-mismatch failures while developing usually mean an
