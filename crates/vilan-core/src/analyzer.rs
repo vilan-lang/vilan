@@ -1552,6 +1552,13 @@ pub struct Closure {
     // Destructures for tuple parameters (`|(a, b)| ..`), run before the body.
     pub parameter_destructures: Vec<Id>,
     pub return_: Id,
+    /// The closure's OWN return-type annotation (`|x: i32|: i32 { .. }`), if
+    /// written — S3 (editing-dx.md §3.4/§3.9): an annotated closure gets the
+    /// same return-position check a named function's declared return type
+    /// gets (rule 2, `resolve_return_type`), which this field is what makes
+    /// reachable; before it, the annotation was parsed, re-printed by the
+    /// formatter, and otherwise completely ignored by type checking.
+    pub return_type_id: Option<TypeId>,
 }
 
 /// A constraint that a struct initializer's field value must
@@ -1693,7 +1700,17 @@ enum Constraint<'src> {
     /// return-position generic call (`Option::from_json(t)` returning `Option<T>`
     /// where `R = Option<User>`) leaves `T` unbound and lowers to the abstract
     /// trait method. Mirrors `Variable`.
-    ReturnType { body_id: Id, return_type_id: TypeId },
+    ReturnType {
+        body_id: Id,
+        return_type_id: TypeId,
+        /// The block's last STATEMENT, when `body_id` is a function/closure
+        /// TAIL (not a `ret`) and the block has one — S3's regime-1/1'
+        /// distinction (editing-dx.md §3.7): a body-ends-without-a-value
+        /// mismatch is worded differently depending on whether that
+        /// statement, had it been the tail instead of discarded by a
+        /// trailing `;`, would itself have produced the expected value.
+        last_statement_id: Option<Id>,
+    },
     /// `expr!` — resolves the receiver's `Try` dispatch (std `Option`/`Result`
     /// fast path or a user `Try` impl), types the expression as the good half,
     /// and checks the enclosing function's return type can carry the bad half.
@@ -1797,6 +1814,16 @@ enum Resolution {
     Resolved,
     Deferred,
     Failed,
+}
+
+/// The outcome of [`Analyzer::check_return_position`] (S3, editing-dx.md
+/// §3.9): a body checked against a target return type either isn't ready yet
+/// (mirrors [`Type::Unresolved`]), matches, or carries the message to report
+/// at the caller's anchor of choice.
+enum ReturnPositionCheck {
+    Unresolved,
+    Matched,
+    Mismatched(String),
 }
 
 impl<'src> StructInitializerConstraint<'src> {
@@ -17972,13 +17999,21 @@ impl<'src> Analyzer<'src> {
                         Some(declared) => ReturnFrame::Function(id, declared),
                         None => ReturnFrame::VoidFunction,
                     });
-                    let (ids, expr_id) = match &function.body {
+                    let (ids, expr_id, last_statement_id) = match &function.body {
                         Some(body) => {
                             // Parameter destructures run first, before the body.
                             let mut ids = parameter_destructures;
-                            ids.extend(self.walk_expr_nodes(&body.0.0, body_scope_id));
+                            let statement_ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
+                            // S3 (editing-dx.md §3.7): the block's own last
+                            // statement, captured before it's merged with the
+                            // destructure ids — `resolve_return_type` reads it
+                            // to tell "this body ends without producing a
+                            // value" from "the `;` discards this body's last
+                            // value".
+                            let last_statement_id = statement_ids.last().copied();
+                            ids.extend(statement_ids);
                             let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
-                            (ids, expr_id)
+                            (ids, expr_id, last_statement_id)
                         }
                         None => {
                             // A signature without a body is only legitimate as a
@@ -17998,7 +18033,7 @@ impl<'src> Analyzer<'src> {
                             self.expr_id_to_expr_map.insert(void_id, Expr::Void);
                             self.expr_id_to_scope_id_map.insert(void_id, body_scope_id);
                             self.span_map.insert(void_id, &EMPTY_SPAN);
-                            (Vec::new(), void_id)
+                            (Vec::new(), void_id, None)
                         }
                     };
                     self.return_type_stack.pop();
@@ -18013,6 +18048,7 @@ impl<'src> Analyzer<'src> {
                         self.constraints.push(Constraint::ReturnType {
                             body_id: expr_id,
                             return_type_id,
+                            last_statement_id,
                         });
                         self.return_sites.push((id, expr_id));
                     }
@@ -18109,6 +18145,9 @@ impl<'src> Analyzer<'src> {
                         self.constraints.push(Constraint::ReturnType {
                             body_id: checked_id,
                             return_type_id,
+                            // A `ret`'s checked value is never a block tail —
+                            // regime 1/1' is a tail-only distinction.
+                            last_statement_id: None,
                         });
                         self.return_sites.push((function_id, checked_id));
                     }
@@ -18955,6 +18994,13 @@ impl<'src> Analyzer<'src> {
                         rets,
                     });
                 }
+                // S3 (editing-dx.md §3.4/§3.9): resolved in the body scope,
+                // like a named function's return type, so it can name the
+                // closure's own generic parameters.
+                let return_type_id = closure
+                    .return_type
+                    .as_deref()
+                    .map(|node| self.walk_type_node(node, body_scope_id));
                 self.closures.insert(
                     id,
                     Closure {
@@ -18962,6 +19008,7 @@ impl<'src> Analyzer<'src> {
                         parameters,
                         parameter_destructures,
                         return_: expr_id,
+                        return_type_id,
                     },
                 );
                 Some(Expr::Closure(id))
@@ -18994,6 +19041,11 @@ impl<'src> Analyzer<'src> {
                         parameters: Vec::new(),
                         parameter_destructures: Vec::new(),
                         return_: return_id,
+                        // `async` has no return-type annotation grammar, and
+                        // this desugared closure is reached only through
+                        // `Expr::Async`, never `Expr::Closure` — S3's
+                        // return-position check (below) never sees it.
+                        return_type_id: None,
                     },
                 );
                 self.expr_id_to_expr_map
@@ -21687,6 +21739,7 @@ impl<'src> Analyzer<'src> {
                 let closure = self.closures.get(closure_id).unwrap();
                 let parameter_ids = closure.parameters.clone();
                 let return_expr_id = closure.return_;
+                let declared_return_type_id = closure.return_type_id;
                 // Bidirectional inference: when the expected type is a closure of
                 // matching arity, fill any unannotated (`Unknown`) parameter from
                 // it — so `|res|` passed where `|Res| void` is expected types
@@ -21727,6 +21780,110 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .map(|parameter_id| self.parameters.get(parameter_id).unwrap().type_id)
                     .collect::<Vec<_>>();
+
+                // S3 (editing-dx.md §3.9): when the closure's return type is
+                // KNOWN and GROUND ahead of the body — either its OWN
+                // annotation (rule 2 "directly", §3.4/P26) or the CONTEXT's
+                // expected closure type once every parameter already
+                // reconciles (P27's fallback: a parameter mismatch stays on
+                // the whole-value comparison below, since nothing narrower
+                // would be honest there) — check the body in RETURN POSITION
+                // instead of comparing the whole closure value.
+                // `target_return_type_id` stays `None` whenever the fully
+                // SUBSTITUTED target still carries an unbound generic
+                // anywhere in its structure (`Iterator::from_fn`'s
+                // `Option<T>`, `.map`'s `U`, P21): such a mismatch isn't
+                // detectable until the generic binds, one level out — the
+                // caller's OWN reconcile-and-bind (below, unchanged) is what
+                // binds it, and returning a lied-about type here would
+                // freeze it unbound instead of letting that happen (B19's
+                // family).
+                let mut target_return_type_id = match declared_return_type_id {
+                    Some(declared) => {
+                        let substituted =
+                            self.substitute_type(&declared.get_type(self), substitution_context);
+                        let substituted_id = substituted.get_type_id(self);
+                        self.type_is_ground(substituted_id)
+                            .then_some(substituted_id)
+                    }
+                    None => None,
+                };
+                if target_return_type_id.is_none()
+                    && let Type::Closure(expected_parameter_ids, expected_return_type_id) =
+                        &constraint
+                    && expected_parameter_ids.len() == parameter_type_ids.len()
+                {
+                    let expected_parameter_ids = expected_parameter_ids.clone();
+                    let substituted_expected_return = self.substitute_type(
+                        &expected_return_type_id.get_type(self),
+                        substitution_context,
+                    );
+                    let substituted_expected_return_id =
+                        substituted_expected_return.get_type_id(self);
+                    if self.type_is_ground(substituted_expected_return_id) {
+                        let mut every_parameter_reconciles = true;
+                        for (actual_type_id, expected_type_id) in
+                            parameter_type_ids.iter().zip(expected_parameter_ids.iter())
+                        {
+                            let actual_type = actual_type_id.get_type(self);
+                            let expected_type = expected_type_id.get_type(self);
+                            if self
+                                .reconcile_type(&actual_type, &expected_type, substitution_context)
+                                .is_none()
+                            {
+                                every_parameter_reconciles = false;
+                                break;
+                            }
+                        }
+                        if every_parameter_reconciles {
+                            target_return_type_id = Some(substituted_expected_return_id);
+                        }
+                    }
+                }
+
+                if let Some(target_return_type_id) = target_return_type_id
+                    && let Some((brace_span, tail_id, last_statement_id)) =
+                        self.closure_block_tail(return_expr_id)
+                {
+                    let target_return_type = target_return_type_id.get_type(self);
+                    match self.check_return_position(
+                        tail_id,
+                        &target_return_type,
+                        last_statement_id,
+                        substitution_context,
+                        exprs_seen,
+                    ) {
+                        ReturnPositionCheck::Unresolved => return Type::Unresolved,
+                        ReturnPositionCheck::Matched => {
+                            return Type::Closure(parameter_type_ids, target_return_type_id);
+                        }
+                        ReturnPositionCheck::Mismatched(msg) => {
+                            // `infer_type` has no memoization, so the same
+                            // closure can be re-inferred while the
+                            // enclosing constraint's OTHER inputs are still
+                            // pending — guard against re-reporting the
+                            // identical diagnostic (B5: one per root cause).
+                            if !self
+                                .diagnostics
+                                .iter()
+                                .any(|d| d.span == brace_span && d.msg == msg)
+                            {
+                                self.diagnostics.push(Error {
+                                    note: None,
+                                    span: brace_span,
+                                    msg,
+                                });
+                            }
+                            // The closure's reported TYPE is the target it
+                            // was held to, not the value it actually
+                            // produced: the mismatch is reported here, at
+                            // the body, not a second time at every place the
+                            // closure is compared as a whole value.
+                            return Type::Closure(parameter_type_ids, target_return_type_id);
+                        }
+                    }
+                }
+
                 let return_type = self.infer_type_inner(
                     return_expr_id,
                     &Type::Unknown,
@@ -23025,7 +23182,8 @@ impl<'src> Analyzer<'src> {
             Constraint::ReturnType {
                 body_id,
                 return_type_id,
-            } => self.resolve_return_type(*body_id, *return_type_id),
+                last_statement_id,
+            } => self.resolve_return_type(*body_id, *return_type_id, *last_statement_id),
             Constraint::TryAssert {
                 id,
                 receiver_id,
@@ -24825,33 +24983,186 @@ impl<'src> Analyzer<'src> {
         self.expected_types.insert(expr, type_id);
     }
 
-    fn resolve_return_type(&mut self, body_id: Id, return_type_id: TypeId) -> Resolution {
+    fn resolve_return_type(
+        &mut self,
+        body_id: Id,
+        return_type_id: TypeId,
+        last_statement_id: Option<Id>,
+    ) -> Resolution {
         if !self.expr_id_to_expr_map.contains_key(&body_id) {
             return Resolution::Deferred;
         }
         let return_type = return_type_id.get_type(self);
         let substitution_context = HashMap::default();
-        let body_type = self.infer_type(body_id, &return_type, &substitution_context);
+        match self.check_return_position(
+            body_id,
+            &return_type,
+            last_statement_id,
+            &substitution_context,
+            &mut HashSet::default(),
+        ) {
+            ReturnPositionCheck::Unresolved => return Resolution::Deferred,
+            ReturnPositionCheck::Matched => {}
+            ReturnPositionCheck::Mismatched(msg) => {
+                let span = **self.span_map.get(&body_id).unwrap_or(&&EMPTY_SPAN);
+                self.diagnostics.push(Error {
+                    note: None,
+                    span,
+                    msg,
+                });
+            }
+        }
+        Resolution::Resolved
+    }
+
+    /// Whether `type_id` is fully GROUND — no `Generic`, `Unknown`, or
+    /// `Unresolved` anywhere in its structure, recursively through every
+    /// type argument. S3's closure return-position check (below) only
+    /// treats a context's expected return type as a checkable TARGET when
+    /// it is ground: an abstract component (a still-unbound generic, e.g.
+    /// `Option<T>` in `Iterator::from_fn<T>`'s callback) can only be BOUND
+    /// from the body's actual type, and short-circuiting past the caller's
+    /// own reconcile-and-bind would freeze it unbound instead (I5/B19's
+    /// family — this is what `an_unannotated_next_that_yields_an_option_
+    /// stays_legal` and its neighbors pin against).
+    fn type_is_ground(&self, type_id: TypeId) -> bool {
+        match type_id.get_type(self) {
+            Type::Generic(_) | Type::Unknown | Type::Unresolved => false,
+            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+            Type::Closure(parameter_type_ids, return_type_id) => {
+                parameter_type_ids
+                    .iter()
+                    .all(|parameter_type_id| self.type_is_ground(*parameter_type_id))
+                    && self.type_is_ground(return_type_id)
+            }
+            Type::Enum(_, argument_type_ids)
+            | Type::Struct(_, argument_type_ids)
+            | Type::Trait(_, argument_type_ids)
+            | Type::Tuple(argument_type_ids) => argument_type_ids
+                .iter()
+                .all(|argument_type_id| self.type_is_ground(*argument_type_id)),
+            Type::Array(element_type_id, _) => self.type_is_ground(element_type_id),
+            Type::Mapped(_, source_type_id, template_type_id) => {
+                self.type_is_ground(source_type_id) && self.type_is_ground(template_type_id)
+            }
+        }
+    }
+
+    /// Checks `body_id` — a function or closure's TAIL, or a `ret`'s value —
+    /// against `target_return_type` (proposal/ret-checking.md rule 2), shared
+    /// by named functions (`resolve_return_type`) and, since S3
+    /// (editing-dx.md §3.9), closures whose expected return type is known
+    /// ahead of the body (`infer_type_path`'s `Expr::Closure` arm). Threads
+    /// `exprs_seen` through rather than starting a fresh cycle guard, since
+    /// the closure call site is already inside one.
+    fn check_return_position(
+        &mut self,
+        body_id: Id,
+        target_return_type: &Type,
+        last_statement_id: Option<Id>,
+        substitution_context: &SubstitutionContext,
+        exprs_seen: &mut HashSet<Id>,
+    ) -> ReturnPositionCheck {
+        let body_type = self.infer_type_inner(
+            body_id,
+            target_return_type,
+            substitution_context,
+            exprs_seen,
+        );
         if matches!(body_type, Type::Unresolved) {
-            return Resolution::Deferred;
+            return ReturnPositionCheck::Unresolved;
         }
         // The checking half (proposal/ret-checking.md): the value must reconcile
         // with the declared type — the same unification the let-annotation check
         // uses, so a generic return binds rather than mismatching. Without this,
         // return position directed inference but never verified it.
         if self
-            .reconcile_type(&body_type, &return_type, &substitution_context)
-            .is_none()
+            .reconcile_type(&body_type, target_return_type, substitution_context)
+            .is_some()
         {
-            let expected = self.pretty_print_type(&return_type, &substitution_context);
-            let got = self.pretty_print_type(&body_type, &substitution_context);
-            self.diagnostics.push(Error {
-                note: None,
-                span: **self.span_map.get(&body_id).unwrap_or(&&EMPTY_SPAN),
-                msg: format!("Expected {}, but got {} instead.", expected, got),
-            });
+            return ReturnPositionCheck::Matched;
         }
-        Resolution::Resolved
+        // S3 (editing-dx.md §3.6-3.7): a body that ends WITHOUT PRODUCING A
+        // VALUE is a distinct mistake from an ordinary type mismatch — the
+        // parser's synthesized `Expr::Void` tail is the marker (nothing else
+        // manufactures one at this span): a REAL void-typed tail (an `if`
+        // with no `else`, a void call) is a genuine value the body produced
+        // and stays on the plain message, already A1-anchored at its own
+        // span (§3.3, left alone — no refinement here).
+        let msg = if matches!(self.expr_id_to_expr_map.get(&body_id), Some(Expr::Void)) {
+            self.missing_return_value_message(
+                last_statement_id,
+                target_return_type,
+                substitution_context,
+            )
+        } else {
+            let expected = self.pretty_print_type(target_return_type, substitution_context);
+            let got = self.pretty_print_type(&body_type, substitution_context);
+            format!("Expected {}, but got {} instead.", expected, got)
+        };
+        ReturnPositionCheck::Mismatched(msg)
+    }
+
+    /// S3 (editing-dx.md §3.7): the message for a body that ends without
+    /// producing a value, once the caller has already established the tail is
+    /// the parser's synthesized `Expr::Void`. Regime 1' — "the `;` discards
+    /// this body's last value" — applies when the block has a last STATEMENT
+    /// that, had it been the tail instead, would itself have reconciled with
+    /// `return_type`; `Type::Void`/`Never` (a genuinely void statement, or a
+    /// diverging one like a bare `ret` — never the fix), a DECLARATION
+    /// (`self.variables` — a `let`'s own id types as the BINDING, e.g. `i32`
+    /// for `let sum: i32 = ..;`, which reconciles by coincidence, not
+    /// because removing the `;` would make it the tail — `let` isn't an
+    /// expression), and an unresolved type all fall back to the general
+    /// regime 1 wording, never a guess.
+    fn missing_return_value_message(
+        &mut self,
+        last_statement_id: Option<Id>,
+        return_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> String {
+        let return_type_rendered = self.pretty_print_type(return_type, substitution_context);
+        let mut discards_a_real_value = false;
+        if let Some(id) = last_statement_id
+            && !self.variables.contains_key(&id)
+        {
+            let statement_type = self.infer_type(id, &Type::Unknown, substitution_context);
+            discards_a_real_value = !matches!(
+                statement_type,
+                Type::Unresolved | Type::Unknown | Type::Void | Type::Never
+            ) && self
+                .reconcile_type(&statement_type, return_type, substitution_context)
+                .is_some();
+        }
+        if discards_a_real_value {
+            format!(
+                "Expected {return_type_rendered}, but got void instead: the `;` discards this body's last value."
+            )
+        } else {
+            format!(
+                "Expected {return_type_rendered}, but got void instead: this body ends without producing a value."
+            )
+        }
+    }
+
+    /// The braced-block form of a closure body (`|x| { .. }`, as opposed to
+    /// the bare-expression form `|x| x + 1`, which has no closing brace to
+    /// anchor at): the block's own span (whose LAST byte, after S3's parser
+    /// fix, is exactly the closing `}`), its tail's id, and — mirroring the
+    /// named-function walk — its last STATEMENT's id for the regime-1/1'
+    /// distinction.
+    fn closure_block_tail(&self, return_expr_id: Id) -> Option<(Span, Id, Option<Id>)> {
+        let Expr::Block((statement_ids, tail_id)) =
+            self.expr_id_to_expr_map.get(&return_expr_id)?
+        else {
+            return None;
+        };
+        let block_span = **self.span_map.get(&return_expr_id)?;
+        let brace_span = Span {
+            start: block_span.end.saturating_sub(1),
+            end: block_span.end,
+        };
+        Some((brace_span, *tail_id, statement_ids.last().copied()))
     }
 
     /// `a?.b.c` (proposal/try-and-lift.md §3): once the subject resolves, the

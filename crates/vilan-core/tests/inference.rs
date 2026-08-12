@@ -11211,6 +11211,278 @@ fn ret_with_a_value_in_an_undeclared_void_function_is_allowed() {
     );
 }
 
+// --- S3: the missing return value re-anchored (editing-dx.md §3) ----------
+// The known-bad shape the charter named first: a missing return value used
+// to underline the WHOLE closure (or, worse, the whole call) rather than the
+// gap. Three regimes, per §3.2-§3.4; pins below are named after the paper's
+// probes (P21-P28).
+
+// P22 — regime 1: a named function whose body ends in a non-expression
+// statement (here a `let`) has NO tail to anchor at all. Old behavior: a
+// zero-width point one byte PAST the closing brace (invisible in an editor,
+// §3.2). New: the closing brace itself, one character wide.
+#[test]
+fn missing_return_value_regime_1_anchors_the_closing_brace() {
+    assert_fails_spanning(
+        r#"
+        fun total(a: i32, b: i32): i32 {
+        	let sum: i32 = a + b;
+        }
+
+        fun main() {
+        	total(1, 2);
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
+
+// Regime 1' for a NAMED function (not one of the paper's own probes — P24's
+// closure shape is the paper's example, but the same statement-based
+// distinction applies to a plain function body, and CLAUDE.md's "per case,
+// not per example" wants the edge covered directly): the last statement IS
+// an expression whose value would satisfy the return type, discarded only by
+// its trailing `;` — the sharper, actionable message.
+#[test]
+fn missing_return_value_regime_1_prime_named_function_names_the_semicolon() {
+    assert_fails_spanning(
+        r#"
+        fun total(a: i32, b: i32): i32 {
+        	a + b;
+        }
+
+        fun main() {
+        	total(1, 2);
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// A last statement that reconciles by NAME-COINCIDENCE only, not because
+// removing its `;` would make it the tail: `let` is a declaration, not an
+// expression, even though its own type (i32) happens to match the return
+// type. Regression guard for the bug this shape reproduced during
+// development (a bare `self.variables` miss let a `let`'s binding type stand
+// in for "the last statement's value").
+#[test]
+fn a_declaration_as_the_last_statement_does_not_trigger_regime_1_prime() {
+    assert_fails_with(
+        r#"
+        fun total(a: i32, b: i32): i32 {
+        	let sum: i32 = a + b;
+        }
+
+        fun main() {
+        	total(1, 2);
+        }
+        "#,
+        "this body ends without producing a value.",
+    );
+}
+
+// P25 — regime 2: an `if` with no `else` in tail position is a REAL
+// expression (not the parser's synthesized `Void`), so its span is already
+// A1-compliant — correct anchor, `if`-no-`else` refinement not built in this
+// slice (editing-dx.md §3.6's "one refinement", not required for A1).
+// Regression guard: confirms the unrefined shape is untouched by S3's other
+// changes.
+#[test]
+fn missing_return_value_regime_2_if_with_no_else_is_unchanged() {
+    assert_fails_with(
+        r#"
+        fun classify(n: i32): str {
+        	if n > 0 {
+        		"positive"
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead.",
+    );
+}
+
+// P23 — regime 3, unannotated closure bound to an annotated `let`: the
+// closure's OWN parameters need no annotation (`|value|`, filled by
+// bidirectional inference from `|i32| i32`); once they reconcile, the body
+// checks in RETURN POSITION against the annotation's return half instead of
+// the whole closure value being compared at the `let` — the closing BRACE,
+// not the closure's `|params| { .. }` span, `points.map(..)`'s whole call,
+// or anything else upstream.
+#[test]
+fn missing_return_value_regime_3_context_closure_anchors_its_own_brace() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	let scale: |i32| i32 = |value| {
+        		let doubled: i32 = value * 2;
+        	};
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
+
+// P24 — the one-line spelling of the same shape: the whole mistake is one
+// character (`;`), and the message now names it. Old behavior: 22 characters
+// underlined (the whole closure) to ask for one to be deleted.
+#[test]
+fn missing_return_value_regime_3_context_closure_one_liner_names_the_semicolon() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	let scale: |i32| i32 = |value| { value * 2; };
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// P26 — the root-cause probe: a closure's OWN return-type annotation
+// (`: i32`) used to be parsed, re-printed by the formatter, and completely
+// ignored by type checking (`Closure::return_type` had no analyzer reader at
+// all). It now gets rule 2 "directly" — the same return-position check a
+// named function's declared return type gets — independent of any
+// surrounding context.
+#[test]
+fn missing_return_value_regime_3_annotated_closure_is_newly_checked() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let scale: |i32| i32 = |value: i32|: i32 { print(value); };
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
+
+// An annotated closure whose body actually satisfies its OWN declared
+// return type compiles clean — the new check is additive, not a false
+// positive on the common case.
+#[test]
+fn an_annotated_closure_whose_body_satisfies_its_own_return_type_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let scale: |i32| i32 = |value: i32|: i32 { value * 2 };
+        	print(scale(5));
+        }
+        "#,
+        "10\n",
+    );
+}
+
+// P27 — the contrast that bounds the fix: when the PARAMETER type is what
+// differs (not the return type), the whole-closure anchor is correct and
+// stays untouched — nothing narrower would be honest about a closure that,
+// as written, is the wrong VALUE.
+#[test]
+fn missing_return_value_regime_3_parameter_mismatch_keeps_the_whole_value_anchor() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	let scale: |i32| i32 = |value: str| { 1 };
+        }
+        "#,
+        "|value: str| { 1 }",
+        "Expected |i32| i32, but got |str| i32 instead.",
+    );
+}
+
+// P21 — KNOWN, NOT FIXED by this slice: the closure's void return
+// propagates through a GENERIC binding (`map<U>`'s `U`) before the mismatch
+// surfaces, one level out, on the initializer — a different, harder
+// mechanism (tracing the root cause back through generic instantiation)
+// than the direct context-return-type case P23/P24 cover. `type_is_ground`
+// deliberately declines to route a still-abstract target through the new
+// check (I5/B19's family — see its own doc comment), which is what leaves
+// this one on today's path.
+#[test]
+#[ignore = "S3 residue (editing-dx.md P21): the closure's void return reaches List<void> \
+            through a generic binding before it mismatches, one level out — the new \
+            return-position check only fires when the expected return type is fully \
+            ground, so this stays on the whole-call anchor. Un-ignore once generic-return \
+            provenance tracing ships."]
+fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| {
+        		point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// P28 — a B5 violation NOT closed by this slice: a bare `ret` in a
+// value-returning function still reports the same root cause twice (once at
+// the `ret`, once at the synthesized void tail after it) — S3's parser fix
+// (editing-dx.md §3.9) makes BOTH anchors correct and visible where the tail
+// one used to be an invisible zero-width point; it does not deduplicate
+// them. Pinned as today's true (still-doubled) behavior, not ignored, since
+// nothing here is wrong on its own — §12 files the count as owed and unmet.
+#[test]
+fn a_bare_ret_still_duplicates_the_synthesized_tail_diagnostic() {
+    let source = r#"
+        fun total(a: i32): i32 {
+        	ret;
+        }
+
+        fun main() {
+        	total(1);
+        }
+        "#;
+    let diagnostics = failure_diagnostics(source);
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _)| {
+            message
+                == "Expected i32, but got void instead: this body ends without producing a value."
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        2,
+        "expected the known B5 duplicate (one at `ret`, one at the tail); got: {diagnostics:#?}"
+    );
+    let ret_span = source.find("ret").map(|start| start..start + "ret".len());
+    let brace_span = source.find('}').map(|start| start..start + 1);
+    assert!(
+        matching
+            .iter()
+            .any(|(_, range)| Some(range.clone()) == ret_span),
+        "expected one diagnostic at `ret`; got: {matching:#?}"
+    );
+    assert!(
+        matching
+            .iter()
+            .any(|(_, range)| Some(range.clone()) == brace_span),
+        "expected one diagnostic at the closing brace; got: {matching:#?}"
+    );
+}
+
 // A generic return type checks `ret` by unification, exactly like the tail.
 #[test]
 fn generic_return_rets_bind_like_the_tail() {
