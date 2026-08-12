@@ -222,6 +222,10 @@ Nothing that was already complete changes: `_` and a binder still cover everythi
 
 ---
 
+**Two more diagnostics now offer a quick fix: a missing `;`, and the `;` that silently discarded a return value.** Both steers already existed as message text; the editor now offers to apply them directly. "Expected `;` to end this statement" gets an "Insert `;`" action at exactly the gap the diagnostic points at. "...the `;` discards this body's last value" — a function or closure whose last statement would satisfy the declared return type if its trailing `;` weren't there — gets a "Remove `;`" action, which finds the right `;` from the same bookkeeping the diagnostic itself used, not by guessing backward from the closing brace; a comment sitting between the statement and its `;` (an unusual shape) is left alone rather than risking a wrong edit.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.

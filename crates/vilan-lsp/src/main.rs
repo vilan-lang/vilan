@@ -2795,6 +2795,116 @@ mod snapshot_consistency_tests {
         assert_eq!(edits[0].new_text, "entries");
     }
 
+    // E61/S2, end to end (editing-dx.md §17.4): the parser's own gap-anchored
+    // "expected `;` to end this statement" diagnostic becomes a QUICKFIX that
+    // inserts exactly `;` at the gap — a zero-width edit right after the
+    // token the `;` was missing from.
+    #[tokio::test]
+    async fn quickfix_inserts_a_missing_semicolon_through_the_real_handler() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (_dir, document) = crate::document::tests::analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet x: i32 = 1\n\tx;\n}\n",
+        )]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("a quickfix is offered");
+        assert_eq!(response.len(), 1, "{response:#?}");
+        let CodeActionOrCommand::CodeAction(action) = &response[0] else {
+            panic!("expected a CodeAction, got {:?}", response[0]);
+        };
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        assert_eq!(action.title, "Insert `;`");
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("an edit for this file");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ";");
+        assert_eq!(
+            edits[0].range.start, edits[0].range.end,
+            "a zero-width insertion, not a replacement"
+        );
+        // Right after the `1` that ends `let x: i32 = 1` (line 1, 0-based) —
+        // the gap `gap_span` anchors, not the head of the next statement.
+        assert_eq!(edits[0].range.start, Position::new(1, 15));
+    }
+
+    // E61/S3-residual, end to end (editing-dx.md §17.4): regime 1's `;`
+    // discards a value" diagnostic — anchored at the callable's closing
+    // BRACE, not the `;` itself — becomes a QUICKFIX that removes exactly
+    // the `;` it names, located from the program's own last-statement
+    // bookkeeping rather than the diagnostic's own span.
+    #[tokio::test]
+    async fn quickfix_removes_a_discarding_semicolon_through_the_real_handler() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (_dir, document) = crate::document::tests::analyze_workspace(&[(
+            "main.vl",
+            "fun total(a: i32, b: i32): i32 {\n\ta + b;\n}\n\nfun main() {\n\ttotal(1, 2);\n}\n",
+        )]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("a quickfix is offered");
+        assert_eq!(response.len(), 1, "{response:#?}");
+        let CodeActionOrCommand::CodeAction(action) = &response[0] else {
+            panic!("expected a CodeAction, got {:?}", response[0]);
+        };
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        assert_eq!(action.title, "Remove `;`");
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("an edit for this file");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "");
+        // The `;` right after `a + b` (line 1, 0-based) — not the closing
+        // brace the diagnostic itself anchors at.
+        assert_eq!(edits[0].range.start, Position::new(1, 6));
+        assert_eq!(edits[0].range.end, Position::new(1, 7));
+    }
+
+    // The `;`-locating scan's own edge case: something OTHER than whitespace
+    // between the last statement and its `;` (a `//` comment, here) makes it
+    // DECLINE rather than guess past it — the diagnostic still fires
+    // (unaffected — this is a fix-offering question, not a diagnostic one),
+    // but no quickfix is offered for it (B4: no fix beats a wrong one).
+    #[tokio::test]
+    async fn no_remove_semicolon_quickfix_is_offered_when_a_comment_sits_in_the_gap() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (_dir, document) = crate::document::tests::analyze_workspace(&[(
+            "main.vl",
+            "fun total(a: i32, b: i32): i32 {\n\ta + b // trailing comment\n\t;\n}\n\nfun main() {\n\ttotal(1, 2);\n}\n",
+        )]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let response = backend.code_action(params).await.expect("not stale");
+        assert!(
+            response.is_none(),
+            "expected no quickfix offered when a comment sits in the gap; got {response:#?}"
+        );
+    }
+
     // S1/S3: read-only queries never refuse — they answer
     // correctly-for-the-snapshot. Semantic tokens over a stale buffer come back
     // byte-identical to the pre-edit answer, which is what stops the
