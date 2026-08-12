@@ -393,6 +393,11 @@ pub struct AutoImport {
     pub module_path: Vec<String>,
     pub edit_span: Span,
     pub edit_replacement: String,
+    /// This candidate's auto-import ranking tier (E59, [`import_origin_tier`]),
+    /// carried through so the server (`main::to_completion_item`) can bucket
+    /// the client-visible `sort_text` by it without re-deriving it from
+    /// `module_path` — one computation, read in two places.
+    pub origin_tier: u8,
 }
 
 impl Completion {
@@ -3434,16 +3439,36 @@ impl Document {
     /// Dependency packages are not scanned here — reaching them the way
     /// [`Self::import_candidates`] does is a disk-bound full-origin scan, fine
     /// for an on-demand quickfix but too slow to pay on every keystroke.
-    /// Sorted alphabetically and capped at [`AUTO_IMPORT_COMPLETION_CAP`] so a
-    /// std-heavy file's loaded surface cannot flood the popup — candidates
-    /// beyond the cap are the ones that would sort last, not a `Program`
-    /// hash-order artifact.
+    ///
+    /// **Position-aware filtering, declined (E59):** the caller (`completion`)
+    /// reaches this function from one branch only — no preceding `.` or `::`
+    /// — used identically for a bare value expression and a bare type
+    /// annotation; neither it nor this function is told which. Telling them
+    /// apart is not a read of data some earlier pass already computed (the
+    /// analyzed `Program`'s own `type_references` only covers RESOLVED code,
+    /// not the very position being typed); it is new syntactic analysis —
+    /// scanning back past whatever sits before the cursor to find the
+    /// enclosing form (`let x: |`, `fun f(): |`, `List<|>`, `x as |`, a
+    /// struct field type, …), each a different shape, unlike
+    /// [`in_import_path`]'s single-line anchor. Declined here; recorded as
+    /// E59's residual.
+    ///
+    /// Ranked by [`import_origin_tier`] (E59), THEN alphabetically within a
+    /// tier, and capped at [`AUTO_IMPORT_COMPLETION_CAP`] — applied in that
+    /// order, before the truncation, which is the point: a plain alphabetical
+    /// sort let the always-loaded `std` prelude's capitalized trait/type names
+    /// (`Add`, `BitAnd`, …) fill the whole cap ahead of a small real file's
+    /// own unimported names, which sort no higher than any other lowercase
+    /// identifier. Tiering the user's own `pkg` ahead of `std` means the
+    /// cap's last-to-survive candidates are always `std`'s, never `pkg`'s —
+    /// a std-heavy file's loaded surface still cannot flood the popup, and
+    /// now `std` only spends slots `pkg` didn't need.
     fn auto_import_completions(
         &self,
         program: &Program,
         in_scope: &HashSet<&str>,
     ) -> Vec<Completion> {
-        let mut candidates: Vec<(String, CompletionKind, Vec<String>)> = Vec::new();
+        let mut candidates: Vec<(u8, String, CompletionKind, Vec<String>)> = Vec::new();
         for root in ["std", "pkg"] {
             let Some(&root_module_id) = program.module_id_by_name.get(root) else {
                 continue;
@@ -3454,6 +3479,7 @@ impl Document {
             let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
                 continue;
             };
+            let tier = import_origin_tier(root);
             for &child_id in root_scope.name_to_id_map.values() {
                 let Some(child_module) = program.modules.get(&child_id) else {
                     continue;
@@ -3477,6 +3503,7 @@ impl Document {
                         continue;
                     }
                     candidates.push((
+                        tier,
                         name.to_string(),
                         kind,
                         vec![root.to_string(), child_module.name.to_string()],
@@ -3484,12 +3511,12 @@ impl Document {
                 }
             }
         }
-        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         candidates.truncate(AUTO_IMPORT_COMPLETION_CAP);
         let source = self.line_index.text();
         candidates
             .into_iter()
-            .filter_map(|(name, kind, module_path)| {
+            .filter_map(|(tier, name, kind, module_path)| {
                 let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
                 let edit = vilan_core::formatter::insert_import(source, &path_refs, &name)?;
                 Some(Completion {
@@ -3503,6 +3530,7 @@ impl Document {
                         module_path,
                         edit_span: edit.span,
                         edit_replacement: edit.replacement,
+                        origin_tier: tier,
                     }),
                 })
             })
@@ -3709,7 +3737,42 @@ fn is_identifier_byte(byte: u8) -> bool {
 /// std-heavy file can have a large loaded surface, and this is what keeps a
 /// bare scope completion from drowning the popup in auto-import candidates
 /// beneath the names actually in scope.
+///
+/// Kept at 20 by E59: the filing that found the flood was explicit that the
+/// cap's SIZE was never the bug — a popup already offers 20 auto-import
+/// candidates beneath the in-scope ones, plenty for a human to scan, and
+/// [`import_origin_tier`] fixes which 20 those are. No evidence turned up
+/// that a real file needs more of its own names surfaced at once than this;
+/// raising it would only hand `std` back more of the slots `pkg` still
+/// doesn't need.
 const AUTO_IMPORT_COMPLETION_CAP: usize = 20;
+
+/// An auto-import candidate's ranking tier by where it comes from (E59): the
+/// user's own package (`pkg`) outranks the standard library (`std`) — a real
+/// file's own unimported names are a far likelier completion target than the
+/// always-loaded prelude's surface, which used to fill the whole cap first
+/// purely because its capitalized trait/type names (`Add`, `BitAnd`, …) sort
+/// ahead of an ordinary lowercase identifier in bare alphabetical order. Used
+/// both pre-truncation ([`Document::auto_import_completions`]'s sort) and in
+/// the client-visible `sort_text` (`main::to_completion_item`, via
+/// [`AutoImport::origin_tier`]) — the one mapping, read in both places.
+///
+/// Tier 1 is reserved for a dependency package's names, ranked between the
+/// two: closer to the user's intent than `std`'s always-loaded surface (the
+/// user chose to add the dependency), but not the user's own authored code.
+/// It is unreachable today — `auto_import_completions` only ever calls this
+/// with `"std"` or `"pkg"`, since E54 scoped this keystroke-path candidate
+/// gathering to those two roots (a dependency scan is the disk-bound
+/// full-origin one `Document::import_candidates` pays for the on-demand
+/// quickfix, not this path) — recorded here for whenever that changes rather
+/// than left for a future tier scheme to rediscover.
+fn import_origin_tier(root: &str) -> u8 {
+    match root {
+        "pkg" => 0,
+        "std" => 2,
+        _ => 1,
+    }
+}
 
 /// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
 /// `(span, replacement)` this document's own text needs — LIVE space, same
@@ -4056,6 +4119,8 @@ pub(crate) mod tests {
     }
 
     // --- E54/E58: the quickfix home, add-import, auto-import completion ------
+    // (E59 adds the pkg-above-std ordering the cap truncates by — see
+    // `import_origin_tier` and `auto_import_completions`'s doc.)
 
     // A single unambiguous candidate: one quickfix, titled with its module,
     // whose edit — applied and re-analyzed — actually resolves the name.
@@ -4242,32 +4307,33 @@ pub(crate) mod tests {
     // sibling name from it is imported) is offered at a bare scope position,
     // labeled with its module and carrying the brace-set-extension edit.
     //
-    // The fixture's names are `AAA_`-prefixed on purpose: real std is
-    // analyzed alongside this tiny fixture (the LSP always loads it), and its
-    // OWN loaded prelude modules contribute plenty of unimported candidates
-    // of their own — capitalized type/trait names that, in default string
-    // order, sort before any ordinary lowercase identifier. Without forcing
-    // this fixture's names to sort first, `AUTO_IMPORT_COMPLETION_CAP` would
-    // be spent entirely on std's surface before ever reaching this file's
-    // own candidates, and the assertions below would test std's names by
-    // accident instead of this fixture's.
+    // Natural, unprefixed names on purpose (E59): real std is analyzed
+    // alongside this tiny fixture (the LSP always loads it), and its OWN
+    // loaded prelude modules contribute plenty of unimported candidates of
+    // their own — capitalized type/trait names (`Add`, `BitAnd`, …) that, in
+    // bare alphabetical order, sort ahead of an ordinary lowercase
+    // identifier like `farewell`. Before E59's `pkg`-above-`std` tiering,
+    // this test needed its names `AAA_`-prefixed to survive
+    // `AUTO_IMPORT_COMPLETION_CAP` at all; the tiering makes that
+    // unnecessary — a `pkg` candidate now outranks every `std` one
+    // regardless of its label, so the plain name proves the natural case.
     #[test]
     fn auto_import_completion_offers_a_labeled_edit_carrying_sibling_from_an_already_loaded_module()
     {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import pkg::helper::AAA_greet;\n\nfun main() {\n\tAAA_greet();\n\t\n}\n",
+                "import pkg::helper::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
             ),
-            ("helper.vl", "fun AAA_greet() {}\n\nfun AAA_farewell() {}\n"),
+            ("helper.vl", "fun greet() {}\n\nfun farewell() {}\n"),
         ]);
-        let marker = "AAA_greet();\n\t";
+        let marker = "greet();\n\t";
         let text = document.line_index.text();
         let offset = text.find(marker).unwrap() + marker.len();
         let candidates = document.completion(offset);
         let farewell = candidates
             .iter()
-            .find(|candidate| candidate.label == "AAA_farewell")
+            .find(|candidate| candidate.label == "farewell")
             .expect("an unimported sibling in an already-loaded module is offered");
         let auto_import = farewell
             .needs_import
@@ -4277,32 +4343,32 @@ pub(crate) mod tests {
             auto_import.module_path,
             vec!["pkg".to_string(), "helper".to_string()]
         );
-        // `helper` is already imported (bare `AAA_greet`): the edit EXTENDS
-        // it into a two-member set rather than inserting a new line.
-        assert_eq!(auto_import.edit_replacement, "{ AAA_farewell, AAA_greet }");
+        // `helper` is already imported (bare `greet`): the edit EXTENDS it
+        // into a two-member set rather than inserting a new line.
+        assert_eq!(auto_import.edit_replacement, "{ farewell, greet }");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A name already offered from SCOPE is never duplicated as an auto-import
     // candidate — the in-scope one is the only match on the menu. (Same
-    // `AAA_`-prefix reasoning as above.)
+    // natural-name reasoning as above — E59.)
     #[test]
     fn a_name_already_in_scope_is_not_offered_as_an_auto_import_candidate() {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import pkg::helper::AAA_greet;\n\nfun AAA_farewell() {}\n\n\
-                 fun main() {\n\tAAA_greet();\n\t\n}\n",
+                "import pkg::helper::greet;\n\nfun farewell() {}\n\n\
+                 fun main() {\n\tgreet();\n\t\n}\n",
             ),
-            ("helper.vl", "fun AAA_greet() {}\n\nfun AAA_farewell() {}\n"),
+            ("helper.vl", "fun greet() {}\n\nfun farewell() {}\n"),
         ]);
-        let marker = "AAA_greet();\n\t";
+        let marker = "greet();\n\t";
         let text = document.line_index.text();
         let offset = text.find(marker).unwrap() + marker.len();
         let candidates = document.completion(offset);
         let farewells: Vec<_> = candidates
             .iter()
-            .filter(|candidate| candidate.label == "AAA_farewell")
+            .filter(|candidate| candidate.label == "farewell")
             .collect();
         assert_eq!(
             farewells.len(),
@@ -4315,22 +4381,23 @@ pub(crate) mod tests {
 
     // E54c's cap: a module with many unimported siblings doesn't flood the
     // popup — the count never exceeds `AUTO_IMPORT_COMPLETION_CAP`, though at
-    // least one still comes through. `AAA`-prefixed names (see above) so this
-    // fixture's own 29 unimported candidates are what compete for the cap's
-    // 20 slots, not std's much larger loaded surface.
+    // least one still comes through. Natural, unprefixed names (E59, see
+    // above) so this fixture's own 30 unimported candidates are what compete
+    // for the cap's 20 slots, not std's much larger loaded surface — proven
+    // by `origin_tier`, not by out-sorting std alphabetically.
     #[test]
     fn auto_import_completions_are_capped() {
         let many_functions: String = (0..30)
-            .map(|index| format!("fun AAA{index:02}() {{}}\n"))
+            .map(|index| format!("fun sibling{index:02}() {{}}\n"))
             .collect();
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import pkg::helper::AAA00;\n\nfun main() {\n\tAAA00();\n\t\n}\n",
+                "import pkg::helper::sibling00;\n\nfun main() {\n\tsibling00();\n\t\n}\n",
             ),
             ("helper.vl", &many_functions),
         ]);
-        let marker = "AAA00();\n\t";
+        let marker = "sibling00();\n\t";
         let text = document.line_index.text();
         let offset = text.find(marker).unwrap() + marker.len();
         let candidates = document.completion(offset);
@@ -4347,7 +4414,7 @@ pub(crate) mod tests {
         assert!(
             auto_import_labels
                 .iter()
-                .all(|label| label.starts_with("AAA")),
+                .all(|label| label.starts_with("sibling")),
             "expected the fixture's own 29 unimported siblings to fill the \
              cap, not std's: {auto_import_labels:?}"
         );
@@ -4355,6 +4422,56 @@ pub(crate) mod tests {
             auto_import_labels.len(),
             AUTO_IMPORT_COMPLETION_CAP,
             "29 candidates over a cap of {AUTO_IMPORT_COMPLETION_CAP} should saturate it: {auto_import_labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E59: the pin proving the filing's own case — a small real file's own
+    // pkg name (alphabetically LAST among its siblings, deliberately named
+    // to lose against std's capitalized prelude in bare string order) still
+    // appears, ahead of every std candidate, because `pkg` outranks `std` by
+    // tier rather than by label. Plant-proof: reverting `import_origin_tier`
+    // to return the same tier for every root turns this red (`zzz_local` is
+    // squeezed out by std's >20 capitalized prelude names before the sort
+    // ever reaches it) — restored after confirming it.
+    #[test]
+    fn a_pkg_name_that_loses_alphabetically_still_outranks_stds_surface() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::anchor;\n\nfun main() {\n\tanchor();\n\t\n}\n",
+            ),
+            ("helper.vl", "fun anchor() {}\n\nfun zzz_local() {}\n"),
+        ]);
+        let marker = "anchor();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let local = candidates
+            .iter()
+            .find(|candidate| candidate.label == "zzz_local")
+            .expect(
+                "a pkg name must survive the cap even when it sorts after \
+                 std's entire loaded surface alphabetically",
+            );
+        assert_eq!(
+            local
+                .needs_import
+                .as_ref()
+                .expect("labeled with the import it needs")
+                .origin_tier,
+            0,
+            "pkg is tier 0"
+        );
+        let std_present = candidates.iter().any(|candidate| {
+            candidate.needs_import.as_ref().is_some_and(|auto_import| {
+                auto_import.module_path.first().map(String::as_str) == Some("std")
+            })
+        });
+        assert!(
+            std_present,
+            "the pkg tier (2 names) doesn't come close to filling the cap, \
+             so std candidates still appear behind them"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
