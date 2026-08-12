@@ -96,6 +96,24 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
+        "mount_target",
+        Side::BrowserOnly,
+        "A24 (fullstack-dx.md §9.5): the lookup `mount`/`mount_root` share, \
+         failing loud and naming the id instead of leaving `element.clear()` to \
+         throw a bare null-dereference. It exists only to guard THEM — see their \
+         own entries above — and the process twin calls `get_element_by_id` \
+         nowhere at all.",
+    ),
+    (
+        "ui",
+        "is_null",
+        Side::BrowserOnly,
+        "With `mount_target`: the one host-null peek its guard needs. Same \
+         reasoning as `mount_target` above — nothing to guard on the process \
+         side.",
+    ),
+    (
+        "ui",
         "is_svg_tag",
         Side::BrowserOnly,
         "A private helper, not a surface: the browser routes SVG tags through \

@@ -1433,8 +1433,13 @@ without knowing anything about the build.
 shared lookup now panics `mount: no element with id '{id}'` when
 `get_element_by_id` comes back JS `null`; `get_element_by_id`'s own signature
 is untouched (a real `Option<Element>` return stays a separate, wider API
-question, deliberately not taken here). Happy-path bytes unchanged — verified
-against the corpus goldens (zero movement).
+question, deliberately not taken here). The `vilan/test` corpus goldens are
+zero movement (none of them call `mount`/`mount_root`); the ONE golden that
+does — `crates/vilan-cli/tests/split`'s pinned fixture, whose `app.vl` calls
+`mount_root` — legitimately grew the new guard's few lines and was
+regenerated after a byte-diff review (the three route chunks and the
+manifest stayed untouched, matching splitting's own "moves route-exclusive
+code and nothing else" rule).
 
 ## 10. Open questions — the owner's to rule
 
