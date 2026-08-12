@@ -65,13 +65,25 @@ fn vilan_run_with_liveness_bound(dir: &Path) -> String {
     let unexpected: Vec<&str> = stderr
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !is_node_windows_teardown_noise(line))
         .collect();
     assert!(
         unexpected.is_empty(),
         "vilan run wrote to stderr:\n{stderr}\nstdout:\n{stdout}"
     );
     stdout
+}
+
+/// Windows only: node's own shutdown race, not output from the program —
+/// `uv_async_send` aborting on a closing handle during exit teardown
+/// (nodejs/node#56645 / #58091; `rpc_http.rs` documents the mechanism and
+/// this exact tolerance). The abort lands strictly AFTER the program's
+/// complete stdout, which every caller here asserts on; exactly this
+/// assertion line is tolerated, and anything else on stderr still fails.
+fn is_node_windows_teardown_noise(line: &str) -> bool {
+    cfg!(windows)
+        && line.starts_with("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)")
+        && line.contains("async.c")
 }
 
 /// A long-running server, spawned with `node` directly against a built bundle
