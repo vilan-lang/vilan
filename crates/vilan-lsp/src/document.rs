@@ -7567,9 +7567,9 @@ pub(crate) mod tests {
     // broken region and parsing continues, so the items above AND below the
     // error all survive. `let x = ;` is the syntax error; nothing else is wrong.
     const RECOVERABLE_INBODY: &str = "struct Widget { size: i32 }\n\nfun above(w: Widget): i32 {\n\tw.size\n}\n\nfun broken() {\n\tlet x = ;\n}\n\nfun below(): i32 {\n\thelper()\n}\n\nfun helper(): i32 {\n\t7\n}\n";
-    // A stray token at file scope: the top-level statement loop declines and
-    // stops, so only the PREFIX (everything before the token) is salvaged; the
-    // tail after it is not recovered. This is the other salvage regime.
+    // A stray token at file scope: the top-level statement loop reports it and
+    // synchronizes to the next item keyword (`editing-dx.md` S1), so the prefix
+    // AND the tail are salvaged. This is the other salvage regime.
     const RECOVERABLE_TOPLEVEL: &str =
         "fun above(): i32 {\n\t42\n}\n\n$ garbage here $\n\nfun below(): i32 {\n\t7\n}\n";
     // A clean parse with an analyzer error in the middle (`no_such_name` is
@@ -7751,11 +7751,13 @@ pub(crate) mod tests {
         assert_eq!(&RECOVERABLE_INBODY[span.into_range()], "helper");
     }
 
-    // The reality of the top-level regime: a stray token at file scope stops the
-    // statement loop, so only the prefix is salvaged. `above` (before) works;
-    // `below` (after) is not in the program at all. Contrast the in-body case.
+    // The top-level regime, since the statement/item synchronizer shipped
+    // (`editing-dx.md` S1): a stray token at file scope is reported and skipped to
+    // the next item boundary, so the items on BOTH sides of it survive. This pin
+    // used to assert the opposite — that `below` was not in the program at all —
+    // which is precisely the file-tail blackout §2.2 mechanism 3 measured.
     #[test]
-    fn a_top_level_error_salvages_the_prefix_and_drops_the_tail() {
+    fn a_top_level_error_keeps_the_items_on_both_sides() {
         let document = analyze_text(RECOVERABLE_TOPLEVEL);
         assert!(document.program.is_some());
         assert!(!document.diagnostics.is_empty());
@@ -7769,8 +7771,8 @@ pub(crate) mod tests {
             "prefix kept: {names:?}"
         );
         assert!(
-            !names.contains(&"below".to_string()),
-            "the tail after a top-level stray token is not recovered: {names:?}",
+            names.contains(&"below".to_string()),
+            "the tail after a top-level stray token is recovered too: {names:?}",
         );
         assert!(
             document
@@ -7778,10 +7780,11 @@ pub(crate) mod tests {
                 .is_some_and(|hover| hover.contains("fun above(): i32")),
             "the prefix item still hovers",
         );
-        assert_eq!(
-            document.hover(offset_at(RECOVERABLE_TOPLEVEL, "fun below", 4)),
-            None,
-            "the dropped tail item has nothing to hover",
+        assert!(
+            document
+                .hover(offset_at(RECOVERABLE_TOPLEVEL, "fun below", 4))
+                .is_some_and(|hover| hover.contains("fun below(): i32")),
+            "and so does the item below the error",
         );
     }
 
@@ -8282,9 +8285,14 @@ pub(crate) mod tests {
     #[test]
     fn a_salvage_break_keeps_the_byte_identical_tail_highlighted() {
         let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
-        // A stray top-level token: salvage keeps the parsed prefix and drops
-        // everything below — the exact blank-tail shape B38 exists for.
-        let broken = "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        // An unterminated interpolated triple-quoted string: there is no
+        // resynchronisation point inside one, so the LEXER stops there and every
+        // token below is gone — the blank-tail shape B38 exists for. (A stray
+        // top-level token used to do this too; since the statement/item
+        // synchronizer shipped, `editing-dx.md` S1, the parse skips it and the
+        // tail is analyzed normally, which is the blackout's death and leaves the
+        // lexer-level break as the honest premise here.)
+        let broken = "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
         let zeta = offset_at(broken, "zeta", 0);
 
         // Premise: the broken text's own analysis has no token at `zeta`.
@@ -8317,7 +8325,7 @@ pub(crate) mod tests {
     fn an_edited_line_below_the_break_stays_unhighlighted() {
         let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
         let broken_and_edited =
-            "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet quux = 8;\n}\n";
+            "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet quux = 8;\n}\n";
         let quux = offset_at(broken_and_edited, "quux", 0);
         let mut document = analyze_text(whole);
         document.adopt_analysis(analyze_text(broken_and_edited));
@@ -8336,7 +8344,7 @@ pub(crate) mod tests {
     #[test]
     fn a_complete_analysis_suppresses_the_retained_tail() {
         let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
-        let broken = "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let broken = "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
         let mut document = analyze_text(whole);
         document.adopt_analysis(analyze_text(broken));
         // The user closes the string; the next analysis is whole again.

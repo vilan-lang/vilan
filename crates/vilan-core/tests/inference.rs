@@ -55530,3 +55530,165 @@ fn b118_the_witness_is_a_pattern_that_closes_the_hole() {
         "e\nef\nee\n",
     );
 }
+
+// --- The blackout: analysis survives a parse error (editing-dx.md S1/S6) -------
+//
+// `analyze_source` runs the analyzer on the SALVAGED tree, so these pins measure
+// what the language server publishes and — since S6 — what batch `vilan check`
+// prints. The survey's §2 finding is that a file which does not parse used to
+// lose every diagnostic it already had: `vilan check` analyzed nothing at all
+// (mechanism 1, P29), and the salvage the server did get was prefix-only, with
+// the enclosing body emptied (mechanisms 2 and 3, P30/P31).
+//
+// Each pin below asserts BOTH halves — the parse error is reported, AND the
+// analyzer diagnostics elsewhere in the file are still there — because either one
+// alone passes vacuously on the behavior it is meant to exclude.
+
+/// Every diagnostic message a source produces, parse and analysis together, in
+/// the order `analyze_source` returns them.
+#[track_caller]
+fn all_diagnostics(source: &str) -> Vec<String> {
+    match compile(source) {
+        Ok(_) => panic!("expected diagnostics, but it compiled cleanly"),
+        Err(messages) => messages,
+    }
+}
+
+#[track_caller]
+fn assert_reports_all(source: &str, expected: &[&str]) {
+    let messages = all_diagnostics(source);
+    for part in expected {
+        assert!(
+            messages.iter().any(|message| message.contains(part)),
+            "no diagnostic contains {part:?}; got: {messages:#?}"
+        );
+    }
+}
+
+/// P29, the batch shape: one parse error in `broken`, two genuine type errors in
+/// `main`. All three are reported. Before S1/S6 this file produced exactly one
+/// diagnostic — the parse error — and one missing `;` anywhere in a file blinded
+/// the checker to everything else in it.
+#[test]
+fn a_parse_error_does_not_hide_the_analyzer_errors_in_another_function() {
+    assert_reports_all(
+        "import std::print;\n\
+         fun broken() {\n\
+         \tlet a: i32 = 1\n\
+         \tprint(a);\n\
+         }\n\
+         fun main() {\n\
+         \tlet bad: i32 = \"text\";\n\
+         \tlet other: str = 5;\n\
+         \tprint(bad);\n\
+         }\n",
+        &[
+            "expected `;` to end this statement",
+            "Expected i32, but got str instead.",
+            "Expected str, but got i32 instead.",
+        ],
+    );
+}
+
+/// P30 stage 2, the keystroke the survey measured: a standing type error one line
+/// above a half-typed call. The editor used to show ONLY `found '}' expected an
+/// expression`, anchored on a brace the user never touched — the standing error
+/// disappeared for the two keystrokes between `print(` and `print(1)`.
+#[test]
+fn a_standing_type_error_survives_a_half_typed_call_below_it() {
+    assert_reports_all(
+        "fun main() {\n\tlet wrong: i32 = \"text\";\n\tprint(\n}\n",
+        &[
+            "unclosed `(`: expected a matching `)`",
+            "Expected i32, but got str instead.",
+        ],
+    );
+}
+
+/// P31 row B, the shape a typing user is in constantly: an unclosed `(` ABOVE a
+/// type error. The row the survey singles out as losing the most — "everything
+/// below the cursor stops being checked" — because an unclosed region defeated
+/// recovery and the statement loop stopped there.
+#[test]
+fn an_unclosed_delimiter_above_a_type_error_no_longer_erases_it() {
+    assert_reports_all(
+        "fun one() {\n\
+         \tprint(\n\
+         }\n\
+         fun two() {\n\
+         \tlet bad: i32 = \"text\";\n\
+         }\n",
+        &[
+            "unclosed `(`: expected a matching `)`",
+            "Expected i32, but got str instead.",
+        ],
+    );
+}
+
+/// The same, in ONE body: the broken statement is dropped and its siblings are
+/// still analyzed. This is mechanism 2 — the enclosing `{…}` used to be skipped
+/// wholesale and replaced by an empty block, so every statement in the body
+/// stopped existing along with the half-typed one.
+#[test]
+fn a_broken_statement_does_not_erase_its_siblings_diagnostics() {
+    assert_reports_all(
+        "fun main() {\n\
+         \tlet above: i32 = \"text\";\n\
+         \tlet broken: i32 = ;\n\
+         \tlet below: str = 5;\n\
+         }\n",
+        &[
+            "found ';' expected an expression",
+            "Expected i32, but got str instead.",
+            "Expected str, but got i32 instead.",
+        ],
+    );
+}
+
+/// The analyzer says nothing INSIDE a recovered region — §13.1's proposed
+/// mitigation ("suppress diagnostics whose span falls inside one") turns out to
+/// need no code, because a salvaged tree holds nothing there to diagnose: the
+/// garbled `(1 +)` becomes a `Node::Error` placeholder that types as nothing and
+/// reports nothing, while the standing error beside it is untouched.
+#[test]
+fn a_recovered_region_produces_no_analyzer_diagnostics_of_its_own() {
+    let messages =
+        all_diagnostics("fun main() {\n\tlet x: i32 = (1 +);\n\tlet bad: i32 = \"text\";\n}\n");
+    assert_eq!(
+        messages.len(),
+        2,
+        "the parse error and the standing error, and nothing from the placeholder: {messages:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("found ')' expected an expression"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Expected i32, but got str instead."))
+    );
+}
+
+/// A parse error must not MANUFACTURE a diagnostic either — the other direction
+/// of §8 clause 3, and the one a synchronizer gets wrong by default. A statement
+/// whose only fault is its missing `;` is kept, so the names it binds stay bound
+/// and the lines below it, which are correct, stay quiet.
+#[test]
+fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
+    let messages = all_diagnostics(
+        "import std::print;\n\
+         fun main() {\n\
+         \tlet origin: i32 = 3\n\
+         \tlet total: i32 = origin + 1;\n\
+         \tprint(total);\n\
+         }\n",
+    );
+    assert_eq!(
+        messages.len(),
+        1,
+        "one missing token, one diagnostic — and no `cannot find 'origin'`: {messages:#?}"
+    );
+    assert!(messages[0].contains("expected `;` to end this statement"));
+}

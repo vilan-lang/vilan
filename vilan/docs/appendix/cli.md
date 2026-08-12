@@ -77,6 +77,17 @@ nothing, and runs no `[build] run` hooks. Same path forms and flags
 every entry, each under its own platform. Exit is non-zero when
 diagnostics were reported.
 
+One thing it does that `build` does not: when the file has a **syntax
+error**, `check` reports it and then type-checks the rest of the file
+anyway. The parser recovers at the next statement or item boundary, so a
+half-written statement no longer hides the type errors above and below
+it — which is the state a file is in most of the time it is being
+edited. `build` stops at the syntax errors, because a recovered file is
+not something to emit from. Diagnostics that are *consequences* of the
+skipped statement — a function body that lost its result, a name whose
+declaration did not parse — are reported too, beside the syntax error
+that explains them.
+
 ## `vilan run [file] [args…]`
 
 Builds and runs. Anything after the file is forwarded to the program.

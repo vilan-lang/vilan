@@ -171,9 +171,15 @@ fn recovers_garbled_list_literal() {
 
 #[test]
 fn recovers_garbled_block() {
-    // parser.rs ~539: a garbled `{ .. }` block recovers via `|span| (None, span)`
-    // to an EMPTY block (no statements, a `Void` tail). The non-empty source with
-    // `errors > 0` proves this is recovery, not a legitimately-empty `fun main() {}`.
+    // parser.rs ~539: a garbled `{ .. }` block recovers to an EMPTY block (no
+    // statements, a `Void` tail). The non-empty source with `errors > 0` proves
+    // this is recovery, not a legitimately-empty `fun main() {}`.
+    //
+    // The SHAPE is unchanged since `editing-dx.md` S1 retired the region-skipping
+    // arm this site used to take: the block's one statement is now recovered
+    // individually and dropped individually, which leaves the same empty block
+    // here — and, unlike region-skipping, leaves a body's OTHER statements in
+    // place (`a_broken_statement_keeps_its_siblings_in_the_body`).
     for_each_frontend("fun main() { let x = 1 + ; }\n", |name, tree, errors| {
         assert!(errors > 0, "[{name}] garbled block must report (c): {tree}");
         assert!(
@@ -460,4 +466,402 @@ mod analyze {
             "no downstream item should be lost to the steer; got: {messages:#?}"
         );
     }
+}
+
+// --- The recovery bar (editing-dx.md §8, S1) -----------------------------------
+//
+// The three clauses the survey wrote as the statement/item synchronizer's
+// acceptance test, as EXACT-COUNT pins. §12 records why they are new: "the pins
+// assert 'at least one error', never an exact count", and §8's bar "cannot be
+// defended without exact counts".
+//
+//   1. One missing token produces exactly one diagnostic. (Met before S1 too —
+//      P6/P14 — so this half pins what S1 must not break.)
+//   2. N independent errors produce N diagnostics, including in the SAME body and
+//      including when the first is an unclosed delimiter.
+//   3. A parse error never removes a diagnostic from a region it does not
+//      contain. At the parse level that reads: the statements and items around a
+//      broken one are still in the tree. (The analyze-level half — that their
+//      DIAGNOSTICS survive — is pinned in `vilan-core/tests/inference.rs` and,
+//      for the editor, in `vilan-lsp/src/document.rs`.)
+
+/// Each diagnostic of a recovered parse as `(rendered message, the source text it
+/// spans)` — the pair a user sees: what it says, and what it underlines.
+fn diagnostics(source: &str) -> Vec<(String, String)> {
+    let (_tree, errors) = parsing::parse(source);
+    errors
+        .iter()
+        .map(|error| {
+            (
+                parsing::render(error),
+                source[error.span.start..error.span.end].to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The recovered tree's `Debug`, for shape assertions.
+fn tree_of(source: &str) -> String {
+    let (tree, _errors) = parsing::parse(source);
+    format!("{:?}", tree.expect("recovery always yields a tree"))
+}
+
+// --- Clause 1: one missing token, one diagnostic -------------------------------
+
+#[test]
+fn one_missing_semicolon_reports_exactly_one_diagnostic() {
+    // P6, with the four correct statements after it. The count is the pin; the
+    // message and anchor are S2's (`editing-dx.md` §4.4) — the gap after the
+    // statement that lost its `;`, not the head of the one that follows.
+    let source = "fun main() {\n\tlet a: i32 = 1\n\tlet b: i32 = 2;\n\tlet c: i32 = 3;\n\tlet d: i32 = 4;\n\tlet e: i32 = 5;\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one missing `;`, one diagnostic: {reported:#?}"
+    );
+    assert_eq!(
+        reported[0],
+        (
+            "expected `;` to end this statement".to_string(),
+            "1".to_string()
+        ),
+        "the diagnostic names `;` and anchors at the gap"
+    );
+}
+
+#[test]
+fn one_unclosed_paren_reports_exactly_one_diagnostic() {
+    // P14: one unclosed `(`, three correct statements after it. Before S1 the
+    // count was 1 because the parse STOPPED (§4.3 — "the recovery bar is met by
+    // the wrong means"); it is 1 now because recovery resumes at the next
+    // statement boundary, which the sibling pins below prove.
+    //
+    // The message is the located one, not `unclosed \`(\``: `let b: i32 = 2` reads
+    // as an argument, so a committed demand — the argument list's own `,`/`)` —
+    // fails INSIDE the region and says where. That is the same shape, and the
+    // same message, as §5.1's P8, which the survey grades the best in the survey
+    // and asks to leave alone.
+    let source =
+        "fun main() {\n\tprint(\n\tlet b: i32 = 2;\n\tlet c: i32 = 3;\n\tlet d: i32 = 4;\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one unclosed `(`, one diagnostic: {reported:#?}"
+    );
+    assert_eq!(
+        reported[0],
+        ("found ';' expected ',' or ')'".to_string(), ";".to_string()),
+    );
+    // …and the statements past the `;` that ended the unfinished region are
+    // parsed, rather than the whole body being dropped.
+    let tree = tree_of(source);
+    assert!(tree.contains("\"c\"") && tree.contains("\"d\""), "{tree}");
+}
+
+#[test]
+fn an_unfinished_call_gives_up_only_to_the_next_statement_terminator() {
+    // The residual, pinned honestly: the statement swallowed INTO an unfinished
+    // `(` is lost — the parser read `let b: i32 = 2` as an argument, and there is
+    // no reading in which it is both an argument and a statement. Everything past
+    // that statement's `;` resumes. Before S1 the whole body went (§2.2
+    // mechanism 2), and before it the whole file tail (mechanism 3).
+    let tree = tree_of(
+        "fun main() {\n\tlet above: i32 = 0;\n\tprint(\n\tlet swallowed: i32 = 2;\n\tlet below: i32 = 3;\n}\n",
+    );
+    assert!(
+        tree.contains("\"above\""),
+        "the statement above survives: {tree}"
+    );
+    assert!(
+        tree.contains("\"below\""),
+        "the statement below survives: {tree}"
+    );
+    assert!(
+        !tree.contains("\"swallowed\""),
+        "the statement read as an argument is the one casualty: {tree}"
+    );
+}
+
+#[test]
+fn a_missing_semicolon_keeps_the_statement_it_should_have_terminated() {
+    // The statement parsed perfectly; only its terminator is absent, and the
+    // token after it can only begin a new one. Dropping it would unbind `origin`
+    // at every use below — a screenful of "cannot find" on correct lines, from a
+    // statement the parser read without difficulty.
+    let source =
+        "fun main() {\n\tlet origin: i32 = 3\n\tlet total: i32 = origin + 1;\n\tprint(total);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    let tree = tree_of(source);
+    // The BINDING, not merely the name — `origin + 1` below mentions it either
+    // way, so a substring pin on the bare name would pass on a dropped statement.
+    assert!(
+        tree.contains("Let((\"origin\""),
+        "the statement missing its `;` is kept, not skipped: {tree}"
+    );
+    assert!(
+        tree.contains("Let((\"total\""),
+        "and so is the one after it: {tree}"
+    );
+}
+
+#[test]
+fn a_missing_semicolon_on_an_import_keeps_the_import() {
+    // The same, for the two non-expression statements that take a terminator.
+    // P3's file used to lose its `import` — so every use of `print` below
+    // reported "cannot find 'print' in this scope" as well.
+    let source = "import std::print
+
+fun main() {\n\tprint(1);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert!(
+        tree_of(source).contains("Import"),
+        "the import survives its missing `;`"
+    );
+}
+
+#[test]
+fn a_statement_that_is_not_merely_missing_its_semicolon_is_still_skipped() {
+    // The boundary condition that keeps insertion from cascading: `1` is not a
+    // statement anyone wrote, so `print 1);` takes the skipping path and reports
+    // once — §5.2's accepted outcome for a missing OPENING paren. Two broken
+    // statements report twice, one each, and neither multiplies.
+    let reported = diagnostics("fun main() {\n\tprint 1);\n\tfoo bar baz;\n}\n");
+    assert_eq!(reported.len(), 2, "one per broken statement: {reported:#?}");
+    assert!(
+        reported
+            .iter()
+            .all(|(message, _)| message == "expected `;` to end this statement"),
+        "{reported:#?}"
+    );
+}
+
+#[test]
+fn a_missing_semicolon_on_a_void_bodys_last_statement_stays_silent() {
+    // P5, pinned as a NON-diagnostic: the statement legally becomes the block's
+    // tail expression, and a void tail in a void function is fine
+    // (`ret-checking.md` rule 3). S2 must not turn correct language semantics
+    // into an error.
+    let source = "fun main() {\n\tlet a: i32 = 1;\n\ta\n}\n";
+    assert_eq!(diagnostics(source), Vec::new(), "no `;` is wanted here");
+}
+
+// --- Clause 2: N errors, N diagnostics -----------------------------------------
+
+#[test]
+fn two_missing_semicolons_in_two_bodies_report_two() {
+    // P7a — met before S1 (the bodies are independent) and pinned so it stays met.
+    let source = "fun one() {\n\tlet a: i32 = 1\n\tprint(a);\n}\nfun two() {\n\tlet b: i32 = 2\n\tprint(b);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        2,
+        "two bodies, two diagnostics: {reported:#?}"
+    );
+    assert!(
+        reported
+            .iter()
+            .all(|(message, _)| message == "expected `;` to end this statement"),
+        "{reported:#?}"
+    );
+}
+
+#[test]
+fn two_broken_statements_in_one_body_report_two() {
+    // The half P7 could NOT reach before S1: two independent errors in the SAME
+    // body. The first used to eat the whole body (mechanism 2), so the second was
+    // never seen.
+    let source = "fun main() {\n\tlet a: i32 = 1\n\tprint(a);\n\tlet b: i32 = 2\n\tprint(b);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        2,
+        "two statements, two diagnostics: {reported:#?}"
+    );
+    assert!(
+        reported
+            .iter()
+            .all(|(message, _)| message == "expected `;` to end this statement"),
+        "{reported:#?}"
+    );
+}
+
+#[test]
+fn an_unclosed_delimiter_first_does_not_hide_a_later_error() {
+    // Clause 2's second half, and the P31-B shape at the parse level: an unclosed
+    // `(` above, a missing `;` below. Before S1 the unclosed region defeated
+    // recovery and everything after it was dropped — one diagnostic, and the
+    // file tail unparsed.
+    let source = "fun one() {\n\tprint(\n}\nfun two() {\n\tlet b: i32 = 2\n\tprint(b);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 2, "both errors are reported: {reported:#?}");
+    assert_eq!(reported[0].0, "unclosed `(`: expected a matching `)`");
+    assert_eq!(reported[1].0, "expected `;` to end this statement");
+}
+
+// --- Clause 3: a parse error never removes what it does not contain ------------
+
+#[test]
+fn a_broken_statement_keeps_its_siblings_in_the_body() {
+    // Mid-statement, with correct statements on BOTH sides: the broken one is
+    // dropped and nothing else is. Before S1 `parse_block` replaced the entire
+    // body with an EMPTY block (§2.2 mechanism 2), so `before` and `after` left
+    // the tree with it.
+    let tree = tree_of(
+        "fun main() {\n\tlet before: i32 = 1;\n\tlet broken: i32 = ;\n\tlet after: i32 = 2;\n}\n",
+    );
+    assert!(
+        tree.contains("\"before\""),
+        "the statement above survives: {tree}"
+    );
+    assert!(
+        tree.contains("\"after\""),
+        "the statement below survives: {tree}"
+    );
+}
+
+#[test]
+fn a_broken_statement_keeps_the_items_below_it() {
+    // The file-tail half: an item after a broken one still parses. Before S1 both
+    // statement loops `break`, so everything below the first decline was dropped.
+    let tree = tree_of(
+        "fun broken() {\n\tprint(\n}\nfun below(): i32 {\n\t7\n}\nstruct After { x: i32 }\n",
+    );
+    assert!(
+        tree.contains("\"below\""),
+        "the item below survives: {tree}"
+    );
+    assert!(
+        tree.contains("\"After\""),
+        "and so does the one after it: {tree}"
+    );
+}
+
+#[test]
+fn an_unclosed_paren_in_an_item_header_keeps_the_items_below_it() {
+    // The reach an item keyword gets that a statement head does not: `fun broken(`
+    // never closes, so the scan would otherwise run to end of input, swallowing
+    // the whole file inside the unfinished parameter list — the file-tail blackout
+    // again, one layer up. `fun` cannot appear inside a parenthesized region
+    // (only inside a block within one, which the scan tracks), so it ends the
+    // region.
+    let source =
+        "fun broken( {\n\tprint(1);\n}\nfun below(): i32 {\n\t7\n}\nstruct After { x: i32 }\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one broken header, one diagnostic: {reported:#?}"
+    );
+    let tree = tree_of(source);
+    assert!(
+        tree.contains("\"below\""),
+        "the item below survives: {tree}"
+    );
+    assert!(tree.contains("\"After\""), "and the one after it: {tree}");
+}
+
+#[test]
+fn a_nested_item_inside_an_unfinished_call_is_not_a_boundary() {
+    // The other side of that rule: a `fun` declared inside a closure body is
+    // ordinary code, so it must NOT end the region — the `{` above it says so —
+    // and neither does the `;` of a statement in that body. Stopping at either
+    // would resume mid-expression and report a second time. One unfinished call,
+    // one diagnostic, and the item after the enclosing function still parses.
+    let source = "fun main() {\n\tapply(|| {\n\t\tfun helper() {}\n\t\tlet a: i32 = 1;\n\t}\n}\nfun below(): i32 {\n\t7\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one unfinished call, one diagnostic: {reported:#?}"
+    );
+    let tree = tree_of(source);
+    assert!(
+        tree.contains("\"below\""),
+        "the item after the broken one survives: {tree}"
+    );
+}
+
+#[test]
+fn a_broken_statement_in_a_nested_block_keeps_its_enclosing_body() {
+    // Nested: the unclosed `(` is two blocks deep. The `}` that stops the scan is
+    // the INNER block's, so the `if`'s body closes, the outer body keeps going,
+    // and the statement after the `if` survives.
+    let source = "fun main() {\n\tlet before: i32 = 1;\n\tif before > 0 {\n\t\tprint(\n\t}\n\tlet after: i32 = 2;\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one unclosed `(`, one diagnostic: {reported:#?}"
+    );
+    assert_eq!(reported[0].0, "unclosed `(`: expected a matching `)`");
+    let tree = tree_of(source);
+    assert!(
+        tree.contains("\"before\""),
+        "the statement above survives: {tree}"
+    );
+    assert!(
+        tree.contains("\"after\""),
+        "the statement after the `if` survives: {tree}"
+    );
+}
+
+// --- The anchors the survey asked for ------------------------------------------
+
+#[test]
+fn a_file_scope_missing_semicolon_reports_at_the_gap() {
+    // P3: an `import` with no `;`. Before S2 this read `found 'import' expected an
+    // expression` ON the `import` keyword — §4.1 calls it incomprehensible, and
+    // §4.2 records the fallback it came from as untested anywhere in the repo.
+    let source = "import std::print\n\nfun main() {\n\tprint(1);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert_eq!(
+        reported[0],
+        (
+            "expected `;` to end this statement".to_string(),
+            "t".to_string()
+        ),
+        "the anchor is the last character of `print`, where the `;` goes"
+    );
+}
+
+#[test]
+fn an_unclosed_brace_anchors_at_the_opening_brace() {
+    // P13: a body that runs out of input. Before S1 this reported `found end of
+    // input expected an expression` at EOF and the unclosed `{` — five lines up —
+    // was never mentioned; the whole file was dropped with it.
+    let source = "fun main() {\n\tlet x: i32 = 1;\n\tprint(x);\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert_eq!(
+        reported[0],
+        (
+            "unclosed `{`: expected a matching `}`".to_string(),
+            "{".to_string()
+        )
+    );
+    let tree = tree_of(source);
+    assert!(
+        tree.contains("\"x\""),
+        "the body's statements survive: {tree}"
+    );
+}
+
+#[test]
+fn a_committed_separator_failure_still_reports_where_it_broke() {
+    // §5.1's "best diagnostics in the survey" are NOT re-anchored: when a
+    // committed demand fails INSIDE an unfinished region, its located message
+    // wins over naming the opener. `distance(1, 2;` closes nothing either, so
+    // only the failure-within rule keeps it from becoming "unclosed `(`".
+    let source = "fun main() {\n\tlet total: i32 = distance(1, 2;\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert_eq!(
+        reported[0],
+        ("found ';' expected ',' or ')'".to_string(), ";".to_string())
+    );
 }

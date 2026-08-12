@@ -580,3 +580,73 @@ fn phase_timing_env_var_prints_the_phase_split() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The batch half of the blackout (`editing-dx.md` S6/§13.1, the P29 shape).
+///
+/// `check`'s whole job is to answer questions about a file the user is still
+/// writing, and it used to answer only one: a file whose parse was not clean was
+/// not analyzed at all, so one missing `;` anywhere blinded it to every type
+/// error in the rest of the file. It now analyzes the salvaged tree — the same
+/// tree the language server has analyzed since the H6 cutover.
+///
+/// `build` keeps its contract, which is the other half of the pin: it reports the
+/// parse errors and stops, because a recovered tree is not something to emit from.
+const BROKEN_PLUS_TYPE_ERRORS: &str = "import std::print;\n\
+                                       fun broken() {\n\
+                                       \tlet a: i32 = 1\n\
+                                       \tprint(a);\n\
+                                       }\n\
+                                       fun main() {\n\
+                                       \tlet bad: i32 = \"text\";\n\
+                                       \tlet other: str = 5;\n\
+                                       \tprint(bad);\n\
+                                       }\n";
+
+#[test]
+fn check_analyzes_a_file_that_did_not_parse_cleanly() {
+    let dir = temp_package("check_salvage", BROKEN_PLUS_TYPE_ERRORS);
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a broken file still fails `check`"
+    );
+    assert!(
+        stderr.contains("expected `;` to end this statement"),
+        "the parse error is still reported: {stderr}"
+    );
+    assert!(
+        stderr.contains("Expected i32, but got str instead."),
+        "the first type error, in the OTHER function, survives it: {stderr}"
+    );
+    assert!(
+        stderr.contains("Expected str, but got i32 instead."),
+        "and so does the second: {stderr}"
+    );
+}
+
+#[test]
+fn build_reports_only_the_parse_error_and_emits_nothing() {
+    let dir = temp_package("build_salvage", BROKEN_PLUS_TYPE_ERRORS);
+    let output = vilan(&dir, &["build", "."], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let emitted = dir.join("dist").exists() || dir.join("src/main.mjs").exists();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "a broken file fails `build`");
+    assert!(
+        stderr.contains("expected `;` to end this statement"),
+        "the parse error is reported: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Expected i32, but got str instead."),
+        "`build` does not analyze a recovered tree — its output contract is \
+         unchanged (§13.1: change `check`, leave `build`): {stderr}"
+    );
+    assert!(
+        !emitted,
+        "and nothing is written from a tree that did not parse"
+    );
+}
