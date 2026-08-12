@@ -1971,3 +1971,226 @@ document.rs` (`entity_spans` excludes synthesized `Expr::Void`),
 page under `vilan/docs/` quoted the old message text for any changed
 diagnostic (checked by grep before closing the docs gate), so none needed
 updating in this commit.
+
+## 17. What shipped — the residuals lane (E61, 2026-08-12)
+
+Cycle 19's disposition of the six residuals E61 filed from §15/§16's
+divergences, in the `editing-residuals` worktree off `next`. Five commits,
+one per item that moved; item 5 left untouched and item 6 fixed — both
+against the standing instruction to prefer a standing pin over a half-fix.
+Zero corpus golden movement across every commit
+(`cargo test -p vilan-cli --test corpus`). CHANGELOG entries added under
+`## Unreleased` for the three user-facing changes (17.1, 17.3, 17.4); 17.2
+and 17.5 are recovery/dedup internals, not new wording, per the cycle's own
+scoping.
+
+### 17.1 Regime 2's if-no-else refinement — SHIPPED
+
+§16 deferred this as needing "a provenance channel from `infer_type_path`'s
+`Expr::If` arm ... through to whichever diagnostic reports the mismatch."
+The channel needed no new field: `has_final_else` (the `Expr::If` arm's own
+nested fn, deciding whether the `if` produces a value at all) is a pure
+syntactic question with no dependency on inference state, so it was hoisted
+to a free function (`if_branch_has_final_else`) and asked again, directly,
+from `check_return_position` at the point it is about to fall through to
+the generic mismatch message. When the tail expression IS an `if` with no
+final `else`, the message now reads `` Expected T, but got void instead: an
+`if` with no `else` produces void. `` instead of the bare `` Expected T, but
+got Y instead. ``; the anchor is unchanged (already A1-compliant per §3.3).
+A void-typed CALL in tail position asks the same structural question, finds
+no `Expr::If`, and correctly keeps the generic message — pinned as a
+boundary guard alongside the fix
+(`missing_return_value_a_void_call_tail_keeps_the_generic_message`).
+
+Pin: `missing_return_value_regime_2_if_with_no_else_names_the_gap`
+(renamed from `..._is_unchanged`, re-verdicted to the new wording). Both
+pins plant-proven red against the pre-fix code and restored. Commit
+`7d1f14ae`.
+
+### 17.2 P28's duplicate dedup — SHIPPED
+
+§16 pinned the bare-`ret` shape's doubled diagnostic as today's true
+behavior and named the fix without building it: "requiring the
+tail-construction site to know a preceding `ret` already diverged." That
+is exactly what shipped. The named-function walk (where the block's
+synthesized void tail gets its own `Constraint::ReturnType`) now checks
+whether the block's last STATEMENT is itself a `ret`
+(`Expr::FunctionReturn`) before pushing that constraint — when it is, the
+`ret`'s OWN constraint (pushed independently at its construction site)
+already reports whatever is wrong with the function's return value, and
+the tail's constraint would only repeat it. Deliberately narrow: a last
+statement that diverges some OTHER way (a `jump`, an exhaustive
+`if`/`match` where a live bug was found and left alone — see below) is not
+touched.
+
+Bycatch, found building the fix and fixed by the same mechanism: a
+mistyped `ret` VALUE (`ret "nope";` against a declared `i32`) doubled the
+same way, pairing the real value-mismatch diagnostic with a spurious "ends
+without producing a value" for code that, once the real error is fixed, is
+complete — not filed anywhere, closed alongside the bare-`ret` case with
+its own pin.
+
+Live bug found and DELIBERATELY left unfixed, out of scope for this item:
+an exhaustive `if`/`else` where every branch is only a bare `ret` (no
+tail) currently reports "Expected T, but got void instead" on the whole
+`if` — because each branch's own tail is a synthesized `Void` (the `ret`
+is a statement, not a value), so the branches unify to `Void` regardless of
+the `if` having a complete `else`. This is a DIFFERENT bug from P28 (a
+false mismatch on genuinely complete code, not a duplicate diagnostic) and
+was not filed by the survey; recorded here rather than fixed silently in
+passing, per CLAUDE.md's per-case discipline.
+
+Pins: `a_bare_ret_still_duplicates_the_synthesized_tail_diagnostic` renamed
+to `a_bare_ret_no_longer_duplicates_the_synthesized_tail_diagnostic`,
+re-verdicted to `assert_fails_once_with` (exactly one diagnostic, anchored
+at `ret`); new
+`a_mistyped_ret_value_no_longer_duplicates_the_synthesized_tail_diagnostic`.
+Both plant-proven red and restored. Commit `51688ea4`.
+
+### 17.3 The C3 "declared here" note — SHIPPED, scoped to S4
+
+§16 left the C3 note unbuilt for BOTH S3 (the return type's own note) and
+S4 (the count-mismatch subject's declaration). This lane's charter scoped
+it to S4 only: the count-mismatch diagnostics (a function call, a method
+call, a struct initializer) gain a secondary note pointing at the
+subject's declaration, matching the wording already used elsewhere in the
+codebase (`` `{name}` is declared here ``, `const_eval.rs` /
+`init_order.rs`). S3's return-type note remains unbuilt, unchanged from
+§16's record.
+
+New `declared_here_note(id)`, resolving a callable's declaration the same
+way `callable_name` already names it (a `Function`/`ExternalFunction` id
+directly, or a method's `member_id` through its
+`Expr::Function`/`Expr::ExternalFunction` indirection), wired at both
+call-arity push sites. The struct-field site builds its note by hand at
+the struct's own `name_span`, since its subject is a `Struct`, not a
+callable the helper resolves.
+
+Pins: one `assert_fails_noting` test per site
+(`call_argument_count_notes_the_callees_declaration`,
+`method_argument_count_notes_the_methods_declaration`,
+`struct_initializer_field_count_notes_the_structs_declaration`), all three
+plant-proven red (the note nulled at each push site) and restored. Commit
+`aa71bd44`.
+
+### 17.4 Insert-`;` / remove-`;` quickfixes — SHIPPED
+
+§15.9 had already corrected §3.8.1's stale claim that no quickfix surface
+existed — E54 (cycle 18) built it. This item is the ordinary follow-on
+work that claim implied: two new arms in `Document::quickfixes`'
+diagnostic-to-fix routing, alongside the add-import and rename-field
+fixes it already carried.
+
+**Insert `;`** (S2's `` expected `;` to end this statement ``): the
+diagnostic's own span IS the gap — `gap_span` (parsing.rs) already
+computed "the last character before the `;` belongs," one character wide
+— so the fix is a zero-width insertion right after it. No `Program`
+lookup needed.
+
+**Remove `;`** (regime 1', `` the `;` discards this body's last value ``):
+the diagnostic anchors at the callable's closing BRACE (S3), not the `;`
+itself, so the fix cannot use the diagnostic's own span. It locates the
+`;` from the `Program`'s own bookkeeping instead — the same last-statement
+question `missing_return_value_message` asks analyzer-side, re-derived
+LSP-side by matching the brace span against `program.functions`' and
+`program.closures`' own tail spans, then scanning forward from that
+statement's span end past ASCII whitespace only. Something else in the
+gap (a `//` comment — an unusual but legal shape) declines the fix rather
+than guessing past it (B4).
+
+Pins: two end-to-end tests through the real `code_action` handler (insert,
+remove), the comment-in-the-gap decline case end to end, a direct
+`quickfixes()` pin for the insert fix's exact offset, and one for the
+CLOSURE shape specifically (proving the `program.closures` branch isn't
+dead code) — 6 new tests total, full `vilan-lsp` suite green (291 tests).
+Both fix-offering branches plant-proven red and restored. Commit
+`e0091e4a`.
+
+### 17.5 The unfinished-paren swallow — SHIPPED (§15's honest residual, closed)
+
+§15.8 recorded clause 3's one residual precisely: a statement typed where
+a call's arguments were expected (`print(` then `let swallowed: i32 = 2;`)
+is read as an argument and lost with the whole abandoned call — "there is
+no reading in which it is both an argument and a statement." True on its
+face, and the fix does not contradict it: the statement is not read as an
+argument a second time. Once the enclosing call is known abandoned, the
+same tokens are retried as what they would be OUTSIDE it.
+
+`recover_statement`'s own boundary scan already boxes the abandoned region
+exactly — `opener` (the call's `(`) to `resume` (one past the `;` that
+ended it, S1's own "reaches inside" boundary). The new
+`recover_swallowed_statement` retries that span from a fresh position as
+an ordinary statement, keeping it ONLY when the retry both succeeds and
+lands precisely on `resume` — nothing more, nothing less. A region shaped
+any other way (more than one swallowed statement, a genuinely garbled
+head) declines rather than guesses, and the caller's original
+jump-to-`resume` behavior is exactly what runs. Scoped to `(` specifically
+— a block's `{ statement* }` and `[value; length]`'s own `;` fork already
+parse their own contents, so only a call's argument list can swallow a
+foreign statement whole. The diagnostic itself is UNCHANGED (the located
+`` found ';' expected ',' or ')' `` shape §5.1/§15.4 grade best and ask to
+leave alone) — only the recovered tree gains the statement back.
+
+This was judged a CONTAINED fix (the charter's bar for touching this
+item): the change is two new lines at each of `recover_statement`'s two
+call sites plus one new function reusing data the scan already computes,
+with no change to `scan_to_sync_point`, `take_failure_within`, or any of
+the other nine `recover_delimited` sites. All 35 pre-existing
+`parser_recovery.rs` pins (unclosed delimiters, garbled bodies,
+item-header cases, the nested-item boundary) stayed green untouched,
+confirming the fix's blast radius is exactly the one shape it targets.
+
+Pins: the residual pin renamed and re-verdicted to the fixed behavior
+(`an_unfinished_call_recovers_the_statement_swallowed_into_it` — diagnostic
+unchanged, all three statements now present), a span pin proving the
+recovered node keeps its own position rather than the call's
+(`a_swallowed_statement_recovers_at_its_own_span_not_the_calls`), and the
+safety net's own decline case
+(`a_swallowed_statement_only_recovers_when_it_lands_exactly_on_resume`).
+Both new-behavior pins plant-proven red (the whole recovery function
+stubbed to always decline) and restored. Full suite swept after this
+change specifically (inference, corpus, docs, vilan-lsp), all green.
+Commit `407d9eac`.
+
+### 17.6 P21 — generic propagation through an annotated `.map<U>` — DELIBERATELY UNTOUCHED
+
+§16's own verdict stands: "tracing the root cause back through a generic
+binding is a materially different mechanism from the direct-target case
+this slice builds." This lane's charter permitted an attempt only with
+time to spare and only if it would not be a half-fix; a bounded
+investigation (not a build attempt) confirmed §16's assessment rather than
+finding a shortcut past it.
+
+The mechanism: `infer_type_path`'s `Expr::Closure` arm only routes a
+closure's tail through `check_return_position` when the target return type
+is fully GROUND (`type_is_ground`) at the moment the closure itself is
+inferred. For `points.map(|point| { .. })` against `let widths: List<i32>
+= ..`, the closure's expected return type is `.map`'s own generic `U` —
+unbound at that point, because `U` is bound ONE LEVEL OUT, by the CALL's
+own return-type reconcile (`List<U>` against `List<i32>`), which runs
+AFTER the closure has already been inferred and reported its type for
+that attempt. Confirmed live: `vilan check` on P21's exact program still
+reports the pre-existing `` Expected List<i32>, but got List<void>
+instead. `` on the whole call, unmoved since §16.
+
+Since `infer_type` has no memoization, a later fixpoint pass CAN re-infer
+the same closure — but only if something re-runs the call's argument
+inference AFTER `U` is bound, and nothing in the current constraint
+ordering guarantees that: the call's own generic-parameter binding is a
+downstream CONSEQUENCE of the argument inference that already ran, not an
+input available before it starts. A real fix needs either (a) reordering
+generic method-call resolution so a context-known return type binds the
+method's own generic parameters BEFORE its closure arguments are inferred
+— a change to shared call-resolution machinery every generic call
+(closures or not) would ride, not a `.map`-local one — or (b) a genuinely
+new deferred-constraint class that re-triggers the closure-specific check
+once its target becomes ground, coordinated with the existing
+value-position reconcile so the two never double-report the same root
+cause (a second B5 question this item would open, not close). Either path
+is solver architecture, not a span/message edit, and (a)'s blast radius in
+particular is exactly the kind of thing that broke four unrelated iterator
+tests during S3's own development before `type_is_ground`'s gate was
+added (§16). The standing `#[ignore]`d pin
+(`missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed`)
+is left exactly as §16 shipped it — untouched, not re-verdicted, not
+touched by any commit in this lane.
