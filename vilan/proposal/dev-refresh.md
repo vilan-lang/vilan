@@ -246,3 +246,89 @@ What ships instead, per the owner's design:
 §4's questions resolve with the ruling: the signaling-plumbing question
 DISSOLVES (no hook, no plumbing); the surface is thin; (iii) deferred; the
 signal is uniform. Nothing here remains the owner's to rule.
+
+## 6. `force_refresh()`, as shipped (2026-08-11, cycle 18)
+
+§5 item 2's second primitive, end to end. `is_watching()` is a separate
+lane's addition to the same module this cycle (`VILAN_WATCH`); this record
+covers `force_refresh()` only.
+
+- **The env var**: `VILAN_HMR_PORT`, set on the Node child at the ONE spawn
+  site `run --watch`'s HMR round restarts through (`spawn_node`'s call
+  inside `hmr_round`, `main.rs`). `spawn_node` grew a fourth parameter —
+  `envs: &[(&str, String)]` — so every other caller (plain `run`, `run
+  --watch` with no HMR, the temp-script launcher) passes `&[]` and is
+  unaffected; only the HMR-active restart passes
+  `[("VILAN_HMR_PORT", channel.port().to_string())]`. Defined only when a
+  dev channel exists — there is no `run`-without-`--watch` value, by design
+  (§5's "no watch" case IS "the var is absent", not "the var is `0`" or
+  similar).
+- **The endpoint**: `POST /refresh` on the dev channel (`hmr.rs`). No body,
+  no auth (the same trust boundary as every other route there — bound to
+  `127.0.0.1`, hmr.md §2). On receipt it broadcasts one `reload` event
+  (`event_json("reload", version, None, None)`, the same framing as
+  `swap`/`css`) to every connected client and answers `204`. The broadcast
+  logic moved out of `DevChannel::broadcast` into a free `broadcast_to`
+  function so the HTTP handler — which has the client registry but no
+  `&DevChannel` (the channel that owns one lives on the main watch thread,
+  not the accept loop) — can reach it too.
+- **The primitive**: `std::watch::force_refresh(): void`, in a NEW file,
+  `std/src/process/watch.vl`. §5's own prose names it "`std::process::dev`
+  or the thin equivalent" — the thin equivalent is what shipped, and the
+  name deviates from a literal reuse of `dev` for a reason the full suite
+  caught, not a stylistic choice: `std_twin_parity.rs`'s `TWINNED_MODULES`
+  comment already documents `dev` as **deliberately single-platform**
+  (browser-only, "no counterpart to be held against" — the same status
+  `db`/`fs`/`http`/`process`/`rpc_server` have on the process side). A
+  first pass DID reuse `dev` (mirroring `std::ui`'s browser/process twin,
+  which shares one component surface by design); `cargo nextest run
+  --workspace` caught it immediately —
+  `std_twin_parity::the_twin_inventory_is_known` failed, correctly: the two
+  `dev`s share no component source the way `std::ui`'s two halves do (five
+  unrelated names, `hmr_active`/`on_teardown`/`stash`/`take` vs
+  `force_refresh`), so forcing them into the twin-parity mechanism would
+  have meant five dishonest `ALLOWED_DIVERGENCES` entries justifying a
+  divergence that was never the kind that gate exists to hold together.
+  `watch` sidesteps it cleanly — a new, ordinary single-platform module,
+  no twin, nothing for that gate to say. Reads `VILAN_HMR_PORT`
+  (`std::process::env`); absent ⇒ no-op. Present ⇒ fire-and-forget —
+  `async post(url, "").send()` — so `force_refresh` stays a plain, SYNC
+  `void` function (not inferred-async): calling it never spreads asyncness
+  to its caller, the same reasoning `std::fetch`'s own docs give for `let
+  _sent = async cell.write(..)`. `std::fetch` is a base (all-platform)
+  module, so the process layer reaches it with no new dependency.
+  MERGE NOTE: if the serve-build lane's `is_watching()` independently
+  created its own `std/src/process/dev.vl` (the literal reading of §5's
+  prose), it will hit the identical `std_twin_parity` failure — reconcile
+  to `std::watch` rather than re-opening the twin.
+- **The shim**: unchanged. `hmr_shim.js`'s `handleEvent` already had
+  `case "reload": reload(); break;` (the cycle-16 rework) — a one-shot
+  `location.reload()`, wired to nothing until this cycle gave the dev
+  channel something to send it from.
+- **The doctrine pin**: `fetchAndSwap`'s never-reload comment (a
+  version-gap-triggered *automatic* reload loops against a stale server)
+  is untouched and still true — `force_refresh` is neither automatic nor
+  version-gap-driven, it's one explicit call, and the reloaded page's shim
+  has nothing left to re-fire from it. Verified non-vacuous by planting the
+  violation the doctrine forbids (a version-gap `connected` calling
+  `reload()` instead of `fetchAndSwap`) in `hmr_shim.js` and watching
+  `hmr_swap.rs`'s existing "heal" assertion go red, then reverting — a
+  manual check against shipped code, not a new standing test (the standing
+  coverage is `hmr_swap.rs`'s `connected` heal and `hmr.rs`'s
+  `a_css_push_heals_a_boot_time_stale_server_route`, both unchanged by this
+  work).
+- **e2e** (`crates/vilan-cli/tests/hmr.rs`): a server program calling
+  `force_refresh()` from an HTTP route, a connected `SseClient` (the file's
+  existing raw SSE test client, standing in for a browser) observing the
+  broadcast `reload` event — the full wire path, no JS harness needed since
+  the shim side was already covered. Event-anchored (`SseClient::expect_kind`),
+  no fixed wall-clocks. The trigger server deliberately outlives watch
+  rounds (it has to answer the test's request), so it carries the E60
+  `/shutdown` + connect-poll teardown, asserted dead on the green path only.
+  A second test pins the no-op case directly: a plain `vilan run` (no
+  `--watch`, so `VILAN_HMR_PORT` is never set) calling `force_refresh()`
+  exits cleanly under `support::run_liveness()`'s bound.
+- **Docs**: `docs/std/process.md` (`## std::watch`, cross-linked from
+  `docs/std/dev.md`'s browser page) and `docs/guide/dev-loop.md`
+  (`## Freshness for a hand-rolled server`), both gated by
+  `cargo test -p vilan-core --test docs`.

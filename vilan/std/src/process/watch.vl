@@ -1,0 +1,41 @@
+// `std::watch` — the process layer's dev-mode surface (`dev-refresh.md` §5
+// item 2). Named apart from the browser's `std::dev` (`std/src/browser/dev.vl`)
+// on purpose: `std_twin_parity.rs`'s `TWINNED_MODULES` documents `dev` as
+// deliberately single-platform (browser-only, no counterpart to hold it
+// against — the same reasoning `db`/`fs`/`http`/`process`/`rpc_server` already
+// get on the process side), so reusing that name here would silently open a
+// twin the parity gate was never meant to cover — the two surfaces share no
+// component source the way `std::ui`'s two halves do, which is what that gate
+// actually protects.
+//
+// `force_refresh()` is the manual half of the ruling's composed mechanism:
+// check `is_watching()`, re-read cheaply, `force_refresh()`, and the browser
+// re-pulls current bytes over the existing push routes. A no-op outside
+// `vilan run --watch` — importing this module costs nothing in a shipped
+// process.
+//
+// NOTE (merge): `is_watching(): bool` — §5 item 2's other primitive — is a
+// separate lane's addition to this same module this cycle (`VILAN_WATCH`). If
+// both land independently under different module names, reconcile to one
+// (this file's name was picked to satisfy `std_twin_parity.rs`; the other
+// lane may not have hit that gate yet).
+
+import pkg::fetch::post;
+import pkg::option::Option::{ None, Some, self };
+import pkg::process::env;
+
+/// Ask every connected browser to reload once (`dev-refresh.md` §5 item 2).
+/// The watcher hands its child the dev channel's port over `VILAN_HMR_PORT`
+/// (the node-child spawn site inside `run --watch`'s HMR round); with no
+/// watch session — the env var unset, a plain `vilan run`, or any shipped
+/// process — this is a no-op. Fire-and-forget: the call doesn't wait for the
+/// POST to land or for the browser to actually reload, so it never blocks
+/// the caller.
+fun force_refresh(): void {
+	match env("VILAN_HMR_PORT") {
+		Some(let port) => {
+			let _ = async post(i"http://127.0.0.1:{port}/refresh", "").send();
+		},
+		None => {},
+	}
+}
