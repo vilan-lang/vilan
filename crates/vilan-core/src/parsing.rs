@@ -5429,8 +5429,12 @@ mod tests {
             ("fun main() { let x = (1 +); }\n", "Some((Error, 21..26))"),
             ("fun main() { let x = [1 +]; }\n", "Some((Error, 21..26))"),
             (
+                // The synthesized tail `Void` carries the CLOSING BRACE's span
+                // (editing-dx.md §16's S3 anchor rule), not a zero-width point
+                // past it — composed with S1's recovery, which declines the
+                // broken statement and leaves the body empty.
                 "fun main() { let x = 1 + ; }\n",
-                "body: Some((([], (Void, 28..28)",
+                "body: Some((([], (Void, 27..28)",
             ),
             (
                 "struct S { 1 2 3 }\n",
