@@ -57,6 +57,7 @@ impl ServerBuilder {
 }
 impl Server {
 	fun start(self)        // begin listening; holds the event loop
+	fun stop(self)         // stop listening; fires on_stop once the listener has closed
 	fun port(self): i32    // the bound port (see below)
 	fun url(self): str
 }
@@ -111,6 +112,12 @@ over the raw bindings (`NodeRequest`/`NodeSocket`). For an rpc-serving
 app you won't touch any of this directly: `serve_service` wraps it
 (below), and `serve_connected` itself now rides this surface.
 
+`Server::stop()` closes the listener and fires `on_stop` once it has
+actually closed — call it from `on_start` (stash the `Server` value
+somewhere reachable, e.g. behind a signal handler or a `/shutdown`
+route) or from inside a request handler. Stopping a `Server` value
+`start()` never populated (built but never started) is a no-op.
+
 ## std::rpc_server
 
 ```vilan,fragment
@@ -123,11 +130,26 @@ fun serve_service(
 
 fun serve_connected(port, protocol, on_connection, fallback, on_ready)
 	// the same server with the per-connection hook exposed (custom attach/auth)
+
+impl Service {
+	fun new(protocol: RpcProtocol): Service   // mounted at "/"; the session-registry lifecycle
+	fun at(own self, prefix: str): Service    // mount elsewhere instead, e.g. "/admin/"
+	fun on_connect(own self, handler: |i32, DuplexEnd| void): Service
+	fun on_disconnect(own self, handler: |i32| void): Service
+}
+impl ServerBuilder {
+	fun with_service(own self, service: Service): ServerBuilder   // repeatable
+}
 ```
 
 Websocket upgrade + session registry (mirror attach/detach) + rpc dispatch;
-each handler runs in a turn (`AtEnd`). Details and the client side:
-[Services & RPC](../guide/services.md) and the [rpc reference](rpc.md).
+each handler runs in a turn (`AtEnd`). `serve_rpc`/`serve_service`/
+`serve_connected` are sugar over `Server::builder().with_service(…)` —
+the underlying layer a server can grow into: install a second service on
+its own mount, or a plain page alongside one, by adding a call rather
+than swapping to a different `serve_*` function. Details and the client
+side: [Services & RPC](../guide/services.md) and the
+[rpc reference](rpc.md).
 
 ## std::fs
 
