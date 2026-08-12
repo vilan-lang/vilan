@@ -2091,3 +2091,119 @@ right about.
 fullstack template's spawn-and-fetch e2e — which now boots through
 `require_shell` and is therefore also the green half of this slice. Corpus: zero
 movement.
+
+## 15. S5 shipped — rung 2, the document (2026-08-12)
+
+`Document::of`, the builder methods, `Document::render`, and the `<!--ssr-->`
+marker's retirement. The slice adds a generator to S4's rules rather than a
+second copy of them: `of` writes markup, and the property gate holds that markup
+against the same `check_shell` a hand-written shell faces.
+
+### 15.1 The surface
+
+```vilan
+impl Document {
+	fun of(build: LegBuild): Document
+	fun title(own self, title: str): Document
+	fun lang(own self, lang: str): Document
+	fun mount(own self, id: str): Document
+	fun head(own self, markup: str): Document
+	fun body(own self, markup: str): Document
+	fun render(self, view: View): Document
+	fun html(self): str
+}
+```
+
+§5.5's, with one signature decision the sketch left open: **`render` takes `self`
+where every other builder method takes `own self`**, because it is the one method
+called PER REQUEST. A handler builds its document once at boot and captures it;
+`own self` would move that captured binding on every request. So `render`
+derives a copy — create, serialize, discard — and the document it was called on
+is unchanged, which is pinned.
+
+Two smaller calls. The default `<title>` is **empty**: a document that was not
+given one has no title rather than an invented one (the leg's name is not a
+page's name). And `html()` writes an indented document — a page a person can
+read in View Source — with `head`/`body` markup inserted verbatim at their
+indent.
+
+### 15.2 Where §10.1's bound bit
+
+The ruling scopes rung 2 to "the intersection of the seven shells plus
+`head`/`body` escape hatches", and the bound was load-bearing three times.
+**No `styles(Ignored)`**, although §5.6's own sketched error message offers one
+as a note: an application that means to load styles another way handles
+`check_shell`'s `Result`, which is the escape hatch the design already has, and a
+second one would be a knob on the generator that the checker would then have to
+learn about. **No route-prefix knob** (`.at("/static/")`, §5.4's deliberate
+non-v1) — the moment the prefix is configurable, the document and `serve_build`
+share a second string contract, which is what this paper removes. **No meta,
+favicon, description, CSP or `<base>` helpers**: every one of them is a `head()`
+call today, and §10.1 says to review the surface again if the first three
+requests are all in `head()` — that review wants the requests, not a
+pre-emption. The `<meta charset>`/`<meta name="viewport">` pair is emitted
+unconditionally and is not configurable, because no shell in the tree varies it.
+
+### 15.3 The splice, and the marker
+
+`render` puts the markup inside the mount element at both rungs. For a generated
+document that is where `html()` writes it; for a supplied shell, `from_shell`
+records the index just past the mount element's start tag — the element **the
+check already located by id** (§5.8's own words) — and `html()` splices there.
+Recording it at check time rather than searching at render time is what makes a
+later `mount(id)` unable to move the splice somewhere the check never looked, so
+a supplied-shell document cannot be talked into rendering into an element nobody
+verified exists. `mount()` is therefore about a generated document, and says so.
+
+Nothing checks for a marker and no `ShellFault` names one: the convention is
+gone rather than validated, which is the difference §5.8 asked for.
+
+### 15.4 `examples/ssr`
+
+Four lines of diff. `src/app.html` loses `<!--ssr-->` from inside
+`<div id="app">` (and gains a comment saying where the render lands and why
+there is nothing to spell). `src/server.vl` reads the shell through
+`require_shell` — so the example demonstrates the checked rung-0 shell, which is
+the rung §6.3 keeps the scaffold at — and its handler becomes
+`page.render(app()).html()` in place of `shell.replace("<!--ssr-->", render(app()))`,
+dropping `import std::fs` and `import std::ui::render`.
+
+The example keeps `src/app.html`, deliberately: `tests/init.rs`'s blessed-layout
+gate pins that file as a member of the full-stack shape across the scaffold and
+three examples at once, and §6.3's cost note ("the blessed examples keep their
+`app.html`") is a claim this slice had no mandate to reverse. Rung 2 is
+demonstrated in `docs/guide/ssr.md` and `docs/std/process.md`, and pinned by the
+e2e in 15.5.
+
+### 15.5 The gates
+
+`crates/vilan-cli/tests/document.rs`, three pins:
+
+- **the property** — *every document `Document::of` can produce passes
+  `check_shell`* — over 1152 documents: styles/no styles × splits/does not ×
+  three titles (one carrying `&`, `<`, `>` and quotes) × two languages × two
+  mount ids × four `head` values × three `body` values × rendered/unrendered.
+  The count is asserted, not just the absence of faults, so a probe that
+  silently checked nothing cannot pass. The same pin carries the other
+  direction: a `<link>` added through `head()` to a stylesheet the build did not
+  emit IS reported — generation is sugar over the check, not an exemption from
+  it;
+- **the splice**, at both rungs, plus the derivation: the document rendered
+  *from* still has an empty mount element;
+- **a generated document over a real build**, end to end: a project with no
+  `src/app.html` at all, built, served, and fetched — the `<link>` the document
+  wrote reaches the compiled styles and the `<script>` reaches the bundle, over
+  routes `serve_build` installed. That is the founding bug's loop — emitted,
+  linked, served — closed in one test. The server dies by `/shutdown` and is
+  asserted dead.
+
+**Planted red, each restored**: emitting the stylesheet `<link>` unconditionally,
+emitting `type="module"` unconditionally, and hardcoding the mount id each redden
+the property (in the fault variant each corresponds to — F2, F6, F4); appending
+the render after the mount element instead of inside it reddens the splice pin.
+
+`crates/vilan-cli/tests/ssr_fullstack.rs` passes **unchanged** — not one
+assertion moved, including `!page.contains("<!--ssr-->")`, which now pins that no
+marker convention returns, and `<div id="app"><main class="app">`, which is the
+splice landing exactly where the marker used to. Only its module comment was
+updated, to stop describing a marker that no longer exists.

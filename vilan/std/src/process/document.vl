@@ -35,6 +35,8 @@ import pkg::fs;
 import pkg::io::panic;
 import pkg::option::Option::{ None, Some, self };
 import pkg::result::Result::{ Err, Ok, self };
+import pkg::ui;
+import pkg::ui::{ View, escape_attribute, escape_text };
 
 /// The mount element's id when nothing says otherwise — what every shell in
 /// this tree uses, and the other end of `mount_root("app", …)`.
@@ -142,7 +144,8 @@ fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<Shel
 
 	// F2 — a link into this leg's namespace that the build did not write.
 	for href in stylesheets {
-		if is_local(href) && leg_owns(build, file_name_of(href)) && !is_emitted_style(build, file_name_of(href)) {
+		let file = file_name_of(href);
+		if is_local(href) && leg_owns(build, file) && !is_emitted_style(build, file) {
 			faults.push(ShellFault::LinkedStyleMissing(href));
 		}
 	}
@@ -189,12 +192,58 @@ fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<Shel
 /// request — while a `View`-shaped document would reopen `ssr.md` §6(a)'s
 /// ratified fragment-only process layer for no gain.
 struct Document {
-	/// The markup, supplied (`from_shell`) — and checked before this value
-	/// existed.
-	shell: str,
+	/// The build this document loads: every generated tag is derived from it,
+	/// and a supplied shell was checked against it.
+	build: LegBuild,
+	/// The markup, when it was supplied (`from_shell`) rather than generated
+	/// (`of`) — and checked before this value existed.
+	shell: Option<str>,
+	/// The `<title>`'s text. Empty until `title()` says otherwise: a document
+	/// that was not given one has no title rather than an invented one.
+	title: str,
+	/// `<html lang>`.
+	lang: str,
+	/// The mount element's id, for a generated document.
+	mount: str,
+	/// Raw markup appended inside `<head>`.
+	head: str,
+	/// Raw markup appended inside `<body>`, before the script tag.
+	body: str,
+	/// Server-rendered markup for the mount element (`render`), empty for a
+	/// document that ships unrendered.
+	rendered: str,
+	/// For a SUPPLIED shell, where that markup goes: the index just past the
+	/// mount element's start tag, located by the check itself (§5.8) — so
+	/// nothing later can move the splice somewhere the check never looked.
+	splice: i32,
 }
 
 impl Document {
+	/// The default document for a build: doctype, `<html lang>`, charset,
+	/// viewport, `<title>`, the stylesheet link IF AND ONLY IF the build
+	/// emitted styles, the mount element, and the bundle's script tag in the
+	/// form the build requires — a module script, or a classic one for a leg
+	/// that splits (§3.5, F6).
+	///
+	/// Opinionated and small, and bounded by §10.1's ruling: the intersection
+	/// of the shells this repository ships, each of which is reconstructible
+	/// from it plus the `head`/`body` escape hatches. Everything it emits is
+	/// derived from the build, which is what makes the guarantee true — every
+	/// document this can produce passes `check_shell`.
+	fun of(build: LegBuild): Document {
+		Document {
+			build = build,
+			shell = None,
+			title = "",
+			lang = "en",
+			mount = default_mount,
+			head = "",
+			body = "",
+			rendered = "",
+			splice = 0,
+		}
+	}
+
 	/// A hand-authored shell, CHECKED: the rung-0 escape hatch made safe — the
 	/// same `Document` value, its markup supplied rather than generated.
 	///
@@ -204,9 +253,80 @@ impl Document {
 	/// precisely so that dropping a rung never drops the check.
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>> {
 		match check_shell(shell, build, default_mount) {
-			Ok(let _checked) => Ok(Document { shell = shell }),
+			Ok(let _checked) => Ok(Document {
+				build = build,
+				shell = Some(shell),
+				title = "",
+				lang = "en",
+				mount = default_mount,
+				head = "",
+				body = "",
+				rendered = "",
+				splice = splice_point(shell, default_mount),
+			}),
 			Err(let faults) => Err(faults),
 		}
+	}
+
+	/// The `<title>`'s text, escaped when the document is written.
+	fun title(own self, title: str): Document {
+		self.title = title;
+		self
+	}
+
+	/// The document's language (`<html lang>`).
+	fun lang(own self, lang: str): Document {
+		self.lang = lang;
+		self
+	}
+
+	/// The mount element's id — the other end of `mount_root(id, …)`. Defaults
+	/// to `"app"`, which is what every shell in this tree uses.
+	///
+	/// This is about a GENERATED document. A supplied shell's mount element is
+	/// the one `from_shell`'s check located, and nothing here moves it — a
+	/// splice into an element the check never saw is exactly the silence this
+	/// module exists to remove.
+	fun mount(own self, id: str): Document {
+		self.mount = id;
+		self
+	}
+
+	/// Raw markup appended inside `<head>`: a favicon, an `og:` tag, a CSP, an
+	/// inline `<style>` for the page frame. Repeatable — each call appends.
+	///
+	/// It is raw on purpose (that is what an escape hatch is), and it is not an
+	/// exemption: the markup goes through the same `check_shell` rules as
+	/// anything else, so a `<link>` here to a stylesheet the build did not emit
+	/// is caught here too.
+	fun head(own self, markup: str): Document {
+		self.head = self.head + markup;
+		self
+	}
+
+	/// Raw markup appended inside `<body>`, before the script tag. Repeatable.
+	fun body(own self, markup: str): Document {
+		self.body = self.body + markup;
+		self
+	}
+
+	/// Server-rendered markup for the mount element (`ssr.md` §1) — the splice,
+	/// with no marker string in it (§5.8).
+	///
+	/// The document already knows where the mount element is, so the markup goes
+	/// INSIDE it by construction and there is nothing to spell wrong: the
+	/// `<!--ssr-->` convention it replaces was a string literal in `.vl` that
+	/// had to equal a string literal in `.html`, whose mismatch was a silent
+	/// no-op observed only by a crawler.
+	///
+	/// The one method here that takes `self` rather than `own self`, because it
+	/// is the one called PER REQUEST: a handler builds the document once at
+	/// boot and renders a fresh view into a copy of it for each response —
+	/// create, serialize, discard.
+	fun render(self, view: View): Document {
+		mut rendered = self;
+		rendered.rendered = ui::render(view);
+		rendered
 	}
 
 	/// The document as markup. A `str`, not a `Response` (§5.5): the
@@ -214,8 +334,68 @@ impl Document {
 	/// it. A document that knew about HTTP would have to know about routing,
 	/// and then it is a framework.
 	fun html(self): str {
-		self.shell
+		match self.shell {
+			// Supplied: its own bytes, with any render spliced into the mount
+			// element the check located.
+			Some(let markup) => if self.rendered == "" {
+				markup
+			} else {
+				markup.substring(0, self.splice) + self.rendered + markup.substring(self.splice, markup.len())
+			},
+			None => self.generated(),
+		}
 	}
+
+	/// The generated document — §5.5's default, written out.
+	fun generated(self): str {
+		mut markup = "<!doctype html>\n";
+		markup = markup + i"<html lang=\"{escape_attribute(self.lang)}\">\n";
+		markup = markup + "\t<head>\n";
+		markup = markup + "\t\t<meta charset=\"utf-8\" />\n";
+		markup = markup + "\t\t<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n";
+		markup = markup + i"\t\t<title>{escape_text(self.title)}</title>\n";
+		// If and only if the build emitted styles — the whole of F1 and F2, on
+		// the generating side.
+		match self.build.styles {
+			Some(let sidecar) => markup = markup + i"\t\t<link rel=\"stylesheet\" href=\"/{sidecar}\" />\n",
+			None => {},
+		}
+		if self.head != "" {
+			markup = markup + "\t\t" + self.head + "\n";
+		}
+		markup = markup + "\t</head>\n";
+		markup = markup + "\t<body>\n";
+		markup = markup + i"\t\t<div id=\"{escape_attribute(self.mount)}\">{self.rendered}</div>\n";
+		if self.body != "" {
+			markup = markup + "\t\t" + self.body + "\n";
+		}
+		markup = markup + "\t\t" + script_tag(self.build) + "\n";
+		markup + "\t</body>\n</html>\n"
+	}
+}
+
+/// The bundle's script tag, in the form the build requires (§3.5): a classic
+/// script exactly when the leg splits, because chunk resolution reads
+/// `document.currentScript` and a module script has none.
+fun script_tag(build: LegBuild): str {
+	if build.classic_script {
+		i"<script src=\"/{build.bundle}\"></script>"
+	} else {
+		i"<script type=\"module\" src=\"/{build.bundle}\"></script>"
+	}
+}
+
+/// Where server-rendered markup goes in a supplied shell: just past the mount
+/// element's start tag, i.e. its first child position. `0` when the shell has no
+/// such element — unreachable through `from_shell`, whose check refuses a shell
+/// that does not carry the mount id.
+fun splice_point(shell: str, mount: str): i32 {
+	for tag in tags_of(shell) {
+		if attribute(tag, "id") == mount {
+			ret tag.end;
+		}
+	}
+	0
 }
 
 /// The shell at `path`, read and checked against `build` — or a stop naming the
@@ -253,9 +433,8 @@ struct Tag {
 	name: str,
 	/// Its attributes in source order, as `(lowercased name, raw value)`.
 	attributes: List<(str, str)>,
-	/// Where its `<` sits.
-	start: i32,
-	/// One past its `>`, i.e. where its content begins.
+	/// One past its `>`, i.e. where its content begins — the splice point a
+	/// server-rendered document needs (§5.8).
 	end: i32,
 }
 
@@ -369,7 +548,7 @@ fun tags_of(markup: str): List<Tag> {
 		}
 		let name = markup.substring(index + 1, cursor).to_lowercase_ascii();
 		let (attributes, end) = attributes_of(markup, cursor);
-		tags.push(Tag { name = name, attributes = attributes, start = index, end = end });
+		tags.push(Tag { name = name, attributes = attributes, end = end });
 		index = if name == "script" || name == "style" {
 			skip_raw_text(markup, end, name)
 		} else {

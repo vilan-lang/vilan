@@ -1,29 +1,34 @@
 // The server: serve the browser leg's build and the HTML shell. On the page
-// route it renders the app to markup with `render(app())` and splices it into the
-// shell at the `<!--ssr-->` marker (proposal/ssr.md §1, §6b — the splice stays in
-// user code, zero new std surface). The page arrives fully painted; `/client.js`
-// carries the bundle that boots and replaces it, and `serve_build` is what puts
-// it there — the bundle's name comes from the build, not from this file.
+// route it renders the app to markup with `Document::render(app())`, which
+// splices it INSIDE the mount element — the same `<div id="app">` the client
+// mounts into, located by the check that read the shell at boot. There is no
+// marker string in either file to keep in step (proposal/ssr.md §1;
+// proposal/fullstack-dx.md §5.8 retires the `<!--ssr-->` convention). The page
+// arrives fully painted; `/client.js` carries the bundle that boots and
+// replaces it, and `serve_build` is what puts it there — the bundle's name comes
+// from the build, not from this file.
 
 import std::build::require_build;
-import std::fs;
+import std::document::require_shell;
 import std::http::{ Request, Response, Server };
 import std::print;
-import std::ui::render;
 import pkg::app::app;
 
 async fun main() {
 	// Read once at boot; the server runs from the project root (`vilan run .`).
+	// `require_shell` also CHECKS src/app.html against the build: a shell whose
+	// script tag or mount element stopped matching what the build wrote stops
+	// the server here rather than serving a page that cannot work.
 	let build = require_build("client");
-	let shell = fs::read_file_to_str("src/app.html");
+	let page = require_shell("src/app.html", build);
 
 	Server::builder()
 		.port(8791)
 		.serve_build(build)
 		// Create, serialize, discard: a fresh `app()` is built and rendered per
-		// request, its markup spliced into the shell. No effects, no
-		// subscriptions, no owner survives the response.
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(shell.replace("<!--ssr-->", render(app()))).build())
+		// request into a copy of the document. No effects, no subscriptions, no
+		// owner survives the response.
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page.render(app()).html()).build())
 		.on_start(|server| print("ssr example: http://localhost:8791/"))
 		.build()
 		.start();

@@ -4,8 +4,11 @@
 //!
 //! 1. **Server render.** `node dist/server.mjs` serves the page; a GET asserts the
 //!    served HTML carries the RENDERED content — the signal-fed list items, the
-//!    escaped heading, the `when` branch, the read-once button — spliced into the
-//!    shell at the `<!--ssr-->` marker, all present BEFORE any client JS runs.
+//!    escaped heading, the `when` branch, the read-once button — spliced inside
+//!    the shell's mount element, all present BEFORE any client JS runs. (That
+//!    splice used to be a `str::replace` over an `<!--ssr-->` marker, which
+//!    `Document::render` retired in E56 S5; the assertion that no marker
+//!    survives into the served page is kept, and now pins that none returns.)
 //! 2. **Client replace.** The built `dist/client.js` is driven under the A10 DOM
 //!    stub against a container PRE-POPULATED with the server-rendered nodes (a
 //!    simulated SSR page). Booting the bundle must REPLACE the container: the old

@@ -255,7 +255,16 @@ impl ShellFault {
 fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>>
 
 impl Document {
+	fun of(build: LegBuild): Document                     // generate one from the build
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>>
+
+	fun title(own self, title: str): Document
+	fun lang(own self, lang: str): Document
+	fun mount(own self, id: str): Document                // the other end of mount_root
+	fun head(own self, markup: str): Document             // raw, appended inside <head>
+	fun body(own self, markup: str): Document             // raw, before the script tag
+	fun render(self, view: View): Document                // SSR markup, inside the mount element
+
 	fun html(self): str
 }
 
@@ -317,6 +326,57 @@ stylesheet on another origin (a font CDN) is nobody's business but yours.
 Comments and `<script>`/`<style>` bodies are skipped rather than searched,
 so a commented-out `<link>` links nothing and a `<div id="app">` inside a
 script's own string is not a mount element.
+
+**`Document::of(build)` writes the document instead.** Same value, same
+rules — every document it can produce passes `check_shell`, which is what
+keeps the generator and the checker from drifting apart. It emits a
+doctype, `<html lang>`, charset, viewport, `<title>`, the stylesheet link
+*if and only if* the build emitted styles, the mount element, and the
+bundle's script tag in the form the build requires (a classic script for a
+leg that splits, since chunk resolution reads `document.currentScript`):
+
+```vilan,norun
+import std::build::require_build;
+import std::document::Document;
+import std::http::{ Response, Server };
+
+async fun main() {
+	let build = require_build("client");
+	let page = Document::of(build)
+		.title("Notes")
+		.head("<style>body { font: 16px/1.5 system-ui; }</style>")
+		.html();
+
+	Server::builder()
+		.port(8080)
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.build()
+		.start();
+}
+```
+
+`head`/`body` take raw markup and append (a favicon, an `og:` tag, a CSP,
+a `<noscript>`), which is what keeps the generated document small enough
+to be worth having: everything else is derived. They are an escape hatch,
+not an exemption — markup you add there is checked like any other, so a
+`<link>` to a stylesheet the build did not emit is caught wherever it came
+from.
+
+`render(view)` is the server-rendering splice ([SSR](../guide/ssr.md)):
+the markup goes *inside the mount element*, because the document already
+knows where that is. It takes `self` rather than `own self` — it is the
+one method called per request, on a document the handler built once at
+boot:
+
+```vilan,fragment
+.on_request(|request| Response::builder().body(page.render(app()).html()).build())
+```
+
+`html()` returns a `str`, at every rung — a generated document can be
+post-processed with the same string operations an app already uses, which
+is what keeps the hand-written shell (rung 0) and the generated one made
+of the same material.
 
 ## std::process
 
