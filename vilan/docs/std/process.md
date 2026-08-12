@@ -233,6 +233,151 @@ serve, so it stops with the error's message instead of starting.
 "dist/client.js")` — in serving order. `std::http`'s
 [`serve_build`](#stdhttp-the-server) is the consumer that makes them routes.
 
+## std::document
+
+The HTML document a browser leg is loaded by, held against what that leg's
+build emitted — so the `<script>`, the `<link>` and the mount element
+cannot disagree with the artifacts they name.
+
+```vilan,fragment
+enum ShellFault {
+	StylesNotLinked(str),         // the build emitted styles; the document links none
+	LinkedStyleMissing(str),      // it links a stylesheet this build did not emit
+	ScriptNotEmitted(str),        // it loads a script this build did not emit
+	BundleNotLoaded(str),         // this build's bundle is loaded by no <script>
+	MountMissing(str),            // nothing carries the id the client mounts into
+	ModuleScriptWithChunks(str),  // a splitting leg loaded as a module script
+}
+impl ShellFault {
+	fun message(self): str        // what is wrong, and what to do about it
+}
+
+fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>>
+
+impl Document {
+	fun of(build: LegBuild): Document                     // generate one from the build
+	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>>
+
+	fun title(own self, title: str): Document
+	fun lang(own self, lang: str): Document
+	fun mount(own self, id: str): Document                // the other end of mount_root
+	fun head(own self, markup: str): Document             // raw, appended inside <head>
+	fun body(own self, markup: str): Document             // raw, before the script tag
+	fun render(self, view: View): Document                // SSR markup, inside the mount element
+
+	fun html(self): str
+}
+
+fun require_shell(path: str, build: LegBuild): Document   // async; stops if it can't
+```
+
+**The check is the primitive.** `check_shell` takes a plain `str`, so it
+works on a shell produced any way at all — read from disk, templated,
+fetched from a CMS — and reports *every* fault, not the first. That
+ordering matters: a generator only protects documents it generated, and
+the page most likely to be wrong is the hand-written one somebody dropped
+to for a CSP header or a font preload.
+
+**A fault stops the server from starting.** `require_shell` is the boot
+idiom: it reads the file, checks it, and either hands back a `Document` or
+stops with the file, the leg, and one line per fault. Refusing is
+defensible because the check is cheap, total, and about the *build* rather
+than about a request — it cannot fail intermittently, and a server that
+starts with a document that cannot work is worse than one that does not
+start.
+
+```vilan,norun
+import std::build::require_build;
+import std::document::require_shell;
+import std::http::{ Response, Server };
+
+async fun main() {
+	let build = require_build("client");
+	// src/app.html is yours; it is checked against what the build wrote.
+	let page = require_shell("src/app.html", build).html();
+
+	Server::builder()
+		.port(8080)
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.build()
+		.start();
+}
+```
+
+An app that genuinely means it says so, once, in code — `check_shell`
+returns a `Result`, so the decision is yours:
+
+```vilan,fragment
+match check_shell(shell, build, "app") {
+	Ok(let _checked) => {},
+	// Report and carry on instead of stopping.
+	Err(let faults) => faults.for_each(|fault| print(i"warning: {fault.message()}")),
+}
+```
+
+What it will and will not have an opinion about is bounded by what a
+build knows. This leg's artifacts are `<leg>.js`, `<leg>.css` and
+`<leg>.<Arm>.js`, and the leg's last build owns that namespace, so a
+document loading `<leg>.…` files this build did not emit is loading its
+own stale output and is told so. A `/theme.css` your application serves
+itself is outside that namespace — the check says nothing about it, and a
+stylesheet on another origin (a font CDN) is nobody's business but yours.
+Comments and `<script>`/`<style>` bodies are skipped rather than searched,
+so a commented-out `<link>` links nothing and a `<div id="app">` inside a
+script's own string is not a mount element.
+
+**`Document::of(build)` writes the document instead.** Same value, same
+rules — every document it can produce passes `check_shell`, which is what
+keeps the generator and the checker from drifting apart. It emits a
+doctype, `<html lang>`, charset, viewport, `<title>`, the stylesheet link
+*if and only if* the build emitted styles, the mount element, and the
+bundle's script tag in the form the build requires (a classic script for a
+leg that splits, since chunk resolution reads `document.currentScript`):
+
+```vilan,norun
+import std::build::require_build;
+import std::document::Document;
+import std::http::{ Response, Server };
+
+async fun main() {
+	let build = require_build("client");
+	let page = Document::of(build)
+		.title("Notes")
+		.head("<style>body { font: 16px/1.5 system-ui; }</style>")
+		.html();
+
+	Server::builder()
+		.port(8080)
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.build()
+		.start();
+}
+```
+
+`head`/`body` take raw markup and append (a favicon, an `og:` tag, a CSP,
+a `<noscript>`), which is what keeps the generated document small enough
+to be worth having: everything else is derived. They are an escape hatch,
+not an exemption — markup you add there is checked like any other, so a
+`<link>` to a stylesheet the build did not emit is caught wherever it came
+from.
+
+`render(view)` is the server-rendering splice ([SSR](../guide/ssr.md)):
+the markup goes *inside the mount element*, because the document already
+knows where that is. It takes `self` rather than `own self` — it is the
+one method called per request, on a document the handler built once at
+boot:
+
+```vilan,fragment
+.on_request(|request| Response::builder().body(page.render(app()).html()).build())
+```
+
+`html()` returns a `str`, at every rung — a generated document can be
+post-processed with the same string operations an app already uses, which
+is what keeps the hand-written shell (rung 0) and the generated one made
+of the same material.
+
 ## std::process
 
 ```vilan,fragment

@@ -60,10 +60,23 @@ That also means a leg that stops emitting styles stops having them
 served, with no `fs::exists` guard to remember: the build says whether it
 wrote a sidecar, and the server believes it.
 
-Miss the link and nothing announces it — the app runs, unstyled, while
-the compiler faithfully rebuilds a stylesheet nobody loads. A `<link>`
-(rather than an inlined `<style>`) is also what lets `--watch` hot-swap
-CSS without reloading the page; see
+Miss the link and the app runs unstyled while the compiler faithfully
+rebuilds a stylesheet nobody loads — which is why a server can hold its
+shell against its build and refuse to start over exactly that:
+
+```vilan,fragment
+let page = require_shell("src/app.html", build).html();
+```
+
+`require_shell` (`std::document`, the
+[reference](../std/process.md#stddocument)) checks the file every boot: a
+shell that links no stylesheet over a build that emitted one stops the
+server, naming the file and the fix. The fullstack template ships that
+line. Nothing checks a browser-only project's `index.html` — there is no
+server to check it — so that one is still on you.
+
+A `<link>` (rather than an inlined `<style>`) is also what lets `--watch`
+hot-swap CSS without reloading the page; see
 [the dev loop](dev-loop.md#the-css-link-idiom).
 
 At runtime you can still *select and combine* styles you already built.

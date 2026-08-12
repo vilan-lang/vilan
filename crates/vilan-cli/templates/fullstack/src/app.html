@@ -6,7 +6,9 @@
 		<title>{{name}}</title>
 		<!-- The client's compiled styles. `vilan build .` writes them to
 		     dist/client.css, and src/server.vl's `serve_build` routes every
-		     artifact the build wrote to `/<file name>` — this one included. -->
+		     artifact the build wrote to `/<file name>` — this one included.
+		     Delete this line and the server will not start: `require_shell`
+		     checks this file against that build on every boot. -->
 		<link rel="stylesheet" href="/client.css" />
 		<!-- The page frame is not the app's business, so it stays plain CSS. -->
 		<style>

@@ -4,7 +4,7 @@
 // entry cannot reach.
 
 import std::build::require_build;
-import std::fs;
+import std::document::require_shell;
 import std::http::{ Request, Response, Server };
 import std::print;
 import pkg::shared::greeting;
@@ -16,13 +16,17 @@ async fun main() {
 	// nothing here names a file, and a client that stops emitting styles stops
 	// having them served, with no guard to remember.
 	let build = require_build("client");
-	// Read once at boot; the server runs from the project root (`vilan run .`).
-	let shell = fs::read_file_to_str("src/app.html");
+	// Read once at boot, and CHECKED against that build: src/app.html is yours
+	// to edit, and a `<link>` that no longer matches the styles the build
+	// emitted — or a mount `<div id>` that drifted from src/client.vl — stops
+	// the server here, naming the file and the fix, rather than serving a page
+	// that renders wrong and looks right.
+	let page = require_shell("src/app.html", build).html();
 
 	Server::builder()
 		.port(8080)
 		.serve_build(build)
-		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(shell).build())
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
 		.on_start(|server| print(greeting() + " — http://localhost:8080/"))
 		.build()
 		.start();

@@ -1951,3 +1951,259 @@ spawning the watch child without `VILAN_WATCHING` reddens the watcher pin.
 `src/server.vl`'s header said `serve_connected` where the code says
 `serve_service`, and `src/app.html:6` closed `</head>` on the stylesheet
 `<link>`'s own line. Both fixed.
+
+## 14. S4 shipped — the validator (2026-08-12)
+
+`ShellFault`, `check_shell`, `Document::from_shell` and the template's
+adoption. The slice's whole claim is §5.6's: **validation is the primitive**,
+and the rung above it (S5) is sugar over these rules rather than a second
+implementation of them.
+
+### 14.1 The surface
+
+`std::document` (`vilan/std/src/process/document.vl`) — a new process-layer
+module, no twin, no shadow, beside `std::build` for the same reason it exists:
+one module describes what the build wrote, the next holds a document against
+it.
+
+```vilan
+enum ShellFault {
+	StylesNotLinked(str), LinkedStyleMissing(str), ScriptNotEmitted(str),
+	BundleNotLoaded(str), MountMissing(str), ModuleScriptWithChunks(str),
+}
+impl ShellFault { fun message(self): str }
+
+fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>>
+
+impl Document {
+	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>>
+	fun html(self): str
+}
+
+fun require_shell(path: str, build: LegBuild): Document
+```
+
+The six variants are §5.6's, unchanged, and their payload is uniformly *the
+thing the fault is about* — the file the build emitted, or the url the document
+named — so `message()` can quote it back with its fix. F5 (the SSR marker) has
+no variant, as §5.8 ruled: the marker stops existing rather than being checked.
+
+**`require_shell` is the slice's one addition, and it takes a PATH rather than
+markup.** Two reasons, one language and one editorial. The language one is
+`require_build`'s (§12.4): `Document::from_shell(…)!` cannot be written in the
+`async fun main()` every server has, because `!` asserts-or-returns and a void
+`main` has no residual. The better one is §5.6's own error rendering, which
+opens `src/app.html links no stylesheet` — a `ShellFault` is about *markup*,
+which arrives from anywhere, so it cannot name a file, while the founding bug's
+report wants to name one first. Taking the path lets the sugar say it, and it
+deletes the template's `import std::fs` on the way. `check_shell` and
+`from_shell` still take a `str`, which is §5.7's requirement: the escape hatch
+has to work on a shell produced any way at all.
+
+### 14.2 The rule that bounds a refusal — the leg's namespace
+
+§10.7 rules that a fault stops the boot, and that makes SOUNDNESS the design
+constraint rather than coverage: a false positive is now a server that will not
+start. Two of the six faults are about files the document names, and "the
+document links a stylesheet this build did not emit" read literally would flag a
+`/theme.css` the application serves itself, or a font CDN.
+
+The bound taken is the one the ratified records already state:
+`bundle-splitting.md` Appendix A's invariant is *the leg's last build owns the
+namespace*, and that namespace is spelled `<leg>.` — `client.js`, `client.css`,
+`client.<Arm>.js`. So `LinkedStyleMissing` and `ScriptNotEmitted` fire only
+inside it: a document loading `client.…` files this build did not emit is
+loading this leg's own stale output, which is unambiguous. Anything outside it —
+another origin, another name — the check says nothing about. The founding cases
+are all inside: deleting the last `const style()` leaves `/client.css` linked,
+dropping `split` leaves `/client.Route_Home.js` loaded.
+
+`BundleNotLoaded` needs no such bound (it is about this build's own file), and
+neither does `MountMissing` (the id is the caller's).
+
+### 14.3 Reading the markup
+
+`check_shell` walks the shell once with a small scanner (`tags_of`) that finds
+tags and their attributes and skips everything else. Three details are handled
+rather than approximated, because each one would otherwise produce a *wrong*
+answer rather than a coarse one, and a wrong answer here is a server that will
+not boot: a comment is skipped whole (a commented-out `<link>` links nothing);
+`<script>` and `<style>` bodies are raw text and are skipped to their closing
+tag (a `<div id="app">` inside a script's own string is not a mount element);
+and a quoted attribute value may contain `>`. Both quoting styles and unquoted
+values are read, `rel` is treated as the space-separated token list it is, and a
+query string is stripped before a file name is compared — `/client.js?v=2` is
+the bundle, the same reading `serve_build` gives it.
+
+What it deliberately is not is a parser: nothing here builds a tree, matches
+close tags, or resolves entities. Every question this module asks is about a
+tag.
+
+### 14.4 The template
+
+One line, as §6.2 predicted, and `import std::fs` goes with it:
+
+```vilan
+let page = require_shell("src/app.html", build).html();
+```
+
+The scaffold now ships at rung 1 + rung 0+, which is §10.6's ruling. `app.html`
+is untouched except for its comment, which can now say the thing that makes the
+scaffold the charter's own demonstration: *delete this line and the server will
+not start*.
+
+### 14.5 The gates
+
+`crates/vilan-cli/tests/shell_check.rs`, eight pins. Six are one per fault
+variant, each planted by breaking a real shell — every plant is one edit to
+`templates/fullstack/src/app.html`, read out of the tree rather than
+transcribed, so a pin cannot drift from the shell the language ships:
+
+- **F1** in a project scaffolded by the real `vilan init`, its `<link>` line
+  deleted — the charter's own case, in the file every new user edits first;
+- **F2** the template's shell over a leg that compiles no styles;
+- **F3** a chunk script over a leg that does not split (`ScriptNotEmitted`), and
+  the shell's own `<script>` deleted (`BundleNotLoaded`);
+- **F4** the mount `<div id>` renamed;
+- **F6** `type="module"` over a splitting leg, whose shell is otherwise correct.
+
+Plus: a shell with two faults reports **two**, on their own lines; and a
+`vilan run` probe over `LegBuild` values built directly — no server, no port —
+pins the six discriminations a `contains`-based check could not make (a correct
+shell, a font CDN's stylesheet, a cache-buster, single quotes, a commented-out
+link, a mount element inside a script body, and a stylesheet outside the leg's
+namespace).
+
+Every server pin boots the built `dist/server.mjs` and waits for it to STOP: a
+server that refuses exits on its own, and one that wrongly started is killed by
+the harness at the deadline and reported as the failure it is, rather than left
+to hold a port.
+
+**Planted red, each restored**: `check_shell` returning `Ok` unconditionally
+reddens all eight; returning only `faults[0]` reddens the two-fault pin;
+ignoring `classic_script` reddens F6; scanning inside comments reddens the
+commented-link case; not skipping raw-text bodies reddens the in-script mount
+case; and dropping the namespace bound reddens the `/theme.css` case — the
+false-positive direction, which is the one a refuse-to-boot check has to be
+right about.
+
+`cargo test -p vilan-cli --test init` passes **unchanged**, including the
+fullstack template's spawn-and-fetch e2e — which now boots through
+`require_shell` and is therefore also the green half of this slice. Corpus: zero
+movement.
+
+## 15. S5 shipped — rung 2, the document (2026-08-12)
+
+`Document::of`, the builder methods, `Document::render`, and the `<!--ssr-->`
+marker's retirement. The slice adds a generator to S4's rules rather than a
+second copy of them: `of` writes markup, and the property gate holds that markup
+against the same `check_shell` a hand-written shell faces.
+
+### 15.1 The surface
+
+```vilan
+impl Document {
+	fun of(build: LegBuild): Document
+	fun title(own self, title: str): Document
+	fun lang(own self, lang: str): Document
+	fun mount(own self, id: str): Document
+	fun head(own self, markup: str): Document
+	fun body(own self, markup: str): Document
+	fun render(self, view: View): Document
+	fun html(self): str
+}
+```
+
+§5.5's, with one signature decision the sketch left open: **`render` takes `self`
+where every other builder method takes `own self`**, because it is the one method
+called PER REQUEST. A handler builds its document once at boot and captures it;
+`own self` would move that captured binding on every request. So `render`
+derives a copy — create, serialize, discard — and the document it was called on
+is unchanged, which is pinned.
+
+Two smaller calls. The default `<title>` is **empty**: a document that was not
+given one has no title rather than an invented one (the leg's name is not a
+page's name). And `html()` writes an indented document — a page a person can
+read in View Source — with `head`/`body` markup inserted verbatim at their
+indent.
+
+### 15.2 Where §10.1's bound bit
+
+The ruling scopes rung 2 to "the intersection of the seven shells plus
+`head`/`body` escape hatches", and the bound was load-bearing three times.
+**No `styles(Ignored)`**, although §5.6's own sketched error message offers one
+as a note: an application that means to load styles another way handles
+`check_shell`'s `Result`, which is the escape hatch the design already has, and a
+second one would be a knob on the generator that the checker would then have to
+learn about. **No route-prefix knob** (`.at("/static/")`, §5.4's deliberate
+non-v1) — the moment the prefix is configurable, the document and `serve_build`
+share a second string contract, which is what this paper removes. **No meta,
+favicon, description, CSP or `<base>` helpers**: every one of them is a `head()`
+call today, and §10.1 says to review the surface again if the first three
+requests are all in `head()` — that review wants the requests, not a
+pre-emption. The `<meta charset>`/`<meta name="viewport">` pair is emitted
+unconditionally and is not configurable, because no shell in the tree varies it.
+
+### 15.3 The splice, and the marker
+
+`render` puts the markup inside the mount element at both rungs. For a generated
+document that is where `html()` writes it; for a supplied shell, `from_shell`
+records the index just past the mount element's start tag — the element **the
+check already located by id** (§5.8's own words) — and `html()` splices there.
+Recording it at check time rather than searching at render time is what makes a
+later `mount(id)` unable to move the splice somewhere the check never looked, so
+a supplied-shell document cannot be talked into rendering into an element nobody
+verified exists. `mount()` is therefore about a generated document, and says so.
+
+Nothing checks for a marker and no `ShellFault` names one: the convention is
+gone rather than validated, which is the difference §5.8 asked for.
+
+### 15.4 `examples/ssr`
+
+Four lines of diff. `src/app.html` loses `<!--ssr-->` from inside
+`<div id="app">` (and gains a comment saying where the render lands and why
+there is nothing to spell). `src/server.vl` reads the shell through
+`require_shell` — so the example demonstrates the checked rung-0 shell, which is
+the rung §6.3 keeps the scaffold at — and its handler becomes
+`page.render(app()).html()` in place of `shell.replace("<!--ssr-->", render(app()))`,
+dropping `import std::fs` and `import std::ui::render`.
+
+The example keeps `src/app.html`, deliberately: `tests/init.rs`'s blessed-layout
+gate pins that file as a member of the full-stack shape across the scaffold and
+three examples at once, and §6.3's cost note ("the blessed examples keep their
+`app.html`") is a claim this slice had no mandate to reverse. Rung 2 is
+demonstrated in `docs/guide/ssr.md` and `docs/std/process.md`, and pinned by the
+e2e in 15.5.
+
+### 15.5 The gates
+
+`crates/vilan-cli/tests/document.rs`, three pins:
+
+- **the property** — *every document `Document::of` can produce passes
+  `check_shell`* — over 1152 documents: styles/no styles × splits/does not ×
+  three titles (one carrying `&`, `<`, `>` and quotes) × two languages × two
+  mount ids × four `head` values × three `body` values × rendered/unrendered.
+  The count is asserted, not just the absence of faults, so a probe that
+  silently checked nothing cannot pass. The same pin carries the other
+  direction: a `<link>` added through `head()` to a stylesheet the build did not
+  emit IS reported — generation is sugar over the check, not an exemption from
+  it;
+- **the splice**, at both rungs, plus the derivation: the document rendered
+  *from* still has an empty mount element;
+- **a generated document over a real build**, end to end: a project with no
+  `src/app.html` at all, built, served, and fetched — the `<link>` the document
+  wrote reaches the compiled styles and the `<script>` reaches the bundle, over
+  routes `serve_build` installed. That is the founding bug's loop — emitted,
+  linked, served — closed in one test. The server dies by `/shutdown` and is
+  asserted dead.
+
+**Planted red, each restored**: emitting the stylesheet `<link>` unconditionally,
+emitting `type="module"` unconditionally, and hardcoding the mount id each redden
+the property (in the fault variant each corresponds to — F2, F6, F4); appending
+the render after the mount element instead of inside it reddens the splice pin.
+
+`crates/vilan-cli/tests/ssr_fullstack.rs` passes **unchanged** — not one
+assertion moved, including `!page.contains("<!--ssr-->")`, which now pins that no
+marker convention returns, and `<div id="app"><main class="app">`, which is the
+splice landing exactly where the marker used to. Only its module comment was
+updated, to stop describing a marker that no longer exists.

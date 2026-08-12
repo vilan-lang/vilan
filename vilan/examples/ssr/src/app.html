@@ -5,7 +5,11 @@
 	<title>Vilan SSR</title>
 </head>
 <body>
-	<div id="app"><!--ssr--></div>
+	<!-- The mount point, and the only place the server render can land:
+	     `Document::render` splices inside the element the check located by
+	     id, so there is no marker string to keep in step (proposal/ssr.md §1,
+	     proposal/fullstack-dx.md §5.8). -->
+	<div id="app"></div>
 	<script type="module" src="/client.js"></script>
 </body>
 </html>
