@@ -900,7 +900,14 @@ impl<'a, 'src> Parser<'a, 'src> {
     ///
     /// The cursor always advances at least one token, so the caller's loop cannot
     /// spin.
-    fn recover_statement(&mut self, start: usize, in_block: bool) {
+    ///
+    /// Returns a statement RECOVERED from inside the abandoned region, when one
+    /// exists — `editing-dx.md` §8 clause 3's one residual (§15.8/§17.5): a
+    /// statement written where a call's arguments were expected (`print(` then
+    /// `let swallowed: i32 = 2;`) is read as an argument, and lost with the whole
+    /// abandoned call when its `attempt` backtracks. See
+    /// [`Parser::recover_swallowed_statement`].
+    fn recover_statement(&mut self, start: usize, in_block: bool) -> Option<Spanned<Node<'src>>> {
         let (resume, unclosed) = self.scan_to_sync_point(start, in_block);
         // A committed demand that failed strictly INSIDE the unclosed region
         // located the real error (`distance(1, 2;` fails at the `;`, wanting `,`
@@ -908,9 +915,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         // it the best in the survey. Only a region nothing complained inside of is
         // reported as unclosed.
         let inside = unclosed.and_then(|opener| self.take_failure_within(opener, resume));
-        match (unclosed, inside) {
+        let swallowed = match (unclosed, inside) {
             (_, Some(failure)) => {
-                self.emit_failure(failure.position, failure.expected, failure.context)
+                self.emit_failure(failure.position, failure.expected, failure.context);
+                unclosed.and_then(|opener| self.recover_swallowed_statement(opener, resume))
             }
             (Some(opener), None) => {
                 let delimiter = match self.tokens.get(opener) {
@@ -924,10 +932,56 @@ impl<'a, 'src> Parser<'a, 'src> {
                     hint: None,
                 });
                 self.farthest_failure = None;
+                None
             }
-            (None, None) => self.emit_statement_failure(start, in_block),
-        }
+            (None, None) => {
+                self.emit_statement_failure(start, in_block);
+                None
+            }
+        };
+        // Unconditional, regardless of what `recover_swallowed_statement`'s own
+        // attempt left `self.position` at (its own `attempt` already restores it
+        // to `opener + 1` on decline): `resume` is the scan's own authoritative
+        // answer, never second-guessed by the recovery it enables.
         self.position = resume;
+        swallowed
+    }
+
+    /// The one case of `recover_statement`'s abandoned region that is not
+    /// actually garbled: a call left unclosed by a statement typed where an
+    /// argument was expected. `opener` and `resume` box that statement's tokens
+    /// exactly — `scan_to_sync_point` stops at the first token that cannot be
+    /// part of a parenthesized region, so `(opener + 1)..resume` is precisely
+    /// "one statement, plus the `;` that ended it" whenever the abandoned
+    /// region genuinely holds one. Retried from a fresh position as an ordinary
+    /// statement; kept only when that retry both succeeds AND lands EXACTLY on
+    /// `resume` — nothing more, nothing less — so a region shaped any other way
+    /// (more than one statement, a genuinely garbled head, a nested unclosed
+    /// delimiter of its own) declines rather than guesses, and the caller's
+    /// existing jump-to-`resume` behavior is exactly as before it.
+    ///
+    /// Scoped to `(` on purpose: `[value; length]`'s own `;` fork and a
+    /// block's `{ statement* }` already parse their contents as themselves, so
+    /// only a call's argument list can swallow a foreign statement whole.
+    fn recover_swallowed_statement(
+        &mut self,
+        opener: usize,
+        resume: usize,
+    ) -> Option<Spanned<Node<'src>>> {
+        if !matches!(self.tokens.get(opener), Some((Token::Ctrl('('), _))) {
+            return None;
+        }
+        self.position = opener + 1;
+        let recovered = self
+            .attempt(Self::parse_statement)
+            .filter(|_| self.position == resume);
+        // Either outcome may have left farthest-failure tracking pointed at a
+        // committed demand from INSIDE the region this call already reported
+        // on (the retry's own clean demands on success; `attempt`'s rollback
+        // does not touch this field on decline) — cleared so it cannot be
+        // mistaken for a later statement's failure.
+        self.farthest_failure = None;
+        recovered
     }
 
     /// Recover a statement whose only fault is the missing `;`: the body parsed to
@@ -1225,7 +1279,11 @@ impl<'a, 'src> Parser<'a, 'src> {
                 Some(statement) => statements.push(statement),
                 None => match self.recover_missing_terminator() {
                     Some(statement) => statements.push(statement),
-                    None => self.recover_statement(self.position, false),
+                    None => {
+                        if let Some(swallowed) = self.recover_statement(self.position, false) {
+                            statements.push(swallowed);
+                        }
+                    }
                 },
             }
         }
@@ -2435,7 +2493,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 statements.push(statement);
                 continue;
             }
-            self.recover_statement(self.position, true);
+            if let Some(swallowed) = self.recover_statement(self.position, true) {
+                statements.push(swallowed);
+            }
         }
         if !self.eat_ctrl('}') {
             // The loop only leaves on `}` or end of input, so this is a `{` the

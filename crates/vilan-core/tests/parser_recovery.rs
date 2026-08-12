@@ -561,26 +561,76 @@ fn one_unclosed_paren_reports_exactly_one_diagnostic() {
 }
 
 #[test]
-fn an_unfinished_call_gives_up_only_to_the_next_statement_terminator() {
-    // The residual, pinned honestly: the statement swallowed INTO an unfinished
-    // `(` is lost — the parser read `let b: i32 = 2` as an argument, and there is
-    // no reading in which it is both an argument and a statement. Everything past
-    // that statement's `;` resumes. Before S1 the whole body went (§2.2
-    // mechanism 2), and before it the whole file tail (mechanism 3).
-    let tree = tree_of(
-        "fun main() {\n\tlet above: i32 = 0;\n\tprint(\n\tlet swallowed: i32 = 2;\n\tlet below: i32 = 3;\n}\n",
+fn an_unfinished_call_recovers_the_statement_swallowed_into_it() {
+    // The residual §15.8 recorded honestly and §17.5 closes: the statement
+    // written where `print(`'s arguments were expected — `let swallowed:
+    // i32 = 2` — is read as an argument first, same as before, but is no
+    // longer lost when that reading is abandoned. `recover_statement`'s own
+    // scan already boxes the region exactly (`opener` to `resume`, the `;`
+    // that ends the unfinished call); retried from `opener + 1` as an
+    // ordinary statement, it parses cleanly and lands exactly on `resume`,
+    // so it is kept rather than skipped. The diagnostic is UNCHANGED — this
+    // is the located `found ';' expected ',' or ')'` shape §5.1/§15.4 grade
+    // best and ask to leave alone — only the recovered TREE gained a node.
+    let source = "fun main() {\n\tlet above: i32 = 0;\n\tprint(\n\tlet swallowed: i32 = 2;\n\tlet below: i32 = 3;\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one unfinished call, one diagnostic, exactly as before: {reported:#?}"
     );
+    assert_eq!(
+        reported[0],
+        ("found ';' expected ',' or ')'".to_string(), ";".to_string()),
+    );
+    let tree = tree_of(source);
     assert!(
         tree.contains("\"above\""),
         "the statement above survives: {tree}"
     );
     assert!(
+        tree.contains("\"swallowed\""),
+        "the statement read as an argument is recovered, not lost: {tree}"
+    );
+    assert!(
         tree.contains("\"below\""),
         "the statement below survives: {tree}"
     );
+}
+
+#[test]
+fn a_swallowed_statement_recovers_at_its_own_span_not_the_calls() {
+    // The recovered node is `swallowed`'s OWN statement, at its own span —
+    // not a copy of the abandoned call, and not shifted to start at the
+    // call's `(`. `let swallowed: i32 = 2` starts at byte 43 in this source
+    // (right after the newline and tab following `print(`).
+    let source = "fun main() {\n\tprint(\n\tlet swallowed: i32 = 2;\n\tlet below: i32 = 3;\n}\n";
+    let tree = tree_of(source);
+    let expected_start = source.find("let swallowed").unwrap();
     assert!(
-        !tree.contains("\"swallowed\""),
-        "the statement read as an argument is the one casualty: {tree}"
+        tree.contains(&format!(", {expected_start}..")),
+        "the recovered statement's span starts at `let swallowed`'s own position ({expected_start}): {tree}"
+    );
+}
+
+#[test]
+fn a_swallowed_statement_only_recovers_when_it_lands_exactly_on_resume() {
+    // The safety net: when the abandoned region is NOT cleanly "one
+    // statement" — here, a real first argument (`1`) followed by `,` and
+    // then the statement-shaped second "argument" — retrying from
+    // `opener + 1` as ONE statement fails immediately (`1` wants `;` next
+    // and finds `,`), so the retry is discarded and the region is skipped
+    // exactly as it was before this fix, rather than guessing which part
+    // of it to keep.
+    let source = "fun main() {\n\tprint(1,\n\tlet b: i32 = 2;\n\tlet below: i32 = 3;\n}\n";
+    let tree = tree_of(source);
+    assert!(
+        !tree.contains("\"b\""),
+        "the region isn't cleanly one statement, so nothing is guessed at: {tree}"
+    );
+    assert!(
+        tree.contains("\"below\""),
+        "the statement after the unfinished call still survives: {tree}"
     );
 }
 
