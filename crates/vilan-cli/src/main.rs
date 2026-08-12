@@ -854,7 +854,7 @@ fn hmr_round(
                 // `build_and_spawn_run`.
                 let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
                 // `dev-refresh.md` §5 item 2: the dev channel's port, so the
-                // child's `std::dev::force_refresh()` (a no-op without it)
+                // child's `std::watch::force_refresh()` (a no-op without it)
                 // knows where to POST. HEADS-UP for the merge: the serve-build
                 // lane adds `VILAN_WATCHING` at this same spawn site — union
                 // the two `envs` entries, don't pick one.
