@@ -6743,6 +6743,38 @@ fn a_closures_ret_still_cannot_hand_back_a_view() {
 }
 
 #[test]
+#[ignore] // B123: the closure tail's own whole-block blindness, unfixed.
+fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local() {
+    // The un-masking pin (`element-clones.md` §13.4 / backlog B123): B122 gave
+    // `check_view_escape`'s FUNCTION seam a leaf walk, but the closure seam
+    // kept the old whole-position question — `escapes_as_view(closure.return_)`
+    // asks the closure's whole `Block`/`If`, never leaf-wise, and `is_view_expr`
+    // matches neither directly. Every existing pin happened to also spell a
+    // `ret`, which the per-expr `Expr::FunctionReturn` arm catches unconditionally
+    // regardless of this hole — so the blindness was self-masked. Here there is
+    // no `ret` anywhere: the view of a closure-local reaches the caller only
+    // through one arm of the closure's conditional TAIL, and the whole-block
+    // question is `false` for an `if`, so nothing asks the arm that matters.
+    // Wrongly compiles today (verified against the live compiler); the `ret`
+    // spelling of the identical shape is already refused
+    // (`b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closure_local`).
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { Inner { n = 0 } } else { &local }
+            };
+            print(grab(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
 fn a_list_literal_element_copies_its_source_place() {
     // B54: `[xs]` installed the caller's storage as element 0, so growing the
     // result's element grew `xs`. Printed 3.
