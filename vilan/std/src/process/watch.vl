@@ -14,15 +14,34 @@
 // `vilan run --watch` — importing this module costs nothing in a shipped
 // process.
 //
-// NOTE (merge): `is_watching(): bool` — §5 item 2's other primitive — is a
-// separate lane's addition to this same module this cycle (`VILAN_WATCH`). If
-// both land independently under different module names, reconcile to one
-// (this file's name was picked to satisfy `std_twin_parity.rs`; the other
-// lane may not have hit that gate yet).
-
 import pkg::fetch::post;
 import pkg::option::Option::{ None, Some, self };
 import pkg::process::env;
+
+/// Whether this process is the child of a `vilan run --watch` session — the dev
+/// loop (`dev-refresh.md` §5, item 2).
+///
+/// Uniform: DEFINED under every run and `false` outside a watch, so a program
+/// branches on it without knowing how it was started. `std::dev` is the
+/// browser's answer to the same question and is browser-only by construction
+/// (HMR swaps the browser leg in place; the node leg restarts), so this is the
+/// process layer's own.
+///
+/// What it is for is FRESHNESS, not code: a server that restarts on every code
+/// change can still serve week-old bytes for a file it read once at the top of
+/// `main`. `serve_build` uses it to revalidate its assets per request while
+/// watching and serve them from memory otherwise; a hand-rolled server can do
+/// the same. Server-side HMR remains a permanent non-goal (`hmr.md` §8).
+///
+/// The signal is the `VILAN_WATCHING` environment variable the watcher sets on
+/// the Node child it spawns — nothing that can fail independently of the
+/// process actually starting, and nothing left behind by a watcher that died.
+fun is_watching(): bool {
+	match env("VILAN_WATCHING") {
+		Some(let value) => value == "1",
+		None => false,
+	}
+}
 
 /// Ask every connected browser to reload once (`dev-refresh.md` §5 item 2).
 /// The watcher hands its child the dev channel's port over `VILAN_HMR_PORT`

@@ -1,34 +1,28 @@
 // The node entry (`[entry.server]`; `target` defaults to node). It serves the
-// HTML shell and the client bundle the build wrote into `dist/`. Add routes
-// here — this side may use `std::fs`, `std::db`, and the rest of the process
-// layer, which the client entry cannot reach.
+// client leg's build and the HTML shell. Add routes here — this side may use
+// `std::fs`, `std::db`, and the rest of the process layer, which the client
+// entry cannot reach.
 
+import std::build::require_build;
 import std::fs;
 import std::http::{ Request, Response, Server };
 import std::print;
 import pkg::shared::greeting;
 
 async fun main() {
+	// What `vilan build .` wrote for the client leg: the bundle, and the style
+	// sidecar the client's `const` styles emitted. `serve_build` installs one
+	// route per artifact, with the content type its extension implies — so
+	// nothing here names a file, and a client that stops emitting styles stops
+	// having them served, with no guard to remember.
+	let build = require_build("client");
 	// Read once at boot; the server runs from the project root (`vilan run .`).
-	let client_js = fs::read_file_to_str("dist/client.js");
 	let shell = fs::read_file_to_str("src/app.html");
-	// The style sidecar the build writes from the client's `const` styles.
-	// Guarded because a client with no styles emits no file at all.
-	let client_css = if fs::exists("dist/client.css") {
-		fs::read_file_to_str("dist/client.css")
-	} else {
-		""
-	};
 
 	Server::builder()
 		.port(8080)
-		.on_request(|request| {
-			match request.path() {
-				"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-				"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
-				_ => Response::builder().set_header("Content-Type", "text/html").body(shell).build(),
-			}
-		})
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(shell).build())
 		.on_start(|server| print(greeting() + " — http://localhost:8080/"))
 		.build()
 		.start();

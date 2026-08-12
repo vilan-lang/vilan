@@ -5,7 +5,8 @@
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>{{name}}</title>
 		<!-- The client's compiled styles. `vilan build .` writes them to
-		     dist/client.css; src/server.vl serves them at this path. -->
+		     dist/client.css, and src/server.vl's `serve_build` routes every
+		     artifact the build wrote to `/<file name>` — this one included. -->
 		<link rel="stylesheet" href="/client.css" />
 		<!-- The page frame is not the app's business, so it stays plain CSS. -->
 		<style>

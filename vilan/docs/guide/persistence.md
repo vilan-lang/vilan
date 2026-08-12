@@ -99,24 +99,24 @@ fun main() {
 from a builder: `.code(i32)` (200 by default),
 `.set_header(name, value)`, `.body(str)`, `.build()`.
 
-Here is the standard full-stack fallback. It serves the client bundle
-and answers *every other path* with the HTML shell, so deep links load
-(see [Routing](routing.md)):
+Here is the standard full-stack fallback. `build_handler` serves the
+client leg's own artifacts — the bundle, its stylesheet, any route chunks
+— and your closure answers *every other path* with the HTML shell, so deep
+links load (see [Routing](routing.md)):
 
 ```vilan,fragment
-|request| match request.path() {
-	"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-	"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
-	_ => Response::builder().set_header("Content-Type", "text/html").body(app_html).build(),
-}
+build_handler(require_build("client"), |request| {
+	Response::builder().set_header("Content-Type", "text/html").body(app_html).build()
+})
 ```
 
 ## Files: `std::fs`
 
 ```vilan,fragment
-fun exists(path: str): bool               // sync — boot code can branch on it
-fun read_file_to_str(path: str): str      // async (implicitly awaited), UTF-8
-fun write_file(path: str, contents: str)  // async
+fun exists(path: str): bool                 // sync — boot code can branch on it
+fun read_file_to_str(path: str): str        // async (implicitly awaited), UTF-8
+fun read_file_to_str_sync(path: str): str   // sync — for a callback that can't suspend
+fun write_file(path: str, contents: str)    // async
 ```
 
 The typical server reads the client bundle and shell into memory once at

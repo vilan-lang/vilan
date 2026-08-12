@@ -60,12 +60,14 @@ compile time (the styling system's CSS) land beside the output.
 - `--backend js`: the only backend today; the flag exists so a future
   one has somewhere to live.
 
-A `browser` entry with `[entry.<name>] split = true` writes an eager
-bundle plus one file per route arm and a `<name>.chunks.json` listing
-them, and warns when the split cost the first load more than it deferred.
-The leg's chunk files belong to its last build: a build that writes none
-removes any a previous one left. `vilan run` ignores `split` — the dev
-loop swaps whole bundles — and emits the leg as one file.
+Every build of a `browser` entry writes `<name>.chunks.json`, the leg's
+build manifest — what it emitted, for `std::build::build_of` to read. A
+`browser` entry with `[entry.<name>] split = true` additionally writes one
+file per route arm, lists them in that manifest, and warns when the split
+cost the first load more than it deferred. The leg's chunk files belong to
+its last build: a build that writes none removes any a previous one left,
+and rewrites the manifest to say the leg emitted none. `vilan run` ignores
+`split` — the dev loop swaps whole bundles — and emits the leg as one file.
 
 ## `vilan check [file]`
 

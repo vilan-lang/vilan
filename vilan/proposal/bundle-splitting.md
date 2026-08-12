@@ -517,3 +517,47 @@ Three things this arc touched and did not close, each outliving it:
   names are unrepresentable as collisions, but a leg whose entry file stem
   collides with another package's is still the pre-existing hole, and it is
   not a splitting problem.
+
+## Appendix A — the sidecar became the leg's build manifest (2026-08-11, E56 S2)
+
+One sentence of §9 is reversed, deliberately and by a ruling outside this
+paper. `fullstack-dx.md` §10.3 was put to the owner as an open question and
+answered **yes** on ratification (2026-08-11): `<leg>.chunks.json` is now
+written on **every build of a browser leg**, chunks or none, and carries
+three fields it did not before — `leg`, `styles` and `classic_script`,
+around the `entry` and `chunks` it already had.
+
+**The sentence that no longer holds**, §9, "`--watch` strays":
+
+> dropping `split` takes the manifest with it (a manifest outliving its
+> chunks is one that LIES, and §10's server would serve from it)
+
+**Why the invariant survives it.** The invariant §9 was defending is *a
+leg's chunk namespace belongs to its LAST build* — and that is untouched:
+every write of the leg still sweeps the namespace, and a build that emits no
+chunks still removes every `<leg>.<arm>.js` a previous one left. What
+changed is what the manifest's *absence* was being made to mean. Under the
+old rule an absent file said two different things at once — "this leg does
+not split" and "this leg was never built" — and a consumer could not tell
+them apart. An always-written manifest with `"chunks": []` is a **positive
+statement**, which is strictly more information, and it is rewritten by the
+same sweep that used to delete it. `std::build::build_of` needs exactly that
+difference: a leg that was never built is a named error, not an empty build.
+
+**What §10's server does now.** `examples/fullstack` no longer reads the
+manifest itself; `build_of("client")` reads it and `serve_build` installs
+one route per artifact (`fullstack-dx.md` §5.4). §10's property is
+preserved and widened: nothing in that server names a route, and a leg that
+*gains* `split = true` gains its chunk routes with no server edit at all.
+
+**The cost, paid once.** `crates/vilan-cli/tests/split/golden/app.chunks.json`
+churned by exactly three inserted lines (`"leg"`, `"styles"`,
+`"classic_script"`); no existing line moved, and the other four goldens are
+byte-identical. Three pins in `crates/vilan-cli/tests/split.rs` that read the
+manifest's absence as "did not split" now read its `chunks` list instead,
+which is what they meant.
+
+**§9's other half is unchanged**, and worth restating because it is the
+reason this is safe: a leg name is a manifest-checked identifier, so
+`<leg>.chunks.json` is in the leg's own namespace and nobody else's. A node
+leg writes no manifest — it describes what a browser loads.

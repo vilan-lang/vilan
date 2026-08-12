@@ -1,7 +1,7 @@
 // `std::process` — the Node platform layer's process surface (stdin, arguments,
 // environment, exit). Not available when building for the browser.
 
-import pkg::option::Option;
+import pkg::option::Option::{ None, Some, self };
 
 /// Terminate the process with `code` (0 = success). Never returns.
 [extern("process.exit")]

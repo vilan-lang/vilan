@@ -162,34 +162,40 @@ opens a session row whose token identifies later calls ([Services &
 RPC](services.md#authentication)). `open_database()` creates the tables at
 startup; `boot()` loads the mirror once from the already-open database.
 
-## The server entry: read, boot, serve
+## The server entry: describe, boot, serve
 
 [`src/server.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/server.vl)
 is now the boring file, which is the point:
 
 ```vilan,fragment
 async fun main() {
-	let client_js = fs::read_file_to_str("dist/client.js");
-	let client_css = fs::read_file_to_str("dist/client.css");
+	let build = require_build("client");
 	let app_html = fs::read_file_to_str("src/app.html");
 
 	let store = boot();
 
-	serve_service(4600, store.dispatcher().into_protocol(json_codec()), |request| {
-		match request.path() {
-			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-			"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
-			_ => Response::builder().set_header("Content-Type", "text/html").body(app_html).build(),
-		}
-	}, |server| print(i"notes server listening on {server.url()}"));
+	serve_service(
+		4600,
+		store.dispatcher().into_protocol(json_codec()),
+		build_handler(build, |request| Response::builder().set_header("Content-Type", "text/html").body(app_html).build()),
+		|server| print(i"notes server listening on {server.url()}"),
+	);
 }
 ```
 
-The catch-all serves the shell for every unknown path. That's what makes
-deep links like `/note/7` load ([Routing](routing.md#deep-links-and-the-server)).
-The client bundle it ships is `dist/client.js`. `vilan build` compiles
-browser entries first, so the file is always fresh by the time the
-server entry builds.
+`require_build("client")` asks what the client leg's build emitted — the
+bundle, and the stylesheet its `const` styles produced — and
+`build_handler` turns that into one route per artifact, with the content
+type each extension implies. No `dist/` path is spelled here, so renaming
+the leg cannot leave this file compiling and the page blank. (When the app
+owns its builder, `Server::builder().serve_build(build)` is the same thing
+installed on the chain.)
+
+The fallback then serves the shell for every path the build does not
+claim. That's what makes deep links like `/note/7` load
+([Routing](routing.md#deep-links-and-the-server)). `vilan build` compiles
+browser entries first, so the client's artifacts are always there by the
+time the server entry builds.
 
 ## The client entry: four signals and a mount
 

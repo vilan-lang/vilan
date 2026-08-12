@@ -808,9 +808,6 @@ fn hmr_round(
                 bundle_path.display()
             );
         }
-        // This round emitted the leg whole, so nothing of a previous split
-        // build of it may remain (`bundle-splitting.md` §S3, item 4).
-        sweep_stale_chunks(&bundle_path, &[]);
         if let Some(css) = &leg.css {
             let css_path = dist.join(format!("{}.css", leg.name));
             if let Err(error) = fs::write(&css_path, css) {
@@ -821,6 +818,15 @@ fn hmr_round(
                 );
             }
         }
+        // This round emitted the leg whole, so nothing of a previous split build
+        // of it may remain (`bundle-splitting.md` §S3, item 4) — and a browser
+        // leg still writes its build manifest, because the dev loop is exactly
+        // where a server asks what its client leg emitted (`serve_build`'s watch
+        // policy re-reads per request, but the DESCRIPTION is read once at boot,
+        // and a watch round that swept it would leave the restarted server with
+        // nothing to describe).
+        let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
+        let _ = write_chunks(&bundle_path, &[], styles.as_deref(), leg.is_browser);
     }
     for (name, kind, content) in &other_assets {
         let asset_path = dist.join(format!("{name}.{kind}"));
@@ -855,11 +861,9 @@ fn hmr_round(
                 let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
                 // `dev-refresh.md` §5 item 2: the dev channel's port, so the
                 // child's `std::watch::force_refresh()` (a no-op without it)
-                // knows where to POST. HEADS-UP for the merge: the serve-build
-                // lane adds `VILAN_WATCHING` at this same spawn site — union
-                // the two `envs` entries, don't pick one.
-                let envs = [("VILAN_HMR_PORT", channel.port().to_string())];
-                match spawn_node(&script, args, Some(&root), &envs) {
+                // knows where to POST.
+                let extra = [("VILAN_HMR_PORT", channel.port().to_string())];
+                match spawn_watched_node(&script, args, Some(&root), &extra) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
                         eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
@@ -969,13 +973,14 @@ fn build_and_spawn_run(
     if run_build_hooks(&project).is_err() {
         return None;
     }
-    let launch = |script: &Path, cwd: Option<&Path>| match spawn_node(script, args, cwd, &[]) {
-        Ok(child) => Some(child),
-        Err(error) => {
-            eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
-            None
-        }
-    };
+    let launch =
+        |script: &Path, cwd: Option<&Path>| match spawn_watched_node(script, args, cwd, &[]) {
+            Ok(child) => Some(child),
+            Err(error) => {
+                eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
+                None
+            }
+        };
     match project {
         Project::Single { unit, platform, .. } => {
             let platform = platform.unwrap_or_default();
@@ -1756,8 +1761,13 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         return ExitCode::SUCCESS;
     }
     let output_path = unit.entry.with_extension(platform.script_extension());
-    write_assets(&output_path, &assets);
-    if let Err(code) = write_chunks(&output_path, &chunks) {
+    let styles = write_assets(&output_path, &assets);
+    if let Err(code) = write_chunks(
+        &output_path,
+        &chunks,
+        styles.as_deref(),
+        matches!(platform, Platform::Browser),
+    ) {
         return code;
     }
     match fs::write(&output_path, javascript) {
@@ -1894,10 +1904,16 @@ fn build_workspace_artifacts(
         let (javascript, assets, _sources) =
             compile_unit(unit, *platform, debug, false, None, sink)?;
         let output = artifact_path(&dist, &unit.name, *platform);
-        write_assets(&output, &assets);
+        let styles = write_assets(&output, &assets);
         // Unconditional: this is also where a previous build's chunks are swept
-        // when this one wrote none.
-        write_chunks(&output, &chunks)?;
+        // when this one wrote none, and where a browser leg's build manifest is
+        // written whether it split or not (`fullstack-dx.md` §10.3).
+        write_chunks(
+            &output,
+            &chunks,
+            styles.as_deref(),
+            matches!(platform, Platform::Browser),
+        )?;
         if let Err(error) = fs::write(&output, javascript) {
             eprintln!(
                 "{} cannot write {}: {error}",
@@ -2039,7 +2055,6 @@ fn run_workspace(
         &artifact_path(Path::new("dist"), &server.name, NODE_LEG),
         args,
         Some(root),
-        &[],
     )
     .and_then(|mut child| child.wait());
     exit_code_of(status)
@@ -2269,29 +2284,68 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
 /// Writes the build's accumulated assets (const-eval.md §3) beside the
 /// compiled output: `<output>.css` for kind "css", deduplicated and
 /// deterministically ordered by `assemble_assets`.
-fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
+///
+/// Returns the STYLE SIDECAR's file name when this build emitted one — the
+/// `styles` field of the leg's build manifest ([`write_chunks`]). A leg with no
+/// `const style()` collects no `css` entry and so writes no file, and that
+/// absence is the fact a shell cannot see today (`fullstack-dx.md` §5.2, F1/F2):
+/// the manifest states it positively instead of leaving a server to probe the
+/// filesystem for it.
+fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Option<String> {
+    let mut styles = None;
     for (kind, content) in vilan_core::const_eval::assemble_assets(assets) {
         let path = output_js.with_extension(kind.as_str());
+        let is_styles = kind.as_str() == "css" && !content.is_empty();
         if let Err(error) = fs::write(&path, content) {
             eprintln!(
                 "{} cannot write {}: {error}",
                 paint::error_prefix(),
                 path.display()
             );
-        } else {
-            println!(
-                "{}  {}",
-                paint::out(paint::Style::GREEN, "Emitted"),
-                paint::out(paint::Style::BOLD, &path.display().to_string())
-            );
+            continue;
+        }
+        println!(
+            "{}  {}",
+            paint::out(paint::Style::GREEN, "Emitted"),
+            paint::out(paint::Style::BOLD, &path.display().to_string())
+        );
+        if is_styles {
+            styles = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
         }
     }
+    styles
 }
 
-/// Writes a split leg's route chunks beside its bundle, plus the
-/// `<leg>.chunks.json` sidecar listing every artifact — the manifest a
-/// hand-written server iterates instead of hard-coding one route per file
-/// (`bundle-splitting.md` §3, adopted by the fullstack example in S4).
+/// Writes a browser leg's BUILD MANIFEST — `<leg>.chunks.json` — plus the route
+/// chunks it describes, when the leg split.
+///
+/// The sidecar started as a list of chunk files a hand-written server could
+/// iterate instead of hard-coding one route per file (`bundle-splitting.md` §3).
+/// `fullstack-dx.md` §10.3 (RATIFIED 2026-08-11) made it the leg's build
+/// manifest — *what this leg's build emitted*, the value `std::build::build_of`
+/// reads and `serve_build` serves — which means it is written on EVERY build of
+/// a browser leg, chunks or none, carrying:
+///
+/// - `leg` / `entry` — the leg's name and its eager bundle's file name;
+/// - `styles` — the style sidecar's file name, or `null` when the leg compiled
+///   no styles (F1/F2: the fact a shell cannot see and a `fs::exists` probe
+///   cannot check in both directions);
+/// - `classic_script` — whether the bundle must be loaded as a classic script,
+///   true exactly when the leg split, because chunk resolution reads
+///   `document.currentScript` (§3.5);
+/// - `chunks` — the route chunks, `[]` for a leg that does not split.
+///
+/// That reverses `bundle-splitting.md` §9's "dropping `split` takes the manifest
+/// with it", and STRENGTHENS its invariant rather than weakening it: the
+/// invariant is *the leg's last build owns the file*, and a present-but-empty
+/// chunk list is a positive statement where an absent file is an ambiguity
+/// between "did not split" and "was never built" (§5.9). `build_of` needs that
+/// difference — a leg that was never built is a named error, not an empty build.
+///
+/// A NODE leg writes none: the manifest describes what a browser loads, and
+/// `classic_script` has no meaning off the browser.
 ///
 /// Chunk names are `<leg>.<arm>.js`, and a leg name is a manifest-checked
 /// identifier (no `.`), so a chunk can never collide with another leg's
@@ -2307,12 +2361,17 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
 /// files lying beside it. They would be inert (a whole bundle names no chunk)
 /// but a `chunks.json` that outlived its chunks is a manifest that lies, and a
 /// server iterating it would serve code the bundle no longer knows about.
-fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<(), ExitCode> {
+fn write_chunks(
+    output_js: &std::path::Path,
+    chunks: &[EmittedChunk],
+    styles: Option<&str>,
+    is_browser: bool,
+) -> Result<(), ExitCode> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
-    sweep_stale_chunks(output_js, chunks);
-    if chunks.is_empty() {
-        return Ok(());
-    }
+    // The manifest this build is about to write is not stale; one left by a
+    // build that wrote a manifest where this one will not (a leg retargeted off
+    // the browser) is, and the sweep takes it.
+    sweep_stale_chunks(output_js, chunks, is_browser);
     for chunk in chunks {
         let path = directory.join(&chunk.file);
         if let Err(error) = fs::write(&path, &chunk.source) {
@@ -2330,25 +2389,44 @@ fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<
             chunk.arm
         );
     }
+    if !is_browser {
+        return Ok(());
+    }
+    let leg = output_js
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let entry = output_js
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let listing = chunks
-        .iter()
-        .map(|chunk| {
-            format!(
-                "\t\t{{ \"arm\": {}, \"tag\": {}, \"file\": {} }}",
-                json_string(&chunk.arm),
-                chunk.tag,
-                json_string(&chunk.file)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",\n");
+    let listing = if chunks.is_empty() {
+        "[]".to_string()
+    } else {
+        let rows = chunks
+            .iter()
+            .map(|chunk| {
+                format!(
+                    "\t\t{{ \"arm\": {}, \"tag\": {}, \"file\": {} }}",
+                    json_string(&chunk.arm),
+                    chunk.tag,
+                    json_string(&chunk.file)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("[\n{rows}\n\t]")
+    };
     let manifest = format!(
-        "{{\n\t\"entry\": {},\n\t\"chunks\": [\n{listing}\n\t]\n}}\n",
-        json_string(&entry)
+        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing}\n}}\n",
+        json_string(&leg),
+        json_string(&entry),
+        styles.map_or_else(|| "null".to_string(), json_string),
+        // A split leg's chunk `import()` resolves against
+        // `document.currentScript`, which is `null` in a module script — so a
+        // leg that split must be loaded by a classic `<script>` and a leg that
+        // did not may be loaded either way (`fullstack-dx.md` §3.5, F6).
+        !chunks.is_empty(),
     );
     let manifest_path = output_js.with_extension("chunks.json");
     if let Err(error) = fs::write(&manifest_path, manifest) {
@@ -2359,11 +2437,17 @@ fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<
         );
         return Err(ExitCode::FAILURE);
     }
-    println!(
-        "{}    {}",
-        paint::out(paint::Style::GREEN, "Chunk"),
-        paint::out(paint::Style::BOLD, &manifest_path.display().to_string())
-    );
+    // Announced only when it describes chunks: a non-splitting leg's manifest is
+    // as routine as its `.css` sidecar and says nothing a reader of a build log
+    // needs. (Byte-identical `vilan build` output for every project that has one
+    // today, which is every project.)
+    if !chunks.is_empty() {
+        println!(
+            "{}    {}",
+            paint::out(paint::Style::GREEN, "Chunk"),
+            paint::out(paint::Style::BOLD, &manifest_path.display().to_string())
+        );
+    }
     Ok(())
 }
 
@@ -2373,7 +2457,14 @@ fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<
 /// leg owns all of it. A failed removal is reported and otherwise ignored: a
 /// stray is a tidiness problem, never a correctness one, and it must not fail a
 /// build that otherwise succeeded.
-fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk]) {
+///
+/// `writes_manifest` says whether the caller is about to write `<leg>.chunks.json`
+/// itself — true for every browser leg since `fullstack-dx.md` §10.3 made the
+/// sidecar the leg's build manifest. The manifest is swept only when this build
+/// will leave none, which is a leg retargeted off the browser: a manifest
+/// describing a bundle no browser loads is the same lie as one outliving its
+/// chunks.
+fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], writes_manifest: bool) {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
     let Some(leg) = output_js.file_stem().map(|stem| stem.to_string_lossy()) else {
         return;
@@ -2395,7 +2486,7 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk]) {
         if (!is_chunk && !is_manifest) || keep.contains(&name.as_str()) {
             continue;
         }
-        if is_manifest && !wrote.is_empty() {
+        if is_manifest && writes_manifest {
             continue;
         }
         if let Err(error) = fs::remove_file(entry.path()) {
@@ -2798,7 +2889,7 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let status = spawn_node(&script, args, None, &[]).and_then(|mut child| child.wait());
+    let status = spawn_node(&script, args, None).and_then(|mut child| child.wait());
     let _ = fs::remove_file(&script);
     exit_code_of(status)
 }
@@ -2813,23 +2904,47 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
 /// assigned to a kill-on-close Job object (`windows-support.md` §6) — a restart
 /// round's kill takes the program's whole process tree, and the CLI's own death
 /// reaps it. On unix the wrapper is a transparent newtype: unchanged behavior.
-///
-/// `envs` are additional environment variables set on the child beyond what it
-/// inherits (`dev-refresh.md` §5 item 2's `VILAN_HMR_PORT`, the HMR watch
-/// round's own addition — every other caller passes `&[]`).
-fn spawn_node(
+fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Result<ManagedChild> {
+    spawn_node_with_env(script, args, cwd, &[])
+}
+
+/// The environment variable a `--watch` session sets on its Node child, and the
+/// whole of `std::watch::is_watching()`'s plumbing (`dev-refresh.md` §1, and
+/// §5 item 2's thin surface): no wire protocol, no socket, nothing that can
+/// fail independently of the process actually starting, and nothing to clean up
+/// after a crashed watcher. `is_watching()` is defined under every run and is
+/// `true` only when this is set.
+const WATCHING_ENV: &str = "VILAN_WATCHING";
+
+/// [`spawn_node`] for a child a `--watch` session owns — [`WATCHING_ENV`], plus
+/// whatever `extra` the round carries (the HMR round adds `VILAN_HMR_PORT`,
+/// `dev-refresh.md` §5 item 2 — the plain restart loop adds nothing). Both
+/// watch paths go through it; plain `vilan run` does not, which is what makes
+/// `is_watching()` answer the question it is named for.
+fn spawn_watched_node(
     script: &Path,
     args: &[String],
     cwd: Option<&Path>,
-    envs: &[(&str, String)],
+    extra: &[(&str, String)],
+) -> std::io::Result<ManagedChild> {
+    let mut env: Vec<(&str, String)> = vec![(WATCHING_ENV, "1".to_string())];
+    env.extend(extra.iter().map(|(name, value)| (*name, value.clone())));
+    spawn_node_with_env(script, args, cwd, &env)
+}
+
+fn spawn_node_with_env(
+    script: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &[(&str, String)],
 ) -> std::io::Result<ManagedChild> {
     let mut command = std::process::Command::new("node");
     command.arg(script).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    for (key, value) in envs {
-        command.env(key, value);
+    for (name, value) in env {
+        command.env(name, value);
     }
     command.spawn().map(ManagedChild::adopt)
 }

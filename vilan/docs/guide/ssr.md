@@ -52,11 +52,12 @@ fun main() {
 
 ## On the server: render and splice
 
-The server reads the client bundle and an HTML shell from disk, then serves. The
-shell has a marker where the app goes; the handler replaces it with the render.
-The splice is plain user code (one `str::replace`, no framework):
+The server serves the client leg's build and an HTML shell. The shell has a
+marker where the app goes; the handler replaces it with the render. The splice
+is plain user code (one `str::replace`, no framework):
 
 ```vilan,norun
+import std::build::require_build;
 import std::fs;
 import std::http::{ Server, Request, Response };
 import std::ui::{ view, View, render };
@@ -65,23 +66,22 @@ fun app(): View {
 	view("main").child(view("h1").text("Tasks"))
 }
 
-fun main() {
-	let client_js = fs::read_file_to_str("dist/client.js");
+async fun main() {
+	let build = require_build("client");
 	let shell = fs::read_file_to_str("src/app.html");
 	Server::builder()
 		.port(8791)
-		.on_request(|request| {
-			match request.path() {
-				"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-				// Create, serialize, discard: a fresh render per request, spliced
-				// into the shell. No effects, no subscriptions survive the response.
-				_ => Response::builder().set_header("Content-Type", "text/html").body(shell.replace("<!--ssr-->", render(app()))).build(),
-			}
-		})
+		.serve_build(build)
+		// Create, serialize, discard: a fresh render per request, spliced into
+		// the shell. No effects, no subscriptions survive the response.
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(shell.replace("<!--ssr-->", render(app()))).build())
 		.build()
 		.start();
 }
 ```
+
+`serve_build` installs the client leg's artifacts — here just `/client.js` —
+in front of `on_request`, so the handler is only ever asked about the page.
 
 The shell puts the marker inside the mount point:
 

@@ -1,35 +1,27 @@
 // The server: boots the one authoritative `TodoStore` (which owns its own
-// persistence — see `store.vl`), serves the browser bundle, and mounts the
+// persistence — see `store.vl`), serves the browser leg's build, and mounts the
 // store's generated dispatcher on a connected server
-// (`std::rpc_server::serve_connected`) — `POST /rpc` carries the client's
+// (`std::rpc_server::serve_service`) — `POST /rpc` carries the client's
 // calls, and each session's SSE stream (`GET /events`) carries the list's
 // changes out to every subscribed tab.
 
+import std::build::require_build;
 import std::fs;
-import std::http::Response;
+import std::http::{ Response, build_handler };
 import std::json::json_codec;
 import std::print;
 import std::rpc_server::serve_service;
 import pkg::store::boot;
 
 async fun main() {
-	// Read the browser bundle once (`vilan build`/`run` writes it to
-	// `dist/client.js`, and the server runs from the project root).
-	let client_js = fs::read_file_to_str("dist/client.js");
-	// The compiled stylesheet the client's `const` styles emitted at build
-	// time (proposal/ui-styling.md) — served like the bundle it belongs to.
-	let client_css = fs::read_file_to_str("dist/client.css");
-
+	// What the build wrote for the browser leg: the bundle, and the stylesheet
+	// its `const` styles emitted. Nothing here names a file or a content type —
+	// `build_handler` installs one route per artifact in front of the page.
+	let build = require_build("client");
 	let app_html = fs::read_file_to_str("src/app.html");
 
 	// Reload, seed ids, subscribe persistence — the store's own lifecycle.
 	let store = boot();
 
-	serve_service(59386, store.dispatcher().into_protocol(json_codec()), |request| {
-		match request.path() {
-			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-			"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
-			_ => Response::builder().set_header("Content-Type", "text/html").body(app_html).build(),
-		}
-	}, |server| print(i"todo server: {server.url()} — open it in two tabs"));
+	serve_service(59386, store.dispatcher().into_protocol(json_codec()), build_handler(build, |request| Response::builder().set_header("Content-Type", "text/html").body(app_html).build()), |server| print(i"todo server: {server.url()} — open it in two tabs"));
 }

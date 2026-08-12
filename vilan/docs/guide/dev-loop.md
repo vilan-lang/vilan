@@ -333,14 +333,16 @@ fun main() {
 ### Serving the chunks
 
 A chunk is fetched from the same directory the bundle was served from, so a
-static host needs nothing: serve `dist/` and you are done. A hand-written
-server iterates `dist/client.chunks.json` instead of hard-coding a route per
-file — it lists every artifact the build wrote, so adding, renaming or
-removing a route arm needs no server change:
+static host needs nothing: serve `dist/` and you are done. A vilan server
+needs nothing either — `dist/client.chunks.json` is the leg's **build
+manifest**, and `serve_build` turns it into routes:
 
 ```json
 {
+	"leg": "client",
 	"entry": "client.js",
+	"styles": "client.css",
+	"classic_script": true,
 	"chunks": [
 		{ "arm": "Route::Home", "tag": 0, "file": "client.Route_Home.js" },
 		{ "arm": "Route::Docs(..)", "tag": 1, "file": "client.Route_Docs.js" }
@@ -348,10 +350,17 @@ removing a route arm needs no server change:
 }
 ```
 
-`examples/fullstack`'s server does exactly that: it reads the manifest at
-boot, keeps each named file in memory beside `client.js`, and serves them by
-path. A leg that does not split writes no manifest, and that code path is
-then simply empty — so the same server works either way.
+Every build of a browser leg writes it, split or not — a leg that does not
+split gets `"chunks": []` and `"classic_script": false`. That is deliberate:
+an absent file cannot tell "did not split" from "was never built", and
+`build_of` needs the difference. `styles` is `null` when the leg compiled no
+`const style()`, which is the one thing an `fs::exists` probe could never
+answer in both directions.
+
+`examples/fullstack`'s server reads it with `build_of("client")` and hands
+the result to `serve_build`, which installs one route per artifact — so
+adding, renaming or removing a route arm needs no server change, and neither
+does turning `split` on.
 
 ### Is it worth it?
 

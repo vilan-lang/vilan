@@ -53,8 +53,12 @@ impl ServerBuilder {
 	fun on_upgrade(own self, handler: |NodeRequest, NodeSocket, Bytes| void): ServerBuilder
 	fun on_start(own self, callback: |Server| void): ServerBuilder
 	fun on_stop(own self, callback: |Server| void): ServerBuilder
+	fun serve_build(own self, build: LegBuild): ServerBuilder   // one route per artifact
 	fun build(self): Server
 }
+// The same routing for a boot function that hands you only a fallback
+// (`serve_service`, `serve_connected`):
+fun build_handler(build: LegBuild, fallback: |Request| Response): |Request| Response
 impl Server {
 	fun start(self)        // begin listening; holds the event loop
 	fun stop(self)         // stop listening; fires on_stop once the listener has closed
@@ -103,6 +107,28 @@ fun main() {
 		.start();
 }
 ```
+
+`serve_build` is the one call that replaces the boot reads and the
+content-type table a full-stack server used to write by hand. It takes a
+[`LegBuild`](#stdbuild) and installs one route per artifact at
+`/<file name>` — the bundle, the style sidecar if the leg emitted one, and
+every route chunk — in front of `on_request`, whatever order the chain was
+written in. So the app's catch-all still answers every path the build does
+not claim, and a leg that gains `split = true` gains its chunk routes with
+no server edit.
+
+Three details are decisions, not defaults. The route shape is
+`/<file name>`, which is what every shell already asks for, so adopting it
+moves no HTML. Content types come from a short fixed table (`.js`/`.mjs`,
+`.css`, `.json`, `.html`); anything else is not served, because
+`serve_build` serves a *build*, not a directory. And an artifact the build
+named but did not write **stops the server at boot**, naming the file and
+the leg, rather than 404ing for the life of the process.
+
+Freshness is its dev-mode policy: under `vilan run --watch`
+([`is_watching`](#stdwatch)) each asset is re-read per request, so a
+rebuild is served without a restart; otherwise the copy read at boot is
+served from memory.
 
 A **streaming** response holds the connection open: once the status and
 headers are written, `on_open` receives the live `ResponseStream` and
@@ -156,6 +182,7 @@ side: [Services & RPC](../guide/services.md) and the
 ```vilan,fragment
 fun exists(path: str): bool                     // sync
 fun read_file_to_str(path: str): str            // async, UTF-8
+fun read_file_to_str_sync(path: str): str       // sync, UTF-8 — blocks the event loop
 fun read_bytes(path: str): Bytes                // async, true binary read
 fun write_file(path: str, contents: str)        // async
 fun read_dir(path: str): List<str>              // async, entry NAMES, flat (v1)
@@ -171,7 +198,40 @@ struct Stat {
 failure, missing path included — the same posture `read_file_to_str` always
 had. `stat` alone is a non-throwing probe: it exists to let a caller ask
 "is this here yet, and what does it look like" (a poller's use case), so a
-missing path is `None`, not a thrown exception.
+missing path is `None`, not a thrown exception. Prefer the async read; the
+sync one exists for a read that must complete inside a callback that cannot
+suspend — `serve_build`'s dev-mode revalidation is the case it was added
+for.
+
+## std::build
+
+What a browser leg's build emitted, as the build itself knows it — the
+value that lets a server stop restating `"dist/client.js"` from memory.
+
+```vilan,fragment
+struct LegBuild {
+	leg: str,               // `client`, for `[entry.client]`
+	dist: str,              // where its artifacts live — `dist`
+	bundle: str,            // `client.js`
+	styles: Option<str>,    // `client.css`, or None if the leg compiled no styles
+	chunks: List<str>,      // route chunks, empty unless the leg splits
+	classic_script: bool,   // true exactly when it splits
+}
+
+fun build_of(leg: str): Result<LegBuild, BuildError>   // async
+fun require_build(leg: str): LegBuild                  // async; stops if it can't
+```
+
+`build_of` reads `dist/<leg>.chunks.json`, which every build of a browser
+leg writes. A leg that was never built is `Err(BuildError::NotBuilt)` and
+not an empty build — the manifest's presence is the difference, which is
+why it is written even when the leg does not split. `require_build` is the
+boot idiom: a server that cannot describe its own build has nothing to
+serve, so it stops with the error's message instead of starting.
+
+`LegBuild::artifacts()` gives `(url, file)` pairs — `("/client.js",
+"dist/client.js")` — in serving order. `std::http`'s
+[`serve_build`](#stdhttp-the-server) is the consumer that makes them routes.
 
 ## std::process
 
@@ -182,14 +242,24 @@ fun exit(code: i32)
 fun scan(): str                  // read a line from stdin
 ```
 
+Server-side hot-swapping of code is not a thing
+here and is not planned — the node leg restarts.
+
 A completed `main` ends the process; long-lived programs must hold it open
 (a listening server does; a socket-holding client needs an explicit wait).
 
 ## std::watch
 
 ```vilan,fragment
+fun is_watching(): bool     // is this a `vilan run --watch` child?
 fun force_refresh(): void   // ask every connected browser to reload once
 ```
+
+`is_watching()` is defined under every run and is `true` only under
+`vilan run --watch`, so a program branches on it without knowing how it
+was started. It is about *data* freshness, not code: `serve_build` uses it
+to revalidate its assets per request while watching, and a hand-rolled
+server can do the same.
 
 The process layer's dev-mode surface (`dev-refresh.md` §5 item 2) — the
 manual channel for a hand-rolled server's own freshness: re-read whatever
