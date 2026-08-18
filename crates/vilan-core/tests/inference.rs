@@ -11677,9 +11677,10 @@ fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
 // §17.2): a bare `ret` in a value-returning function used to report the
 // same root cause twice (once at the `ret`, once at the synthesized void
 // tail after it — both correctly anchored since S3's parser fix, which is
-// what made the duplicate visible enough to fix). The tail-construction
-// site now knows a preceding `ret` already diverged and skips its own
-// redundant constraint, so only the `ret`'s own check fires.
+// what made the duplicate visible enough to fix). B124 (§17.7) generalized
+// the dedup: `check_return_position` asks whether the last statement
+// DIVERGES, of which "is a `ret`" is one case, so only the `ret`'s own
+// check fires.
 #[test]
 fn a_bare_ret_no_longer_duplicates_the_synthesized_tail_diagnostic() {
     let source = r#"
@@ -11723,6 +11724,460 @@ fn a_mistyped_ret_value_no_longer_duplicates_the_synthesized_tail_diagnostic() {
         }
         "#,
         "Expected i32, but got",
+    );
+}
+
+// --- B124: a branch that LEAVES contributes no tail value (editing-dx.md
+// §17.7). Every pin below reproduced `Expected str, but got void instead.`
+// against complete code before the fix, because each branch unified on its
+// own synthesized void tail rather than on the `ret` that actually left.
+
+// The item's own shape: an exhaustive `if`/`else` where every branch is a
+// bare `ret`. The whole `if` is the function's tail, so the false mismatch
+// landed on the `if` itself.
+#[test]
+fn an_exhaustive_if_else_of_bare_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "positive\nnon-positive\n",
+    );
+}
+
+// The chained spelling — `else if` legs are branches of the same `if`, and
+// each one has to be asked about divergence separately.
+#[test]
+fn an_if_else_if_else_chain_of_bare_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else if value < 0 {
+        		ret "negative";
+        	} else {
+        		ret "zero";
+        	}
+        }
+
+        fun main() {
+        	print(classify(3));
+        	print(classify(-3));
+        	print(classify(0));
+        }
+        "#,
+        "positive\nnegative\nzero\n",
+    );
+}
+
+// Nesting: an outer branch whose own body is an exhaustive `if`/`else` of
+// `ret`s leaves too — the divergence question recurses rather than stopping
+// at the first level.
+#[test]
+fn a_nested_if_else_of_bare_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		if value > 10 {
+        			ret "big";
+        		} else {
+        			ret "small";
+        		}
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(20));
+        	print(classify(2));
+        	print(classify(-2));
+        }
+        "#,
+        "big\nsmall\nnon-positive\n",
+    );
+}
+
+// A plain block of `ret`s in tail position: no `if` at all, so this one is
+// carried by `check_return_position`'s own divergence question rather than
+// by the branch merge.
+#[test]
+fn a_block_of_rets_in_tail_position_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	{
+        		ret "positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        }
+        "#,
+        "positive\n",
+    );
+}
+
+// The `match` spelling of the same mistake: every leg's body is a block
+// whose tail is the synthesized void after its `ret`, so the leg
+// unification made the whole match `void`.
+#[test]
+fn a_match_whose_every_leg_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	match value {
+        		0 => {
+        			ret "zero";
+        		},
+        		_ => {
+        			ret "other";
+        		},
+        	}
+        }
+
+        fun main() {
+        	print(classify(0));
+        	print(classify(7));
+        }
+        "#,
+        "zero\nother\n",
+    );
+}
+
+// Mixed: one branch leaves, the other yields. The `if` is the yielded
+// type — `Never` yields in `reconcile_type` — where before the fix the
+// leaving branch's void won the merge and the whole `if` typed as void.
+#[test]
+fn an_if_branch_that_rets_beside_one_that_yields_takes_the_yielded_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		"non-positive"
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "positive\nnon-positive\n",
+    );
+}
+
+// The `match` twin of the mixed shape, which before the fix reported the
+// missing return AND a bogus `match legs have mismatched types: expected
+// void, but got str` on the leg that was right.
+#[test]
+fn a_match_leg_that_rets_beside_one_that_yields_takes_the_yielded_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	match value {
+        		0 => {
+        			ret "zero";
+        		},
+        		_ => "other",
+        	}
+        }
+
+        fun main() {
+        	print(classify(0));
+        	print(classify(7));
+        }
+        "#,
+        "zero\nother\n",
+    );
+}
+
+// The same merge in VALUE position rather than return position: a `let`
+// bound to an `if` one of whose branches leaves the enclosing function.
+#[test]
+fn a_diverging_if_branch_in_a_let_takes_the_live_branchs_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	let label = if value > 0 {
+        		ret "early";
+        	} else {
+        		"other"
+        	};
+        	label
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "early\nother\n",
+    );
+}
+
+// The STATEMENT spelling (a trailing `;` on the `if`), where the body's
+// tail is the parser's synthesized void rather than the `if` itself: the
+// tail is dead code after a last statement that leaves, so holding it to
+// the declared type was §17.2's `ret`-only dedup missing its general case.
+#[test]
+fn a_last_statement_if_that_diverges_leaves_no_tail_to_check() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	let doubled = value * 2;
+        	if doubled > 0 {
+        		ret "positive";
+        	} else {
+        		ret "non-positive";
+        	};
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "positive\nnon-positive\n",
+    );
+}
+
+// The same, for a `match` — the shape that forced the check to resolve
+// time: at walk time a `match` is not yet in `expr_id_to_expr_map` (it is
+// inserted by `resolve_match`), so a walk-time divergence question cannot
+// see this one leave at all.
+#[test]
+fn a_last_statement_match_that_diverges_leaves_no_tail_to_check() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	match value {
+        		0 => {
+        			ret "zero";
+        		},
+        		_ => {
+        			ret "other";
+        		},
+        	};
+        }
+
+        fun main() {
+        	print(classify(0));
+        	print(classify(7));
+        }
+        "#,
+        "zero\nother\n",
+    );
+}
+
+// The async instance of the same function: the inferred-async pass runs
+// over the same tail, and the false mismatch reproduced there too.
+#[test]
+fn an_async_function_whose_tail_is_an_if_else_of_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+
+        fun classify(value: i32): str {
+        	sleep(1);
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        }
+        "#,
+        "positive\n",
+    );
+}
+
+// A closure whose body is an exhaustive `if`/`else` of value-`ret`s. The
+// FALSE mismatch on the closure is gone; ret-checking.md §4's deliberate
+// guidance ("make the ret'd value the body's tail" — the conservative rule
+// that avoids the diverging-tail swamp) is untouched, since B124 does not
+// reopen closure return inference.
+#[test]
+fn a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance() {
+    let source = r#"
+        fun run(f: |i32| str): str {
+        	f(1)
+        }
+
+        fun main() {
+        	run(|value| {
+        		if value > 0 {
+        			ret "positive";
+        		} else {
+        			ret "non-positive";
+        		}
+        	});
+        }
+        "#;
+    assert_fails_without(source, "Expected str, but got void instead.");
+    assert_fails_with(
+        source,
+        "the closure's body ends without a value, but this `ret` returns one",
+    );
+}
+
+// The boundary that `tail_yields_no_value` guards: a closure whose body
+// leaves by BARE `ret`s yields nothing, exactly as a void-tailed one does,
+// so rule 4's bare-`ret` leg must stay silent rather than newly complain
+// that the body "yields never".
+#[test]
+fn a_closure_whose_body_is_an_if_else_of_bare_rets_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run(f: |i32|) {
+        	f(1);
+        }
+
+        fun main() {
+        	run(|value| {
+        		if value > 0 {
+        			ret;
+        		} else {
+        			ret;
+        		}
+        	});
+        	print("done");
+        }
+        "#,
+        "done\n",
+    );
+}
+
+// --- B124's negatives: the missing-return diagnostics the fix must NOT
+// weaken. `expr_diverges` needs EVERY path out to leave, so anything that
+// can fall through is still diagnosed.
+
+// No `else`, so the `if` falls through — regime 2's wording, unchanged.
+#[test]
+fn an_if_with_no_else_of_rets_still_reports_the_missing_return() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// One branch leaves, the other reaches its end without a value: the `if`
+// still merges to void, and the missing return is still a real mistake.
+#[test]
+fn an_if_branch_that_rets_beside_one_that_falls_through_still_reports() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		let ignored = 1;
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead.",
+    );
+}
+
+// A live branch whose value is the WRONG type, beside a leaving one: the
+// leaving branch yields in the merge, so the mismatch is the live branch's
+// own and is still reported against the declared type.
+#[test]
+fn a_wrongly_typed_branch_beside_a_ret_branch_is_still_diagnosed() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		5
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
+    );
+}
+
+// A `ret` whose VALUE is wrong inside an otherwise-exhaustive `if`/`else`:
+// each `ret` still owns its own return-position constraint, which is the
+// whole reason the unreachable tail after it needs no second check.
+#[test]
+fn a_mistyped_ret_inside_an_exhaustive_if_else_is_still_diagnosed() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret 5;
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
     );
 }
 
