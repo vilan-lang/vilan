@@ -18217,36 +18217,21 @@ impl<'src> Analyzer<'src> {
                     {
                         self.expected_types.insert(expr_id, return_type_id);
                         self.return_sites.push((id, expr_id));
-                        // P28 dedup (editing-dx.md §17.2; deferred at §16 as
-                        // needing "the tail-construction site to know a
-                        // preceding `ret` already diverged"): when the
-                        // block's own last STATEMENT is itself a `ret`,
-                        // that `ret`'s own return-position check (pushed at
-                        // its construction site, below) already reports
-                        // whatever is wrong with this function's return
-                        // value — the synthesized void tail after it is
-                        // unreachable, and checking IT too is B5's "second
-                        // diagnostic that adds no information", not a
-                        // second mistake. Narrow on purpose: a `ret` is the
-                        // one statement shape that already owns an
-                        // independent `Constraint::ReturnType` of its own: a
-                        // last statement that diverges some OTHER way (a
-                        // `jump`, an exhaustive `if`/`match`) raises a
-                        // different, unfiled question about the TAIL's own
-                        // inferred type and is left alone.
-                        let tail_is_reachable = !last_statement_id.is_some_and(|statement_id| {
-                            matches!(
-                                self.expr_id_to_expr_map.get(&statement_id),
-                                Some(Expr::FunctionReturn(_))
-                            )
+                        // The synthesized void tail after a last statement that
+                        // LEAVES is unreachable, and checking it draws a second
+                        // diagnostic that adds no information (P28's duplicate,
+                        // editing-dx.md §17.2) or — for an exhaustive
+                        // `if`/`match` of `ret`s — a false one (B124, §17.7).
+                        // The constraint is pushed unconditionally and
+                        // `check_return_position` asks `expr_diverges` instead:
+                        // at walk time a `match` is not yet in
+                        // `expr_id_to_expr_map` (`resolve_match` inserts it), so
+                        // only the resolve-time question can see every way out.
+                        self.constraints.push(Constraint::ReturnType {
+                            body_id: expr_id,
+                            return_type_id,
+                            last_statement_id,
                         });
-                        if tail_is_reachable {
-                            self.constraints.push(Constraint::ReturnType {
-                                body_id: expr_id,
-                                return_type_id,
-                                last_statement_id,
-                            });
-                        }
                     }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(
@@ -21833,39 +21818,62 @@ impl<'src> Analyzer<'src> {
             // miscompiled the call to its trait's abstract body (B17). Without
             // a final `else` the `if` is a statement, so it is void.
             Expr::If(branch) => {
-                // Every branch's trailing expression id, in source order.
-                fn trailing_ids(branch: &ExprIfBranch, out: &mut Vec<Id>) {
+                // Every branch's BODY — statement list and trailing expression
+                // — in source order. The statements come along because they
+                // decide whether the trailing expression is reached at all
+                // (B124, below).
+                fn branch_bodies(branch: &ExprIfBranch, out: &mut Vec<(Vec<Id>, Id)>) {
                     match branch {
-                        ExprIfBranch::If(_, (_, trailing), next) => {
-                            out.push(*trailing);
+                        ExprIfBranch::If(_, (statements, trailing), next) => {
+                            out.push((statements.clone(), *trailing));
                             if let Some(next) = next {
-                                trailing_ids(next, out);
+                                branch_bodies(next, out);
                             }
                         }
-                        ExprIfBranch::Else((_, trailing)) => out.push(*trailing),
+                        ExprIfBranch::Else((statements, trailing)) => {
+                            out.push((statements.clone(), *trailing))
+                        }
                     }
                 }
                 if if_branch_has_final_else(branch) {
-                    let mut trailings = Vec::new();
-                    trailing_ids(branch, &mut trailings);
+                    let mut bodies = Vec::new();
+                    branch_bodies(branch, &mut bodies);
                     // The `if`'s type is the unification of its branches; infer
                     // each against the constraint so each branch's tail directs
                     // its own inference (the branches must agree, checked
                     // elsewhere). An unresolved branch defers the whole `if`.
-                    let mut result = Type::Unknown;
-                    for trailing in trailings {
-                        // Seed each branch tail's expectation (the `match`/call
-                        // binding channel), then infer it against the constraint.
-                        self.seed_expectation(trailing, &constraint);
-                        let branch_type = self.infer_type_inner(
-                            trailing,
-                            &constraint,
-                            substitution_context,
-                            exprs_seen,
-                        );
-                        if matches!(branch_type, Type::Unresolved) {
-                            return Type::Unresolved;
-                        }
+                    // `Never` is the merge's identity — it YIELDS to the other
+                    // side in `reconcile_type` — so an `if` every branch of
+                    // which leaves types as `never`, not as the `Unknown` seed.
+                    let mut result = Type::Never;
+                    for (statements, trailing) in bodies {
+                        // A branch that definitely LEAVES contributes no value
+                        // to the merge (B124): control never reaches its
+                        // trailing expression, which for a branch ending in a
+                        // bare `ret` is the parser's synthesized void. Unifying
+                        // on that void is what typed an exhaustive `if`/`else`
+                        // of bare `ret`s as `void` and drew a false
+                        // `Expected T, but got void` over complete code; the
+                        // branch's real contribution is the `Type::Never` the
+                        // `ret` itself already infers as.
+                        let branch_type = if self.block_diverges(&statements, trailing) {
+                            Type::Never
+                        } else {
+                            // Seed each branch tail's expectation (the
+                            // `match`/call binding channel), then infer it
+                            // against the constraint.
+                            self.seed_expectation(trailing, &constraint);
+                            let inferred = self.infer_type_inner(
+                                trailing,
+                                &constraint,
+                                substitution_context,
+                                exprs_seen,
+                            );
+                            if matches!(inferred, Type::Unresolved) {
+                                return Type::Unresolved;
+                            }
+                            inferred
+                        };
                         result = match self.reconcile_type(
                             &result,
                             &branch_type,
@@ -21877,7 +21885,7 @@ impl<'src> Analyzer<'src> {
                             // type — diagnosis is the checker's job, not this
                             // inference's.
                             None => {
-                                if matches!(result, Type::Unknown) {
+                                if matches!(result, Type::Unknown | Type::Never) {
                                     branch_type
                                 } else {
                                     result
@@ -25391,6 +25399,26 @@ impl<'src> Analyzer<'src> {
         {
             return ReturnPositionCheck::Matched;
         }
+        // B124 (editing-dx.md §17.7): a body that definitely LEAVES has no
+        // value in this position to check. Every path out of it is a `ret`,
+        // each of which already carries its own `Constraint::ReturnType`, so
+        // the value that actually leaves is checked where it is written — and
+        // the tail after it is unreachable. Two shapes reach here: the body
+        // ITSELF diverges (a `{ ret ..; }` block in tail position — an
+        // exhaustive `if`/`match` of `ret`s already infers as `Type::Never`
+        // and reconciled above), or the block's last STATEMENT diverges and
+        // the parser's synthesized void tail after it is dead code. The second
+        // subsumes §17.2's `ret`-only dedup at the tail-construction site: a
+        // `jump`, or an exhaustive `if`/`match` of `ret`s, leaves exactly the
+        // same way and left the same false "ends without producing a value"
+        // behind. Nothing is weakened — `expr_diverges` needs EVERY path to
+        // leave, so a body with any fall-through still reaches the diagnostics
+        // below.
+        if self.expr_diverges(body_id)
+            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id))
+        {
+            return ReturnPositionCheck::Matched;
+        }
         // S3 (editing-dx.md §3.6-3.7): a body that ends WITHOUT PRODUCING A
         // VALUE is a distinct mistake from an ordinary type mismatch — the
         // parser's synthesized `Expr::Void` tail is the marker (nothing else
@@ -26224,11 +26252,19 @@ impl<'src> Analyzer<'src> {
         if matches!(tail_type, Type::Unresolved | Type::Unknown) {
             return Resolution::Deferred;
         }
-        let tail_is_void = matches!(tail_type, Type::Void);
+        // A tail that DIVERGES yields no value either (B124 made an `if`/`match`
+        // of `ret`s in tail position type as `never` rather than `void`), so
+        // rule 4's void-tail rules apply to it unchanged: the conservative
+        // "make the ret'd value the body's tail" guidance is what
+        // ret-checking.md §4 settled to avoid the diverging-tail swamp, and
+        // B124 does not reopen it. Reading `never` as a produced value would
+        // instead have rejected a bare `ret` for "exiting a closure whose body
+        // yields never".
+        let tail_yields_no_value = matches!(tail_type, Type::Void | Type::Never);
         for (span, value_id) in rets {
             match value_id {
                 None => {
-                    if !tail_is_void {
+                    if !tail_yields_no_value {
                         let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
                         self.diagnostics.push(Error { note: None,
                             span: *span,
@@ -26243,7 +26279,7 @@ impl<'src> Analyzer<'src> {
                     if matches!(value_type, Type::Unresolved) {
                         return Resolution::Deferred;
                     }
-                    if tail_is_void && !matches!(value_type, Type::Void) {
+                    if tail_yields_no_value && !matches!(value_type, Type::Void) {
                         self.diagnostics.push(Error { note: None,
                             span: *span,
                             msg: "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail"
@@ -26938,10 +26974,22 @@ impl<'src> Analyzer<'src> {
             let leg_constraint = expected
                 .map(|type_id| type_id.get_type(self))
                 .unwrap_or(Type::Unknown);
-            let body_type = self.infer_type(*body_id, &leg_constraint, &HashMap::default());
-            if matches!(body_type, Type::Unresolved) {
-                return Resolution::Deferred;
-            }
+            // A leg that definitely LEAVES contributes no value to the merge
+            // (B124), the same way an `if` branch that leaves does: its body's
+            // tail is the synthesized void control never reaches, so unifying
+            // on it made an all-`ret` match `void` — and made a `ret` leg
+            // beside a value leg report `match legs have mismatched types`.
+            // `Type::Never` yields in `reconcile_type`, so the live legs decide
+            // the match's type and an all-diverging match is `never`.
+            let body_type = if self.expr_diverges(*body_id) {
+                Type::Never
+            } else {
+                let inferred = self.infer_type(*body_id, &leg_constraint, &HashMap::default());
+                if matches!(inferred, Type::Unresolved) {
+                    return Resolution::Deferred;
+                }
+                inferred
+            };
             unified = Some(match unified {
                 None => body_type,
                 Some(current) => {

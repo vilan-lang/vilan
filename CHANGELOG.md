@@ -6,6 +6,18 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**A function whose every path ends in `ret` is no longer told it forgot to return a value.** `fun classify(n: i32): str { if n > 0 { ret "positive"; } else { ret "non-positive"; } }` — complete code, every branch leaving with a `str` — reported `Expected str, but got void instead.` across the whole `if`. So did the `else if` chain, the nested form, the `match` whose every leg `ret`s, and the same shapes written as a statement with a trailing `;`.
+
+A `ret` is a statement, not a value, so a branch that ends in one has nothing left over for the block's tail — and the parser fills that gap with a synthesized void. Branch unification then merged those synthesized voids instead of noticing that no branch reached the merge at all, and the `if` came out `void` no matter what the `ret`s carried. A branch that definitely leaves now contributes `never`, the type the `ret` itself already has, which yields to whatever the other branches produce: an `if`/`match` all of whose branches leave is `never` and reconciles with any declared return type, and one where a single branch leaves takes the *other* branch's type. That last case fixes a second wrong answer of the same shape — `if n > 0 { ret "positive"; } else { 5 }` reported the mismatch as `got void`, blaming the merge, where it now reads `got i32` and points at the branch that is actually wrong.
+
+The reachability question moved to the same place. A body whose last statement leaves — by `ret`, by `jump`, or by an exhaustive `if`/`match` of them — has an unreachable tail, and that tail is no longer checked, which generalizes the narrower `ret`-only rule that already suppressed the duplicate diagnostic after a bare `ret`.
+
+Nothing that can fall through is affected: an `if` with no `else`, a branch that ends without a value beside one that `ret`s, and a `ret` carrying the wrong type are all still reported exactly as before. Closure return inference is deliberately untouched — a closure still asks for the ret'd value as its body's tail.
+
+---
+
 ## v0.34.0 — 2026-08-12
 
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.

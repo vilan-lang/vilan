@@ -2194,3 +2194,65 @@ added (§16). The standing `#[ignore]`d pin
 (`missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed`)
 is left exactly as §16 shipped it — untouched, not re-verdicted, not
 touched by any commit in this lane.
+
+### 17.7 B124 — a branch that leaves contributes no tail value — SHIPPED
+
+The live bug §17.2 recorded rather than fixed in passing, root-caused: the
+analyzer already had the whole divergence vocabulary
+(`expr_diverges`/`block_diverges`/`if_diverges`, `analyzer.rs:9455-9483`,
+and `Expr::FunctionReturn(_) | Expr::Jump(_) => Type::Never` in
+`infer_type_path`), and the merges that decide a branching expression's
+type simply never asked it. `infer_type_path`'s `Expr::If` arm collected
+only each branch's TRAILING id and unified those — for a branch ending in
+a bare `ret` that trailing is the parser's synthesized `Expr::Void`,
+control never reaches it, and unifying on it made an exhaustive `if`/`else`
+of `ret`s type as `void` regardless of what the `ret`s carried;
+`resolve_match`'s leg unification had the same hole one level down (each
+leg body is a block whose tail is that same synthesized void), which is why
+a `ret` leg beside a value leg ALSO produced a spurious `match legs have
+mismatched types: expected void, but got str`. The fix collects each `if`
+branch's `(statements, trailing)` pair and contributes `Type::Never` when
+`block_diverges` holds (`analyzer.rs:21825-21875`, with the merge seed
+changed from `Type::Unknown` to `Type::Never` — the merge's identity, since
+`reconcile_type`'s `(Never, _)` arm already YIELDS — so an all-diverging
+`if` types as `never` rather than falling out as `Unknown`), and asks
+`expr_diverges` per leg in `resolve_match` (`analyzer.rs:26984`). Both are
+the existing "`ret`/`jump` never produce a value where they stand" rule
+applied at the two places that merge branch values, not a new one.
+
+The second half is reachability. `check_return_position` now returns
+`Matched` when the body itself diverges, or when the block's last STATEMENT
+does and the synthesized void tail after it is dead code
+(`analyzer.rs:25417`) — which subsumes and deletes §17.2's `ret`-only dedup
+at the walk-time tail-construction site (`analyzer.rs:18220`, now an
+unconditional push). It had to move to resolve time: at walk time a `match`
+is not yet in `expr_id_to_expr_map` (`resolve_match` inserts it), so a
+walk-time question cannot see a body leave through one. Nothing is
+weakened — `expr_diverges` requires EVERY path to leave, so an `if` with no
+`else`, a branch that falls through beside one that `ret`s, and a wrongly
+typed `ret` all still report. One diagnostic improved as bycatch: a live
+branch of the wrong type beside a leaving one now reads `got i32` (the
+branch actually at fault) instead of `got void` (the merge).
+
+Closure return inference is deliberately NOT reopened: ret-checking.md §4
+settled the conservative "make the ret'd value the body's tail" rule
+explicitly to avoid the diverging-tail swamp, so `resolve_closure_returns`
+reads a `Never` tail exactly as it reads a `Void` one
+(`tail_yields_no_value`, `analyzer.rs:26263`) and its guidance is unchanged
+— without that, a closure leaving by BARE `ret`s would have been newly
+rejected for "exiting a closure whose body yields never". What the closure
+shape does lose is the FALSE `Expected str, but got void` that used to
+accompany the guidance.
+
+Pins (`crates/vilan-core/tests/inference.rs`): thirteen for the shapes
+fixed — the plain `if`/`else`, the `else if` chain, the nested form, a bare
+block of `ret`s in tail position, the all-`ret` `match`, the mixed
+`if` and mixed `match`, the `let`-bound diverging `if`, the statement
+spellings of the `if` and the `match`, the async instance, the closure's
+lost cascade, and the closure bare-`ret` boundary — all thirteen
+plant-proven red against the reverted analyzer; four for the negatives
+(`if` with no `else`, a fall-through branch beside a `ret`, a wrongly typed
+branch beside a `ret`, a mistyped `ret` inside an exhaustive `if`/`else`),
+plant-proven red against an over-reaching guard (`if true ||` at
+`check_return_position`'s new check, and the narrowed `tail_yields_no_value`
+for the closure pair). Zero corpus golden movement, docs gate green.
