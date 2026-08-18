@@ -1,5 +1,10 @@
 # Method resolution — a deliberate precedence rule (B57)
 
+> **§13 SHIPPED 2026-08-18** — R1, R2 and R3 all landed the day of the
+> ruling; the ship record, including the four places the measurement
+> differed from §13.2's prediction, is **§13.8**. All 13 pins are
+> un-ignored and 10 more were added. What follows is the ruling as given.
+>
 > **§13 RULED 2026-08-18 as recommended** ("Go with B73 as recommended"): Q1 (a) — R1 → R2 → R3 in that order, (b) not taken, (c) stays available as a later additive layer; Q2 yes — the expected type steers among argument-distinct homes; Q3 the std blanket STAYS — deleting it remains an independent simplification (tracked as B127, deferred), not part of B73; Q4 call site; Q5 `9` — a more specific impl takes the trait's default; Q6 in scope — bounds are part of applicability (row 15's pin is one of the thirteen). The fix is scheduled (Order 3, cycle 21); the 13 `b73_*` pins un-ignore as each rule lands. BETA-CRITICAL per beta.md Q2.
 > 
 > Prior status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
@@ -808,8 +813,9 @@ the inherent one (B74), it is OUTRANKED by it (B57).
 
 ## 13. Specificity: the blanket-vs-specific design (B73)
 
-> Status: **DRAFTED 2026-08-18, AWAITING RULING.** Proposal only — no fix
-> ships under this section. §9(6) declined this question ("a specificity
+> Status: **SHIPPED 2026-08-18** (ruled the same day; record at §13.8).
+> Everything below §13.6 is the design as it was written before the fix;
+> §13.8 records what each rule became and where it differed. §9(6) declined this question ("a specificity
 > question, which §3(b) declines"); `trait-objects.md` §15.8(3) left the
 > overlap to it ("Blanket-vs-specific OVERLAP stays legal, and stays
 > B73's"); `spec/types.md` §5.4's implementation note says a specificity
@@ -1221,3 +1227,124 @@ inherent-tier pins. Every pin's program was run through this worktree's
 `target/debug/vilan` first, so each records a measured "today" in its
 comment rather than an assumed one — and each is non-vacuous by
 construction, since today's answer differs from the asserted one.
+
+### 13.8 The ship record (2026-08-18)
+
+Shipped as ruled: (a) with R1 → R2 → R3, three commits, each green on
+`cargo build` + `cargo test -p vilan-core --test inference` + `cargo test
+-p vilan-cli --test corpus` + `cargo test -p vilan-core --test docs`. No
+corpus golden moved at any of the three — the transformer change is a
+filter, and every program whose trait arguments already agreed emits the
+bytes it always did. All 13 pins are un-ignored; 10 more were added for
+shapes the 13 do not cover.
+
+**R1 — the trait's arguments join the key.**
+
+- `ImplMemberCandidate::home_arguments` (analyzer.rs 1472) with
+  `instantiated_home_arguments` (11567): B98's padding
+  (`effective_trait_arguments_of`, 4947 — the `TraitImplSite` version now
+  delegates to it) plus the impl's binders bound from the receiver, so
+  std's blanket reads as `Into<Foo>` on a `Foo`.
+- `rank_member_candidates` (11611) groups candidates into homes by
+  `(trait, arguments)` with `same_impl_types`, keeps §3/§4's
+  `AmbiguousTraits` for two DIFFERENT traits, and reports
+  `AmbiguousTraitArguments` (1496) for two instantiations of one.
+- `bound_dispatch_traits` widened to `(trait, arguments)` (2562, 31277);
+  `resolve_member_on_trait_impl` (transformer.rs 6172) filters through
+  `trait_instantiation_conflicts` (6018) / `nominally_different` (6047).
+- Pins un-ignored: rows 2 and 20 — both silent miscompiles, so no clean
+  compile in this family produces a wrong answer after R1 alone.
+- New pins: `b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them`,
+  `b73_two_bounds_at_different_arguments_each_reach_their_own_impl`,
+  `b73_an_impl_whose_trait_argument_is_its_own_binder_survives_the_filter`.
+- Diagnostics-ledger row 213.
+
+**R2 — the expected type selects among argument-distinct homes.**
+
+- `select_home_by_expected_type` (11901) with `member_return_type_for`
+  (11942), consulted at `resolve_method_call` (25234) before the
+  ambiguity is reported. The expectation is read from `expected_types`,
+  which an annotated `let`, a declared return type and a `ret` already
+  seed.
+- `bind_trait_qualified_call` (24474) collects every provider of the
+  named trait instead of taking the first, and asks the same selector.
+- `static_path_candidates` (11327) drops `self`-method candidates when
+  the path head IS a trait: a blanket impl's generic subject
+  `compare_type`s the bare trait type, so `Into::into` was answered as
+  though it were an attached static and never reached §3.1's re-point.
+  Attached statics (`Iterator::from_fn`) are untouched.
+- Pins un-ignored: rows 1, 3, 5, 6/7, 18/19.
+- New pin: `b73_an_expectation_matching_no_home_leaves_the_call_ambiguous`.
+
+**R3 — specificity ranks a genuine overlap.**
+
+- Applicability (Q6): `applicable_candidates` (11517) / `impl_bounds_hold`
+  (11538) drop an impl whose binder bounds the receiver does not satisfy.
+  The filter narrows and never empties — when nothing applies the
+  unfiltered list stands, so a program with only an inapplicable impl
+  keeps the bound diagnostic it has always had.
+- Subsumption: `impl_subject_matches` (11715), the directional match
+  `compare_type` cannot be; `subject_bounds_are_stronger` (11783) for
+  equal shapes; `impl_outranks` (11810); `impls_rank_equally` (11833)
+  keeps §2's platform-twin shape out of the ambiguity;
+  `most_specific_in_home` (11863) takes the maxima and reports the
+  residue as `AmbiguousImpls` (1501) at the call site (Q4).
+- Row 17 (Q5, ruled `9`): `inheriting_impls_of_declared_homes` (11459)
+  adds an impl that takes its trait's DEFAULT as a candidate — but only
+  into a home a declaring impl already occupies, so §3's
+  declaration-over-default tier and Gap E's fallback are untouched. The
+  winner is returned as `FoundInheritedDefault` (1506) and rides Gap E's
+  re-dispatch channel (25287).
+- Pins un-ignored: rows 9/10, 11/12, 13/14, 15, 17, 21/22.
+- New pins: `b73_two_impls_bounded_by_unrelated_traits_are_an_unrankable_overlap`,
+  `b73_an_inapplicable_impl_that_is_the_only_one_still_reports_its_bound`,
+  `b73_an_applicable_impl_wins_whichever_side_of_the_inapplicable_one_it_sits`,
+  `b73_an_inherent_member_still_outranks_the_most_specific_trait_impl`,
+  `b73_a_blanket_declaring_nothing_leaves_the_specific_impl_alone`,
+  `b73_a_conditional_impl_does_not_satisfy_a_bound_its_binder_refuses`.
+- Diagnostics-ledger row 214.
+
+#### Where the table's prediction and the measurement differ
+
+- **Rows 18/19 need R1 AND R2**, not R1 alone as §13.5's R1 bullet says.
+  Splitting `Conv<Bar>` and `Conv<Baz>` into two homes is what makes both
+  reachable; *choosing* between two reachable homes on one receiver is
+  precisely what an expected type is for, and R1 has no other instrument.
+  R1 alone turns rows 18/19 from "the first-declared, silently" into a
+  report — better, not fixed.
+- **Rows 6/7 close under R2, not R3** as §13.4(a) implies. A user's
+  `impl type T with Conv<T>` instantiates as `Conv<Foo>` against the
+  specific impl's `Conv<Bar>`, so the two are argument-distinct HOMES and
+  the annotation settles them before specificity is consulted. Rows
+  21/22, whose `Tag` takes no arguments, are the shape that genuinely
+  exercises R3's subsumption order.
+- **Row 5's mechanism is not the one §13.3 describes.** `Into::into(foo)`
+  never reached §3.1's re-point: the static path head resolved it
+  directly to the blanket's `into`, because an impl with a GENERIC
+  subject `compare_type`s `Type::Trait(Into, [])` itself. Two repairs
+  were needed, not one.
+- **`spec/types.md` §5.4's second implementation note (Q6's other side)
+  was already stale, for reasons unrelated to this arc.** Its own
+  example — `List<B>` satisfying a `Marker` bound via
+  `impl List<type T: Marker>` when `B` lacks `Marker` — measures as
+  REJECTED with R3's applicability step planted out, because bound
+  satisfaction goes through `type_implements_trait`, which asks
+  `compare_type`, which resolves a bounded binder to its constraint. The
+  note is rewritten and the claim is now pinned
+  (`b73_a_conditional_impl_does_not_satisfy_a_bound_its_binder_refuses`);
+  the derive-checks sentence it carried stands unchanged.
+
+#### Deferred
+
+- **An unranked home inside a multi-home call is represented by its first
+  maximum rather than reported.** `rank_member_candidates` (11671) hands
+  R2 one representative per home; if R2 then selects a home whose impls
+  R3 could not rank, the first maximum answers instead of the ambiguity
+  R3 would raise for that home alone. It takes a program with BOTH an
+  argument-distinct split AND an unrankable overlap inside one of the
+  halves; the tree contains none, and none of the 24 rows is that shape.
+- **B127 (delete the std `Into<T>` blanket) stays deferred**, per the Q3
+  ruling. Nothing here depends on the blanket existing or not.
+- **(c), the definition-site hybrid, remains available** as the purely
+  additive layer §13.5 describes: R3's residue is exactly the pair set
+  (c) would refuse early instead.

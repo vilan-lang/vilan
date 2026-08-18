@@ -1451,7 +1451,7 @@ pub struct Implementation<'src> {
 /// One impl-declared candidate for `receiver.member` — a member some impl of
 /// the receiver's type declares, before precedence picks between them
 /// (`proposal/method-resolution.md` §3).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ImplMemberCandidate {
     member_id: Id,
     /// The declaring impl's subject, to reconcile against the receiver so the
@@ -1460,6 +1460,22 @@ struct ImplMemberCandidate {
     /// The trait the name comes from, or `None` when the member is INHERENT —
     /// the type's own, outranking every trait-provided candidate.
     home_trait: Option<Id>,
+    /// The home trait's arguments AS THIS RECEIVER INSTANTIATES THEM — std's
+    /// `impl type T with Into<T>` reached through a `Foo` is `Into<Foo>`, a
+    /// user's `impl Foo with Into<str>` is `Into<str>`. Empty for an inherent
+    /// member and for a trait with no parameters.
+    ///
+    /// Half of B73's R1 resolution key: the trait id alone made those two one
+    /// home, so `homes.len()` was 1, no ambiguity was raised, and declaration
+    /// order decided which body a call reached (`method-resolution.md` §13.3,
+    /// defect D1).
+    home_arguments: Vec<TypeId>,
+    /// Whether the providing impl takes the home trait's DEFAULT body rather
+    /// than declaring the member itself. Such an impl contributes a candidate
+    /// only where a declaring impl already occupies its home, so R3 can rank
+    /// the two (§13.2 row 17): the more specific impl wins and brings its
+    /// inherited default with it.
+    inherits_the_default: bool,
 }
 
 /// How `receiver.member` resolves against the impls whose subject matches
@@ -1472,6 +1488,22 @@ enum ImplMemberResolution {
     /// them: the call has to name one (`Trait::member(receiver)`). Carries the
     /// competing traits, in declaration order.
     AmbiguousTraits(Vec<Id>),
+    /// ONE trait provides the name at two or more distinct instantiations —
+    /// `Into<Foo>` and `Into<str>` for this receiver (B73's R1 key). §3.1's
+    /// `Trait::member` disambiguator has no argument slot, so naming the trait
+    /// settles nothing; the call is reported. Carries one candidate per home,
+    /// in declaration order.
+    AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
+    /// Two or more impls of ONE home that the specificity order does not rank
+    /// — `Box<type T: Display>` against `Box<type U: Ord>` for a `Box<i32>`
+    /// that satisfies both (§13.4(a)(3), reported at the call site per §13.6
+    /// Q4). Carries the unranked maxima, in declaration order.
+    AmbiguousImpls(Vec<ImplMemberCandidate>),
+    /// The winner takes the home trait's DEFAULT body (§13.2 row 17): the
+    /// member is the trait's own declaration, so the call re-dispatches through
+    /// the same channel Gap E's inherited defaults use. Carries the member, the
+    /// winning impl's subject, and the home as this receiver instantiates it.
+    FoundInheritedDefault(Id, TypeId, Id, Vec<TypeId>),
     Missing,
 }
 
@@ -2518,11 +2550,16 @@ pub struct Analyzer<'src> {
     // the operand's own span covers `e` alone.
     spread_spans: HashMap<Id, Span>,
     // The trait a bound call resolved through (`value.tag()` where `T: Marker`
-    // found `tag` in `Marker`), keyed by call id. The OnConstraint emission
+    // found `tag` in `Marker`), keyed by call id, WITH the arguments the bound
+    // wrote (`T: Conv<Baz>` -> `[Baz]`; empty for an unparameterized trait or
+    // where the site knows only the trait). The OnConstraint emission
     // dispatches on THAT trait's surface — override, else default — so an
     // inherent method sharing the name can't shadow the trait member the
-    // analyzer typed against.
-    bound_dispatch_traits: HashMap<Id, Id>,
+    // analyzer typed against, and on THAT instantiation, so a bound written
+    // `Conv<Baz>` cannot re-dispatch into an `impl .. with Conv<Bar>` that
+    // merely registered first (B73's R1; `method-resolution.md` §13.2 row 20 —
+    // the type confusion).
+    bound_dispatch_traits: HashMap<Id, (Id, Vec<TypeId>)>,
     prepped_trait_impls: Vec<TraitImplCheck<'src>>,
     // Every `impl Subject with Trait` clause whose trait resolved, recorded as
     // the (trait, subject) pair the coherence rule is keyed on (B98). Consumed
@@ -4900,25 +4937,40 @@ impl<'src> Analyzer<'src> {
     /// `impl Bag with Combine` and `impl Bag with Combine<Bag>` would compare as
     /// different instantiations of the one they both are.
     fn effective_trait_arguments(&self, site: &TraitImplSite) -> Vec<TypeId> {
-        let Some(trait_) = self.traits.get(&site.trait_id) else {
-            return site.arguments.clone();
+        self.effective_trait_arguments_of(site.trait_id, &site.arguments, site.subject)
+    }
+
+    /// [`effective_trait_arguments`] over the parts rather than a
+    /// [`TraitImplSite`] — the same padding rule, reached from the resolution
+    /// path (B73's R1), which holds an [`Implementation`] and not a check's
+    /// recorded site.
+    fn effective_trait_arguments_of(
+        &self,
+        trait_id: Id,
+        written_arguments: &[TypeId],
+        subject: TypeId,
+    ) -> Vec<TypeId> {
+        let Some(trait_) = self.traits.get(&trait_id) else {
+            return written_arguments.to_vec();
         };
         trait_
             .generic_parameter_constraint_ids
             .iter()
             .enumerate()
-            .map(|(position, declared_id)| match site.arguments.get(position) {
-                Some(written_id) => *written_id,
-                None if matches!(declared_id.get_type(self), Type::Trait(id, _) if id == site.trait_id) => {
-                    site.subject
-                }
-                None => *declared_id,
-            })
+            .map(
+                |(position, declared_id)| match written_arguments.get(position) {
+                    Some(written_id) => *written_id,
+                    None if matches!(declared_id.get_type(self), Type::Trait(id, _) if id == trait_id) => {
+                        subject
+                    }
+                    None => *declared_id,
+                },
+            )
             .chain(
                 // A clause that wrote MORE arguments than the trait declares is
                 // already an arity error elsewhere; keep them so two such
                 // clauses still compare by what they wrote.
-                site.arguments
+                written_arguments
                     .iter()
                     .skip(trait_.generic_parameter_constraint_ids.len())
                     .copied(),
@@ -11216,7 +11268,7 @@ impl<'src> Analyzer<'src> {
 
     /// Resolves a method `member_name` callable on a concrete `subject_type`
     /// (a struct or enum) by searching its implementations.
-    fn method_member_in_impls(&self, subject_type: &Type, member_name: &str) -> Option<Id> {
+    fn method_member_in_impls(&mut self, subject_type: &Type, member_name: &str) -> Option<Id> {
         self.method_member_impl_subject(subject_type, member_name)
             .map(|(member_id, _)| member_id)
     }
@@ -11230,13 +11282,19 @@ impl<'src> Analyzer<'src> {
     /// a caller that wants to tell them apart — and to say so — asks
     /// [`resolve_impl_member`] directly.
     fn method_member_impl_subject(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Option<(Id, TypeId)> {
         match self.resolve_impl_member(subject_type, member_name) {
-            ImplMemberResolution::Found(member_id, impl_subject) => Some((member_id, impl_subject)),
-            ImplMemberResolution::AmbiguousTraits(_) | ImplMemberResolution::Missing => None,
+            ImplMemberResolution::Found(member_id, impl_subject)
+            | ImplMemberResolution::FoundInheritedDefault(member_id, impl_subject, ..) => {
+                Some((member_id, impl_subject))
+            }
+            ImplMemberResolution::AmbiguousTraits(_)
+            | ImplMemberResolution::AmbiguousTraitArguments(_)
+            | ImplMemberResolution::AmbiguousImpls(_)
+            | ImplMemberResolution::Missing => None,
         }
     }
 
@@ -11249,7 +11307,7 @@ impl<'src> Analyzer<'src> {
     /// ([`declaration_order`]), so which candidate a tie names is a property of
     /// the program, not of the order its imports happen to be written in.
     fn method_member_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<ImplMemberCandidate> {
@@ -11267,16 +11325,32 @@ impl<'src> Analyzer<'src> {
     /// `[trait_only]` member is reachable when the path head IS the trait
     /// (access on the trait itself stays allowed, §3.2).
     fn static_path_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
         subject_is_trait: bool,
     ) -> Vec<ImplMemberCandidate> {
-        self.impl_member_candidates(subject_type, member_name, false, subject_is_trait)
+        let candidates =
+            self.impl_member_candidates(subject_type, member_name, false, subject_is_trait);
+        if !subject_is_trait {
+            return candidates;
+        }
+        // `Trait::member(receiver)` for a `self`-method is §3.1's disambiguator,
+        // not a static: which implementation runs is the RECEIVER's to decide,
+        // and the path head falls through to `trait_qualified_calls` to let it.
+        // An impl with a GENERIC subject compare_types the bare trait type,
+        // though, so std's `impl type T with Into<T>` answered the path itself
+        // and `Into::into(foo)` reached the blanket whatever `foo` implements
+        // (`method-resolution.md` §13.2 row 5). A trait's attached statics —
+        // `Iterator::from_fn`, which take no `self` — are untouched.
+        candidates
+            .into_iter()
+            .filter(|candidate| !self.is_self_method(candidate.member_id))
+            .collect()
     }
 
     fn impl_member_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
         methods_only: bool,
@@ -11292,7 +11366,11 @@ impl<'src> Analyzer<'src> {
         let Some(declaring) = self.implementations_by_member.get(member_name) else {
             return Vec::new();
         };
-        let mut candidates: Vec<ImplMemberCandidate> = declaring
+        // `(member, impl subject, home trait, the home's arguments AS WRITTEN)`.
+        // The written arguments are read here, where the declaring impl is in
+        // hand; padding and instantiation happen below, once the immutable
+        // borrow of `implementations_by_member` is released.
+        let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = declaring
             .iter()
             .map(|index| &self.implementations[*index])
             .filter(|implementation| {
@@ -11311,16 +11389,206 @@ impl<'src> Analyzer<'src> {
                     .get(member_name)
                     .copied()
                     .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
-                Some(ImplMemberCandidate {
+                let home_trait = self.member_home_trait(implementation, member_name);
+                let written_arguments = home_trait
+                    .and_then(|trait_id| {
+                        implementation
+                            .trait_args
+                            .iter()
+                            .find(|(id, _)| *id == trait_id)
+                            .map(|(_, arguments)| arguments.clone())
+                    })
+                    .unwrap_or_default();
+                Some((
                     member_id,
-                    impl_subject: implementation.subject,
-                    home_trait: self.member_home_trait(implementation, member_name),
-                })
+                    implementation.subject,
+                    home_trait,
+                    written_arguments,
+                ))
             })
             .collect();
-        candidates.sort_by_key(|candidate| self.declaration_order(candidate.member_id));
-        candidates.dedup_by_key(|candidate| candidate.member_id);
-        candidates
+        found.extend(self.inheriting_impls_of_declared_homes(subject_type, member_name, &found));
+        found.sort_by_key(|(member_id, ..)| self.declaration_order(*member_id));
+        found.dedup_by_key(|(member_id, ..)| *member_id);
+        let candidates: Vec<ImplMemberCandidate> = found
+            .into_iter()
+            .map(
+                |(member_id, impl_subject, home_trait, written_arguments)| ImplMemberCandidate {
+                    member_id,
+                    impl_subject,
+                    home_trait,
+                    home_arguments: match home_trait {
+                        Some(trait_id) => self.instantiated_home_arguments(
+                            subject_type,
+                            trait_id,
+                            &written_arguments,
+                            impl_subject,
+                        ),
+                        None => Vec::new(),
+                    },
+                    inherits_the_default: !self.declares_member(impl_subject, member_id),
+                },
+            )
+            .collect();
+        self.applicable_candidates(subject_type, candidates)
+    }
+
+    /// Whether the impl with this subject DECLARES `member_id` itself, as
+    /// opposed to inheriting it as a trait default (B73 R3, row 17).
+    fn declares_member(&self, impl_subject: TypeId, member_id: Id) -> bool {
+        self.implementations.iter().any(|implementation| {
+            implementation.subject == impl_subject
+                && implementation
+                    .declarations
+                    .values()
+                    .any(|declared| *declared == member_id)
+        })
+    }
+
+    /// The impls that provide `member_name` by taking their trait's DEFAULT body
+    /// — collected only for a home some declaring impl already occupies, so
+    /// R3 can rank them side by side (§13.2 row 17, ruled `9` at §13.6 Q5).
+    ///
+    /// Deliberately NOT every impl that inherits a default: §3's tiers stand, so
+    /// a declaration still beats an unrelated trait's default outright, and Gap
+    /// E's fallback still owns the case where no impl declares the name at all.
+    /// Specificity ranks *inside* one home, and this is the candidate set that
+    /// makes that ranking complete — without it, `impl Foo with Tag { }` beside
+    /// a blanket that declares `tag` contributes nothing and the trait's default
+    /// is unreachable for `Foo` in either declaration order.
+    fn inheriting_impls_of_declared_homes(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        declared: &[(Id, TypeId, Option<Id>, Vec<TypeId>)],
+    ) -> Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> {
+        let homes: Vec<Id> = declared
+            .iter()
+            .filter_map(|(_, _, home_trait, _)| *home_trait)
+            .collect();
+        if homes.is_empty() {
+            return Vec::new();
+        }
+        self.implementations
+            .iter()
+            .filter(|implementation| !implementation.declarations.contains_key(member_name))
+            .filter(|implementation| {
+                self.compare_type(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
+            .filter_map(|implementation| {
+                let trait_id = *implementation
+                    .trait_ids
+                    .iter()
+                    .find(|trait_id| homes.contains(trait_id))?;
+                let member_id = self.method_member_in_trait(trait_id, member_name)?;
+                if !self.member_has_default_body(member_id) {
+                    return None;
+                }
+                let written_arguments = implementation
+                    .trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)
+                    .map(|(_, arguments)| arguments.clone())
+                    .unwrap_or_default();
+                Some((
+                    member_id,
+                    implementation.subject,
+                    Some(trait_id),
+                    written_arguments,
+                ))
+            })
+            .collect()
+    }
+
+    /// B73's R3 applicability step (§13.6 Q6, ruled in scope): an impl whose
+    /// binders carry bounds the receiver does not satisfy does not compete.
+    /// `compare_type` treats a bounded parameter as a hole like any other, so
+    /// `impl Box<type T: Display>` used to win the race on a `Box<Opaque>` and
+    /// then fail its own bound check while an applicable `impl Box<type T>` sat
+    /// below it — §13.2 row 15's false rejection.
+    ///
+    /// The filter narrows the field and never empties it: when nothing applies,
+    /// the unfiltered list stands so the program keeps the bound diagnostic it
+    /// has always had, which is the right message when no impl fits.
+    fn applicable_candidates(
+        &mut self,
+        subject_type: &Type,
+        candidates: Vec<ImplMemberCandidate>,
+    ) -> Vec<ImplMemberCandidate> {
+        let mut applicable: Vec<ImplMemberCandidate> = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            if self.impl_bounds_hold(candidate.impl_subject, subject_type) {
+                applicable.push(candidate.clone());
+            }
+        }
+        match applicable.is_empty() {
+            true => candidates,
+            false => applicable,
+        }
+    }
+
+    /// Whether every bound on the impl subject's binders holds for what this
+    /// receiver binds them to. Only a NOMINAL binding can fail: anything still
+    /// abstract or unresolved is undecided here, and an undecided bound is not
+    /// evidence for dropping a candidate.
+    fn impl_bounds_hold(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
+        let impl_subject_type = impl_subject.get_type(self);
+        let Some((_, bindings)) =
+            self.reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+        else {
+            return true;
+        };
+        bindings.iter().all(|(constraint_id, bound_id)| {
+            let bound = bound_id.get_type(self);
+            if !matches!(bound, Type::Struct(..) | Type::Enum(..)) {
+                return true;
+            }
+            self.generic_bound_trait_ids(*constraint_id)
+                .into_iter()
+                .all(|trait_id| self.type_implements_trait(&bound, trait_id))
+        })
+    }
+
+    /// The home trait's arguments as THIS receiver instantiates them — B73's R1
+    /// key. Two steps, both already shipped elsewhere: pad the `with` clause to
+    /// the trait's arity with its declared defaults, resolving `= Self` to the
+    /// subject (B98's pair key, [`effective_trait_arguments`]); then bind the
+    /// impl's own generic parameters from the receiver and substitute, so std's
+    /// `impl type T with Into<T>` reads as `Into<Foo>` on a `Foo` rather than as
+    /// the abstract `Into<T>` it is written as.
+    ///
+    /// Without the second step every blanket impl in the program would share one
+    /// home with every specific impl of the same trait, which is exactly the
+    /// collapse `method-resolution.md` §13.3 measured.
+    fn instantiated_home_arguments(
+        &mut self,
+        subject_type: &Type,
+        trait_id: Id,
+        written_arguments: &[TypeId],
+        impl_subject: TypeId,
+    ) -> Vec<TypeId> {
+        let effective =
+            self.effective_trait_arguments_of(trait_id, written_arguments, impl_subject);
+        if effective.is_empty() {
+            return effective;
+        }
+        let impl_subject_type = impl_subject.get_type(self);
+        let bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        effective
+            .into_iter()
+            .map(|argument_id| {
+                let argument = argument_id.get_type(self);
+                let resolved = self.substitute_type(&argument, &bindings);
+                resolved.get_type_id(self)
+            })
+            .collect()
     }
 
     /// The precedence rule of `proposal/method-resolution.md` §3, for a
@@ -11328,8 +11596,13 @@ impl<'src> Analyzer<'src> {
     /// unconditionally; two traits providing the same name with no inherent
     /// member above them is an ambiguity the call has to resolve by naming one
     /// (`Trait::member(receiver)`).
-    fn resolve_impl_member(&self, subject_type: &Type, member_name: &str) -> ImplMemberResolution {
-        self.rank_member_candidates(self.method_member_candidates(subject_type, member_name))
+    fn resolve_impl_member(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> ImplMemberResolution {
+        let candidates = self.method_member_candidates(subject_type, member_name);
+        self.rank_member_candidates(candidates)
     }
 
     /// The tiering itself, over an already-collected candidate list — shared by
@@ -11346,26 +11619,346 @@ impl<'src> Analyzer<'src> {
         {
             return ImplMemberResolution::Found(inherent.member_id, inherent.impl_subject);
         }
-        // Tier 2: trait-provided. Two impls of the SAME trait are not an
-        // ambiguity — the name has one home, and only one of them can be live
-        // in a given build (the platform-twin shape, §2).
-        let mut homes: Vec<Id> = Vec::new();
+        // Tier 2: trait-provided. A home is `(trait, the arguments THIS receiver
+        // instantiates)` — B73's R1. Keying on the trait id alone made std's
+        // `impl type T with Into<T>` and a user's `impl Foo with Into<str>` one
+        // home for a `Foo`, so there was one home, no ambiguity was raised, and
+        // `candidates.first()` handed the call to whichever impl registered
+        // first (std, always).
+        let mut homes: Vec<Vec<&ImplMemberCandidate>> = Vec::new();
         for candidate in &candidates {
-            if let Some(trait_id) = candidate.home_trait
-                && !homes.contains(&trait_id)
+            let Some(trait_id) = candidate.home_trait else {
+                continue;
+            };
+            let existing = homes.iter_mut().find(|home| {
+                home[0].home_trait == Some(trait_id)
+                    && self.same_impl_types(
+                        &home[0].home_arguments,
+                        &candidate.home_arguments,
+                        &mut Vec::new(),
+                    )
+            });
+            match existing {
+                Some(home) => home.push(candidate),
+                None => homes.push(vec![candidate]),
+            }
+        }
+        // Two DIFFERENT traits keep §3/§4's verdict and its `Trait::member`
+        // steer. Two instantiations of ONE trait have no such spelling, so they
+        // are reported apart (R2 gives the expected type a chance first).
+        let mut distinct_traits: Vec<Id> = Vec::new();
+        for home in &homes {
+            if let Some(trait_id) = home[0].home_trait
+                && !distinct_traits.contains(&trait_id)
             {
-                homes.push(trait_id);
+                distinct_traits.push(trait_id);
             }
         }
-        if homes.len() > 1 {
-            return ImplMemberResolution::AmbiguousTraits(homes);
+        if distinct_traits.len() > 1 {
+            return ImplMemberResolution::AmbiguousTraits(distinct_traits);
         }
-        match candidates.first() {
-            Some(candidate) => {
-                ImplMemberResolution::Found(candidate.member_id, candidate.impl_subject)
+        // R3: rank the impls WITHIN each home by specificity (§13.4(a)).
+        let ranked: Vec<Result<&ImplMemberCandidate, Vec<ImplMemberCandidate>>> = homes
+            .iter()
+            .map(|home| self.most_specific_in_home(home))
+            .collect();
+        // Two homes of ONE trait have no `Trait::member` spelling to pick
+        // between them. Reporting is what makes row 2 stop being a silent wrong
+        // answer; R2 gives the call's expected type the first chance to choose.
+        // Each home is represented by its most specific impl — an unranked home
+        // by its first maximum, the residue §13.8 records as deferred.
+        if ranked.len() > 1 {
+            return ImplMemberResolution::AmbiguousTraitArguments(
+                ranked
+                    .into_iter()
+                    .filter_map(|home| match home {
+                        Ok(winner) => Some(winner.clone()),
+                        Err(unranked) => unranked.into_iter().next(),
+                    })
+                    .collect(),
+            );
+        }
+        match ranked.into_iter().next() {
+            Some(Ok(winner)) => self.resolution_for_candidate(winner),
+            Some(Err(unranked)) => ImplMemberResolution::AmbiguousImpls(unranked),
+            None => match candidates.first() {
+                Some(candidate) => self.resolution_for_candidate(candidate),
+                None => ImplMemberResolution::Missing,
+            },
+        }
+    }
+
+    /// A won candidate's verdict: an ordinary `Found`, or — when the winning
+    /// impl takes its trait's default body — the inherited-default form, whose
+    /// member id belongs to the trait and needs Gap E's re-dispatch.
+    fn resolution_for_candidate(&self, candidate: &ImplMemberCandidate) -> ImplMemberResolution {
+        match (candidate.inherits_the_default, candidate.home_trait) {
+            (true, Some(trait_id)) => ImplMemberResolution::FoundInheritedDefault(
+                candidate.member_id,
+                candidate.impl_subject,
+                trait_id,
+                candidate.home_arguments.clone(),
+            ),
+            _ => ImplMemberResolution::Found(candidate.member_id, candidate.impl_subject),
+        }
+    }
+
+    /// Whether `pattern` — an impl subject, in its own generic terms — MATCHES
+    /// `target`, another impl subject, with the pattern's binders read as holes
+    /// and the target's read as RIGID. `Box<type T>` matches `Box<i32>` and
+    /// `Box<List<i32>>`; neither of those matches `Box<type T>`.
+    ///
+    /// That asymmetry is the whole of §13.4(a)(1): where `compare_type` is
+    /// compatibility and answers yes in both directions, this answers yes in
+    /// exactly one, and the direction it refuses is which impl is more
+    /// specific.
+    fn impl_subject_matches(&self, pattern: TypeId, target: TypeId) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match (pattern.get_type(self), target.get_type(self)) {
+            // A hole matches anything, including another hole; a concrete
+            // pattern does not match a hole.
+            (Type::Generic(_), _) => true,
+            (_, Type::Generic(_)) => false,
+            (Type::Struct(left_id, left_arguments), Type::Struct(right_id, right_arguments))
+            | (Type::Enum(left_id, left_arguments), Type::Enum(right_id, right_arguments))
+            | (Type::Trait(left_id, left_arguments), Type::Trait(right_id, right_arguments)) => {
+                left_id == right_id
+                    && self.impl_subject_arguments_match(&left_arguments, &right_arguments)
             }
-            None => ImplMemberResolution::Missing,
+            (Type::Tuple(left_items), Type::Tuple(right_items)) => {
+                self.impl_subject_arguments_match(&left_items, &right_items)
+            }
+            (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
+                left_length == right_length && self.impl_subject_matches(left_item, right_item)
+            }
+            (left, right) => left == right,
         }
+    }
+
+    /// Argument lists for [`impl_subject_matches`]. An ERASED side — a subject
+    /// written `List` with no arguments — carries no shape to compare, so the
+    /// heads alone decide, exactly as `compare_argument_types` treats it.
+    fn impl_subject_arguments_match(&self, pattern: &[TypeId], target: &[TypeId]) -> bool {
+        if pattern.is_empty() || target.is_empty() {
+            return true;
+        }
+        pattern.len() == target.len()
+            && pattern
+                .iter()
+                .zip(target.iter())
+                .all(|(pattern_id, target_id)| self.impl_subject_matches(*pattern_id, *target_id))
+    }
+
+    /// The binders a subject writes, in walk order — the positions
+    /// [`subject_bounds_are_stronger`] aligns.
+    fn collect_subject_binders(&self, subject: TypeId, binders: &mut Vec<TypeId>) {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return;
+        };
+        match subject.get_type(self) {
+            Type::Generic(constraint_id) => binders.push(constraint_id),
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                for argument in arguments {
+                    self.collect_subject_binders(argument, binders);
+                }
+            }
+            Type::Tuple(items) => {
+                for item in items {
+                    self.collect_subject_binders(item, binders);
+                }
+            }
+            Type::Array(item, _) => self.collect_subject_binders(item, binders),
+            _ => {}
+        }
+    }
+
+    /// §13.4(a)(2): with the subject shapes equal up to binder renaming, the
+    /// impl whose binders carry a strictly stronger bound set is more specific —
+    /// `Box<type T: Display>` ≻ `Box<type T>`. "Stronger" is superset per
+    /// aligned binder, with at least one position strictly larger; two binders
+    /// bounded by unrelated traits are neither, which is the residue R3 reports
+    /// rather than ranks.
+    fn subject_bounds_are_stronger(&self, stronger: TypeId, weaker: TypeId) -> bool {
+        let mut stronger_binders = Vec::new();
+        let mut weaker_binders = Vec::new();
+        self.collect_subject_binders(stronger, &mut stronger_binders);
+        self.collect_subject_binders(weaker, &mut weaker_binders);
+        if stronger_binders.is_empty() || stronger_binders.len() != weaker_binders.len() {
+            return false;
+        }
+        let mut strictly = false;
+        for (stronger_id, weaker_id) in stronger_binders.iter().zip(weaker_binders.iter()) {
+            let stronger_bounds = self.generic_bound_trait_ids(*stronger_id);
+            let weaker_bounds = self.generic_bound_trait_ids(*weaker_id);
+            if !weaker_bounds
+                .iter()
+                .all(|trait_id| stronger_bounds.contains(trait_id))
+            {
+                return false;
+            }
+            if stronger_bounds.len() > weaker_bounds.len() {
+                strictly = true;
+            }
+        }
+        strictly
+    }
+
+    /// The specificity order over two impls of ONE home (§13.4(a)): subject
+    /// shape first, then the binders' bounds when the shapes are equal.
+    fn impl_outranks(&self, candidate: &ImplMemberCandidate, other: &ImplMemberCandidate) -> bool {
+        let (subject, other_subject) = (candidate.impl_subject, other.impl_subject);
+        if subject == other_subject {
+            return false;
+        }
+        let matches_forward = self.impl_subject_matches(subject, other_subject);
+        let matches_backward = self.impl_subject_matches(other_subject, subject);
+        if matches_backward && !matches_forward {
+            return true;
+        }
+        if matches_forward && !matches_backward {
+            return false;
+        }
+        // Equal shapes: the stronger bound set wins.
+        matches_forward && self.subject_bounds_are_stronger(subject, other_subject)
+    }
+
+    /// Whether two impls of one home sit at the SAME point in the specificity
+    /// order — mutually matching shapes and binder-for-binder identical bounds.
+    /// That is the platform-twin shape §2 measured: one program, two impls, only
+    /// one live per build, and *not* an ambiguity. Two impls that merely fail to
+    /// rank — `Box<type T: Display>` against `Box<type U: Ord>` — are not the
+    /// same point, and R3 reports them.
+    fn impls_rank_equally(
+        &self,
+        candidate: &ImplMemberCandidate,
+        other: &ImplMemberCandidate,
+    ) -> bool {
+        let (subject, other_subject) = (candidate.impl_subject, other.impl_subject);
+        if subject == other_subject {
+            return true;
+        }
+        if !self.impl_subject_matches(subject, other_subject)
+            || !self.impl_subject_matches(other_subject, subject)
+        {
+            return false;
+        }
+        let mut binders = Vec::new();
+        let mut other_binders = Vec::new();
+        self.collect_subject_binders(subject, &mut binders);
+        self.collect_subject_binders(other_subject, &mut other_binders);
+        binders.len() == other_binders.len()
+            && binders
+                .iter()
+                .zip(other_binders.iter())
+                .all(|(left, right)| self.same_generic_bounds(*left, *right, &mut Vec::new()))
+    }
+
+    /// R3 over one home's candidates: the maxima of the specificity order.
+    /// A single maximum is the winner; several that rank equally keep
+    /// declaration order (the platform-twin shape); several that do not rank
+    /// are the residue §13.4(a)(3) leaves deliberately unranked, reported at the
+    /// call site (§13.6 Q4).
+    fn most_specific_in_home<'a>(
+        &self,
+        home: &[&'a ImplMemberCandidate],
+    ) -> Result<&'a ImplMemberCandidate, Vec<ImplMemberCandidate>> {
+        let maxima: Vec<&ImplMemberCandidate> = home
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !home
+                    .iter()
+                    .any(|other| self.impl_outranks(other, candidate))
+            })
+            .collect();
+        let Some(first) = maxima.first().copied() else {
+            // Cannot happen for a non-empty home — the order is irreflexive —
+            // but resolution never depends on that being true.
+            return home.first().copied().ok_or_else(Vec::new);
+        };
+        match maxima
+            .iter()
+            .all(|candidate| self.impls_rank_equally(first, candidate))
+        {
+            true => Ok(first),
+            false => Err(maxima.into_iter().cloned().collect()),
+        }
+    }
+
+    /// B73's R2: the type the call site expects picks among argument-distinct
+    /// homes. Exactly one candidate whose return type — as THIS receiver
+    /// instantiates it — reconciles with the expectation wins; zero, or two or
+    /// more, is `None` and the caller reports the ambiguity.
+    ///
+    /// Method resolution runs receiver-first everywhere else, so this is the one
+    /// place the annotation on the left of the `=` reaches across and chooses
+    /// among the implementations on the right. It is what makes
+    /// `let b: Bar = foo.into()` mean the user's `impl Foo with Into<Bar>`
+    /// rather than std's blanket, and what `variadic-generics.md` 182–187
+    /// recorded as its blocker.
+    fn select_home_by_expected_type(
+        &mut self,
+        call_id: Id,
+        subject_type: &Type,
+        homes: &[(Id, TypeId)],
+    ) -> Option<(Id, TypeId)> {
+        let expected_id = self.expected_types.get(&call_id).copied()?;
+        let expected = expected_id.get_type(self);
+        // An expectation that is itself open constrains nothing — the call is
+        // as ambiguous as it was without one.
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+            return None;
+        }
+        let mut selected: Option<(Id, TypeId)> = None;
+        for (member_id, impl_subject) in homes {
+            let Some(return_type) =
+                self.member_return_type_for(*member_id, *impl_subject, subject_type)
+            else {
+                continue;
+            };
+            // A return type that never resolved reconciles with everything, so
+            // it must not be allowed to *win* the selection.
+            if matches!(return_type, Type::Unknown | Type::Unresolved | Type::Any) {
+                continue;
+            }
+            if !self.compare_type(&return_type, &expected, &HashMap::default()) {
+                continue;
+            }
+            if selected.is_some() {
+                // Two homes fit the expectation: it does not disambiguate.
+                return None;
+            }
+            selected = Some((*member_id, *impl_subject));
+        }
+        selected
+    }
+
+    /// A candidate member's declared return type, with the declaring impl's own
+    /// binders bound from the receiver — so the blanket's `fun into(self): T`
+    /// reads as `Foo` on a `Foo` and the user's `fun into(self): Bar` as `Bar`.
+    /// `None` when the member declares no return type.
+    fn member_return_type_for(
+        &mut self,
+        member_id: Id,
+        impl_subject: TypeId,
+        subject_type: &Type,
+    ) -> Option<Type> {
+        let return_type_id = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => self.functions.get(function_id)?.return_type_id?,
+            Some(Expr::ExternalFunction(function_id)) => {
+                self.external_functions.get(function_id)?.return_type_id
+            }
+            _ => return None,
+        };
+        let impl_subject_type = impl_subject.get_type(self);
+        let bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        let declared = return_type_id.get_type(self);
+        Some(self.substitute_type(&declared, &bindings))
     }
 
     /// The trait that is `member_name`'s home when `implementation` provides it
@@ -11386,6 +11979,55 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|trait_| trait_.declarations.contains_key(member_name))
                 })
         })
+    }
+
+    /// An impl's subject as the program writes it — `Box<T: Display>`, not the
+    /// receiver it is being matched against — so an unranked overlap names the
+    /// two definitions the reader has to go and edit (B1). The binders' bounds
+    /// are part of the spelling: without them the two subjects of §13.4(a)(3)'s
+    /// residue render identically.
+    fn impl_subject_label(&self, impl_subject: TypeId) -> String {
+        let mut binders = Vec::new();
+        self.collect_subject_binders(impl_subject, &mut binders);
+        let rendered = self.pretty_print_type(&impl_subject.get_type(self), &HashMap::default());
+        let bounds: Vec<String> = binders
+            .iter()
+            .filter_map(|constraint_id| {
+                let name = self.generic_constraint_names.get(constraint_id)?;
+                let traits: Vec<String> = self
+                    .generic_bound_traits(*constraint_id)
+                    .into_iter()
+                    .map(|(trait_id, arguments)| {
+                        self.pretty_print_type(
+                            &Type::Trait(trait_id, arguments),
+                            &HashMap::default(),
+                        )
+                    })
+                    .collect();
+                match traits.is_empty() {
+                    true => None,
+                    false => Some(format!("{name}: {}", traits.join(" + "))),
+                }
+            })
+            .collect();
+        match bounds.is_empty() {
+            true => rendered,
+            false => format!("{rendered} where {}", bounds.join(", ")),
+        }
+    }
+
+    /// One candidate's home, spelled as THIS receiver instantiates it —
+    /// `Into<Foo>` for std's blanket reached through a `Foo`, `Into<str>` for
+    /// the user's own impl (B1: the reader has to be able to tell the two
+    /// apart, and `Into` twice does not).
+    fn home_label(&self, candidate: &ImplMemberCandidate) -> String {
+        let Some(trait_id) = candidate.home_trait else {
+            return String::new();
+        };
+        self.pretty_print_type(
+            &Type::Trait(trait_id, candidate.home_arguments.clone()),
+            &HashMap::default(),
+        )
     }
 
     /// A trait's user-facing spelling for one subject — with the arguments the
@@ -23855,7 +24497,10 @@ impl<'src> Analyzer<'src> {
                 call_id,
                 GenericDispatch::OnConstraint(constraint_id, member_name),
             );
-            self.bound_dispatch_traits.insert(call_id, trait_id);
+            // The qualified spelling names a trait and no arguments, so the
+            // instantiation is left unconstrained (B73 R1's empty-list case).
+            self.bound_dispatch_traits
+                .insert(call_id, (trait_id, Vec::new()));
             return None;
         }
         if !matches!(receiver_type, Type::Struct(..) | Type::Enum(..)) {
@@ -23863,7 +24508,11 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         self.trait_qualified_calls.remove(&subject_id);
-        let provider = self
+        // Every impl of the named trait whose subject matches, not just the
+        // first: one subject may implement the trait at two instantiations
+        // (`Into<Bar>` beside std's `Into<Foo>`), and naming the trait says
+        // nothing about which — §3.1's spelling has no argument slot (B73 R2).
+        let providers: Vec<(Option<Id>, TypeId)> = self
             .implementations
             .iter()
             .filter(|implementation| {
@@ -23886,7 +24535,25 @@ impl<'src> Analyzer<'src> {
                     implementation.subject,
                 )
             })
-            .next();
+            .collect();
+        let declaring: Vec<(Id, TypeId)> = providers
+            .iter()
+            .filter_map(|(member_id, impl_subject)| {
+                member_id.map(|member_id| (member_id, *impl_subject))
+            })
+            .collect();
+        // With more than one implementation declaring the name, the call's
+        // expected type is the only thing that can choose (R2). When it cannot,
+        // the first-declared still wins, as it always has — the reported
+        // ambiguity belongs to `receiver.member()`, which is where a reader can
+        // act on it; there is no *further* spelling to steer a qualified call to.
+        let provider = match declaring.len() > 1 {
+            true => self
+                .select_home_by_expected_type(call_id, &receiver_type, &declaring)
+                .map(|(member_id, impl_subject)| (Some(member_id), impl_subject))
+                .or_else(|| providers.first().copied()),
+            false => providers.first().copied(),
+        };
         match provider {
             Some((Some(member_id), impl_subject)) => {
                 let count = self.reference_count.entry(member_id).or_insert(0);
@@ -23920,7 +24587,8 @@ impl<'src> Analyzer<'src> {
                 // Dispatch on THIS trait's surface: two traits whose defaults
                 // share a name are exactly the case the call named one to
                 // resolve, so a by-name lookup would undo the disambiguation.
-                self.bound_dispatch_traits.insert(call_id, trait_id);
+                self.bound_dispatch_traits
+                    .insert(call_id, (trait_id, Vec::new()));
                 let rest: Vec<Id> = argument_ids[1..].to_vec();
                 self.constraints.push(Constraint::MethodArgCheck {
                     call_id,
@@ -24487,6 +25155,11 @@ impl<'src> Analyzer<'src> {
             // Two or more traits provide the name and no inherent member
             // outranks them (B57) — the call has to name one.
             AmbiguousTraits(Vec<Id>),
+            // ONE trait provides the name at two or more instantiations (B73's
+            // R1) — `Trait::member` cannot name which, so the call is reported.
+            AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
+            // Two impls of ONE home that specificity does not rank (B73's R3).
+            AmbiguousImpls(Vec<ImplMemberCandidate>),
             // The receiver is a value typed as a bare trait (not `self` in a trait
             // default) — there is no concrete type to dispatch to.
             BareTraitValue(Id),
@@ -24555,7 +25228,21 @@ impl<'src> Analyzer<'src> {
         let mut return_ambiguous: Option<Vec<Id>> = None;
         let lookup = match &subject_type {
             Type::Struct(_, _) | Type::Enum(_, _) => {
-                match self.resolve_impl_member(&subject_type, member_name) {
+                let mut resolution = self.resolve_impl_member(&subject_type, member_name);
+                // R2: before reporting two argument-distinct homes, let the type
+                // the call site expects choose between them.
+                if let ImplMemberResolution::AmbiguousTraitArguments(homes) = &resolution {
+                    let reachable: Vec<(Id, TypeId)> = homes
+                        .iter()
+                        .map(|home| (home.member_id, home.impl_subject))
+                        .collect();
+                    if let Some((member_id, impl_subject)) =
+                        self.select_home_by_expected_type(id, &subject_type, &reachable)
+                    {
+                        resolution = ImplMemberResolution::Found(member_id, impl_subject);
+                    }
+                }
+                match resolution {
                     ImplMemberResolution::Found(member_id, impl_subject_id) => {
                         // Bind the impl's generic parameters from the receiver
                         // (`List<i32>` against the impl's `List<T>` binds `T = i32`)
@@ -24585,6 +25272,39 @@ impl<'src> Analyzer<'src> {
                     }
                     ImplMemberResolution::AmbiguousTraits(trait_ids) => {
                         MethodLookup::AmbiguousTraits(trait_ids)
+                    }
+                    ImplMemberResolution::AmbiguousTraitArguments(homes) => {
+                        MethodLookup::AmbiguousTraitArguments(homes)
+                    }
+                    ImplMemberResolution::AmbiguousImpls(unranked) => {
+                        MethodLookup::AmbiguousImpls(unranked)
+                    }
+                    // R3, §13.2 row 17: the most specific impl of the home takes
+                    // the trait's DEFAULT body. The member id belongs to the
+                    // trait, whose declared receiver no concrete argument
+                    // reconciles against, so the call rides the same Gap E
+                    // channel an uncontested inherited default already does.
+                    ImplMemberResolution::FoundInheritedDefault(
+                        member_id,
+                        impl_subject_id,
+                        trait_id,
+                        trait_arguments,
+                    ) => {
+                        let receiver_type_id = subject_type.clone().get_type_id(self);
+                        self.generic_dispatch.insert(
+                            id,
+                            GenericDispatch::OnType(Some(receiver_type_id), member_name),
+                        );
+                        let bindings = self.inherited_default_bindings(
+                            &subject_type,
+                            impl_subject_id,
+                            trait_id,
+                            &trait_arguments,
+                        );
+                        if !bindings.is_empty() {
+                            self.method_call_substitution.insert(id, bindings);
+                        }
+                        MethodLookup::Found(member_id)
                     }
                     // Gap E: fall back to an inherited trait default, re-dispatched
                     // to this concrete type at codegen.
@@ -24702,7 +25422,7 @@ impl<'src> Analyzer<'src> {
                             continue;
                         };
                         member = Some(found_member);
-                        member_trait = Some(*trait_id);
+                        member_trait = Some((*trait_id, trait_arguments.clone()));
                         // A parameterized bound (`F: Feed<T>`) substitutes the trait's
                         // parameters with the bound's arguments, so a method parameter
                         // typed in the trait's terms (`each(observer: |T| ..)`) is typed
@@ -24734,8 +25454,12 @@ impl<'src> Analyzer<'src> {
                             id,
                             GenericDispatch::OnConstraint(*constraint_id, member_name),
                         );
-                        if let Some(trait_id) = member_trait {
-                            self.bound_dispatch_traits.insert(id, trait_id);
+                        if let Some((trait_id, trait_arguments)) = member_trait {
+                            // The bound's own arguments (`T: Conv<Baz>` -> `[Baz]`)
+                            // travel with the trait, so codegen re-dispatches into
+                            // the impl of THAT instantiation (B73 R1, row 20).
+                            self.bound_dispatch_traits
+                                .insert(id, (trait_id, trait_arguments));
                         }
                     }
                     found(member)
@@ -24933,6 +25657,75 @@ impl<'src> Analyzer<'src> {
                         if providers.len() == 2 { "both " } else { "" },
                         join_with(&providers, "and"),
                         join_with(&steers, "or"),
+                    ),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Resolution::Failed
+            }
+            // B73 R1: one trait, two instantiations. §3.1's disambiguator names
+            // a trait and has no argument slot, so — per B83's "an impossible
+            // steer is worse than no steer" — the message says what does select
+            // (the expected type, R2) rather than offering a spelling that does
+            // not exist.
+            MethodLookup::AmbiguousTraitArguments(homes) => {
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                let trait_name = homes
+                    .first()
+                    .and_then(|home| home.home_trait)
+                    .and_then(|trait_id| self.traits.get(&trait_id))
+                    .map(|trait_| trait_.name)
+                    .unwrap_or("Trait");
+                let providers: Vec<String> = homes
+                    .iter()
+                    .map(|home| format!("'{}'", self.home_label(home)))
+                    .collect();
+                self.diagnostics.push(Error {
+                    note: None,
+                    // The member NAME is what is ambiguous (A1/A4) — the same
+                    // anchor the two-trait ambiguity uses.
+                    span: self
+                        .member_name_spans
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(arguments_span),
+                    msg: format!(
+                        "'{member_name}' is ambiguous on '{type_str}': {}{} provide it, and \
+                         '{trait_name}::{member_name}' names only the trait, not which of its \
+                         instantiations; annotate the type this call must produce to pick one",
+                        if providers.len() == 2 { "both " } else { "" },
+                        join_with(&providers, "and"),
+                    ),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Resolution::Failed
+            }
+            // B73 R3's residue (§13.4(a)(3)): two impls of one home, neither
+            // more specific. There is no call-site spelling that picks between
+            // them — both are the same trait at the same instantiation — so the
+            // message states the rule that failed to apply and sends the reader
+            // to the definitions, which is where the fix lives (B6/B4).
+            MethodLookup::AmbiguousImpls(unranked) => {
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                let subjects: Vec<String> = unranked
+                    .iter()
+                    .map(|candidate| {
+                        format!("'{}'", self.impl_subject_label(candidate.impl_subject))
+                    })
+                    .collect();
+                self.diagnostics.push(Error {
+                    note: None,
+                    span: self
+                        .member_name_spans
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(arguments_span),
+                    msg: format!(
+                        "'{member_name}' is ambiguous on '{type_str}': {}{} provide it and \
+                         neither impl subject is more specific than the other; vilan picks the \
+                         more specific of two overlapping impls, so narrow one subject until it \
+                         is",
+                        if subjects.len() == 2 { "both " } else { "" },
+                        join_with(&subjects, "and"),
                     ),
                 });
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
@@ -28161,11 +28954,14 @@ impl<'src> Analyzer<'src> {
                         // Only a trait provides it as a METHOD: refuse, and say
                         // which path does reach it (handled below).
                         false => ImplMemberResolution::Missing,
-                        true => self.rank_member_candidates(self.static_path_candidates(
-                            &subject_type,
-                            member_name,
-                            subject_is_trait,
-                        )),
+                        true => {
+                            let static_candidates = self.static_path_candidates(
+                                &subject_type,
+                                member_name,
+                                subject_is_trait,
+                            );
+                            self.rank_member_candidates(static_candidates)
+                        }
                     };
                     let static_member = match &static_resolution {
                         ImplMemberResolution::Found(member_id, impl_subject) => {
@@ -28393,7 +29189,8 @@ impl<'src> Analyzer<'src> {
                                 // an inherent static sharing the name can't
                                 // shadow it (keyed by the accessor: the call id
                                 // isn't known here).
-                                self.bound_dispatch_traits.insert(id, matched_trait);
+                                self.bound_dispatch_traits
+                                    .insert(id, (matched_trait, Vec::new()));
                             }
                             None => {
                                 let bounds = bound_trait_ids
@@ -28939,18 +29736,19 @@ impl<'src> Analyzer<'src> {
                     let resolved = self
                         .generic_bound_traits(constraint_id)
                         .into_iter()
-                        .find_map(|(trait_id, _)| {
+                        .find_map(|(trait_id, trait_arguments)| {
                             self.method_member_in_trait(trait_id, next_method)
-                                .map(|next_id| (trait_id, next_id))
+                                .map(|next_id| (trait_id, trait_arguments, next_id))
                         });
                     match resolved {
-                        Some((trait_id, next_id)) => {
+                        Some((trait_id, trait_arguments, next_id)) => {
                             self.for_each_next.insert(for_each_id, next_id);
                             self.generic_dispatch.insert(
                                 for_each_id,
                                 GenericDispatch::OnConstraint(constraint_id, next_method),
                             );
-                            self.bound_dispatch_traits.insert(for_each_id, trait_id);
+                            self.bound_dispatch_traits
+                                .insert(for_each_id, (trait_id, trait_arguments));
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
@@ -30473,7 +31271,10 @@ pub struct Program<'src> {
     pub for_each_views: HashMap<Id, bool>,
     pub binary_op_dispatch: HashMap<Id, Id>,
     pub own_generic_call_bindings: HashMap<Id, Vec<TypeId>>,
-    pub bound_dispatch_traits: HashMap<Id, Id>,
+    /// Call id -> `(trait, the arguments the bound wrote)`. The arguments are
+    /// empty where the site knows only the trait; an empty list constrains
+    /// nothing, so re-dispatch behaves exactly as it did before B73's R1.
+    pub bound_dispatch_traits: HashMap<Id, (Id, Vec<TypeId>)>,
     /// Per `expr!` site: how the transformer lowers it (std fast path or a
     /// user `Try` impl's members) — proposal/try-and-lift.md §4.
     pub try_dispatch: HashMap<Id, TryDispatch>,
