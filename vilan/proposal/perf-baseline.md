@@ -127,8 +127,8 @@ ceremony that puts each measurement in the crate that owns the code it
 measures, and `#[ignore]` is what keeps a minutes-long benchmark out of a
 gate that already costs what it costs.
 
-Four things run in the normal gate, and nothing else — together under two
-seconds:
+Four things ran in the normal gate at the time of writing, and nothing else —
+together under two seconds (M4 added a fifth; see the amendment below):
 
 - `perf_baseline_harness_smoke` (vilan-cli) — the whole harness on the
   `tiny` subject at one cold iteration, two warm, and one end-to-end
@@ -153,6 +153,13 @@ cost nothing detectable; the 10 s difference is the build cache, not the
 change. (CLAUDE.md's cited ~64 s figure is a different, faster box — the
 comparison that means anything is before-and-after on one machine.)
 
+**Amended 2026-08-18 (M4).** A fifth gate test joined them — the const pass's
+scaling pin, `the_const_pass_scales_with_its_const_sites_and_not_with_their_square`
+in the same `perf_baseline` binary (`const-eval.md` §10.4). It costs **2.3 s**
+(the binary's gate tests go 0.69 s → 2.96 s), which is the largest single thing
+in this file's gate footprint and is stated rather than buried. What follows is
+the rule it is an exception to, and why it is one.
+
 **No threshold assertion belongs in the gate, and that is a decision, not an
 omission.** The suite's own history is the argument: E32/E39/E40
 (`suite-speed.md` §5–§7) are three separate incidents of a clock wrapped
@@ -164,6 +171,19 @@ manners: on a 4-core shared runner, mid-suite, with 16 test processes
 interleaved, the noise band around a 30 % regression is wider than 30 %. The
 gate pins that the *instrument* works; the instrument is pointed at the tree
 deliberately, on a quiet machine, by a person who wants an answer.
+
+M4's pin does not break that rule, and the difference is what makes it
+admissible rather than a re-litigation. It asserts nothing about how long
+anything takes: it takes **two** measurements in one process, seconds apart, of
+the same code on two sizes of the same input, and compares them to each other.
+Both samples see the same runner, the same contention and the same neighbours,
+so the noise the rule is about cancels in the ratio instead of accumulating in
+it. And the bound is on a **shape**, not a magnitude — 4× the input against a
+6× bound, where the fixed tree measures 3.4× and a pass that goes quadratic
+measures 14×. There is no regression it can catch by tightening and no
+regression a 30 % move can trip. A relative-threshold *regression* check —
+"this must not get 30 % slower than last time" — is still the thing this
+section refuses.
 
 ## 2. The baseline
 
@@ -346,6 +366,18 @@ That figure was taken on a corpus that does not look like this one and
 should not be read as the general number. Filed as **backlog M4**, and it is
 the first thing to profile: `check` pays it in full while emitting nothing,
 and so does every keystroke.
+
+**Profiled 2026-08-18 — [`const-eval.md`](const-eval.md) §10.** The pass is
+*linear* in its `const` sites at a flat ~0.75 ms each; the website's gap over
+kolt is site count times chain length (483 evaluations against at most 18) and
+nothing else, and the "something super-linear" suspect survives only as a 3.4 %
+span scan. Two thirds of a site is the interpreter
+computing the style itself (0.094 ms per property, zero intercept); a sixth
+was a per-site rebuild of program-wide state, now hoisted. The tables above
+are the pre-fix record and stay as measured — §10.4 carries the after-numbers
+diffed against `perf-baseline.jsonl`, including `website_server` warm
+`post_passes` 206.3 → 155.5 ms and `page.vl`'s keystroke p50
+321.5 → 252.4 ms.
 
 ### 4.4 Compile cost tracks `std` reach, not user line count
 

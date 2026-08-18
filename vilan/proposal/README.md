@@ -43,7 +43,7 @@ Closing sweeps archive tombstones into
 | `claims-and-epochs.md` | shipped / foundational (ratified 2026-07-18) | The one law behind the memory model (claim validity via epochs); frames C4 as the model's last major change. |
 | `compiler-bindings.md` | design record (idea sketch, unscheduled) | Unshaped idea for compiler-hosted bindings; not designed to the project's proposal bar. |
 | `composite-spanning-split.md` | shipped arc (2026-08-01, backlog B49) | A list/struct literal holding a spanning element splits regardless of width. |
-| `const-eval.md` | shipped arc (2026-07-10; G2 tail mostly shipped 2026-08-04; G3 shipped 2026-08-04) | `const` as a compile-time-evaluation language feature, the asset-emission channel, and inferred `const` folding (backlog G3, §9); G2's deep-failure spans and full LSP memoization remain open (§8). |
+| `const-eval.md` | shipped arc (2026-07-10; G2 tail mostly shipped 2026-08-04; G3 shipped 2026-08-04; M4's profile + per-analysis hoists shipped 2026-08-18) | `const` as a compile-time-evaluation language feature, the asset-emission channel, and inferred `const` folding (backlog G3, §9); §10 is the M4 performance profile and what it fixed. G2's deep-failure spans (§8) and the shared-const-world / cross-analysis-memo options (§10.5) remain open. |
 | `destruction-impl-plan.md` | shipped arc (2026-07-19) | The C4 implementation ledger: all five Tier-1 destruction slices. |
 | `destruction.md` | shipped arc (Tier 1, 2026-07-19; Tier 2 tracked as backlog C1/F4) | Deterministic destruction — the owned-resource class, scope-end `Drop`. |
 | `diagnostics-ledger.md` | active (living ledger) | Every `diagnostics.push` site with its audit verdict; updated per audit batch. |

@@ -13,6 +13,7 @@ use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
 use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options).transform_entry()
@@ -1561,42 +1562,18 @@ enum ScopeTeardown {
 
 impl<'src> Transformer<'src> {
     fn new(program: &'src Program<'src>, options: &BuildOptions) -> Self {
-        let style = if options.readable_names {
-            NameStyle::Readable
-        } else if options.debug_names {
-            NameStyle::Annotated
-        } else {
-            NameStyle::Plain
-        };
-        // Source names for functions, variables, and parameters — what `Readable`
-        // names identifiers after and `Annotated` annotates them with. `Plain`
-        // needs none.
-        let source_names = if matches!(style, NameStyle::Plain) {
-            HashMap::default()
-        } else {
-            program
-                .variables
-                .iter()
-                .map(|(id, variable)| (*id, variable.name.to_string()))
-                .chain(
-                    program
-                        .functions
-                        .iter()
-                        .map(|(id, function)| (*id, function.name.to_string())),
-                )
-                .chain(
-                    program
-                        .parameters
-                        .iter()
-                        .map(|(id, parameter)| (*id, parameter.name.to_string())),
-                )
-                .collect::<HashMap<Id, String>>()
-        };
-        // Seeded in EVERY style, not just the readable one: the obfuscated
-        // sequence walks `a, b, …, aa, ab, …` and so eventually spells `if`,
-        // `in`, `do` — names no style may hand a binding.
-        let reserved = collect_reserved_names(program);
+        Self::with_name_seed(program, options, Rc::new(NameSeed::build(program, options)))
+    }
 
+    /// [`Transformer::new`] over an ALREADY-BUILT name seed — the entry a caller
+    /// that transforms the same program many times uses, so the seed is built
+    /// once instead of once per transform. See [`NameSeed`] and
+    /// [`ConstProgramSeed`].
+    fn with_name_seed(
+        program: &'src Program<'src>,
+        options: &BuildOptions,
+        names: Rc<NameSeed>,
+    ) -> Self {
         let print_fn_id = {
             let std_module_id = *program
                 .module_id_by_name
@@ -1614,7 +1591,7 @@ impl<'src> Transformer<'src> {
 
         Self {
             formatter: Formatter::from_options(options.indent, options.spaces),
-            ng: NameGenerator::new(style, source_names, reserved),
+            ng: NameGenerator::new(names),
             print_fn_id,
             list_new_fn_id: program.list_new_fn_id,
             list_push_fn_id: program.list_push_fn_id,
@@ -7620,6 +7597,31 @@ fn const_value_to_js<'src>(value: &ConstValue) -> js::Node<'src> {
     }
 }
 
+/// Everything a const mini-program's build needs that does NOT vary with the
+/// expression being built: the [`NameSeed`] its transformer starts from, and
+/// the module-level bindings its prelude is filtered against. Both are
+/// functions of `(program, options)` alone — and both were rebuilt per const
+/// site, which on the website's server entry meant 210 rebuilds of a 4,184-entry
+/// source-name map and 210 walks of the module tree (`const-eval.md` §10). The
+/// `const` pass builds one of these per analysis and hands it to every site.
+pub struct ConstProgramSeed {
+    names: Rc<NameSeed>,
+    /// Module-level bindings as a set: the ids a mini-program's prelude may
+    /// have to declare. `module_level_bindings()` returns them in emission
+    /// order, which this build does not need — the prelude sorts its own
+    /// batches by entity id (`b33-emission-order.md` §4).
+    module_level_bindings: HashSet<Id>,
+}
+
+impl ConstProgramSeed {
+    pub fn build(program: &Program, options: &BuildOptions) -> Self {
+        Self {
+            names: Rc::new(NameSeed::build(program, options)),
+            module_level_bindings: program.module_level_bindings().into_iter().collect(),
+        }
+    }
+}
+
 /// Builds the mini-program that evaluates one `const` expression: the
 /// functions it (transitively) requires, declarations for the bindings it
 /// reads — already-computed const values as literals, literal initializers
@@ -7632,21 +7634,21 @@ fn const_value_to_js<'src>(value: &ConstValue) -> js::Node<'src> {
 pub fn transform_const_program<'src>(
     program: &'src Program<'src>,
     options: &BuildOptions,
+    seed: &ConstProgramSeed,
     expr_id: Id,
     external_bindings: &HashSet<Id>,
     const_values: &HashMap<Id, crate::interpreter::ConstValue>,
 ) -> (JsProgram<'src>, Vec<Id>) {
-    let mut transformer = Transformer::new(program, options);
+    let mut transformer = Transformer::with_name_seed(program, options, seed.names.clone());
 
     // The bindings that may need a prelude declaration: the expression's own
     // free locals (checked by the caller) and module-level bindings reached
     // through called functions. Everything else referenced is declared inside
-    // the emitted code itself (function-body and block locals).
-    let external: HashSet<Id> = program
-        .module_level_bindings()
-        .into_iter()
-        .chain(external_bindings.iter().copied())
-        .collect();
+    // the emitted code itself (function-body and block locals). Asked as a
+    // predicate over the two sets rather than built as their union, so the
+    // module-level half stays the seed's one copy.
+    let is_external =
+        |id: &Id| seed.module_level_bindings.contains(id) || external_bindings.contains(id);
 
     let mut body = Vec::new();
     let result = transformer
@@ -7667,7 +7669,7 @@ pub fn transform_const_program<'src>(
             .referenced_globals
             .iter()
             .copied()
-            .filter(|id| external.contains(id) && !declared.contains(id))
+            .filter(|id| is_external(id) && !declared.contains(id))
             .collect();
         if pending.is_empty() {
             break;
@@ -8006,54 +8008,142 @@ enum NameStyle {
     Plain,
 }
 
+/// What a [`NameGenerator`] starts from, and the only part of it that is a fact
+/// about the PROGRAM rather than about one transform: the source names the
+/// readable styles name identifiers after, the reserved set no style may hand
+/// out, and which style is in force. All three are functions of
+/// `(program, options)` alone, so a caller that transforms one program many
+/// times — the `const` pass, once per const site — builds this once and shares
+/// it (`const-eval.md` §10). Behind an `Rc` because sharing it is the point.
+struct NameSeed {
+    style: NameStyle,
+    /// Source names by id (functions, variables, parameters) — empty for `Plain`.
+    source_names: HashMap<Id, String>,
+    /// Keywords, referenced globals, `__`-helpers and `[extern]` symbols: names
+    /// no generated identifier may collide with. Seeded in EVERY style, not just
+    /// the readable one — the obfuscated sequence walks `a, b, …, aa, ab, …` and
+    /// so eventually spells `if`, `in`, `do`.
+    reserved: HashSet<String>,
+}
+
+thread_local! {
+    /// How many [`NameSeed`]s this thread has built since
+    /// [`reset_name_seed_build_count`]. A test instrument for the
+    /// one-seed-per-const-pass invariant (`const-eval.md` §10), on the same
+    /// argument as `call_graph`'s build counter: a seed rebuilt per const site
+    /// and a seed built once produce IDENTICAL output — the sharing is
+    /// behaviour-neutral by construction — so only a counter can tell them
+    /// apart, and only a counter can catch the rebuild creeping back.
+    ///
+    /// Thread-local for the same reason as that one: the suite runs analyses
+    /// concurrently under plain `cargo test`, and an analysis is
+    /// single-threaded. One `Cell` bump against a build that walks every
+    /// variable, function and parameter in the program — unmeasurable.
+    static NAME_SEED_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`NameSeed`] builds on this thread since the last
+/// [`reset_name_seed_build_count`]. See [`NAME_SEED_BUILD_COUNT`].
+pub fn name_seed_build_count() -> usize {
+    NAME_SEED_BUILD_COUNT.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`name_seed_build_count`].
+pub fn reset_name_seed_build_count() {
+    NAME_SEED_BUILD_COUNT.with(|count| count.set(0));
+}
+
+impl NameSeed {
+    fn build(program: &Program, options: &BuildOptions) -> Self {
+        NAME_SEED_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+        let style = if options.readable_names {
+            NameStyle::Readable
+        } else if options.debug_names {
+            NameStyle::Annotated
+        } else {
+            NameStyle::Plain
+        };
+        // `Plain` names after nothing, so it needs no source names.
+        let source_names = if matches!(style, NameStyle::Plain) {
+            HashMap::default()
+        } else {
+            program
+                .variables
+                .iter()
+                .map(|(id, variable)| (*id, variable.name.to_string()))
+                .chain(
+                    program
+                        .functions
+                        .iter()
+                        .map(|(id, function)| (*id, function.name.to_string())),
+                )
+                .chain(
+                    program
+                        .parameters
+                        .iter()
+                        .map(|(id, parameter)| (*id, parameter.name.to_string())),
+                )
+                .collect::<HashMap<Id, String>>()
+        };
+        Self {
+            style,
+            source_names,
+            reserved: collect_reserved_names(program),
+        }
+    }
+}
+
 struct NameGenerator {
     chars: Vec<char>,
     counter: u64,
     names: HashMap<Id, String>,
-    /// Source names by id (functions, variables, parameters) — empty for `Plain`.
-    source_names: HashMap<Id, String>,
-    style: NameStyle,
-    /// Names already in use: the reserved set (keywords, referenced globals,
-    /// `__`-helpers, `[extern]` symbols) plus every name minted so far. Every
-    /// mint consults it, so a generated name is never a reserved word and never
-    /// repeats — the generator's own uniqueness invariant.
-    taken: HashSet<String>,
+    /// The program-wide seed — see [`NameSeed`].
+    seed: Rc<NameSeed>,
     /// Every name this generator has MINTED — the ones handed to an `Id` by
     /// `name_for` and the ones handed to an anonymous temp by `next_name` alike.
     /// `names` covers only the former, which is what made B69 possible: the
     /// scope re-allocator needs the CLOSED set, because a minted name it does
     /// not know about is one it will happily mint again out of its own
     /// identical alphabet. See `rename_for_scopes`.
+    ///
+    /// With the seed's reserved set it is also the generator's uniqueness
+    /// invariant: [`NameGenerator::is_taken`] is the union of the two, and every
+    /// mint consults it, so a generated name is never a reserved word and never
+    /// repeats.
     minted: HashSet<String>,
 }
 
 impl NameGenerator {
-    fn new(style: NameStyle, source_names: HashMap<Id, String>, reserved: HashSet<String>) -> Self {
+    fn new(seed: Rc<NameSeed>) -> Self {
         Self {
             chars: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
                 .chars()
                 .collect(),
             counter: 0,
             names: HashMap::default(),
-            source_names,
-            style,
-            taken: reserved,
+            seed,
             minted: HashSet::default(),
         }
+    }
+
+    /// Reserved, or already handed out by this generator — the two halves of
+    /// "unavailable".
+    fn is_taken(&self, name: &str) -> bool {
+        self.seed.reserved.contains(name) || self.minted.contains(name)
     }
 
     fn name_for(&mut self, id: Id) -> String {
         if let Some(name) = self.names.get(&id) {
             return name.clone();
         }
-        let name = match self.style {
+        let name = match self.seed.style {
             // Name after the source; an entity with no source name (an anonymous
             // temp) gets a `$`-prefixed fresh name, which no source name can be.
-            NameStyle::Readable => match self.source_names.get(&id).cloned() {
+            NameStyle::Readable => match self.seed.source_names.get(&id).cloned() {
                 Some(source) => self.unique_readable(&source),
                 None => self.next_name(),
             },
-            NameStyle::Annotated => match self.source_names.get(&id).cloned() {
+            NameStyle::Annotated => match self.seed.source_names.get(&id).cloned() {
                 Some(source) => format!("{}/*{}*/", self.next_name(), source),
                 None => self.next_name(),
             },
@@ -8069,7 +8159,7 @@ impl NameGenerator {
         let base = sanitize_identifier(source);
         let mut candidate = base.clone();
         let mut suffix = 2;
-        while self.taken.contains(&candidate) {
+        while self.is_taken(&candidate) {
             candidate = format!("{base}{suffix}");
             suffix += 1;
         }
@@ -8084,19 +8174,19 @@ impl NameGenerator {
 
     /// The next unused generated name. The obfuscated sequence walks the same
     /// `[a-zA-Z]` alphabet the scope re-allocator draws from, so it eventually
-    /// spells reserved words (`if`, `in`, `do`, …) — `taken` is consulted so it
-    /// never hands one out.
+    /// spells reserved words (`if`, `in`, `do`, …) — [`NameGenerator::is_taken`]
+    /// is consulted so it never hands one out.
     fn next_name(&mut self) -> String {
         loop {
             let index = self.next_idx();
             let short = self.name_from_idx(index);
             // In readable mode, temps are `$`-prefixed so they can't collide with a
             // readable (source-derived) name, which never contains `$`.
-            let candidate = match self.style {
+            let candidate = match self.seed.style {
                 NameStyle::Readable => format!("${short}"),
                 _ => short,
             };
-            if !self.taken.contains(&candidate) {
+            if !self.is_taken(&candidate) {
                 return self.mint(candidate);
             }
         }
@@ -8105,7 +8195,6 @@ impl NameGenerator {
     /// Records a name as handed out: unavailable for a later mint, and a member
     /// of the closed set `rename_for_scopes` re-allocates over.
     fn mint(&mut self, name: String) -> String {
-        self.taken.insert(name.clone());
         self.minted.insert(name.clone());
         name
     }
@@ -8491,7 +8580,7 @@ fn rename_if(branch: &mut js::IfBranch, rename: &HashMap<String, String>) {
 /// either re-allocated against a scope's `used` set or reserved in every scope,
 /// and a binding the walk misses can only come out over-long, never colliding.
 fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::Node>) {
-    let release = match ng.style {
+    let release = match ng.seed.style {
         NameStyle::Annotated => return,
         NameStyle::Readable => false,
         NameStyle::Plain => true,
@@ -8499,7 +8588,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
     // Each renameable binding's current (unique) name -> its source name.
     let mut source_of: HashMap<String, String> = HashMap::default();
     for (id, name) in &ng.names {
-        if let Some(source) = ng.source_names.get(id) {
+        if let Some(source) = ng.seed.source_names.get(id) {
             source_of.insert(name.clone(), source.clone());
         }
     }

@@ -39,6 +39,16 @@ The numbers are in `vilan/proposal/perf-baseline.md`, and the first one is a sur
 One more thing the baseline settles: what a program costs to compile is mostly what its imports drag in, not how long it is. A 22-line entry over a 119-line app and a 289-line entry over a 943-line app compile 8 % apart.
 
 ---
+
+**The `const` pass stopped rebuilding the whole program once per `const` site.** The baseline above found `const_eval::evaluate` costing two thirds of a style-heavy compile and named three suspects. Profiling settled them: the pass is *linear* in its `const` sites — 0.72 to 0.79 ms each, flat from ten sites to four hundred — and the promo site's gap over kolt is site count times chain length, 483 evaluations against at most eighteen, with nothing degrading as either grows. Two thirds of a site's cost is the interpreter computing the style itself, at 0.094 ms per property with a zero intercept: that is the work, not overhead around it.
+
+The other sixth was rebuild. Every `const` site is compiled to its own mini-program, and every one of those started by rebuilding state that is a fact about the program and nothing else — chiefly the transformer's name seed, a map of **every variable, function and parameter in the reachable world**, measured at 4,184 entries and 4,184 string allocations *per site*, 882,732 of them across one entry. Beside it, a walk of the module tree per site, and a scan of every `const` span once per call site in the program — the one genuinely super-linear term the profile found, at 3.4 %. All three are now built once per pass and shared.
+
+On the promo site: the const pass drops from 3.41 s to 2.80 s in debug and 429 ms to 308 ms in release, `vilan check` from 845.8 ms to 734.9 ms, and — the one a person actually feels — a keystroke in the site's 735-line main page from **321.5 ms to 252.4 ms**, against a 150 ms debounce budget it still misses, by 1.68× where it used to miss by 2.14×. The two subjects with no `const` in them at all moved 4–6 %, which is the machine, and that is what makes the rest readable. Emitted output is byte-identical: the site's three bundles, three stylesheets and two chunk manifests diff clean across the change.
+
+What is left is now almost all evaluation, and cutting it further is a structural question — one shared const world per analysis, or memoization across analyses — written up as a design in `vilan/proposal/const-eval.md` §10.5 rather than built.
+
+---
 ## v0.34.0 — 2026-08-12
 
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
