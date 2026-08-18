@@ -4,7 +4,7 @@ E63 draft — kolt's server onto the full-stack ladder (rung 1 + rung 0+)
 A PROPOSAL, not an applied change. The kolt checkout was read and nothing in
 it was modified; no git command was run there. Apply with:
 
-    cd /home/reed/code/kolt && git apply /path/to/kolt-server.patch
+    cd <your kolt checkout> && git apply /path/to/kolt-server.patch
 
 Everything above the first `diff --git` line is ignored by `git apply`.
 
