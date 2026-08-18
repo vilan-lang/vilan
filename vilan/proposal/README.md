@@ -36,7 +36,7 @@ Closing sweeps archive tombstones into
 | `backlog-archive.md` | active (append-only) | Where closing sweeps move tombstones from the live tracker; indexes the frozen eras. |
 | `backlog-2026-07-18.md` | historical record (frozen 2026-08-13) | The cycle 15–19 era's tracker, tombstones in place — the E49/E56 charters' arcs and the first two trains. |
 | `backlog.md` | historical record | The alpha-era planning surface; every shipped item's full body lives here, including everything moved out of the distilled file. |
-| `beta.md` | draft — awaiting owner review (2026-08-13) | The beta execution charter: tracks process.md §5's ratified trigger against today's tree, plans the pre-switch/at-switch work, proposes the stability annex (diagnostics identity, std tiers). |
+| `beta.md` | ratified 2026-08-13 as recommended | The beta execution charter: tracks process.md §5's ratified trigger against today's tree, plans the pre-switch/at-switch work, proposes the stability annex (diagnostics identity, std tiers). |
 | `bits-and-bytes.md` | shipped arc (2026-07-02) | The binary floor: hex literals, bitwise/shift operators, `std::bytes`. |
 | `bundle-splitting.md` | shipped arc (2026-08-04) | Route-chunk splitting from whole-program reachability (A16); S1 (measure-first), S2 (emission + gate), S3 (loading), S4 (consumer sweep) all shipped — §5's v1 non-goals stand, §11 scopes a v2. |
 | `chain-seam-split.md` | shipped arc (2026-08-01, backlog B48) | A chain splits when a non-final link renders across lines, not just on width. |
@@ -116,7 +116,7 @@ Closing sweeps archive tombstones into
 | `dev-refresh.md` | ruled 2026-08-11 (owner's superseding design) | The dev-refresh hook declined for the no-round flaw; §5 records the owner's primitives instead — `std::watch`'s `is_watching`/`force_refresh` + `serve_build`'s dev policy — and §6 their implementation (E55 complete). |
 | `fullstack-dx.md` | ratified 2026-08-11; FULLY BUILT | E56's charter — the document, the assets, a server that grows: S1–S5 all shipped by 2026-08-12 (Service layer, LegBuild, serve_build, ShellFault/check_shell, Document); records §11–§15. |
 | `optimistic-lifecycle.md` | shipped arc (2026-08-04) | `Optimistic::over(signal)` — Pending/Confirmed/Rejected beside the value, generation-guarded; §9 holds two open owner questions (indexed in the tracker header). |
-| `design-language.md` | draft — awaiting owner review (2026-08-13) | One visual system for site, playground, and docs — kolt's `visual-overhaul-2` role tokens + Zed's principles mapped onto the brand palette; frames the playground UX fixes (K1–K4, K9–K10) and the stay-on-CodeMirror recommendation. |
+| `design-language.md` | ratified 2026-08-13 as recommended | One visual system for site, playground, and docs — kolt's `visual-overhaul-2` role tokens + Zed's principles mapped onto the brand palette; frames the playground UX fixes (K1–K4, K9–K10) and the stay-on-CodeMirror recommendation. |
 
 Nothing in flight outside this directory as of the 2026-08-13 sweep —
 every drafted paper has a row above.

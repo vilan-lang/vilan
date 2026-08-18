@@ -1,8 +1,27 @@
 # Beta — executing the ratified contract, and the annex that extends it
 
-> Status: **DRAFT 2026-08-13** — for the owner's review. Filed from the
-> owner's 2026-08-13 cleanup list ("This seems like the turning point
-> where we transition from alpha to beta"), item 6 elevated to a charter.
+> Status: **RATIFIED 2026-08-13 as recommended** ("Go with the
+> recommendations on both papers") — §4's five answers stand: Q1 the
+> clean-train count starts at v0.35.0; Q2 **B73 blocks trigger (c)** and
+> is beta-critical from today; Q3 message-head identity, no numeric
+> codes; Q4 reactive/ui Tier 2, canvas Tier 3; Q5 the annex (§3) is
+> ratified as beta's extended surface. **Owner's same-day question —
+> "should we defer beta? I might have jumped the gun":** the ratified
+> trigger already answers it. Beta is not declared by this paper or by
+> anyone; it is declared when process.md §5.4's four conditions hold,
+> and today none of them do — (b) cannot be satisfied before
+> 2026-08-29 at the earliest (two clean trains from v0.35.0), (c) now
+> waits on B73, (a) on kolt's migration, (d) on D5. So: the charter
+> stands, the pre-switch work (§2) proceeds at ordinary priority as the
+> low-regret hygiene it is, and **nothing beta-branded ships publicly
+> until the trigger fires** — the gun was never fired, only cocked.
+> Recorded here so the question does not recur.
+>
+> Filed from the owner's 2026-08-13 cleanup list ("This seems like the
+> turning point where we transition from alpha to beta"), item 6
+> elevated to a charter.
+>
+> Prior status: DRAFT 2026-08-13.
 >
 > **This paper decides nothing process.md already decided.** The beta
 > contract is RATIFIED (process.md §5, 2026-08-07): beta adds exactly
@@ -43,9 +62,10 @@ process.md §5.4, verbatim conditions, with today's status:
   false *rejections* (valid code refused), not wrong answers. **B73 is
   the live question**: a blanket `Into<T>` beating a user's more
   specific impl by declaration order produces a *wrong resolution from
-  a clean compile* — that is miscompile-shaped, and §4 Q2 asks whether
-  it blocks the trigger. If yes, B73 graduates from
-  "blocked: specificity design" to beta-critical.
+  a clean compile* — that is miscompile-shaped, and §4 Q2 asked whether
+  it blocks the trigger. **Ruled yes, 2026-08-13**: B73 graduated from
+  "blocked: specificity design" to beta-critical; the specificity design
+  (method-resolution.md §9) is scheduled as a proposal-first lane.
 - **(d) There is somebody to break the promise to** — D5, the traction
   plan, still `OPEN (blocked: needs a dedicated session with the
   owner)`. process.md §7.1 already named this the policy's urgent
@@ -135,7 +155,7 @@ and keep one-version read-back compat; the RPC wire needs only
 same-build agreement and §5.2(3) already makes any wire change a
 Breaking entry unconditionally.
 
-## 4. Open questions
+## 4. Open questions — all RULED 2026-08-13, each as recommended
 
 - **Q1 — trigger (b) accounting**: does the v0.33.0 → v0.34.0 pair
   (second cut called early) count as the first of the two clean

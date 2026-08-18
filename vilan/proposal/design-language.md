@@ -1,7 +1,17 @@
 # The design language — one visual system for site, playground, and docs
 
-> Status: **DRAFT 2026-08-13** — for the owner's review. Filed from the
-> owner's 2026-08-13 cleanup list, item 3: the web surfaces should read
+> Status: **RATIFIED 2026-08-13 as recommended** ("Go with the
+> recommendations on both papers") — §3's five answers stand: Q1 the
+> hero survives, rebuilt on the tokens, fenced as the one indulgence;
+> Q2 role tokens now, the light theme lands with K6's docs port; Q3
+> CommitMono for all code surfaces — **with the owner's own settings,
+> recorded in §2.3**; Q4 the editor stays CodeMirror 6; Q5 kolt's token
+> vocabulary adopted verbatim. Adoption is sliced in the tracker (§K).
+>
+> Prior status: DRAFT 2026-08-13.
+>
+> Filed from the owner's 2026-08-13 cleanup list, item 3: the web
+> surfaces should read
 > like Zed and kolt — "clean yet utilitarian. They show power through
 > their design language." Everything cited from kolt was read off its
 > `visual-overhaul-2` branch (the owner's designated reference — the
@@ -89,6 +99,25 @@ Display" stays a marketing-register face. Structure the tokens for
 theming from day one (roles make it nearly free); ship the dark brand
 theme as default plus **one light theme** for docs readability (§3 Q2).
 
+**The CommitMono spec (ratified 2026-08-13, the owner's own editor
+settings — the canonical form for every vilan code surface):**
+
+- Face: **CommitMono V143**, the *variable* font, self-hosted
+  (`CommitMono-VariableFont` woff2 — kolt's copy under
+  `client/src/public/font/` on `visual-overhaul-2` is the reference;
+  the `@font-face` declares the full weight range so the variable axes
+  are live — the owner's `editor.fontVariations: true`).
+- Features, all on: stylistic sets **ss01–ss05** and character variants
+  **cv04, cv06, cv08** — in CSS,
+  `font-feature-settings: "ss01", "ss02", "ss03", "ss04", "ss05", "cv04", "cv06", "cv08";`
+  (kolt's `index.css` already carries exactly this set, which is how the
+  study first read it off the tree). Note that ss01–ss05 include
+  CommitMono's ligature/alternate sets, so this is also the ligature
+  ruling: **on**, per the owner's `editor.fontLigatures`.
+- One definition, in `theme.vl`'s token block, generated outward to the
+  CodeMirror theme (K10) and the docs stylesheet (K6) — never
+  hand-duplicated.
+
 ### 2.4 One token source, generated outward
 
 The hand-sync between `theme.vl` and the editor's hardcoded theme
@@ -136,7 +165,7 @@ advantage is a richer completion story, which buys nothing today
 because no completion source is wired at all (K9); if K9 later wants
 LSP-grade completion, CM6's autocomplete API is already in the bundle.
 
-## 3. Open questions
+## 3. Open questions — all RULED 2026-08-13, each as recommended
 
 - **Q1 — the hero**: does the bloom/gradient marketing register survive
   on the landing page, or does utilitarian go wall-to-wall?

@@ -18,5 +18,13 @@ The eras before this file:
 
 ---
 
-*(No entries yet — the first sweep after the 2026-08-13 re-baseline
-starts the record.)*
+## 2026-08-13
+
+- **L1. Ratify beta.md — CLOSED 2026-08-13** (ratified as recommended
+  the same day it was drafted: Q1 the clean-train count starts at
+  v0.35.0; Q2 B73 blocks trigger (c) — beta-critical; Q3 message-head
+  identity, no numeric codes; Q4 reactive/ui Tier 2, canvas Tier 3; Q5
+  the annex ratified. The owner's follow-up "should we defer beta?" is
+  answered in the status block: the ratified trigger already defers the
+  declaration; pre-switch work proceeds as low-regret hygiene. Record:
+  beta.md status block / process.md §5.)
