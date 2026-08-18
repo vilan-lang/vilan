@@ -28,3 +28,20 @@ The eras before this file:
   answered in the status block: the ratified trigger already defers the
   declaration; pre-switch work proceeds as low-regret hygiene. Record:
   beta.md status block / process.md §5.)
+
+- **M3. `DevChannel.clients` accumulates dead SSE streams (S; found by the survey)** — SHIPPED 2026-08-18. The HMR dev channel pushed every SSE connection into
+`clients: Arc<Mutex<Vec<TcpStream>>>` unconditionally and pruned
+only as a side effect of a broadcast's write failure — a long dev
+session with many reconnects and sparse rebuilds accumulated dead
+streams unboundedly. Confirmed at one leaked fd per disconnect (100
+cycles → 100 fds, no rebuild involved), with two corrections to the
+survey's write-up: the per-connection **threads never leaked** (the
+handler returned after registering the socket), and a rebuild did
+**not** reap — a write to a cleanly closed peer succeeds, so a dead
+client survived its first broadcast and left only on the second.
+Fixed with the read-side liveness check: the connection's own thread
+now stays on it, blocked reading, and unregisters on end-of-stream;
+the broadcast prune stays as a backstop. After: 100 cycles, zero fd
+and zero thread growth. Pinned in `hmr.rs`'s unit tests (the
+registry's size is not observable on the wire, and `vilan-cli` is
+bin-only). M2's tier-2 soak remains the long-horizon validation. (Record: hmr.md appendix; merged 931171dc.)
