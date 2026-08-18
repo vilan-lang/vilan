@@ -9000,3 +9000,219 @@ mod leak_measurement {
         );
     }
 }
+
+/// The edit-latency half of the performance baseline (`proposal/perf-baseline.md`).
+///
+/// `leak_measurement` above answers "does a keystroke leak"; this answers "what
+/// does a keystroke *cost*", over the same loop and through the same entry
+/// point (`Document::analyze_on_this_thread`, which is why the section lives
+/// here rather than in the CLI's harness — it is private to this crate, and a
+/// benchmark is not a reason to widen it). A tail latency, not a mean: an
+/// editor is judged by the keystroke that stalls, so the row is p50/p95/p99.
+///
+/// Not `target_os = "linux"`-gated, unlike its neighbor — that gate is about
+/// `/proc/self/statm`, and a clock is everywhere.
+///
+/// Run it (with the CLI half, one command, `perf-baseline.md` §3):
+///
+/// ```text
+/// cargo nextest run --release --workspace --run-ignored ignored-only \
+///     -E 'test(perf_baseline)' --no-capture > perf.log 2>&1
+/// ```
+#[cfg(test)]
+mod perf_baseline {
+    use super::*;
+    use crate::document::tests::std_root;
+    use std::time::{Duration, Instant};
+
+    /// Which build measured the row. A debug-profile number is a fact about
+    /// `-O0`, not about the compiler a user installs, and a baseline that does
+    /// not say which it is invites exactly that confusion.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    }
+
+    /// Nearest-rank percentile over sorted samples.
+    fn percentile(sorted: &[Duration], fraction: f64) -> f64 {
+        let rank = (fraction * sorted.len() as f64).ceil().max(1.0) as usize;
+        sorted[rank.min(sorted.len()) - 1].as_secs_f64() * 1000.0
+    }
+
+    /// The same `PERF {…}` line shape the CLI harness emits, so a run's rows
+    /// from both binaries concatenate into one diffable summary.
+    fn report(corpus: &str, note: &str, samples: &mut Vec<Duration>) {
+        samples.sort_unstable();
+        let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        println!(
+            "PERF {{\"section\":\"lsp_edit\",\"corpus\":\"{}\",\"mode\":\"warm\",\
+             \"metric\":\"analyze\",\"profile\":\"{}\",\"runs\":{},\"min_ms\":{:.2},\
+             \"median_ms\":{:.2},\"p95_ms\":{:.2},\"p99_ms\":{:.2},\"max_ms\":{:.2},\
+             \"note\":\"{}\"}}",
+            corpus,
+            profile(),
+            samples.len(),
+            milliseconds(samples[0]),
+            percentile(samples, 0.50),
+            percentile(samples, 0.95),
+            percentile(samples, 0.99),
+            milliseconds(*samples.last().expect("at least one sample")),
+            note,
+        );
+    }
+
+    /// Runs `warmup` unmeasured then `measured` timed analyses of `text_at(i)`,
+    /// each a distinct document (a keystroke), and returns the per-analysis
+    /// wall times.
+    ///
+    /// The mode is **warm** and could not honestly be anything else: this is
+    /// the editor's steady state, where the resolved base world is already in
+    /// the process and only the entry is new. The cold shape — a first analysis
+    /// after the server starts — is what the CLI harness's `cold` rows measure.
+    /// The warmup is what makes the distinction real rather than assumed
+    /// (`suite-speed.md` §2.1/E26): without it the first samples carry the whole
+    /// std resolve and the percentile is a mixture of two populations.
+    fn measure(
+        text_at: impl Fn(usize) -> String,
+        entry: &Path,
+        warmup: usize,
+        measured: usize,
+    ) -> Vec<Duration> {
+        let std_dir = std_root();
+        for i in 0..warmup {
+            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, entry);
+        }
+        let mut samples = Vec::with_capacity(measured);
+        for i in warmup..warmup + measured {
+            let text = text_at(i);
+            let started = Instant::now();
+            let _ = Document::analyze_on_this_thread(&text, &std_dir, entry);
+            samples.push(started.elapsed());
+        }
+        samples
+    }
+
+    fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(work)
+            .expect("spawn the latency measurement thread")
+            .join()
+            .expect("the latency measurement thread panicked")
+    }
+
+    /// The synthetic subject: a std-using document with no macros, one
+    /// character different per iteration. Deliberately the same fixture
+    /// `leak_measurement` uses, so the leak plateau and the latency curve are
+    /// statements about one document.
+    fn synthetic_text(i: usize) -> String {
+        format!(
+            "import std::print;\nimport std::option::Option::{{ self, Some, None }};\n\n\
+             fun describe(value: Option<i32>): str {{\n\
+             \tmatch value {{\n\t\tSome(let n) => int_to_string(n),\n\t\tNone => \"empty {i}\",\n\t}}\n}}\n\n\
+             fun int_to_string(n: i32): str {{\n\t\"n\"\n}}\n\n\
+             fun main() {{\n\tlet value = Some({i});\n\tprint(describe(value));\n\tprint(describe(None));\n}}\n"
+        )
+    }
+
+    /// A real package file, edited the way the broken-world fixture above edits
+    /// its own: a trailing comment that changes every iteration. It is a whole
+    /// re-analysis either way — the entry is never served from a content cache
+    /// once its bytes move — and a trailing comment is the one edit that is
+    /// valid in every file, so the same mutation works on any corpus.
+    fn corpus_text(base: &str, i: usize) -> String {
+        format!("{base}\n// keystroke {i}\n")
+    }
+
+    /// The sibling-repository corpora, addressed by environment variable and
+    /// skipped when absent (`perf-baseline.md` §1): `VILAN_PERF_KOLT`,
+    /// `VILAN_PERF_WEBSITE`.
+    const CORPORA: &[(&str, &str, &str)] = &[
+        ("kolt_views", "VILAN_PERF_KOLT", "src/views.vl"),
+        ("website_page", "VILAN_PERF_WEBSITE", "src/page.vl"),
+    ];
+
+    #[test]
+    #[ignore = "the performance baseline: minutes of measurement, run deliberately (proposal/perf-baseline.md §3)"]
+    fn perf_baseline_lsp_edit_latency() {
+        let samples = on_big_stack(|| {
+            let directory =
+                std::env::temp_dir().join(format!("vilan_perf_latency_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("create the fixture directory");
+            let entry = directory.join("main.vl");
+            let samples = measure(synthetic_text, &entry, 50, 2000);
+            let _ = std::fs::remove_dir_all(&directory);
+            samples
+        });
+        let mut samples = samples;
+        report("synthetic", "15 lines, no macros", &mut samples);
+
+        for (name, variable, relative) in CORPORA {
+            let Some(root) = std::env::var_os(variable).map(PathBuf::from) else {
+                println!("PERF-SKIP {name}: {variable} is not set");
+                continue;
+            };
+            let entry = root.join(relative);
+            let Ok(base) = std::fs::read_to_string(&entry) else {
+                println!("PERF-SKIP {name}: {} is not readable", entry.display());
+                continue;
+            };
+            let lines = base.lines().count();
+            // Fewer iterations than the synthetic subject, and the reason is
+            // recorded rather than tuned by feel: each analysis leaks its entry
+            // text and AST (the known, named leak `leak_measurement` bounds), so
+            // a 25 KB file at 2000 keystrokes is hundreds of megabytes of
+            // deliberate garbage — and at a real file's per-keystroke cost that
+            // many iterations is most of an hour. 100 is enough for p50/p95 and
+            // is reported with its `runs` so a reader can judge the p99 for
+            // themselves.
+            let mut samples =
+                on_big_stack(move || measure(move |i| corpus_text(&base, i), &entry, 10, 100));
+            report(name, &format!("{lines} lines"), &mut samples);
+        }
+    }
+
+    /// The gate's pin on this half of the harness: it runs and produces an
+    /// ordered, non-empty sample set. A handful of analyses, seconds.
+    #[test]
+    fn perf_baseline_lsp_harness_smoke() {
+        let mut samples = on_big_stack(|| {
+            let directory = std::env::temp_dir()
+                .join(format!("vilan_perf_latency_smoke_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("create the fixture directory");
+            let entry = directory.join("main.vl");
+            let samples = measure(synthetic_text, &entry, 1, 3);
+            let _ = std::fs::remove_dir_all(&directory);
+            samples
+        });
+        assert_eq!(samples.len(), 3, "the harness measured the wrong count");
+        report("synthetic", "smoke", &mut samples);
+        assert!(
+            samples.windows(2).all(|pair| pair[0] <= pair[1]),
+            "reporting did not leave the samples sorted, so the percentiles are not percentiles",
+        );
+        assert!(
+            samples[0] > Duration::ZERO,
+            "an analysis measured zero time — the clock is not measuring the work",
+        );
+    }
+
+    /// The pin on the statistic itself, over known samples. Three measured
+    /// analyses cannot tell a p95 from a p5 — every rank of a three-sample set
+    /// is within one of every other — so the tail numbers this section exists
+    /// to report need a fixture that can distinguish them.
+    #[test]
+    fn perf_baseline_lsp_percentiles_are_nearest_rank() {
+        let sorted: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+        assert_eq!(percentile(&sorted, 0.50), 50.0);
+        assert_eq!(percentile(&sorted, 0.95), 95.0);
+        assert_eq!(percentile(&sorted, 0.99), 99.0);
+        // A single sample answers every question with itself.
+        assert_eq!(percentile(&sorted[..1], 0.99), 1.0);
+    }
+}

@@ -6,6 +6,16 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**The compiler has a measured performance baseline, and one command that reproduces it.** Four phases — parse, analyze, the post-analysis passes, transform — timed as the library calls they already are, over five corpora from a five-line program to the 2,996-line promo site, each measured cold *and* warm with the process-global caches cleared on purpose rather than left to whatever the previous iteration happened to leave behind. Alongside them: `vilan check` end to end on real packages, reported in units of a freshly measured reference compile so the numbers survive a change of machine, and the language server's edit latency as p50/p95/p99 over thousands of synthetic keystrokes. No benchmark framework was added — `std::time::Instant`, repeated runs, min and median. The harness is `#[ignore]`d, so the test suite does not get slower; what runs in the gate is a two-second pin that the harness itself still works.
+
+The numbers are in `vilan/proposal/perf-baseline.md`, and the first one is a surprise. Parsing is nowhere: 1.8 ms at its largest, never more than 1.4 % of a compile. The post-analysis passes are 71 % of a *warm* website compile — and unlike analysis, which the base cache makes 40–76 % cheaper, they cost exactly as much warm as cold, because they recompute over the whole reachable world every time. Inside them, `const_eval::evaluate` is 89 % of the total: 4.21 s of the site's 6.60 s check, 68× what kolt pays for a third of the source. `check` pays it in full while emitting nothing, and so does every keystroke — editing the site's main page costs 321 ms per keystroke against a 150 ms debounce budget. Filed as backlog M4, with M5 (the phase instrument cannot see inside the post-passes) and M6 behind it.
+
+One more thing the baseline settles: what a program costs to compile is mostly what its imports drag in, not how long it is. A 22-line entry over a 119-line app and a 289-line entry over a 943-line app compile 8 % apart.
+
+---
+
 ## v0.34.0 — 2026-08-12
 
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
