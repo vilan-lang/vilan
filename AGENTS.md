@@ -103,10 +103,11 @@ Rust workspace, four crates, plus the language's own tree:
 - **Root causes.** Fix the general path; a special case that handles one input is a
   smell. If the general fix implies a refactor, say so in your report rather than
   building around the debt.
-- **Read the named proposal sections first.** The current arc:
-  `vilan/proposal/destruction-impl-plan.md` (the build sequence),
-  `vilan/proposal/destruction.md` (the C4 design),
-  `vilan/proposal/claims-and-epochs.md` (the memory-model frame and closure rule).
+- **Read the named proposal sections first.** The current arc lives in
+  `vilan/proposal/backlog-2026-08-13.md` (the single planning surface — its
+  Now/Next/Later block names what's active); each item cites the proposal
+  paper that governs it. A work-order brief that names sections overrides
+  this default. (Arcs move; the tracker is the pointer that stays true.)
 - **Report honestly and compactly:** what changed (files + why), what you ran with
   exact exit codes, what you did *not* verify, open questions. A true "unverified" is
   worth more than a false "works".

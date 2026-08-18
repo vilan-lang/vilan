@@ -4,6 +4,9 @@
 > [`backlog-2026-07-18.md`](backlog-2026-07-18.md) (distilled, open items only, same
 > stable ids). This file stays as the historical record: shipped items, their full
 > context, and the lessons recorded alongside them. Don't add new items here.
+> *(Chain continued 2026-08-13: the distilled tracker froze in turn — the live
+> surface is now [`backlog-2026-08-13.md`](backlog-2026-08-13.md), and closing
+> sweeps archive into [`backlog-archive.md`](backlog-archive.md).)*
 
 A running capture of work that is *known but not done*, so nothing is lost to conversation. This
 is the tactical companion to [`roadmap.md`](roadmap.md) (the ranked strategic view); items that
