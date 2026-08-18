@@ -1,6 +1,6 @@
 # Beta — executing the ratified contract, and the annex that extends it
 
-> Status: **RATIFIED 2026-08-13 as recommended** ("Go with the
+> Status: **RATIFIED 2026-08-18 as recommended** ("Go with the
 > recommendations on both papers") — §4's five answers stand: Q1 the
 > clean-train count starts at v0.35.0; Q2 **B73 blocks trigger (c)** and
 > is beta-critical from today; Q3 message-head identity, no numeric
@@ -17,11 +17,11 @@
 > until the trigger fires** — the gun was never fired, only cocked.
 > Recorded here so the question does not recur.
 >
-> Filed from the owner's 2026-08-13 cleanup list ("This seems like the
+> Filed from the owner's 2026-08-18 cleanup list ("This seems like the
 > turning point where we transition from alpha to beta"), item 6
 > elevated to a charter.
 >
-> Prior status: DRAFT 2026-08-13.
+> Prior status: DRAFT 2026-08-18.
 >
 > **This paper decides nothing process.md already decided.** The beta
 > contract is RATIFIED (process.md §5, 2026-08-07): beta adds exactly
@@ -34,7 +34,7 @@
 > work the trigger and promises need, §3 proposes an **annex** of
 > stability surfaces the ratified floor doesn't name (diagnostics
 > identity, std tiers, toolchain, formats), and §4 asks the open
-> questions. Tracker home: backlog-2026-08-13.md §L.
+> questions. Tracker home: backlog-2026-08-18.md §L.
 
 ## 0. Why now
 
@@ -50,7 +50,7 @@ process.md §5.4, verbatim conditions, with today's status:
 - **(a) The reference application runs on a released toolchain** —
   kolt-migration.md is the living tracker. In flight: the owner's
   `vilan-migration` branch on kolt is the active conversion (confirmed
-  2026-08-13 — it is kolt's checked-out branch). Not yet met; closest of
+  2026-08-18 — it is kolt's checked-out branch). Not yet met; closest of
   the four to mechanical completion.
 - **(b) Two consecutive weekly trains ship with no urgent patch
   between them** — v0.33.0 (2026-08-08) and v0.34.0 (2026-08-12, cut
@@ -63,7 +63,7 @@ process.md §5.4, verbatim conditions, with today's status:
   the live question**: a blanket `Into<T>` beating a user's more
   specific impl by declaration order produces a *wrong resolution from
   a clean compile* — that is miscompile-shaped, and §4 Q2 asked whether
-  it blocks the trigger. **Ruled yes, 2026-08-13**: B73 graduated from
+  it blocks the trigger. **Ruled yes, 2026-08-18**: B73 graduated from
   "blocked: specificity design" to beta-critical; the specificity design
   (method-resolution.md §9) is scheduled as a proposal-first lane.
 - **(d) There is somebody to break the promise to** — D5, the traction
@@ -96,7 +96,8 @@ process.md §5.4, verbatim conditions, with today's status:
 - **process.md's own deferred tail** (L6–L8): branch protection (§8.3 —
   amend ruleset 18887216 per §2.3/§2.4, then require `ci / check`), the
   three security settings (§9.2 flagged "should not drift far" — that
-  was six days ago), and the scaffolding slice (CONTRIBUTING.md et al.,
+  was eleven days ago; enabled 2026-08-18 under Order 2, L7), and the
+  scaffolding slice (CONTRIBUTING.md et al.,
   deferred with D5). Protection and secret scanning should not wait for
   beta.
 
@@ -105,7 +106,7 @@ process.md §5.4, verbatim conditions, with today's status:
 - CHANGELOG.md header and releases.md §4 rewritten with the three
   promises (process.md §9.2 defers them to exactly this moment).
 - README.md's "fast-moving alpha" status line replaced — it is
-  *correct today* and stays until this commit (the 2026-08-13 rot
+  *correct today* and stays until this commit (the 2026-08-18 rot
   survey flagged it as stale; per the ratified policy it is not).
 - The `### Breaking` heading becomes structural in the changelog
   (v0.34.0's cut already *ordered* breaking entries first; beta makes
@@ -155,7 +156,7 @@ and keep one-version read-back compat; the RPC wire needs only
 same-build agreement and §5.2(3) already makes any wire change a
 Breaking entry unconditionally.
 
-## 4. Open questions — all RULED 2026-08-13, each as recommended
+## 4. Open questions — all RULED 2026-08-18, each as recommended
 
 - **Q1 — trigger (b) accounting**: does the v0.33.0 → v0.34.0 pair
   (second cut called early) count as the first of the two clean

@@ -2,7 +2,7 @@
 
 One line per file in this directory: name, status, one-clause description.
 Status is derived from each file's own header/status block (read, not the
-whole file), as of 2026-08-03, last re-verified 2026-08-13 (the cleanup
+whole file), as of 2026-08-03, last re-verified 2026-08-18 (the cleanup
 arc's records sweep: eight "awaiting review" rows refreshed to their
 files' own resolved statuses, three missing rows added, the new planning
 chain landed — the 2026-08-04 sweep's detail lives in this file's
@@ -17,7 +17,7 @@ kept for context only).
 
 Cycle proposals through 2026-08-04 are merged and carry real status lines below.
 
-The open-work tracker is [`backlog-2026-08-13.md`](backlog-2026-08-13.md)
+The open-work tracker is [`backlog-2026-08-18.md`](backlog-2026-08-18.md)
 — the single planning surface (status convention in its own header).
 Closing sweeps archive tombstones into
 [`backlog-archive.md`](backlog-archive.md); `backlog.md` and
@@ -32,11 +32,11 @@ Closing sweeps archive tombstones into
 | `argument-tail-descent.md` | shipped arc (2026-08-01, backlog B43) | A statement's split descends through a call's last argument, matching `Split::Tail`. |
 | `async-polymorphism.md` | shipped arc (Part A 2026-07-17, Part B 2026-07-18) | Async polymorphism: `sync` contracts, adaptation by monomorphized asyncness, structured-concurrency scopes; Part C (the parallelism spine) is a design record, deferred (backlog §J.1) with no driver application yet. |
 | `b33-emission-order.md` | shipped arc (2026-07-25) | Module-level binding emission in dependency order, cycles diagnosed. |
-| `backlog-2026-08-13.md` | active | THE open-work tracker — the single planning surface, re-baselined at the cleanup arc; carries the Now/Next/Later strategic block. |
+| `backlog-2026-08-18.md` | active | THE open-work tracker — the single planning surface, re-baselined at the cleanup arc; carries the Now/Next/Later strategic block. |
 | `backlog-archive.md` | active (append-only) | Where closing sweeps move tombstones from the live tracker; indexes the frozen eras. |
-| `backlog-2026-07-18.md` | historical record (frozen 2026-08-13) | The cycle 15–19 era's tracker, tombstones in place — the E49/E56 charters' arcs and the first two trains. |
+| `backlog-2026-07-18.md` | historical record (frozen 2026-08-18) | The cycle 15–19 era's tracker, tombstones in place — the E49/E56 charters' arcs and the first two trains. |
 | `backlog.md` | historical record | The alpha-era planning surface; every shipped item's full body lives here, including everything moved out of the distilled file. |
-| `beta.md` | ratified 2026-08-13 as recommended | The beta execution charter: tracks process.md §5's ratified trigger against today's tree, plans the pre-switch/at-switch work, proposes the stability annex (diagnostics identity, std tiers). |
+| `beta.md` | ratified 2026-08-18 as recommended | The beta execution charter: tracks process.md §5's ratified trigger against today's tree, plans the pre-switch/at-switch work, proposes the stability annex (diagnostics identity, std tiers). |
 | `bits-and-bytes.md` | shipped arc (2026-07-02) | The binary floor: hex literals, bitwise/shift operators, `std::bytes`. |
 | `bundle-splitting.md` | shipped arc (2026-08-04) | Route-chunk splitting from whole-program reachability (A16); S1 (measure-first), S2 (emission + gate), S3 (loading), S4 (consumer sweep) all shipped — §5's v1 non-goals stand, §11 scopes a v2. |
 | `chain-seam-split.md` | shipped arc (2026-08-01, backlog B48) | A chain splits when a non-final link renders across lines, not just on width. |
@@ -83,7 +83,7 @@ Closing sweeps archive tombstones into
 | `releases.md` | active | Installation, versioning, and the release pipeline — the process this project actually runs. |
 | `requirement-polymorphism.md` | shipped arc (2026-08-02, backlog B51) | The owner-coverage fence follows instantiation chains through generic forwarders. |
 | `ret-checking.md` | shipped arc (2026-07-04) | Return-position type checking (backlog B10). |
-| `roadmap.md` | historical / superseded (banner 2026-08-13) | Pre-lettered-section ranked backlog; its strategic role now lives in `backlog-2026-08-13.md`'s Now/Next/Later block, its Done chronicle stays as history. |
+| `roadmap.md` | historical / superseded (banner 2026-08-18) | Pre-lettered-section ranked backlog; its strategic role now lives in `backlog-2026-08-18.md`'s Now/Next/Later block, its Done chronicle stays as history. |
 | `router.md` | shipped arc (settled 2026-07-11) | `std::router` — history-API routing (backlog A10). |
 | `rule4-completion.md` | shipped arc (complete 2026-07-19) | The `borrows` root-set and the `bumps` effect completing rule 4 (C6 + C10). |
 | `signature-layout.md` | shipped arc (2026-08-01, backlog B46) | `fun` signatures reach the width rule as a declaration site. |
@@ -116,7 +116,7 @@ Closing sweeps archive tombstones into
 | `dev-refresh.md` | ruled 2026-08-11 (owner's superseding design) | The dev-refresh hook declined for the no-round flaw; §5 records the owner's primitives instead — `std::watch`'s `is_watching`/`force_refresh` + `serve_build`'s dev policy — and §6 their implementation (E55 complete). |
 | `fullstack-dx.md` | ratified 2026-08-11; FULLY BUILT | E56's charter — the document, the assets, a server that grows: S1–S5 all shipped by 2026-08-12 (Service layer, LegBuild, serve_build, ShellFault/check_shell, Document); records §11–§15. |
 | `optimistic-lifecycle.md` | shipped arc (2026-08-04) | `Optimistic::over(signal)` — Pending/Confirmed/Rejected beside the value, generation-guarded; §9 holds two open owner questions (indexed in the tracker header). |
-| `design-language.md` | ratified 2026-08-13 as recommended | One visual system for site, playground, and docs — kolt's `visual-overhaul-2` role tokens + Zed's principles mapped onto the brand palette; frames the playground UX fixes (K1–K4, K9–K10) and the stay-on-CodeMirror recommendation. |
+| `design-language.md` | ratified 2026-08-18 as recommended | One visual system for site, playground, and docs — kolt's `visual-overhaul-2` role tokens + Zed's principles mapped onto the brand palette; frames the playground UX fixes (K1–K4, K9–K10) and the stay-on-CodeMirror recommendation. |
 
-Nothing in flight outside this directory as of the 2026-08-13 sweep —
+Nothing in flight outside this directory as of the 2026-08-18 sweep —
 every drafted paper has a row above.

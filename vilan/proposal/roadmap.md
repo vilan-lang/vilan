@@ -1,8 +1,8 @@
 # Vilan Roadmap
 
-> **Superseded 2026-08-13** — the ranked-strategy role this file played
+> **Superseded 2026-08-18** — the ranked-strategy role this file played
 > now lives in the **Now / Next / Later** block of
-> [`backlog-2026-08-13.md`](backlog-2026-08-13.md), the single planning
+> [`backlog-2026-08-18.md`](backlog-2026-08-18.md), the single planning
 > surface. The Done chronicle below stays as history; don't rank new
 > work here. (Note: the "tactical companion" reference below points at
 > `backlog.md`, which was itself superseded 2026-07-18 — the chain is

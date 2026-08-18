@@ -104,7 +104,7 @@ Rust workspace, four crates, plus the language's own tree:
   smell. If the general fix implies a refactor, say so in your report rather than
   building around the debt.
 - **Read the named proposal sections first.** The current arc lives in
-  `vilan/proposal/backlog-2026-08-13.md` (the single planning surface — its
+  `vilan/proposal/backlog-2026-08-18.md` (the single planning surface — its
   Now/Next/Later block names what's active); each item cites the proposal
   paper that governs it. A work-order brief that names sections overrides
   this default. (Arcs move; the tracker is the pointer that stays true.)

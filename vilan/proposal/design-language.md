@@ -1,6 +1,6 @@
 # The design language — one visual system for site, playground, and docs
 
-> Status: **RATIFIED 2026-08-13 as recommended** ("Go with the
+> Status: **RATIFIED 2026-08-18 as recommended** ("Go with the
 > recommendations on both papers") — §3's five answers stand: Q1 the
 > hero survives, rebuilt on the tokens, fenced as the one indulgence;
 > Q2 role tokens now, the light theme lands with K6's docs port; Q3
@@ -8,16 +8,16 @@
 > recorded in §2.3**; Q4 the editor stays CodeMirror 6; Q5 kolt's token
 > vocabulary adopted verbatim. Adoption is sliced in the tracker (§K).
 >
-> Prior status: DRAFT 2026-08-13.
+> Prior status: DRAFT 2026-08-18.
 >
-> Filed from the owner's 2026-08-13 cleanup list, item 3: the web
+> Filed from the owner's 2026-08-18 cleanup list, item 3: the web
 > surfaces should read
 > like Zed and kolt — "clean yet utilitarian. They show power through
 > their design language." Everything cited from kolt was read off its
 > `visual-overhaul-2` branch (the owner's designated reference — the
 > working tree is mid-conversion to the vilan framework and its visuals
 > are not authoritative), via `git show`, no checkout. Tracker home:
-> backlog-2026-08-13.md §K5; the playground UX fixes it frames are
+> backlog-2026-08-18.md §K5; the playground UX fixes it frames are
 > K1–K4 and K9–K10.
 
 ## 1. The references, read out of the tree
@@ -99,7 +99,7 @@ Display" stays a marketing-register face. Structure the tokens for
 theming from day one (roles make it nearly free); ship the dark brand
 theme as default plus **one light theme** for docs readability (§3 Q2).
 
-**The CommitMono spec (ratified 2026-08-13, the owner's own editor
+**The CommitMono spec (ratified 2026-08-18, the owner's own editor
 settings — the canonical form for every vilan code surface):**
 
 - Face: **CommitMono V143**, the *variable* font, self-hosted
@@ -165,7 +165,7 @@ advantage is a richer completion story, which buys nothing today
 because no completion source is wired at all (K9); if K9 later wants
 LSP-grade completion, CM6's autocomplete API is already in the bundle.
 
-## 3. Open questions — all RULED 2026-08-13, each as recommended
+## 3. Open questions — all RULED 2026-08-18, each as recommended
 
 - **Q1 — the hero**: does the bloom/gradient marketing register survive
   on the landing page, or does utilitarian go wall-to-wall?
