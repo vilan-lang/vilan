@@ -12,6 +12,14 @@ re-sending it. Echoes are ignored, clean fields update, dirty fields win.
 [handles](#handle) to them. The tool for graphs and cycles.
 [The memory model](../tour/memory-model.md).
 
+**backed enum**: an enum whose payload-free variants carry an explicit
+string or integer — `enum Align { Start = "flex-start" }`. The variant
+*is* that value at run time (no tag, no wrapper), which is why `value()`
+costs nothing, `parse` is offered, and it keys a `Map` with no derive. Its
+runtime domain is the host's, so an exhaustive `match` traps on a value
+outside the set. [Data and traits](../tour/data-and-traits.md),
+[spec §5.2](../spec/types.md).
+
 **binding**: a name introduced by `let` (immutable) or `mut` (mutable).
 [Values and types](../tour/values-and-types.md).
 
@@ -39,9 +47,12 @@ with `get`. [Functions & closures](../tour/functions-and-closures.md).
 the service's shape. A stale client fails cleanly instead of corrupting
 calls. [Services & RPC](../guide/services.md).
 
-**copy**: what every assignment, argument pass, and field store does to
-a value. The receiver gets its own; the original is untouched.
-[The memory model](../tour/memory-model.md).
+**copy**: what every binding, assignment, argument pass, field store, and
+**return** does to a value. The receiver gets its own; the original is
+untouched. The *signature* decides: a function returning `Inner` returns
+a value even where its body names the receiver's storage; one returning
+`&mut Inner` returns the projection.
+[The memory model](../tour/memory-model.md), [spec §6.1](../spec/memory.md).
 
 **derive**: an attribute like `[derive(PartialEq, Debug)]` that
 generates a trait implementation from a type's shape.

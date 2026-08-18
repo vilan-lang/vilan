@@ -101,6 +101,14 @@ ends: falling off the bottom, an early `ret`, a `jump` out of a loop,
 even a panic unwinding through. There are no drop flags and nothing to remember:
 if a binding still owns a resource when control leaves the scope, it drops.
 
+It runs on **overwrites** too, not only at scope ends. Assigning onto a
+place that still holds a resource drops the old value first — and the
+place is what decides, so `holder = Holder::Empty` on an owned binding,
+`slot.held = Holder::Empty` on a field or a tuple element, and the same
+write through a `&mut` view all destroy what they replace, in that order:
+destructor, then write. It has to be that order, because the destructor
+reads the very slot the write is about to overwrite.
+
 A **pattern capture is a binding like any other**. Matching by value
 consumes what you matched, so the capture becomes the payload's owner —
 and it drops at the end of the arm that bound it:
@@ -293,8 +301,17 @@ owner is an ordinary resource the scope rules already know how to tear down.
 
 - **"Why can't I use it again?"** You moved it. Loan it (`&x` / `&mut x`, or
   a method call) instead of binding, passing, or returning it by value.
-- **A resource can't go in a `List`, `Map`, or `Set`**: the compiler
-  can't see inside those. Use an `Option`, or a struct field.
+- **A resource can't go in a `List`, `Map`, or `Set`**: those are native
+  containers whose internals are host code the move checker cannot see,
+  so it cannot promise to close what you put in one. Use an `Option` (the
+  sanctioned resource container), a **fixed array** (`[Guard; 2]` is a
+  value aggregate, a resource by containment, and drops its elements in
+  reverse order), or a struct field. The rule is about the *type*, not
+  about whether you wrote one down: deleting the annotation on
+  `mut arr: List<Guard> = [ … ]` changes nothing, an inferred return or a
+  list grown by `push` is refused the same way, and a container built out
+  of a generic body's own `T` is refused at the instantiation site, with a
+  note pointing at the line in the body that builds it.
 - **A closure or spawn can't capture a *local* resource.** Pass a loan into
   the call, give the resource to a struct (or an `OwnedNursery`) that
   owns the closure's lifetime, or keep it at module level: a module

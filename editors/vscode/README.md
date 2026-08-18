@@ -20,7 +20,9 @@ builds your project, so the editor and the build never disagree.
 - **Hover**: inferred types on locals and parameters (loan conventions
   included), doc comments on everything you declared, and documentation on the
   language's own keywords, deep-linked into the book.
-- **Inlay hints**: the inferred types of `let` bindings and parameters.
+- **Inlay hints**: the inferred type of every binding you left unannotated —
+  `let`/`mut`, a `for` binder, a comprehension binder. (A parameter's type is
+  on hover, not as a hint: it is written in the signature already.)
 - **Semantic highlighting** from the analyzer, over a TextMate grammar
   (including `vilan` code fences in Markdown).
 - **Go to definition**, including into the `std` package.

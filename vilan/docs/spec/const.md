@@ -17,7 +17,7 @@ A `const` expression may appear anywhere an expression may, including
 module-level initializers, where it is also the way to run *logic* at
 load position without runtime cost: a `const` initializer ships as a
 plain value, participates in no platform coloring (§11.2), and cannot
-violate the initializer rules of §7.4 (nothing of it remains to run at
+violate the initializer rules of §7.1 (nothing of it remains to run at
 load time).
 
 ## 9.2 The const environment

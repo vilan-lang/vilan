@@ -95,11 +95,17 @@ Rust workspace, five crates, plus the language's own tree:
   `let` binding.
 - **Numerics:** the JS-backed integers are `i53`/`u53` (a ±2^53 contract); unknown
   numeric suffixes are hard errors.
-- **A new keyword lands in THREE places** — the lexer (`lexing.rs`), the TextMate
-  grammar (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the book's
+- **A new keyword lands in THREE places** — the lexer (`lexing.rs`, whose
+  keyword table is the `match` in `read_identifier`), the TextMate grammar
+  (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the book's
   highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource` keyword shipped
   with only the first and was caught twice, days apart. Check with a lexer-vs-list
-  diff, not by eye.
+  diff, not by eye. The same drift reaches the **primitive-type** and
+  **attribute-marker** lists that sit beside the keywords in both grammars
+  (`SCALAR_PRIMITIVE_NAMES` in `type_.rs`, `is_known_attribute_marker` in
+  `parsing.rs` are the sources of truth); D15's audit found `i64`/`u64` still
+  highlighted as valid types a release after they became a hard error. Nothing
+  gates any of this yet — backlog D17.
 - **A post-`analyze()` pass must be wired into BOTH pipelines** — `lib.rs`'s
   `analyze_source` (tests + LSP) *and* the CLI's duplicated sequence in
   `crates/vilan-cli/src/main.rs` — and verified with a CLI probe, not only an

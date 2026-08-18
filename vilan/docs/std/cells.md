@@ -13,7 +13,8 @@ value-semantics copying.
 impl Shared<type T> {
 	fun new(value: T): Shared<T>
 	fun read(self): T                      // a COPY of the contents
-	fun write(self): &mut T                // a writable view of the contents
+	fun clone(self): Shared<T>             // another handle to the SAME cell
+	fun write(self): &mut T borrows self   // a writable view of the contents
 }
 ```
 
@@ -51,6 +52,7 @@ struct Handle<T> { … }   // slot index + generation; copy freely
 
 impl Arena<type T> {
 	fun new(): Arena<T>
+	fun branded(): Arena<T>   // a fresh brand — a handle from one arena cannot index another
 	fun insert(&mut self, value: T): Handle<T>
 	fun get(&self, handle: Handle<T>): Option<&T> borrows self  // a view; None once removed
 	fun set(&mut self, handle: Handle<T>, value: T): bool

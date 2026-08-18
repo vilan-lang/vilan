@@ -110,6 +110,14 @@ on anything else, with the value in the message
 is an answer you expect rather than a bug, bind the `str` and use
 `parse`, which gives you `None` instead.
 
+The same "the variant *is* the value" rule reaches the wire:
+`[derive(Json)]` and `[derive(Wire)]` on a backed enum encode the
+**backing value**, so `Align::Start` crosses as `"flex-start"`, not as
+`"Start"`. That is usually the point — the string a backed enum carries
+is generally the one the outside world already speaks — but it is worth
+knowing before you name a backing value, because renaming one later is a
+wire change.
+
 ## impl: methods and statics
 
 Methods live in `impl` blocks, separate from the data:

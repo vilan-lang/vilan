@@ -101,7 +101,7 @@ never touches a
 Views come with a deliberate restriction: **they don't outlive the
 moment.** A view can be a parameter or a short-lived local. It cannot be
 stored in a struct field, put in a list, returned into long-lived state,
-or held across an `await`. Lend, use, done. That confinement is what
+or held across a suspension. Lend, use, done. That confinement is what
 makes views safe without a whole lifetime system. If you've heard Rust
 horror stories, this is the part Vilan deliberately keeps small.
 
@@ -136,6 +136,16 @@ through to the list.
 > conflict with a live view; a method that only writes fields or elements
 > through `&mut self` passes freely. Hover a function to see both
 > inferred effects (`borrows`, `bumps`). Spec §6 has the precise rules.
+>
+> What decides whether you got a projection or a copy is the **return
+> type**, never what the body happened to touch. `fun make(&self):
+> (i32, i32) { self.pair }` returns a value — the caller's copy, so a
+> later write to `h.pair` cannot reach it — and so does `fun grab(&self):
+> Inner { &self.inner }`, one `&` away, because the return says `Inner`.
+> Only `fun slot(&mut self): &mut T` hands back the alias, as it must.
+> References are transparent in the type system, so inside the body
+> `self` looks the same either way; the signature is the only thing that
+> says which one you meant.
 
 ## `Shared<T>`: one cell, many holders
 
@@ -202,19 +212,26 @@ pointing at the new occupant. The full API is in the
 ## The async rule
 
 One rule ties this chapter to the [async model](async.md): **a view may
-not be held across an `await`.** While your function is suspended, other
-code runs and may change or replace whatever the view pointed into. The
-compiler rejects the shape. The fix is always the same: re-derive after
-the suspension.
+not be held across a suspension.** While your function is suspended,
+other code runs and may change or replace whatever the view pointed
+into. The compiler rejects the shape. The fix is always the same:
+re-derive after the suspension.
 
 ```vilan,fragment
 let row = &mut rows[i];
 send(row.id);            // suspends —
-row.text = "sent";       // ✗ rejected: view held across await
+row.text = "sent";       // ✗ rejected: view held across a suspension
 
 send(rows[i].id);        // ✓ re-derive after the suspension
 rows[i].text = "sent";
 ```
+
+The question is whether the call **can suspend**, not whether you wrote
+`await`. Calling an async function without the keyword is the sanctioned
+spelling and it yields exactly the same way, so `send(row.id)` above is
+caught with no `await` anywhere in it — and so is a sync-looking function
+in between that reaches something async. The rule reads the declaration
+of the function you *call*.
 
 ## Traps
 

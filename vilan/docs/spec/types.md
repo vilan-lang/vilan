@@ -549,10 +549,12 @@ Normative rejection cases (each is a compile error):
   literal).
 
 *Implementation note (tracked gaps): a closure bound to a local and
-called directly does not infer its parameter types from the call;
+called directly does not infer its parameter types from the call, and
 `effect`'s unannotated closure parameter can type against the impl's
-abstract `T` (B23); and a closure passed to a **method's** own generic
-parameter reaches its body with that parameter still abstract, so a
-pattern inside it is not checked at all — the free-function twin
-substitutes and is. Each has a pinned test; the workaround is an
-annotation or a binding.*
+abstract `T` (B23). Each has a pinned test; the workaround is an
+annotation or a binding. (A closure passed to a method's own generic
+parameter was a third such gap — its body reached the checker with the
+parameter still abstract, so a pattern inside it was not checked at all.
+Both call paths now bind from the non-closure arguments and defer before
+typing any closure, so the substitution has landed by the time the body
+is read.)*

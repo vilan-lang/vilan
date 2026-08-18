@@ -36,7 +36,7 @@ has several. Both are covered in [the dev loop](../guide/dev-loop.md).
 A workspace groups several packages so they build together with one
 `vilan build .` at the root. You need it less often than you might
 expect, since a client + server app is *one* package with two entries
-(see [below](#the-shape-of-a-full-stack-app)). Reach for a workspace
+(see [the full-stack shape](platforms.md#full-stack-packages)). Reach for a workspace
 when members want their own manifests and dependency sets:
 
 ```toml

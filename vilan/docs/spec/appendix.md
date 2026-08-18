@@ -26,16 +26,16 @@ top-tier-only forms: `const expr` and struct initializers (§3.8).
 ## A.2 Reserved words
 
 ```text
-async  await  borrows  const else    enum   export  external
-for    fun    if       impl  import  in     is      jump
-let    macro  match    mod   mut     null   own     ret
-struct trait  type     use   with    true   false
+async  await  borrows  const     else    enum   export  external
+for    fun    if       impl      import  in     is      jump
+let    macro  match    mod       mut     null   own     resource
+ret    struct trait    type      use     with   true    false
 ```
 
-Contextual (identifier everywhere else): `context`, `void`, `self`,
-`Self`, `break`/`continue` (after `jump`), and the attribute names
+Contextual (identifier everywhere else): `context`, `sync`, `void`,
+`self`, `Self`, `break`/`continue` (after `jump`), and the attribute names
 `derive` `service` `extern` `must_use` `rpc` `trait_only` `doc`
-`expose`.
+`expose` `platform`.
 
 ## A.3 Literal suffixes
 

@@ -34,21 +34,21 @@ Identifiers are ASCII. The following words are **reserved**; they lex as
 keyword tokens and are never `IDENT`:
 
 ```text
-async  await  borrows  const  else    enum   export  external
-for    fun    if       impl  import  in     is      jump
-let    macro  match    mod   mut     null   own     ret
-struct trait  type     use   with    true   false
+async  await  borrows  const     else    enum   export  external
+for    fun    if       impl      import  in     is      jump
+let    macro  match    mod       mut     null   own     resource
+ret    struct trait    type      use     with   true    false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
 
 **Contextual keywords** lex as `IDENT` and take meaning only by position:
-`context` (the clause after a closure type, §3.9), `void` (the unit
-value/type), `self` and `Self` (receiver and receiver type), `derive`,
-`service`, `extern`, `must_use`, `rpc`, `trait_only`, `doc`, `expose`
-(attribute names in `[...]` position), and jump targets (`break`,
-`continue`) after `jump`. All remain usable as ordinary identifiers
-elsewhere.
+`context` (the clause after a closure type, §3.9), `sync` (the marker
+opening a closure type, §3.9), `void` (the unit value/type), `self` and
+`Self` (receiver and receiver type), `derive`, `service`, `extern`,
+`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform` (attribute
+names in `[...]` position), and jump targets (`break`, `continue`) after
+`jump`. All remain usable as ordinary identifiers elsewhere.
 
 ## 2.3 Literals
 

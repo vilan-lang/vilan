@@ -150,14 +150,22 @@ That's the standard history-API fallback, and the catch-all in your http
 handler does it:
 
 ```vilan,fragment
-serve_service(4000, protocol, build_handler(build, |request| {
-	…app shell html…   // every path the build does not claim serves the shell
-}))
+serve_service(
+	4000,
+	protocol,
+	// Every path the build does not claim serves the shell.
+	build_handler(build, |request| Response::builder().body(app_html).build()),
+	|server| print(i"listening on {server.url()}"),
+)
 ```
 
 `build_handler(build, …)` answers the build's own artifacts (`/client.js`,
 `/client.css`, and any route chunks) and hands everything else to your
-fallback, which is the catch-all deep links need.
+fallback, which is the catch-all deep links need. Where the app owns its
+own builder, the same routing is a link in the chain —
+`Server::builder().serve_build(build).on_request(|request| …)` — and the
+`on_request` handler is the catch-all
+([Persistence](persistence.md#serving-http-stdhttp)).
 
 On the client side, a deep-linked page usually needs data that hasn't
 synced yet. Mount it under `when(present)` so it appears when the data

@@ -272,7 +272,7 @@ struct Draft<T> {
 	state: Signal<DraftState>, // Synced | Dirty | Failed(str)
 	…
 }
-draft(initial: T, commit: async |T| Option<str>): Draft<T>
+draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T>
 draft.push(value)   // set local + spawn the commit (never waits on the wire)
 draft.adopt(remote) // fold in a remote change
 draft.commit()      // send now (the explicit save)
