@@ -280,35 +280,63 @@ fn render_call_chain(trace: &[String]) -> String {
 ///
 /// Stored per source as a merged, sorted, DISJOINT interval list, so nesting
 /// (a closure inside a generic function) needs no special case and a
-/// containment test is one binary search.
+/// containment test is one binary search. See [`SpanRegions`].
 struct GenericRegions {
-    by_source: HashMap<u32, Vec<(usize, usize)>>,
+    regions: SpanRegions,
 }
 
 impl GenericRegions {
     fn build(program: &Program) -> Self {
-        let mut by_source: HashMap<u32, Vec<(usize, usize)>> = HashMap::default();
         let mut mentions = TypeParameterScan::new(program);
-        for (function_id, function) in &program.functions {
-            let dependent = !function.generic_parameter_constraint_ids.is_empty()
-                || function
-                    .return_type_id
-                    .is_some_and(|type_id| mentions.reaches_a_type_parameter(type_id))
-                || function.parameters.iter().any(|parameter_id| {
-                    program
-                        .parameters
-                        .get(parameter_id)
-                        .is_some_and(|parameter| {
-                            mentions.reaches_a_type_parameter(parameter.type_id)
-                        })
-                });
-            if !dependent {
-                continue;
-            }
-            let (Some(source), Some(span)) = (
-                program.source_of(*function_id),
-                program.span_map.get(function_id),
-            ) else {
+        let dependent: Vec<Id> = program
+            .functions
+            .iter()
+            .filter(|(_, function)| {
+                !function.generic_parameter_constraint_ids.is_empty()
+                    || function
+                        .return_type_id
+                        .is_some_and(|type_id| mentions.reaches_a_type_parameter(type_id))
+                    || function.parameters.iter().any(|parameter_id| {
+                        program
+                            .parameters
+                            .get(parameter_id)
+                            .is_some_and(|parameter| {
+                                mentions.reaches_a_type_parameter(parameter.type_id)
+                            })
+                    })
+            })
+            .map(|(function_id, _)| *function_id)
+            .collect();
+        Self {
+            regions: SpanRegions::of(program, &dependent),
+        }
+    }
+
+    fn covers(&self, program: &Program, id: Id) -> bool {
+        self.regions.contains(program, id)
+    }
+}
+
+/// A set of source regions, indexed for containment: per source, the spans
+/// sorted and merged into DISJOINT intervals, so a test is one binary search
+/// instead of a scan of every region.
+///
+/// Merging is sound for the two things indexed here — function bodies and
+/// `const` subtrees — because both are syntax subtrees, so two of them in one
+/// file are nested or disjoint, never partially overlapping. A nested one is
+/// absorbed by its enclosing one, which is the answer containment wants anyway.
+struct SpanRegions {
+    by_source: HashMap<u32, Vec<(usize, usize)>>,
+}
+
+impl SpanRegions {
+    /// The index over `roots`' own spans. An entity with no source or no span
+    /// contributes nothing, and is contained by nothing.
+    fn of(program: &Program, roots: &[Id]) -> Self {
+        let mut by_source: HashMap<u32, Vec<(usize, usize)>> = HashMap::default();
+        for root in roots {
+            let (Some(source), Some(span)) = (program.source_of(*root), program.span_map.get(root))
+            else {
                 continue;
             };
             by_source
@@ -318,9 +346,6 @@ impl GenericRegions {
         }
         for regions in by_source.values_mut() {
             regions.sort_unstable();
-            // Merge into disjoint intervals: a nested function's span is
-            // absorbed by its enclosing one, so `covers` never has to look at
-            // more than the single interval a binary search lands in.
             let mut merged: Vec<(usize, usize)> = Vec::with_capacity(regions.len());
             for &(start, end) in regions.iter() {
                 match merged.last_mut() {
@@ -333,7 +358,8 @@ impl GenericRegions {
         Self { by_source }
     }
 
-    fn covers(&self, program: &Program, id: Id) -> bool {
+    /// Whether `id`'s span lies inside one of the regions, in the same file.
+    fn contains(&self, program: &Program, id: Id) -> bool {
         let (Some(source), Some(span)) = (program.source_of(id), program.span_map.get(&id)) else {
             return false;
         };
@@ -508,6 +534,12 @@ struct State<'p, 'src> {
     /// fold both (const-eval.md §9.5).
     inferable: HashSet<Id>,
     locals: LocalIndex,
+    /// The `const` subtrees, as a per-source interval index — see
+    /// [`SpanRegions`] and [`State::in_const_subtree`].
+    const_regions: SpanRegions,
+    /// The per-analysis half of a mini-program build, hoisted out of the
+    /// per-site loop (const-eval.md §10).
+    program_seed: transformer::ConstProgramSeed,
     results: HashMap<Id, ConstValue>,
     assets: Vec<(String, String)>,
     failed: HashSet<Id>,
@@ -540,6 +572,8 @@ impl<'p, 'src> State<'p, 'src> {
             const_set: program.const_exprs.iter().copied().collect(),
             inferable,
             locals: LocalIndex::build(program),
+            const_regions: SpanRegions::of(program, &program.const_exprs),
+            program_seed: transformer::ConstProgramSeed::build(program, options),
             results: HashMap::default(),
             assets: Vec::new(),
             failed: HashSet::default(),
@@ -627,6 +661,7 @@ impl<'p, 'src> State<'p, 'src> {
             let (mini, unresolved) = transformer::transform_const_program(
                 self.program,
                 self.options,
+                &self.program_seed,
                 expr_id,
                 &external,
                 &self.results,
@@ -1000,17 +1035,14 @@ impl<'p, 'src> State<'p, 'src> {
 
     /// Whether an entity sits inside any `const` expression's span (same
     /// source file) — the site test the capability check cuts edges by.
+    ///
+    /// Answered from the interval index rather than by scanning every `const`
+    /// expression: `check_const_only` asks this once per call site in the
+    /// program, so the scan was the pass's one super-linear term — O(call sites
+    /// × const sites), 64 ms of the website's server entry at 210 sites and
+    /// growing as the square (const-eval.md §10).
     fn in_const_subtree(&self, id: Id) -> bool {
-        let Some(source) = self.program.source_of(id) else {
-            return false;
-        };
-        let span = self.span_of(id);
-        self.program.const_exprs.iter().any(|&root| {
-            self.program.source_of(root) == Some(source) && {
-                let root_span = self.span_of(root);
-                span.start >= root_span.start && span.end <= root_span.end
-            }
-        })
+        self.const_regions.contains(self.program, id)
     }
 
     /// The free local references of the const subtree: every `Expr::Local`

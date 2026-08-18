@@ -33,6 +33,13 @@
 //! grep '^PERF ' perf.log
 //! ```
 //!
+//! One thing in this file is not a measurement but a *pin*, and runs in the
+//! normal gate: `the_const_pass_scales_with_its_const_sites_and_not_with_their_square`
+//! (backlog M4, `const-eval.md` §10.4). It asserts a ratio between two
+//! measurements taken in one process, never a number of seconds — see its own
+//! comment, and `perf-baseline.md` §1.4 for why that is admissible where a
+//! relative-regression check is not.
+//!
 //! `--release` because a debug measurement is a fact about `-O0` — every row
 //! stamps its `profile` so the two can never be compared by accident.
 //! `--no-capture` streams the rows and makes nextest run the two tests
@@ -667,6 +674,131 @@ fn run(scale: Scale) -> Vec<Row> {
     report(&rows);
     assert_rows_are_well_formed(&rows);
     rows
+}
+
+// ---------------------------------------------------------------------------
+// The const pass's scaling pin (backlog M4, `const-eval.md` §10)
+// ---------------------------------------------------------------------------
+
+/// A style-heavy entry: `sites` module-level `const` style chains, the shape
+/// `vilan-website/src/art.vl` is 79 of and which made the const pass two thirds
+/// of that package's compile. Every site is a distinct chain, so no site's
+/// result can be shared with another's — the pass has to do `sites` evaluations
+/// however clever it gets.
+fn style_heavy_source(sites: usize) -> String {
+    let mut source = String::from(
+        "import std::print;\n\
+         import std::style::{ Color, Display, Length, space, style };\n\n",
+    );
+    for site in 0..sites {
+        source.push_str(&format!(
+            "let s{site} = const style()\n\
+             \t.display(Display::Flex)\n\
+             \t.padding(space({}))\n\
+             \t.background(Color::gray({}))\n\
+             \t.width(Length::px({}.0));\n",
+            site % 7,
+            (site % 9 + 1) * 100,
+            site % 40 + 1,
+        ));
+    }
+    source.push_str("\nfun main() {\n");
+    for site in 0..sites {
+        source.push_str(&format!("\tprint(s{site}.class_list());\n"));
+    }
+    source.push_str("}\n");
+    source
+}
+
+/// The `post_analysis_passes` wall for a style-heavy entry of `sites` const
+/// sites, warm and taken as the MINIMUM of a few rounds — the least-contended
+/// sample, which is the one a ratio should be built from on a machine that may
+/// be running a suite around it.
+fn const_pass_wall(sites: usize, std: &PackageSpec, platform: Platform) -> Duration {
+    let subject = PhaseSubject::synthetic(&format!("style_{sites}"), &style_heavy_source(sites));
+    // One throwaway compile puts the subject on the same cache footing as its
+    // sibling, exactly as `phase_section` primes its subjects.
+    let _ = measure_phases(&subject, std, platform, false);
+    (0..3)
+        .map(|_| measure_phases(&subject, std, platform, false).post)
+        .min()
+        .expect("at least one round")
+}
+
+/// The pass must stay LINEAR in its const sites.
+///
+/// This is the property M4's fix establishes and the one a future change is
+/// most likely to lose: the const pass compiles every `const` site to its own
+/// mini-program, so anything it does per site that is a fact about the whole
+/// program — rebuilding the transformer's name seed, walking the module tree,
+/// scanning every `const` span — multiplies the site count by the program size
+/// and turns a linear pass into a quadratic one. Both of those existed; both
+/// were hoisted (`const-eval.md` §10).
+///
+/// Relative by construction, never a fixed number of seconds: the assertion is
+/// four times the sites against a bound of six times the time, measured in the
+/// same process, in the same session, on the same source shape — the
+/// measured-reference discipline `tests/support/mod.rs` established for the
+/// suite's liveness bounds, and for the same reason (`suite-speed.md` §5–§7:
+/// three separate incidents of a clock in the gate, each fixed by replacing it
+/// with a ratio). The headroom is deliberately generous — a 4× ratio with 50 %
+/// slack — because the useful failure is a change of SHAPE, and a shape change
+/// blows through it by orders of magnitude while noise does not.
+///
+/// Honest about what it does and does not catch, because a pin that is believed
+/// to catch more than it does is worse than none. At the site counts a gate can
+/// afford, `std`'s own ~4,000 entities dominate the per-site term, so the
+/// pre-fix tree passes this too: measured on this machine, pre-fix **3.53×**
+/// against the fixed tree's **3.44×** — a real improvement in the absolute
+/// numbers (114.6 → 101.6 ms and 404.8 → 349.8 ms) and nothing a ratio bound can
+/// separate. What reddens on the pre-fix tree is the counter pin in
+/// `vilan-core/tests/inference.rs`
+/// (`the_const_pass_builds_one_name_seed_however_many_const_sites_there_are`).
+/// This one guards the ASYMPTOTE, and is non-vacuous on its own terms: planting
+/// one whole-program mini-build per other const site — the exact shape it
+/// exists for — took it to **13.89×** (518.8 ms → 7207.2 ms) and red.
+#[test]
+fn the_const_pass_scales_with_its_const_sites_and_not_with_their_square() {
+    const SITES: usize = 20;
+    const FACTOR: usize = 4;
+    // Generous, and argued for above: four times the work must not cost six
+    // times the time.
+    const BOUND: f64 = 6.0;
+
+    let (small, large) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            let std = std_spec();
+            let platform = Platform::default();
+            (
+                const_pass_wall(SITES, &std, platform),
+                const_pass_wall(SITES * FACTOR, &std, platform),
+            )
+        })
+        .expect("spawn the const-scaling measurement thread")
+        .join()
+        .expect("the const-scaling measurement thread panicked");
+
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    println!(
+        "PERF-SCALE const_pass {SITES} sites = {:.2} ms, {} sites = {:.2} ms, ratio {ratio:.2}×",
+        milliseconds(small),
+        SITES * FACTOR,
+        milliseconds(large),
+    );
+    assert!(
+        small > Duration::ZERO,
+        "the {SITES}-site measurement read zero, so the ratio means nothing",
+    );
+    assert!(
+        ratio <= BOUND,
+        "{}× the const sites cost {ratio:.2}× the post-analysis passes \
+         ({:.2} ms → {:.2} ms), over the {BOUND}× bound: the const pass has \
+         gone super-linear in its sites (const-eval.md §10)",
+        FACTOR,
+        milliseconds(small),
+        milliseconds(large),
+    );
 }
 
 #[test]

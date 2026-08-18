@@ -43485,6 +43485,138 @@ fn one_call_graph_per_analysis() {
     );
 }
 
+/// Analyzes `source` on a large-stack worker and reports how many transformer
+/// name seeds the whole analysis built. Same instrument, same reasoning and
+/// same isolation as [`call_graphs_built_by_one_analysis`] above.
+fn name_seeds_built_by_one_analysis(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::transformer::reset_name_seed_build_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let _ = program.expect("analysis should produce a program");
+            vilan_core::transformer::name_seed_build_count()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn the_const_pass_builds_one_name_seed_however_many_const_sites_there_are() {
+    // M4 (`const-eval.md` §10). Every `const` site is compiled to its own
+    // mini-program, and each one used to start by rebuilding the transformer's
+    // name seed — a map of every variable, function and parameter in the
+    // reachable world (4,184 entries with `std` loaded), plus the reserved-name
+    // set. That is per-site work with a per-analysis answer, and on the
+    // website's 210-site entry it was 210 rebuilds. The seed is now built once
+    // per pass and shared.
+    //
+    // Only a counter can pin it: the shared seed produces byte-identical
+    // mini-programs, so no behaviour test can distinguish one build from N.
+    // Three sites rather than one, because a per-site rebuild reads 1 on a
+    // one-site program and would slip through.
+    let three_sites = r#"
+        import std::print;
+        let A: i32 = const 1 + 2;
+        let B: i32 = const 3 * 4;
+        let C: i32 = const 5 - 6;
+        fun main() { print(A + B + C); }
+        "#;
+    assert_eq!(
+        name_seeds_built_by_one_analysis(three_sites),
+        1,
+        "the const pass must build ONE name seed, not one per const site"
+    );
+    // And the count must not move with the site count — the property that makes
+    // the pass linear in its sites rather than linear in sites × program size.
+    let six_sites = r#"
+        import std::print;
+        let A: i32 = const 1 + 2;
+        let B: i32 = const 3 * 4;
+        let C: i32 = const 5 - 6;
+        let D: i32 = const 7 + 8;
+        let E: i32 = const 9 * 10;
+        let F: i32 = const 11 - 12;
+        fun main() { print(A + B + C + D + E + F); }
+        "#;
+    assert_eq!(
+        name_seeds_built_by_one_analysis(six_sites),
+        name_seeds_built_by_one_analysis(three_sites),
+        "doubling the const sites must not change how many name seeds are built"
+    );
+}
+
+#[test]
+fn a_const_site_reads_its_dependency_afresh_in_a_second_analysis() {
+    // The memo M4 adds is per-ANALYSIS, and this is what says so: the same
+    // process analyzes an edited source and must fold the new value. A seed
+    // (or any other const-pass state) that leaked across analyses would fold
+    // the first source's answer into the second's program — the failure mode a
+    // cache keyed on nothing has.
+    let fold = |literal: &str| -> String {
+        let source = format!(
+            r#"
+            import std::print;
+            let STEP: i32 = {literal};
+            let SCALED: i32 = const STEP * 10;
+            fun main() {{ print(SCALED); }}
+            "#
+        );
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let leaked: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    leaked,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                let program = program.expect("analysis should produce a program");
+                vilan_core::transform(&program, &vilan_core::BuildOptions::default())
+                    .expect("the folded program should emit")
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    };
+
+    // Both analyses run in THIS process, in this order — the point of the pin.
+    let first = fold("4");
+    let second = fold("7");
+    assert!(
+        first.contains("40"),
+        "the first analysis should fold `4 * 10`; emitted:\n{first}"
+    );
+    assert!(
+        second.contains("70") && !second.contains("40"),
+        "the second analysis must fold the EDITED dependency, not the first \
+         analysis's; emitted:\n{second}"
+    );
+}
+
 #[test]
 fn context_threading_owns_the_one_graph_that_cannot_be_shared() {
     // The exception that makes the rule honest. `context::apply` rewrites

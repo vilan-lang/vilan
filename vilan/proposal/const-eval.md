@@ -504,6 +504,12 @@ intercept is the other fixed work §8.3 named in the same breath (a fresh
 still open and is now the larger half of the fixed cost** — the remaining
 `const`-specific slice, and unlike this one it needs a design.
 
+*[Closed, and the attribution was wrong again — §10.2.* G3's `LocalIndex`
+turned that scan into a binary search, and profiled on the website's 483 const
+sites `free_locals` costs **1.4 ms of 1269.5** on the largest entry. The larger
+half of the fixed cost was `Transformer::new` rebuilding the whole program's
+source-name map per site, which nothing in §8.3 or §8.4 suspected.]*
+
 A second thing shrank the prize: the tree got much faster. §8.3 measured
 136–181 ms analyses on the v0.26.0 tree; the same probes now analyze warm in
 9–20 ms. A call-graph build was never 5–7 % of an analysis, but the analysis it
@@ -876,3 +882,269 @@ so under release BOTH of its builds were already dying in the renaming bug, and
 the generic-context error printing `undefined` was **masked**. Confounding the
 two knobs did not merely add failures to read past; it hid the real one. The
 release path keeps its own pin, gate 2.
+
+## 10. Where the const pass's time actually goes — the M4 profile, 2026-08-18
+
+> **Status: the local half SHIPPED 2026-08-18; the structural half is a
+> DESIGN awaiting a ruling (§10.5).** M1's baseline found
+> `const_eval::evaluate` costing 4.21 s of the website's 6.60 s `vilan check`
+> and filed three suspects — per-site evaluation cost, a missing memo, or
+> something super-linear. This section is what profiling found. Two of the
+> three were right; the third was right about a term that turned out to be
+> small. What ships here is every hoist that is local and algorithmic; what
+> does not is the shared-world restructure that the remaining two thirds
+> would need, written up in §10.5 rather than built.
+
+### 10.1 Reproducing it, and the instrument
+
+`perf` is not installed on the dev box, so the attribution was done the way
+§4.3 and §8.4 were: `Instant` marks patched into `const_eval::evaluate`,
+`transform_const_program` and `Transformer::new` behind a `VILAN_CONST_PROFILE`
+environment check, measured, and reverted. The baseline reproduces — `vilan
+check` on the website, this box, tree `m4-const-eval` off `next` at `a75668ec`:
+**891 ms release** (§2.2 recorded 845.8) and **6774 ms debug** (§2.4 recorded
+6601.9).
+
+The website builds three entries, and each pays the pass in full: **186** const
+sites on `client`, **87** on `playground`, **210** on `server` — 483 in all,
+against `art.vl`'s 79 and `theme.vl`'s 45 as the bulk of them.
+
+### 10.2 What the pass spends the time on
+
+Per entry, debug, pre-fix. (Release is the same shape at ~8× less: 429.3 ms
+total, 156.5 transform, 254.6 interpreter.)
+
+| | client (186) | playground (87) | server (210) | total | share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `const_eval::evaluate` | 1269.5 | 643.4 | 1495.1 | **3408.0 ms** | 100 % |
+| — the interpreter (`eval_const`) | 861.2 | 491.3 | 968.0 | 2320.5 | 68 % |
+| — `transform_const_program` | 350.9 | 136.5 | 446.7 | 934.1 | 27 % |
+| ⤷ of which `Transformer::new` | 119.5 | 53.0 | 161.4 | 333.9 | 9.8 % |
+| ⤷ of which `module_level_bindings` | 40.7 | 15.7 | 62.0 | 118.4 | 3.5 % |
+| ⤷ of which `walk_entity` | 162.0 | 56.3 | 185.8 | 404.1 | 11.9 % |
+| — `check_const_only` | 43.0 | 9.0 | 64.0 | 116.0 | 3.4 % |
+| — `LocalIndex::build` (once) | 6.6 | 3.6 | 6.6 | 16.8 | 0.5 % |
+
+Counts, and they are exact: 880 `evaluate_one` entries over the three entries,
+of which **483 are evaluations** and 397 are hits on a dependency another site
+already folded — and **483 `transform_const_program` calls, 483 `eval_const`
+calls**, one apiece. The retry loop never fires on this corpus, so nothing is
+built twice, and the dependency recursion costs nothing. A site's mini-program
+holds **26 nodes, 24 of them functions**, the transitive `std::style` closure
+its chain reaches. `free_locals`, which §8.4 named as "the larger half of the
+fixed cost" and left open, costs **1.4 ms of 1269.5** — the `LocalIndex` that
+shipped with G3 already closed it, and that sentence is now stale.
+
+### 10.3 The root cause: linear in sites, with a per-site rebuild of the world
+
+The pass is **not** super-linear in any term that matters, and that suspect was
+the wrong one. Measured on a synthetic style-heavy program (N module-level
+`const style()…` chains), release:
+
+| const sites | 1 | 10 | 25 | 50 | 100 | 200 | 400 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| evaluate, ms | 1.3 | 9.3 | 19.4 | 37.7 | 73.5 | 151.2 | 326.1 |
+| per site, µs | 1000 | 900 | 760 | 744 | **723** | **740** | **786** |
+| `check_const_only`, ms | 0.1 | 0.1 | 0.1 | 0.3 | 0.9 | 2.8 | **11.4** |
+
+Per-site cost is flat to within 9 % over a 400× range (and the 1-site row's
+1000 µs is the pass's own fixed overhead showing through, not a trend). Nothing
+degrades with scale, so the website's 55× kolt is **count times chain length**
+and nothing else: the website evaluates **483 sites** across its three entries
+where kolt's whole `check` evaluates at most **18** (six `const style()` chains
+in `views.vl`, times three entries, and the `probe` entry reaches none of them)
+— 27–40× — and the website's chains are the longer ones, which the 0.094 ms per
+property below converts straight into the rest of the gap. The one genuinely
+super-linear term is `check_const_only`'s
+`in_const_subtree`, which scanned every `const` expression once per call site
+in the program — O(sites × call sites), visible as the 12.7× growth across a
+4× site count in the last row, and 3.4 % of the pass at the website's size.
+
+So the cost is **per-site, and the site's own work splits in two**:
+
+**The two thirds that is real.** Varying the chain length at a fixed 100 sites
+separates them (release):
+
+| properties per chain | 0 (`const 1+2`) | 1 | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| interpreter, ms | 0.1 | 9.8 | 19.4 | 39.2 | 75.0 |
+| transform, ms | 8.3 | 24.8 | 26.9 | 30.2 | 33.0 |
+| functions per mini-program | 0 | 22 | 25 | 31 | 35 |
+
+The interpreter's cost is **0.094 ms per style property with a zero
+intercept** — it is the atomic-rule computation itself (the content hash, the
+interpolation, the map merge, the `emit`), not overhead around it. Every site
+computes a different style, so nothing within one analysis can be shared: this
+is work the pass has to do. Hoisting the mini-program's function declarations
+would save the declaration cost only, which the same table prices at
+**≈4 µs per function**.
+
+**The third that was pure rebuild.** `transform_const_program` began every one
+of the 483 calls by building state that is a fact about `(program, options)`
+and nothing else:
+
+- `Transformer::new` → the `NameGenerator`'s seed. Under the debug preset
+  (`readable_names: true`, which is what `vilan check` and every language-server
+  analysis run) that is a `HashMap<Id, String>` over **every variable, function
+  and parameter in the reachable world** — measured at **4,184 entries and
+  4,184 `String` allocations per const site**, 882,732 of them across the
+  server entry — plus a 127-name reserved set derived from the program's
+  `[extern]` symbols.
+- `program.module_level_bindings()` → a walk of the global scope, every module
+  body, and every variable, then collected into a `HashSet` per site.
+- `in_const_subtree` → the linear scan above.
+
+None of it varies with the expression being evaluated. Together, **16.7 % of
+the pass** (568 ms of 3408 debug; 69 ms of 429 release), and its per-site term
+is proportional to program size, which is what made the pass
+Θ(sites × program) rather than Θ(sites).
+
+**Verdict on M4's three suspects.** *Per-site evaluation cost* — correct, and
+it is the headline. *A missing memo across sites* — correct for the rebuild
+third, wrong for the interpreter two thirds, which memoizes to nothing within
+one analysis. *Something super-linear (re-resolving or re-cloning a world per
+site)* — a world is not re-resolved or cloned; the only super-linear term is
+the span scan, at 3.4 %.
+
+### 10.4 What shipped
+
+Three hoists, all local, none changing a byte of output.
+
+1. **`NameSeed`** (`transformer.rs`) — the name generator's program-wide seed
+   (style, source names, reserved set) split out of `Transformer::new` and
+   shared behind an `Rc`. `NameGenerator` loses its `taken` field, which was
+   exactly `reserved ∪ minted` and is now asked as that union, so the seed can
+   be immutable and shared while every generator keeps its own `minted`.
+2. **`ConstProgramSeed`** — `NameSeed` plus the module-level bindings, built
+   once per const pass by `State::new` and handed to every
+   `transform_const_program`. The prelude filter asks the two sets as a
+   predicate rather than materializing their union, so the per-site
+   `HashSet<Id>` build goes too.
+3. **`SpanRegions`** — the per-source merged-interval index `GenericRegions`
+   already used, extracted and pointed at the `const` spans as well, so
+   `in_const_subtree` is a binary search. Sound for both because a function
+   body and a `const` subtree are syntax subtrees: two in one file nest or are
+   disjoint, never partially overlap.
+
+Measured after, same box, same session:
+
+| | before | after | |
+| --- | ---: | ---: | ---: |
+| `const_eval::evaluate`, website, all 3 entries, debug | 3408.0 ms | **2798.5 ms** | −17.9 % |
+| `const_eval::evaluate`, website, all 3 entries, release | 429.3 ms | **307.7 ms** | −28.3 % |
+| `check_const_only`, debug | 116.0 ms | **7.3 ms** | −94 % |
+| `vilan check` website, release — min of 10 interleaved rounds | 837 ms | **731 ms** | −12.7 % |
+| `vilan check` website, release — median of 10 interleaved rounds | 887 ms | **788 ms** | −11.1 % |
+| `vilan check` website, debug — min of 6 interleaved rounds | 6385 ms | **5808 ms** | −9.0 % |
+| `vilan check` website, debug — median, quiet machine, not interleaved | 6774 ms | **5899 ms** | −12.9 % |
+
+The two binaries were run **alternately**, §8.4's discipline, because the box
+was not idle for part of this session (another checkout was running a headless
+browser through part of it); min and median are reported together for the same
+reason, and the debug rows are the noisiest because the debug interleave landed
+in the loud stretch. The website's whole `dist/` — three JavaScript bundles, three
+stylesheets, two chunk manifests — is **byte-identical** across the change,
+checked by building a copy of the package with each binary and diffing the
+trees.
+
+And the harness rows, §3's recipe, release, diffed against the checked-in
+[`perf-baseline.jsonl`](perf-baseline.jsonl) as §3 prescribes. This run's
+**controls** are what make the diff readable: `tiny` and the LSP's synthetic
+subject have no `const` in them at all, so they price the box rather than the
+change, and both land within 6 % of the recorded run — the machine is in the
+same state it was in when §2 was taken.
+
+| row (release) | §2 baseline | after | Δ |
+| --- | ---: | ---: | ---: |
+| `tiny` cold total — *control* | 13.70 | 13.08 | −4.5 % |
+| LSP synthetic keystroke p50 — *control* | 10.04 | 9.43 | −6.1 % |
+| `kolt_server` warm `post_passes` | 12.4 | 11.10 | −10.5 % |
+| `website_server` cold `post_passes` | 204.9 | **152.59** | **−25.5 %** |
+| `website_server` warm `post_passes` | 206.3 | **155.50** | **−24.6 %** |
+| `website_server` warm total | 292.1 | 234.66 | −19.7 % |
+| `vilan check` website, end to end | 845.8 | 734.86 | −13.1 % |
+| LSP keystroke p50, `kolt/src/views.vl` | 78.39 | 68.21 | −13.0 % |
+| **LSP keystroke p50, `vilan-website/src/page.vl`** | **321.50** | **252.38** | **−21.5 %** |
+
+§4.5's finding stands but softens: `page.vl` was 2.14× the 150 ms debounce
+budget and is now **1.68×**. Every keystroke in that file still misses the
+budget; none of them misses it by as much.
+
+`perf-baseline.jsonl` is deliberately **not** amended. §3 defines it as *the*
+recorded baseline — one dated header over 57 rows — not an append log, and a
+second run's rows under a second header would change what the file is. The
+numbers above are the record.
+
+**Pins.** `the_const_pass_builds_one_name_seed_however_many_const_sites_there_are`
+(`vilan-core/tests/inference.rs`) counts `NameSeed` builds per analysis through
+a thread-local counter, exactly as E35 pinned the shared call graph and for
+exactly the same reason — a seed built once and a seed built per site produce
+byte-identical mini-programs, so nothing but a counter can tell them apart. It
+reads 1; planted back to per-site it reads 4 on a three-site program.
+`a_const_site_reads_its_dependency_afresh_in_a_second_analysis` pins that the
+memo is per-analysis: two analyses in one process of an edited source must fold
+the edited value, and a planted cross-analysis result cache emits the first
+analysis's `40` where `70` is required.
+`the_const_pass_scales_with_its_const_sites_and_not_with_their_square`
+(`vilan-cli/tests/perf_baseline.rs`) is the asymptote guard — 20 vs 80 style
+sites, `post_analysis_passes` timed in-process, ratio asserted ≤ 6× and never a
+fixed number of seconds. It does **not** redden on the pre-fix tree and says so
+in its own comment: at gate-affordable size std's ~4,000 entities dominate the
+per-site term, so pre-fix reads 3.53× against the fixed tree's 3.44×. Planting
+one whole-program mini-build per other const site — the shape it exists for —
+takes it to 13.89× and red. It is the one thing here that costs the gate
+anything: **2.3 s**, the `perf_baseline` binary's gate tests going 0.69 s →
+2.96 s, recorded in `perf-baseline.md` §1.4 alongside why a ratio between two
+in-process measurements is admissible there where a relative-regression
+threshold is not.
+
+### 10.5 The remaining two thirds — DESIGN, not built
+
+After the hoists, `evaluate` on the website is 2.80 s debug / 308 ms release,
+and it is now almost all *evaluation*: ~68 % interpreter, ~25 %
+`transform_const_program`'s per-site `walk_entity` and assembly. Cutting either
+further is a structural change and is settled on paper first, per CLAUDE.md's
+proven-before-implemented rule — so this section stops at the design.
+
+**Option A — one const world per analysis.** Every site's mini-program
+re-emits the `std::style` closure its chain reaches: **4,545 function emissions
+across the client entry's 186 sites**, and since every one of those chains
+enters through `style()` the overlap is near-total. (The distinct count is
+*not* measured — establishing it is the first thing Option A should do, and the
+prize below is sized from the emission count, not from a ratio nobody has
+taken.) Emit the union ONCE into a shared `JsProgram`, hoist its declarations
+into a
+shared interpreter `Scope`, and run each site's expression against it. Shape:
+one `Transformer` for the whole pass (which the `ConstProgramSeed` above is
+already half of — the name generator would become shared too, which is what
+makes names line up across sites), and an `interpreter::eval_const_in`
+taking a pre-populated `Env`. Prize: `walk_entity` amortizes to near zero and
+the ≈4 µs/function declaration cost disappears — call it 25–30 % of what is
+left. Costs: the mini-program's lifetime has to outlive every run (the
+interpreter borrows `&'a str` out of it), the dependency-order retry loop needs
+a per-site prelude against a shared body, and the failure `trace` (§8.2) reads
+function names out of the emitted tree, so a shared name generator must not
+change what a user sees. **It does not forfeit the equivalence gate** — the
+interpreter still runs the tree codegen emits, hoisted once instead of 483
+times, which is the property §8.2 said a spanned IR would give up.
+
+**Option B — cross-analysis memoization**, §8.3's deferred item, and the only
+thing that helps the language server's *second* keystroke. Its open question is
+unchanged and is the reason it is still deferred: **what is a const
+expression's cache key?** Entity ids regenerate per analysis, so the key is
+source-derived; the dependency closure is a fixpoint over reached functions,
+not a syntactic walk; and a std edit must invalidate it as surely as an entry
+edit, so the key composes with the base cache's content hashes rather than
+replacing them. §10.3 also prices what it would buy that Option A would not:
+the interpreter's 68 %, which is per-site and irreducible within one analysis
+but perfectly reusable across two analyses of an unedited file. The pin
+`a_const_site_reads_its_dependency_afresh_in_a_second_analysis` is deliberately
+written to be the thing such a cache has to keep green.
+
+**Recommendation: A first, B on a ruling.** A is bounded, needs no cache key,
+and keeps every gate the pass has today; B is the larger prize for the editor
+and is the one with an unsettled design question in it. Neither is built here.
+
+*Question for the owner, and it is B's:* is a source-derived, base-cache-composed
+key worth the invalidation surface it opens, given that A gets a quarter of the
+remaining cost with no key at all?
