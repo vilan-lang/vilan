@@ -57290,11 +57290,12 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
 // comment records the measured answer today, which differs from what the pin
 // asserts — so none of them is vacuous.
 
-/// §13.2 row 1. Today: `Expected Bar, but got Foo instead.` — std's
-/// `impl type T with Into<T>` (`std/src/into.vl` 5–9) is a candidate for every
-/// receiver and, being tier 0, sorts first, so the user's own impl is dead code.
+/// §13.2 row 1, closed by R2. Before it: `Expected Bar, but got Foo instead.`
+/// — std's `impl type T with Into<T>` (`std/src/into.vl` 5–9) is a candidate for
+/// every receiver and, being tier 0, sorted first, so the user's own impl was
+/// dead code. R1 makes the two separate homes (`Into<Foo>` and `Into<Bar>`) and
+/// R2 lets the `let`'s annotation say which was meant.
 #[test]
-#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
 fn b73_a_user_into_impl_beats_the_std_blanket() {
     assert_compiles_and_runs(
         r#"
@@ -57347,11 +57348,10 @@ fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
     );
 }
 
-/// §13.2 row 3. The same defect in return position, which reconciles value-first
-/// (§10(3)) rather than through an annotation. Today: `Expected Bar, but got
-/// Foo instead.` on the `x.into()` tail.
+/// §13.2 row 3, closed by R2 — the same defect in RETURN position, where the
+/// expectation comes from the declared return type rather than from a `let`.
+/// Before: `Expected Bar, but got Foo instead.` on the `x.into()` tail.
 #[test]
-#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
 fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
@@ -57373,12 +57373,15 @@ fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
     );
 }
 
-/// §13.2 row 5. §3.1's disambiguator is no escape hatch here — both candidates
-/// have the same trait head, so naming it settles nothing. Today the unannotated
-/// form prints `1` and the annotated form below reports `Expected Bar, but got
-/// Foo instead.`; under R2 the annotation is what picks the home.
+/// §13.2 row 5, closed by R2. §3.1's disambiguator is no escape hatch here —
+/// both candidates have the same trait head, so naming it settles nothing; the
+/// annotation is what picks the home. Two defects stood between: the path head
+/// `Into::into` never reached §3.1's re-point at all, because the blanket's
+/// GENERIC subject compare_types the bare trait type and answered the static
+/// path itself (a `self`-method can no longer do that); and the re-point's own
+/// provider scan then took the first impl of the trait rather than the one the
+/// expectation names.
 #[test]
-#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
 fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
@@ -57402,11 +57405,17 @@ fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
 }
 
 /// §13.2 rows 6–7, the ordering-sensitive form: a user-written blanket, so std's
-/// tier-0 position is not what decides it. Today the blanket-first program
-/// prints `1` and the specific-first program prints `101` — the same two impls,
-/// two answers, decided by which block was typed above the other.
+/// tier-0 position is not what decides it. Before, the blanket-first program
+/// printed `1` and the specific-first program printed `101` — the same two
+/// impls, two answers, decided by which block was typed above the other.
+///
+/// Closed by **R2**, not R3 as §13.4(a) predicted: `impl type T with Conv<T>`
+/// instantiates as `Conv<Foo>` on a `Foo` while the specific impl is
+/// `Conv<Bar>`, so the two are argument-distinct HOMES and the `let`'s
+/// annotation selects between them before specificity is ever consulted. Rows
+/// 21–22, whose trait takes no arguments, are the shape that genuinely needs
+/// ranking.
 #[test]
-#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
 fn b73_a_user_blanket_loses_to_a_specific_impl_whatever_the_order() {
     let blanket_first = r#"
         import std::print;
@@ -57630,12 +57639,15 @@ fn b73_a_specific_impl_taking_the_trait_default_outranks_a_blanket_declaration()
 
 /// §13.2 rows 18–19, and R1's whole point: `spec/types.md` 271–275 says
 /// `Conv<Bar>` and `Conv<Baz>` on one subject are two implementations, and B98's
-/// pair key agrees — but resolution collapses them to one home (`member_home_trait`
-/// returns a bare trait `Id`), so only the first-declared is ever reachable.
-/// Today: the `Baz` annotation reports `Expected Baz, but got Bar instead.`
-/// while the `Bar` one compiles and prints `2`.
+/// pair key agrees — but resolution collapsed them to one home
+/// (`member_home_trait` returned a bare trait `Id`), so only the first-declared
+/// was ever reachable. Before: the `Baz` annotation reported `Expected Baz, but
+/// got Bar instead.` while the `Bar` one compiled and printed `2`.
+///
+/// It takes R1 *and* R2, against §13.5's reading that R1 alone would do it:
+/// splitting the homes is what makes both reachable, and choosing between two
+/// reachable homes on one receiver is exactly what the expected type is for.
 #[test]
-#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
 fn b73_two_impls_of_one_trait_at_different_arguments_are_both_reachable() {
     let source = r#"
         import std::print;
@@ -57727,6 +57739,33 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
         "'into' is ambiguous on 'Foo': both 'Into<Foo>' and 'Into<str>' provide it, and \
          'Into::into' names only the trait, not which of its instantiations; annotate the \
          type this call must produce to pick one",
+    );
+}
+
+/// R2's ZERO-match leg. An expectation that fits neither home does not get to
+/// pick one by being nearest: the call stays ambiguous and says so, rather than
+/// resolving to some impl and then reporting a type mismatch against it. That
+/// second message would name a home the program never chose.
+#[test]
+fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s: i32 = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "'into' is ambiguous on 'Foo': both 'Into<Foo>' and 'Into<str>' provide it",
     );
 }
 

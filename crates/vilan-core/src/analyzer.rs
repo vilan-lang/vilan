@@ -11310,7 +11310,23 @@ impl<'src> Analyzer<'src> {
         member_name: &str,
         subject_is_trait: bool,
     ) -> Vec<ImplMemberCandidate> {
-        self.impl_member_candidates(subject_type, member_name, false, subject_is_trait)
+        let candidates =
+            self.impl_member_candidates(subject_type, member_name, false, subject_is_trait);
+        if !subject_is_trait {
+            return candidates;
+        }
+        // `Trait::member(receiver)` for a `self`-method is §3.1's disambiguator,
+        // not a static: which implementation runs is the RECEIVER's to decide,
+        // and the path head falls through to `trait_qualified_calls` to let it.
+        // An impl with a GENERIC subject compare_types the bare trait type,
+        // though, so std's `impl type T with Into<T>` answered the path itself
+        // and `Into::into(foo)` reached the blanket whatever `foo` implements
+        // (`method-resolution.md` §13.2 row 5). A trait's attached statics —
+        // `Iterator::from_fn`, which take no `self` — are untouched.
+        candidates
+            .into_iter()
+            .filter(|candidate| !self.is_self_method(candidate.member_id))
+            .collect()
     }
 
     fn impl_member_candidates(
@@ -11513,6 +11529,80 @@ impl<'src> Analyzer<'src> {
             }
             None => ImplMemberResolution::Missing,
         }
+    }
+
+    /// B73's R2: the type the call site expects picks among argument-distinct
+    /// homes. Exactly one candidate whose return type — as THIS receiver
+    /// instantiates it — reconciles with the expectation wins; zero, or two or
+    /// more, is `None` and the caller reports the ambiguity.
+    ///
+    /// Method resolution runs receiver-first everywhere else, so this is the one
+    /// place the annotation on the left of the `=` reaches across and chooses
+    /// among the implementations on the right. It is what makes
+    /// `let b: Bar = foo.into()` mean the user's `impl Foo with Into<Bar>`
+    /// rather than std's blanket, and what `variadic-generics.md` 182–187
+    /// recorded as its blocker.
+    fn select_home_by_expected_type(
+        &mut self,
+        call_id: Id,
+        subject_type: &Type,
+        homes: &[(Id, TypeId)],
+    ) -> Option<(Id, TypeId)> {
+        let expected_id = self.expected_types.get(&call_id).copied()?;
+        let expected = expected_id.get_type(self);
+        // An expectation that is itself open constrains nothing — the call is
+        // as ambiguous as it was without one.
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+            return None;
+        }
+        let mut selected: Option<(Id, TypeId)> = None;
+        for (member_id, impl_subject) in homes {
+            let Some(return_type) =
+                self.member_return_type_for(*member_id, *impl_subject, subject_type)
+            else {
+                continue;
+            };
+            // A return type that never resolved reconciles with everything, so
+            // it must not be allowed to *win* the selection.
+            if matches!(return_type, Type::Unknown | Type::Unresolved | Type::Any) {
+                continue;
+            }
+            if !self.compare_type(&return_type, &expected, &HashMap::default()) {
+                continue;
+            }
+            if selected.is_some() {
+                // Two homes fit the expectation: it does not disambiguate.
+                return None;
+            }
+            selected = Some((*member_id, *impl_subject));
+        }
+        selected
+    }
+
+    /// A candidate member's declared return type, with the declaring impl's own
+    /// binders bound from the receiver — so the blanket's `fun into(self): T`
+    /// reads as `Foo` on a `Foo` and the user's `fun into(self): Bar` as `Bar`.
+    /// `None` when the member declares no return type.
+    fn member_return_type_for(
+        &mut self,
+        member_id: Id,
+        impl_subject: TypeId,
+        subject_type: &Type,
+    ) -> Option<Type> {
+        let return_type_id = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => self.functions.get(function_id)?.return_type_id?,
+            Some(Expr::ExternalFunction(function_id)) => {
+                self.external_functions.get(function_id)?.return_type_id
+            }
+            _ => return None,
+        };
+        let impl_subject_type = impl_subject.get_type(self);
+        let bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        let declared = return_type_id.get_type(self);
+        Some(self.substitute_type(&declared, &bindings))
     }
 
     /// The trait that is `member_name`'s home when `implementation` provides it
@@ -24027,7 +24117,11 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         self.trait_qualified_calls.remove(&subject_id);
-        let provider = self
+        // Every impl of the named trait whose subject matches, not just the
+        // first: one subject may implement the trait at two instantiations
+        // (`Into<Bar>` beside std's `Into<Foo>`), and naming the trait says
+        // nothing about which — §3.1's spelling has no argument slot (B73 R2).
+        let providers: Vec<(Option<Id>, TypeId)> = self
             .implementations
             .iter()
             .filter(|implementation| {
@@ -24050,7 +24144,25 @@ impl<'src> Analyzer<'src> {
                     implementation.subject,
                 )
             })
-            .next();
+            .collect();
+        let declaring: Vec<(Id, TypeId)> = providers
+            .iter()
+            .filter_map(|(member_id, impl_subject)| {
+                member_id.map(|member_id| (member_id, *impl_subject))
+            })
+            .collect();
+        // With more than one implementation declaring the name, the call's
+        // expected type is the only thing that can choose (R2). When it cannot,
+        // the first-declared still wins, as it always has — the reported
+        // ambiguity belongs to `receiver.member()`, which is where a reader can
+        // act on it; there is no *further* spelling to steer a qualified call to.
+        let provider = match declaring.len() > 1 {
+            true => self
+                .select_home_by_expected_type(call_id, &receiver_type, &declaring)
+                .map(|(member_id, impl_subject)| (Some(member_id), impl_subject))
+                .or_else(|| providers.first().copied()),
+            false => providers.first().copied(),
+        };
         match provider {
             Some((Some(member_id), impl_subject)) => {
                 let count = self.reference_count.entry(member_id).or_insert(0);
@@ -24723,7 +24835,21 @@ impl<'src> Analyzer<'src> {
         let mut return_ambiguous: Option<Vec<Id>> = None;
         let lookup = match &subject_type {
             Type::Struct(_, _) | Type::Enum(_, _) => {
-                match self.resolve_impl_member(&subject_type, member_name) {
+                let mut resolution = self.resolve_impl_member(&subject_type, member_name);
+                // R2: before reporting two argument-distinct homes, let the type
+                // the call site expects choose between them.
+                if let ImplMemberResolution::AmbiguousTraitArguments(homes) = &resolution {
+                    let reachable: Vec<(Id, TypeId)> = homes
+                        .iter()
+                        .map(|home| (home.member_id, home.impl_subject))
+                        .collect();
+                    if let Some((member_id, impl_subject)) =
+                        self.select_home_by_expected_type(id, &subject_type, &reachable)
+                    {
+                        resolution = ImplMemberResolution::Found(member_id, impl_subject);
+                    }
+                }
+                match resolution {
                     ImplMemberResolution::Found(member_id, impl_subject_id) => {
                         // Bind the impl's generic parameters from the receiver
                         // (`List<i32>` against the impl's `List<T>` binds `T = i32`)
