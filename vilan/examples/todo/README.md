@@ -44,8 +44,9 @@ both, so a stale bundle is detectable.
 ## How the data flows
 
 The server holds the list in an `[expose]`d `Signal<List<Todo>>` and mounts the
-generated dispatcher with `std::rpc_server::serve_service`: one port serving
-the page, the WebSocket upgrade, and the RPC/SSE routes. Each tab makes ONE
+generated dispatcher on its own `Server::builder()` chain with
+`ServerBuilder::with_service`: one port serving the page, the browser leg's
+build, the WebSocket upgrade, and the RPC/SSE routes. Each tab makes ONE
 generated call:
 
 1. `TodoClient::connect("/", json_codec())`: opens the WebSocket, verifies

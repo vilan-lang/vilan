@@ -1,13 +1,14 @@
 // The server entry: serve the browser leg's build, boot the store, and answer
-// http + rpc on one port. Everything stateful lives in `pkg::store`, next to
-// its database.
+// http + rpc on one port — one `Server::builder()` chain the service is
+// installed on rather than a boot function that owns the whole port.
+// Everything stateful lives in `pkg::store`, next to its database.
 
 import std::build::require_build;
-import std::fs;
-import std::http::{ Response, build_handler };
+import std::document::require_shell;
+import std::http::{ Response, Server };
 import std::json::json_codec;
 import std::print;
-import std::rpc_server::serve_service;
+import std::rpc_server::Service;
 import pkg::store::boot;
 
 async fun main() {
@@ -15,9 +16,20 @@ async fun main() {
 	// `dist/` path is spelled here, so renaming the leg cannot leave this file
 	// compiling and the page blank.
 	let build = require_build("client");
-	let app_html = fs::read_file_to_str("src/app.html");
+	// Read once at boot, and CHECKED against that build: a shell whose
+	// stylesheet link, script tag or mount `<div id>` stopped matching what the
+	// build wrote stops the server here rather than serving a page that cannot
+	// work.
+	let page = require_shell("src/app.html", build).html();
 
 	let store = boot();
 
-	serve_service(4600, store.dispatcher().into_protocol(json_codec()), build_handler(build, |request| Response::builder().set_header("Content-Type", "text/html").body(app_html).build()), |server| print(i"notes server listening on {server.url()}"));
+	Server::builder()
+		.port(4600)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_start(|server| print(i"notes server listening on {server.url()}"))
+		.build()
+		.start();
 }
