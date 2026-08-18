@@ -3067,7 +3067,7 @@ impl<'src> Transformer<'src> {
                                     .bound_dispatch_traits
                                     .get(&function_call.subject_id)
                             })
-                            .copied();
+                            .cloned();
                         if let Some(dispatch) = self.resolve_dispatch_with(
                             concrete_type_id,
                             member_name,
@@ -3094,7 +3094,7 @@ impl<'src> Transformer<'src> {
                             .get(id)
                             .cloned()
                             .unwrap_or_default();
-                        let preferred = self.program.bound_dispatch_traits.get(id).copied();
+                        let preferred = self.program.bound_dispatch_traits.get(id).cloned();
                         if let Some(dispatch) = self.resolve_dispatch_with(
                             concrete_type_id,
                             member_name,
@@ -3118,7 +3118,7 @@ impl<'src> Transformer<'src> {
                         // dispatch on (B57 §3.1) — without it, two traits whose
                         // DEFAULTS share a name both resolve to whichever the
                         // by-name lookup reaches first.
-                        let preferred = self.program.bound_dispatch_traits.get(id).copied();
+                        let preferred = self.program.bound_dispatch_traits.get(id).cloned();
                         if let Some(dispatch) =
                             self.resolve_dispatch_with(type_id, member_name, &[], preferred)
                         {
@@ -5916,7 +5916,7 @@ impl<'src> Transformer<'src> {
                 .program
                 .bound_dispatch_traits
                 .get(&for_each_id)
-                .copied();
+                .cloned();
             if let Some(dispatch) = self.resolve_dispatch_with(type_id, member_name, &[], preferred)
             {
                 return dispatch;
@@ -6004,6 +6004,64 @@ impl<'src> Transformer<'src> {
         self.resolve_dispatch_with(type_id, member, &[], None)
     }
 
+    /// Whether `implementation` provides `trait_id` at an instantiation the
+    /// re-dispatch demonstrably does NOT want — B73's R1 on the emission side.
+    ///
+    /// The filter is deliberately one-sided: it excludes an impl only when a
+    /// wanted argument and the impl's written one resolve to two *different
+    /// nominal types* (`Conv<Bar>` against a bound written `Conv<Baz>`). A
+    /// position still abstract on either side after `resolve_type_id` — the
+    /// impl's own binder (`impl Signal<type T> with Readable<T>`), or a bound
+    /// argument the current monomorphization has not fixed — proves nothing
+    /// here and keeps the impl, so every program whose arguments already agreed
+    /// emits exactly the bytes it emitted before.
+    fn trait_instantiation_conflicts(
+        &self,
+        implementation: &crate::analyzer::Implementation<'src>,
+        trait_id: Id,
+        wanted_arguments: &[TypeId],
+    ) -> bool {
+        if wanted_arguments.is_empty() {
+            return false;
+        }
+        let Some((_, written_arguments)) = implementation
+            .trait_args
+            .iter()
+            .find(|(id, _)| *id == trait_id)
+        else {
+            return false;
+        };
+        if written_arguments.len() != wanted_arguments.len() {
+            return false;
+        }
+        written_arguments
+            .iter()
+            .zip(wanted_arguments)
+            .any(|(written, wanted)| self.nominally_different(*written, *wanted))
+    }
+
+    /// Whether two types are provably distinct nominal types — the only
+    /// judgement [`trait_instantiation_conflicts`] is willing to act on. Type
+    /// ids are minted, not interned, so identity is compared through the types
+    /// they name and never through the ids themselves.
+    fn nominally_different(&self, left: TypeId, right: TypeId) -> bool {
+        let left = self.resolve_type_id(left);
+        let right = self.resolve_type_id(right);
+        if left == right {
+            return false;
+        }
+        match (
+            self.program.type_id_to_type_map.get(&left),
+            self.program.type_id_to_type_map.get(&right),
+        ) {
+            (Some(Type::Struct(left_id, _)), Some(Type::Struct(right_id, _)))
+            | (Some(Type::Enum(left_id, _)), Some(Type::Enum(right_id, _))) => left_id != right_id,
+            (Some(Type::Struct(..)), Some(Type::Enum(..)))
+            | (Some(Type::Enum(..)), Some(Type::Struct(..))) => true,
+            _ => false,
+        }
+    }
+
     /// `resolve_dispatch`, additionally binding the target method's OWN generics
     /// from `own_generic_values` (the call's bindings in declaration order —
     /// recorded against the trait member the analyzer saw, whose ids differ from
@@ -6016,13 +6074,14 @@ impl<'src> Transformer<'src> {
         type_id: TypeId,
         member: &str,
         own_generic_values: &[TypeId],
-        preferred_trait: Option<Id>,
+        preferred_trait: Option<(Id, Vec<TypeId>)>,
     ) -> Option<Dispatch<'src>> {
         let type_id = self.resolve_type_id(type_id);
-        if let Some(trait_id) = preferred_trait {
-            // Resolve strictly within the trait: the impl's override first...
+        if let Some((trait_id, trait_arguments)) = preferred_trait {
+            // Resolve strictly within the trait AND its instantiation (B73 R1).
+            // The impl's override first...
             if let Some((member_id, impl_subject)) =
-                self.resolve_member_on_trait_impl(type_id, trait_id, member)
+                self.resolve_member_on_trait_impl(type_id, trait_id, &trait_arguments, member)
             {
                 return Some(self.dispatch_to_member(
                     member_id,
@@ -6114,6 +6173,7 @@ impl<'src> Transformer<'src> {
         &self,
         type_id: TypeId,
         trait_id: Id,
+        trait_arguments: &[TypeId],
         member: &str,
     ) -> Option<(Id, TypeId)> {
         let type_ = self.program.type_id_to_type_map.get(&type_id)?;
@@ -6122,6 +6182,11 @@ impl<'src> Transformer<'src> {
             .iter()
             .filter(|implementation| {
                 implementation.trait_ids.contains(&trait_id)
+                    && !self.trait_instantiation_conflicts(
+                        implementation,
+                        trait_id,
+                        trait_arguments,
+                    )
                     && self
                         .program
                         .type_id_to_type_map

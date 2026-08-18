@@ -1451,7 +1451,7 @@ pub struct Implementation<'src> {
 /// One impl-declared candidate for `receiver.member` — a member some impl of
 /// the receiver's type declares, before precedence picks between them
 /// (`proposal/method-resolution.md` §3).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ImplMemberCandidate {
     member_id: Id,
     /// The declaring impl's subject, to reconcile against the receiver so the
@@ -1460,6 +1460,16 @@ struct ImplMemberCandidate {
     /// The trait the name comes from, or `None` when the member is INHERENT —
     /// the type's own, outranking every trait-provided candidate.
     home_trait: Option<Id>,
+    /// The home trait's arguments AS THIS RECEIVER INSTANTIATES THEM — std's
+    /// `impl type T with Into<T>` reached through a `Foo` is `Into<Foo>`, a
+    /// user's `impl Foo with Into<str>` is `Into<str>`. Empty for an inherent
+    /// member and for a trait with no parameters.
+    ///
+    /// Half of B73's R1 resolution key: the trait id alone made those two one
+    /// home, so `homes.len()` was 1, no ambiguity was raised, and declaration
+    /// order decided which body a call reached (`method-resolution.md` §13.3,
+    /// defect D1).
+    home_arguments: Vec<TypeId>,
 }
 
 /// How `receiver.member` resolves against the impls whose subject matches
@@ -1472,6 +1482,12 @@ enum ImplMemberResolution {
     /// them: the call has to name one (`Trait::member(receiver)`). Carries the
     /// competing traits, in declaration order.
     AmbiguousTraits(Vec<Id>),
+    /// ONE trait provides the name at two or more distinct instantiations —
+    /// `Into<Foo>` and `Into<str>` for this receiver (B73's R1 key). §3.1's
+    /// `Trait::member` disambiguator has no argument slot, so naming the trait
+    /// settles nothing; the call is reported. Carries one candidate per home,
+    /// in declaration order.
+    AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
     Missing,
 }
 
@@ -2518,11 +2534,16 @@ pub struct Analyzer<'src> {
     // the operand's own span covers `e` alone.
     spread_spans: HashMap<Id, Span>,
     // The trait a bound call resolved through (`value.tag()` where `T: Marker`
-    // found `tag` in `Marker`), keyed by call id. The OnConstraint emission
+    // found `tag` in `Marker`), keyed by call id, WITH the arguments the bound
+    // wrote (`T: Conv<Baz>` -> `[Baz]`; empty for an unparameterized trait or
+    // where the site knows only the trait). The OnConstraint emission
     // dispatches on THAT trait's surface — override, else default — so an
     // inherent method sharing the name can't shadow the trait member the
-    // analyzer typed against.
-    bound_dispatch_traits: HashMap<Id, Id>,
+    // analyzer typed against, and on THAT instantiation, so a bound written
+    // `Conv<Baz>` cannot re-dispatch into an `impl .. with Conv<Bar>` that
+    // merely registered first (B73's R1; `method-resolution.md` §13.2 row 20 —
+    // the type confusion).
+    bound_dispatch_traits: HashMap<Id, (Id, Vec<TypeId>)>,
     prepped_trait_impls: Vec<TraitImplCheck<'src>>,
     // Every `impl Subject with Trait` clause whose trait resolved, recorded as
     // the (trait, subject) pair the coherence rule is keyed on (B98). Consumed
@@ -4900,25 +4921,40 @@ impl<'src> Analyzer<'src> {
     /// `impl Bag with Combine` and `impl Bag with Combine<Bag>` would compare as
     /// different instantiations of the one they both are.
     fn effective_trait_arguments(&self, site: &TraitImplSite) -> Vec<TypeId> {
-        let Some(trait_) = self.traits.get(&site.trait_id) else {
-            return site.arguments.clone();
+        self.effective_trait_arguments_of(site.trait_id, &site.arguments, site.subject)
+    }
+
+    /// [`effective_trait_arguments`] over the parts rather than a
+    /// [`TraitImplSite`] — the same padding rule, reached from the resolution
+    /// path (B73's R1), which holds an [`Implementation`] and not a check's
+    /// recorded site.
+    fn effective_trait_arguments_of(
+        &self,
+        trait_id: Id,
+        written_arguments: &[TypeId],
+        subject: TypeId,
+    ) -> Vec<TypeId> {
+        let Some(trait_) = self.traits.get(&trait_id) else {
+            return written_arguments.to_vec();
         };
         trait_
             .generic_parameter_constraint_ids
             .iter()
             .enumerate()
-            .map(|(position, declared_id)| match site.arguments.get(position) {
-                Some(written_id) => *written_id,
-                None if matches!(declared_id.get_type(self), Type::Trait(id, _) if id == site.trait_id) => {
-                    site.subject
-                }
-                None => *declared_id,
-            })
+            .map(
+                |(position, declared_id)| match written_arguments.get(position) {
+                    Some(written_id) => *written_id,
+                    None if matches!(declared_id.get_type(self), Type::Trait(id, _) if id == trait_id) => {
+                        subject
+                    }
+                    None => *declared_id,
+                },
+            )
             .chain(
                 // A clause that wrote MORE arguments than the trait declares is
                 // already an arity error elsewhere; keep them so two such
                 // clauses still compare by what they wrote.
-                site.arguments
+                written_arguments
                     .iter()
                     .skip(trait_.generic_parameter_constraint_ids.len())
                     .copied(),
@@ -11216,7 +11252,7 @@ impl<'src> Analyzer<'src> {
 
     /// Resolves a method `member_name` callable on a concrete `subject_type`
     /// (a struct or enum) by searching its implementations.
-    fn method_member_in_impls(&self, subject_type: &Type, member_name: &str) -> Option<Id> {
+    fn method_member_in_impls(&mut self, subject_type: &Type, member_name: &str) -> Option<Id> {
         self.method_member_impl_subject(subject_type, member_name)
             .map(|(member_id, _)| member_id)
     }
@@ -11230,13 +11266,15 @@ impl<'src> Analyzer<'src> {
     /// a caller that wants to tell them apart — and to say so — asks
     /// [`resolve_impl_member`] directly.
     fn method_member_impl_subject(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Option<(Id, TypeId)> {
         match self.resolve_impl_member(subject_type, member_name) {
             ImplMemberResolution::Found(member_id, impl_subject) => Some((member_id, impl_subject)),
-            ImplMemberResolution::AmbiguousTraits(_) | ImplMemberResolution::Missing => None,
+            ImplMemberResolution::AmbiguousTraits(_)
+            | ImplMemberResolution::AmbiguousTraitArguments(_)
+            | ImplMemberResolution::Missing => None,
         }
     }
 
@@ -11249,7 +11287,7 @@ impl<'src> Analyzer<'src> {
     /// ([`declaration_order`]), so which candidate a tie names is a property of
     /// the program, not of the order its imports happen to be written in.
     fn method_member_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<ImplMemberCandidate> {
@@ -11267,7 +11305,7 @@ impl<'src> Analyzer<'src> {
     /// `[trait_only]` member is reachable when the path head IS the trait
     /// (access on the trait itself stays allowed, §3.2).
     fn static_path_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
         subject_is_trait: bool,
@@ -11276,7 +11314,7 @@ impl<'src> Analyzer<'src> {
     }
 
     fn impl_member_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
         methods_only: bool,
@@ -11292,7 +11330,11 @@ impl<'src> Analyzer<'src> {
         let Some(declaring) = self.implementations_by_member.get(member_name) else {
             return Vec::new();
         };
-        let mut candidates: Vec<ImplMemberCandidate> = declaring
+        // `(member, impl subject, home trait, the home's arguments AS WRITTEN)`.
+        // The written arguments are read here, where the declaring impl is in
+        // hand; padding and instantiation happen below, once the immutable
+        // borrow of `implementations_by_member` is released.
+        let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = declaring
             .iter()
             .map(|index| &self.implementations[*index])
             .filter(|implementation| {
@@ -11311,16 +11353,83 @@ impl<'src> Analyzer<'src> {
                     .get(member_name)
                     .copied()
                     .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
-                Some(ImplMemberCandidate {
+                let home_trait = self.member_home_trait(implementation, member_name);
+                let written_arguments = home_trait
+                    .and_then(|trait_id| {
+                        implementation
+                            .trait_args
+                            .iter()
+                            .find(|(id, _)| *id == trait_id)
+                            .map(|(_, arguments)| arguments.clone())
+                    })
+                    .unwrap_or_default();
+                Some((
                     member_id,
-                    impl_subject: implementation.subject,
-                    home_trait: self.member_home_trait(implementation, member_name),
-                })
+                    implementation.subject,
+                    home_trait,
+                    written_arguments,
+                ))
             })
             .collect();
-        candidates.sort_by_key(|candidate| self.declaration_order(candidate.member_id));
-        candidates.dedup_by_key(|candidate| candidate.member_id);
-        candidates
+        found.sort_by_key(|(member_id, ..)| self.declaration_order(*member_id));
+        found.dedup_by_key(|(member_id, ..)| *member_id);
+        found
+            .into_iter()
+            .map(
+                |(member_id, impl_subject, home_trait, written_arguments)| ImplMemberCandidate {
+                    member_id,
+                    impl_subject,
+                    home_trait,
+                    home_arguments: match home_trait {
+                        Some(trait_id) => self.instantiated_home_arguments(
+                            subject_type,
+                            trait_id,
+                            &written_arguments,
+                            impl_subject,
+                        ),
+                        None => Vec::new(),
+                    },
+                },
+            )
+            .collect()
+    }
+
+    /// The home trait's arguments as THIS receiver instantiates them — B73's R1
+    /// key. Two steps, both already shipped elsewhere: pad the `with` clause to
+    /// the trait's arity with its declared defaults, resolving `= Self` to the
+    /// subject (B98's pair key, [`effective_trait_arguments`]); then bind the
+    /// impl's own generic parameters from the receiver and substitute, so std's
+    /// `impl type T with Into<T>` reads as `Into<Foo>` on a `Foo` rather than as
+    /// the abstract `Into<T>` it is written as.
+    ///
+    /// Without the second step every blanket impl in the program would share one
+    /// home with every specific impl of the same trait, which is exactly the
+    /// collapse `method-resolution.md` §13.3 measured.
+    fn instantiated_home_arguments(
+        &mut self,
+        subject_type: &Type,
+        trait_id: Id,
+        written_arguments: &[TypeId],
+        impl_subject: TypeId,
+    ) -> Vec<TypeId> {
+        let effective =
+            self.effective_trait_arguments_of(trait_id, written_arguments, impl_subject);
+        if effective.is_empty() {
+            return effective;
+        }
+        let impl_subject_type = impl_subject.get_type(self);
+        let bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        effective
+            .into_iter()
+            .map(|argument_id| {
+                let argument = argument_id.get_type(self);
+                let resolved = self.substitute_type(&argument, &bindings);
+                resolved.get_type_id(self)
+            })
+            .collect()
     }
 
     /// The precedence rule of `proposal/method-resolution.md` §3, for a
@@ -11328,8 +11437,13 @@ impl<'src> Analyzer<'src> {
     /// unconditionally; two traits providing the same name with no inherent
     /// member above them is an ambiguity the call has to resolve by naming one
     /// (`Trait::member(receiver)`).
-    fn resolve_impl_member(&self, subject_type: &Type, member_name: &str) -> ImplMemberResolution {
-        self.rank_member_candidates(self.method_member_candidates(subject_type, member_name))
+    fn resolve_impl_member(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> ImplMemberResolution {
+        let candidates = self.method_member_candidates(subject_type, member_name);
+        self.rank_member_candidates(candidates)
     }
 
     /// The tiering itself, over an already-collected candidate list — shared by
@@ -11346,19 +11460,52 @@ impl<'src> Analyzer<'src> {
         {
             return ImplMemberResolution::Found(inherent.member_id, inherent.impl_subject);
         }
-        // Tier 2: trait-provided. Two impls of the SAME trait are not an
-        // ambiguity — the name has one home, and only one of them can be live
-        // in a given build (the platform-twin shape, §2).
-        let mut homes: Vec<Id> = Vec::new();
+        // Tier 2: trait-provided. A home is `(trait, the arguments THIS receiver
+        // instantiates)` — B73's R1. Keying on the trait id alone made std's
+        // `impl type T with Into<T>` and a user's `impl Foo with Into<str>` one
+        // home for a `Foo`, so `homes.len()` was 1, no ambiguity was raised, and
+        // `candidates.first()` handed the call to whichever impl registered
+        // first (std, always). Two impls at the SAME instantiation are still not
+        // an ambiguity here — only one of them can be live in a given build (the
+        // platform-twin shape, §2), and B73's R3 ranks a genuine overlap.
+        let mut homes: Vec<&ImplMemberCandidate> = Vec::new();
         for candidate in &candidates {
-            if let Some(trait_id) = candidate.home_trait
-                && !homes.contains(&trait_id)
-            {
-                homes.push(trait_id);
+            let Some(trait_id) = candidate.home_trait else {
+                continue;
+            };
+            let known = homes.iter().any(|home| {
+                home.home_trait == Some(trait_id)
+                    && self.same_impl_types(
+                        &home.home_arguments,
+                        &candidate.home_arguments,
+                        &mut Vec::new(),
+                    )
+            });
+            if !known {
+                homes.push(candidate);
             }
         }
+        // Two DIFFERENT traits keep §3/§4's verdict and its `Trait::member`
+        // steer. Two instantiations of ONE trait have no such spelling, so they
+        // are reported apart (R2 gives the expected type a chance first).
+        let mut distinct_traits: Vec<Id> = Vec::new();
+        for home in &homes {
+            if let Some(trait_id) = home.home_trait
+                && !distinct_traits.contains(&trait_id)
+            {
+                distinct_traits.push(trait_id);
+            }
+        }
+        if distinct_traits.len() > 1 {
+            return ImplMemberResolution::AmbiguousTraits(distinct_traits);
+        }
+        // Two homes of ONE trait have no `Trait::member` spelling to pick
+        // between them. Reporting is what makes row 2 stop being a silent wrong
+        // answer; R2 gives the call's expected type the first chance to choose.
         if homes.len() > 1 {
-            return ImplMemberResolution::AmbiguousTraits(homes);
+            return ImplMemberResolution::AmbiguousTraitArguments(
+                homes.into_iter().cloned().collect(),
+            );
         }
         match candidates.first() {
             Some(candidate) => {
@@ -11386,6 +11533,20 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|trait_| trait_.declarations.contains_key(member_name))
                 })
         })
+    }
+
+    /// One candidate's home, spelled as THIS receiver instantiates it —
+    /// `Into<Foo>` for std's blanket reached through a `Foo`, `Into<str>` for
+    /// the user's own impl (B1: the reader has to be able to tell the two
+    /// apart, and `Into` twice does not).
+    fn home_label(&self, candidate: &ImplMemberCandidate) -> String {
+        let Some(trait_id) = candidate.home_trait else {
+            return String::new();
+        };
+        self.pretty_print_type(
+            &Type::Trait(trait_id, candidate.home_arguments.clone()),
+            &HashMap::default(),
+        )
     }
 
     /// A trait's user-facing spelling for one subject — with the arguments the
@@ -23855,7 +24016,10 @@ impl<'src> Analyzer<'src> {
                 call_id,
                 GenericDispatch::OnConstraint(constraint_id, member_name),
             );
-            self.bound_dispatch_traits.insert(call_id, trait_id);
+            // The qualified spelling names a trait and no arguments, so the
+            // instantiation is left unconstrained (B73 R1's empty-list case).
+            self.bound_dispatch_traits
+                .insert(call_id, (trait_id, Vec::new()));
             return None;
         }
         if !matches!(receiver_type, Type::Struct(..) | Type::Enum(..)) {
@@ -23920,7 +24084,8 @@ impl<'src> Analyzer<'src> {
                 // Dispatch on THIS trait's surface: two traits whose defaults
                 // share a name are exactly the case the call named one to
                 // resolve, so a by-name lookup would undo the disambiguation.
-                self.bound_dispatch_traits.insert(call_id, trait_id);
+                self.bound_dispatch_traits
+                    .insert(call_id, (trait_id, Vec::new()));
                 let rest: Vec<Id> = argument_ids[1..].to_vec();
                 self.constraints.push(Constraint::MethodArgCheck {
                     call_id,
@@ -24487,6 +24652,9 @@ impl<'src> Analyzer<'src> {
             // Two or more traits provide the name and no inherent member
             // outranks them (B57) — the call has to name one.
             AmbiguousTraits(Vec<Id>),
+            // ONE trait provides the name at two or more instantiations (B73's
+            // R1) — `Trait::member` cannot name which, so the call is reported.
+            AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
             // The receiver is a value typed as a bare trait (not `self` in a trait
             // default) — there is no concrete type to dispatch to.
             BareTraitValue(Id),
@@ -24585,6 +24753,9 @@ impl<'src> Analyzer<'src> {
                     }
                     ImplMemberResolution::AmbiguousTraits(trait_ids) => {
                         MethodLookup::AmbiguousTraits(trait_ids)
+                    }
+                    ImplMemberResolution::AmbiguousTraitArguments(homes) => {
+                        MethodLookup::AmbiguousTraitArguments(homes)
                     }
                     // Gap E: fall back to an inherited trait default, re-dispatched
                     // to this concrete type at codegen.
@@ -24702,7 +24873,7 @@ impl<'src> Analyzer<'src> {
                             continue;
                         };
                         member = Some(found_member);
-                        member_trait = Some(*trait_id);
+                        member_trait = Some((*trait_id, trait_arguments.clone()));
                         // A parameterized bound (`F: Feed<T>`) substitutes the trait's
                         // parameters with the bound's arguments, so a method parameter
                         // typed in the trait's terms (`each(observer: |T| ..)`) is typed
@@ -24734,8 +24905,12 @@ impl<'src> Analyzer<'src> {
                             id,
                             GenericDispatch::OnConstraint(*constraint_id, member_name),
                         );
-                        if let Some(trait_id) = member_trait {
-                            self.bound_dispatch_traits.insert(id, trait_id);
+                        if let Some((trait_id, trait_arguments)) = member_trait {
+                            // The bound's own arguments (`T: Conv<Baz>` -> `[Baz]`)
+                            // travel with the trait, so codegen re-dispatches into
+                            // the impl of THAT instantiation (B73 R1, row 20).
+                            self.bound_dispatch_traits
+                                .insert(id, (trait_id, trait_arguments));
                         }
                     }
                     found(member)
@@ -24933,6 +25108,43 @@ impl<'src> Analyzer<'src> {
                         if providers.len() == 2 { "both " } else { "" },
                         join_with(&providers, "and"),
                         join_with(&steers, "or"),
+                    ),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Resolution::Failed
+            }
+            // B73 R1: one trait, two instantiations. §3.1's disambiguator names
+            // a trait and has no argument slot, so — per B83's "an impossible
+            // steer is worse than no steer" — the message says what does select
+            // (the expected type, R2) rather than offering a spelling that does
+            // not exist.
+            MethodLookup::AmbiguousTraitArguments(homes) => {
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                let trait_name = homes
+                    .first()
+                    .and_then(|home| home.home_trait)
+                    .and_then(|trait_id| self.traits.get(&trait_id))
+                    .map(|trait_| trait_.name)
+                    .unwrap_or("Trait");
+                let providers: Vec<String> = homes
+                    .iter()
+                    .map(|home| format!("'{}'", self.home_label(home)))
+                    .collect();
+                self.diagnostics.push(Error {
+                    note: None,
+                    // The member NAME is what is ambiguous (A1/A4) — the same
+                    // anchor the two-trait ambiguity uses.
+                    span: self
+                        .member_name_spans
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(arguments_span),
+                    msg: format!(
+                        "'{member_name}' is ambiguous on '{type_str}': {}{} provide it, and \
+                         '{trait_name}::{member_name}' names only the trait, not which of its \
+                         instantiations; annotate the type this call must produce to pick one",
+                        if providers.len() == 2 { "both " } else { "" },
+                        join_with(&providers, "and"),
                     ),
                 });
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
@@ -28161,11 +28373,14 @@ impl<'src> Analyzer<'src> {
                         // Only a trait provides it as a METHOD: refuse, and say
                         // which path does reach it (handled below).
                         false => ImplMemberResolution::Missing,
-                        true => self.rank_member_candidates(self.static_path_candidates(
-                            &subject_type,
-                            member_name,
-                            subject_is_trait,
-                        )),
+                        true => {
+                            let static_candidates = self.static_path_candidates(
+                                &subject_type,
+                                member_name,
+                                subject_is_trait,
+                            );
+                            self.rank_member_candidates(static_candidates)
+                        }
                     };
                     let static_member = match &static_resolution {
                         ImplMemberResolution::Found(member_id, impl_subject) => {
@@ -28393,7 +28608,8 @@ impl<'src> Analyzer<'src> {
                                 // an inherent static sharing the name can't
                                 // shadow it (keyed by the accessor: the call id
                                 // isn't known here).
-                                self.bound_dispatch_traits.insert(id, matched_trait);
+                                self.bound_dispatch_traits
+                                    .insert(id, (matched_trait, Vec::new()));
                             }
                             None => {
                                 let bounds = bound_trait_ids
@@ -28939,18 +29155,19 @@ impl<'src> Analyzer<'src> {
                     let resolved = self
                         .generic_bound_traits(constraint_id)
                         .into_iter()
-                        .find_map(|(trait_id, _)| {
+                        .find_map(|(trait_id, trait_arguments)| {
                             self.method_member_in_trait(trait_id, next_method)
-                                .map(|next_id| (trait_id, next_id))
+                                .map(|next_id| (trait_id, trait_arguments, next_id))
                         });
                     match resolved {
-                        Some((trait_id, next_id)) => {
+                        Some((trait_id, trait_arguments, next_id)) => {
                             self.for_each_next.insert(for_each_id, next_id);
                             self.generic_dispatch.insert(
                                 for_each_id,
                                 GenericDispatch::OnConstraint(constraint_id, next_method),
                             );
-                            self.bound_dispatch_traits.insert(for_each_id, trait_id);
+                            self.bound_dispatch_traits
+                                .insert(for_each_id, (trait_id, trait_arguments));
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
@@ -30473,7 +30690,10 @@ pub struct Program<'src> {
     pub for_each_views: HashMap<Id, bool>,
     pub binary_op_dispatch: HashMap<Id, Id>,
     pub own_generic_call_bindings: HashMap<Id, Vec<TypeId>>,
-    pub bound_dispatch_traits: HashMap<Id, Id>,
+    /// Call id -> `(trait, the arguments the bound wrote)`. The arguments are
+    /// empty where the site knows only the trait; an empty list constrains
+    /// nothing, so re-dispatch behaves exactly as it did before B73's R1.
+    pub bound_dispatch_traits: HashMap<Id, (Id, Vec<TypeId>)>,
     /// Per `expr!` site: how the transformer lowers it (std fast path or a
     /// user `Try` impl's members) — proposal/try-and-lift.md §4.
     pub try_dispatch: HashMap<Id, TryDispatch>,

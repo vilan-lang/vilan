@@ -57317,14 +57317,14 @@ fn b73_a_user_into_impl_beats_the_std_blanket() {
     );
 }
 
-/// §13.2 row 2 — the beta-critical miscompile. Today this compiles clean, exits
-/// 0, and prints `[ 1 ]`: the blanket's `fun into(self): T { self }` is emitted
-/// (`function $a(self) { return __clone(self); }`) and the user's `into` never
-/// is. With no expected type to steer R2's selection, two argument-distinct
-/// homes remain (`Into<Foo>` and `Into<str>`) and the call must be reported,
-/// not silently resolved.
+/// §13.2 row 2 — the beta-critical miscompile, closed by R1. Before it, this
+/// compiled clean, exited 0, and printed `[ 1 ]`: the blanket's
+/// `fun into(self): T { self }` was emitted (`function $a(self) { return
+/// __clone(self); }`) and the user's `into` never was. With the trait's
+/// arguments in the resolution key the two are separate homes (`Into<Foo>` and
+/// `Into<str>`), and with no expected type to steer R2's selection the call is
+/// reported rather than silently resolved.
 #[test]
-#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
 fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
     assert_fails_with(
         r#"
@@ -57659,15 +57659,15 @@ fn b73_two_impls_of_one_trait_at_different_arguments_are_both_reachable() {
     assert_compiles_and_runs(&source.replace("ANNOTATION", "Bar"), "2\n");
 }
 
-/// §13.2 row 20 — TYPE CONFUSION, and the reason deleting std's blanket would
-/// not close beta trigger (c): there is no blanket in this program. The bound
-/// names `Conv<Baz>`, the analyzer types the call as `Baz`, and the
-/// transformer's `resolve_member_on_trait_impl` (transformer.rs 6123–6136)
-/// re-dispatches on `trait_ids.contains(&Conv)` alone and emits the `Conv<Bar>`
-/// body. Today: compiles clean, exits 0, and prints `2` — an `i32` read out of
-/// a field declared `str`.
+/// §13.2 row 20 — TYPE CONFUSION, closed by R1, and the reason deleting std's
+/// blanket would not have closed beta trigger (c): there is no blanket in this
+/// program. The bound names `Conv<Baz>`, the analyzer types the call as `Baz`,
+/// and the transformer's `resolve_member_on_trait_impl` re-dispatched on
+/// `trait_ids.contains(&Conv)` alone and emitted the `Conv<Bar>` body: it
+/// compiled clean, exited 0, and printed `2` — an `i32` read out of a field
+/// declared `str`. R1 carries the bound's own arguments into
+/// `bound_dispatch_traits`, so the re-dispatch keys on `Conv<Baz>`.
 #[test]
-#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
 fn b73_a_bound_selects_the_impl_matching_its_trait_arguments() {
     assert_compiles_and_runs(
         r#"
@@ -57692,6 +57692,102 @@ fn b73_a_bound_selects_the_impl_matching_its_trait_arguments() {
         }
         "#,
         "baz\n",
+    );
+}
+
+/// R1's diagnostic (C2). The two homes are named as THIS receiver instantiates
+/// them — `Into<Foo>` for std's blanket, `Into<str>` for the user's impl —
+/// because `Into` twice tells the reader nothing, and the message says what
+/// does select rather than offering an `Into::into` spelling that cannot
+/// (B83's "an impossible steer is worse than no steer"). Anchored at the method
+/// name (A1/A4), the same span the two-trait ambiguity uses.
+#[test]
+fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them() {
+    // The third `into` in the source is the CALL — the first two are the import
+    // path and the impl's declaration.
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "into",
+        2,
+        "'into' is ambiguous on 'Foo': both 'Into<Foo>' and 'Into<str>' provide it, and \
+         'Into::into' names only the trait, not which of its instantiations; annotate the \
+         type this call must produce to pick one",
+    );
+}
+
+/// R1's key from the other side, and the edge case row 20 does not cover: BOTH
+/// bounds are written, so each must reach its own impl. Row 20 alone would pass
+/// a filter that always picked the LAST impl; this one fails such a filter,
+/// because `Conv<Bar>` is the first-declared and `Conv<Baz>` the second.
+#[test]
+fn b73_two_bounds_at_different_arguments_each_reach_their_own_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+        struct Baz { tag: str }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Foo with Conv<Baz> { fun conv(self): Baz { Baz { tag = "baz" } } }
+
+        fun to_bar<T: Conv<Bar>>(x: T): Bar { x.conv() }
+
+        fun to_baz<T: Conv<Baz>>(x: T): Baz { x.conv() }
+
+        fun main() {
+            print(to_bar(Foo { n = 1 }).n);
+            print(to_baz(Foo { n = 1 }).tag);
+        }
+        "#,
+        "2\nbaz\n",
+    );
+}
+
+/// The permissive half of R1's emission filter, which is what keeps every
+/// existing golden byte-identical: an impl whose trait argument is its OWN
+/// binder (`impl Box<type T> with Tagged<T>`) is still abstract at the
+/// comparison, so the filter proves nothing about it and must keep it. The
+/// trait carries a DEFAULT here on purpose — that is what makes the pin
+/// non-vacuous: a filter demanding equality drops the impl, and the
+/// re-dispatch then silently emits the default (`1`) in place of the override.
+#[test]
+fn b73_an_impl_whose_trait_argument_is_its_own_binder_survives_the_filter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Tagged<T> { fun tagged(self): i32 { 1 } }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tagged<T> { fun tagged(self): i32 { 2 } }
+
+        fun grab<S: Tagged<i32>>(x: S): i32 { x.tagged() }
+
+        fun main() { print(grab(Box { v = 7 })); }
+        "#,
+        "2\n",
     );
 }
 
