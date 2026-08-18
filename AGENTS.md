@@ -7,24 +7,33 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, four crates, plus the language's own tree:
+Rust workspace, five crates, plus the language's own tree:
 
-- `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexer.rs` /
-  `token.rs` → `parser.rs` (chumsky; cheap-first with rich fallback) → AST in `node.rs`
-  → macro expansion in `macros.rs` (with `interpreter.rs`, the native evaluator that
-  must stay behaviorally equivalent to emitted JS) → `lift.rs` (the expression-lifting
-  rewrite — hooked at every parse entry: `lib.rs`, the CLI, the module loader, macro
-  expansion; the formatter deliberately receives raw, un-lifted trees) → `analyzer.rs`
-  (type solving + the inferred effects: `async_infer.rs`, `platform_color.rs`,
-  `context.rs`, `call_graph.rs`, `const_eval.rs`) → `transformer.rs` (JS emission).
-  Shared type machinery in `type_.rs`; diagnostics in `error.rs` — there is a house
-  diagnostics standard, so match the shape of existing messages; `formatter.rs` is
-  `vilan fmt`.
+- `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
+  `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
+  chumsky 2026-07-22, `proposal/frontend.md`) → AST in `node.rs` → macro
+  expansion in `macros.rs` (with `interpreter.rs`, the native evaluator that
+  must stay behaviorally equivalent to emitted JS) → `elements.rs`
+  (element-syntax desugar) and `lift.rs` (the expression-lifting rewrite;
+  both hooked at every parse entry — `lib.rs`, the CLI, the module loader,
+  macro expansion; the formatter deliberately receives raw, un-lifted trees)
+  → `analyzer.rs` (type solving + the inferred effects: `async_infer.rs`,
+  `platform_color.rs`, `context.rs`, `call_graph.rs`, `const_eval.rs`) →
+  `transformer.rs` (JS emission). Shared type machinery in `type_.rs`;
+  diagnostics in `error.rs` — there is a house diagnostics standard, so match
+  the shape of existing messages; `formatter.rs` is `vilan fmt`. Also in this
+  crate: `bindgen/` (`vilan bindgen`, generating `external` bindings from
+  `.d.ts` files, `proposal/bindgen.md`) and `leak_tally.rs` (per-site leak
+  instrumentation the test suite reads — not a compile stage).
 - `crates/vilan-cli` — the `vilan` binary and the end-to-end suites
   (`tests/corpus.rs`, `cancellation.rs`, `rpc_http.rs`, `streaming.rs`,
   `transport_robustness.rs`, …).
 - `crates/vilan-lsp` — the language server.
 - `crates/vilan-embedded-std` — embeds the std source into the binary.
+- `crates/vilan-wasm` — the compiler as a WebAssembly module; the web
+  playground's engine (`proposal/web-playground.md`). The compile logic is
+  plain Rust tested natively on the host; the `wasm_bindgen` layer at the
+  bottom is a thin type-conversion shim, not where behavior lives.
 - `vilan/std/src/*.vl` — the standard library, written in vilan. std loads as its own
   package with root-scoped module resolution.
 - `vilan/test/` — the corpus: `.vl` programs with **byte-identical** `.mjs` goldens.
@@ -34,17 +43,21 @@ Rust workspace, four crates, plus the language's own tree:
 
 ## Definition of done (the gates)
 
-1. **Full suite green by exit code.** `cargo test` from the workspace root must exit
-   0. Never judge success by grepping output: a piped grep masks the status, and a
-   test target that fails to *compile* prints no `test result:` line at all. Capture
-   the exit code explicitly (run the suite, then `echo "suite exit: $?"`) and report
-   that line verbatim.
+1. **Full suite green by exit code.** `cargo nextest run --workspace` is the gate
+   (`cargo test --workspace --no-fail-fast` is a correct, slower equivalent —
+   `CLAUDE.md` §"Running the suite"); it must exit 0. Never judge success by
+   grepping output: a piped grep masks the status, and a test target that fails
+   to *compile* prints no `test result:` line at all. Capture the exit code
+   explicitly — redirect and check the runner's own code, never pipe through
+   `grep`/`head`/`tail` (`cargo nextest run --workspace > suite.log 2>&1; echo
+   $?`) — and report that line verbatim.
 2. **Corpus byte-identical** (`cargo test -p vilan-cli --test corpus`) unless the work
    order says otherwise. If an *existing* golden changes: stop and report — never
    regenerate. New goldens require rebuilding the debug binary first (`cargo build`);
    a stale binary silently writes wrong goldens.
-3. **Docs compile** (`cargo test --test docs`), and any change to std, a framework, or
-   the language updates the affected `vilan/docs/` page in the same change-set.
+3. **Docs compile** (`cargo test -p vilan-core --test docs`), and any change to std, a
+   framework, or the language updates the affected `vilan/docs/` page in the same
+   change-set.
 4. **Per-case pins.** Every behavior added or changed gets its own tests in
    `crates/vilan-core/tests/inference.rs` (`assert_compiles`,
    `assert_compiles_and_runs`, `assert_fails`) — one pin per case, including the edge
@@ -82,7 +95,7 @@ Rust workspace, four crates, plus the language's own tree:
   `let` binding.
 - **Numerics:** the JS-backed integers are `i53`/`u53` (a ±2^53 contract); unknown
   numeric suffixes are hard errors.
-- **A new keyword lands in THREE places** — the lexer (`lexer.rs`), the TextMate
+- **A new keyword lands in THREE places** — the lexer (`lexing.rs`), the TextMate
   grammar (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the book's
   highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource` keyword shipped
   with only the first and was caught twice, days apart. Check with a lexer-vs-list
@@ -91,9 +104,15 @@ Rust workspace, four crates, plus the language's own tree:
   `analyze_source` (tests + LSP) *and* the CLI's duplicated sequence in
   `crates/vilan-cli/src/main.rs` — and verified with a CLI probe, not only an
   inference pin. A pass added to one place ships a check the other silently skips.
-- **Mutating git is not yours.** Do not commit, push, tag, or regenerate published
-  artifacts. (House rule for everyone: mutating git always names the repo via
-  `git -C`, and never shares a compound command with `cd`.)
+- **Git is scoped to your worktree.** A lane works in its own git worktree under
+  `.claude/worktrees/<lane>`, on its own branch off `next`, and commits there —
+  `git add <paths>` naming each file explicitly (never `-A`), with a
+  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>` trailer. It never
+  pushes, tags, touches `main`/`next`, sets git identity, or regenerates a
+  published artifact (goldens, `THIRD-PARTY-NOTICES.txt`, the homebrew seed)
+  unless the work order says so. Run git from the worktree root, or via
+  `git -C <worktree>`; never share a compound command with `cd` that could
+  land in another checkout.
 
 ## How to work
 
@@ -103,13 +122,15 @@ Rust workspace, four crates, plus the language's own tree:
 - **Root causes.** Fix the general path; a special case that handles one input is a
   smell. If the general fix implies a refactor, say so in your report rather than
   building around the debt.
-- **Read the named proposal sections first.** The current arc lives in
-  `vilan/proposal/backlog-2026-08-18.md` (the single planning surface — its
-  Now/Next/Later block names what's active); each item cites the proposal
-  paper that governs it. A work-order brief that names sections overrides
-  this default. (Arcs move; the tracker is the pointer that stays true.)
-- **Report honestly and compactly:** what changed (files + why), what you ran with
-  exact exit codes, what you did *not* verify, open questions. A true "unverified" is
+- **Read the named proposal sections first.** `vilan/proposal/backlog-2026-08-18.md`
+  is the single planning surface (its Now/Next/Later block names what's
+  active); the papers under `vilan/proposal/` are the specs, and each backlog
+  item cites the one that governs it. A work-order brief that names sections
+  overrides this default. (Arcs move; the tracker is the pointer that stays
+  true.)
+- **Report honestly and compactly — your final message is the report,** not a
+  separate file: what changed (files + why), what you ran with exact exit
+  codes, what you did *not* verify, open questions. A true "unverified" is
   worth more than a false "works".
 
 ## Stop conditions (report instead of proceeding)
