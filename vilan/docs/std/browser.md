@@ -59,7 +59,7 @@ job. Prefer the `View` layer; drop to `dom` for what it doesn't cover.
 struct View { element: Element }
 fun view(tag: str): View
 fun mount(id: str, view: View)                                   // attach only
-fun mount_root(id: str, body: (|| View) context owner_scope): Owner
+fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
 trait Slot { fun place(self, parent: View) }          // View | str | Signal<str> | List<View>
 trait AttrValue { fun apply(self, parent: View, name: str) }   // str | Signal<str>
@@ -68,6 +68,14 @@ trait AttrValue { fun apply(self, parent: View, name: str) }   // str | Signal<s
 `mount_root` = fresh owner + turn boundary + attach; it returns the root
 owner (most apps let it live forever). `mount` is the attach half alone.
 Use it only when you already hold a boundary.
+
+Both **panic naming the id** when nothing on the page carries it —
+`mount: no element with id 'app'`. The lookup they share hands back the
+host's `null` typed as an `Element`, so the alternative was a
+`Cannot read properties of null` from somewhere inside the attach, with
+the one thing you got wrong appearing nowhere in the message. On the
+server side that mismatch is caught before it can happen: the id is what
+[`check_shell`](process.md#stddocument) holds the document against.
 
 `view` knows the SVG vocabulary: an SVG tag name (`svg`, `path`, `rect`,
 `clipPath`, …; exact case) creates its element in the SVG namespace, so
@@ -96,9 +104,10 @@ too.
 | `bind_attr` | `(name: str, source: Signal<str>): View` | reactive attribute |
 | `bind_value` | `(signal: Signal<str>): View` | two-way input bind |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
-| `bind_each` | `(source: Signal<List<T>>, key: \|T\| K, render: (\|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq` | keyed rows; each row is a disposal boundary |
-| `when` | `(condition: Signal<bool>, body: (\|\| View) context owner_scope): View` | state-DROPPING conditional |
-| `swap` | `(source: Signal<T>, render: (\|T\| View) context owner_scope): View`; `T: PartialEq` | dispose + rebuild per changed value |
+| `bind_each` | `(source: Signal<List<T>>, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq` | keyed rows; each row is a disposal boundary |
+| `when` | `(condition: Signal<bool>, body: (sync \|\| View) context owner_scope): View` | state-DROPPING conditional |
+| `swap` | `(source: Signal<T>, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq` | dispose + rebuild per changed value |
+| `swap_split` | same signature as `swap`; `T: PartialEq` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
 | `show` | `(condition: Signal<bool>): View` | state-PRESERVING visibility toggle |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
@@ -113,6 +122,10 @@ fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7
 
 trait Routable { fun to_path(self): str }
 fun link<R: Routable>(label: str, route: R): View   // a real <a>; intercepts plain left-clicks
+
+// Route chunks (a `split = true` leg) — both are ordinary signals
+fun pending(): Signal<bool>                 // a route chunk is in flight
+fun chunk_error(): Signal<Option<str>>      // the last fetch failed, with the reason
 ```
 
 `current_path()` is a singleton signal: every caller gets the same one, and
@@ -120,6 +133,13 @@ the `popstate` listener is wired on first use. `link` renders a real anchor
 (middle-click, ctrl-click, and copy-link keep native behavior) and intercepts
 only a plain left click, calling `prevent_default` + `navigate`. Route
 modelling (`parse`/`href` over enums): the [routing guide](../guide/routing.md).
+
+`pending()` and `chunk_error()` describe a `split = true` leg's route-chunk
+fetches, and are ordinary signals — bind them with `show`, `bind_text` or a
+class. A failed fetch means the navigation simply did not happen and nothing
+is remembered as in flight, so clicking the link again retries; there is no
+retry API because a link is one. Worked example:
+[the dev loop](../guide/dev-loop.md#shipping-routes-separately).
 
 ## std::storage
 

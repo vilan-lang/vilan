@@ -183,6 +183,7 @@ side: [Services & RPC](../guide/services.md) and the
 fun exists(path: str): bool                     // sync
 fun read_file_to_str(path: str): str            // async, UTF-8
 fun read_file_to_str_sync(path: str): str       // sync, UTF-8 — blocks the event loop
+fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
 fun write_file(path: str, contents: str)        // async
 fun read_dir(path: str): List<str>              // async, entry NAMES, flat (v1)
@@ -202,6 +203,17 @@ missing path is `None`, not a thrown exception. Prefer the async read; the
 sync one exists for a read that must complete inside a callback that cannot
 suspend — `serve_build`'s dev-mode revalidation is the case it was added
 for.
+
+Three reads, three different questions. `read_bytes` is the true binary
+read: the host hands back a `Buffer`, which binds straight to `Bytes` with
+no decode in between, and it is what serves an image, a font or a favicon.
+`read_file_to_str` is that read decoded as UTF-8 — the one almost every
+caller wants. `read_file_encoded(path, encoding)` is the same decode with
+the encoding named (`"utf8"`, `"latin1"`, …), for a file that is text but
+not UTF-8; `read_file_to_str` is a one-line call to it. (It was called
+`read_file_bytes` until v0.34.0, which is the name that made the rename
+worth doing: it promised bytes and returned a decoded string. No alias was
+kept.)
 
 ## std::build
 

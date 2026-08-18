@@ -66,6 +66,7 @@
 # Appendix
 
 - [The CLI](appendix/cli.md)
+- [The editor](appendix/editor.md)
 - [Error index](appendix/errors.md)
 - [Gotchas](appendix/gotchas.md)
 - [Glossary](appendix/glossary.md)

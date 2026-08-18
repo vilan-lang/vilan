@@ -106,20 +106,52 @@ impl SocketDuplex {
 ## Server plumbing (`std::rpc_server`, process layer)
 
 ```vilan,fragment
+impl Service {
+	fun new(protocol: RpcProtocol): Service   // mounted at "/"
+	fun at(own self, prefix: str): Service    // mount elsewhere, e.g. "/admin/"
+	fun on_connect(own self, handler: |i32, DuplexEnd| void): Service
+	fun on_disconnect(own self, handler: |i32| void): Service
+}
+impl ServerBuilder {
+	fun with_service(own self, service: Service): ServerBuilder   // repeatable
+}
+
+// The boot functions, each a few lines over `Server::builder()`:
+fun serve_rpc(port: i32, protocol: RpcProtocol, on_ready: |Server| void)
 fun serve_service(
 	port: i32,
 	protocol: RpcProtocol,
 	fallback: |Request| Response,   // plain-http requests: assets + app shell
 	on_ready: |Server| void,        // `server.port()` is the port actually bound
 )
+fun serve_connected(port, protocol, on_connection, fallback, on_ready)
 ```
 
-`serve_service` = WebSocket upgrade + per-connection session registration
-(mirror attach/detach) + rpc dispatch, with `fallback` answering ordinary
-http. Each handler runs in a turn (`AtEnd`). For custom per-connection
-state (connection-scoped auth, an app-written attach), use
-`serve_connected(port, protocol, on_connection, fallback, on_ready)`, the
-same server with the session hook exposed.
+A service is WebSocket upgrade + per-connection session registration
+(mirror attach/detach) + rpc dispatch. Each handler runs in a turn
+(`AtEnd`). `ServerBuilder::with_service` is the layer underneath: it
+installs those routes and the handshake on a `Server::builder()` chain,
+answering **before** `on_request`, so a page and a service sit on one
+builder instead of one replacing the other. It is repeatable — a second
+service goes on its own mount (`Service::new(protocol).at("/admin/")`),
+picked by longest mount and independent of call order.
+
+`serve_service` and `serve_connected` are short bodies over
+`with_service` and keep their exact signatures: the first installs the
+runtime session registry as the connection lifecycle, the second exposes
+the per-connection hook instead (connection-scoped auth, an app-written
+attach). Both take an http `fallback` for every path the service does not
+claim — `build_handler(build, …)` is what usually fills it. `serve_rpc` is
+the odd one out and deliberately so: no upgrade, no session registry, no
+fallback, just the protocol answering every request — the server side of
+`std::rpc`'s `HttpTransport`. Reach for `with_service` when the app owns
+its builder; reach for a `serve_*` when it does not. Details:
+[Services & RPC](../guide/services.md#growing-past-one-service) and the
+[process reference](process.md#stdrpc_server).
+
+One matching rule is worth knowing: a service claims a path **segment** —
+its route exactly, or its route followed by `?` — so `/rpc` does not
+shadow an application's `/rpcs` or `/rpc-docs`.
 
 ## Envelope & codec layer
 

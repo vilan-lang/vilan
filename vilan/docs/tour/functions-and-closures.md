@@ -207,7 +207,7 @@ a closure type is declared (a parameter, a `let` annotation, a struct
 field, a return type):
 
 ```vilan,fragment
-fun draft<T>(initial: T, commit: async |T| Option<str>): Draft<T>   // a parameter
+fun draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T>   // a parameter
 
 struct Poller {
 	tick: async || i32,               // a struct field
@@ -240,11 +240,15 @@ A parameter's closure type can declare that the closure reads an ambient
 
 ```vilan,fragment
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
-fun turn<T>(policy: FlushPolicy, body: (sync || T) context turn_scope): T
+fun batch<T>(body: (sync || T) context turn_scope): T
+fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T
 ```
 
-The `sync` marker in those signatures says the closure must stay
+The `sync` marker on the first two says the closure must stay
 synchronous; [Async](async.md#higher-order-functions-adapt) explains it.
+`turn` carries none, and the difference is the feature: its body is
+asyncness-polymorphic, so an awaiting one holds every notification until
+it completes, where a `batch` body must stay synchronous.
 When you pass a closure literal into such a parameter, the ambient value
 (the current `Owner`, the current `Turn`) is threaded to it at the call
 site, through any depth of ordinary function calls in between. This is

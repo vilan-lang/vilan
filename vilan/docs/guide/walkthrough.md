@@ -197,6 +197,16 @@ claim. That's what makes deep links like `/note/7` load
 browser entries first, so the client's artifacts are always there by the
 time the server entry builds.
 
+This file is quoted from the example as it stands, and the example is one
+rung below the top of the ladder: the shell is still an unchecked
+`fs::read_file_to_str`. Two upgrades are available to an app that owns its
+builder, both covered in [Persistence](persistence.md#putting-it-together).
+`require_shell("src/app.html", build)` holds this same file against the
+build and refuses to boot when they disagree — a deleted stylesheet
+`<link>` is otherwise a page that renders unstyled and entirely
+correct-looking. `Document::of(build)` skips the shell altogether and
+writes the page from the build.
+
 ## The client entry: four signals and a mount
 
 [`src/client.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/client.vl) is

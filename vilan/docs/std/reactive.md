@@ -57,7 +57,7 @@ impl Signal<Signal<type U>> {
   outside any turn it notifies immediately.
 - `update` mutates the **stored** value through a writable view and notifies
   once, unconditionally, after the closure returns — the collection door
-  (`proposal/signal-update.md`). It shares `set`'s notify half, so batching,
+  ([design notes](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/signal-update.md)). It shares `set`'s notify half, so batching,
   drain affinity, and dedup behave identically. A read from *inside* the
   closure sees the in-progress value; a re-entrant `update` of the same
   signal is unsupported.
@@ -233,7 +233,7 @@ recovery; the user re-issues the action.
 
 A cell over a **mirrored** signal is out of scope for now — the mirror writes
 behind the cell's back, so its confirmed value goes stale. Wrap a local
-signal (`proposal/optimistic-lifecycle.md` §8).
+signal ([design notes](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/optimistic-lifecycle.md) §8).
 
 ## Draft — local-first cells
 

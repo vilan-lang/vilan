@@ -64,10 +64,26 @@
 				{ className: "subst", begin: "\\{", end: "\\}" },
 			],
 		};
+		// The built-in attribute markers, mirroring `is_known_attribute_marker`
+		// in the parser (and the TextMate grammar's own list). `macro` is NOT
+		// one — `[macro]` is a `vilan.toml` section, never a source attribute.
 		const ATTRIBUTE = {
 			className: "meta",
-			begin: "^\\s*\\[(?:derive|service|extern|must_use|rpc|trait_only|doc|expose|macro)\\b",
+			begin: "^\\s*\\[(?:derive|service|extern|must_use|rpc|trait_only|doc|expose|platform)\\b",
 			end: "\\]",
+		};
+		// `context` and `sync` are CONTEXTUAL: the lexer hands both back as
+		// identifiers, so they only read as keywords in the one position each
+		// occupies — `context` after a closure type's `)`, `sync` right after
+		// the `(` that opens one. Anchored, so a variable named `context` or a
+		// type named `Sync` is untouched.
+		const CONTEXT_CLAUSE = {
+			className: "keyword",
+			begin: "(?<=\\)\\s{0,8})context\\b",
+		};
+		const SYNC_MARKER = {
+			className: "keyword",
+			begin: "(?<=\\()sync\\b",
 		};
 		const TYPE = {
 			className: "type",
@@ -100,6 +116,8 @@
 				INTERPOLATED,
 				PLAIN_STRING,
 				NUMBER,
+				CONTEXT_CLAUSE,
+				SYNC_MARKER,
 				ELEMENT_TAG,
 				ELEMENT_EVENT,
 				FUNCTION,

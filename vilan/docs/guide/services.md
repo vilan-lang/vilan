@@ -197,12 +197,15 @@ check is still what decides who may act.
 
 - On the client they return `Result<T, RpcError>` and are implicitly
   awaited, like any async call.
-- `RpcError` tells you what went wrong: `Transport` (couldn't reach the
-  server), `Decode`, or `Remote` (the handler failed). Errors are
+- `RpcError` tells you what went wrong, in five variants:
+  `Transport(str)` (couldn't reach the server), `Decode(str)`,
+  `Remote(str)` (the handler failed), `Contract(str)` (the connect-time
+  check below refused a drifted server), and `Unauthorized`. Errors are
   values. Look at them and decide.
 - At connect time, both sides compare a hash of the service's shape. If
-  a stale client meets a redeployed server, the connect fails cleanly
-  instead of calls corrupting halfway. This is the **contract check**.
+  a stale client meets a redeployed server, the connect fails cleanly —
+  as `Contract(reason)` — instead of calls corrupting halfway. This is
+  the **contract check**.
 - On the server, each handler runs inside a turn, so all the signal
   writes one rpc makes are broadcast as a single consistent update.
 - Handler bodies can await: call another service, `sleep_for`, wait on

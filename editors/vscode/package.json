@@ -96,7 +96,7 @@
         "vilan.inlayHints.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Show inlay type hints (inferred let-binding and parameter types). Applies live."
+          "description": "Show inlay type hints (the inferred type of an unannotated binding). Applies live."
         },
         "vilan.semanticTokens.enabled": {
           "type": "boolean",

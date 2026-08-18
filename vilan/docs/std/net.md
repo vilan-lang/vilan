@@ -61,7 +61,7 @@ fun pong_frame(payload: Bytes): Bytes
 fun close_frame(): Bytes
 
 // Parse a byte stream into events
-enum WsEvent { Text(str), Binary(Bytes), Ping(Bytes), Close, … }
+enum WsEvent { Text(str), Binary(Bytes), Ping(Bytes), Closed }
 impl WsParser {
 	fun new(): WsParser
 	fun feed(self, chunk: Bytes): List<WsEvent>   // stateful; call per TCP chunk
