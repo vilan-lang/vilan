@@ -83,11 +83,13 @@ process.md §5.4, verbatim conditions, with today's status:
   §5.2, so this is plumbing + a table, not a new subsystem), the
   one-minor lifetime, CLI alias handling for renames. Design note first;
   exercised end-to-end once before it is load-bearing.
-- **Script the train** (L2): the cut sequence (releases.md §7.2) still
-  has hand steps — the ancestor-verify sweep, the CHANGELOG
-  retitle/ordering, the fold. Scripting them makes trigger (b)'s "clean
-  consecutive trains" a property of the process rather than of the
-  operator's concentration.
+- **Script the train** (L2 — SHIPPED 2026-08-18): the cut sequence
+  (releases.md §7.2) had three hand steps — the ancestor-verify sweep, the
+  CHANGELOG retitle/ordering, the fold. `scripts/cut-release.sh` and
+  `scripts/fold-release.sh` execute them now (the prose stays the
+  authority), which makes trigger (b)'s "clean consecutive trains" a
+  property of the process rather than of the operator's concentration.
+  First train to use them: 2026-08-22.
 - **Ledger recheck** (L5) and **docs currency** (D15): the diagnostics
   promise (§3.1) and the switch commit both assume these are current.
 - **Leak soak** (M2): not a trigger condition, but "beta" and "the LSP
