@@ -64,8 +64,13 @@ process.md §5.4, verbatim conditions, with today's status:
   specific impl by declaration order produces a *wrong resolution from
   a clean compile* — that is miscompile-shaped, and §4 Q2 asked whether
   it blocks the trigger. **Ruled yes, 2026-08-18**: B73 graduated from
-  "blocked: specificity design" to beta-critical; the specificity design
-  (method-resolution.md §9) is scheduled as a proposal-first lane.
+  "blocked: specificity design" to beta-critical — and **SHIPPED the
+  same day** (R1/R2/R3, method-resolution.md §13.8, cycle 21). With
+  B73 closed the open §B ledger is B3/B11 (feature tails), B125/B126
+  (false rejections), B127 (deferred simplification), B128 (a deferred
+  residue no program in the tree exercises) — **condition (c) reads
+  green as of 2026-08-18**, subject to the cut sweep's re-read each
+  train.
 - **(d) There is somebody to break the promise to** — D5, the traction
   plan, still `OPEN (blocked: needs a dedicated session with the
   owner)`. process.md §7.1 already named this the policy's urgent
