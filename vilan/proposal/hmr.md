@@ -554,7 +554,7 @@ fix, not the harness, is what the test is anchored to.
 
 ## Appendix: implementation record — the client registry reaps its own dead (2026-08-18)
 
-**Backlog M3**, found by the 2026-08-13 perf/leak survey. The registry
+**Backlog M3**, found by the 2026-08-18 perf/leak survey. The registry
 (`DevChannel.clients`) took every `/events` connection unconditionally and shed
 one only as a side effect of a later broadcast failing to write to it. Between
 rounds nothing on the server ever *looked* at a client, so every disconnect —

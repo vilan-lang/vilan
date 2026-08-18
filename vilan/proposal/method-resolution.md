@@ -2,14 +2,14 @@
 
 > **§13 RULED 2026-08-18 as recommended** ("Go with B73 as recommended"): Q1 (a) — R1 → R2 → R3 in that order, (b) not taken, (c) stays available as a later additive layer; Q2 yes — the expected type steers among argument-distinct homes; Q3 the std blanket STAYS — deleting it remains an independent simplification (tracked as B127, deferred), not part of B73; Q4 call site; Q5 `9` — a more specific impl takes the trait's default; Q6 in scope — bounds are part of applicability (row 15's pin is one of the thirteen). The fix is scheduled (Order 3, cycle 21); the 13 `b73_*` pins un-ignore as each rule lands. BETA-CRITICAL per beta.md Q2.
 > 
-> Prior status: Status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
+> Prior status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
 > inherent-over-trait, duplicate-inherent as a hard error, trait-vs-trait
 > ambiguity error with `Trait::method(receiver)` disambiguation.
 >
-> **§13 (B73, the blanket-vs-specific design) AWAITS RULING — drafted
-> 2026-08-18.** §9(6) declined the specificity question and §15.8 of
+> **§13 (B73, the blanket-vs-specific design) — drafted 2026-08-18, RULED
+> the same day (above).** §9(6) declined the specificity question and §15.8 of
 > `trait-objects.md` left the overlap it names to B73; beta.md Q2 (ruled
-> 2026-08-13) made it beta-critical. §13 is proposal-only: no fix ships
+> 2026-08-18) made it beta-critical. §13 is proposal-only: no fix ships
 > under it, and its thirteen pins are `#[ignore]`d until the owner rules.
 > Everything §3 ratified stands unchanged — §13 layers inside the trait
 > tier and does not move a tier boundary.
@@ -813,7 +813,7 @@ the inherent one (B74), it is OUTRANKED by it (B57).
 > question, which §3(b) declines"); `trait-objects.md` §15.8(3) left the
 > overlap to it ("Blanket-vs-specific OVERLAP stays legal, and stays
 > B73's"); `spec/types.md` §5.4's implementation note says a specificity
-> rule "is owed". beta.md Q2, ruled 2026-08-13, made it beta-critical:
+> rule "is owed". beta.md Q2, ruled 2026-08-18, made it beta-critical:
 > a wrong resolution from a clean compile is miscompile-shaped, so
 > process.md §5.4's trigger (c) waits on it.
 

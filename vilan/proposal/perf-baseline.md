@@ -394,7 +394,7 @@ style-heavy file M4 is about. A fix for M4 is an editor-latency fix.
 
 ## 5. Filing candidates
 
-Three, all filed against `backlog-2026-08-13.md` §M:
+Three, all filed against `backlog-2026-08-18.md` §M:
 
 - **M4** — `const_eval::evaluate` is two thirds of a style-heavy compile
   (§4.3). The largest single finding.
