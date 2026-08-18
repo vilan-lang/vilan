@@ -1,6 +1,8 @@
 # Method resolution — a deliberate precedence rule (B57)
 
-> Status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
+> **§13 RULED 2026-08-18 as recommended** ("Go with B73 as recommended"): Q1 (a) — R1 → R2 → R3 in that order, (b) not taken, (c) stays available as a later additive layer; Q2 yes — the expected type steers among argument-distinct homes; Q3 the std blanket STAYS — deleting it remains an independent simplification (tracked as B127, deferred), not part of B73; Q4 call site; Q5 `9` — a more specific impl takes the trait's default; Q6 in scope — bounds are part of applicability (row 15's pin is one of the thirteen). The fix is scheduled (Order 3, cycle 21); the 13 `b73_*` pins un-ignore as each rule lands. BETA-CRITICAL per beta.md Q2.
+> 
+> Prior status: Status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
 > inherent-over-trait, duplicate-inherent as a hard error, trait-vs-trait
 > ambiguity error with `Trait::method(receiver)` disambiguation.
 >
@@ -1134,7 +1136,7 @@ unremovable — deleting it is still available as an independent
 simplification (§13.6 Q3) — and it does not touch §3's tiers, §3.1's
 `Trait::member` disambiguator, B98's pair key, or B84's same-block rule.
 
-### 13.6 Questions only the owner can answer
+### 13.6 Questions only the owner can answer — all RULED 2026-08-18, each as recommended
 
 **Q1 — the shape.** (a) with R1–R3, (b), or (c)? *Recommendation: (a) with
 R1–R3.* (b) costs a shipped pin and a user-unreachable fix site; (c) is
