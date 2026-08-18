@@ -1,0 +1,152 @@
+E63 draft — kolt's server onto the full-stack ladder (rung 1 + rung 0+)
+=======================================================================
+
+A PROPOSAL, not an applied change. The kolt checkout was read and nothing in
+it was modified; no git command was run there. Apply with:
+
+    cd /home/reed/code/kolt && git apply /path/to/kolt-server.patch
+
+Everything above the first `diff --git` line is ignored by `git apply`.
+
+SCOPE — deliberately narrow
+
+`src/server.vl` is 289 lines and only the boot/shell/asset part moves. The
+SQLite schema, the pbkdf2 externs, the module-level `Database`, all seven
+closures behind `KoltStore`, `session_user`, `load_tasks`, `load_workspaces`
+and `open_session` are untouched, byte for byte. The rpc protocol moves to
+`.with_service(…)`; everything else stays exactly where it is.
+
+WHAT MOVES
+
+  - The three boot reads (`dist/client.js`, `dist/client.css`,
+    `src/app.html`) become `require_build("client")` +
+    `require_shell("src/app.html", build)`. No `dist/` path and no MIME type
+    is spelled in this file any more, so renaming the client leg cannot
+    leave it compiling and the page blank.
+  - The three-arm `match request.path()` becomes `.serve_build(build)`: one
+    route per artifact the build wrote, content type from the extension. If
+    the client leg ever gains `split = true`, its chunk routes appear with
+    no edit here at all.
+  - `serve_service(59401, protocol, fallback, on_ready)` becomes a
+    `Server::builder()` chain with `.with_service(Service::new(protocol))`.
+    Same routes, same wire — `serve_service` has been a four-line body over
+    this layer since v0.34.0 — but the page and the service now compose, so
+    adding a second service later is `.with_service(…).at("/admin/")` rather
+    than a rewrite of the boot function.
+  - `src/app.html` is KEPT and unchanged. `require_shell` reads it once at
+    boot and holds it against the build: a `<link>` for a stylesheet the
+    build no longer emits, a `<script>` naming a renamed bundle, a mount
+    `<div id>` that drifted from `mount_root` — each stops the server,
+    naming the file and the fix, instead of serving a page that renders
+    wrong and looks right. Rung 2 (`Document::of(build).title("Kolt (vilan
+    pilot)")`, and the file goes away) is available and your shell is plain
+    enough for it, but it would add `lang="en"` and a viewport meta the
+    current shell does not carry — a served-bytes change under e2e/run.sh,
+    which is why this draft does not take it.
+
+Counted by fullstack-dx.md §1.2's rule (non-blank, non-comment lines):
+248 → 249 lines, and 10 ceremony lines become 7. The count rises by one
+because the builder chain puts each call on its own line where
+`serve_service(…)` was a single call — the ceremony is what fell.
+
+WHAT TO VERIFY WHEN YOU APPLY IT
+
+1. That the server still boots. `require_shell` REFUSES TO BOOT on a shell
+   that does not match the build — that is the point of it, and it is the
+   one behavioral change in this patch. Your current `src/app.html` passes
+   (verified below), but it will start failing the day the client stops
+   emitting styles, which is the intended alarm.
+2. `e2e/run.sh` — it drives the real client against a throwaway server, and
+   it is the check this draft could not run here (see below). The served
+   page is byte-identical to `src/app.html`, so it should be unaffected.
+3. `dist/probe.js` still passes: the rpc routes are the same routes.
+4. Port 59401 and the `kolt pilot: …` start line are unchanged.
+
+VERIFIED HERE
+
+A scratch copy of `src/` + `vilan.toml` (nothing written back):
+
+  - `vilan check .` exits 0 both before and after the patch, with the shipped
+    v0.34.0 CLI and with the current `next` build;
+  - `vilan build .` exits 0 and emits client/server/probe;
+  - `node dist/server.mjs` boots against a scratch `kolt.db`, and over HTTP:
+    `/` → 200 text/html and BYTE-IDENTICAL to `src/app.html`; `/client.js` →
+    200 text/javascript; `/client.css` → 200 text/css; `/w/1` (the deep-link
+    fallback) → 200 text/html; `POST /rpc` → 200 application/json.
+
+NOT VERIFIED: `e2e/run.sh` (it wants the real checkout), the browser client,
+and anything touching your real `kolt.db`.
+
+diff --git a/src/server.vl b/src/server.vl
+index 9c73a30..45bed65 100644
+--- a/src/server.vl
++++ b/src/server.vl
+@@ -1,19 +1,22 @@
+ // The Kolt pilot server: accounts + sessions + workspaces in SQLite
+-// (std::db over node:sqlite), the KoltStore service mounted on
+-// serve_service, and the workspace list mirrored live to every session.
++// (std::db over node:sqlite), the KoltStore service installed on a
++// `Server::builder()` chain with `with_service`, and the workspace list
++// mirrored live to every session. The same chain serves the client leg's
++// build (`serve_build`) and the checked shell for every other path.
+ //
+ // Passwords: PBKDF2-SHA-512 via node:crypto's SYNCHRONOUS API (the rpc
+ // dispatch path is sync; std::crypto's WebCrypto surface is async) — bound
+ // here as user-level externs, a candidate for std promotion once proven.
+ 
++import std::build::require_build;
+ import std::db::{ Database, Row, Statement };
+-import std::fs;
+-import std::http::Response;
++import std::document::require_shell;
++import std::http::{ Response, Server };
+ import std::json::json_codec;
+ import std::option::Option::{ None, Some, self };
+ import std::print;
+ import std::reactive::Signal;
+-import std::rpc_server::serve_service;
++import std::rpc_server::Service;
+ import std::shared::Shared;
+ import std::time::{ Instant, now };
+ import pkg::shared::{ AuthOutcome, KoltStore, Task, Workspace };
+@@ -60,9 +63,15 @@ fun open_database(): Database {
+ // --- the server ---
+ 
+ async fun main() {
+-	let client_js = fs::read_file_to_str("dist/client.js");
+-	let client_css = fs::read_file_to_str("dist/client.css");
+-	let app_html = fs::read_file_to_str("src/app.html");
++	// What `vilan build .` wrote for the client leg. `serve_build` installs
++	// one route per artifact with the content type its extension implies, so
++	// no file name and no MIME type is spelled here.
++	let build = require_build("client");
++	// Read once at boot and CHECKED against that build: a `<link>` for a
++	// stylesheet the build no longer emits, a `<script>` naming a bundle that
++	// was renamed, a mount `<div id>` that drifted from src/client.vl — each
++	// stops the server here rather than serving a page that cannot work.
++	let page = require_shell("src/app.html", build).html();
+ 
+ 	let workspaces: Signal<List<Workspace>> = Signal::new(load_workspaces(db));
+ 	let tasks: Signal<List<Task>> = Signal::new(load_tasks(db));
+@@ -239,13 +248,14 @@ async fun main() {
+ 		delete_task_hook = Shared::new(delete_task),
+ 	};
+ 
+-	serve_service(59401, store.dispatcher().into_protocol(json_codec()), |request| {
+-		match request.path() {
+-			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+-			"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
+-			_ => Response::builder().set_header("Content-Type", "text/html").body(app_html).build(),
+-		}
+-	}, |server| print(i"kolt pilot: {server.url()}"));
++	Server::builder()
++		.port(59401)
++		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
++		.serve_build(build)
++		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
++		.on_start(|server| print(i"kolt pilot: {server.url()}"))
++		.build()
++		.start();
+ }
+ 
+ // The session table is the auth boundary: a token row names its user.

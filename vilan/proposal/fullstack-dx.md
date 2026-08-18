@@ -2207,3 +2207,129 @@ assertion moved, including `!page.contains("<!--ssr-->")`, which now pins that n
 marker convention returns, and `<div id="app"><main class="app">`, which is the
 splice landing exactly where the marker used to. Only its module comment was
 updated, to stop describing a marker that no longer exists.
+
+## 16. The consumer sweep, completed (2026-08-18)
+
+§13.3 moved `examples/fullstack`, `examples/ssr` and the init template and left
+`examples/todo` and `examples/walkthrough` behind, with a reason and a
+condition: *"the remaining gap closes when S1 lets them move to the builder"*.
+S1 shipped the same day and the follow-up did not happen (backlog E63). Both
+files now carry the shipped idiom — `Server::builder()`, the service installed
+with `.with_service(Service::new(…))`, the artifacts with `.serve_build(build)`,
+and the shell read through `require_shell` — which is §6.3's rung 1 + rung 0+,
+the same rung the scaffold and `examples/ssr` ship at.
+
+### 16.1 The numbers, and the one that goes the wrong way
+
+Counted by §1.2's rule (non-blank, non-comment lines), before → after:
+
+| File | lines | ceremony |
+|---|---|---|
+| `examples/todo/src/server.vl` | 13 → **20** | 5 → **7** |
+| `examples/walkthrough/src/server.vl` | 13 → **20** | 5 → **7** |
+| *(draft)* `vilan-playground/todo/src/server.vl` | 19 → **20** | 10 → **6** |
+| *(draft)* kolt's `src/server.vl` | 248 → **249** | 10 → **7** |
+
+**The two in-repo counts rise, and that is a fact about §1.2, not about the
+code.** The formatter puts each builder-chain call on its own line where a
+plain call stays on one, so the four things `serve_service(port, protocol,
+build_handler(build, |request| …), on_ready)` said in a single 258-character
+line now occupy seven readable ones. Longest line, todo: 258 → 103;
+walkthrough: 246 → 103. The after-ceremony of **7** is not new ceremony either
+— it is exactly the 7 `templates/fullstack/src/server.vl` and
+`examples/ssr/src/server.vl` already carry, i.e. the true cost of the rung-1 +
+rung-0+ shape, itemized. §13.3's "10 → 5" for these two files was flattered by
+the mega-line, which hid the build serving and the shell answer inside a line
+classified whole.
+
+**The rule should be counted per call, not per line**, or should say that a
+line takes the classification of its longest constituent. As written, §1.2
+rewards a formatter that packs and penalizes one that unpacks, which is the
+opposite of what the paper is arguing for. Recorded as feedback on the
+instrument; no number already published is restated.
+
+### 16.2 What the ladder could not express
+
+**Rung 2 is closed to these examples, and by two shipped gates rather than by
+taste.** §6.3 already ruled the scaffold stays at rung 1 and noted "the blessed
+examples keep their `app.html`"; §15.4 kept `examples/ssr`'s for
+`tests/init.rs:335`'s blessed-layout gate, which asserts `src/client.vl`,
+`src/server.vl` and `src/app.html` on disk across the scaffold and all three
+examples. The second gate is new and is the sharper one:
+`tests/examples.rs::every_example_builds` refuses any example whose build emits
+a stylesheet that **no `.html` file in the staged tree links**. A rung-2 example
+fails that by construction — its page is written by `Document::of` at boot and
+never touches disk, so the check finds a `client.css` and no page at all. Both
+would have to change, which is a stop condition, so neither did.
+
+That is worth stating as design feedback rather than as an obstacle worked
+around: **the repository currently cannot demonstrate rung 2 in an example.**
+`docs/guide/ssr.md` and `docs/std/process.md` teach it and
+`tests/document.rs`'s third pin proves it end to end over a real build, so the
+rung is covered — but if an example is ever meant to show it,
+`unlinked_stylesheets` needs a second source of truth for "linked": the served
+page, or the `Document` the server builds. Filed here, not fixed.
+
+**Nothing else forced a hand-kept line, and no std change was wanted.** The two
+shells passed `check_shell` unmodified — the first time either had been held
+against its build — and the served page is byte-identical to `src/app.html` in
+both examples, which is what makes "behavior identical" a measurement rather
+than a claim.
+
+### 16.3 `build_handler` has no consumer left
+
+§13.1 called it "the slice's one unplanned name", a direct consequence of S1
+not being in that slice, and said that when S1 landed and these two examples
+moved, it "has nothing left to do; it is not load-bearing for the design and
+should be reviewed for removal then". That day is today: the only remaining
+references in the tree are teaching ones — `docs/guide/routing.md`,
+`persistence.md`, `services.md`, and its signature in `docs/std/process.md`.
+
+Not removed here. It is shipped std surface, the `serve_service` shape it
+exists for is still a supported spelling (§4.6), and deleting a public name is
+its own decision with its own changelog entry. The review §13.1 asked for is
+owed, and this is the note that opens it.
+
+### 16.4 The drafts
+
+Two consumers outside this repository are on the pre-ladder idiom. Neither was
+touched: each is a unified diff under `proposal/e63-drafts/`, with a header
+saying what moves and what to verify, for the owner to apply or not.
+
+- **`proposal/e63-drafts/todo-app.patch`** — `vilan-playground/todo`, the app
+  §2.1 measured as the charter's own evidence, at **rung 2**: its shell is
+  exactly what `Document::of(build).title("Todo")` writes, so `src/app.html`
+  is deleted and 32 lines across two files become 20 in one. The four
+  differences between the generated document and the hand-written file are
+  cosmetic (`<!DOCTYPE>` case, `charset=UTF-8`, `initial-scale=1.0`, and a
+  stray indent on `<html>`) and are listed in the header. Verified on a
+  scratch copy: builds, boots, serves the document, `/client.js` and
+  `/client.css` answer with their content types.
+- **`proposal/e63-drafts/kolt-server.patch`** — kolt's 289-line
+  `src/server.vl` at **rung 1 + rung 0+**, deliberately narrow: the schema,
+  the pbkdf2 externs, the module-level `Database`, all seven store closures
+  and the four helpers are untouched byte for byte. Rung 2 is available there
+  too and is declined in the draft for a stated reason — `Document::of` would
+  add `lang="en"` and a viewport meta the current shell does not carry, a
+  served-bytes change under `e2e/run.sh`. Verified on a scratch copy of
+  `src/` + `vilan.toml`: `vilan check` exits 0 before and after under the
+  shipped v0.34.0 CLI, `vilan build` emits all three legs, and the booted
+  server answers `/` byte-identically to `src/app.html`, plus `/client.js`,
+  `/client.css`, the `/w/1` deep link and `POST /rpc`.
+
+### 16.5 The gates
+
+`cargo test -p vilan-cli --test examples --test init --test workspace
+--test print_chunks` passes with **not one assertion moved** — including
+`every_example_builds`'s artifact and unlinked-stylesheet checks over both
+rewritten examples, `the_walkthrough_example_builds`, and the blessed-layout
+gate that pins both `src/app.html` files. `docs/guide/walkthrough.md`'s server
+fence carries the new idiom in the same commit, with prose for `require_shell`
+and `with_service`; `examples/todo/README.md`'s one `serve_service` sentence
+followed it. Corpus: zero movement — no std, no compiler, no emitted
+JavaScript was touched by this slice.
+
+Behavior was measured, not assumed. Each example was built and booted, and
+`/`, `/client.js`, `/client.css`, a deep link and `POST /rpc` were fetched:
+same status, same content types, and a served page diffed byte-identical
+against `src/app.html`.

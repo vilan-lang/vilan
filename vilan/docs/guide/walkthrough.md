@@ -170,29 +170,45 @@ is now the boring file, which is the point:
 ```vilan,fragment
 async fun main() {
 	let build = require_build("client");
-	let app_html = fs::read_file_to_str("src/app.html");
+	let page = require_shell("src/app.html", build).html();
 
 	let store = boot();
 
-	serve_service(
-		4600,
-		store.dispatcher().into_protocol(json_codec()),
-		build_handler(build, |request| Response::builder().set_header("Content-Type", "text/html").body(app_html).build()),
-		|server| print(i"notes server listening on {server.url()}"),
-	);
+	Server::builder()
+		.port(4600)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_start(|server| print(i"notes server listening on {server.url()}"))
+		.build()
+		.start();
 }
 ```
 
 `require_build("client")` asks what the client leg's build emitted — the
 bundle, and the stylesheet its `const` styles produced — and
-`build_handler` turns that into one route per artifact, with the content
+`serve_build` turns that into one route per artifact, with the content
 type each extension implies. No `dist/` path is spelled here, so renaming
-the leg cannot leave this file compiling and the page blank. (When the app
-owns its builder, `Server::builder().serve_build(build)` is the same thing
-installed on the chain.)
+the leg cannot leave this file compiling and the page blank.
 
-The fallback then serves the shell for every path the build does not
-claim. That's what makes deep links like `/note/7` load
+`require_shell` reads `src/app.html` once at boot and holds it against
+that same build: a `<link>` for a stylesheet the build no longer emits, a
+`<script>` naming a bundle that was renamed, a mount `<div id>` that
+drifted from `mount_root("app", …)` — each stops the server here, naming
+the file and the fix, instead of serving a page that renders wrong and
+looks right.
+
+The service goes on the same chain as everything else. `Service::new(…)`
+plus [`with_service`](services.md#growing-past-one-service) installs the
+rpc routes and the WebSocket upgrade in front of `on_request`, so the page
+and the service share one port without one of them replacing the other's
+boot function — delete the `.with_service(…)` line and this file still
+compiles and still serves the page. (`serve_service(port, protocol,
+fallback, on_ready)` is the same layer pre-wired, and still the shorter
+spelling for a server that is only a service.)
+
+`on_request` then serves the shell for every path neither the service nor
+the build claims. That's what makes deep links like `/note/7` load
 ([Routing](routing.md#deep-links-and-the-server)). `vilan build` compiles
 browser entries first, so the client's artifacts are always there by the
 time the server entry builds.

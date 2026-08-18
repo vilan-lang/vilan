@@ -39,6 +39,14 @@ The numbers are in `vilan/proposal/perf-baseline.md`, and the first one is a sur
 One more thing the baseline settles: what a program costs to compile is mostly what its imports drag in, not how long it is. A 22-line entry over a 119-line app and a 289-line entry over a 943-line app compile 8 % apart.
 
 ---
+
+**The last two examples still on the old full-stack idiom moved onto the ladder.** `examples/todo` and `examples/walkthrough` were the two files v0.34.0's sweep left behind: it moved `examples/fullstack`, `examples/ssr` and the `vilan init` scaffold onto `Server::builder()`, and said these two would follow once `with_service` existed to give them a builder to install on. It shipped in the same release and they never followed. Both now read like the scaffold does — `.with_service(Service::new(protocol))` for the rpc service, `.serve_build(build)` for the browser leg's artifacts, `require_shell("src/app.html", build)` for the page — on one `Server::builder()` chain instead of a `serve_service` call that owned the port and handed the app a fallback.
+
+The payoff is not fewer lines; it's that the two examples the book teaches from now teach the idiom the book teaches. Both files got *longer* by the counting rule — a builder chain is one call per line where `serve_service(59386, protocol, build_handler(build, |request| …), on_ready)` was one 258-character line — and shorter to read: the longest line in each dropped to 103 characters, and the four separate things that line was doing are now four named calls. Behavior is identical and measured that way: each example was booted and `/`, `/client.js`, `/client.css`, a deep link and `POST /rpc` were fetched, with the served page byte-identical to `src/app.html`.
+
+One thing did change, and it is the reason the move was worth making: the shell is now **checked**. `require_shell` reads `src/app.html` once at boot and holds it against what the build actually emitted, so a `<link>` for a stylesheet the client stopped compiling, a `<script>` naming a renamed bundle, or a mount `<div id>` that drifted from `mount_root` stops the server with the file and the fix named, instead of serving a page that renders wrong and looks right. Both shells passed unmodified. `docs/guide/walkthrough.md` teaches the new server file, and `build_handler` — which existed only because those two examples had no builder — now has no consumer outside the guide.
+
+---
 ## v0.34.0 — 2026-08-12
 
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
