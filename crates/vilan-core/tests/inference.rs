@@ -56811,3 +56811,473 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
     );
     assert!(messages[0].contains("expected `;` to end this statement"));
 }
+
+// --- B73: blanket-vs-specific (method-resolution.md §13) ---------------------
+//
+// DESIGN DRAFTED 2026-08-18, AWAITING RULING. Every pin below is `#[ignore]`d
+// and asserts §13.5's RECOMMENDED semantics — R1 (the trait's effective
+// arguments join the resolution key), R2 (the expected type selects among
+// argument-distinct homes), R3 (specificity ranks a genuine overlap). Nothing
+// here ships until the owner rules on §13.6; a different ruling rewrites these
+// rather than un-ignores them.
+//
+// The mechanism, for a reader who lands here first: `rank_member_candidates`
+// (analyzer.rs 11338–11369) keys the trait tier on a bare trait `Id`
+// (`member_home_trait`, 11376–11389) where B98's duplicate check and bound
+// satisfaction both key on `(trait, arguments)`, and when two impls survive
+// into one home it takes `candidates.first()` in `declaration_order`
+// (11321/11363) — std first, the entry file last. The transformer's
+// `resolve_member_on_trait_impl` (transformer.rs 6113–6137) repeats the
+// argument blindness and, via `nominal_matches` (1347–1353), disagrees with the
+// analyzer about whether a blanket matches at all.
+//
+// Every program below was run through the worktree's `target/debug/vilan`; each
+// comment records the measured answer today, which differs from what the pin
+// asserts — so none of them is vacuous.
+
+/// §13.2 row 1. Today: `Expected Bar, but got Foo instead.` — std's
+/// `impl type T with Into<T>` (`std/src/into.vl` 5–9) is a candidate for every
+/// receiver and, being tier 0, sorts first, so the user's own impl is dead code.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_user_into_impl_beats_the_std_blanket() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
+        }
+
+        fun main() {
+            let b: Bar = Foo { n = 1 }.into();
+            print(b.n);
+        }
+        "#,
+        "101\n",
+    );
+}
+
+/// §13.2 row 2 — the beta-critical miscompile. Today this compiles clean, exits
+/// 0, and prints `[ 1 ]`: the blanket's `fun into(self): T { self }` is emitted
+/// (`function $a(self) { return __clone(self); }`) and the user's `into` never
+/// is. With no expected type to steer R2's selection, two argument-distinct
+/// homes remain (`Into<Foo>` and `Into<str>`) and the call must be reported,
+/// not silently resolved.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "ambiguous",
+    );
+}
+
+/// §13.2 row 3. The same defect in return position, which reconciles value-first
+/// (§10(3)) rather than through an annotation. Today: `Expected Bar, but got
+/// Foo instead.` on the `x.into()` tail.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
+        }
+
+        fun to_bar(x: Foo): Bar { x.into() }
+
+        fun main() { print(to_bar(Foo { n = 1 }).n); }
+        "#,
+        "101\n",
+    );
+}
+
+/// §13.2 row 5. §3.1's disambiguator is no escape hatch here — both candidates
+/// have the same trait head, so naming it settles nothing. Today the unannotated
+/// form prints `1` and the annotated form below reports `Expected Bar, but got
+/// Foo instead.`; under R2 the annotation is what picks the home.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
+        }
+
+        fun main() {
+            let b: Bar = Into::into(Foo { n = 1 });
+            print(b.n);
+        }
+        "#,
+        "101\n",
+    );
+}
+
+/// §13.2 rows 6–7, the ordering-sensitive form: a user-written blanket, so std's
+/// tier-0 position is not what decides it. Today the blanket-first program
+/// prints `1` and the specific-first program prints `101` — the same two impls,
+/// two answers, decided by which block was typed above the other.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_user_blanket_loses_to_a_specific_impl_whatever_the_order() {
+    let blanket_first = r#"
+        import std::print;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl type T with Conv<T> { fun conv(self): T { self } }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = self.n + 100 } } }
+
+        fun main() {
+            let b: Bar = Foo { n = 1 }.conv();
+            print(b.n);
+        }
+        "#;
+    let specific_first = r#"
+        import std::print;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = self.n + 100 } } }
+
+        impl type T with Conv<T> { fun conv(self): T { self } }
+
+        fun main() {
+            let b: Bar = Foo { n = 1 }.conv();
+            print(b.n);
+        }
+        "#;
+    assert_compiles_and_runs(blanket_first, "101\n");
+    assert_compiles_and_runs(specific_first, "101\n");
+}
+
+/// §13.2 rows 9–10. The plainest specificity case and the one §13.4(a)'s
+/// subsumption rule exists for: `Box<i32>` is matched by `Box<type T>` but not
+/// conversely, so the concrete impl is strictly more specific. Today: `1` when
+/// the generic block is first, `2` when the concrete one is.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_concrete_impl_subject_outranks_a_generic_one() {
+    let generic_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        impl Box<i32> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    let concrete_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<i32> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    assert_compiles_and_runs(generic_first, "2\n");
+    assert_compiles_and_runs(concrete_first, "2\n");
+}
+
+/// §13.2 rows 11–12. Equal subject shapes ranked by their binders' BOUNDS —
+/// the comparison B98 already runs for its sameness key (`trait-objects.md`
+/// §15.8, "Bounds, not identity"). Today: `1` unbounded-first, `2`
+/// bounded-first.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_bounded_impl_subject_outranks_an_unbounded_one() {
+    let unbounded_first = r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    let bounded_first = r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    assert_compiles_and_runs(unbounded_first, "2\n");
+    assert_compiles_and_runs(bounded_first, "2\n");
+}
+
+/// §13.2 rows 13–14, the NESTED form: specificity has to see through a type
+/// argument's own arguments, not just the outermost head. Today: `1`
+/// generic-first, `2` concrete-first.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_nested_concrete_impl_subject_outranks_a_generic_one() {
+    let generic_first = r#"
+        import std::print;
+        import std::list::List;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        impl Box<List<i32>> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = [1, 2, 3] }.tag()); }
+        "#;
+    let concrete_first = r#"
+        import std::print;
+        import std::list::List;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<List<i32>> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = [1, 2, 3] }.tag()); }
+        "#;
+    assert_compiles_and_runs(generic_first, "2\n");
+    assert_compiles_and_runs(concrete_first, "2\n");
+}
+
+/// §13.2 row 15 — the same defect as a FALSE REJECTION, and §13.6 Q6's subject.
+/// Candidate selection ignores whether an impl's bounds hold, so the
+/// `Display`-bounded block wins the race on `Box<Opaque>` and then fails its own
+/// bound check while the unbounded block that does apply sits below it. Today:
+/// `'Opaque' does not implement trait 'Display', required by a generic bound of
+/// this call`.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_an_applicable_unbounded_impl_survives_an_inapplicable_bounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+        struct Opaque { z: i32 }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = Opaque { z = 1 } }.tag()); }
+        "#,
+        "1\n",
+    );
+}
+
+/// §13.2 row 17, and §13.6 Q5 — the least obvious row in the table. A blanket
+/// that DECLARES the name beats a more specific impl that takes the trait's
+/// default, because only a declaration contributes a candidate. Today: `1` in
+/// BOTH orders, so the default `9` is unreachable for `Foo` no matter how the
+/// file is arranged. §13.5's R3 says the more specific impl wins and brings its
+/// inherited default with it; the owner may prefer `1`.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13 (Q5)"]
+fn b73_a_specific_impl_taking_the_trait_default_outranks_a_blanket_declaration() {
+    let blanket_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32 { 9 } }
+
+        struct Foo { n: i32 }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        impl Foo with Tag { }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#;
+    let specific_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32 { 9 } }
+
+        struct Foo { n: i32 }
+
+        impl Foo with Tag { }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#;
+    assert_compiles_and_runs(blanket_first, "9\n");
+    assert_compiles_and_runs(specific_first, "9\n");
+}
+
+/// §13.2 rows 18–19, and R1's whole point: `spec/types.md` 271–275 says
+/// `Conv<Bar>` and `Conv<Baz>` on one subject are two implementations, and B98's
+/// pair key agrees — but resolution collapses them to one home (`member_home_trait`
+/// returns a bare trait `Id`), so only the first-declared is ever reachable.
+/// Today: the `Baz` annotation reports `Expected Baz, but got Bar instead.`
+/// while the `Bar` one compiles and prints `2`.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_two_impls_of_one_trait_at_different_arguments_are_both_reachable() {
+    let source = r#"
+        import std::print;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+        struct Baz { n: i32 }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Foo with Conv<Baz> { fun conv(self): Baz { Baz { n = 3 } } }
+
+        fun main() {
+            let b: ANNOTATION = Foo { n = 1 }.conv();
+            print(b.n);
+        }
+        "#;
+    assert_compiles_and_runs(&source.replace("ANNOTATION", "Baz"), "3\n");
+    assert_compiles_and_runs(&source.replace("ANNOTATION", "Bar"), "2\n");
+}
+
+/// §13.2 row 20 — TYPE CONFUSION, and the reason deleting std's blanket would
+/// not close beta trigger (c): there is no blanket in this program. The bound
+/// names `Conv<Baz>`, the analyzer types the call as `Baz`, and the
+/// transformer's `resolve_member_on_trait_impl` (transformer.rs 6123–6136)
+/// re-dispatches on `trait_ids.contains(&Conv)` alone and emits the `Conv<Bar>`
+/// body. Today: compiles clean, exits 0, and prints `2` — an `i32` read out of
+/// a field declared `str`.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_bound_selects_the_impl_matching_its_trait_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+        struct Baz { tag: str }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Foo with Conv<Baz> { fun conv(self): Baz { Baz { tag = "baz" } } }
+
+        fun to_baz<T: Conv<Baz>>(x: T): Baz { x.conv() }
+
+        fun main() {
+            let z: Baz = to_baz(Foo { n = 1 });
+            print(z.tag);
+        }
+        "#,
+        "baz\n",
+    );
+}
+
+/// §13.2 rows 21–22 — one program, two answers, which is the sharpest argument
+/// for ranking rather than refusing. The direct call resolves through the
+/// analyzer's `compare_type` filter (analyzer.rs 11299–11304), where the blanket
+/// matches everything and sorts first, and prints `1`. The bounded call
+/// re-dispatches through the transformer's `nominal_matches` (transformer.rs
+/// 1347–1353), where a generic subject matches nothing, and prints `7`. Half the
+/// compiler already prefers the specific impl.
+#[test]
+#[ignore = "B73: awaiting the owner's ruling on method-resolution.md §13"]
+fn b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins() {
+    let direct = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Foo { n: i32 }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        impl Foo with Tag { fun tag(self): i32 { 7 } }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#;
+    let through_a_bound = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Foo { n: i32 }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        impl Foo with Tag { fun tag(self): i32 { 7 } }
+
+        fun show<T: Tag>(x: T): i32 { x.tag() }
+
+        fun main() { print(show(Foo { n = 1 })); }
+        "#;
+    assert_compiles_and_runs(direct, "7\n");
+    assert_compiles_and_runs(through_a_bound, "7\n");
+}
