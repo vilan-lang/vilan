@@ -6,6 +6,16 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**A long `vilan run --watch` session no longer banks a dead socket for every browser that disconnects.** The dev channel kept each connected browser's socket in a list and only ever *noticed* one was gone when a rebuild tried to write to it. Between rebuilds nothing looked. A tab refresh, a second tab closed, `EventSource`'s own reconnect after a blip — each left its socket in the list, and the leak was one file descriptor per disconnect, unbounded across a session. Measured on the real thing: 100 connect/disconnect cycles against a watching CLI, with no rebuild in between, left 100 leaked descriptors on the process; the next rebuild reclaimed none of them, because a write to a peer that closed cleanly *succeeds* — it is the write after that one which fails, so a dead client survived its first push and only left on its second.
+
+Each SSE connection now keeps its own thread, blocked reading its socket, and takes itself out of the registry the moment the browser goes away. A browser never writes on that socket, so a read there is pure liveness: it blocks for as long as the tab lives and returns end-of-stream when it does not. The same 100 cycles now leave the descriptor count exactly where it started, with no rebuild involved. The broadcast-time prune stays as a backstop and additionally shuts a failed socket down, so the connection's reader wakes instead of lingering.
+
+The cost is one parked thread per *live* browser, where before there were none — measured at ten open tabs: ten threads, ten descriptors, both back to baseline the moment they close. The accept loop already spent a thread per connection; this extends that thread's life to match its connection's rather than spawning anything new, which is the same "one thread per connection, fine for a localhost dev tool" posture the channel has always had. No wire change: the SSE framing, the `connected` hello, and every event the browser shim handles are byte-for-byte what they were.
+
+---
+
 ## v0.34.0 — 2026-08-12
 
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
