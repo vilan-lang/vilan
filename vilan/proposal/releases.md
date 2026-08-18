@@ -278,6 +278,28 @@ same moment. **(b) and (c) are about the *record*; (a) is about the *tag*.**
   changelog and a public claim about code sitting on an unmerged branch.
   **The check is per entry and it is not optional.**
 
+**How (a) finds an entry's commit** (2026-08-18, backlog L2). Entries carry no
+sha and should not be asked to: nobody knows a commit's sha while writing the
+entry that will be *in* it. So `scripts/cut-release.sh` derives one — the
+oldest commit in the repository that introduced the entry's bold head into
+`CHANGELOG.md`, `git log --all -S'**<head>**' -- CHANGELOG.md` read from the
+bottom — and then asks §7.1's own question of it,
+`git merge-base --is-ancestor <commit> <the commit that will become the tag>`.
+Be exact about what that proves. It proves the entry is **committed** and that
+the commit carrying it is **on the line being tagged**: an entry someone typed
+and never committed, and an entry that reached `## Unreleased` only on a branch
+that never merged, are both red, and the second is precisely the drift this
+sweep was created for. It does **not** prove the entry's *code* landed, because
+a changelog entry is often written in its own `changelog:` or `records:` commit
+rather than beside the code it describes — on the v0.34.0 section, twenty of
+forty-three. So the checklist prints the introducing commit's subject beside
+every entry, and says so out loud when that commit touched nothing but
+`CHANGELOG.md` and `proposal/`: *"note: `<sha>` touched records only — confirm
+its code landed."* Reading twenty subjects is the part that stays human;
+finding them is not. Where the derivation is wrong — an entry reworded after it
+landed, an entry moved between sections — a `<!-- commit: <sha> -->` line above
+the entry names its commit outright and wins.
+
 A release that ships with a wrong changelog section or a stale backlog is a
 smaller problem than one that has already tagged, so the sweep runs before
 step 2's changelog check, not after.
@@ -288,6 +310,14 @@ Steps 1–5 above are what CI does once a `v*` tag exists. This is what the
 person cutting does, start to finish. It is written down here because until
 2026-08-07 the second half of it lived nowhere but a comment in the pages
 repo's `docs.yml` header.
+
+**Steps 1–3 are executed by `scripts/cut-release.sh <X.Y.Z>` and steps 6–10 by
+`scripts/fold-release.sh v<X.Y.Z>`** (2026-08-18, backlog L2). **This prose
+stays the authority; the scripts execute it.** A disagreement between the two
+is a bug in the script, and a change to the sequence is made here first. Both
+carry a `--dry-run` that performs only the read-only checks and prints every
+command it would otherwise run, and neither ever tags or pushes a tag: steps 4
+and 5 are the human's, and `cut-release.sh` finishes by printing them verbatim.
 
 1. **Sweep (a).** Ancestor-verify every `## Unreleased` entry against the
    commit that will become the tag (§7.1). (b) and (c) are already done, per
@@ -303,6 +333,31 @@ repo's `docs.yml` header.
    order is the one a reader wants: breaking changes first, then
    miscompiles, then features, then diagnostics and tooling — separated by
    the `---` rules the changelog already uses between related entries.
+
+   **The family is written down, not inferred.** Each entry under
+   `## Unreleased` carries a `<!-- family: ... -->` line above its bold head —
+   invisible in rendered markdown and in the release notes `release.yml`
+   extracts — and it is one of four words:
+
+   - `breaking` — a program that compiles today may stop, or change behaviour.
+   - `miscompile` — the compiler was wrong about a program it *accepted*:
+     wrong code emitted, or a program admitted that it must refuse.
+   - `feature` — a new capability.
+   - `tooling` — everything else the toolchain does better: diagnostics (a
+     wrong *refusal* now lifted included), the editor, the CLI, packaging,
+     this pipeline. `diagnostics` is an accepted spelling of it.
+
+   The judgement is the entry author's and it is not derivable from the
+   entry's shape: v0.34.0's own 43 entries put four editor and tooling
+   improvements *inside* the features block, because that is where a reader
+   wanted them. So `cut-release.sh` **refuses** an entry with no family, or
+   one it does not know, and prints it — it never guesses. Within a family
+   the authored order is preserved exactly, so a thematic grouping a human
+   wrote survives the sort; only the four blocks are the script's doing.
+   Rules are normalized on the way out: exactly one `---` between
+   neighbours, none leading or trailing. (At the v0.40.0 switch `### Breaking`
+   becomes a structural heading — beta.md §2 — and this marker is what will
+   generate it.)
 4. **Commit, tag, push.** A `release: v<version>` commit on `next`, tagged
    `v<version>`; push `next` and the tag.
 5. **Watch `release.yml`.** The tag push is the trigger. Ten assets, five
@@ -312,6 +367,16 @@ repo's `docs.yml` header.
    (`Merge v<version> — main catches the release train`) and push. This is
    not cosmetic: the book builds from `vilan@main`, so nothing published
    after this point is current until the fold lands.
+
+   It is a real three-way merge, not a fast-forward wearing `--no-ff`, and a
+   check written on the assumption that `main` is an ancestor of the tag will
+   refuse every fold there has ever been. `main` carries its own line: each
+   previous fold commit, plus whatever was pushed straight to it (at v0.34.0
+   that was seven commits the tag did not have, four of them the `AI_STANCE`
+   pushes). What must hold is that the merge is **clean**, and
+   `git merge-tree --write-tree main v<version>` answers that without touching
+   a worktree — on `a86a7f16` and `v0.34.0` it writes the tree the real fold
+   commit `0967ad52` has.
 7. **Dispatch the book — FIRST.**
    `gh workflow run docs.yml -R vilan-lang/vilan-lang.github.io`, and wait
    for it to go green. It checks out `vilan@main`, rebuilds the book with
@@ -346,6 +411,16 @@ repo's `docs.yml` header.
     sha, which is the reliable check.
 
 Everything from step 5 onward is the part that used to be tribal knowledge.
+
+**Two notes on the fold, from mechanizing it.** The release run's verdict comes
+from `gh run list` — a *completed* run whose conclusion is `success` and whose
+head sha is the tag's — never from a watcher's exit code, because `gh run
+watch` exits 0 for "I finished watching" and a red publish leg looks exactly
+like a green one through it. And every step is written so that "already done"
+is a state it recognizes rather than a failure: a fold interrupted at step 9 is
+resumed by re-running it. That is what makes the sequence usable under the
+thing it exists for — a train that must be boringly repeatable, not a ritual
+performed correctly from memory once a week.
 
 **A consequence worth stating plainly: the public site's freshness is now
 the cut cadence.** The website deploy installs the toolchain from the latest
