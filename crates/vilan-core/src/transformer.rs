@@ -7785,7 +7785,7 @@ pub mod js {
         // `_` for a discarded element.
         ForOf(String, Box<Self>, Vec<Self>),
         LetVariable(Variable<'src>),
-        Local(String), // TODO: Consider extracting identifiers into a separate lookup table for late identifier substitution.
+        Local(String),
         Null,
         Number(String, Option<String>),
         // Object(Vec<(&'src str, Self)>),
