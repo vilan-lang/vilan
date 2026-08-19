@@ -9257,11 +9257,61 @@ mod leak_measurement {
         MACRO_SITES.iter().copied().map(leak_tally::bytes).sum()
     }
 
+    /// The subset of the per-site tally a [`LeakReport`] is built from, read on
+    /// whichever thread ran the analyses.
+    ///
+    /// Its own type, rather than fields read inline where the report is built,
+    /// because the tally is **thread-local** and one of the two drivers below
+    /// gives every analysis its own thread: those counters have to be read
+    /// *inside* that thread, before it exits, and summed here. Read after the
+    /// join they are zero — which is not "nothing leaked", it is no measurement
+    /// at all.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Counts {
+        entry_text: usize,
+        entry_ast: usize,
+        display: usize,
+        /// The two sites analysis-reuse.md §2 fixes: `parse_generated`'s leaked
+        /// source and AST, reached from the stamped expansion paths.
+        stamped_parse: usize,
+        macro_bytes: usize,
+        total: usize,
+    }
+
+    impl Counts {
+        /// This thread's counters, as they stand.
+        fn read() -> Counts {
+            Counts {
+                entry_text: leak_tally::bytes(LeakSite::LspEntryText),
+                entry_ast: leak_tally::bytes(LeakSite::EntryAst),
+                display: leak_tally::bytes(LeakSite::DisplayName),
+                stamped_parse: leak_tally::bytes(LeakSite::MacroParseText)
+                    + leak_tally::bytes(LeakSite::MacroParseAst),
+                macro_bytes: macro_bytes(),
+                total: leak_tally::total(),
+            }
+        }
+
+        fn add(&mut self, other: &Counts) {
+            self.entry_text += other.entry_text;
+            self.entry_ast += other.entry_ast;
+            self.display += other.display;
+            self.stamped_parse += other.stamped_parse;
+            self.macro_bytes += other.macro_bytes;
+            self.total += other.total;
+        }
+
+        /// The named, by-design per-analysis leaks: the entry source the
+        /// `Program` borrows for `'static`, its AST, and a dependency package's
+        /// display name. Everything else at every other site is expected to be
+        /// zero over a warm window.
+        fn named(&self) -> usize {
+            self.entry_text + self.entry_ast + self.display
+        }
+    }
+
     /// The per-analysis leak counted over the `measured` window, plus the RSS
-    /// growth (a noisy report, never asserted on). Built on the analysis thread
-    /// — the counters are thread-local, so a snapshot read after the loop on the
-    /// same thread tallies exactly these analyses and nothing a parallel test
-    /// leaked (the E12 flaky-global-counter lesson).
+    /// growth (a noisy report, never asserted on).
     struct LeakReport {
         rss_grown: usize,
         entry_text: usize,
@@ -9276,6 +9326,30 @@ mod leak_measurement {
     }
 
     impl LeakReport {
+        fn from_counts(counts: Counts, rss_grown: usize, measured: usize) -> LeakReport {
+            LeakReport {
+                rss_grown,
+                entry_text: counts.entry_text,
+                entry_ast: counts.entry_ast,
+                display: counts.display,
+                stamped_parse: counts.stamped_parse,
+                macro_bytes: counts.macro_bytes,
+                total: counts.total,
+                measured,
+            }
+        }
+
+        fn counts(&self) -> Counts {
+            Counts {
+                entry_text: self.entry_text,
+                entry_ast: self.entry_ast,
+                display: self.display,
+                stamped_parse: self.stamped_parse,
+                macro_bytes: self.macro_bytes,
+                total: self.total,
+            }
+        }
+
         fn print(&self, label: &str) {
             println!(
                 "[{label}] RSS +{} KiB ≈ {:.1} KiB/analysis over {} analyses (report only)",
@@ -9297,6 +9371,124 @@ mod leak_measurement {
         }
     }
 
+    /// How the harness runs one analysis — the two allocation lifetimes the
+    /// language server actually has.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Driver {
+        /// Inline on the measuring thread, through `analyze_on_this_thread`.
+        /// Every fixture that predates the soak uses this: one long-lived
+        /// thread, one tally, read once at the end of a window.
+        Inline,
+        /// One fresh big-stack thread per analysis — the exact shape
+        /// [`Document::analyze`] gives the real server, which spawns, runs and
+        /// joins a thread per call so the deeply recursive pipeline gets its own
+        /// stack (the LSP then wraps *that* in `spawn_blocking`).
+        ///
+        /// Nothing the compiler caches is thread-local — `BASE_CACHE`, the macro
+        /// `WORLDS`/`FAILURES`/`EXPANSIONS`/`PARSES` and `parse_clean_cached` are
+        /// process-global `OnceLock<Mutex<…>>`, and the `thread_local!`s in
+        /// `analyzer`, `macros`, `call_graph`, `util` and `transformer` are
+        /// per-analysis scratch or test counters — so both drivers see the same
+        /// warm caches. What differs is that every allocation the analysis makes
+        /// belongs to a thread that then *dies*, which returns its arenas to the
+        /// allocator on a different schedule. That is the lifetime worth
+        /// measuring separately, and it is the one the shipped server has.
+        PerAnalysisThread,
+    }
+
+    impl Driver {
+        fn label(self) -> &'static str {
+            match self {
+                Driver::Inline => "inline",
+                Driver::PerAnalysisThread => "per-thread",
+            }
+        }
+    }
+
+    /// One measured window: `count` analyses of `text_at(i)` over
+    /// `start..start + count`, and the bytes they leaked.
+    ///
+    /// The two drivers accumulate differently and have to: the inline driver
+    /// zeroes this thread's counters and reads them once at the end, while the
+    /// per-analysis-thread driver reads each thread's own counters before that
+    /// thread exits and sums them here. Same total, two mechanisms, because a
+    /// thread-local does not outlive its thread.
+    fn run_window(
+        driver: Driver,
+        text_at: &impl Fn(usize) -> String,
+        entry: &Path,
+        std_dir: &Path,
+        start: usize,
+        count: usize,
+    ) -> Counts {
+        match driver {
+            Driver::Inline => {
+                leak_tally::reset();
+                for i in start..start + count {
+                    let _ = Document::analyze_on_this_thread(&text_at(i), std_dir, entry);
+                }
+                Counts::read()
+            }
+            Driver::PerAnalysisThread => {
+                let mut window = Counts::default();
+                for i in start..start + count {
+                    let text = text_at(i);
+                    let std_dir = std_dir.to_path_buf();
+                    let entry = entry.to_path_buf();
+                    window.add(&on_big_stack(move || {
+                        let _ = Document::analyze_on_this_thread(&text, &std_dir, &entry);
+                        Counts::read()
+                    }));
+                }
+                window
+            }
+        }
+    }
+
+    /// Runs `warmup` unmeasured analyses, then `windows` disjoint measured
+    /// windows of `window` analyses each, reporting every window on its own.
+    ///
+    /// More than one window is the whole point of the soak, and it is what turns
+    /// "the leak is small" into "the leak **plateaus**": two equal-length windows
+    /// over an equal-length document must leak the same bytes at every site.
+    /// Anything that accumulates — a cache keyed on something that changes per
+    /// keystroke, a registry nobody prunes, a per-round retention — makes the
+    /// second window larger than the first, and exact integer counters say so
+    /// with no threshold, no tolerance and no curve fit. RSS cannot do this job
+    /// and is only printed: it is dominated by allocator retention from
+    /// rebuilding and dropping the reachable `Program` every call (`leak_tally`'s
+    /// own module doc).
+    fn measure_windows(
+        text_at: impl Fn(usize) -> String,
+        entry: &Path,
+        driver: Driver,
+        warmup: usize,
+        window: usize,
+        windows: usize,
+    ) -> Vec<LeakReport> {
+        let std_dir = std_root();
+        // Warmup fills every content-addressed cache (the reachable std, the
+        // module parses, the macro worlds and their stamped expansions) so the
+        // measured windows see only the genuinely per-analysis leaks. It runs
+        // inline whichever driver is measuring: the caches it fills are
+        // process-global, so which thread fills them is not a distinction.
+        for i in 0..warmup {
+            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, entry);
+        }
+        let mut reports = Vec::with_capacity(windows);
+        for index in 0..windows {
+            let before_rss = rss_kib();
+            let start = warmup + index * window;
+            let counts = run_window(driver, &text_at, entry, &std_dir, start, window);
+            reports.push(LeakReport::from_counts(
+                counts,
+                rss_kib().saturating_sub(before_rss),
+                window,
+            ));
+        }
+        reports
+    }
+
     /// Runs `warmup` then `measured` analyses of `text_at(i)` **on the current
     /// thread** (via `analyze_on_this_thread`, so the leaks land in this
     /// thread's `leak_tally`), zeroing the counters after warmup. Callers must
@@ -9307,34 +9499,12 @@ mod leak_measurement {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let entry = dir.join("main.vl");
-        let std_dir = std_root();
-        // Warmup fills every content-addressed cache (the reachable std, the
-        // module parses, the macro worlds and their stamped expansions) so the
-        // measured window sees only the genuinely per-analysis leaks.
-        for i in 0..warmup {
-            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, &entry);
-        }
-        leak_tally::reset();
-        let before_rss = rss_kib();
-        for i in warmup..warmup + measured {
-            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, &entry);
-        }
-        let report = LeakReport {
-            rss_grown: rss_kib().saturating_sub(before_rss),
-            entry_text: leak_tally::bytes(LeakSite::LspEntryText),
-            entry_ast: leak_tally::bytes(LeakSite::EntryAst),
-            display: leak_tally::bytes(LeakSite::DisplayName),
-            stamped_parse: leak_tally::bytes(LeakSite::MacroParseText)
-                + leak_tally::bytes(LeakSite::MacroParseAst),
-            macro_bytes: macro_bytes(),
-            total: leak_tally::total(),
-            measured,
-        };
+        let mut reports = measure_windows(text_at, &entry, Driver::Inline, warmup, measured, 1);
         let _ = std::fs::remove_dir_all(&dir);
-        report
+        reports.remove(0)
     }
 
-    fn on_big_stack(work: impl FnOnce() -> LeakReport + Send + 'static) -> LeakReport {
+    fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(work)
@@ -9553,6 +9723,250 @@ mod leak_measurement {
         assert!(
             report.entry_text > 0,
             "the broken-world fixture leaked no entry text — it may not be re-analyzing",
+        );
+    }
+
+    // --- The soak: real corpora, thousands of analyses (proposal/leak-soak.md) --
+
+    /// The sibling-repository corpora, addressed by environment variable and
+    /// **skipped, never failed**, when absent — the same two variables the
+    /// `perf_baseline` module beside this one reads, so one export serves both
+    /// harnesses and both speak about the same two files. They live in checkouts
+    /// a fresh clone of this repository does not have.
+    const SOAK_CORPORA: &[(&str, &str, &str)] = &[
+        ("kolt_views", "VILAN_PERF_KOLT", "src/views.vl"),
+        ("website_page", "VILAN_PERF_WEBSITE", "src/page.vl"),
+    ];
+
+    /// Unmeasured analyses before the first measured window. Larger than the
+    /// synthetic fixtures' 8–20 because a real package drags in real modules:
+    /// every one of them has to be parsed, resolved and (for the derives) macro-
+    /// expanded into its content-addressed cache before "warm" is true.
+    const SOAK_WARMUP: usize = 10;
+
+    /// How many analyses one measured window runs. Two windows per driver, so
+    /// the default soak is 2,000 analyses of each corpus on the inline driver —
+    /// "thousands", where the shipped fixtures do tens and hundreds.
+    ///
+    /// Overridable with `VILAN_LEAK_SOAK_WINDOW` because the honest answer to
+    /// "how long should a soak run" is "longer than you think, but you are the
+    /// one waiting": a 735-line file costs ~320 ms an analysis in release
+    /// (`perf-baseline.md` §2.3), so 2,000 of them is ~11 minutes and the same
+    /// run in debug is most of an hour.
+    fn soak_window() -> usize {
+        std::env::var("VILAN_LEAK_SOAK_WINDOW")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|window| *window > 0)
+            .unwrap_or(1000)
+    }
+
+    /// A real file under a **moving single-character edit**: a fixed-width
+    /// trailing comment carrying one `x` that walks one column per iteration and
+    /// wraps.
+    ///
+    /// Three properties, each load-bearing:
+    ///
+    /// - **Every iteration is a distinct content**, so nothing is served from
+    ///   `parse_clean_cached` and every analysis is a genuine re-analysis rather
+    ///   than a cache hit wearing one.
+    /// - **Every iteration is the same LENGTH**, which is what makes the plateau
+    ///   assertion exact instead of statistical: the entry-text leak over a
+    ///   window of N analyses is exactly N × the file's bytes, and two windows of
+    ///   N must then match to the byte.
+    /// - **A trailing comment is valid in every file**, so one mutation works on
+    ///   any corpus without knowing anything about it — the same argument the
+    ///   `perf_baseline` module makes for its own trailing-comment keystroke.
+    ///
+    /// It deliberately edits nothing the analyzer resolves. The question a soak
+    /// asks is what a keystroke costs the *process* over thousands of rounds,
+    /// not what one particular edit costs the type solver; a `perf_baseline`
+    /// row already answers the second.
+    fn moving_edit(base: &str, i: usize) -> String {
+        const TRACK: usize = 64;
+        let column = i % TRACK;
+        format!(
+            "{base}\n// {}x{}\n",
+            " ".repeat(column),
+            " ".repeat(TRACK - 1 - column),
+        )
+    }
+
+    /// One window as a machine-readable row, the shape `perf_baseline`'s `PERF`
+    /// lines have, so a soak run greps into a file that diffs against the next
+    /// one.
+    fn soak_row(
+        corpus: &str,
+        lines: usize,
+        source_bytes: usize,
+        driver: Driver,
+        window_index: usize,
+        report: &LeakReport,
+    ) {
+        println!(
+            "LEAK {{\"corpus\":\"{corpus}\",\"lines\":{lines},\"source_bytes\":{source_bytes},\
+             \"driver\":\"{}\",\"window\":{window_index},\"analyses\":{},\"entry_text_b\":{},\
+             \"entry_ast_b\":{},\"display_b\":{},\"macro_b\":{},\"total_b\":{},\
+             \"bytes_per_analysis\":{},\"rss_grown_kib\":{}}}",
+            driver.label(),
+            report.measured,
+            report.entry_text,
+            report.entry_ast,
+            report.display,
+            report.macro_bytes,
+            report.total,
+            report.total / report.measured,
+            report.rss_grown,
+        );
+    }
+
+    /// The soak's tier 1 (`leak-soak.md` §2): the shipped plateau assertion, run
+    /// against real application files instead of synthetic ones, for thousands
+    /// of keystrokes instead of tens, through both of the server's allocation
+    /// lifetimes.
+    ///
+    /// `#[ignore]`d because it is minutes to hours of measurement; the cheap
+    /// fixtures above stay in the gate and keep asserting the same invariant on
+    /// the shapes that can be asserted in seconds.
+    ///
+    /// Each corpus is measured in two disjoint equal windows and the windows are
+    /// compared **to the byte**. That comparison is the finding, not a
+    /// threshold: a per-analysis leak that is by design (the entry source the
+    /// `Program` borrows for `'static`, its AST) contributes the same bytes to
+    /// both windows, while anything that *accumulates* contributes more to the
+    /// second. RSS is printed beside it and asserted on nowhere, for the reason
+    /// `leak_tally`'s module doc gives.
+    #[test]
+    #[ignore = "the leak soak: thousands of analyses per corpus, run deliberately (proposal/leak-soak.md §5)"]
+    fn leak_soak_corpus_plateaus() {
+        for &(corpus, variable, relative) in SOAK_CORPORA {
+            let Some(root) = std::env::var_os(variable).map(PathBuf::from) else {
+                println!("LEAK-SKIP {corpus}: {variable} is not set");
+                continue;
+            };
+            let entry = root.join(relative);
+            let Ok(base) = std::fs::read_to_string(&entry) else {
+                println!("LEAK-SKIP {corpus}: {} is not readable", entry.display());
+                continue;
+            };
+            let lines = base.lines().count();
+            let source_bytes = moving_edit(&base, 0).len();
+
+            for driver in [Driver::Inline, Driver::PerAnalysisThread] {
+                let window = match driver {
+                    Driver::Inline => soak_window(),
+                    // A quarter of the window on the per-thread driver, stated
+                    // rather than tuned by feel: what it has to support is the
+                    // same plateau claim, and a plateau is proven by two windows
+                    // being EQUAL, not by their length. Its extra cost over the
+                    // inline driver is one 256 MiB-stack thread spawn and join
+                    // per analysis — small beside a real file's analysis, but
+                    // paid thousands of times.
+                    Driver::PerAnalysisThread => (soak_window() / 4).max(25),
+                };
+                let text = base.clone();
+                let subject = entry.clone();
+                let reports = on_big_stack(move || {
+                    measure_windows(
+                        move |i| moving_edit(&text, i),
+                        &subject,
+                        driver,
+                        SOAK_WARMUP,
+                        window,
+                        2,
+                    )
+                });
+                for (index, report) in reports.iter().enumerate() {
+                    report.print(&format!("{corpus} {} w{}", driver.label(), index + 1));
+                    soak_row(corpus, lines, source_bytes, driver, index + 1, report);
+                }
+
+                for (index, report) in reports.iter().enumerate() {
+                    assert_eq!(
+                        report.total,
+                        report.counts().named(),
+                        "{corpus} ({}) window {}: an unnamed leak site grew over {} analyses \
+                         — total {} B, named sites {} B (macro path {} B)",
+                        driver.label(),
+                        index + 1,
+                        report.measured,
+                        report.total,
+                        report.counts().named(),
+                        report.macro_bytes,
+                    );
+                }
+                assert_eq!(
+                    reports[0].entry_text,
+                    window * source_bytes,
+                    "{corpus} ({}): the entry-text leak is not one copy of the {source_bytes}-byte \
+                     source per analysis over {window} analyses",
+                    driver.label(),
+                );
+                assert_eq!(
+                    reports[1].counts(),
+                    reports[0].counts(),
+                    "{corpus} ({}): the second window of {window} analyses did not leak what the \
+                     first did — something is accumulating across keystrokes, which is the leak \
+                     this soak exists to find",
+                    driver.label(),
+                );
+            }
+        }
+    }
+
+    /// The gate's pin on the soak harness: a handful of analyses through BOTH
+    /// drivers, asserting they agree to the byte and that two equal windows
+    /// plateau. Seconds, not minutes.
+    ///
+    /// Not a small copy of the heavy soak — it is the pin that the heavy soak's
+    /// *instrument* works, and specifically the one the per-analysis-thread
+    /// driver cannot do without. Read that driver's tally after the join instead
+    /// of inside the thread and every count comes back zero, which reads exactly
+    /// like a perfect plateau; the equality against the inline driver is what
+    /// makes shipping that impossible.
+    #[test]
+    fn leak_soak_harness_smoke() {
+        let base = no_macro_text(0);
+        let source_bytes = moving_edit(&base, 0).len();
+        let mut per_driver = Vec::new();
+        for driver in [Driver::Inline, Driver::PerAnalysisThread] {
+            let text = base.clone();
+            let reports = on_big_stack(move || {
+                let dir = std::env::temp_dir().join(format!(
+                    "vilan_leak_soak_smoke_{}_{}",
+                    std::process::id(),
+                    driver.label()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let entry = dir.join("main.vl");
+                let reports =
+                    measure_windows(move |i| moving_edit(&text, i), &entry, driver, 2, 2, 2);
+                let _ = std::fs::remove_dir_all(&dir);
+                reports
+            });
+            for (index, report) in reports.iter().enumerate() {
+                report.print(&format!("soak-smoke {} w{}", driver.label(), index + 1));
+            }
+            assert_eq!(
+                reports[0].entry_text,
+                2 * source_bytes,
+                "the {} driver did not tally one copy of the {source_bytes}-byte source per \
+                 analysis — a driver that reports nothing reports a clean plateau",
+                driver.label(),
+            );
+            assert_eq!(
+                reports[1].counts(),
+                reports[0].counts(),
+                "the {} driver's two equal windows did not leak equally",
+                driver.label(),
+            );
+            per_driver.push(reports[0].counts());
+        }
+        assert_eq!(
+            per_driver[1], per_driver[0],
+            "the per-analysis-thread driver must tally exactly what the inline driver tallies — \
+             the same analyses ran, only the thread they ran on differs",
         );
     }
 }

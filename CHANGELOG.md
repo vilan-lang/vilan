@@ -104,7 +104,6 @@ The other sixth was rebuild. Every `const` site is compiled to its own mini-prog
 On the promo site: the const pass drops from 3.41 s to 2.80 s in debug and 429 ms to 308 ms in release, `vilan check` from 845.8 ms to 734.9 ms, and — the one a person actually feels — a keystroke in the site's 735-line main page from **321.5 ms to 252.4 ms**, against a 150 ms debounce budget it still misses, by 1.68× where it used to miss by 2.14×. The two subjects with no `const` in them at all moved 4–6 %, which is the machine, and that is what makes the rest readable. Emitted output is byte-identical: the site's three bundles, three stylesheets and two chunk manifests diff clean across the change.
 
 What is left is now almost all evaluation, and cutting it further is a structural question — one shared const world per analysis, or memoization across analyses — written up as a design in `vilan/proposal/const-eval.md` §10.5 rather than built.
-
 ---
 
 <!-- family: tooling -->
@@ -120,6 +119,18 @@ Inside `<div …>`, completion also knows it is inside markup. At `<div .|>` it 
 Attribute *names* are deliberately not offered: the element desugar is name-blind by design — `name(x)` lowers to `.attr("name", x)` whatever `name` is — so there is no list in the compiler to offer, and one written into the language server alone would be a second source of truth with nothing keeping it true.
 
 Getting there needed one parser fix, which helps beyond completion: a `.` in an opening tag with no method name after it yet used to make the whole tag unparseable, and nested — which is every real component — it took the entire statement with it, so an editor had nothing to work from anywhere inside the markup. The dot has already committed the item to the chain form, so the incomplete item is now reported and dropped and the element survives. The file still doesn't compile, with the same one diagnostic; `vilan fmt` is unaffected, since it declines a file with parse errors.
+
+---
+
+<!-- family: tooling -->
+---
+
+<!-- family: tooling -->
+**The toolchain was soaked for leaks, thoroughly, and the numbers are written down.** Five thousand real keystrokes through the language server on kolt's `views.vl` and the website's `page.vl`, forty `vilan run --watch` rebuild rounds with a hundred and sixty browser connect/disconnects between them, and forty thousand requests against a compiled server. Every per-site leak counter plateaus **exactly** — two thousand-analysis windows over the same file leak byte-identical totals, and every site except the two named, by-design ones contributes zero. The dev channel's descriptor accounting, fixed earlier in this cycle, holds in the field: four browsers cost four descriptors and four threads while they are open and exactly nothing once they close, on all forty rounds, where the old behaviour would have banked a hundred and sixty. A compiled server's memory stops climbing after about fifteen thousand requests and completes the same work inside a 64 MiB V8 heap.
+
+The one thing worth reporting is a magnitude rather than a defect. Editing a file in the language server leaks its source and its parsed tree on purpose — the analysis borrows both for the life of the process — and nobody had measured what that costs across a session. It is **3.12 MiB of resident memory per keystroke** on a 735-line file and 0.74 MiB on a 372-line one, so a couple of hours in one large file grows the server by several gigabytes it never gives back. The parsed tree is 97 % of it. That is now a tracked item with a repro rather than a footnote, and nothing about it is new behaviour — only newly known.
+
+The instruments ship with it. `scripts/soak.sh` runs both long-lived processes for as long as you ask and prints a table per round; the language-server half is an `#[ignore]`d test the PR gate never pays for. Every fixture the soak writes expires on its own, every process it starts is killed *and* verified dead, and it sweeps for survivors by process name when it finishes. `vilan/proposal/leak-soak.md` is the record: the method, the tables, a disposition for every curve, and a sketch of what a heap profiler would add that these counters cannot.
 
 ## v0.34.0 — 2026-08-12
 

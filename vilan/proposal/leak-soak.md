@@ -1,0 +1,556 @@
+# The leak soak — looking thoroughly for what does not plateau (M2)
+
+> **Status: SHIPPED 2026-08-18.** Two instruments. Tier 1 is
+> `crates/vilan-lsp/src/document.rs`'s `leak_measurement` module, extended from
+> synthetic fixtures at tens-to-hundreds of analyses to the two real
+> application files at thousands, through both of the language server's
+> allocation lifetimes, `#[ignore]`d so the PR gate never pays for it. Tier 2 is
+> `scripts/soak.sh`, a standalone multi-minute driver for the two processes a
+> person actually leaves running — a `vilan run --watch` session under rebuild
+> and browser-reconnect churn, and a compiled Node server under sustained
+> requests. No new dependency: `/proc`, integer counters, `curl` and `node`.
+>
+> **The verdict is in §4, and it is not "nothing".** Every per-site leak
+> counter plateaus exactly, on every corpus, on both drivers — that half is a
+> clean negative. The soak also produced one finding worth filing, and it is a
+> number rather than a bug: the language server's *by-design* per-analysis leak
+> costs **3.12 MiB of resident memory per keystroke** on the website's
+> 735-line `page.vl` and 0.74 MiB on kolt's 372-line `views.vl` — 6.1 GiB after
+> two thousand keystrokes in one file, none of it returnable. Filed as backlog
+> M7. The other three curves are dispositioned and closed in §4.
+
+This paper is the record backlog M2 asked for, and it was written to be
+falsifiable rather than reassuring: the owner's brief was *"there might not be
+one, but I want to thoroughly look"*, and a "looked thoroughly, found nothing"
+is only worth something if the looking is described precisely enough that
+someone can disagree with it. §1 is the method and its instruments; §2 is
+tier 1's results; §3 is tier 2's; §4 dispositions every curve either of them
+produced; §5 is how to run both; §6 is what dhat would add and why it is not
+here.
+
+## 1. The method
+
+### 1.1 What a leak is here, and why RSS is not the instrument
+
+Three different things get called a leak, and only one of them is a bug:
+
+| | what it is | how it is measured here |
+|---|---|---|
+| **per-analysis leak** | memory made immortal by a `Box::leak`/`String::leak` on the analysis path — the source text and AST arenas a `Program` borrows for `'static` | `leak_tally`, per site, exact bytes |
+| **retention** | memory still reachable and still in a live cache — nothing is lost, but nothing is returned either | the same counters, plus the cache's own key: a curve that grows with *distinct inputs* rather than with *iterations* |
+| **unbounded growth** | either of the above growing without a bound the design can name | two equal windows leaking unequally; a curve that never flattens |
+
+`leak_tally`'s module doc already refuses RSS as the gate, and this soak agrees
+with it and then goes further: RSS is dominated by allocator retention from
+rebuilding and dropping the reachable `Program` on every call, so it moves by
+megabytes for reasons that have nothing to do with what was made immortal. It
+is printed on every row below. It is asserted on nowhere. The one place RSS
+*is* the only available instrument is tier 2's Node leg, and that leg says so.
+
+### 1.2 Tier 1 — the LSP, scaled to real files
+
+The shipped `leak_measurement` module runs a warmup, zeroes the thread-local
+counters, runs a measured window, and asserts the window's per-site totals.
+This extends it in four ways:
+
+1. **Real corpora.** `kolt/src/views.vl` (372 lines, 11,337 bytes) and
+   `vilan-website/src/page.vl` (735 lines, 26,968 bytes) — the two files
+   `perf-baseline.md` §2.3 measures keystroke latency on, read through the same
+   environment variables (`VILAN_PERF_KOLT`, `VILAN_PERF_WEBSITE`) and
+   **skipped, not failed**, when absent. One export serves both harnesses, and
+   both speak about the same two files.
+2. **Thousands of analyses**, where the synthetic fixtures do 40 and 200.
+3. **Two windows instead of one**, which is what upgrades the claim from *the
+   leak is small* to *the leak plateaus*. Two equal-length windows over an
+   equal-length document must leak the same bytes at every site; anything
+   accumulating makes the second larger, and exact integer counters say so with
+   no threshold, no tolerance and no curve fit.
+4. **Both allocation lifetimes.** `Document::analyze` — the entry point the
+   real server's `spawn_blocking` wraps — spawns a fresh 256 MiB-stack thread
+   per call, runs the analysis on it, and joins. The shipped fixtures all drive
+   `analyze_on_this_thread` inline on one long-lived thread instead. The soak
+   drives both.
+
+The edit is a **moving single-character edit**: a fixed-width trailing comment
+carrying one `x` that walks one column per iteration and wraps. Three
+properties, each load-bearing — every iteration is a *distinct content*, so
+nothing is served from `parse_clean_cached` and every analysis is a real
+re-analysis; every iteration is the *same length*, which is what makes the
+plateau assertion exact rather than statistical (the entry-text leak over N
+analyses is exactly N × the file's bytes); and a trailing comment is valid in
+every file, so one mutation works on any corpus.
+
+### 1.3 Reading a thread-local counter across threads
+
+The per-analysis-thread driver has a trap in it worth recording, because
+falling in produces a *perfect-looking* result. `leak_tally`'s counters are
+thread-local by deliberate design (its module doc gives the reason: a
+process-global counter's before/after deltas are famously flaky under a
+parallel test runner). A thread-local dies with its thread. So a driver that
+spawns a thread per analysis and reads the tally *after the join* reads zero at
+every site — which is indistinguishable, in the output, from a flawless
+plateau.
+
+The driver therefore reads each thread's own counters **inside** that thread,
+before it exits, and sums them in the caller. The gate pin
+`leak_soak_harness_smoke` exists for exactly this: it runs the same fixture
+through both drivers and asserts they agree **to the byte**, so a driver that
+reports nothing cannot pass as a driver that found nothing.
+
+Two facts license the comparison, and both were checked in the tree rather than
+assumed: nothing the compiler caches is thread-local — `BASE_CACHE`
+(`analyzer.rs`), the macro `WORLDS`/`FAILURES`/`EXPANSIONS`/`PARSES`
+(`macros.rs`) and `parse_clean_cached` (`lib.rs`) are process-global
+`OnceLock<Mutex<…>>` — and the five `thread_local!`s in `analyzer`, `macros`,
+`call_graph`, `util` and `transformer` are per-analysis scratch or test
+counters, not caches. Both drivers therefore see the same warm caches; what
+differs is that under the per-thread driver every allocation belongs to a
+thread that then dies.
+
+### 1.4 Tier 2 — the two processes people leave running
+
+`scripts/soak.sh`, and the choice of a script over an `#[ignore]`d test is a
+decision with a reason rather than a preference. A test would reuse the CLI
+suite's harness (`support::WATCH_LIVENESS`, `kill_watcher`, the SSE client in
+`tests/hmr.rs`), which is real value. But what a soak is *for* is being run for
+minutes to hours, by hand, on a quiet box, and nightly by a scheduler — and in
+all three of those a script wins: it takes `--rounds`/`--requests` without a
+recompile, it streams its table as it goes instead of buffering under
+`--no-capture`, and it can be pointed at a released binary rather than a
+`CARGO_BIN_EXE`. The cost is duplicated waiting logic, and it is a small cost:
+the two helpers a script needs (wait for a line, wait for a port) are ten lines
+of `grep`.
+
+Two legs:
+
+- **watch** — `vilan run --watch` on a two-leg fullstack fixture, through N
+  rebuild rounds. Each round rewrites `src/server.vl` with its round number, so
+  the round's completion is *witnessed* by the restarted Node child's own boot
+  marker rather than assumed from a timer. Between rounds, `CLIENTS` SSE
+  browsers connect to the dev channel and then disconnect — the churn backlog
+  M3's file-descriptor leak lived in (hmr.md's M3 appendix). Descriptors,
+  threads and RSS are read from `/proc/<watcher>/` **three times a round**:
+  idle, with the browsers connected, and after they leave.
+- **server** — the compiled Node server, built with `vilan build` and run
+  directly under `node` (never via `vilan run`, whose child would be orphaned
+  by a kill — `rpc_http.rs` records that lesson), under M requests split
+  between the page route and `POST /rpc`. RSS, descriptors and threads sampled
+  per batch, plus a **settle sample** after an idle window, because a rising
+  RSS curve under load is not by itself a leak: V8 grows its heap while nothing
+  forces it to collect, and what separates *grew* from *retains* is what the
+  number does once the load stops.
+
+**The LSP edit storm is deliberately not a leg of the script.** No JSON-RPC
+protocol harness exists in this repository to drive a real `vilan-lsp` process
+over stdio, and inventing one for a soak would have been a larger and less
+trustworthy instrument than the one that already exists: tier 1 drives the same
+entry point the server's `spawn_blocking` wraps, for thousands of keystrokes,
+reading exact per-site counters — where a protocol harness could only have
+watched RSS, the one signal §1.1 rejects.
+
+### 1.5 Process hygiene, and why it is in the paper
+
+A soak that leaves processes behind is a leak generator, not a leak detector.
+Three rules, each of them existing scar tissue:
+
+- **Every fixture self-expires.** Each fixture server sleeps out a deadline
+  derived from the configured run and then exits, so a soak whose driver is
+  killed leaves nothing running.
+- **Every process is killed *and asserted dead*.** SIGKILLing the watcher does
+  not reap its Node grandchild (E60), so every fixture server carries a
+  `/shutdown` route and its death is witnessed by a refused connection — each
+  poll re-sends the request, exactly the css e2e's shape in `tests/hmr.rs`.
+  The watcher's `vilan-watch-<pid>.mjs` temp script is removed the way
+  `support::kill_watcher` removes it.
+- **The zombie sweep matches the process NAME** — `pgrep -x node`, which
+  matches `comm`. `pgrep -f node` matches the soak's own command line and
+  reports the soak as the leak it was looking for.
+
+## 2. Tier 1 — the language server, per corpus
+
+Measured 2026-08-18 on the dev machine, one process, release:
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 7 9800X3D, 8 cores / 16 threads |
+| OS | WSL2, Linux 6.18.33.1-microsoft-standard-WSL2 |
+| RAM | 23 GiB |
+| tree | `next` at ccf74a5f plus this change |
+| profile | release |
+| run | 5,040 analyses, **1021.1 s**, exit 0 |
+
+Window = 1,000 analyses on the inline driver, 250 on the per-thread one, two
+windows each, after 10 unmeasured warm-up analyses. `w1`/`w2` are the two
+windows; the counted columns are `leak_tally` bytes, exact.
+
+### 2.1 The counted leak — every site, both windows
+
+| corpus | driver | window | analyses | entry-text B | entry-AST B | display B | macro B | total B | B/analysis |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `kolt/src/views.vl` (372 lines, 11,337 B) | inline | w1 | 1000 | 11,337,000 | 404,040,000 | 0 | 0 | 415,377,000 | 415,377 |
+| | inline | w2 | 1000 | 11,337,000 | 404,040,000 | 0 | 0 | 415,377,000 | 415,377 |
+| | per-thread | w1 | 250 | 2,834,250 | 101,010,000 | 0 | 0 | 103,844,250 | 415,377 |
+| | per-thread | w2 | 250 | 2,834,250 | 101,010,000 | 0 | 0 | 103,844,250 | 415,377 |
+| `vilan-website/src/page.vl` (735 lines, 26,968 B) | inline | w1 | 1000 | 26,968,000 | 947,800,000 | 0 | 0 | 974,768,000 | 974,768 |
+| | inline | w2 | 1000 | 26,968,000 | 947,800,000 | 0 | 0 | 974,768,000 | 974,768 |
+| | per-thread | w1 | 250 | 6,742,000 | 236,950,000 | 0 | 0 | 243,692,000 | 974,768 |
+| | per-thread | w2 | 250 | 6,742,000 | 236,950,000 | 0 | 0 | 243,692,000 | 974,768 |
+
+Four things this table says, in the order of how load-bearing they are:
+
+1. **Every window is byte-identical to its partner.** Not close, not within a
+   tolerance — the same integers. The plateau is exact.
+2. **Nothing leaks that is not named.** `total` equals `entry-text + entry-AST +
+   display` on every row, so the macro path, the content-keyed module parses,
+   the loader's error path and the wasm front end contributed *zero* bytes over
+   5,000 measured real-application keystrokes. The gensym, world-recompile and
+   broken-world plateaus that `analysis-reuse.md` §2 and E23 closed on synthetic
+   fixtures hold on real files at fifty times the iteration count.
+3. **The per-analysis leak is exactly file-proportional.** `entry-text` is the
+   analysed source, to the byte, every time (1,000 × 11,337 = 11,337,000). It is
+   proportional to the file, and the *rate* is flat in the iteration count.
+4. **Both drivers agree to the byte.** 415,377 B/analysis on kolt and 974,768 on
+   the website whether the analysis runs inline or on its own dying thread. The
+   thread-per-analysis lifetime the shipped server actually uses changes nothing
+   the counters can see.
+
+### 2.2 RSS — the secondary signal, and what it says anyway
+
+RSS is not asserted on, and §1.1 says why. It is reported because on this
+corpus it agrees with the counters about the *shape* and disagrees about the
+*scale* — and the disagreement is the interesting part.
+
+| corpus | driver | w1 RSS growth | w2 RSS growth | KiB per analysis | × the counted leak |
+|---|---|---:|---:|---:|---:|
+| `views.vl` | inline (1000) | 753,012 KiB | 762,060 KiB | 753.0 / 762.1 | 1.86× |
+| `views.vl` | per-thread (250) | 200,804 KiB | 191,612 KiB | 803.2 / 766.4 | 1.94× |
+| `page.vl` | inline (1000) | 3,194,936 KiB | 3,190,440 KiB | 3,194.9 / 3,190.4 | 3.35× |
+| `page.vl` | per-thread (250) | 794,488 KiB | 797,808 KiB | 3,178.0 / 3,191.2 | 3.34× |
+
+The second window grows as much as the first: within 1.2 % on the two
+1,000-analysis rows, within 4.6 % on the shorter 250-analysis pairs where a
+single arena decision is a larger share of the total. That is what makes this
+RSS number readable at all — allocator retention *saturates*, and a saturated
+allocator on a steady workload stops growing. This does not stop growing, on
+either corpus, on either driver, at any point in 5,000 measured analyses. It is
+the counted leak, plus the deep heap the counters can only estimate.
+
+**The scale is the finding.** One keystroke on `page.vl` costs the language
+server **3.12 MiB of resident memory it never gives back**, and one on
+`views.vl` costs 0.74 MiB. That is §4's finding 1.
+
+## 3. Tier 2 — the two long-lived processes
+
+Same machine, same tree, the release binary, 2026-08-18. Both legs exit 0 and
+the zombie sweep is clean (§3.3).
+
+### 3.1 `vilan run --watch` — 40 rounds, 4 browsers churned per round
+
+`scripts/soak.sh --rounds 40 --requests 20000 --batch 500 --clients 4`, leg 1.
+Every round rewrites the server leg, waits for the restarted Node child's own
+boot marker, then samples `/proc/<watcher>/` three times: idle, with four SSE
+browsers connected, and after they disconnect.
+
+| round | fds idle | fds open | fds after | threads idle | threads open | threads after | RSS KiB |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 8 | 4 | 4 | 8 | 4 | 61,956 |
+| 2 | 4 | 8 | 4 | 4 | 8 | 4 | 66,044 |
+| 10 | 4 | 8 | 4 | 4 | 8 | 4 | 66,104 |
+| 20 | 4 | 8 | 4 | 4 | 8 | 4 | 66,672 |
+| 30 | 4 | 8 | 4 | 4 | 8 | 4 | 66,996 |
+| 40 | 4 | 8 | 4 | 4 | 8 | 4 | 67,320 |
+| idle +10 s | 4 | — | — | 4 | — | — | 67,320 |
+
+**The descriptor and thread columns are constant across all forty rounds** —
+`4 → 8 → 4` and `4 → 8 → 4`, with no exception at any round. Four browsers cost
+exactly four descriptors and four threads while they are connected and exactly
+zero once they leave, which is the M3 fix's contract stated as a field
+measurement rather than a unit test: `hmr.md`'s M3 appendix measured 14 fds /
+14 threads at ten open connections and 4 / 4 the moment they closed, and 160
+connect-disconnect cycles across forty rebuilds reproduce it exactly. Against
+the pre-fix behaviour the same run would have ended at **164** descriptors.
+
+RSS grows 61,956 → 67,320 KiB across the session: **+5,364 KiB total**, of which
++4,088 KiB is the single step from round 1 to round 2 and +1,276 KiB is
+everything the remaining 38 rounds did (~34 KiB/round, decelerating). §4
+dispositions it.
+
+### 3.2 The compiled Node server — 20,000 requests
+
+Leg 2, `vilan build` then `node dist/server.mjs` directly (never through
+`vilan run`, whose child a kill would orphan — `rpc_http.rs` records that).
+Each batch is half `GET /` (the built page, served from a `Document::of` string)
+and half `POST /rpc` (a real dispatch through the JSON codec and a reactive
+turn, incrementing an `[expose]`d signal). Two runs, differing only in V8's
+old-space limit:
+
+```sh
+scripts/soak.sh --rounds 40 --requests 20000 --batch 500 --clients 4
+scripts/soak.sh --leg server --requests 20000 --batch 1000 --heap-cap 64
+```
+
+| requests | RSS KiB (default heap) | RSS KiB (`--heap-cap 64`) |
+|---:|---:|---:|
+| 0 | 62,692 | 63,632 |
+| 2,000 | 93,544 | 93,176 |
+| 5,000 | 124,424 | 112,484 |
+| 10,000 | 174,620 | 130,860 |
+| 15,000 | 206,372 | 131,340 |
+| 20,000 | 214,100 | 159,864 |
+| settled (+10 s idle) | 214,100 | 159,864 |
+
+Descriptors held at **22** and threads at **11** for every sample of both runs —
+the fd/thread half of this leg is flat, full stop.
+
+The RSS curve rises and then stops: the last 4,500 requests of the default run
+move it 188 KiB (213,912 → 214,100), against 148 MiB over the first 15,500. The
+settle sample is identical to the peak, which says V8 does not hand the pages
+back once it has them — expected, and not a leak.
+
+The capped run is the discriminator, and it is the reason `--heap-cap` exists.
+Under `--max-old-space-size=64` the same 20,000 requests complete with **no
+heap-out-of-memory abort** and land 53 MiB lower. Its own curve is not flat
+either — it sits at ~131 MiB from request 8,000 to 15,000 and then climbs
+again to 160 MiB — and that is fine, because the claim it carries is not "flat"
+but "never aborted": V8 fits the identical work inside a 64 MiB old space when
+told to. So whatever the default run's 148 MiB was, it is heap the collector
+had no reason to reclaim rather than retention it could not. An unbounded leak
+does not pass that test.
+
+### 3.3 Teardown
+
+Both fixture servers answered `/shutdown` and their deaths were witnessed by a
+refused connection, on both runs. `pgrep -x node` was empty before and after
+each run: **no node process outlived any soak**. The watcher's
+`vilan-watch-<pid>.mjs` was removed by the driver, the way
+`support::kill_watcher` removes it.
+
+## 4. Findings and dispositions
+
+Four curves came out of §2 and §3. One is filed; three are dispositioned and
+closed.
+
+### 4.1 FILED — the per-analysis leak is linear in keystrokes, in megabytes
+
+**Backlog M7.** Every analysis leaks its entry source and entry AST, by
+construction: the `Program` borrows both for `'static`, so
+`analyze_on_this_thread` leaks a copy of the text and `analyze_source` leaks the
+parsed tree. That much is designed, named and already measured — it is what the
+shipped `per_analysis_leak_is_bounded_by_named_sites` pin asserts, and
+`analysis-reuse.md` §2 explicitly leaves eliminating it as "a recorded
+refinement for the entry". What has never been measured is what it *costs over
+a session*, and this soak measures it:
+
+| corpus | counted B/keystroke | RSS MiB/keystroke | after 2,000 keystrokes |
+|---|---:|---:|---:|
+| `kolt/src/views.vl` (372 lines) | 415,377 | 0.74 | **1.4 GiB** |
+| `vilan-website/src/page.vl` (735 lines) | 974,768 | 3.12 | **6.1 GiB** |
+
+The AST is the whole of it: 947.8 MB of the website's 974.8 MB counted total is
+`EntryAst`, 97 %, against 27 MB of source text. Both figures are flat per
+analysis and linear in the count — the rate plateaus and the total does not,
+which is precisely the distinction §1.1 draws between a bounded leak and
+unbounded growth. Two thousand keystrokes is not a stress figure: at a 150 ms
+debounce it is a couple of hours of typing in one file.
+
+Not fixed here, and not a one-liner: the entry text and AST are `&'static`
+because the whole `Program` type is parameterised on that lifetime, so freeing
+them is a lifetime refactor (or an arena the document owns and swaps), not a
+`drop`. Filed with the numbers, the site and the repro rather than patched
+around.
+
+**Repro** (both corpora, ~17 minutes):
+
+```sh
+VILAN_PERF_KOLT=/path/to/kolt VILAN_PERF_WEBSITE=/path/to/vilan-website \
+cargo nextest run --release -p vilan-lsp --run-ignored ignored-only \
+    -E 'test(leak_soak_corpus_plateaus)' --no-capture
+```
+
+### 4.2 CLOSED — every other leak site plateaus at zero
+
+By-design retention, each bounded by a key that is not the iteration count, and
+each contributing **0 bytes** over 5,000 measured real-file keystrokes (§2.1):
+
+- **`parse_clean_cached`** (`crates/vilan-core/src/lib.rs`) — one leaked source
+  and AST per *distinct content*, shared by every compile in the process. A
+  moving keystroke never repeats a content, so this site could have grown with
+  the iteration count; it did not, because the language server's entry is
+  parsed directly by `analyze_source` and leaked at its own site, and every
+  *module* the corpus reaches is unchanged and served from the cache. (The CLI
+  does route its entry through here, which is §4.3.)
+- **The macro caches** (`crates/vilan-core/src/macros.rs`: `WORLDS`,
+  `FAILURES`, `EXPANSIONS`, `PARSES`) — content-keyed, bounded by distinct
+  macro-world definitions and distinct expansions. Zero on both corpora, which
+  is the E23 and `analysis-reuse.md` §2 plateaus holding at scale.
+- **`BASE_CACHE`** (`crates/vilan-core/src/analyzer.rs`) — resolved pre-entry
+  worlds keyed by `BaseCacheKey`, bounded by distinct (platform, std seeds,
+  workspace, macro budgets) tuples. One key per corpus here, as intended.
+- **`interned_display_name`'s `NAMES`** (`crates/vilan-core/src/analyzer.rs`) —
+  one leaked string per distinct dependency display name per process. The
+  `display` column is 0 on both corpora because neither package declares a
+  dependency; the site is bounded by names, not by analyses, either way.
+- **The server's `line_indices`** (`crates/vilan-lsp/src/main.rs`) — one index
+  per stable on-disk path, deliberately never invalidated, and deliberately
+  never populated for a path with an open buffer. Bounded by files visited.
+
+### 4.3 CLOSED — the watch session's RSS is bounded and decelerating
+
++5,364 KiB over 40 rounds, three quarters of it in the first round-to-round
+step and ~34 KiB/round thereafter (§3.1). Each round writes a **new** 495-byte
+`src/server.vl`, and the CLI reads its entry through `parse_clean_cached`, so
+each round does add one content-keyed entry — 40 rounds is ~20 KiB of
+genuinely immortal source plus its parsed tree, and the rest is the allocator
+finding its working set. Bounded by *distinct file
+contents*, which is the documented design (backlog E12: keyed on content, never
+mtime, so an unchanged leg is served rather than re-parsed), and two orders of
+magnitude below the per-keystroke figure in 4.1. Not filed.
+
+### 4.4 CLOSED — the Node server's RSS plateaus, and the cap proves it
+
+Flat over the last 4,500 requests, unchanged after a 10 s idle, and the same
+work fits in a 64 MiB V8 old space without an abort (§3.2). Descriptors and
+threads never move. Note what this leg does and does not cover: it measures
+vilan's standard library **as it runs in JavaScript**, on V8's heap, where the
+collector decides what comes back — nothing here is inside Rust's memory model,
+and no counter in this repository can see it. RSS was the only instrument
+available and its verdict is the weakest of the four in §4; the heap cap is
+what makes it worth writing down. Not filed.
+
+### 4.5 What was looked at and found nothing to say about
+
+Stated so the "found nothing" is falsifiable rather than a shrug. The soak
+covered: both real corpora at 2,520 analyses each (5,000 measured plus 40
+warm-up); both LSP allocation lifetimes; all fifteen `leak_tally` sites (via
+`total`, which is the sum of every one of them); 40 watch rebuild rounds; 160
+SSE connect/disconnect cycles;
+40,000 HTTP requests across two heap configurations; and descriptor, thread and
+RSS accounting on three separate processes. It did **not** cover: a real
+`vilan-lsp` process over JSON-RPC (§1.4 — no protocol harness exists, and tier 1
+drives the same entry point more precisely); the WebAssembly front end
+(`WasmEntryText` is content-interned and unreachable from either driver here);
+`vilan build`'s own process, which is short-lived by construction; and the deep
+heap behind the AST counters, which is §6's job.
+
+## 5. Running it
+
+### 5.1 Tier 1 — the LSP plateau, on real corpora
+
+One command. Release, for the reason `perf-baseline.md` §3 gives: the same run
+in debug is roughly eight times longer, and nothing here is a statement about
+wall time.
+
+```sh
+cd <repo>
+VILAN_PERF_KOLT=/path/to/kolt \
+VILAN_PERF_WEBSITE=/path/to/vilan-website \
+cargo nextest run --release -p vilan-lsp --run-ignored ignored-only \
+    -E 'test(leak_soak_corpus_plateaus)' --no-capture > leak.log 2>&1
+echo "leak exit: $?"
+grep '^LEAK ' leak.log > leak.jsonl
+```
+
+`--no-capture` streams the rows. Drop either environment variable to skip that
+corpus (it is reported as `LEAK-SKIP`, never a failure). `VILAN_LEAK_SOAK_WINDOW`
+sets the analyses per window — the default is 1,000, so 2,000 analyses per
+corpus on the inline driver and 500 on the per-thread one.
+
+Every row is one `LEAK {…}` line of JSON — corpus, lines, source bytes, driver,
+window index, analyses, the per-site byte counts, the derived bytes-per-analysis
+and the RSS growth — so two runs diff as text.
+
+### 5.2 Tier 2 — the two long-lived processes
+
+```sh
+cd <repo>
+cargo build --release                      # the soak prefers target/release
+scripts/soak.sh --rounds 40 --requests 20000 --clients 4 > soak.log 2>&1
+echo "soak exit: $?"
+```
+
+`scripts/soak.sh --help` lists every option. `--leg watch` or `--leg server`
+runs one leg; `--heap-cap 64` re-runs the server leg under a small V8 old-space
+cap, which is the cheap discriminator §4 uses; `--keep` leaves the work
+directory (fixtures, logs, `soak.jsonl`) in place for inspection.
+
+Exit status is 0 when the soak **ran**. A fixture that would not build, a
+server that would not come up, a process that would not die, or a `node` that
+outlived the run are the failures — because each of them means there is no
+measurement. Nothing in the script asserts a threshold on a curve; §4 is where
+a curve gets a verdict.
+
+### 5.3 The gate
+
+Nothing above is in the PR gate, and one small thing is:
+`leak_soak_harness_smoke` (§1.3) — a handful of analyses through both drivers.
+It joins the `leak_measurement` group, which `.config/nextest.toml` already
+schedules first at priority 100 because that group holds the suite's longest
+single tests. Measured rather than asserted, on this machine:
+
+| | new smoke | the group's longest | suite Summary |
+|---|---:|---:|---:|
+| the group alone (5 tests) | 1.005 s | 16.258 s | 37.4 s |
+| inside `--workspace`, contended | 2.889 s | 33.581 s | — |
+| `--workspace` before this change | — | — | **147.562 s**, 3742 tests, exit 0 |
+| `--workspace` after | — | — | **129.691 s**, 3743 tests, exit 0 |
+
+The gate did not get slower. It measured 17.9 s *faster*, which is the box
+rather than the change — the honest reading of both rows is that one ~3 s test
+scheduled first, against a 33.6 s neighbour in its own priority group, is not
+detectable in a 130-second wall. The four shipped plateau fixtures are
+unchanged and still run every time; the heavy soak is `#[ignore]`d and shows in
+the Summary's skip count (4 → 5).
+
+## 6. What dhat would add, and why it is not here
+
+`dhat-rs` is the whole-heap cross-check `leak_tally`'s own module doc frames
+RSS as a poor proxy for. It would be a **new dependency**, which AGENTS.md
+makes a stop condition, so this section describes the plug-in rather than
+performing it.
+
+**The shape.** `crates/vilan-lsp/Cargo.toml` grows an **optional** `dhat`
+dependency and a `dhat-heap = ["dep:dhat"]` feature enabling it — optional
+rather than a dev-dependency, because a Cargo feature cannot reference a
+dev-dependency and the allocator has to be declared in the crate root either
+way. That root grows
+
+```rust
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+```
+
+and the tier-1 soak wraps its measured windows in a
+`let _profiler = dhat::Profiler::new_heap();`, which writes `dhat-heap.json` on
+drop for the DHAT viewer. Run as
+`cargo nextest run --release -p vilan-lsp --features dhat-heap …`. Nothing
+outside that feature changes, and the default build never links it.
+
+**What it would answer that nothing here can.** Three gaps, in order of how
+much they matter:
+
+1. **The AST figures are estimates.** `leak_tally`'s own doc says so: the entry
+   AST site records a tree-proportional estimate (node count × node size), not
+   a deep heap audit, and every cache-bounded AST site records the *shallow*
+   `size_of_val` of the leaked box. So §2's `entry-AST` column is a faithful
+   proxy for *growth* and an unreliable one for *magnitude*. It is why §4.1
+   states its headline in **RSS** — a real measurement of the real process —
+   and keeps the counted total beside it as the thing that proves the *rate* is
+   flat. dhat would make the counted number a real number too, and would say
+   which allocation inside the tree is the expensive one.
+2. **Retention is invisible to a leak counter.** Everything `leak_tally` sees
+   is a `Box::leak` call. A `HashMap` that grows forever leaks nothing by that
+   definition and is a leak by every other. §4.2's five by-design retentions
+   were dispositioned by reading each cache's KEY and reasoning about its
+   bound — a sound argument, and not a measurement. dhat's at-exit live-block
+   report with backtraces would measure them, and would find the same class of
+   thing in code nobody thought to read.
+3. **Allocations the compiler does not make itself.** A dependency's retention
+   is outside every counter in this repository.
+
+**What it would cost.** The dependency, a global-allocator swap that slows the
+measured code (so the soak's iteration counts would come down), and dhat's own
+memory for backtraces. All three are acceptable *behind an opt-in feature* and
+none is acceptable in the default build — which is exactly what the feature
+flag is for. Recommended, as the owner's call, and small: the whole change is a
+manifest entry, four lines in the crate root, and two in the soak.

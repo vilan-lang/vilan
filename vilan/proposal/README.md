@@ -64,6 +64,7 @@ Closing sweeps archive tombstones into
 | `hmr.md` | shipped arc (2026-07-21) | Hot module replacement closing the dev loop (A13). |
 | `kolt-migration.md` | active (living document) | The kolt→vilan migration driver; tracks the reference app's porting status. |
 | `lazy.md` | draft, ratified but deferred (2026-07-21/22) | `lazy` parameters and module bindings — deferred by user call until real demand appears (backlog B30). |
+| `leak-soak.md` | shipped arc (M2, 2026-08-18) | The memory-leak soak: the LSP plateau scaled to real corpora at thousands of keystrokes through both allocation lifetimes, plus `scripts/soak.sh` over a `run --watch` session and a compiled Node server. §4 dispositions every curve — three closed, one filed (M7: 3.12 MiB of resident memory per keystroke on a 735-line file, by design and never returned); §6 sketches the dhat cross-check it deliberately does not add. |
 | `library-packages.md` | shipped arc (2026-06-23) | Library packages, replacing old roadmap item P4. |
 | `local-shadowing.md` | shipped arc (2026-07-28) | Positional visibility for local bindings (B34), including the same-scope shadowing fix. |
 | `lsp-snapshot-consistency.md` | shipped arc (approved/implemented 2026-07-28) | Semantic tokens never outrun the analysis they're served from. |
