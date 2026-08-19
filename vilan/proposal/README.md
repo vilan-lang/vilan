@@ -50,7 +50,7 @@ Closing sweeps archive tombstones into
 | `diagnostics-standard.md` | shipped / foundational (accepted 2026-07-16) | The rules a diagnostic message must follow, plus the audit plan the ledger executes. |
 | `distribution.md` | shipped arc (2026-07-25, provisioned 2026-07-29) | npm/Marketplace/Open VSX/Homebrew distribution (F7) plus the project-model deferrals (F5). |
 | `docs-audit-2026-08-18.md` | shipped arc (D15 2026-08-18; D17–D19 gates §5 2026-08-19) | The book's currency audit against v0.34.0: a per-page inventory, what was fixed, the three-way keyword/grammar diff, and D16–D18 filed behind it. |
-| `docs-port.md` | RATIFIED 2026-08-19; S5 SHIPPED (K7, §7); S1–S4/S6 in review (K6, §6) | The docs port: the three-repo estate surveyed, the vilan-framework port costed and blocked on a markdown story, re-theming mdBook onto the ratified tokens ruled (option B, chrome mechanism (i)), with K7's run button and K5's light theme sliced behind it. |
+| `docs-port.md` | SHIPPED 2026-08-19 (K6 S1–S6 + K7; §6/§7 ship records; K13 = the port proper) | The docs port: the three-repo estate surveyed, the vilan-framework port costed and blocked on a markdown story, re-theming mdBook onto the ratified tokens ruled (option B, chrome mechanism (i)), with K7's run button and K5's light theme sliced behind it. |
 | `docs-site.md` | shipped arc (2026-07-12) | The rendered docs site: mdBook, custom grammar, GitHub Pages publishing. |
 | `draft-reconnect.md` | shipped arc (2026-08-04) | `Draft` re-push on reconnect and the debounced commit — A14's last reactive residual. |
 | `documentation.md` | shipped arc (Phase 3, 2026-07-12) | D1a, the user-facing reference docs — what the book covers and its phasing. |
