@@ -98,7 +98,7 @@ sees it.
 
 ## Quick fixes
 
-Five, each attached to the diagnostic that earns it:
+Four, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|

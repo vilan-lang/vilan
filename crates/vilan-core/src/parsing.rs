@@ -483,22 +483,29 @@ fn extern_binding_from_args<'src>(args: &[ExternArg<'src>]) -> ExternBinding<'sr
     }
 }
 
-/// The built-in attribute-marker names, excluded from a *user* macro attribute's
-/// name (they keep their own parsers, fused into `function`/`struct` or earlier in
-/// the statement choice). Mirrors the chumsky `macro_attribute_name` guard.
+/// The built-in attribute-marker names — `[derive(..)]`, `[service]`, … — each
+/// with its own parser, fused into `function`/`struct` or earlier in the
+/// statement choice, and therefore excluded from a *user* macro attribute's name
+/// ([`is_known_attribute_marker`]). The one source of truth for the list: both
+/// highlighting grammars (`editors/vscode/syntaxes/vilan.tmLanguage.json`,
+/// `vilan/docs/theme/vilan.js`) carry a copy, held to this one by
+/// `crates/vilan-cli/tests/grammar_sync.rs` (AGENTS.md's three-place rule).
+pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
+    "derive",
+    "service",
+    "extern",
+    "must_use",
+    "rpc",
+    "trait_only",
+    "doc",
+    "expose",
+    "platform",
+];
+
+/// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
+/// `macro_attribute_name` guard.
 fn is_known_attribute_marker(name: &str) -> bool {
-    matches!(
-        name,
-        "derive"
-            | "service"
-            | "extern"
-            | "must_use"
-            | "rpc"
-            | "trait_only"
-            | "doc"
-            | "expose"
-            | "platform"
-    )
+    KNOWN_ATTRIBUTE_MARKERS.contains(&name)
 }
 
 impl<'a, 'src> Parser<'a, 'src> {

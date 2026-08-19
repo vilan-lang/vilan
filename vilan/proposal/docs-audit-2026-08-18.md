@@ -383,3 +383,123 @@ against `editors/vscode/syntaxes/vilan.tmLanguage.json` and
 illustration of the pattern: the list somebody edited when the rename
 landed is right, and the list two hundred lines away in a different file is
 the one that rotted.
+
+## 5. The gates (2026-08-19)
+
+STATUS: SHIPPED 2026-08-19 (work order 5, lane `d17-grammar-gate`) — D17,
+D18 and D19 built as three mechanical gates; §3's "filed rather than built"
+is closed.
+
+**D17 — `crates/vilan-cli/tests/grammar_sync.rs`.** Lives beside
+`vscode_extension.rs` because the two grammars are repo-level assets outside
+any crate, the CLI crate already pins those (`npm_stub.rs`, `brew_formula.rs`)
+and already reads JSON with node. The compiler's lists are read
+programmatically, each the table its own consumer uses — which took three
+small refactors, all behaviour-preserving: the lexer's `read_identifier`
+`match` became a `pub const KEYWORDS: &[(&str, Token)]` table it looks up;
+`is_known_attribute_marker`'s `matches!` became `pub const
+KNOWN_ATTRIBUTE_MARKERS`; and the analyzer's numeric-suffix `matches!` became
+`pub const NUMERIC_SUFFIXES` beside `SCALAR_PRIMITIVE_NAMES` in `type_.rs`.
+The grammars are read with node: the TextMate file as JSON (every
+`match`/`begin`/`end` under each repository entry, nested), and `vilan.js`
+*evaluated* under a stub `hljs` so the checked word lists are the ones the
+real highlighter registers (the keyword string is built by concatenation).
+Word lists are extracted from the regexes by one rule — every maximal
+identifier-shaped run that is neither an escape nor inside a bracket class —
+which reads `\b(if|else)\b`, `(?:derive|…)\b` and `(?<=\))\s+(context)\b` as
+their words and a shape rule like `\b[A-Z][A-Za-z0-9_]*` as none. Six tests,
+each direction of each axis: every lexer keyword in both grammars; nothing in
+either grammar's keyword lists the lexer does not know, with a five-entry
+allowance for the contextual words (`context`, `sync`, `self`, `Self`,
+`void`) each pinned to still lex as an identifier and to still be used by a
+grammar; the TextMate primitive alternation equal to the lowercase
+non-keyword scalars plus `bool`/`void`/`any`, and every scalar (including
+`BigInt` via the PascalCase rule, `null` via the literals) matched by some
+rule; `vilan.js`'s number-suffix regex accepting exactly `NUMERIC_SUFFIXES`
+on decimal probes and rejecting `i64`/`u64`/`i128`/…; the attribute markers
+equal in both grammars, where in the TextMate file *every* regex under
+`attributes` that names any marker must name all nine (the opening lookahead
+and the inner rule both — `(method|get|set)` names none and is not held).
+
+*Found by the gate and fixed in the same change:* the TextMate grammar's
+attribute **opening lookahead** still listed eight markers — §4's fix added
+`platform` to the inner rule but not to the lookahead that opens the scope,
+so `[platform(…)]` coloured only at a line's start. One word added.
+
+*Not drift, noted:* `vilan.js` has no primitive-type list at all — its `TYPE`
+rule is PascalCase-only, and `i32`/`str` are not coloured as types in the
+book where VS Code colours them. §4 treated the number-suffix regex as the
+theme's primitive surface and the gate does the same; giving the highlight.js
+grammar a `type:` keyword group (the highlight.js idiom) is a book-colouring
+decision for the owner, not a list drift. The TextMate number
+rule accepts any identifier suffix by design (its comment says so), so there
+is nothing to hold it to.
+
+**D18 and D19 — `crates/vilan-lsp/src/book_sync.rs`,** a `#[cfg(test)]`
+module of the server binary. Not `crates/vilan-lsp/tests/`: `vilan-lsp` is a
+bin-only crate, so an integration test could not reach `KEYWORD_DOCS` or the
+capabilities; a test module inside the crate can, with `KEYWORD_DOCS` and
+`BOOK_BASE` made `pub(crate)` and `initialize`'s capabilities literal
+factored into a pure `server_capabilities()` (the one refactor in the LSP).
+
+D19: mdBook's heading-id algorithm is reimplemented (`mdbook_heading_ids`)
+and every `page.html#anchor` in `KEYWORD_DOCS` is checked against the page's
+headings — no renderer at test time, per `docs.rs`'s renderer-independent
+design. The algorithm as verified against mdBook 0.5.4's output is *not* the
+"non-alphanumerics → `-`, collapse" shape the work order described: it is
+mdBook's `normalize_id` — keep alphanumerics, `_` and `-` (lowercased), turn
+each whitespace character into one `-`, **drop** every other character, no
+collapsing — over the heading's rendered text (inline code keeps its
+characters, so `` `Shared<T>` `` is `sharedt`; `if / else` is `if--else`;
+`impl: methods and statics` is `impl-methods-and-statics`), with repeats
+suffixed `-1`, `-2`. An `#[ignore]`d test builds the real book into a temp
+dir and compares every heading of every page (447 headings, 56 pages, zero
+mismatches with mdBook 0.5.4); it runs on `cargo test -p vilan-lsp book_sync
+-- --ignored` wherever `mdbook` is on PATH, and is the proof the
+reimplementation leans on. `impl`'s link was the one broken entry of 22
+unique targets and is fixed (`impl--methods-and-statics` →
+`impl-methods-and-statics`; CHANGELOG `tooling`). `vscode_extension.rs` and
+`brew_formula.rs` still pin the base URL as literals; `book_sync.rs` ties
+`document.rs`'s `BOOK_BASE` to `package.json`'s `homepage`, so the three
+agree by test rather than by eye.
+
+D18: the page's claims are read out of `appendix/editor.md` by its own
+formatting — the Quick fixes section's tables (double-backticked first cells
+are quick-fix titles, bold ones source actions), the Settings table's
+backticked names and their Default column, the bold feature names and the
+"no …" phrases of "What it does not have", whitespace-flattened so a re-wrap
+cannot break a pin — and each is held to the thing it describes: the
+`title:` string literals inside every `QuickFix { … }` (document.rs) and
+`CodeAction { … }` (main.rs) constructor, matched as templates (a `format!`
+hole matches the page's example — ``Import `X` from std::json`` instantiates
+`Import `{name}` from {}`), in both directions and in count;
+`server_capabilities()` through a claims table of 24 `(phrase, claimed,
+predicate)` rows, the phrase pinned to appear on the page; and
+`package.json`'s `contributes.configuration` (names equal as sets, literal
+defaults equal, `—` meaning the empty or discovery-sentinel default) and
+`contributes.commands` (`Vilan: Restart Language Server`). Shape pins
+throughout: a section or table that goes missing panics with the page's name
+rather than extracting nothing.
+
+*Found by the gate and fixed:* the page opened its quick-fix table with
+"Five" over four rows and four `QuickFix` constructors; the count is now a
+pinned claim and reads "Four".
+
+**Demonstrated non-vacuous.** Each assertion was driven red by a planted
+drift and restored: `resource` removed from `vilan.js`'s keyword string;
+`i64` re-added to the TextMate primitive list; the theme's suffix widths
+changed `53` → `64`; `yield` added to the TextMate keywords; `platform`
+dropped from the theme's marker list; the old two-hyphen `impl` anchor; a
+misspelled page name; a server title changed to ``Drop `;` ``;
+`hover_provider` set to `None`; a setting renamed on the page; the Insert
+row deleted from the page; "Five" restored. Every one failed the intended
+test and nothing else.
+
+**Filed, not built (for the tracker).** (i) `bindgen.rs`'s `RESERVED` list
+(keywords + primitives + `any bool self void` + four std type names) is a
+fourth copy of the keyword and primitive lists, clean today; it could be held
+to `KEYWORDS ∪ SCALAR_PRIMITIVE_NAMES` by the same gate through a
+`#[doc(hidden)] pub` accessor. (ii) `lexing.rs`'s own unit test
+`keywords_classify_and_identifiers_do_not` still carries its hand copy of the
+table — left as a deliberate pin of the set, but it no longer needs to be one.
+(iii) Whether the book should colour primitive type names (above).

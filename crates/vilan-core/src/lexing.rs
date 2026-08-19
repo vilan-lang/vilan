@@ -45,6 +45,49 @@ pub fn tokenize(source: &str) -> (Vec<Spanned<Token<'_>>>, Vec<LexError>) {
     (lexer.tokens, lexer.errors)
 }
 
+/// The keyword table: every identifier spelling the lexer classifies as a keyword
+/// rather than a [`Token::Ident`], with the token it becomes. This is the one
+/// source of truth for "what is a keyword" — [`Lexer::read_identifier`] looks its
+/// text up here, and `crates/vilan-cli/tests/grammar_sync.rs` holds the TextMate
+/// grammar (`editors/vscode/syntaxes/vilan.tmLanguage.json`) and the book's
+/// highlight.js theme (`vilan/docs/theme/vilan.js`) to exactly this list — the
+/// three-place rule in AGENTS.md, gated. A new keyword is one row here plus a
+/// `Token` variant; the gate then names the two grammar files it must reach.
+pub const KEYWORDS: &[(&str, Token<'static>)] = &[
+    ("async", Token::Async),
+    ("await", Token::Await),
+    ("const", Token::Const),
+    ("else", Token::Else),
+    ("enum", Token::Enum),
+    ("export", Token::Export),
+    ("external", Token::External),
+    ("false", Token::Bool(false)),
+    ("for", Token::For),
+    ("fun", Token::Fun),
+    ("if", Token::If),
+    ("impl", Token::Impl),
+    ("import", Token::Import),
+    ("in", Token::In),
+    ("is", Token::Is),
+    ("jump", Token::Jump),
+    ("let", Token::Let),
+    ("macro", Token::Macro),
+    ("match", Token::Match),
+    ("mod", Token::Mod),
+    ("mut", Token::Mut),
+    ("null", Token::Null),
+    ("own", Token::Own),
+    ("borrows", Token::Borrows),
+    ("ret", Token::Ret),
+    ("resource", Token::Resource),
+    ("struct", Token::Struct),
+    ("trait", Token::Trait),
+    ("type", Token::Type),
+    ("true", Token::Bool(true)),
+    ("use", Token::Use),
+    ("with", Token::With),
+];
+
 fn span(start: usize, end: usize) -> Span {
     (start..end).into()
 }
@@ -315,41 +358,10 @@ impl<'src> Lexer<'src> {
     fn read_identifier(&self, start: usize) -> (Token<'src>, usize) {
         let end = self.identifier_end(start);
         let text = &self.source[start..end];
-        let token = match text {
-            "async" => Token::Async,
-            "await" => Token::Await,
-            "const" => Token::Const,
-            "else" => Token::Else,
-            "enum" => Token::Enum,
-            "export" => Token::Export,
-            "external" => Token::External,
-            "false" => Token::Bool(false),
-            "for" => Token::For,
-            "fun" => Token::Fun,
-            "if" => Token::If,
-            "impl" => Token::Impl,
-            "import" => Token::Import,
-            "in" => Token::In,
-            "is" => Token::Is,
-            "jump" => Token::Jump,
-            "let" => Token::Let,
-            "macro" => Token::Macro,
-            "match" => Token::Match,
-            "mod" => Token::Mod,
-            "mut" => Token::Mut,
-            "null" => Token::Null,
-            "own" => Token::Own,
-            "borrows" => Token::Borrows,
-            "ret" => Token::Ret,
-            "resource" => Token::Resource,
-            "struct" => Token::Struct,
-            "trait" => Token::Trait,
-            "type" => Token::Type,
-            "true" => Token::Bool(true),
-            "use" => Token::Use,
-            "with" => Token::With,
-            _ => Token::Ident(text),
-        };
+        let token = KEYWORDS
+            .iter()
+            .find(|(keyword, _)| *keyword == text)
+            .map_or(Token::Ident(text), |(_, token)| token.clone());
         (token, end)
     }
 

@@ -14,6 +14,17 @@ pub const SCALAR_PRIMITIVE_NAMES: &[&str] = &[
     "str", "i32", "u32", "f64", "BigInt", "null", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
 ];
 
+/// The numeric-literal type suffixes the analyzer accepts (`42u32`, `1.5f`,
+/// `0n`); any other suffix is a hard error (numeric-types.md §3 — `5i64` names
+/// the rename to `i53`). One source of truth: the book's highlight.js theme
+/// (`vilan/docs/theme/vilan.js`) spells this list inside its number regex, and
+/// `crates/vilan-cli/tests/grammar_sync.rs` holds it to this one — the D15 audit
+/// found the theme current and the TextMate grammar a release behind on the
+/// sibling primitive-type list, which is the drift that gate closes.
+pub const NUMERIC_SUFFIXES: &[&str] = &[
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f", "f32", "f64", "n",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
     Any,
