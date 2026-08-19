@@ -10,13 +10,14 @@ use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Implementation, Parameter, SourceId};
 use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
+use vilan_core::leak_tally::{LeakSite, Leaked};
 use vilan_core::lexing::tokenize;
 use vilan_core::node::Convention;
 use vilan_core::token::Token;
 use vilan_core::type_::{Type, TypeId};
 use vilan_core::{
-    Error, Manifest, PackageSpec, Platform as BuildPlatform, Program, Span,
-    Workspace as BuildWorkspace, analyze_source,
+    Error, LeakedEntryAst, Manifest, PackageSpec, Platform as BuildPlatform, Program, Span,
+    Workspace as BuildWorkspace, analyze_source_reclaimable,
 };
 
 use crate::line_index::LineIndex;
@@ -916,7 +917,11 @@ pub struct Document {
     /// A `LineIndex` owns its text, so this IS the analyzed-text record — there
     /// is no second `String` to keep in step.
     analyzed_index: Arc<LineIndex>,
-    pub program: Option<Program<'static>>,
+    /// The analyzed program, paired with the entry text and tree it borrows
+    /// for `'static` — one value, so a superseded analysis's program and its
+    /// allocations are replaced (and reclaimed) together. See
+    /// [`AnalyzedProgram`].
+    pub program: AnalyzedProgram,
     pub diagnostics: Vec<Error>,
     /// The source file each diagnostic belongs to, parallel to `diagnostics`
     /// (`SourceId(0)` = this document; imported modules publish to their own
@@ -961,6 +966,91 @@ pub struct Document {
     /// can enumerate modules the `Program` never loaded. `None` on the degraded
     /// internal-error document, which resolved nothing.
     import_roots: Option<ImportRoots>,
+}
+
+/// The analyzed `Program` together with the two allocations it borrows for
+/// `'static`: the copy of the entry text `analyze_on_this_thread` leaks and the
+/// entry tree `analyze_source_reclaimable` leaks. The program's lifetime
+/// parameter says `'static`; this pairing is what makes that true for exactly
+/// as long as the program lives, and gives the bytes back afterwards — the M7
+/// fix (`leak-soak.md` §7): before it, every keystroke's analysis leaked both
+/// for the rest of the session (3.12 MiB of RSS per keystroke on a 735-line
+/// file, 6.1 GiB after two thousand).
+///
+/// **The invariant** (promised at [`AnalyzedProgram::new`], relied on in
+/// `Drop`): the program borrows only `text`, `ast`, and allocations that are
+/// immortal (std and module texts in `parse_clean_cached`, interned names,
+/// cached macro worlds); and nothing outside this value borrows `text` or
+/// `ast` — no process-global cache, no thread-local, nothing the server
+/// retains. `leak-soak.md` §7.2 is the audit that establishes the second half,
+/// global by global; the first half is what `analyze_source_reclaimable`
+/// returns. Every `Document` query returns owned values, so nothing borrowed
+/// from the program outlives the borrow of `self` that produced it.
+///
+/// `Drop` does the ordering in one visible place — program first, then the
+/// two reclaims — rather than leaning on field declaration order.
+pub struct AnalyzedProgram {
+    program: Option<Program<'static>>,
+    /// The leaked entry text the program borrows (`None` on a document that
+    /// analyzed nothing — the degraded internal-error document).
+    text: Option<Leaked<str>>,
+    /// The leaked entry tree the program borrows (`None` when parsing produced
+    /// no tree, or nothing was analyzed).
+    ast: Option<LeakedEntryAst>,
+}
+
+impl AnalyzedProgram {
+    /// Pairs a program with the allocations it borrows.
+    ///
+    /// # Safety
+    ///
+    /// `program` must borrow nothing with a non-`'static` life other than
+    /// `*text` and `*ast` — it is the program `analyze_source_reclaimable`
+    /// built over exactly that text and returned with exactly that `ast`
+    /// handle — and nothing else may hold a reference derived from either
+    /// leak: when this value drops, both are freed.
+    unsafe fn new(
+        program: Option<Program<'static>>,
+        text: Option<Leaked<str>>,
+        ast: Option<LeakedEntryAst>,
+    ) -> AnalyzedProgram {
+        AnalyzedProgram { program, text, ast }
+    }
+
+    /// No program, nothing leaked — the internal-error document's analysis.
+    pub fn none() -> AnalyzedProgram {
+        AnalyzedProgram {
+            program: None,
+            text: None,
+            ast: None,
+        }
+    }
+
+    pub fn as_ref(&self) -> Option<&Program<'static>> {
+        self.program.as_ref()
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.program.is_some()
+    }
+}
+
+impl Drop for AnalyzedProgram {
+    fn drop(&mut self) {
+        // The program borrows the two allocations: it goes FIRST, and only
+        // then are they given back. Nothing else borrows them (the `new`
+        // contract, established by leak-soak.md §7.2's audit), so after this
+        // line no reference into either allocation exists anywhere.
+        self.program = None;
+        if let Some(text) = self.text.take() {
+            // SAFETY: the program — the only borrower — was just dropped.
+            unsafe { text.reclaim() };
+        }
+        if let Some(ast) = self.ast.take() {
+            // SAFETY: as above; the tree's only borrower is gone.
+            unsafe { ast.reclaim() };
+        }
+    }
 }
 
 /// A semantic-token classification (E2): precision highlighting from the
@@ -1198,7 +1288,7 @@ impl Document {
             live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
             line_index,
-            program: None,
+            program: AnalyzedProgram::none(),
             diagnostics: vec![Error {
                 note: None,
                 span: vilan_core::span::Span::new((), 0..0),
@@ -1225,12 +1315,13 @@ impl Document {
         // only when an edit lands (`set_text`).
         let line_index = Arc::new(LineIndex::new(text));
         let text_hash = hash_text(text);
-        // The program borrows its source for `'static`, so leak a copy (the
-        // editor re-analyzes on change; see the known leak tradeoff).
-        let leaked: &'static str = Box::leak(text.to_string().into_boxed_str());
-        vilan_core::leak_tally::record(
-            vilan_core::leak_tally::LeakSite::LspEntryText,
-            leaked.len(),
+        // The program borrows its source for `'static`, so leak a copy — with
+        // the handle kept: the `AnalyzedProgram` built below owns it and gives
+        // it back when the analysis is superseded or the document closes.
+        let (leaked_text, leaked) = Leaked::leak(
+            text.to_string().into_boxed_str(),
+            LeakSite::LspEntryText,
+            text.len(),
         );
         // Prefer the project's declared platform and source root (the file's role in
         // its `vilan.toml`); fall back to inferring the platform from imports and
@@ -1259,7 +1350,11 @@ impl Document {
                 })
                 .collect(),
         };
-        let (program, diagnostics) = analyze_source(
+        let vilan_core::AnalyzedEntry {
+            program,
+            diagnostics,
+            ast,
+        } = analyze_source_reclaimable(
             leaked,
             &std,
             &pkg_root,
@@ -1316,6 +1411,13 @@ impl Document {
             .as_ref()
             .map(vilan_core::platform_color::requirements)
             .unwrap_or_default();
+        // SAFETY: `program` was built by `analyze_source_reclaimable` over
+        // `leaked` (the text `leaked_text` owns) and returned with `ast`, the
+        // handle to the very tree it borrows; everything read from it above
+        // was copied into owned values (`entity_spans`, the diagnostics, the
+        // requirements). Nothing else borrows either allocation — leak-soak.md
+        // §7.2 audits every process-global and every thread-local for that.
+        let program = unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast) };
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
@@ -1597,7 +1699,7 @@ impl Document {
     /// conservative direction — the old always-sweep behavior, kept exactly
     /// where its reason still holds.
     pub fn depends_on(&self, path: &Path) -> bool {
-        let Some(program) = &self.program else {
+        let Some(program) = self.program.as_ref() else {
             return true;
         };
         program
@@ -1641,7 +1743,11 @@ impl Document {
             manifest_problem,
             import_roots,
         } = analysis;
-        // The analysis side, in full.
+        // The analysis side, in full. `program` is the pair of the new
+        // program and the allocations it borrows; assigning it drops the
+        // OUTGOING pair — its program first, then its entry text and tree are
+        // reclaimed (`AnalyzedProgram`'s `Drop`). This is the line the
+        // session leak M7 measured (leak-soak.md §4.1) stops at.
         self.analyzed_index = analyzed_index;
         self.program = program;
         self.diagnostics = diagnostics;
@@ -2182,7 +2288,7 @@ impl Document {
     /// resolved — inference made a decision the source doesn't show, so the
     /// editor shows it in place. Sorted by position.
     pub fn inlay_hints(&self) -> Vec<(usize, String)> {
-        let Some(program) = &self.program else {
+        let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
         let mut hints: Vec<(usize, String)> = Vec::new();
@@ -2213,7 +2319,7 @@ impl Document {
     /// definitions also cover macro names — they share trait names by design,
     /// and only semantics can tell them apart).
     pub fn semantic_tokens(&self) -> Vec<(Span, TokenKind, u32)> {
-        let Some(program) = &self.program else {
+        let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
         let entry = |id: Id| program.source_of(id) == Some(SourceId(0));
@@ -4374,6 +4480,19 @@ pub(crate) mod tests {
         std::env::var_os("VILAN_STD")
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"))
+    }
+
+    /// Runs `work` on a 256 MiB-stack thread and joins it — the stack
+    /// `Document::analyze` gives the pipeline, for tests that drive
+    /// `analyze_on_this_thread` directly (to read the thread-local leak tally
+    /// on the thread that analyzed).
+    pub(crate) fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(work)
+            .expect("spawn measurement thread")
+            .join()
+            .expect("measurement thread panicked")
     }
 
     // `same_file` / `is_within` decide a document's package and platform, so a
@@ -9021,7 +9140,7 @@ pub(crate) mod tests {
     #[test]
     fn a_document_without_a_program_is_conservatively_a_dependent() {
         let (dir, mut document) = analyze_workspace(&[("main.vl", "fun main() {}\n")]);
-        document.program = None;
+        document.program = AnalyzedProgram::none();
         assert!(
             document.depends_on(&dir.join("anything.vl")),
             "with no recorded source set, re-analysis is the conservative direction"
@@ -9214,6 +9333,161 @@ pub(crate) mod tests {
     }
 }
 
+/// M7 (`leak-soak.md` §7): the entry text and tree an analysis leaks are given
+/// back when the `Document` drops or replaces the analysis. Platform-
+/// independent — the counters need no `/proc` — so unlike `leak_measurement`
+/// below this is not Linux-gated. Each pin runs its analyses on ONE big-stack
+/// thread and reads that thread's counters, because the tally is thread-local
+/// (`leak_tally`'s module doc); the last pin is the exception on purpose.
+#[cfg(test)]
+mod entry_reclaim {
+    use super::*;
+    use crate::document::tests::{on_big_stack, std_root};
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    const FIRST: &str = "import std::print;\n\nfun main() {\n\tprint(\"one\");\n}\n";
+    const SECOND: &str =
+        "import std::print;\n\nfun main() {\n\tlet greeting = \"two\";\n\tprint(greeting);\n}\n";
+
+    fn analyze_here(text: &str) -> Document {
+        Document::analyze_on_this_thread(text, &std_root(), Path::new("reclaim.vl"))
+    }
+
+    /// Closing a document (dropping it) gives back exactly the text and tree
+    /// its analysis recorded — the gross record stands, the outstanding
+    /// balance at both sites is zero.
+    #[test]
+    fn dropping_a_document_reclaims_its_entry_text_and_tree() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let document = analyze_here(FIRST);
+            assert!(document.program.is_some(), "the fixture analyzes");
+            assert_eq!(leak_tally::bytes(LeakSite::LspEntryText), FIRST.len());
+            let tree = leak_tally::bytes(LeakSite::EntryAst);
+            assert!(tree > 0, "no entry tree was recorded — the pin is vacuous");
+            assert_eq!(leak_tally::released(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::released(LeakSite::EntryAst), 0);
+            drop(document);
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                FIRST.len(),
+                "the entry text was not given back to the byte"
+            );
+            assert_eq!(
+                leak_tally::released(LeakSite::EntryAst),
+                tree,
+                "the entry tree was not given back at the bytes it recorded"
+            );
+            assert_eq!(leak_tally::outstanding(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::EntryAst), 0);
+            // The gross record is unchanged by the reclaim: `bytes` still says
+            // what the analysis leaked, which is what the plateau pins read.
+            assert_eq!(leak_tally::bytes(LeakSite::LspEntryText), FIRST.len());
+        });
+    }
+
+    /// The server's path: a document analyzes, the buffer changes, a second
+    /// analysis lands through `adopt_analysis`. Exactly the FIRST analysis's
+    /// allocations are given back, exactly the SECOND's stay out, and the
+    /// adopted program still answers — its own allocations were not the ones
+    /// reclaimed. Then the document drops and both sites net to zero.
+    #[test]
+    fn a_document_that_analyzes_twice_reclaims_the_first_analysis_and_keeps_the_second() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let mut document = analyze_here(FIRST);
+            let first_tree = leak_tally::bytes(LeakSite::EntryAst);
+            let second = analyze_here(SECOND);
+            let second_tree = leak_tally::bytes(LeakSite::EntryAst) - first_tree;
+            assert!(
+                first_tree > 0 && second_tree > 0,
+                "both analyses record a tree"
+            );
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                0,
+                "nothing is reclaimed before the adoption"
+            );
+            document.adopt_analysis(second);
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                FIRST.len(),
+                "adoption must reclaim the superseded analysis's text, and only that"
+            );
+            assert_eq!(
+                leak_tally::released(LeakSite::EntryAst),
+                first_tree,
+                "adoption must reclaim the superseded analysis's tree, and only that"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::LspEntryText),
+                SECOND.len() as isize,
+                "the adopted analysis's text is the one still out"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::EntryAst),
+                second_tree as isize,
+                "the adopted analysis's tree is the one still out"
+            );
+            // The adopted program answers from its own, live allocations.
+            assert_eq!(document.analyzed_text(), SECOND);
+            let offset = SECOND
+                .find("greeting")
+                .expect("the binding is in the fixture")
+                + 1;
+            assert!(
+                document.hover(offset).is_some(),
+                "the adopted analysis no longer answers hover"
+            );
+            assert!(
+                !document.semantic_tokens().is_empty(),
+                "the adopted analysis no longer produces semantic tokens"
+            );
+            drop(document);
+            assert_eq!(leak_tally::outstanding(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::EntryAst), 0);
+        });
+    }
+
+    /// The shipped server's allocation lifetime: `Document::analyze` records on
+    /// a thread that then dies, and the `Document` is dropped on the caller's
+    /// thread. The reclaim happens where the drop happens — this thread sees a
+    /// release it never recorded, a negative outstanding balance that a cross-
+    /// thread sum (the soak's) nets to zero.
+    #[test]
+    fn an_analysis_from_its_own_thread_is_reclaimed_on_the_thread_that_drops_it() {
+        leak_tally::reset();
+        let document = Document::analyze(FIRST, &std_root(), Path::new("reclaim.vl"));
+        assert!(document.program.is_some(), "the fixture analyzes");
+        assert_eq!(
+            leak_tally::bytes(LeakSite::LspEntryText),
+            0,
+            "the record belongs to the analysis thread, not this one"
+        );
+        drop(document);
+        assert_eq!(leak_tally::released(LeakSite::LspEntryText), FIRST.len());
+        assert!(
+            leak_tally::released(LeakSite::EntryAst) > 0,
+            "the tree was not given back on the dropping thread"
+        );
+        assert_eq!(
+            leak_tally::outstanding(LeakSite::LspEntryText),
+            -(FIRST.len() as isize)
+        );
+    }
+
+    /// The degraded document (a panicked analysis) owns nothing: dropping it
+    /// releases nothing and cannot double-free.
+    #[test]
+    fn the_internal_error_document_owns_nothing_to_reclaim() {
+        leak_tally::reset();
+        let document = Document::internal_error(FIRST);
+        assert!(!document.program.is_some());
+        drop(document);
+        assert_eq!(leak_tally::released_total(), 0);
+    }
+}
+
 // Linux-only, and specifically Linux rather than unix: the harness reads
 // resident-set size from `/proc/self/statm`, which Windows does not have (the
 // CI run failed with `NotFound`) and macOS does not have either. The E3 Phase-1
@@ -9223,7 +9497,7 @@ pub(crate) mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod leak_measurement {
     use super::*;
-    use crate::document::tests::std_root;
+    use crate::document::tests::{on_big_stack, std_root};
     use vilan_core::leak_tally::{self, LeakSite};
 
     /// Resident set size in KiB, from /proc/self/statm (Linux pages × 4).
@@ -9249,6 +9523,7 @@ mod leak_measurement {
         LeakSite::MacroExpansion,
         LeakSite::MacroWorldText,
         LeakSite::MacroWorldProgram,
+        LeakSite::MacroWorldAst,
         LeakSite::MacroPreludeText,
         LeakSite::MacroBlockEntryName,
     ];
@@ -9268,8 +9543,19 @@ mod leak_measurement {
     /// at all.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     struct Counts {
+        /// GROSS bytes recorded at the entry-text site: one copy of the
+        /// analysed source per analysis, whether or not it was later given
+        /// back — the file-proportional figure the plateau claims read.
         entry_text: usize,
+        /// GROSS bytes recorded at the entry-tree site, likewise.
         entry_ast: usize,
+        /// The NET balance at the entry-text site once every `Document` the
+        /// window produced has dropped: recorded minus reclaimed. Zero is the
+        /// M7 claim (`leak-soak.md` §7); signed because a reclaim may happen
+        /// on another thread than the record.
+        entry_text_outstanding: isize,
+        /// The net balance at the entry-tree site, likewise.
+        entry_ast_outstanding: isize,
         display: usize,
         /// The two sites analysis-reuse.md §2 fixes: `parse_generated`'s leaked
         /// source and AST, reached from the stamped expansion paths.
@@ -9284,6 +9570,8 @@ mod leak_measurement {
             Counts {
                 entry_text: leak_tally::bytes(LeakSite::LspEntryText),
                 entry_ast: leak_tally::bytes(LeakSite::EntryAst),
+                entry_text_outstanding: leak_tally::outstanding(LeakSite::LspEntryText),
+                entry_ast_outstanding: leak_tally::outstanding(LeakSite::EntryAst),
                 display: leak_tally::bytes(LeakSite::DisplayName),
                 stamped_parse: leak_tally::bytes(LeakSite::MacroParseText)
                     + leak_tally::bytes(LeakSite::MacroParseAst),
@@ -9295,6 +9583,8 @@ mod leak_measurement {
         fn add(&mut self, other: &Counts) {
             self.entry_text += other.entry_text;
             self.entry_ast += other.entry_ast;
+            self.entry_text_outstanding += other.entry_text_outstanding;
+            self.entry_ast_outstanding += other.entry_ast_outstanding;
             self.display += other.display;
             self.stamped_parse += other.stamped_parse;
             self.macro_bytes += other.macro_bytes;
@@ -9316,6 +9606,8 @@ mod leak_measurement {
         rss_grown: usize,
         entry_text: usize,
         entry_ast: usize,
+        entry_text_outstanding: isize,
+        entry_ast_outstanding: isize,
         display: usize,
         /// The two sites analysis-reuse.md §2 fixes: `parse_generated`'s leaked
         /// source and AST, reached from the stamped expansion paths.
@@ -9331,6 +9623,8 @@ mod leak_measurement {
                 rss_grown,
                 entry_text: counts.entry_text,
                 entry_ast: counts.entry_ast,
+                entry_text_outstanding: counts.entry_text_outstanding,
+                entry_ast_outstanding: counts.entry_ast_outstanding,
                 display: counts.display,
                 stamped_parse: counts.stamped_parse,
                 macro_bytes: counts.macro_bytes,
@@ -9343,6 +9637,8 @@ mod leak_measurement {
             Counts {
                 entry_text: self.entry_text,
                 entry_ast: self.entry_ast,
+                entry_text_outstanding: self.entry_text_outstanding,
+                entry_ast_outstanding: self.entry_ast_outstanding,
                 display: self.display,
                 stamped_parse: self.stamped_parse,
                 macro_bytes: self.macro_bytes,
@@ -9359,7 +9655,8 @@ mod leak_measurement {
             );
             println!(
                 "[{label}] counted leak over {} analyses: entry-text {} B, entry-AST {} B, \
-                 display {} B, macro {} B, total {} B ≈ {:.0} B/analysis",
+                 display {} B, macro {} B, total {} B ≈ {:.0} B/analysis; outstanding after \
+                 the documents dropped: entry-text {} B, entry-AST {} B",
                 self.measured,
                 self.entry_text,
                 self.entry_ast,
@@ -9367,6 +9664,8 @@ mod leak_measurement {
                 self.macro_bytes,
                 self.total,
                 self.total as f64 / self.measured as f64,
+                self.entry_text_outstanding,
+                self.entry_ast_outstanding,
             );
         }
     }
@@ -9504,15 +9803,6 @@ mod leak_measurement {
         reports.remove(0)
     }
 
-    fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-        std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(work)
-            .expect("spawn measurement thread")
-            .join()
-            .expect("measurement thread panicked")
-    }
-
     // A changing, std-using document with no macros. Each `i` differs (a
     // keystroke), so every analysis re-parses and re-analyzes.
     fn no_macro_text(i: usize) -> String {
@@ -9531,12 +9821,34 @@ mod leak_measurement {
     // dependency packages, so no display names) — and nothing on the macro path
     // or any other site. RSS is far noisier (allocator retention from rebuilding
     // the reachable `Program`); it is printed, never asserted.
+    //
+    // And since M7 (leak-soak.md §7) the two named sites are RECLAIMED: every
+    // `Document` the window produced was dropped, so the outstanding balance at
+    // both is exactly zero — the gross record is still one source copy and one
+    // tree per analysis (the window genuinely re-analysed), and none of it is
+    // still out.
     #[test]
-    fn per_analysis_leak_is_bounded_by_named_sites() {
+    fn per_analysis_leak_is_bounded_by_named_sites_and_the_entry_is_reclaimed() {
         let warmup = 20;
         let measured = 200;
         let report = on_big_stack(move || measure(no_macro_text, warmup, measured));
         report.print("no-macro");
+
+        // M7: the entry text and tree of every dropped document were given
+        // back — to the byte, because the reclaim releases exactly what the
+        // leak recorded.
+        assert_eq!(
+            report.entry_text_outstanding, 0,
+            "{} B of entry text is still out after every document in the window dropped — \
+             the superseded analysis's text is not being reclaimed (leak-soak.md §7)",
+            report.entry_text_outstanding,
+        );
+        assert_eq!(
+            report.entry_ast_outstanding, 0,
+            "{} B of entry tree is still out after every document in the window dropped — \
+             the superseded analysis's AST is not being reclaimed (leak-soak.md §7)",
+            report.entry_ast_outstanding,
+        );
 
         // The counted per-analysis leak is EXACTLY the named sites — every other
         // leak site (macro path, the content-keyed module parses, the loader's
@@ -9553,9 +9865,9 @@ mod leak_measurement {
             "a non-macro document leaked {} macro bytes over {} analyses",
             report.macro_bytes, report.measured,
         );
-        // The entry source is the dominant named leak and is file-proportional:
-        // it is exactly the bytes of every analyzed text (each keystroke leaks
-        // its own source copy — the recorded, still-open refinement).
+        // The entry source is the dominant named record and is file-
+        // proportional: it is exactly the bytes of every analyzed text (each
+        // keystroke leaks its own source copy, and — above — gives it back).
         let expected_entry_text: usize = (warmup..warmup + measured)
             .map(|i| no_macro_text(i).len())
             .sum();
@@ -9807,7 +10119,8 @@ mod leak_measurement {
             "LEAK {{\"corpus\":\"{corpus}\",\"lines\":{lines},\"source_bytes\":{source_bytes},\
              \"driver\":\"{}\",\"window\":{window_index},\"analyses\":{},\"entry_text_b\":{},\
              \"entry_ast_b\":{},\"display_b\":{},\"macro_b\":{},\"total_b\":{},\
-             \"bytes_per_analysis\":{},\"rss_grown_kib\":{}}}",
+             \"bytes_per_analysis\":{},\"entry_text_outstanding_b\":{},\
+             \"entry_ast_outstanding_b\":{},\"rss_grown_kib\":{}}}",
             driver.label(),
             report.measured,
             report.entry_text,
@@ -9816,6 +10129,8 @@ mod leak_measurement {
             report.macro_bytes,
             report.total,
             report.total / report.measured,
+            report.entry_text_outstanding,
+            report.entry_ast_outstanding,
             report.rss_grown,
         );
     }
@@ -9902,6 +10217,24 @@ mod leak_measurement {
                      source per analysis over {window} analyses",
                     driver.label(),
                 );
+                // M7 (leak-soak.md §7): every one of those copies, and every
+                // tree, was given back when its document dropped — on both
+                // drivers, the per-thread one included (each analysis thread
+                // drops its own document before it reads its counters).
+                for (index, report) in reports.iter().enumerate() {
+                    assert_eq!(
+                        (report.entry_text_outstanding, report.entry_ast_outstanding),
+                        (0, 0),
+                        "{corpus} ({}) window {}: {} B of entry text and {} B of entry tree are \
+                         still out after {} analyses whose documents all dropped — the session \
+                         leak M7 fixed is back",
+                        driver.label(),
+                        index + 1,
+                        report.entry_text_outstanding,
+                        report.entry_ast_outstanding,
+                        report.measured,
+                    );
+                }
                 assert_eq!(
                     reports[1].counts(),
                     reports[0].counts(),
@@ -9953,6 +10286,16 @@ mod leak_measurement {
                 2 * source_bytes,
                 "the {} driver did not tally one copy of the {source_bytes}-byte source per \
                  analysis — a driver that reports nothing reports a clean plateau",
+                driver.label(),
+            );
+            assert_eq!(
+                (
+                    reports[0].entry_text_outstanding,
+                    reports[0].entry_ast_outstanding
+                ),
+                (0, 0),
+                "the {} driver left entry text or tree outstanding after its documents dropped \
+                 — the reclaim (leak-soak.md §7) is not reaching this driver's lifetime",
                 driver.label(),
             );
             assert_eq!(

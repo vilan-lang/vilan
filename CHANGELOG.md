@@ -17,6 +17,15 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**The language server no longer grows by megabytes per keystroke.** Every analysis the editor ran leaked a copy of the file's text and its whole parsed tree, for the rest of the session, by design: the analyzed program borrows both for `'static`. The leak soak put a number on it (proposal/leak-soak.md §4.1) — 3.12 MiB of resident memory per keystroke on a 735-line file, 0.74 MiB on a 372-line one, linear and never returned, so a couple of hours of typing in one file grew `vilan-lsp` by six gigabytes.
+
+A superseded analysis now gives both back. The document owns its program *together with* the two allocations it borrows, and when a newer analysis lands (or the file closes) the program is dropped first and the text and tree are reclaimed right after — the soundness condition being that nothing else in the compiler holds a borrow into either, which was audited global by global (§7.2) and is pinned: a document that analyzes twice releases exactly the first analysis's bytes and keeps exactly the second's. Re-run against the same two files (§7.6), the counted per-keystroke balance at both sites is zero, and resident memory per keystroke fell from 0.74 MiB to 0.05 on the 372-line file and from 3.12 MiB to 1.53 on the 735-line one. What remains on the larger file is a second, separate leak the first one was hiding — the const pass's evaluator leaves reference cycles behind on every analysis (§7.7) — measured, attributed, and filed rather than patched here.
+
+For whoever reads the leak tally: `VILAN_LEAK_REPORT`'s line is unchanged in production, and gains a `; reclaimed …` clause on a thread that has given bytes back; a macro world's entry tree now records at its own `MacroWorldAst` site instead of alongside the real entry's, so `EntryAst` means exactly the file you are editing.
+
+---
+
 <!-- family: miscompile -->
 **A method call reaches the impl that should answer it, not the one that was declared first.** `impl Foo with Into<str> { fun into(self): str { "converted" } }` and then `let s = foo.into(); print(s)` compiled clean, exited 0, and printed `[ 1 ]` — the raw struct. Your `into` was never emitted at all: std's `impl type T with Into<T>` matches every receiver, it is registered before any file of yours, and resolution took the first hit. The same defect with no std blanket anywhere in it was worse. Two impls of one trait at different arguments are legal by the language's own rule, and reaching one through a bound picked whichever was declared first: `fun to_baz<T: Conv<Baz>>(x: T): Baz { x.conv() }` against an earlier `impl Foo with Conv<Bar>` returned a `Bar` under the static type `Baz`, so reading a field declared `str` printed an `i32`. Clean compile, exit 0.
 

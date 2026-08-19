@@ -4,7 +4,7 @@
 //! platform `std` layers. These need real files on disk (the loader reads them),
 //! so each writes a throwaway package directory and analyzes against it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use vilan_core::{
@@ -1375,6 +1375,157 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
          content cache"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// M7 (`leak-soak.md` §7): `analyze_source_reclaimable` is `analyze_source`
+/// with the entry tree's handle attached — the handle recorded exactly what
+/// the `EntryAst` site shows, and reclaiming it once the program is dropped
+/// nets the site to zero while the gross record stands. The plain
+/// `analyze_source` keeps the leak: nothing is released.
+#[test]
+fn the_reclaimable_entry_analysis_hands_back_the_tree_it_leaked() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    let source: &'static str = "import std::print;\n\nfun main() {\n\tprint(\"reclaim\");\n}\n";
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let std = std_spec();
+            leak_tally::reset();
+            let vilan_core::AnalyzedEntry {
+                program,
+                diagnostics,
+                ast,
+            } = vilan_core::analyze_source_reclaimable(
+                source,
+                &std,
+                Path::new("."),
+                Path::new("reclaim_probe.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                diagnostics.is_empty(),
+                "expected a clean compile, got: {diagnostics:#?}"
+            );
+            let program = program.expect("a clean compile yields a program");
+            let ast = ast.expect("a parsed entry yields its tree handle");
+            let recorded = leak_tally::bytes(LeakSite::EntryAst);
+            assert!(
+                recorded > 0,
+                "no entry tree was recorded — the pin is vacuous"
+            );
+            assert_eq!(
+                ast.bytes(),
+                recorded,
+                "the handle must carry exactly what the site recorded, so a reclaim nets to zero"
+            );
+            assert_eq!(ast.site(), LeakSite::EntryAst);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::EntryAst),
+                recorded as isize
+            );
+            drop(program);
+            // SAFETY: the program — the tree's only borrower — was dropped on
+            // the line above; this thread holds no other reference into it.
+            unsafe { ast.reclaim() };
+            assert_eq!(leak_tally::released(LeakSite::EntryAst), recorded);
+            assert_eq!(leak_tally::outstanding(LeakSite::EntryAst), 0);
+            assert_eq!(
+                leak_tally::bytes(LeakSite::EntryAst),
+                recorded,
+                "the gross record stands"
+            );
+
+            // The wrapper keeps the leak.
+            leak_tally::reset();
+            let (_program, _errors) = analyze_source(
+                source,
+                &std,
+                Path::new("."),
+                Path::new("reclaim_probe.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(leak_tally::bytes(LeakSite::EntryAst) > 0);
+            assert_eq!(
+                leak_tally::released(LeakSite::EntryAst),
+                0,
+                "`analyze_source` must leave its tree leaked — the macro world's nested compile \
+                 and every other caller rely on that"
+            );
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+}
+
+/// A macro world's blanked entry is analysed through the same pipeline, and its
+/// tree used to land at `EntryAst` beside the real entry's. It records at
+/// `MacroWorldAst` now (bounded by `WORLDS`, like the world's text and program),
+/// so `EntryAst` is exactly the top-level entry's tree: a macro-defining entry
+/// records the SAME `EntryAst` bytes cold (world compiled) and warm (world
+/// cached), and the world's tree shows up once, at its own site.
+#[test]
+fn a_macro_worlds_tree_records_at_its_own_site_not_the_entrys() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    let source: &'static str = "import std::print;\n\n\
+        macro fun twice(arguments: Arguments): Source {\n\
+        \timport macro_std::source;\n\
+        \timport macro_std::meta::{ Arguments, Source };\n\
+        \tsource(\"2\")\n\
+        }\n\n\
+        fun main() {\n\tlet value = macro twice(1);\n\tprint(value);\n}\n";
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let std = std_spec();
+            let analyze = || {
+                leak_tally::reset();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std,
+                    Path::new("."),
+                    Path::new("world_site_probe.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                assert!(
+                    errors.is_empty(),
+                    "expected a clean compile, got: {errors:#?}"
+                );
+                assert!(program.is_some());
+                (
+                    leak_tally::bytes(LeakSite::EntryAst),
+                    leak_tally::bytes(LeakSite::MacroWorldAst),
+                )
+            };
+            let (cold_entry, cold_world) = analyze();
+            let (warm_entry, warm_world) = analyze();
+            assert!(
+                cold_entry > 0,
+                "no entry tree recorded — the pin is vacuous"
+            );
+            assert!(
+                cold_world > 0,
+                "the cold analysis compiled no macro world (or its tree recorded elsewhere) — \
+                 the pin is vacuous"
+            );
+            assert_eq!(
+                warm_world, 0,
+                "the world was recompiled on a warm, unchanged analysis — `WORLDS` missed"
+            );
+            assert_eq!(
+                cold_entry, warm_entry,
+                "`EntryAst` must be the entry's own tree alone: the cold analysis recorded \
+                 {cold_entry} B and the warm one {warm_entry} B, so the world's tree is \
+                 leaking into the entry's site"
+            );
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
 }
 
 // --- B112: a post-`build()` check attributes to its span's own file ------------
