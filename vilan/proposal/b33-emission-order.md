@@ -165,8 +165,11 @@ filtering, tree-shaking, and the functions-first assembly are unchanged
 world (`transform_functions`) applies the same order. Riders while in the
 area (investigation finds): half 2 of `module_level_bindings` is
 O(modules × variables) and rebuilt per consumer — cache or reshape it;
-`transform_const_program`'s prelude iteration is over a `HashSet`
-(:5074) — make it deterministic while touching the file.
+a const site's prelude iteration is over a `HashSet`
+(:5074) — make it deterministic while touching the file. (Both done: the
+seed caches the bindings and the prelude sorts each batch by entity id;
+the const site's build lives in `ConstWorld::prepare`, const-eval.md
+§10.4/§10.6.)
 
 ## 5. Open calls
 

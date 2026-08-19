@@ -887,8 +887,9 @@ release path keeps its own pin, gate 2.
 
 ## 10. Where the const pass's time actually goes — the M4 profile, 2026-08-18
 
-> **Status: the local half SHIPPED 2026-08-18; the structural half is a
-> DESIGN awaiting a ruling (§10.5).** M1's baseline found
+> **Status: the local half SHIPPED 2026-08-18 (§10.1–10.4); Option A, the
+> shared const world, SHIPPED 2026-08-18 (§10.6); Option B stays deferred.**
+> M1's baseline found
 > `const_eval::evaluate` costing 4.21 s of the website's 6.60 s `vilan check`
 > and filed three suspects — per-site evaluation cost, a missing memo, or
 > something super-linear. This section is what profiling found. Two of the
@@ -1100,7 +1101,7 @@ anything: **2.3 s**, the `perf_baseline` binary's gate tests going 0.69 s →
 in-process measurements is admissible there where a relative-regression
 threshold is not.
 
-### 10.5 The remaining two thirds — DESIGN, RULED 2026-08-18: Option A as recommended
+### 10.5 The remaining two thirds — DESIGN, RULED 2026-08-18: Option A as recommended (A SHIPPED, §10.6)
 
 After the hoists, `evaluate` on the website is 2.80 s debug / 308 ms release,
 and it is now almost all *evaluation*: ~68 % interpreter, ~25 %
@@ -1150,3 +1151,208 @@ and is the one with an unsettled design question in it. Neither is built here.
 *Question for the owner, and it is B's:* is a source-derived, base-cache-composed
 key worth the invalidation surface it opens, given that A gets a quarter of the
 remaining cost with no key at all?
+
+### 10.6 Option A, built — the shared const world, 2026-08-18
+
+§10.5 sized Option A's prize "from the emission count, not from a ratio nobody
+has taken", and said establishing the distinct count was the first thing the
+work should do. It was, and the ratio is enormous.
+
+**The measurement.** A temporary tally in `transform_const_program`, unioning
+each site's `required_functions` keys across a whole `evaluate` pass, over the
+website's three entries:
+
+| entry | sites | function emissions | **distinct** | instance emissions | distinct | prelude declarations | distinct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| client | 188 | 3,873 | **106** | 697 | 5 | 751 | 93 |
+| playground | 101 | 1,641 | **94** | 312 | 5 | 349 | 77 |
+| server | 224 | 4,731 | **111** | 861 | 5 | 921 | 107 |
+| **all three** | **513** | **10,245** | | 1,870 | | 2,021 | |
+
+So the overlap §10.5 called "near-total" is 36.5× on the client entry, 42.6× on
+the server's, 17.5× on the playground's — every chain enters through `style()`
+and re-lowers the same closure behind it. (§10.5's "4,545 emissions across 186
+sites" is this same number: 3,873 functions plus 697 instances is 4,570, and the
+site count moved because the website has gained `const` sites since §10.2's 483.
+The counts here are exact and were taken on the same tree the timings below are.)
+
+**And the prize, measured rather than projected.** The tally above says how much
+work is redundant, not how much time it is worth, so a second temporary
+instrument timed each body walk's EXCLUSIVE self time and split it by whether
+the pass had lowered that function before. Release, the three entries, on an
+instrumented binary (~10 % slower than the shipped one, which is why the shares
+matter and the absolutes do not):
+
+| | ms | share of the pass |
+| --- | ---: | ---: |
+| `const_eval::evaluate` | 341.0 | 100 % |
+| — the interpreter | 261.4 | 76.6 % |
+| — `transform_const_program` | 66.1 | 19.4 % |
+| ⤷ of which: FIRST lowering of each function | 4.0 | 1.2 % |
+| ⤷ of which: **re-lowering** | **58.3** | **17.1 %** |
+
+**17.1 %, against §10.5's 25–30 %.** The ruling's estimate was high because it
+sized the prize from the emission count while the split it also quoted (~25 %
+transform) had drifted to 19.4 % after §10.4's hoists. 17 % clears the work
+order's 10 % floor with room, and the whole of the transform third is within
+reach — the world costs 4 ms to lower once — so it was built.
+
+**What "shared" means, and what it does not.** The pass builds ONE
+`Transformer` (`ConstWorld`), and a site's expression is walked the first time
+the pass reaches it — lazily, in `program.const_exprs` order with the same
+dependency-first recursion as before, so a site whose free-variable check fails
+is still never walked. What that walk requires is lowered into the world's
+`required_functions` / `monomorphized` and never lowered again.
+
+What is shared is the LOWERING: immutable `js::Node` trees, handed to the
+interpreter by reference. Nothing else is:
+
+- **Every site gets its own interpreter scope.** `eval_const` takes a
+  `ConstSite` — the world declarations it reaches, its own prelude, its own body
+  — hoists all three into a fresh `Scope::root()` and runs them there, which is
+  exactly what a per-site mini-program's single `nodes` list did in the same
+  order. No site can observe a value another site produced.
+- **Every site declares its own module-level bindings.** The prelude is rebuilt
+  per site (and per dependency retry) from that site's own reached set, so its
+  values are constructed fresh from literals and folded constants each time.
+- **`asset::emit` output, budgets and failure state stay per site**, as before.
+
+The isolation question §10.5 raised — could a site see another's mutation of
+module state? — turns out to be closed by the language, not by this choice. A
+`mut` module binding is not compile-time-known, so `classify` refuses to reach
+it ("this `const` expression reaches `X`, whose value is not
+compile-time-known"); an immutable one cannot be mutated, so the analyzer
+refuses that ("cannot mutate immutable 'TABLE'"); and a copy taken out of one is
+a copy. There is no program in which the leak is expressible. Sharing the
+lowering is safe for a stronger reason than the per-site scope, and the per-site
+scope is kept anyway, because it costs ~24 `Rc` allocations a site and removes
+the question.
+
+**A site's REACH is still its own, and that is the part with teeth.** Three
+things a mini-program used to learn from its own re-walk are per-site facts, not
+world facts:
+
+1. which module-level bindings it reads — its prelude, and the `unresolved`
+   bindings that become "reaches `X`, whose value is not compile-time-known";
+2. which runtime helpers it needs — what `check_capabilities` refuses on
+   (`__random_int` is not available at expansion time);
+3. which host imports it reaches — the same refusal for `[extern]`.
+
+Lowering each function once loses all three for every site after the first, and
+a WORLD-WIDE union of them is not the same program: one site reaching
+`std::random` would refuse every other site beside it, and one site reaching a
+runtime binding would put that diagnostic on all of them. So each emission
+records what it contributed directly — its globals, helpers, imports, and what
+it directly required — and a site recovers its exact set by closing over
+`requires` from its own walk (`EmissionRecord`, `ConstWorld::reach_from`). A
+keyed emission (a generic instance, a specialized trait default, a per-type drop
+helper) reserves its identity BEFORE its body is walked, so a self- or mutually
+recursive requirement inside that body resolves to it; the closure is a
+worklist, so a cycle terminates on `visited`. A memo hit contributes to the
+asking site exactly what a fresh emission would.
+
+**The one thing a user can see, and the root cause it exposed.** One name
+generator now serves the whole pass — which is what makes the lowered bodies
+reusable at all, since names are baked into them — so two reached functions that
+share a source name cannot both be called by it: the second is minted `helper2`.
+§8.2's failure attribution matched the interpreter's frame trace against
+`program.functions` BY NAME, so `helper2` matched nothing and the diagnostic
+lost its subject: `const evaluation failed: index out of bounds` where it had
+read `const evaluation failed in `helper`: …`. Matching by name was always the
+wrong hinge — it already failed this way inside a single site whose world
+reached two same-named functions — so the fix is at the root: `resolve_trace`
+maps each frame back to the entity the generator minted it for, and the
+diagnostic reads that function's SOURCE name and anchors at its declaration.
+The emitted name is never shown. Two consequences beyond the repair: the B1
+guard against printing a synthetic or monomorphized frame is now structural (an
+instance name comes from the anonymous sequence and was minted for no entity, so
+it resolves to `None`), and C1's ambiguity guard is gone because the ambiguity
+is — a trace inside one of two `helper`s now notes the RIGHT declaration where
+it used to note neither. `functions_named` and `unique_function_named` are
+deleted.
+
+**Measured after.** Same box, same session, the two binaries run **alternately**
+(§8.4's discipline; another checkout was compiling through part of the session,
+so min and median are both reported).
+
+| | before | after | Δ min | Δ median |
+| --- | ---: | ---: | ---: | ---: |
+| `const_eval::evaluate`, website, all 3 entries, release — min / median of 8 | 332.5 / 341.4 ms | **267.0 / 273.4 ms** | **−19.7 %** | **−19.9 %** |
+| `const_eval::evaluate`, all 3 entries, debug — min / median of 6 | 3001 / 3062 ms | **2594 / 2617 ms** | −13.6 % | −14.6 % |
+| `vilan check` website, release wall — min / median of 10 interleaved | 787 / 807 ms | **716 / 730 ms** | −9.0 % | −9.5 % |
+| `vilan check` website, debug wall — min / median of 6 interleaved | 6322 / 6430 ms | **5891 / 5950 ms** | −6.8 % | −7.5 % |
+
+The pass beat its own 17.1 % projection because the per-site
+`Transformer::with_name_seed` construction and the per-site node-list assembly
+went with the re-lowering.
+
+And the harness rows, §3's recipe, release — both runs with the workspace
+already built, because the first attempt measured a run that had just paid a
+release compile and read 50–70 % swings on 15 ms corpora that no const change
+could touch. **Controls** first, as §10.4 did: `synthetic` and `reference` have
+no `const` in them, `kolt_views` and `kolt_server` barely any.
+
+| row (release) | before min / median | after min / median | Δ min / median |
+| --- | ---: | ---: | ---: |
+| LSP synthetic keystroke p50 — *control* | 8.54 / 9.61 | 8.66 / 9.84 | +1.4 % / +2.4 % |
+| `reference` cold `check` — *control* | 34.25 / 34.41 | 33.44 / 35.28 | −2.4 % / +2.5 % |
+| `kolt_server` warm `post_passes` — *control* | 11.03 / 11.75 | 11.38 / 12.22 | +3.2 % / +4.0 % |
+| LSP keystroke p50, `kolt/src/views.vl` | 63.15 / 69.13 | 63.00 / 67.12 | −0.2 % / −2.9 % |
+| `website_server` warm `post_passes` | 163.66 / 170.25 | **130.58 / 136.86** | **−20.2 % / −19.6 %** |
+| `website_server` cold `post_passes` | 160.99 / 165.32 | 132.91 / 150.66 | −17.4 % / −8.9 % |
+| `website_server` warm total | 247.41 / 255.75 | 214.17 / 223.22 | −13.4 % / −12.7 % |
+| `vilan check` website, end to end | 797.88 / 856.05 | 731.40 / 743.62 | −8.3 % / −13.1 % |
+| **LSP keystroke p50, `vilan-website/src/page.vl`** | **241.74 / 252.00** | **216.93 / 237.12** | **−10.3 % / −5.9 %** |
+
+§4.5's finding softens again: `page.vl` was 2.14× the 150 ms debounce budget at
+M1, 1.68× after §10.4, and is **1.58×** now. It still misses on every keystroke.
+`perf-baseline.jsonl` is again deliberately **not** amended, for §10.4's reason —
+§3 defines it as *the* recorded baseline, not an append log. The numbers above
+are the record.
+
+**Byte-identical output**, checked by building a copy of each package with each
+binary and diffing the trees: the website's whole `dist/` (three bundles, three
+stylesheets, two chunk manifests), kolt's, and the playground todo app's. The
+corpus goldens are byte-identical by the gate.
+
+**Pins**, all in `vilan-core/tests/inference.rs`, each proven non-vacuous by
+planting the bug it exists for and watching it redden.
+
+- `the_const_pass_lowers_its_world_once_however_many_sites_reach_it` — the
+  counter, exactly as §10.4's `NameSeed` pin and E35's call-graph pin: a world
+  lowered once and a world lowered per site produce identical values and
+  identical diagnostics, which is the whole claim, so nothing but a count can
+  tell them apart. One, three and six sites through one function all read the
+  same number. *Planted* to a fresh `ConstWorld` per site: 3 against 1, red.
+  This is also M4-A's scaling pin — the property is "does not scale with the
+  site count", stated exactly rather than in seconds, which is what §10.4's
+  timing-based asymptote guard could not manage at gate-affordable size.
+- `const_sites_sharing_a_world_compute_what_they_computed_alone` — the same
+  claim over values: three sites through one function with different arguments,
+  plus a fourth reading what they folded. *Planted* to hand every site the first
+  site's body: red.
+- `a_const_site_reads_its_module_bindings_afresh_and_never_another_sites` — two
+  sites take a copy of one const-folded module binding and grow it; each sees
+  the binding as its initializer left it. *Planted* to §10.5's literal shape —
+  one interpreter scope for the pass, module bindings declared into it once — it
+  reads "`TABLE` is not defined" and is red. Honestly: it does NOT redden on a
+  shared scope that still re-declares per site, because the copy is a copy.
+- `no_const_site_can_reach_mutable_module_state_at_all` — the reason the one
+  above is safe rather than merely observed to be: both refusals, pinned, so the
+  argument for sharing has tests under it.
+- `a_const_site_is_refused_only_for_what_it_itself_reaches` — one clean site
+  beside one that reaches `std::random`, in BOTH orders, and one clean site
+  beside one that reaches a `mut` module binding: exactly one diagnostic each
+  time. *Planted* to the world's union of helpers: two, red. This is the pin
+  that says the reach reconstruction is not decoration.
+- `a_const_failure_names_the_function_that_failed_not_the_name_it_was_emitted_under`
+  — two modules declaring `helper`, the second one failing. *Planted* back to
+  name matching: the subject vanishes, red.
+- `a_const_site_reads_its_dependency_afresh_in_a_second_analysis` (§10.4) stays
+  green and is now load-bearing for a second reason: the world is per pass, so
+  two analyses in one process build two of them.
+
+**Option B is untouched** and its question is unchanged (§10.5): what is a const
+expression's cache key? A's 20 % came with no key at all; B's prize is the
+interpreter's 77 %, and only across analyses.
+

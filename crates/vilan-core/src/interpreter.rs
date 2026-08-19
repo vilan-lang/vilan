@@ -24,7 +24,7 @@
 //!   slicing are replaced (`from_utf16_lossy`) rather than preserved.
 
 use crate::node::BinaryOp;
-use crate::transformer::{JsProgram, js};
+use crate::transformer::{ConstSite, JsProgram, js};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -226,16 +226,22 @@ struct ConstRun {
     exited: Option<i32>,
 }
 
-/// Evaluates a const mini-program — the functions and bindings one `const`
-/// expression needs, ending in `const __const_result = <expr>;` — and returns
-/// the result as plain data (const-eval.md §1) together with every effect it
-/// produced. The two public entries below decide what to do about those.
+/// Evaluates one const site against the pass's SHARED world (const-eval.md
+/// §10.6) and returns the result as plain data (§1) together with every effect
+/// it produced — the two public entries below decide what to do about those.
+///
+/// The declarations the site reaches, lowered once for the whole pass, are
+/// hoisted into a scope this site alone owns, together with its own prelude and
+/// its own body. What a per-site mini-program gave — a fresh root scope holding
+/// exactly this site's declarations and this site's module-level bindings, and
+/// nothing another site evaluated — is what this gives; only the LOWERING is
+/// shared.
 fn run_const<'a>(
-    program: &'a JsProgram<'a>,
+    site: &'a ConstSite<'a>,
     limits: Limits,
     allow_assets: bool,
 ) -> Result<ConstRun, Failure> {
-    check_capabilities(program)?;
+    check_reach(&site.imports, &site.helpers)?;
     let mut interpreter = Interpreter {
         fuel: limits.fuel,
         depth_left: limits.call_depth,
@@ -245,9 +251,17 @@ fn run_const<'a>(
         allow_assets,
     };
     let globals = Scope::root();
-    match interpreter.exec_body(&program.nodes, &globals)? {
-        Flow::Normal => {}
-        _ => {
+    // Hoisted as one body, then run as one body — a mini-program held the same
+    // three sections in the same order in a single `nodes` list.
+    Interpreter::hoist(site.world.iter().copied(), &globals)?;
+    Interpreter::hoist(site.prelude.iter(), &globals)?;
+    Interpreter::hoist(site.body.iter(), &globals)?;
+    for section in [
+        interpreter.exec_statements(site.world.iter().copied(), &globals)?,
+        interpreter.exec_statements(site.prelude.iter(), &globals)?,
+        interpreter.exec_statements(site.body.iter(), &globals)?,
+    ] {
+        if !matches!(section, Flow::Normal) {
             return Err(Failure::internal(
                 "control flow escaped the const expression",
             ));
@@ -278,10 +292,10 @@ fn run_const<'a>(
 /// user asked for this computation to happen at compile time, and printing is
 /// part of the computation that moved.
 pub fn eval_const<'a>(
-    program: &'a JsProgram<'a>,
+    site: &'a ConstSite<'a>,
     limits: Limits,
 ) -> Result<(ConstValue, Vec<(String, String)>), Failure> {
-    let run = run_const(program, limits, true)?;
+    let run = run_const(site, limits, true)?;
     Ok((run.value, run.assets))
 }
 
@@ -295,11 +309,8 @@ pub fn eval_const<'a>(
 ///   swallowing a `print` — which the explicit form legitimately does — would
 ///   silently change a working program's output when someone switched preset.
 ///   The caller turns the refusal into a silent fallback like any other.
-pub fn eval_inferred<'a>(
-    program: &'a JsProgram<'a>,
-    limits: Limits,
-) -> Result<ConstValue, Failure> {
-    let run = run_const(program, limits, false)?;
+pub fn eval_inferred<'a>(site: &'a ConstSite<'a>, limits: Limits) -> Result<ConstValue, Failure> {
+    let run = run_const(site, limits, false)?;
     if !run.stdout.is_empty() {
         return Err(Failure::unsupported(
             "output during evaluation (an inferred fold must be observably silent)",
@@ -357,10 +368,17 @@ pub fn run_program<'a>(program: &'a JsProgram<'a>, limits: Limits) -> Result<Run
 
 /// A program needing host capabilities cannot run at expansion time.
 fn check_capabilities(program: &JsProgram) -> Result<(), Failure> {
-    if !program.imports.is_empty() {
+    check_reach(&program.imports, &program.helpers)
+}
+
+/// The same refusal over what a caller REACHES rather than over a whole
+/// program — a const site against the shared world carries its own two lists
+/// (const-eval.md §10.6), and they are what it is refused on.
+fn check_reach(imports: &[String], helpers: &[&'static str]) -> Result<(), Failure> {
+    if !imports.is_empty() {
         return Err(Failure::unsupported("host bindings ([extern])"));
     }
-    for helper in &program.helpers {
+    for helper in helpers {
         // The impure helpers are absent by design; everything else is native.
         if matches!(
             *helper,
@@ -594,7 +612,19 @@ impl Interpreter {
         body: &'a [js::Node<'a>],
         env: &Env<'a>,
     ) -> Result<Flow<'a>, Failure> {
-        for node in body {
+        Self::hoist(body.iter(), env)?;
+        self.exec_statements(body.iter(), env)
+    }
+
+    /// Binds every function declaration in `nodes` over `env`, as JS hoists
+    /// them — the first half of [`Interpreter::exec_body`], split out so a const
+    /// site can hoist its shared world, its prelude and its own body together
+    /// before any of the three runs (`const-eval.md` §10.6).
+    fn hoist<'a>(
+        nodes: impl Iterator<Item = &'a js::Node<'a>>,
+        env: &Env<'a>,
+    ) -> Result<(), Failure> {
+        for node in nodes {
             if let js::Node::Function(function) = node {
                 if function.is_async {
                     return Err(Failure::unsupported("async (macro bodies are synchronous)"));
@@ -610,7 +640,16 @@ impl Interpreter {
                     .insert(function.name.as_str(), closure);
             }
         }
-        for node in body {
+        Ok(())
+    }
+
+    /// Runs `nodes` in order — the second half of [`Interpreter::exec_body`].
+    fn exec_statements<'a>(
+        &mut self,
+        nodes: impl Iterator<Item = &'a js::Node<'a>>,
+        env: &Env<'a>,
+    ) -> Result<Flow<'a>, Failure> {
+        for node in nodes {
             match self.exec_statement(node, env)? {
                 Flow::Normal => {}
                 other => return Ok(other),
