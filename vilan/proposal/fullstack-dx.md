@@ -2333,3 +2333,30 @@ Behavior was measured, not assumed. Each example was built and booted, and
 `/`, `/client.js`, `/client.css`, a deep link and `POST /rpc` were fetched:
 same status, same content types, and a served page diffed byte-identical
 against `src/app.html`.
+
+### 16.6 The todo-app draft, applied — 2026-08-18
+
+The owner asked for it the same day ("update `vilan-playground/todo` with
+the new full-stack system, if it's ready"), and it was applied by the
+orchestrator with `patch -p1` (the tree is not under git; `src/` backed up
+first). Applied clean. Then the field test the header asked for, on the
+shipped v0.34.0 CLI:
+
+- `vilan build .` — exit 0; `dist/` gains `client.chunks.json` beside the
+  three artifacts (the leg manifest S2 introduced).
+- Boot: `notes server listening on http://localhost:4600/`.
+- `GET /` — 200 `text/html`, the `Document::of(build).title("Todo")` page:
+  `<!doctype html>`, `charset="utf-8"`, `initial-scale=1`, no stray indent
+  — exactly the four cosmetic deltas §16.4's header predicted, nothing
+  else. `<link rel="stylesheet" href="/client.css" />`,
+  `<div id="app">`, `<script type="module" src="/client.js">` — all
+  derived from the build.
+- `/client.js` 200 `text/javascript` 40,568 B; `/client.css` 200
+  `text/css` 57 B; `POST /rpc` 200 `application/json`.
+- Stopped clean; port released.
+
+So the app §2.1 measured as the charter's own evidence — 19 lines, 10 of
+them ceremony, three boot-time reads and a hand-written shell — now runs
+at rung 2 with no path, file name, or MIME type in its server. The one
+behavioral change is the one the arc exists for: the page cannot disagree
+with the artifacts it names, because it is written from them.
