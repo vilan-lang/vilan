@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: breaking -->
+**`std::http`'s `build_handler` is removed.** It was `serve_build`'s fold as a plain `|Request| Response` — the same reads, the same routes, the same dev-mode freshness — packaged for a boot function that builds its own `Server` and hands you only a fallback, and it shipped with the full-stack sweep as a stopgap: `serve_service` handed over no builder to install `serve_build` on, and the two examples the book teaches from were still on `serve_service`. Both moved onto the builder, and nothing has called it since.
+
+What replaces it is the builder. A server that serves its build says `.serve_build(build)` on its `Server::builder()` chain; an rpc app that was wrapping a `serve_service` fallback in `build_handler` puts its service on that same chain instead — `Server::builder().port(port).with_service(Service::new(protocol)).serve_build(build).on_request(|request| …).on_start(on_ready).build().start()` — which is what `serve_service` expands to, plus the build's routes. The routing, persistence and services guides and the process-layer reference teach that shape where they taught `build_handler`.
+
+---
+
 <!-- family: feature -->
 **A service mirror is subscribed while — and only while — something is watching it, and it reads as a plain signal where it is shown.** `RemoteSource::sub` opened a channel that nothing ever closed: the client's only control-frame builder was called with `"Subscribe"` at both of its call sites, so the server's `stop` was unreachable, and disposing the `Subscription` that `sub` handed back stopped the local observer and nothing else — the server kept forwarding every change to a client that had stopped listening, and a second local watcher opened a *second* server-side forward on the same channel, so every value crossed the wire twice. Measured through a frame-logging relay: after the only subscription was disposed, the next `set` still put an `Update` on the wire.
 

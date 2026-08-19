@@ -128,16 +128,7 @@ async fun main() {
 Renaming the leg, adding a stylesheet, or turning `split = true` on needs
 no edit here: the build says what it emitted and the server believes it.
 An rpc app adds `.with_service(Service::new(protocol))` to the same chain
-— [Services & RPC](services.md#growing-past-one-service) has it whole. For
-a boot function that owns its own builder and hands you only a fallback —
-`serve_service`, `serve_connected` — `build_handler` is that same routing
-wrapped around your closure instead:
-
-```vilan,fragment
-build_handler(require_build("client"), |request| {
-	Response::builder().set_header("Content-Type", "text/html").body(app_html).build()
-})
-```
+— [Services & RPC](services.md#the-server-side) has it whole.
 
 ## Files: `std::fs`
 

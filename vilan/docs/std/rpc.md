@@ -185,8 +185,9 @@ picked by longest mount and independent of call order.
 runtime session registry as the connection lifecycle, the second exposes
 the per-connection hook instead (connection-scoped auth, an app-written
 attach). Both take an http `fallback` for every path the service does not
-claim — `build_handler(build, …)` is what usually fills it. `serve_rpc` is
-the odd one out and deliberately so: no upgrade, no session registry, no
+claim — the app shell, usually; serving the build's own artifacts is
+`ServerBuilder::serve_build`'s job, on the builder. `serve_rpc` is the
+odd one out and deliberately so: no upgrade, no session registry, no
 fallback, just the protocol answering every request — the server side of
 `std::rpc`'s `HttpTransport`. Reach for `with_service` when the app owns
 its builder; reach for a `serve_*` when it does not. Details:
