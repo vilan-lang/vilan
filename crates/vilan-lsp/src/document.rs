@@ -460,14 +460,19 @@ pub enum CompletionKind {
 const EXPRESSION_TYPE_DEPTH_LIMIT: usize = 8;
 
 /// The vilan book's published base URL — keyword hovers deep-link into it.
-const BOOK_BASE: &str = "https://vilan-lang.org/docs/";
+/// (`crates/vilan-cli/tests/vscode_extension.rs` and `brew_formula.rs` pin the
+/// same URL as the marketplace listing's and the tap's homepage.)
+pub(crate) const BOOK_BASE: &str = "https://vilan-lang.org/docs/";
 
 /// Every keyword the lexer classifies (`token.rs`), each with a one-line
 /// meaning and a deep link into the book: `(keyword, sentence, page#anchor)`.
 /// Semantics-bearing keywords point at the specification; the rest point where
 /// the book teaches them best. The set is kept in lockstep with the lexer by
-/// [`keyword_lexeme`], whose every keyword arm has an entry here.
-const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
+/// [`keyword_lexeme`], whose every keyword arm has an entry here. Every
+/// `page#anchor` is held to the book's own headings by `book_sync.rs` — the
+/// anchor is mdBook's slug of a heading in `vilan/docs/<page>.md`, so a
+/// heading edit there has to land here too.
+pub(crate) const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     (
         "fun",
         "Declares a function.",
@@ -491,7 +496,7 @@ const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     (
         "impl",
         "Implements methods for a type (and, with a trait, that trait).",
-        "tour/data-and-traits.html#impl--methods-and-statics",
+        "tour/data-and-traits.html#impl-methods-and-statics",
     ),
     (
         "with",

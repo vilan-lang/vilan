@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**The `impl` keyword's hover link lands on its section again, and the editor's `[platform]` attribute colours anywhere on a line.** Hovering `impl` in the editor offered a link to the book that resolved to nothing: the anchor was written `#impl--methods-and-statics`, two hyphens, where mdBook slugs the heading `impl: methods and statics` with one — the colon vanishes rather than becoming a hyphen. It was the only one of the 32 keyword-hover links that missed, and it had no test, so nothing could have said so. The VS Code grammar, separately, opened an attribute scope for every built-in marker anywhere on a line except `[platform(…)]`, which it recognised only at a line's start — `platform` had been added to the marker list inside the attribute but not to the lookahead that opens it. Both are fixed.
+
+The reason they are fixed together is that both came out of the same new gates. The suite now holds the lexer's keyword table, the scalar-primitive and numeric-suffix lists and the attribute-marker list to both highlighting grammars — the TextMate grammar and the book's highlight.js theme — in both directions, so a keyword added to the compiler fails the suite until both grammars carry it and a type the compiler has dropped fails it until the grammars drop it too (the `i64`/`u64` drift the last docs audit found by hand). It also holds every keyword-hover link to an actual heading of the book, without needing mdBook installed, and holds the book's editor page to the server: the quick-fix titles it quotes, the settings it lists, the capabilities it says the server does and does not advertise. That page said "Five" quick fixes over a table of four; it says four.
+
+---
+
 <!-- family: miscompile -->
 **A method call reaches the impl that should answer it, not the one that was declared first.** `impl Foo with Into<str> { fun into(self): str { "converted" } }` and then `let s = foo.into(); print(s)` compiled clean, exited 0, and printed `[ 1 ]` — the raw struct. Your `into` was never emitted at all: std's `impl type T with Into<T>` matches every receiver, it is registered before any file of yours, and resolution took the first hit. The same defect with no std blanket anywhere in it was worse. Two impls of one trait at different arguments are legal by the language's own rule, and reaching one through a bound picked whichever was declared first: `fun to_baz<T: Conv<Baz>>(x: T): Baz { x.conv() }` against an earlier `impl Foo with Conv<Bar>` returned a `Bar` under the static type `Baz`, so reading a field declared `str` printed an `i32`. Clean compile, exit 0.
 

@@ -96,16 +96,22 @@ Rust workspace, five crates, plus the language's own tree:
 - **Numerics:** the JS-backed integers are `i53`/`u53` (a ±2^53 contract); unknown
   numeric suffixes are hard errors.
 - **A new keyword lands in THREE places** — the lexer (`lexing.rs`, whose
-  keyword table is the `match` in `read_identifier`), the TextMate grammar
-  (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the book's
-  highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource` keyword shipped
-  with only the first and was caught twice, days apart. Check with a lexer-vs-list
-  diff, not by eye. The same drift reaches the **primitive-type** and
-  **attribute-marker** lists that sit beside the keywords in both grammars
-  (`SCALAR_PRIMITIVE_NAMES` in `type_.rs`, `is_known_attribute_marker` in
-  `parsing.rs` are the sources of truth); D15's audit found `i64`/`u64` still
-  highlighted as valid types a release after they became a hard error. Nothing
-  gates any of this yet — backlog D17.
+  keyword table is the `KEYWORDS` const `read_identifier` looks up), the
+  TextMate grammar (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the
+  book's highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource`
+  keyword shipped with only the first and was caught twice, days apart. The
+  same drift reaches the **primitive-type** and **attribute-marker** lists
+  that sit beside the keywords in both grammars (`SCALAR_PRIMITIVE_NAMES` and
+  `NUMERIC_SUFFIXES` in `type_.rs`, `KNOWN_ATTRIBUTE_MARKERS` in `parsing.rs`
+  are the sources of truth); D15's audit found `i64`/`u64` still highlighted
+  as valid types a release after they became a hard error. The lexer-vs-list
+  diff is a gate: `crates/vilan-cli/tests/grammar_sync.rs` reads those tables
+  and holds both grammars to them in both directions on every suite run, so
+  a keyword added to the lexer fails the suite until both grammars carry it.
+  Its sibling `crates/vilan-lsp/src/book_sync.rs` holds the LSP's 32
+  keyword-hover deep links to the book's headings and
+  `docs/appendix/editor.md` to the server's code-action titles, capabilities
+  and settings (D18/D19).
 - **A post-`analyze()` pass must be wired into BOTH pipelines** — `lib.rs`'s
   `analyze_source` (tests + LSP) *and* the CLI's duplicated sequence in
   `crates/vilan-cli/src/main.rs` — and verified with a CLI probe, not only an

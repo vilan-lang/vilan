@@ -2,6 +2,8 @@
 //! Analyzes each open document on change and answers diagnostics, hover,
 //! go-to-definition, find-references, and rename — across files into `std`.
 
+#[cfg(test)]
+mod book_sync;
 mod document;
 mod line_index;
 mod manifest_completion;
@@ -1618,6 +1620,71 @@ impl Backend {
     }
 }
 
+/// What the server advertises at `initialize` — every provider it answers
+/// for, and by omission every one it does not. A pure value, so the book's
+/// editor page can be held to it (`book_sync.rs`): the page's "what it gives
+/// you" and "what it does not have" are claims about exactly this struct.
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                // B39c: the client sends ranged edits, not the
+                // whole buffer per keystroke.
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
+        )),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        // Element syntax S5: editing one tag name renames its pair.
+        linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            // `.` and `:` (the second `:` of `::`) re-trigger completion so
+            // member/path candidates appear without a manual invoke.
+            trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+            ..Default::default()
+        }),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        // E2: precision highlighting from the analyzed program. The
+        // legend is index-aligned with `document::TokenKind`.
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: crate::document::TOKEN_TYPES
+                        .iter()
+                        .map(|name| SemanticTokenType::new(name))
+                        .collect(),
+                    token_modifiers: crate::document::TOKEN_MODIFIERS
+                        .iter()
+                        .map(|name| SemanticTokenModifier::new(name))
+                        .collect(),
+                },
+                full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
+                range: Some(true),
+                ..Default::default()
+            },
+        )),
+        // WO-2: the "Organize Imports" source action (sort + prune).
+        // E54: QUICKFIX (add-import, and E58's field-name rename) and
+        // the "add all missing imports" source action.
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![
+                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                CodeActionKind::QUICKFIX,
+                fix_all_imports_kind(),
+            ]),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -1646,70 +1713,7 @@ impl LanguageServer for Backend {
             self.snippet_support
                 .store(snippet_support, Ordering::Relaxed);
             Ok(InitializeResult {
-                capabilities: ServerCapabilities {
-                    text_document_sync: Some(TextDocumentSyncCapability::Options(
-                        TextDocumentSyncOptions {
-                            open_close: Some(true),
-                            // B39c: the client sends ranged edits, not the
-                            // whole buffer per keystroke.
-                            change: Some(TextDocumentSyncKind::INCREMENTAL),
-                            save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-                            ..Default::default()
-                        },
-                    )),
-                    hover_provider: Some(HoverProviderCapability::Simple(true)),
-                    // Element syntax S5: editing one tag name renames its pair.
-                    linked_editing_range_provider: Some(
-                        LinkedEditingRangeServerCapabilities::Simple(true),
-                    ),
-                    definition_provider: Some(OneOf::Left(true)),
-                    references_provider: Some(OneOf::Left(true)),
-                    rename_provider: Some(OneOf::Left(true)),
-                    document_symbol_provider: Some(OneOf::Left(true)),
-                    document_formatting_provider: Some(OneOf::Left(true)),
-                    completion_provider: Some(CompletionOptions {
-                        // `.` and `:` (the second `:` of `::`) re-trigger completion so
-                        // member/path candidates appear without a manual invoke.
-                        trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
-                        ..Default::default()
-                    }),
-                    inlay_hint_provider: Some(OneOf::Left(true)),
-                    // E2: precision highlighting from the analyzed program. The
-                    // legend is index-aligned with `document::TokenKind`.
-                    semantic_tokens_provider: Some(
-                        SemanticTokensServerCapabilities::SemanticTokensOptions(
-                            SemanticTokensOptions {
-                                legend: SemanticTokensLegend {
-                                    token_types: crate::document::TOKEN_TYPES
-                                        .iter()
-                                        .map(|name| SemanticTokenType::new(name))
-                                        .collect(),
-                                    token_modifiers: crate::document::TOKEN_MODIFIERS
-                                        .iter()
-                                        .map(|name| SemanticTokenModifier::new(name))
-                                        .collect(),
-                                },
-                                full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
-                                range: Some(true),
-                                ..Default::default()
-                            },
-                        ),
-                    ),
-                    // WO-2: the "Organize Imports" source action (sort + prune).
-                    // E54: QUICKFIX (add-import, and E58's field-name rename) and
-                    // the "add all missing imports" source action.
-                    code_action_provider: Some(CodeActionProviderCapability::Options(
-                        CodeActionOptions {
-                            code_action_kinds: Some(vec![
-                                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                                CodeActionKind::QUICKFIX,
-                                fix_all_imports_kind(),
-                            ]),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                },
+                capabilities: server_capabilities(),
                 server_info: Some(ServerInfo {
                     name: "vilan-lsp".to_string(),
                     version: None,

@@ -30146,20 +30146,7 @@ impl<'src> Analyzer<'src> {
             // An unknown suffix is an ERROR, not silently unsuffixed (`5q`
             // once typed as `i32`). The renamed wide types get a hint.
             if let Some(suffix) = suffix
-                && !matches!(
-                    suffix,
-                    "i8" | "u8"
-                        | "i16"
-                        | "u16"
-                        | "i32"
-                        | "u32"
-                        | "i53"
-                        | "u53"
-                        | "f"
-                        | "f32"
-                        | "f64"
-                        | "n"
-                )
+                && !crate::type_::NUMERIC_SUFFIXES.contains(&suffix)
             {
                 if let Some(span) = self.span_map.get(&literal_id) {
                     let span = **span;
