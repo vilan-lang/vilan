@@ -9,7 +9,7 @@ Import what you use:
 import std::reactive::{
 	Signal, Source, Subscription, Disposable, combine,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
-	Turn, FlushPolicy, turn_scope, turn, batch, flush,
+	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
 	draft, Draft, DraftState,
 	reconcile, ReconcilePlan, RowStep,
@@ -26,7 +26,7 @@ import std::reactive::{
 | `combine` | fn | tuple-signal over 2+ signals |
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `run_with_owner`, `comp`, `get_owner`, `owner_scope` | fns/context | establish/read the ambient owner |
-| `turn`, `batch`, `flush`, `FlushPolicy`, `turn_scope` | fns/context | write batching |
+| `turn`, `batch`, `flush`, `at_settle`, `FlushPolicy`, `turn_scope` | fns/context | write batching |
 | `optimistic` | fn | paint → commit → confirm-or-rollback (one shot) |
 | `Optimistic<T>`, `WriteState` | struct/enum | the same lifecycle, observable and overlap-safe |
 | `draft`, `Draft<T>`, `DraftState` | fn/struct/enum | local-first editing cell |
@@ -84,8 +84,9 @@ fun main() {
   unowned (lives as long as the source).
 - `effect` requires an ambient owner; calling it outside every owner is a
   compile error (context coverage). It fires once immediately.
-- `sub` does **not** fire immediately, and its `Subscription` is yours to
-  dispose (or hand to `owner.take`).
+- `sub` fires once immediately with the current value, like `effect`, and
+  then on every change; its `Subscription` is yours to dispose (or hand to
+  `owner.take`).
 
 ## combine
 
@@ -155,6 +156,7 @@ let turn_scope: Context<Turn>
 fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T
 fun batch<T>(body: (sync || T) context turn_scope): T   // join or create
 fun flush()                                             // drain the ambient turn now
+fun at_settle(id: i32, action: || void)                 // run `action` at the ambient settle; now if none
 ```
 
 Inside a turn, signal writes are recorded and each subscriber runs once with
@@ -164,6 +166,14 @@ an awaiting body holds every notification until it fully completes (a
 transaction). Framework boundaries establish turns for you: UI event handlers
 and `mount_root` (`AtSuspension`), RPC service handlers (`AtEnd`). Writes
 landing after a settle (from spawned work) drain in per-segment microtasks.
+
+`at_settle` defers a plain action the same way a notification is deferred:
+it rides the ambient turn's queue, deduped by `id` (repeat deferrals of one
+action in one turn run it once), joins the currently draining turn when
+called from inside a settle, and runs inline when no turn is ambient. It is
+the primitive under a remote mirror's deferred `Unsubscribe`
+(`std::rpc`); library code that wants "after this turn, once" uses it with
+an id that cannot collide with a subscriber's (`fresh_id()` mints one).
 
 ## optimistic
 

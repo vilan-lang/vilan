@@ -59080,3 +59080,56 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
          up   {\"Unsubscribe\":0}\n",
     );
 }
+
+/// A pre-existing generic-inference gap that A25's `or` lands on squarely
+/// (every census site is a list mirror): an empty `[]` passed to a `T`-typed
+/// parameter does not take its element type from the receiver's already-bound
+/// `T`, so `remote.or([])` on a `RemoteSource<List<Todo>>` yields a signal
+/// whose element is `any`/unknown — "cannot access field 'done' on type any"
+/// at the first use. `Option<List<Todo>>::unwrap_or([])` has the same gap
+/// ("cannot index this List: its element type is never determined"), and so
+/// does a `map` whose arms are `Some(let list) => list, None => []`. The
+/// annotated form `let items: Signal<List<Todo>> = remote.or([])` works and is
+/// what the examples and docs write; this pin asserts the UNANNOTATED form
+/// and stays ignored until the analyzer binds `T` from the receiver first.
+/// Reproduces on the v0.30.0 binary, so it predates A25.
+#[test]
+#[ignore = "analyzer: an empty `[]` through a `T`-typed parameter loses the element type (also Option::unwrap_or([])) — A25 ship record, remote-sources.md §8"]
+fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        [derive(Wire, PartialEq, Debug)]
+        struct Todo { id: i32, done: bool }
+
+        fun open_count(remote: RemoteSource<List<Todo>>): i32 {
+            let items = remote.or([]);
+            let remaining: Signal<i32> = items.map(|list| {
+                mut open = 0;
+                for todo in list {
+                    if !todo.done {
+                        open += 1;
+                    }
+                }
+                open
+            });
+            remaining.get()
+        }
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let todos: Signal<List<Todo>> = Signal::new([Todo { id = 1, done = false }, Todo { id = 2, done = true }]);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
+            let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let scope = Owner::new();
+            print(owner_scope.run(scope, || open_count(remote)));
+            scope.dispose();
+        }
+        "#,
+        "1\n",
+    );
+}

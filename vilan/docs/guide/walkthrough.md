@@ -223,31 +223,42 @@ build and refuses to boot when they disagree — a deleted stylesheet
 correct-looking. `Document::of(build)` skips the shell altogether and
 writes the page from the build.
 
-## The client entry: four signals and a mount
+## The client entry: two signals, a connect, and a mount
 
 [`src/client.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/client.vl) is
 the whole wiring diagram:
 
 ```vilan,fragment
 async fun main() {
-	let notes: Signal<List<Note>> = Signal::new([]);
 	let token = Signal::new(storage::get("notes-token"));
 	let route = current_path().map(parse);
 
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			let _sync = client.notes.sub(|list| notes.set(list));
-			let _root = mount_root("app", || screen(client, notes, token, route));
+			let _root = mount_root("app", || screen(client, token, route));
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}
 }
 ```
 
-Read it as: mirror in, token from `localStorage` (a reload stays signed
-in), the typed route derived from the URL, connect, mount. `NotesClient`
-comes from `import pkg::store::NotesClient;`, the same module whose
-bodies run SQL on the server. This build sees only the stub.
+Read it as: token from `localStorage` (a reload stays signed in), the
+typed route derived from the URL, connect, mount. `NotesClient` comes
+from `import pkg::store::NotesClient;`, the same module whose bodies run
+SQL on the server. This build sees only the stub. The mirror is not
+wired here at all: `client.notes` is a `RemoteSource<List<Note>>`, and
+the screen reads it where it is shown —
+
+```vilan,fragment
+fun screen(client: NotesClient<SocketTransport>, token: Signal<str>, route: Signal<Route>): View {
+	let notes: Signal<List<Note>> = client.notes.or([]);
+	…
+}
+```
+
+— `[]` until the first sync, the live list after, and a subscription
+that opens when the screen mounts and closes when it unmounts
+([Services: reading a mirror](services.md#reading-a-mirror)).
 Everything after this line is views reading those signals.
 
 ## Routes

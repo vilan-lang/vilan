@@ -14,7 +14,7 @@ signal fields, the macro generates:
 // client side
 FooClient::connect(url: str, codec: Codec): Result<FooClient<SocketTransport>, RpcError>
 client.some_rpc(args…): Result<T, RpcError>     // per [rpc] method; implicitly awaited
-client.some_signal: Signal<T>                   // per [expose] field; a live mirror
+client.some_signal: RemoteSource<T>             // per [expose] field; a typed mirror (below)
 client.transport: SocketTransport               // connection state lives here
 
 // server side
@@ -26,6 +26,50 @@ dispatcher.into_protocol(codec: Codec): RpcProtocol   // what serve_service take
 host over WebSocket, waits for the server's announcement, and verifies the
 **contract hash**: a drifted server fails the connect with
 `RpcError::Contract`.
+
+## Mirrors: `RemoteSource<T>`
+
+```vilan,fragment
+struct RemoteSource<T> { … }
+
+impl RemoteSource<type T> {
+	fun get(self): Option<T>                              // passive: the cache, `None` before the first update
+	fun status(self): Signal<Status>                      // passive: `Waiting` until a value has arrived, then `Ready`
+	fun or(self, initial: T): Signal<T>                   // counted, owner-scoped: `initial` until the first update
+	fun map<U>(self, transform: sync |Option<T>| U): Signal<U>   // counted, owner-scoped: the `Option` confronted once
+	[must_use]
+	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
+}
+
+[derive(PartialEq, Debug)]
+enum Status { Waiting, Ready }
+```
+
+A mirror holds `Option<T>` — `None` until the first `Update` lands — and
+**subscribes by demand**: every `or`, `map`, and `sub` takes a counted lease
+on the channel. The 0→1 lease sends `Subscribe` (the server answers with
+the current value at once); the 1→0 release sends `Unsubscribe`, deferred
+to the end of the ambient turn so a same-turn re-subscribe (a view
+re-rendering in place) sends nothing. A second watcher on an open channel
+sends no frame. On reconnect a watched mirror (count > 0) re-subscribes on
+its fresh channel; an unwatched one does not.
+
+`or` and `map` hand the lease to the ambient owner (the enclosing view, or
+a `run_with_owner`), so it is released at unmount; calling either where no
+owner is ambient is a compile error (context coverage), by design — a
+network subscription must have a releaser. `sub` is the manual form for
+code with no owner: you hold the `Subscription` and `dispose` it.
+
+`get` and `status` open nothing. **A `status` observer alone never sees
+`Waiting → Ready`**: `status` reports, it does not ask; until something
+that renders the value subscribes, the mirror stays `Waiting`, and that is
+correct — the channel was never opened.
+
+The `Signal<T>` that `or`/`map` return is a local derivative: writing it
+writes nothing back (the server owns the source) and the next update
+overwrites it. With an empty-list `initial`, annotate the binding
+(`let notes: Signal<List<Note>> = client.notes.or([]);`) — a bare `[]`
+does not carry its element type through `or`.
 
 ## Errors
 

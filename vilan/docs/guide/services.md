@@ -63,8 +63,8 @@ fun main() {
 ```
 
 And a client. `NotesClient::connect` gives you an object whose exposed
-fields are live local signals and whose rpc methods are ordinary calls
-that return `Result`:
+fields are typed **mirrors** (`RemoteSource<T>`, one per `[expose]`) and
+whose rpc methods are ordinary calls that return `Result`:
 
 ```vilan,browser
 import std::print;
@@ -97,13 +97,16 @@ impl Notes {
 async fun main() {
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			// The mirror: fires on every server-side change, on every client.
-			let _sync = client.entries.sub(|list: List<Note>| print(list.len()));
+			// The mirror, watched by hand: the first `sub` opens the channel,
+			// and the observer fires on every server-side change, on every
+			// client. Disposing the last watcher closes the channel again.
+			let watching = client.entries.sub(|list: List<Note>| print(list.len()));
 			// An rpc call: implicitly awaited, Result-typed.
 			match client.add("hello") {
 				Ok(let id) => print(id),
 				Err(let error) => print(i"rpc failed: {error.debug()}"),
 			}
+			watching.dispose();
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}
@@ -232,6 +235,82 @@ Three patterns follow from it:
   [drafts](reactive.md#optimistic-writes-and-local-first-drafts) whose
   commit is the rpc, and `adopt` mirror updates into them. Typing stays
   instant, remote edits fold in, and your own echoes are no-ops.
+
+### Reading a mirror
+
+A mirror is a `RemoteSource<T>`, not a `Signal<T>`, for one honest
+reason: before the first update lands it has **no value**, and nothing
+about the type pretends otherwise. You read it one of four ways:
+
+- `mirror.or(initial): Signal<T>` — the common one, for a view. A plain
+  signal you hand to `bind_each`, `bind_text`, or a `{…}` hole: `initial`
+  until the first sync, the mirrored value after. Write it inside the
+  view (not in `main`), because it is a **subscription**: it opens the
+  channel, and it is released when the view that created it is unmounted.
+- `mirror.map(|value| …): Signal<U>` — the same, with the `Option<T>`
+  in your hands once, which is where a fallback of a *different* type
+  belongs (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for
+  the same-type case.
+- `mirror.sub(|value| …): Subscription` — the manual form: an observer
+  of present values, and a handle you dispose yourself. For code with no
+  view and no owner (a probe, a script).
+- `mirror.get(): Option<T>` and `mirror.status(): Signal<Status>`
+  (`Waiting` / `Ready`) — passive reads. They open nothing.
+
+```vilan,browser
+import std::print;
+import std::json::json_codec;
+import std::reactive::Signal;
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::SocketTransport;
+import std::shared::Shared;
+import std::ui::{ View, mount_root, view };
+
+[derive(Wire, PartialEq, Debug)]
+struct Note {
+	id: i32,
+	text: str,
+}
+
+[service(NotesClient)]
+struct Notes {
+	[expose] entries: Signal<List<Note>>,
+	next_id: Shared<i32>,
+}
+
+fun notes_panel(client: NotesClient<SocketTransport>): View {
+	// Counted, and released when this view is unmounted: the channel is
+	// open while — and only while — the panel is showing. `[]` until the
+	// first sync. (Annotate the binding: an empty `[]` does not carry its
+	// element type through `or` by itself.)
+	let entries: Signal<List<Note>> = client.entries.or([]);
+	view("ul").bind_each(entries, |note| note.id, |note| view("li").text(note.text))
+}
+
+async fun main() {
+	match NotesClient::connect("/", json_codec()) {
+		Ok(let client) => {
+			let _root = mount_root("app", || notes_panel(client));
+		},
+		Err(let error) => print(i"connect failed: {error.debug()}"),
+	}
+}
+```
+
+**Subscription follows demand.** Every `or`, `map`, and `sub` takes a
+counted lease on the channel: the first one sends `Subscribe`, the last
+release sends `Unsubscribe` (deferred to the end of the turn, so a view
+that re-renders in place churns nothing). Ten bindings on one mirror
+cost one channel; unmounting the page closes it. Which is also why
+`or`/`map` must be called where an owner is ambient (inside a view, or
+under `run_with_owner`): a network subscription with nobody to release
+it is a compile error, not a slow leak.
+
+One sentence to keep in mind: **`status` reports; it does not ask.** A
+`status()` observer alone never sees `Waiting → Ready`, because nothing
+opened the channel — the mirror stays `Waiting` until something that
+renders the value (`or`, `map`, `sub`) subscribes. That is the passive
+read being honest, and the count is what makes the active ones cheap.
 
 ## Connection state and reconnection
 
@@ -395,8 +474,9 @@ working unchanged — they're this same layer with the registry lifecycle
   *old server process* is still holding the port. Check with
   `ss -tlnp | grep <port>` and kill it by pid.
 - The wire is value-semantic. A mirrored list is a fresh copy per
-  update. Mutate through rpcs, never by writing the client's mirror
-  signal.
+  update. Mutate through rpcs, never by writing the signal `or`/`map`
+  handed you — that writes the local derivative only, and the next sync
+  overwrites it.
 - An rpc handler's reply is its return value, so the handler runs to
   completion before the client hears back. Long work belongs in spawned
   tasks that write signals when done.
