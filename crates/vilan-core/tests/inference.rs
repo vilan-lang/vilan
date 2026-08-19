@@ -57401,26 +57401,12 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
 
 // --- B73: blanket-vs-specific (method-resolution.md §13) ---------------------
 //
-// DESIGN DRAFTED 2026-08-18, AWAITING RULING. Every pin below is `#[ignore]`d
-// and asserts §13.5's RECOMMENDED semantics — R1 (the trait's effective
+// RULED 2026-08-18 as recommended and SHIPPED the same day (R1 eafe5a3e,
+// R2 4e086a5d, R3 9d72f2e6 — method-resolution.md §13.8). Every pin below is
+// LIVE and asserts the shipped semantics — R1 (the trait's effective
 // arguments join the resolution key), R2 (the expected type selects among
-// argument-distinct homes), R3 (specificity ranks a genuine overlap). Nothing
-// here ships until the owner rules on §13.6; a different ruling rewrites these
-// rather than un-ignores them.
-//
-// The mechanism, for a reader who lands here first: `rank_member_candidates`
-// (analyzer.rs 11338–11369) keys the trait tier on a bare trait `Id`
-// (`member_home_trait`, 11376–11389) where B98's duplicate check and bound
-// satisfaction both key on `(trait, arguments)`, and when two impls survive
-// into one home it takes `candidates.first()` in `declaration_order`
-// (11321/11363) — std first, the entry file last. The transformer's
-// `resolve_member_on_trait_impl` (transformer.rs 6113–6137) repeats the
-// argument blindness and, via `nominal_matches` (1347–1353), disagrees with the
-// analyzer about whether a blanket matches at all.
-//
-// Every program below was run through the worktree's `target/debug/vilan`; each
-// comment records the measured answer today, which differs from what the pin
-// asserts — so none of them is vacuous.
+// argument-distinct homes), R3 (specificity ranks a genuine overlap). The
+// residue no row exercises is B128, deferred.
 
 /// §13.2 row 1, closed by R2. Before it: `Expected Bar, but got Foo instead.`
 /// — std's `impl type T with Into<T>` (`std/src/into.vl` 5–9) is a candidate for
