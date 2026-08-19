@@ -101,6 +101,12 @@ The other sixth was rebuild. Every `const` site is compiled to its own mini-prog
 On the promo site: the const pass drops from 3.41 s to 2.80 s in debug and 429 ms to 308 ms in release, `vilan check` from 845.8 ms to 734.9 ms, and — the one a person actually feels — a keystroke in the site's 735-line main page from **321.5 ms to 252.4 ms**, against a 150 ms debounce budget it still misses, by 1.68× where it used to miss by 2.14×. The two subjects with no `const` in them at all moved 4–6 %, which is the machine, and that is what makes the rest readable. Emitted output is byte-identical: the site's three bundles, three stylesheets and two chunk manifests diff clean across the change.
 
 What is left is now almost all evaluation, and cutting it further is a structural question — one shared const world per analysis, or memoization across analyses — written up as a design in `vilan/proposal/const-eval.md` §10.5 rather than built.
+
+---
+
+<!-- family: tooling -->
+**The VS Code extension's lockfile picks up `brace-expansion` 5.0.9.** Dependabot — switched on for the repository this morning — flagged the transitive `brace-expansion` 5.0.8 (via `minimatch`) in `editors/vscode/package-lock.json` for GHSA-rgw5-rvv9-x895, a denial-of-service through unbounded intermediate arrays; 5.0.9 is the patched release. Lockfile-only bump, no source change; the extension the release packages picks it up at the next cut.
+
 ## v0.34.0 — 2026-08-12
 
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
