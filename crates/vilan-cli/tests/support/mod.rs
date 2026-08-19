@@ -8,6 +8,8 @@
 //! covering unused code: nothing here is unused by the file as a set.
 #![allow(dead_code)]
 
+pub mod ladder;
+
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};

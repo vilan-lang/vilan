@@ -1,13 +1,14 @@
 // The server: boots the one authoritative `TodoStore` (which owns its own
-// persistence — see `store.vl`), serves the browser leg's build, and installs
-// the store's generated dispatcher as a service on the same builder
-// (`ServerBuilder::with_service`) — `POST /rpc` carries the client's calls, and
-// each session's SSE stream (`GET /events`) carries the list's changes out to
-// every subscribed tab. One chain, three claims on the port: the service's
-// routes, the build's artifacts, and the page for everything else.
+// persistence — see `store.vl`), serves the browser leg's build, writes the
+// page that loads it, and installs the store's generated dispatcher as a
+// service on the same builder (`ServerBuilder::with_service`) — `POST /rpc`
+// carries the client's calls, and each session's SSE stream (`GET /events`)
+// carries the list's changes out to every subscribed tab. One chain, three
+// claims on the port: the service's routes, the build's artifacts, and the
+// page for everything else.
 
 import std::build::require_build;
-import std::document::require_shell;
+import std::document::Document;
 import std::http::{ Response, Server };
 import std::json::json_codec;
 import std::print;
@@ -19,11 +20,18 @@ async fun main() {
 	// its `const` styles emitted. Nothing here names a file or a content type —
 	// `serve_build` installs one route per artifact in front of the page.
 	let build = require_build("client");
-	// Read once at boot, and CHECKED against that build: a `<link>` that no
-	// longer matches the styles the build emitted — or a mount `<div id>` that
-	// drifted from src/client.vl — stops the server here, naming the file and
-	// the fix, rather than serving a page that renders wrong and looks right.
-	let page = require_shell("src/app.html", build).html();
+	// The page, written FROM that build rather than read from a file: the
+	// `<link>`, the `<script>` and the mount `<div id>` are all derived from
+	// what the build emitted, so they cannot disagree with the artifacts they
+	// name. There is no `src/app.html` in this example — `body` carries the one
+	// line of markup that is this app's own. (`require_shell("src/app.html",
+	// build)` is the other rung: your markup, checked against the build at
+	// every boot — what `examples/walkthrough` and the `vilan init` scaffold
+	// ship.)
+	let page = Document::of(build)
+		.title("Vilan todos")
+		.body("<p style=\"opacity:0.6;font-size:0.875rem\">The list lives on the server — open this page in a second tab and watch them stay in sync.</p>")
+		.html();
 
 	// Reload, seed ids, subscribe persistence — the store's own lifecycle.
 	let store = boot();

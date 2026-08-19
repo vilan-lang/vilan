@@ -26,8 +26,17 @@ todo/
     server.vl    the node entry — owns the store, persists it, serves everything
     client.vl    the browser entry — connect, mirror, mount
     todos.vl     the UI — renders signals; never touches the data directly
-    app.html     the shell
 ```
+
+There is no `app.html`. The server writes the page from what the client leg's
+build emitted — `Document::of(build).title("Vilan todos")` — so the
+`<link>`, the `<script>` and the mount `<div id>` are derived from the
+artifacts they name and cannot disagree with them. That is the top rung of
+the full-stack ladder ([Services & RPC](../../docs/guide/services.md),
+[`std::document`](../../docs/std/process.md)); the
+[walkthrough](../walkthrough/) and the `vilan init` scaffold stand one rung
+below, with a hand-written `src/app.html` that `require_shell` checks against
+the build at every boot.
 
 `store.vl` reads and writes `todos.json` with `std::fs` while sitting in the
 same directory as the browser entry. That is safe because the check is on
@@ -45,8 +54,9 @@ both, so a stale bundle is detectable.
 
 The server holds the list in an `[expose]`d `Signal<List<Todo>>` and mounts the
 generated dispatcher on its own `Server::builder()` chain with
-`ServerBuilder::with_service`: one port serving the page, the browser leg's
-build, the WebSocket upgrade, and the RPC/SSE routes. Each tab makes ONE
+`ServerBuilder::with_service`: one port serving the page (written from the
+build), the browser leg's build (`serve_build`), the WebSocket upgrade, and the
+RPC/SSE routes. Each tab makes ONE
 generated call:
 
 1. `TodoClient::connect("/", json_codec())`: opens the WebSocket, verifies

@@ -214,14 +214,15 @@ browser entries first, so the client's artifacts are always there by the
 time the server entry builds.
 
 This file is quoted from the example as it stands, and the example is one
-rung below the top of the ladder: the shell is still an unchecked
-`fs::read_file_to_str`. Two upgrades are available to an app that owns its
-builder, both covered in [Persistence](persistence.md#putting-it-together).
-`require_shell("src/app.html", build)` holds this same file against the
-build and refuses to boot when they disagree — a deleted stylesheet
-`<link>` is otherwise a page that renders unstyled and entirely
-correct-looking. `Document::of(build)` skips the shell altogether and
-writes the page from the build.
+rung below the top of the ladder: the shell is still a file you write,
+held against the build. The last rung is `Document::of(build)`, which
+skips the shell altogether and writes the page from the build — the
+`<link>`, the `<script>` and the mount `<div id>` derived from what the
+build emitted, so there is nothing left to check. The
+[to-do example](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/todo/)
+stands there: it has no `app.html` at all. Both rungs are covered in
+[Persistence](persistence.md#putting-it-together); which one you want is a
+question of whether you care about the document.
 
 ## The client entry: four signals and a mount
 

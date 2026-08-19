@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 use vilan_core::manifest::Manifest;
 
+mod support;
+use support::ladder::documented_legs;
+
 /// A fresh temp directory for one test to scaffold into.
 fn temp_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -331,8 +334,9 @@ fn the_fullstack_template_matches_the_blessed_example_layout() {
             );
         }
 
-        // ...and the layout the manifest implies is on disk in both.
-        for relative in ["src/client.vl", "src/server.vl", "src/app.html"] {
+        // ...and the layout the manifest implies is on disk in both: the two
+        // entries' files.
+        for relative in ["src/client.vl", "src/server.vl"] {
             assert!(
                 project.join(relative).is_file(),
                 "the scaffold is missing {relative}"
@@ -342,6 +346,29 @@ fn the_fullstack_template_matches_the_blessed_example_layout() {
                 "{example} is missing {relative}"
             );
         }
+
+        // The shell is a rung, not a layout (fullstack-dx.md §5.3). The
+        // scaffold ships rung 1 + the validator — `src/app.html` on disk, read
+        // through `require_shell` — by §6.3/§10.6's ratified ruling (a new
+        // user expects to find the HTML), so the file is asserted there. An
+        // example teaches whichever rung it stands on, and must stand on one:
+        // the shell on disk, or the server writing the client leg's document
+        // itself with `Document::of(build)` (rung 2 — `examples/todo`, E65),
+        // in which case there is no `.html` to find and nothing to miss.
+        assert!(
+            project.join("src/app.html").is_file(),
+            "the scaffold is missing src/app.html — it ships rung 1 + the \
+             validator (fullstack-dx.md §6.3), with the shell on disk"
+        );
+        let server = std::fs::read_to_string(directory.join("src/server.vl"))
+            .unwrap_or_else(|error| panic!("{example}: read src/server.vl: {error}"));
+        let writes_the_document = documented_legs(&server).iter().any(|leg| leg == "client");
+        assert!(
+            directory.join("src/app.html").is_file() || writes_the_document,
+            "{example} stands on no rung: no src/app.html on disk, and \
+             src/server.vl does not write the client leg's document with \
+             `Document::of(build)`"
+        );
     }
 }
 
