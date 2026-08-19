@@ -2266,7 +2266,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.note_expected("`>` or `/>`");
                 return None;
             }
-            head.push(self.parse_element_head_item()?);
+            if let Some(item) = self.parse_element_head_item()? {
+                head.push(item);
+            }
         };
         let (children, self_closing, close_tag) = children;
         let body = ElementBody {
@@ -2283,12 +2285,30 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// attribute `name(value)`, or a bare boolean attribute `name`
     /// (proposal/element-syntax.md §2 — the dot is the disambiguator, so the
     /// grammar never consults any method list).
-    fn parse_element_head_item(&mut self) -> Option<ElementHeadItem<'src>> {
+    ///
+    /// `Some(None)` is the recovered case: a head item that could not be
+    /// completed, already reported, which the head loop drops while keeping the
+    /// element (see the chain arm).
+    fn parse_element_head_item(&mut self) -> Option<Option<ElementHeadItem<'src>>> {
         // Chain form — the link node exactly as a written chain builds it.
         if self.peek_is_ctrl('.') {
             self.bump();
-            let link = self.parse_member_call()?;
-            return Some(ElementHeadItem::Chain(link));
+            let Some(link) = self.attempt(Self::parse_member_call) else {
+                // A dot with no name after it: the shape a head is in while a
+                // chain link is being TYPED (`<div .`). The dot has already
+                // committed the item to the chain form, so this is a committed
+                // production failing — recover it the way E49 recovers every
+                // other one, by reporting and carrying on, rather than by
+                // declining and letting `parse_atom`'s element recovery flatten
+                // the whole tag (and, nested, the whole statement) to an error
+                // atom. Keeping the element is what lets the language server
+                // still answer inside a tag under construction (E67).
+                self.note_expected("a method name");
+                let context = self.context_stack.clone();
+                self.emit_failure(self.position, vec!["a method name".to_string()], context);
+                return Some(None);
+            };
+            return Some(Some(ElementHeadItem::Chain(link)));
         }
         // Event form — `on`, an adjacent `:`, an adjacent event name.
         if matches!(self.peek(), Some(Token::Ident("on")))
@@ -2308,10 +2328,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.expect_ctrl('(')?;
             let handler = self.parse_expression()?;
             self.expect_ctrl(')')?;
-            return Some(ElementHeadItem::Event(
+            return Some(Some(ElementHeadItem::Event(
                 (event, event_span),
                 Box::new(handler),
-            ));
+            )));
         }
         // Attribute form.
         let Some((name, _)) = self.parse_element_name() else {
@@ -2319,7 +2339,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         };
         if !self.peek_is_ctrl('(') {
-            return Some(ElementHeadItem::Attribute(name, None));
+            return Some(Some(ElementHeadItem::Attribute(name, None)));
         }
         self.bump();
         let value = self.parse_expression()?;
@@ -2328,7 +2348,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         }
         self.expect_ctrl(')')?;
-        Some(ElementHeadItem::Attribute(name, Some(value)))
+        Some(Some(ElementHeadItem::Attribute(name, Some(value))))
     }
 
     /// Children up to the matching `</tag>`: nested elements, quoted strings

@@ -2256,3 +2256,174 @@ branch beside a `ret`, a mistyped `ret` inside an exhaustive `if`/`else`),
 plant-proven red against an over-reaching guard (`if true ||` at
 `check_return_position`'s new check, and the narrowed `tail_yields_no_value`
 for the closure pair). Zero corpus golden movement, docs gate green.
+
+## 18. What shipped — the playground's second field test — completion gaps (E66/E67, 2026-08-18)
+
+Two completion holes the owner hit writing `vilan-playground/todo/src/client.vl`
+and filed as backlog E66 and E67. Both are the same family as §14's E52/E57
+work — completion answering the wrong question mid-edit — but neither is a
+snapshot-mapping bug: the offsets were right, and what was missing was, in one
+case, the type of the thing under the cursor, and in the other, any notion that
+the cursor was inside markup at all. One lane, `e66-e67-completion` off `next`.
+Zero corpus golden movement (`cargo test -p vilan-cli --test corpus`).
+
+### 18.1 E66 — `client.add("blah").|` offered nothing
+
+**The shape.** `client.vl:42`, inside `print(client.add(note_name.get()))`: a
+`.` typed after the call's closing paren offers nothing, where the same `.`
+after a bound name offers that name's members.
+
+**Mechanism.** Not the snapshot, not the closure, not the element — the three
+hypotheses the item raised, all disproved by probe. `Document::completion`'s
+member branch resolves a receiver two ways
+(`crates/vilan-lsp/src/document.rs`, `receiver_nominal_id`): a bare NAME
+through its binding, and anything else through `entity_at` → `hover_label` →
+`nominal_id_by_name`. The second path is the one a call takes, and it cannot
+work, for two compounding reasons:
+
+1. `hover_label` answers a `Expr::Call` with the CALLEE's signature — `make()`
+   labels as `fn make(): Point`, which is what a *hover* wants and what
+   `base_type_name` then reduces to nonsense. The `Expr::Call` arm's own
+   comment says it is a fallback for "when the call's own result type isn't
+   recorded", and it is always taken, because —
+2. `program.expr_types` / `expr_type_ids` hold a type only where one is
+   *produced*. A call is typed ON DEMAND (`Analyzer::infer_type_inner`'s
+   `Expr::Call` arm) and stores nothing on its own expr id — the same silence
+   B85 hit on `for … in` iterables and B70 on tuple elements, both of which
+   were closed by recording the type at the site into a dedicated map.
+
+So a field receiver (`p.x.`) and an index receiver (`xs[0].`) worked all along
+— those DO carry `expr_types` entries — and every call shape did not. Probed
+per shape before the fix: name ✓, field ✓, index ✓, call ✗, chained call ✗,
+call in argument position ✗, block ✗.
+
+**The fix** (LSP-side, general): a receiver's VALUE type gets its own
+resolution, separate from hover's phrasing.
+`Document::expression_type_id` answers from `expr_type_ids` where the analyzer
+recorded one and walks the structure where it did not — a binding through its
+declared type, a **call through its callee's declared return type**
+(`Function::return_type_id` / `ExternalFunction::return_type_id`, or a
+closure-typed callee's result), a block through its trailing expression, with a
+depth bound. `expression_nominal_id` reduces that to the nominal id member
+resolution is keyed by, and `expression_element_nominal_id` is its lifted twin
+(the container's first type argument) for `?.`.
+
+Type ARGUMENTS are deliberately not solved: member completion resolves on the
+nominal head, and the head is written in the declaration. That is why the
+owner's case works — the `[service(Client)]` expansion declares its client
+stubs `: Result<{return}, RpcError>` (`vilan/std/src/rpc.vl` §"The client
+sibling"), so `client.add("blah").` offers `Result`'s members without the
+solver having to have finished.
+
+The old label path is KEPT as the fallback, because it carries one shape the
+structural walk does not: a constructor call (`Some(1).`), which
+`hover_label` answers with the constructed enum. Both are pinned.
+
+**Not broken, found while pinning:** the `?.`-lifted CALL shape
+(`find()?.`) already worked — `first_generic_argument` reads
+`Option<Point>` straight out of the callee signature label. It is pinned
+anyway (the item asked for the shape), and the pin stays green when the new
+resolution is planted out.
+
+### 18.2 E67 — `<div |>` and `<div .|>` offered nothing usable
+
+**Mechanism, part one — no context.** Element syntax is desugared before
+analysis (`crates/vilan-core/src/elements.rs`, hooked at every parse entry), so
+no element node ever reaches `program`; completion had no way to know the
+cursor was between `<div` and `>`. It therefore fell through to the ordinary
+dispatch, which offered — measured — the entire enclosing scope, every
+primitive type name, every keyword and the construct snippets at `<div |>`,
+and nothing at all at `<div .|>`. Every one of those candidates is invalid in a
+head.
+
+**Mechanism, part two — no tree.** `parse_element_head_item`'s chain arm
+consumed the `.` and then required `parse_member_call` to succeed. A dot with
+no name yet declined, `parse_element` declined with it, and `parse_atom`'s
+element recovery flattened the whole tag to a `Node::Error`. Nested — which is
+every real component — the flattening took the ENTIRE statement: probed,
+`<div><span .></span></div>` recovered to nothing at all, because
+`recover_delimited`'s balanced `<…>` scan cannot close over sibling tags.
+
+**Fix, part two first** (`crates/vilan-core/src/parsing.rs`): the dot COMMITS
+the item to the chain form, so a failure after it is a committed production
+failing, and E49's rule for those is to report and carry on rather than
+decline. `parse_element_head_item` now returns `Option<Option<…>>` — the inner
+`None` being "reported, dropped, keep going" — and the bare-dot case emits its
+failure (`found …, expected a method name`) and drops the item. The element
+survives, nested or not; the file still does not compile (the diagnostic
+count is unchanged at one), and `vilan fmt` never sees the truncated head
+because the formatter refuses a tree with parse errors
+(`formatter.rs:768`). The attribute arm is deliberately untouched: a name that
+is not a name (`<div 1 2>`) means "this is not a head item at all", a different
+situation, and the shipped pin `recovers_a_garbled_element_to_an_error_atom`
+still holds it.
+
+**Fix, part one** (`crates/vilan-lsp/src/document.rs`): `in_element_head`
+answers whether a LIVE offset sits in an opening tag, from a raw parse of the
+live text — recognizing both a parsed `Node::Element` and the `<…>`-shaped
+`Node::Error` the recovery still leaves for a tag with no closer yet — and then
+a token walk from the tag name that requires the cursor to be *before the
+head's `>` and at the head's own bracket depth*. The depth clause is the whole
+boundary: the cursor in `<form on:submit(|event| { … })>` is three brackets
+deep inside a head item's ARGUMENT, which is ordinary expression ground and
+E66's answer, not this one. It is also what makes the flattened error node safe
+to read, since that node spans the arguments too.
+
+`element_head_completions` then answers from the desugar's own knowledge:
+
+- `<div .|>` — the `View` type's METHODS, found by resolving what std's
+  `view(tag)` returns (`element_view_nominal_id`), so the browser and process
+  twins each answer for their own platform and the list cannot drift from the
+  `View` the program compiles against. Methods only: a `View` FIELD is not
+  something the desugar can splice into a chain, and an ordinary member
+  completion on the desugared `view("div")` would offer them.
+- `<div |>` — the same methods in their own spelling, **dot included**
+  (undotted `text(…)` is an ATTRIBUTE named "text", a different construct and
+  the one §4's warning exists to catch), plus `on:` as a snippet for the event
+  form. And nothing from scope.
+
+**What is deliberately NOT offered, and why:** an attribute-name vocabulary.
+element-syntax.md §2 and §9 item 3 make the desugar name-blind on purpose —
+`name(x)` lowers to `.attr("name", x)` whatever `name` is, "no special-cased
+names in the lowering table, ever" — so there is no table to consume, and a
+list of HTML attribute names written into the language server would be a second
+source of truth with nothing to gate it: exactly the drift the item asked to
+avoid. Deriving one from the DOM bindings was considered and rejected: IDL
+property names are not attribute names (`className` vs `class`), and the
+desugar sets attributes, not properties. If the owner wants it, it wants to be
+data the compiler also reads, and that is a semantics change to §9 item 3.
+
+**Also not attempted:** completion for TAG names (`<di|`) and for a child
+position (`<div>|</div>`, where the grammar takes only an element, a string, or
+a `{expr}` hole, and scope candidates are still offered). Neither is in E67.
+
+### 18.3 Pins
+
+`crates/vilan-lsp/src/document.rs` — eight for E66 (call receiver, chained
+call, method call, call in argument position with the `)` and `;` still to
+come, `?.`-lifted call, block, constructor call, and the field case verbatim —
+a generated client method's `Result` reached inside a closure inside an
+element's `on:submit(…)`), and seven for E67 (`<div .|>`, `<div |>`, a nested
+tag and a nested self-closing tag, `<div .bi|>` mid-word, and three negatives:
+a head item's argument, a `.` outside any markup, and an element CHILD). The
+name-receiver contrast stays pinned where it was
+(`member_completion_lists_fields_and_methods`,
+`member_completion_on_incomplete_receiver`).
+
+`crates/vilan-lsp/src/main.rs` — one per item at the protocol layer, both on a
+STALE buffer, since each exercises a different half of the live/analyzed split:
+E66's receiver resolves against the analyzed program through
+`to_analyzed_offset`, while E67's head context can only come from the LIVE
+text (no element survives into `program` at all).
+
+`crates/vilan-core/tests/parser_recovery.rs` — one for the head-item recovery:
+both elements of the nested shape survive, no error atom is left, and the
+diagnostic is still reported.
+
+Plant-proven: the six structural E66 pins (plus the protocol one) red with
+`expression_nominal_id` planted out; all five positive E67 pins red with the
+head dispatch planted out; the three `>`-terminated E67 pins and the parser pin
+red with the head-item recovery reverted to declining. The `?.`-lifted call pin
+is honestly vacuous against the E66 plant (§18.1's last note) and the three
+negatives are vacuous by construction — they pin the boundary, and the E67
+plant is exactly what they must survive.
