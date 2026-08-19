@@ -32,6 +32,7 @@ import pkg::reactive::{
 	at_settle,
 	batch,
 	fresh_id,
+	get_owner,
 	turn,
 };
 import pkg::result::Result::{ Err, Ok, self };
@@ -1261,6 +1262,18 @@ impl ReactiveClient {
 	}
 }
 
+/// What is locally KNOWN about a mirror (`RemoteSource::status`): whether a
+/// value has arrived. Derived from the cache alone — so an UNWATCHED mirror
+/// reads `Waiting` forever, correctly: nothing opened its channel.
+[derive(PartialEq, Debug)]
+enum Status {
+	/// Nothing has arrived yet. This is what an unwatched mirror reads, for
+	/// as long as it stays unwatched — `status` reports, it does not ask.
+	Waiting,
+	/// The cache holds a value.
+	Ready,
+}
+
 /// A remote read-only handle, typed end to end: the local mirror holds
 /// `Option<T>` — `None` until the first update arrives, the typed replacement
 /// for the old `""` sentinel — `sub` opens the channel (a pre-encoded
@@ -1305,6 +1318,53 @@ impl RemoteSource<type T> {
 	/// forever, which is correct: nothing asked.
 	fun get(self): Option<T> {
 		self.cache.get()
+	}
+
+	/// Observe the mirror through `transform`, as a plain `Signal<U>` — the
+	/// one seam into the ordinary reactive world (`bind_each`, `bind_text`,
+	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
+	/// it opens the channel if nothing else has, and the lease is released
+	/// when the enclosing owner is disposed, which for a view is unmount. So
+	/// it requires an ambient owner, statically: calling it where no
+	/// `owner_scope.run` encloses is a compile error, which makes "a network
+	/// subscription must have an owner" a compile-time law. `transform` sees
+	/// `None` until the first frame lands — the one place the `Option` is
+	/// confronted, and where a fallback of a DIFFERENT type than `T` belongs
+	/// (`"Loading…"` from a `RemoteSource<i32>`).
+	fun map<U>(self, transform: sync |Option<T>| U): Signal<U> {
+		let derived = Signal::new(transform(self.get()));
+		get_owner().take(self.lease(|value| {
+			derived.set(transform(value));
+		}));
+		derived
+	}
+
+	/// `map` for the same-type case: `initial` until the first frame, the
+	/// mirrored value after. Counted and owner-released exactly like `map`,
+	/// because it IS `map` — `client.notes.or([])` inside a view replaces the
+	/// hand-built `Signal::new([])` + never-disposed `sub` pair, and the
+	/// subscription now dies with the view instead of with the tab.
+	fun or(self, initial: T): Signal<T> {
+		self.map(|value| match value {
+			Some(let present) => present,
+			None => initial,
+		})
+	}
+
+	/// What is locally KNOWN about this mirror, as a `Signal<Status>`.
+	/// Passive: opens no channel, takes no lease, needs no owner — derived
+	/// from the cache alone, so it is callable at the top of `main` where
+	/// `map` is not. The honest sentence: a `status` observer ALONE never
+	/// sees `Waiting → Ready`. `status` reports; it does not ask. If nothing
+	/// else is subscribed, the mirror stays `Waiting` forever, and that is
+	/// correct — the channel was never opened. Any path that renders the value
+	/// when it arrives (`sub`, `map`, `or`) subscribes; the count is what
+	/// makes that harmless.
+	fun status(self): Signal<Status> {
+		self.cache.map(|value| match value {
+			Some(let _present) => Status::Ready,
+			None => Status::Waiting,
+		})
 	}
 
 	/// Observe each value as it lands, present values only (the `None` before

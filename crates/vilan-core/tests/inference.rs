@@ -58755,19 +58755,17 @@ fn a25_a_counted_subscription_releases_its_lease_once() {
     );
 }
 
-/// §2b/§2c/§2d — the recommended surface, in one program. Today this does not
-/// compile: "cannot find 'Status' in the imported path" and "RemoteSource<i32>
-/// has no method 'map'". It pins four things at once: `status()` is passive
-/// (it reads `Waiting` with no frame on the wire and needs no owner); `map`
-/// carries a fallback of a DIFFERENT type than `T` (`str` from an `i32`
-/// mirror); the count rides ownership (one `Subscribe` when the scope's `map`
-/// takes its lease, one `Unsubscribe` when the scope is disposed); and the
-/// owner-coverage fence propagates through a plain call — `label` is one
-/// function call down from `owner_scope.run` and compiles, where the same call
-/// outside any scope is a hard error ("context `owner_scope` is read here, but
-/// this code can be reached without an enclosing `run`").
+/// §2b/§2c/§2d — the ratified surface, in one program. Before A25 this did
+/// not compile: "cannot find 'Status' in the imported path" and
+/// "RemoteSource<i32> has no method 'map'". It pins four things at once:
+/// `status()` is passive (it reads `Waiting` with no frame on the wire and
+/// needs no owner); `map` carries a fallback of a DIFFERENT type than `T`
+/// (`str` from an `i32` mirror); the count rides ownership (one `Subscribe`
+/// when the scope's `map` takes its lease, one `Unsubscribe` when the scope
+/// is disposed); and the owner-coverage fence propagates through a plain call
+/// — `label` is one function call down from `owner_scope.run` and compiles,
+/// where the same call outside any scope is a hard error (the next pins).
 #[test]
-#[ignore = "A25 remote-sources.md §2b/§2c/§2d: map/or/status do not exist — RECOMMENDED surface, rewritten if the ruling differs"]
 fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
     assert_compiles_and_runs(
         r#"
@@ -58833,5 +58831,252 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
          text = 8\n\
          up   {\"Unsubscribe\":0}\n\
          text = 8\n",
+    );
+}
+
+/// §2b — `map` requires an ambient owner, statically: a network subscription
+/// must have an owner, and `get_owner()` inside `map` is a strict context
+/// read, so calling it from `main` (the run-less root) is the coverage error.
+#[test]
+fn a25_map_outside_an_owner_scope_is_a_compile_error() {
+    assert_fails_with(
+        r#"
+        import std::json::json_codec;
+        import std::option::Option::{ None, Some, self };
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.map(|value| match value {
+                Some(let n) => i"{n}",
+                None => "Loading...",
+            });
+            print(text.get());
+        }
+        "#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// §2c — `or` IS `map`, so it carries the same law: no owner, no compile.
+#[test]
+fn a25_or_outside_an_owner_scope_is_a_compile_error() {
+    assert_fails_with(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.or(0);
+            print(text.get());
+        }
+        "#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// §2c — `or` reads `initial` before the first frame and the mirrored value
+/// after. Over an in-process transport the server's seed `Update` lands
+/// synchronously on `Subscribe`, so the relay HOLDS upstream frames until the
+/// program releases them: `or` is read with the `Subscribe` still in hand
+/// (`(pending)`), then the frame goes through and the derived signal follows
+/// the cache — the seed, then a later change. The scope's dispose sends the
+/// `Unsubscribe` (held too, so it prints but never reaches the server).
+#[test]
+fn a25_or_reads_the_initial_before_the_first_frame_and_the_value_after() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::shared::Shared;
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            let held: Shared<List<Frame>> = Shared::new([]);
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)} (held)");
+                held.write().push(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let title: Signal<str> = Signal::new("hello");
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(title);
+            let remote: RemoteSource<str> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let scope = Owner::new();
+            let shown = owner_scope.run(scope, || remote.or("(pending)"));
+            print(i"before the first frame: {shown.get()}");
+            for frame in held.read() {
+                spy_server.send(frame);
+            }
+            print(i"after the first frame: {shown.get()}");
+            title.set("hello again");
+            print(i"after a change: {shown.get()}");
+            scope.dispose();
+        }
+        "#,
+        "up   {\"Subscribe\":0} (held)\n\
+         before the first frame: (pending)\n\
+         down {\"Update\":[0,\"hello\"]}\n\
+         after the first frame: hello\n\
+         down {\"Update\":[0,\"hello again\"]}\n\
+         after a change: hello again\n\
+         up   {\"Unsubscribe\":0} (held)\n",
+    );
+}
+
+/// §2b — two `map`s under one owner take ONE lease each on one count: one
+/// `Subscribe` for both (the second finds the count at 1 and sends nothing),
+/// both derived signals follow the mirror, and the owner's dispose releases
+/// both leases — one `Unsubscribe`, after which neither moves.
+#[test]
+fn a25_two_maps_under_one_owner_take_one_subscribe() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::option::Option::{ None, Some, self };
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(1);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let scope = Owner::new();
+            let (doubled, label) = owner_scope.run(scope, || {
+                let doubled = remote.map(|value| match value {
+                    Some(let n) => n * 2,
+                    None => 0,
+                });
+                let label = remote.map(|value| match value {
+                    Some(let n) => i"n={n}",
+                    None => "n=?",
+                });
+                (doubled, label)
+            });
+            print(i"{doubled.get()} {label.get()}");
+            counter.set(2);
+            print(i"{doubled.get()} {label.get()}");
+            scope.dispose();
+            counter.set(3);
+            print(i"{doubled.get()} {label.get()}");
+        }
+        "#,
+        "up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,1]}\n\
+         2 n=1\n\
+         down {\"Update\":[0,2]}\n\
+         4 n=2\n\
+         up   {\"Unsubscribe\":0}\n\
+         4 n=2\n",
+    );
+}
+
+/// §2d — the honest sentence, pinned: a `status` observer ALONE puts nothing
+/// on the wire and stays `Waiting` through a server-side change, because
+/// `status` reports and does not ask — the channel was never opened. Only a
+/// real observer (`sub`) subscribes; then the cache fills and `status`
+/// follows it to `Ready`.
+#[test]
+fn a25_status_alone_opens_nothing_and_stays_waiting() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, Status, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun describe(status: Status): str {
+            match status {
+                Status::Waiting => "Waiting",
+                Status::Ready => "Ready",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(1);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let watching_status = remote.status().sub(|status| print(i"status: {describe(status)}"));
+            counter.set(2);
+            print(i"after a change: {describe(remote.status().get())}");
+            let watching = remote.sub(|n| print(i"sees {n}"));
+            watching.dispose();
+            watching_status.dispose();
+        }
+        "#,
+        "status: Waiting\n\
+         after a change: Waiting\n\
+         up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,2]}\n\
+         status: Ready\n\
+         sees 2\n\
+         up   {\"Unsubscribe\":0}\n",
     );
 }
