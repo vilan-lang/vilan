@@ -681,3 +681,123 @@ item, not fixed here.
 7. **Recorded, not filed:** `src/server.vl:25-31` (website) carries node
    externs for raw-byte read and `readdir` that `std::fs` gained in v0.34.0 —
    noted by the survey, and it belongs to whoever next opens that file.
+
+## 7. S5 ship record (2026-08-19)
+
+**Shipped: the run button, in `theme/vilan.js` alone** (lane k7-run; the
+first IIFE — the highlight.js grammar and its fence-tag shim — is
+byte-identical, the second is rewritten and grew the runner). Nothing under
+`theme/` besides that file, nothing in `book.toml`, no markdown, no
+website-repo file. The docs gate is unmodified and green.
+
+**Mechanism, as §3.1 S5 specifies.** One module worker at
+`/playground/worker.js`, spawned lazily on the first click and shared by
+every fence on the page; jobs queue first-in first-out (each fence is its own
+program, nothing is superseded); the worker is recycled after 32 compiles
+and immediately after a `crash` message — the playground's own policy
+(`editor.mjs:546-549`), with one deliberate sharpening: the playground
+defers a due recycle while work is pending, the docs recycle at 32
+regardless and let the queue wait for the fresh worker's `ready`, so the
+leak is bounded even under a burst of clicks. A worker-level error before
+`ready` is a load failure — three attempts, then the panel says the page is
+not served beside the playground and the next click tries afresh; one after
+`ready` settles the job as a crash and recycles. The runner is the
+playground's srcdoc iframe (`editor.mjs:780-835`, verified at those lines):
+`sandbox="allow-scripts"`, emitted CSS in a `<style>`, emitted JS as a
+module script, `<div id="app">`, the bootstrap forwarding console and
+uncaught errors by `postMessage` — ported verbatim, plus one addition: the
+bootstrap reports the body's height through a `ResizeObserver`, so the
+panel sizes the result to the program (a print-only example gets no empty
+box; a widget gets its room, capped at 400px with the frame's own layout
+height pinned at the cap so a `100vh` program converges). The frame's canvas
+is forced light (`color-scheme:light; background:#fff`) whatever the book's
+theme, the same opaque white Chrome already gives the playground's frame.
+The panel sits under the fence: status line, close, the result frame, the
+diagnostics rows (`severity file:line:column message`, `note:` beneath — the
+playground's own shape), the console (300 lines, then `[output truncated]`,
+the playground's cap). `Run` reads `Check` for a process-leg example and
+reports "checks clean on the server leg … the browser has no process host
+to run it". The 331 KB CodeMirror bundle is never loaded. **No `&v=`/`?v=`
+anywhere** (§2.4, Q6). Styles are one injected `<style>` written against
+`--up-*`/`--down-*`/`--stroke-*`/`--primary`/`--code-*` with mdBook's own
+variables as fallbacks, so the controls are legible in a book built without
+k6-book's theme (the screenshots below are exactly that build).
+
+**Gate, against the real published wasm** (`vilan-lang.github.io/playground/`
+copied beside the built book, served by `python3 -m http.server`, driven by
+headless Chrome 151 over CDP; every Run on a page clicked at once, so the
+queue is exercised on every page): **156 fences carry controls; the 153
+compiled fences all settle — 138 `ran`, 15 `checked`, 0 crashed, 0
+unavailable**. The other three carry controls they should not, and are the
+find below. Links: **156/156 decode back to their fence, 0 pinned, 15 carry
+`&mode=node`** — exactly the 15 `Check` fences. Also probed: the crash path
+(a synthetic `crash` from the worker → the panel's crash line, the worker
+recycled once, the next queued job compiles, a re-run of the crashed fence
+runs); recycle-after-32 (40 compiles on one page → `worker.js` fetched
+exactly twice, every job settles); the no-playground path (a server with no
+`/playground/` → three load attempts, the panel's message, a re-click
+retries); close and re-run; the mounted counter clicked three times through
+the sandbox ("clicked 3 times"). Screenshots at
+`C:\Temp\vilan-shots\k7-*.png`: `before-navy`/`after-navy-idle`/
+`after-navy-run` (the counter, navy), `before-light`/`after-light-idle`/
+`after-light-run` (hello, light), `diagnostic-navy`, `checked-light`,
+`styling-light-run`, `interact-navy`.
+
+**The codec: re-verified, not de-duplicated.** `theme/vilan.js:148-149`'s
+"resync both when either moves" (now `:150-153`) still stands. The playground's encoder
+(`editor.mjs:281-305`, pasted verbatim) was run in the same engine over all
+156 fences and compared with what each ▶ link carries: **156/156 identical**,
+and every payload round-trips through the playground's own `inflate`.
+De-duplication proper needs a shared module on the playground side (say
+`/playground/codec.js`, exporting `encodeBase64Url`/`deflate`/`inflate`,
+imported by both the editor bundle and — dynamically — the book), which is a
+website-repo change (§3.1's stop condition) and would also make the local
+`mdbook serve` book's links depend on a served playground; filed as a find,
+not done.
+
+**Two small changes to the ▶ link, both user-visible.** (1) The tooltip
+reads "Open in the vilan playground" (the run button is now the one that
+runs *here*). (2) `PROCESS_HINT` — the guess that adds `&mode=node` and
+turns Run into Check — is now the process layer's module list
+(`std/vilan.toml [library.layer.process]`: `build db document fs http process
+rpc_server watch`) plus `std::ui`'s `render`; the old list named `ws`, which
+is platform-neutral byte logic, and missed `render`, so the two SSR examples
+(`guide/ssr.md` "One component, both legs", `guide/ui.md` "Server-side
+rendering") opened the playground as browser programs and failed on the
+import. They check clean now.
+
+**Find — the fence-tag shim is blind under mdBook 0.5 (first IIFE, not
+touched).** mdBook v0.5.4 — what `docs.yml` pins — renders
+```` ```vilan,fragment ```` as `class="language-vilan fragment"` (space, not
+comma); the shim at `theme/vilan.js:137` matches `/language-(vilan[^\s]*)/`,
+captures only `vilan`, and then normalizes the class away, so
+`data-vilan-tag` never carries `browser`/`fragment`/`norun`. Consequence
+today, on the live site too: the three `fragment` fences that contain `fun
+main` (`guide/walkthrough.md` "The server entry" and "The client entry",
+`std/collections.md` "What a for can iterate" — a deliberate non-compiling
+example) carry a ▶ link that opens a failing playground, and now a Run that
+reports their diagnostics in-page; §0's "all 153" count was really 156. The
+fix is one line in the shim, `/language-(vilan(?:\s+(?:browser|fragment|norun))*)/`
+with the captured spaces normalized to the comma form the rest of the file
+expects — in the first IIFE, which this lane's order kept byte-identical; it
+belongs to whoever merges, or to D17's family (the shim is a grammar-adjacent
+drift site nothing gates). No `browser`-tagged fence imports a process module,
+so the lost `browser` tag changes no link today.
+
+**Not verified.** Firefox and Safari (Chrome only; the feature gates on
+`CompressionStream`/`DecompressionStream`/module workers, which all three
+ship); the deployed site (the book was served locally beside a *copy* of the
+Pages repo's playground, the exact bytes production serves); k6-book's tokens
+(the styles were exercised only through their fallbacks — the `--primary`
+pill and `--down-*` panel are untested against the real theme); a genuine
+wasm trap (the crash path was driven by a synthetic `crash` message, the
+worker's wire shape, not by a program that panics the compiler);
+`std/net.md`'s fetch example reports `TypeError: Failed to fetch` in the
+sandbox — a live network call from an opaque origin, the program's own
+behaviour, not the runner's.
+
+**Open.** The controls reveal on hover, like mdBook's copy button — the run
+button is undiscoverable until the pointer is on the fence; a standing Run
+is k6-book's visual call. The white result canvas in the navy theme is the
+playground's look today; a themed canvas needs a `color-scheme`/token story
+inside the program's frame and is not this slice's.
