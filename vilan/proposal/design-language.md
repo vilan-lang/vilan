@@ -8,6 +8,10 @@
 > recorded in §2.3**; Q4 the editor stays CodeMirror 6; Q5 kolt's token
 > vocabulary adopted verbatim. Adoption is sliced in the tracker (§K).
 >
+> §2.5 (the light variant) added 2026-08-19 by K6 S3 — the value
+> table Q2 deferred to the docs port; the sections after it shifted by
+> one (the playground fixes are §2.6, the editor ruling §2.7).
+>
 > Prior status: DRAFT 2026-08-18.
 >
 > Filed from the owner's 2026-08-18 cleanup list, item 3: the web
@@ -125,7 +129,81 @@ object dies: the site is a vilan program, so emit the CodeMirror theme
 (and anything else that needs raw values — the docs stylesheet once K6
 ports it) from `theme.vl`'s constants at build time. Filed as K10.
 
-### 2.5 The playground, made honest (the K-fixes this paper frames)
+### 2.5 The light variant (K6 S3, 2026-08-19)
+
+The light theme is the brand inverted — **ink on blush** where the
+dark theme is blush on ink — built with the ladder discipline
+`theme.vl:38-67` explains for the dark values, and it is the shared
+source for both light surfaces: the book's `vilan/docs/theme/css/variables.css`
+(`html.light`) and the site's `theme.vl` light block. The dark column is
+`theme.vl` as of `vilan-website@6e549d2` (`src/theme.vl` last touched at
+`8c98bbc`), copied, not re-derived; the light column is new here. Every
+contrast is WCAG relative-luminance, stated the way `theme.vl:50-61`
+states the dark ones.
+
+**The ground is the brand's own blush, exactly as the dark ground is
+the brand's own ink.** `down-dim` = `#F9DFE7`, `up-bright` = `#120004`.
+That symmetry is what makes this an inversion rather than a second
+palette: ink on blush is the same 16.3:1 that blush on ink is, and the
+two ladders below step away from their ground with the same shape the
+dark ladders have. Raised surfaces go *lighter* in both themes — the
+`down` ladder always ascends in luminance from the ground (kolt's
+`dawn-light` does the same: `down-dim` is its darkest surface), so
+`down-bright` stays the floating surface and a hairline stays a
+hairline.
+
+| role | dark (`theme.vl`) | light | how the light value was derived |
+|---|---|---|---|
+| `down-dim` | `#120004` | `#F9DFE7` | the brand blush — the ground, un-tinted |
+| `down-normal` | `#1B060D` | `#FBE7ED` | blush toward white, +2/+8/+6 — the panel; 1.06:1 against the ground (dark: 1.05:1) |
+| `down-bright` | `#28101A` | `#FDF3F6` | one more step, larger, +2/+12/+9 — raised reads as raised; 1.09:1 against the panel (dark: 1.09:1) |
+| `up-bright` | `#F9DFE7` | `#120004` | the brand ink — **16.3:1** on the ground (dark: 16.3:1) |
+| `up-normal` | `#D8BEC8` | `#3B262D` | ink pulled toward the blush along the same warm pink (hue 340°) — **11.2:1** (dark: 11.8:1) |
+| `up-dim` | `#9A7F8B` | `#6A535B` | one more pull — **5.6:1** (dark: 5.6:1); the dim tier clears 4.5:1 on every surface (5.9:1 on the panel, 6.4:1 raised), so nothing in the hierarchy is decorative-only |
+| `down-hover` | `rgba(255, 255, 255, 0.06)` | `rgba(18, 0, 4, 0.06)` | ink at the same alpha: white at 6% on ink is a 1.11:1 step, ink at 6% on blush is 1.13:1 — the same perceived hover |
+| `down-active` | `rgba(255, 255, 255, 0.10)` | `rgba(18, 0, 4, 0.10)` | likewise 1.23:1 / 1.24:1 |
+| `stroke-hard` | `#402C32` | `#CFAFBA` | the visible hairline: blush deepened until it sits 1.59:1 off the ground (dark: 1.58:1) |
+| `stroke-soft` | `rgba(64, 44, 50, 0.5)` | `rgba(207, 175, 186, 0.5)` | the hard hue at half strength, as in dark |
+| `primary` | `#EB682E` | `#AE3611` | ember, deepened: at its dark value ember reads 2.6:1 on blush and cannot be a link; at `#AE3611` it is **5.0:1** on the ground, 5.3:1 on the panel — same hue, a weight that carries text |
+| `primary-on` | `#120004` | `#F9DFE7` | the inversion again — blush on the light primary is 5.0:1, ink on the dark primary 6.4:1 |
+| `accent` | `#E5AFD9` | `#922A7C` | rose, deepened the same way (hue 313° kept): the dark rose is 1.5:1 on blush; `#922A7C` is **5.9:1**, which is what code strings need |
+| `up-info` | `#F4F4F5` (zinc-100) | `#3F3F46` (zinc-700) | see the semantic note below — 8.3:1 |
+| `up-caution` | `#FBBF24` (amber-400) | `#92400E` (amber-800) | 5.7:1 |
+| `up-error` | `#FB7185` (rose-400) | `#BE123C` (rose-700) | 5.0:1 |
+| `down-info` | `#10B981` (emerald-500) | `#10B981` | fixed |
+| `down-caution` | `#FBBF24` (amber-400) | `#FBBF24` | fixed |
+| `down-danger` | `#FB7185` (rose-400) | `#FB7185` | fixed |
+| `tint-callable` | `#F0A886` | `#7F260D` | the code palette's one non-role value: primary pulled toward `up-bright` (dark: toward blush; light: ~30% toward ink) — 8.1:1 on the panel (dark: 9.9:1) |
+
+**The semantic hues, precisely.** Kolt fixes emerald/amber/rose across
+its themes and only ever prints the `up-*` word *on* the `down-*` fill
+(its light theme sets all three `up-*` to white). Vilan spends `up-error`
+and `up-caution` as standalone text on the ground
+(`playground_page.vl:362-368`), and on blush the 400-weight hues are
+unreadable — amber-400 is 1.3:1, rose-400 2.1:1. So the rule this
+paper fixes is: **the hue is fixed; the `down-*` fills keep their
+Tailwind 400/500 values in both themes (they are borders and 6–7%
+washes, never text); the `up-*` text tier steps down the same
+Tailwind ladder until it clears 4.5:1 on the light ground** — rose-700,
+amber-800, zinc-700. Same family, a weight that reads. The playground's
+diagnostics pane needs nothing else to re-theme.
+
+**What the code surface inherits.** `code_palette` (`theme.vl:185-206`)
+is all roles plus alpha pulls on them, so it re-themes on its own — with
+one stated exception: `--code-comment` is `up-bright` at 0.5 in dark
+(4.4:1 on the panel) but ink at 0.5 on the light panel is 3.7:1, so
+**the light theme takes 0.6** (5.3:1). `--code-attr` keeps primary at
+0.65 in both (3.2:1 dark, 2.9:1 light — a deliberately dimmed register,
+unchanged in kind). The hljs mapping in the book uses the same slots the
+CodeMirror theme names (K10), so which role plays "keyword" is still a
+single edit.
+
+**`color-scheme` is honest on both.** The book declares
+`--color-scheme: light` on `html.light` and `dark` on `html.navy`
+(mdBook's `general.css` applies it to `:root`); the site's light block
+must flip `app.html:6` the same way when it lands.
+
+### 2.6 The playground, made honest (the K-fixes this paper frames)
 
 - **K1** — the playground joins the site nav: today `top_bar()` renders
   exactly three links, none of them the playground
@@ -154,7 +232,7 @@ ports it) from `theme.vl`'s constants at build time. Filed as K10.
   DOM list via `playground.vl:266-344`) from one worker payload —
   fine, but the restyle should treat them as one designed system.
 
-### 2.6 The editor stays CodeMirror 6
+### 2.7 The editor stays CodeMirror 6
 
 Recommendation, firm: **stay on CM6.** The study found the restyle is
 "small, mechanical, well-contained" (one theme object, one tokenizer,
@@ -175,7 +253,7 @@ LSP-grade completion, CM6's autocomplete API is already in the bundle.
   *Recommendation: role tokens now, light variant with K6's docs port —
   docs are where light mode earns its keep.*
 - **Q3 — CommitMono** for all code surfaces? *Recommendation: yes.*
-- **Q4 — editor stack**: ratify §2.6 (stay CM6)?
+- **Q4 — editor stack**: ratify §2.7 (stay CM6)?
 - **Q5 — token vocabulary**: adopt kolt's `up`/`down`/`stroke`/`primary`
   names verbatim, or rename for vilan? *Recommendation: verbatim — the
   system is proven, and one vocabulary across kolt and the web estate
