@@ -153,6 +153,34 @@ fun flush() {
 	}
 }
 
+/// Run `action` when the ambient turn settles; with no ambient turn, now. The
+/// action rides the turn's pending queue as an ordinary `Subscriber`, so it is
+/// deduped by `id` exactly like a notification — repeated deferrals of the
+/// same action inside one turn flush once — and it resolves its turn the way
+/// `Signal::notify` does: the ambient turn, else the currently DRAINING one
+/// (an action deferred from inside a settle joins that settle), else inline.
+/// The caller owns `id` (a `fresh_id()` kept for the action's lifetime) so the
+/// dedup is per action, not per call. "Ambient" is the context rule's
+/// (spec §8.4): reached through a stored closure — an owner's cleanup, a
+/// subscription's release hook — the turn is the one that closure captured
+/// at creation, exactly as a `set` from a stored callback; a settled capture
+/// drains on a microtask (`enqueue`'s late path), which still lands after
+/// the current synchronous segment. `proposal/remote-sources.md` §2a: the
+/// `Unsubscribe` a remote mirror owes at its last release is deferred here,
+/// which is what lets a same-segment re-subscribe cancel it.
+fun at_settle(id: i32, action: || void) {
+	let deferred = [Subscriber { id, notify = action }];
+	match turn_scope.get_safe() {
+		Some(let turn) => enqueue(turn, deferred),
+		None => {
+			match draining_turns.read().last() {
+				Some(let draining) => enqueue(draining, deferred),
+				None => action(),
+			}
+		},
+	}
+}
+
 /// Establish a FRESH turn for `body`'s dynamic extent, and settle it when the
 /// extent ends. The isolation primitive: `body`'s writes (and those of the
 /// closures it creates — capture-at-creation) queue here and nowhere else.
@@ -222,6 +250,12 @@ fun batch<T>(body: (sync || T) context turn_scope): T {
 struct Subscription {
 	subscribers: Shared<List<Subscriber>>,
 	id: i32,
+	// Extra teardown to run on dispose, once. `Signal::sub` leaves it `None`;
+	// a COUNTED subscription — `RemoteSource::sub`, whose lease holds a
+	// network channel open (`proposal/remote-sources.md` §2a) — puts its
+	// decrement here, so disposing the handle releases the lease too. A cell,
+	// so every copy of the handle shares the one-shot.
+	release: Shared<Option<|| void>>,
 }
 
 impl Subscription with Disposable {
@@ -249,6 +283,17 @@ impl Subscription with Disposable {
 					}
 				}
 				turn.pending.write() = kept_pending;
+			},
+			None => {},
+		}
+
+		// The release hook runs ONCE: taken out before it runs, so a second
+		// `dispose` (an owner releasing a handle the app already disposed by
+		// hand) cannot double-decrement a count.
+		match self.release.read() {
+			Some(let release) => {
+				self.release.write() = None;
+				release();
 			},
 			None => {},
 		}
@@ -384,7 +429,7 @@ impl Signal<type T> with Source<T> {
 			},
 		});
 		observer(self.get());
-		Subscription { subscribers = self.subscribers, id }
+		Subscription { subscribers = self.subscribers, id, release = Shared::new(None) }
 	}
 }
 
