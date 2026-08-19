@@ -885,7 +885,7 @@ why in one sentence, and the gap is pinned `#[ignore]` as
 `a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation`
 (`AGENTS.md` gate 4) for the analyzer item that closes it.
 
-### The corpus — STOPPED, not regenerated
+### The goldens — STOPPED, not regenerated
 
 `cargo test -p vilan-cli --test corpus` exits 101: **six goldens diverge**
 — `reactive.vl`, `reactive-flatten.vl`, `reactive-owner.vl`,
@@ -896,12 +896,19 @@ field (`[ self[1], id, __shared_new([ 1 ]) ]`), `Subscription::dispose`'s
 tail gains the release-hook match, and the minified helper names shift
 behind those two. No other change of shape. Each rebuilt program's stdout
 under node is byte-identical to its tracked golden's (all six compared).
-This is an inherent consequence of the ratified §2a design — the
-alternative the paper rejected, a bespoke `RemoteSubscription`, is the only
-shape that leaves `Signal::sub` untouched — and the brief says stop, so the
-goldens are untouched on the lane; regenerating them (after `cargo build`)
-is the merge's call. The full suite on the lane is therefore red by exactly
-this test; every other binary is green.
+The split fixture's pinned artifacts (`crates/vilan-cli/tests/split/golden`,
+`the_split_fixture_emits_its_pinned_artifacts`) move for exactly the same
+reason — `app.js` by the constructor, the dispose tail and the renames
+behind them, the three route chunks by renames only, `app.chunks.json` not
+at all (diffed with the `$name`s normalized: nothing else changes). This is
+an inherent consequence of the ratified §2a design — the alternative the
+paper rejected, a bespoke `RemoteSubscription`, is the only shape that
+leaves `Signal::sub` untouched — and the brief says stop, so every golden
+is untouched on the lane; regenerating them (after `cargo build`; the split
+ritual is in `split.rs`'s header) is the merge's call. The full suite on
+the lane: `cargo nextest run --workspace` exits 100 — `3779 tests run:
+3777 passed (1 slow), 2 failed, 6 skipped`, the two being these; every
+other binary is green.
 
 ### Outside this repo — the diffs to apply
 
