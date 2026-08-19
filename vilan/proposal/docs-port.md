@@ -1,0 +1,668 @@
+# The docs port — the book, the brand, and the run button (K6)
+
+> Status: **DRAFT 2026-08-18 — for review.** Proposal-first; nothing is
+> built. Tracker home: `backlog-2026-08-18.md` §K6, with K7 (run buttons /
+> open-in-playground) and K5 slice 3 (the light theme) riding it, and K11
+> (playground wasm retention) adjacent.
+>
+> Filed from the owner's 2026-08-18 cleanup list, item 10: *"Transitioning
+> the docs to the vilan framework and integrating it more closely with the
+> rest of the site. Adding a run button to the example programs using the
+> same tech as the playground. Maybe an 'Open in playground' link for them
+> too."*
+>
+> Governing records already ratified: `design-language.md` (the role
+> tokens, the two registers, CommitMono, and — §3 Q2 — *"role tokens now,
+> the light variant with K6's docs port"*), `documentation.md` §4 (the
+> fence gate), `docs-site.md` (why mdBook), `fullstack-dx.md` §5.3 (the
+> ladder), `const-eval.md` (the asset channel and the const budgets),
+> `bundle-splitting.md` (route chunks).
+>
+> Everything cited from `vilan-website` and `vilan-lang.github.io` was read
+> read-only, at `vilan-lang.github.io@72fd0bb` fetched 2026-08-18 17:27 —
+> file-presence claims there are true of that commit.
+
+## 0. Thesis
+
+The owner asked for one thing and named three; they separate cleanly, and
+only one of them is expensive.
+
+**"Open in playground" is already shipped.** `vilan/docs/theme/vilan.js:146-218`
+puts a ▶ link on every complete example, encoding the program into the
+playground's share fragment with the playground's own codec. All 153
+compiled fences in the book carry `fun main`, so all 153 already have one.
+K7's second half is done and the tracker does not know it.
+
+**The run button and the visual integration are cheap, and neither needs a
+port.** The run button needs `playground/worker.js` (99 lines, which
+resolves its compiler entirely from `import.meta.url` and is therefore
+embeddable from any path) plus the srcdoc-iframe runner (`editor.mjs:780-835`)
+— not the 331 KB CodeMirror bundle. The visual integration is 42 CSS custom
+properties in one mdBook theme override, plus two Handlebars partials that
+this paper probed and confirmed land where the chrome needs them.
+
+**The port itself — markdown rendered to Views by a vilan program — cannot
+be built today, and the wall is not effort but capability.** A `const`
+cannot read a file (`interpreter.rs:359-372` refuses every `[extern]`; probed:
+`const evaluation failed: host bindings ([extern])`). A `const` cannot return
+a `View` (`ConstValue` has no object variant, `interpreter.rs:105-115`; probed:
+`a const result must be plain data; this evaluates to a Shared cell`). There
+is no markdown parser in std, and no regex to write one with. And the fuel
+budget — 1,000,000 per const expression, a compiler constant and not a
+manifest knob (`const_eval.rs:22-24`, `const-eval.md:735-739`) — is exhausted
+by a **minimal** char-scanning loop somewhere between 41,000 and 60,000
+characters, while the book's largest page is 40,767 bytes. The budget does
+not fit a real parser on the book we have.
+
+**So: re-theme mdBook onto the design system, integrate the chrome, land the
+run button — and file the port's actual prerequisite (a markdown story) as
+its own item, so the dogfooding the owner wants becomes reachable instead of
+declined.** The content never adapted to the tool, which is what
+`docs-site.md:53-56` promised, so the exit stays cheap whenever the
+prerequisite lands.
+
+## 1. The estate today
+
+### 1.1 What the book is
+
+56 markdown files under `vilan/docs/`, 585,080 bytes, 89,085 words, 457
+headings — tour 12, guide 9, std 16, spec 12, appendix 5. Measured, not
+estimated. The link graph is dense: **417 cross-page `.md` links** (32 of
+them anchored), plus 34 same-page `#anchor` links. The largest page is
+`spec/memory.md` at 40,767 bytes; the mean is 10.4 KB.
+
+Fences carry harness tags (`documentation.md` §4, `docs.rs:6-10`):
+` ```vilan ` (node), ` ```vilan,browser `, ` ```vilan,norun `, and
+` ```vilan,fragment ` (never compiled). Measured today: **153 compiled
+fences** and **164 fragment fences**.
+
+### 1.2 How it is gated — and why the gate is renderer-independent
+
+The docs gate does **not** run mdBook. `crates/vilan-core/tests/docs.rs:39-58`
+walks `vilan/docs/**/*.md` directly (skipping only `book/`), extracts fences
+with its own CommonMark-shaped rules (`docs.rs:100-154` — indent tracking,
+same-indent close, §4.5 dedent, all unit-pinned at `docs.rs:304-420`), and
+compiles each through `analyze_source` + `transform` (`docs.rs:195-251`). The
+repo README is held to the same gate (`docs.rs:203-207`). A second copy of
+the fence logic lives in `crates/vilan-core/tests/parse_differential.rs:118`,
+and `docs.rs:88-91` says the two must agree.
+
+This is the single most important fact for the design space: **the gate is
+coupled to the markdown, not to the renderer.** `docs-site.md:110-113` chose
+that deliberately — *"The site build itself stays out of the suite: it would
+make every test run depend on an installed external binary."* Any option that
+keeps `vilan/docs/**/*.md` as the source keeps the gate untouched, for free.
+
+There is one renderer-shaped gate: `docs.rs:257-297`
+(`the_sidebar_covers_every_page`) asserts that every page appears in
+`SUMMARY.md` and every `SUMMARY.md` entry points at a real file — both
+directions. `SUMMARY.md` is mdBook's file. An option that retires mdBook must
+either keep `SUMMARY.md` as the nav source of truth or re-point this gate at
+whatever replaces it; retiring it without a replacement loses a real check
+(`docs-site.md:104-108`).
+
+### 1.3 How it is rendered
+
+mdBook v0.5.4, configured by `vilan/docs/book.toml`: `src = "."`,
+`build-dir = "book"`, `additional-js = ["theme/vilan.js"]`,
+`default-theme = "light"`, `preferred-dark-theme = "navy"`. No preprocessors,
+no alternate backends. `vilan/docs/theme/vilan.js` (7,617 B) does three jobs:
+a regex-level highlight.js grammar for vilan (`:17-127`), the fence-tag shim
+that re-highlights `language-vilan,browser` blocks after mdBook's own pass
+(`:129-143`), and the playground-link pass (`:146-218`).
+
+**Probe — the built book.** `mdbook build` on a scratch copy: exit 0, 6.5 MB
+of output, 53 chapter pages plus `index`/`404`/`print`/`toc`. Its weight is
+not the prose:
+
+| artifact | bytes | note |
+|---|---|---|
+| `searchindex-*.js` | 3,153,732 | 45% of the served `docs/` tree |
+| `print.html` | 712,860 | `noindex`, excluded from the sitemap — pure dead weight |
+| `fonts/` | 516 KB | Open Sans ×10 + Source Code Pro — stock mdBook, unrelated to the brand |
+| `highlight-*.js` | 137,537 | stock highlight.js, which the grammar registers into |
+
+**Probe — the leak.** `book.toml` lands in the output. The mechanism is
+`book.toml:8`'s `src = "."`: because the source dir *is* `vilan/docs/`,
+mdBook's copy-non-markdown pass sweeps up the config sitting beside the
+pages. The same mechanism ships `theme/vilan.js` **twice** — once verbatim,
+once as the hashed `theme/vilan-<hash>.js` that the pages actually load.
+Confirmed live at `vilan-lang.github.io/docs/book.toml` and
+`docs/theme/vilan.js`. The rot survey found the first; the second is new here.
+
+### 1.4 How it is deployed — and where `main` comes in
+
+The docs workflow lives in the **Pages repo**, not the compiler repo:
+`vilan-lang.github.io/.github/workflows/docs.yml`. (The compiler repo has
+exactly two workflows, `ci.yml` and `release.yml`; neither publishes docs.)
+The inversion is deliberate and documented at `docs.yml:2-4` — *"This repo
+owns the build so no cross-repo credential exists."*
+
+- Triggers (`docs.yml:11-17`): `workflow_dispatch`, daily cron `17 6 * * *`,
+  and pushes to `main` that touch the workflow itself. **Nothing fires on a
+  vilan-repo commit**; the cut flow dispatches it by hand.
+- Source (`docs.yml:31-35`): `vilan-lang/vilan`, **`ref: main`**. The
+  published book is the *released compiler's* book. Today `main` is at
+  `0967ad52` (v0.34.0, 2026-08-12) and `next` is 48 commits ahead, which is
+  why `appendix/editor.md` exists in the tree and `docs/appendix/editor.html`
+  does not exist on the site. That is the design working, not a defect — but
+  it is the constraint a run button inherits (§2.4).
+- Build (`docs.yml:36-47`): mdBook v0.5.4 pinned, fetched by raw `curl`, no
+  checksum. Then `rm -rf docs && mv toolchain/vilan/docs/book docs` — the
+  target tree is destroyed and replaced wholesale every run.
+- Publish (`docs.yml:68-77`): `git add -A docs`, guarded by a staged-diff
+  check, as `docs-builder <docs@vilan-lang.org>`. A `docs/sitemap.xml` is
+  shell-generated from what actually built (`docs.yml:48-67`).
+
+The site is the other leg of a **three-repo triangle**.
+`vilan-website/.github/workflows/deploy.yml` runs on every push to `main`:
+install the released toolchain from `install.sh` (`:50-54`, deliberately the
+user's own on-ramp), `vilan build .` (`:59-60`), a smoke gate that compiles
+every seeded playground example against the exact wasm the visitor will get
+(`:61-62`), then **render by curl** — start `node dist/server.mjs`, fetch `/`
+and `/playground`, assert the `<!--ssr-->` marker is gone or fail the build
+(`:63-77`). It pushes as a GitHub App scoped to the Pages repo (`:105-113`)
+with an **explicit filename allowlist** (`:149-153`), never `git add -A`,
+precisely so `docs/` stays the other workflow's and `assets/` stays the
+owner's (`deploy.yml:6-7`).
+
+The two bots are single-writer within their prefix, which is what lets them
+race safely (`deploy.yml:161-166` even carries a rebase fallback commented
+*"a concurrent docs publish can win the push race"*). **This is the property
+any merge of the pipelines must not lose.**
+
+### 1.5 The site, and what it does not use
+
+`vilan-website` is one vilan package with three entries (`vilan.toml:11-25`):
+`client` and `playground` (browser) and `server` (node). One `fun page(): View`
+in `src/page.vl:80-101`; `std::ui` resolves per entry platform, so the server
+renders markup and the client re-renders and replaces (`src/client.vl:119`
+`mount_root`, the render-then-replace shape `ssr.md` v1 ratified).
+
+What it does **not** use, all of it shipped std:
+`Document::of` (`fullstack-dx.md:805-812`), `serve_build`
+(`fullstack-dx.md:774-781`), `split = true`, and any router. `src/server.vl`
+still hand-writes the boot reads (`:61-70`), a three-line marker splice
+(`:40-45`), and a literal-path `match` with a catch-all (`:114-165`) — the
+exact block `serve_build` exists to delete. There are **two pages**, two
+shells, two browser bundles, and no route abstraction anywhere.
+
+The design tokens are real and already shaped for this work.
+`src/theme.vl:34-36` mints each token as a `Color` carrying both its `var()`
+reference and its own `:root` declaration, and `:26-30` states the contract:
+*"A THEME SWAP IS A TOKEN SWAP: slice 3's light theme redeclares this block
+behind a selector and every surface below follows on its own. Nothing past
+this block names a hex."* The role vocabulary is in place (`up`/`down`/
+`stroke`/`primary`, `:70-106`), the faces are tokens (`:142-148`), and
+`code_palette` (`:185-206`) mints ~21 `--code-*` slots that the CodeMirror
+theme reads by name and never by hex (`:174-184`) — K10's mechanism, and
+exactly the one `design-language.md` §2.4 says the docs stylesheet should
+join.
+
+Two facts to hold: the site's CSS classes are **content-hashed atomic
+classes emitted by the build** (`s1onro1c`, `smqxnvc` …), so its markup is a
+build artifact and not a template anyone can hand-copy; and the `@font-face`
+declarations for Inter / Vilan Display / CommitMonoV143 live inline in
+`src/app.html:25-53`, not in `client.css`. The nav already links the book
+(`src/masthead.vl:96-102`: `/docs/` and `/docs/tour/hello-vilan.html`), as
+does the footer (`src/page.vl:705`).
+
+The site is dark-only (`src/app.html:6` hard-declares
+`color-scheme: dark`); the book is light-by-default (`book.toml:15`). That
+mismatch is the visible half of what K5 slice 3 is for.
+
+### 1.6 The playground, and the two pieces a run button needs
+
+`playground/worker.js` is 99 lines and a thin adapter. It resolves its
+compiler version from `?v=<tag>` or `manifest.json`, then loads the glue and
+the gzipped wasm from a **versioned, immutable directory** — all of it via
+`new URL(…, import.meta.url)` (`worker.js:27-41`). Because every path is
+relative to the worker's own URL, `new Worker("/playground/worker.js", {type:"module"})`
+resolves identically from a page at `/docs/guide/ui.html` as from
+`/playground/`. Its wire protocol is five message kinds (`worker.js:17-25`).
+
+Running a program is **not** `eval`: `editor.mjs:780-835` builds one
+`sandbox="allow-scripts"` iframe per Run, with the emitted CSS in a `<style>`,
+the emitted JS as a `type="module"` script, a `<div id="app">` mount, and a
+bootstrap that forwards console and uncaught errors by `parent.postMessage`.
+Opaque origin, no same-origin access, torn down and rebuilt each time. The
+worker is recycled after 32 compiles and immediately after any crash, because
+the wasm instance leaks per compile by design (`editor.mjs:546-549`).
+
+**None of that needs `editor.js`** — the 331 KB CodeMirror bundle is the
+*editing* surface. A docs run button needs the worker, the iframe, and a
+console sink.
+
+The share fragment is `#code=<base64url(deflate-raw(source))>` with optional
+`&mode=node` and `&v=<tag>` (`editor.mjs:307-313`), written by Share
+(`:315-336`) and decoded on load ahead of `localStorage` and the seeded
+default (`:364-389`). `theme/vilan.js:166-180` reimplements that codec
+byte-for-byte and says so at `:148-149`: *"the SAME codec the playground's
+Share writes … resync both when either moves."*
+
+**Probe — does the fragment carry the book?** Encoding all 153 compiled
+fences with the real codec: median 270 characters, p90 463, **max 959** (the
+71-line router example at `guide/routing.md:19`, 1,679 source bytes). Worst
+case URL ≈ 999 characters — under even the historic 2,083-character floor,
+with 2× headroom. **Every example in the book fits, and there is no size
+class the link has to refuse.**
+
+### 1.7 The Pages repo as the meeting point
+
+24 MB, 179 files, no README distinguishing bot-written from hand-owned.
+`docs/` is 6.4 MB (45% of it the search index). `playground/` is 15 MB, of
+which **~14.1 MB is 21 immutable versioned wasm directories, v0.19.0 through
+v0.34.0** — 59% of the entire served repository is dead compiler history, and
+`playground/manifest.json` is rebuilt by `ls`-ing those directories
+(`deploy.yml:133-141`), so *the directory list is the retention policy*. That
+is K11, and §2.4 explains why the docs touch it.
+
+## 2. The design space, honestly costed
+
+### 2.1 Option A — render markdown to Views in a vilan program
+
+The owner's literal ask. Costed against the tree, with probes.
+
+**A1. There is no markdown parser in std, and little to write one with.**
+41 root modules; `json.vl` (1,258 lines) is the only parser in the library,
+for a far simpler grammar. `string.vl` offers `split`, `substring`,
+`code_at`, `contains`, `starts_with` — **no regex**. CommonMark-ish in pure
+vilan is realistically 1,500–3,000 lines, and it would have to reproduce
+mdBook's heading-slug algorithm exactly (§A5).
+
+**A2. A `const` cannot read a file.** The asset channel is emission-only:
+`std/src/asset.vl` is two lines of surface (`emit(kind, line)`), assembled at
+`const_eval.rs:202-222` and written beside the JS at `main.rs:2340-2342`.
+There is no read direction in the spec or the code, and no `include_str!`.
+Every `std::fs` read is `[extern]`, and `check_capabilities`
+(`interpreter.rs:359-372`) refuses `[extern]` before a single node executes.
+
+> **Probed.** `let doc = const read_file_to_str("page.md");` →
+> `error: const evaluation failed: host bindings ([extern]) is not available at expansion time`
+
+Adding the read direction is a new host builtin, a carve-out in the
+capability gate, and a build-invalidation story — and it cuts against the
+determinism invariant `const-eval.md:775-778` is built on. That is a
+proposal-and-ruling, not an afternoon.
+
+**A3. A `const` cannot return a `View`.** `ConstValue` (`interpreter.rs:105-115`)
+has no object variant; `value_to_const` rejects `Value::Object`
+(`interpreter.rs:150`). The SSR `View` holds three `Shared` fields
+(`std/src/process/ui.vl:50-55`); the browser `View` holds a live `Element`.
+
+> **Probed.** `let node = const heading("Hello");` →
+> `error: const evaluation failed: a const result must be plain data; this evaluates to a Shared cell`
+
+**A4. The one shape that does work — and its ceiling.** Structs, tuples,
+enums and `List` all lower to JS arrays (`transformer.rs:1324-1326`), so a
+plain-data markdown AST *does* survive const evaluation.
+
+> **Probed.** A `const parse(...)` returning `List<Md>` over an enum of
+> `Heading(i32, str)` / `Para(str)` compiles and runs. The emitted JS is
+> `const tree = [ [ 0, 1, "Title" ], [ 1, "A paragraph." ] ];` and `parse`
+> is eliminated from the output entirely. The parse really happened at
+> compile time.
+
+That is the only viable target shape: const-eval to a plain-data AST, walk it
+at runtime to build Views. It halves the win — the tree-building still
+happens at runtime — and it runs into the budget:
+
+> **Probed — the fuel ceiling.** Explicit `const` gets 1,000,000 fuel and
+> depth 512 (`const_eval.rs:22-24`), charged roughly per evaluated AST node
+> (`interpreter.rs:627, 665, 789`). A **minimal** char-scanning loop — read
+> `code_at`, compare to one byte, increment — const-evaluates 41,000
+> characters and **fails at 60,000** with
+> `const evaluation did not finish within the compile-time budget in scan: the fuel budget was exhausted`.
+> That is ≈17–24 fuel per character for a loop that does nothing. At 100,000
+> characters the compile did not finish in two minutes.
+
+`spec/memory.md` is 40,767 bytes. **The book's largest page sits at the
+ceiling for a scan that only counts `#`**, and a real parser is several times
+heavier per character. The budget is a compiler constant, not a manifest knob
+(`const-eval.md:735-739`), and there is no incremental memoization —
+`const-eval.md:180-186` ships v1 evaluating on every compile. Worse, the const
+pass is *already* the measured hot spot the owner just ruled a fix for:
+`const-eval.md:1103-1131` (§10.5, Option A, RULED 2026-08-18) is about making
+186 mostly-trivial style sites cheaper. Adding 56 markdown parses lands
+directly on it.
+
+**A5. Even granting all three, mdBook must be re-implemented.** Search
+(mdBook's elasticlunr index), the sidebar, prev/next, the theme picker,
+mobile layout, print, the `.md`→URL rewrite over **417 links**, and heading
+anchors over **457 headings** — where the anchors are not free choices,
+because `crates/vilan-lsp/src/document.rs:464+` holds **32 keyword-hover deep
+links** into `https://vilan-lang.org/docs/` (`document.rs:456-457`) in
+mdBook's exact `page.html#slug` shape, and `vscode_extension.rs:192` and
+`brew_formula.rs:316` both pin that base URL as the published homepage.
+`docs-site.md:53-56` costed a hand-rolled generator at *"a real project
+(days, plus ongoing maintenance), spent on web plumbing rather than the
+language"* — and the content has roughly tripled since.
+
+**A6. Delivery is not obviously simpler.** The site deploys to *static*
+GitHub Pages by running the server and curling **two** URLs
+(`deploy.yml:63-71`), with a filename-explicit allowlist (`:149-153`). 56
+pages means 56 curls and a directory-shaped `git add`, and the markdown
+lives in the compiler repo — so the website's deploy would have to check out
+`vilan-lang/vilan`, which is precisely what `docs.yml` already does. The
+work moves; it does not shrink. And the two-writer safety of §1.4 has to be
+re-established under one workflow.
+
+**A7. And the content would ship in the bundle.** `bundle-splitting.md:51-60`
+is explicit: *"Module-level bindings never split. Every module binding stays
+in the entry chunk."* A const-evaluated page AST is a module binding, so
+585 KB of book would be eager by construction. Per-route functions do split
+(`bundle-splitting.md:27-43`), but the site has no router at all today, and
+render-then-replace SSR (`ssr.md` v1) means the client re-renders every
+article it was served.
+
+**Killer cost:** the input path does not exist, the budget does not fit the
+book, and past those two you are re-implementing mdBook against 32 external
+deep links that pin its anchor algorithm.
+
+### 2.2 Option B — keep mdBook as the renderer; re-theme it and integrate the chrome
+
+**B1. The restyle surface is 42 CSS custom properties.**
+
+> **Probed.** `mdbook init --theme` dumps the full override surface: 25
+> files, of which `theme/css/variables.css` (10,422 B) is the whole palette
+> — 42 variables per theme across five theme blocks (`.light`, `.navy`,
+> `.coal`, `.ayu`, `.rust`), including `--mono-font` as a single variable.
+
+mdBook is already token-driven, which is what makes this a mapping and not a
+rewrite: one `variables.css` override maps its 42 names onto the ratified
+`up`/`down`/`stroke`/`primary` roles, `theme/fonts/fonts.css` replaces 516 KB
+of Open Sans + Source Code Pro with the Inter / CommitMonoV143 faces already
+shipped at `vilan-lang.org/assets/fonts/`, and `additional-css` carries the
+fine grain (density, hairlines, the 13–15px band `design-language.md` §2.2
+asks tool surfaces for). The `--code-*` slots of `theme.vl:185-206` are the
+natural source for the code-block palette — `design-language.md` §2.4 already
+names "the docs stylesheet once K6 ports it" as a consumer.
+
+**B2. The chrome can actually be injected — probed, not assumed.**
+
+> **Probed.** `theme/head.hbs` lands inside `<head>` (page line 11).
+> `theme/header.hbs` lands as the **first child of `.page`**, above mdBook's
+> own menu bar (page line 120). Both survive a clean build, exit 0.
+
+One caveat found by the same probe: `nav#sidebar` is a *sibling* of
+`.page-wrapper`, so a `header.hbs` masthead starts to the right of the
+sidebar. A full-bleed masthead above everything needs the `theme/index.hbs`
+override — a 367-line template fork with an mdBook-upgrade maintenance cost.
+The honest v1 is `header.hbs` plus CSS; the fork is available if the owner
+wants the bar edge-to-edge.
+
+The markup itself must not be hand-copied: the site's classes are
+build-generated hashes (§1.5). Two mechanisms, both real: (i) the website's
+deploy exports a chrome fragment (a `/_chrome` route rendered by the same
+`top_bar()` / `page_footer()` code) into the Pages tree, and `docs.yml`
+consumes it as `theme/header.hbs` before running mdBook — both workflows
+already write to that repo; or (ii) the docs chrome is authored once against
+the *tokens* rather than the site's classes, accepting a second markup copy
+in exchange for zero cross-workflow coupling. (i) is the dogfooding answer
+and is recommended; (ii) is the fallback if the owner would rather not
+couple the two workflows.
+
+**B3. The light theme is nearly free.** mdBook already ships a light/dark
+picker and `book.toml` already names `light` / `navy` as the defaults.
+Slice 3 becomes: reskin `.light` and `.navy` onto the vilan tokens, and hide
+the other three picker entries with three lines of `additional-css` (they are
+hardcoded at `index.hbs:152-159`, so removing them properly needs the
+template fork — hiding them does not). Meanwhile the site gains its light
+variant the way `theme.vl:26-30` already says it will: redeclare the token
+block behind a selector.
+
+**B4. The run button is theme JS.** `theme/vilan.js` already walks every
+`code[data-vilan-tag]` block and appends to `pre .buttons` (`:186-217`). The
+run button is the same pass, plus: one lazily-spawned
+`new Worker("/playground/worker.js", {type:"module"})` shared across the
+page, the srcdoc-iframe runner lifted from `editor.mjs:780-835`, and a
+collapsible output panel. The worker's `import.meta.url` resolution (§1.6)
+means no path changes. "Open in playground" needs nothing — it ships.
+
+**B5. Everything else is unchanged.** Authoring: unchanged. The fence gate:
+unchanged, because it never touched mdBook (§1.2). The SUMMARY gate:
+unchanged. Search: unchanged. SEO and first paint: unchanged, and unchanged
+here means *best available* — static HTML with no client re-render.
+Sourcing: stays `main`, which is what the run button needs (§2.4). Deploy:
+one workflow edit (a `rm docs/book.toml docs/theme/vilan.js` after the
+`mv`, killing the §1.3 leak for free) plus the chrome-fragment step of B2.
+
+**Killer cost:** it declines the owner's literal ask. The docs stay rendered
+by a Rust binary, and the dogfooding is limited to the chrome fragment and
+the run-button widget. That is a real cost and §4 Q1 puts it to the owner
+rather than burying it.
+
+### 2.3 Option C — the hybrid: mdBook bodies served under the site's `Document`
+
+mdBook builds the body HTML at CI; the vilan site's process leg serves it
+under `Document::of` with the site chrome; search stays mdBook's.
+
+It does not survive contact with the deploy. **Production is static GitHub
+Pages** — the site's process leg runs only in CI, and the deploy captures it
+by curl (`deploy.yml:63-71`). So "the site serves the book" means "CI curls
+56 URLs and pushes the HTML", which is option B's output arrived at through
+option A's integration bill.
+
+And the bill is real, because mdBook's chapter body is not a free-standing
+fragment. It arrives with `path_to_root` relative rewriting computed per
+depth, a sidebar populated by `toc.js`, a searcher that expects mdBook's own
+DOM, a theme picker wired to `<html>` classes, and clipboard/highlight passes
+— all of which either come along (in which case the site is hosting mdBook's
+chrome inside its own, twice) or get dropped and re-implemented (in which
+case this is option A with an mdBook-shaped parser). It also moves the docs
+build into the website repo's deploy, adding a cross-repo checkout of
+`vilan@main` there and growing a filename-explicit allowlist by 56 entries,
+while dissolving the single-writer property of §1.4.
+
+**Killer cost:** it pays option A's integration bill to obtain option B's
+output, and it trades a safe two-writer deploy for a fragile one-writer one.
+
+### 2.4 The K11 interaction, stated precisely
+
+A run button compiles against a wasm compiler, and that compiler comes from
+the Pages repo's versioned directories. Three facts decide the coupling:
+
+1. The book is built from `vilan@main` (`docs.yml:31-35`), i.e. the released
+   compiler; the playground manifest's `compiler` field names the latest
+   release (`deploy.yml:133-141`). **They already agree** — an unpinned run
+   button naturally compiles the released book's examples under the released
+   compiler.
+2. Therefore the run button should **not** emit `&v=<tag>` pins. If it does
+   not, retention never becomes user-facing: only `manifest.json`'s current
+   entry is load-bearing, and every older directory is reachable solely
+   through a deliberately-pinned share link.
+3. The existing "Open in playground" links already emit no `&v=`
+   (`theme/vilan.js:199-201` emits only `#code=` and optional `&mode=node`).
+   Keeping the run button on the same rule preserves the property.
+
+So K11 stays an independent decision — 21 directories, ~14.1 MB, 59% of the
+served repo — and K6/K7 should be careful not to make it a compatibility
+promise. **Recommendation for K11, filed here because K6 raised it:** keep
+the last N releases as directories, move older bundles to release assets, and
+state the pin policy in one line so a pinned share link's failure mode is a
+documented 404 rather than a surprise.
+
+## 3. The recommendation
+
+**Take option B, and file option A's prerequisite as its own item.**
+
+The argument in one paragraph: the three things the owner asked for are the
+chrome, the theme, and the run button; option B delivers all three, keeps
+every gate and the whole deploy story intact, and costs one CSS file, two
+Handlebars partials, and a theme-JS pass. Option A cannot be built today at
+any effort — the const input path does not exist and the fuel budget will
+not hold the book — and past those walls it is a from-scratch renderer
+pinned to mdBook's anchor algorithm by 32 external deep links. Declining A
+outright would be wrong, though: the owner wants the dogfooding, and the
+honest answer is that the port has a **prerequisite** (a markdown story with
+somewhere to run) rather than a verdict. Filing that prerequisite makes the
+port reachable and keeps `docs-site.md:53-56`'s cheap exit open, because the
+content still never adapts to the tool.
+
+### 3.1 Slices
+
+Each slice is independently shippable and carries its own gate. Slices land
+in the compiler repo (`vilan/docs/theme/`, `vilan/docs/book.toml`) except
+where noted; per K5's standing rule, **every visual slice needs before/after
+screenshots for the owner before merge**.
+
+**S1 — the leak and the weight.** `docs.yml` deletes `docs/book.toml` and
+`docs/theme/vilan.js` after the `mv` (§1.3); decide `print.html` (712 KB,
+`noindex`, already sitemap-excluded — recommend `output.html.print.enable = false`).
+Closes the rot survey's `book.toml` finding.
+*Gate:* a built book with neither file present and the pages intact.
+
+**S2 — the tokens and the faces.** `theme/css/variables.css` maps mdBook's
+42 variables onto the ratified roles; `theme/fonts/fonts.css` drops Open
+Sans + Source Code Pro for Inter + CommitMonoV143 from
+`vilan-lang.org/assets/fonts/` with the §2.3 feature settings;
+`additional-css` carries the tool-register density. This is K5 slice 3's
+first half.
+*Gate:* built book renders in both themes with no stock font requested and no
+literal hex outside `variables.css`; screenshots.
+
+**S3 — the light theme, ruled.** Reskin `.light` and `.navy` as the two vilan
+themes; hide the remaining three picker entries. Land the site's light
+variant in `theme.vl` in the same cycle so the two surfaces agree
+(`theme.vl:26-30`).
+*Gate:* both themes screenshot-reviewed; `color-scheme` honest on both
+surfaces.
+
+**S4 — the chrome.** `theme/head.hbs` links the shared stylesheet;
+`theme/header.hbs` carries the masthead; a footer partial if the owner wants
+one. Mechanism per §4 Q2 — the recommended shape is the website's deploy
+exporting a rendered chrome fragment that `docs.yml` consumes, so the nav is
+generated by the site's own `top_bar()` and never hand-copied.
+*Gate:* a docs page and the landing page screenshot side by side with one
+masthead; the two workflows still single-writer within their prefixes.
+
+**S5 — the run button (K7's live half).** Extend `theme/vilan.js`: one shared
+lazily-spawned worker at `/playground/worker.js`, the srcdoc-iframe runner,
+an output panel, recycle-after-32 and recycle-on-crash carried over
+(`editor.mjs:546-549`). No `&v=` pin (§2.4). Fold in the codec de-duplication
+`theme/vilan.js:148-149` asks for, or at minimum re-verify the two copies
+agree.
+*Gate:* every one of the 153 fences runs or reports a diagnostic in-page,
+exercised against the real published wasm; no regression to the existing ▶
+links.
+
+**S6 — the docs gate, re-pointed only if S4 moved anything.** Nothing in
+S1–S5 touches `vilan/docs/**/*.md` or `SUMMARY.md`, so the answer to *"what
+does the docs gate become"* is: **it does not change.** S6 exists to state
+that as a checked fact rather than an assumption.
+*Gate:* `cargo test -p vilan-core --test docs` green, unmodified.
+
+### 3.2 What the gate becomes, and what the pipeline becomes
+
+**The gate: unchanged.** `docs.rs` reads markdown; option B keeps the
+markdown as the only source of truth. `the_sidebar_covers_every_page` keeps
+`SUMMARY.md`. This is the recommendation's largest single saving and it is
+worth naming as such.
+
+**The pipeline: still two workflows, with one new file crossing between
+them.** `docs.yml` keeps building from `vilan@main` and keeps owning
+`docs/**`; `deploy.yml` keeps owning the root trio and `playground/**` and
+gains one exported chrome fragment. The single-writer-per-prefix property
+survives. The alternative — one workflow owning both — is available later
+and should be taken only when something forces it, because §1.4's race
+safety is a property of the split.
+
+### 3.3 The prerequisite, filed rather than declined
+
+For the port the owner actually asked for, the honest slice order is:
+
+1. **A markdown story.** Either a `std::markdown` (or package) parser
+   producing a plain-data AST — the one shape §2.1/A4 proved works — or a
+   `[build] run` pre-step (`manifest.rs:378-380`, already shipped and re-run
+   every watch round) emitting generated `.vl` from `.md`. The second needs
+   no compiler change at all and is the cheaper proof.
+2. **A const input channel**, only if the parser is to run at compile time —
+   with the fuel budget question answered first, since §2.1/A4 shows the
+   book's largest page already sits at the ceiling.
+3. **A router and rung-2 adoption on the site** — `Document::of` +
+   `serve_build` + `split = true`, which the site does not use today (§1.5),
+   and which `fullstack-dx.md` §16.2 notes the *compiler repo* cannot yet
+   demonstrate in an example.
+
+Only then is the port a port rather than a rewrite. Each of those three is
+independently valuable, which is the test of a real prerequisite.
+
+## 4. Owner questions
+
+**Q1 — the port itself.** The evidence says re-theme mdBook now and file the
+vilan-framework port behind a markdown prerequisite (§3.3). That declines the
+literal ask for this cycle. Accept, or spend the prerequisite first?
+*Recommendation: accept — take §3.1's slices now, file §3.3 as its own
+tracker item so the port stays reachable.*
+
+**Q2 — the chrome mechanism.** (i) the website's deploy exports a rendered
+chrome fragment that `docs.yml` injects as `theme/header.hbs` — one nav,
+generated by the site's own code, at the cost of a file crossing between two
+workflows; or (ii) the docs author their own chrome markup against the shared
+tokens — no coupling, one duplicated markup copy.
+*Recommendation: (i). It is the dogfooding that is actually cheap, and
+`design-language.md` §2.4's "one token source, generated outward" is the same
+argument.*
+
+**Q3 — the URL space.** Does the book keep `/docs/` with mdBook's
+`page.html#slug` anchors? 32 LSP hover links (`document.rs:464+`), the VS Code
+extension and the brew formula all pin that base, and 417 in-book links plus
+457 headings ride the slug algorithm.
+*Recommendation: yes, keep it, and treat it as a compatibility surface —
+which is also an argument for B independent of cost.*
+
+**Q4 — search.** Is search a v1 requirement? Option B keeps it free, but the
+index is 3.0 MB and 45% of the served tree, committed to git on every daily
+rebuild.
+*Recommendation: keep it (a book without search is a worse book), and file
+the index weight as its own hygiene question rather than letting it decide
+the renderer.*
+
+**Q5 — the masthead's shape.** `header.hbs` puts the bar beside the sidebar;
+edge-to-edge needs the 367-line `index.hbs` fork and its upgrade cost.
+*Recommendation: `header.hbs` for v1; revisit if the owner wants full-bleed.*
+
+**Q6 — the run button's version pin.** Confirm no `&v=` (§2.4), so K11 stays
+a free decision.
+*Recommendation: no pin.*
+
+## 5. Bycatch filed
+
+Found in passing; each is filed into `backlog-2026-08-18.md` as a new open
+item, not fixed here.
+
+1. **D19 — an LSP keyword-hover deep link is broken.**
+   `crates/vilan-lsp/src/document.rs:488` points `impl` at
+   `tour/data-and-traits.html#impl--methods-and-statics`; mdBook emits
+   `id="impl-methods-and-statics"` for the heading `## impl: methods and
+   statics` (`tour/data-and-traits.md:121`) — one hyphen, not two. Probed
+   against a built book: 22 unique targets checked, 1 broken. Nothing gates
+   the 32 links, which is the D17/D18 family exactly; the natural home is
+   D17's mechanical-diff test.
+
+2. **N10 — `theme/vilan.js` is served twice.** `docs/theme/vilan.js` ships
+   verbatim beside the hashed copy the pages load, same root cause as the
+   `book.toml` leak (`book.toml:8`'s `src = "."`). Dies with S1.
+
+3. **N11 — `print.html` is 712 KB of served dead weight.** `noindex` and
+   sitemap-excluded (`docs.yml:60`), regenerated and committed daily.
+
+4. **N12 — the Pages repo has no README.** The only prose explaining which
+   paths are bot-written (`docs/` by `docs.yml`; `index.html`/`client.*`/
+   `playground/` by the website's `deploy.yml`) and which are hand-owned
+   (`assets/`, `CNAME`, `404.html`, `robots.txt`, `sitemap.xml`) lives in
+   comments inside the *other two* repos' workflows. Sharpens N8.
+
+5. **N13 — two sitemaps, no story.** The root `sitemap.xml` lists exactly `/`
+   and `/playground/` and is hand-kept; the book keeps its own generated
+   `docs/sitemap.xml` (`docs.yml:48-67`). A visually merged site should
+   decide whether that stays two documents.
+
+6. **K12 — `mdbook` is fetched by raw `curl` with no checksum.**
+   `docs.yml:36-41` pulls a pinned v0.5.4 release tarball and puts it on
+   `PATH` unverified. Cheap to fix, and the release pipeline verifies its own
+   artifacts elsewhere.
+
+7. **Recorded, not filed:** `src/server.vl:25-31` (website) carries node
+   externs for raw-byte read and `readdir` that `std::fs` gained in v0.34.0 —
+   noted by the survey, and it belongs to whoever next opens that file.
