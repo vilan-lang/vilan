@@ -274,6 +274,23 @@ pub fn content_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// The handle to an entry tree `analyze_source_reclaimable` leaked: the
+/// `Program` it returned borrows this tree for `'static`, and the owner that
+/// drops that program may give the tree back (`Leaked::reclaim`, `unsafe`,
+/// its contract there). Dropping the handle keeps the leak.
+pub type LeakedEntryAst = leak_tally::Leaked<span::Spanned<node::NodeList<'static>>>;
+
+/// What one entry analysis produced, with the tree it leaked attached — the
+/// return of [`analyze_source_reclaimable`]. `program` and `diagnostics` are
+/// exactly [`analyze_source`]'s pair; `ast` is the handle to the parsed entry
+/// tree the program borrows (`None` when parsing produced no tree, in which
+/// case there is no program either).
+pub struct AnalyzedEntry {
+    pub program: Option<Program<'static>>,
+    pub diagnostics: Vec<Error>,
+    pub ast: Option<LeakedEntryAst>,
+}
+
 /// Lex, parse, and fully analyze a source string. The source must already be
 /// leaked to `'static` so the returned `Program` (which borrows it) can outlive
 /// this call — the front-end that owns the document lifecycle does the leak.
@@ -286,6 +303,12 @@ pub fn content_hash(text: &str) -> u64 {
 /// `platform` is the build platform to analyze against — pass `Some` when the
 /// front-end knows it (e.g. the language server resolved it from the project's
 /// `vilan.toml`), or `None` to infer it from the file's imports.
+///
+/// The entry tree this parses is leaked for the program to borrow and stays
+/// leaked — the shape every caller but the language server wants (the macro
+/// world's nested compile keeps its tree in the cached world; the tests and
+/// the wasm front end never drop a program mid-process). A front-end that DOES
+/// drop programs calls [`analyze_source_reclaimable`] and owns the tree.
 pub fn analyze_source(
     source: &'static str,
     std: &PackageSpec,
@@ -294,25 +317,47 @@ pub fn analyze_source(
     platform: Option<Platform>,
     workspace: &Workspace,
 ) -> (Option<Program<'static>>, Vec<Error>) {
+    let analyzed =
+        analyze_source_reclaimable(source, std, pkg_root, entry_path, platform, workspace);
+    // `analyzed.ast` drops here without a reclaim: the tree stays leaked.
+    (analyzed.program, analyzed.diagnostics)
+}
+
+/// [`analyze_source`], handing back the handle to the entry tree it leaked so
+/// the caller can reclaim it once the program is dropped (`leak-soak.md` §7 —
+/// the language server's per-keystroke session leak). Same pipeline, same
+/// fences, same program and diagnostics; only the ownership of the tree
+/// differs. The source text is still the caller's leak, as before, so a
+/// caller that wants the text back keeps its own `Leaked<str>` handle.
+pub fn analyze_source_reclaimable(
+    source: &'static str,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    platform: Option<Platform>,
+    workspace: &Workspace,
+) -> AnalyzedEntry {
     // One outer fence covers the stages the analysis fence below does not —
     // lexing/parsing and the lift rewrite. A panic there used to unwind into
     // the caller: in the editor that meant through `Document::analyze`'s
     // thread join and out of a request handler, aborting the whole language
     // server (B40). It degrades to "no program" plus an honest diagnostic
     // instead; the panic hook (or default hook) has already written the
-    // payload and location to stderr.
+    // payload and location to stderr. A tree leaked before such a panic is
+    // lost with the unwound frame (once per panic, not a session rate) —
+    // the inner fence around `analyze` below is the one that matters for
+    // reclaim, and it returns the handle.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         analyze_source_unfenced(source, std, pkg_root, entry_path, platform, workspace)
     }))
-    .unwrap_or_else(|_| {
-        (
-            None,
-            vec![Error {
-                note: None,
-                span: crate::span::Span::new((), 0..0),
-                msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
-            }],
-        )
+    .unwrap_or_else(|_| AnalyzedEntry {
+        program: None,
+        diagnostics: vec![Error {
+            note: None,
+            span: crate::span::Span::new((), 0..0),
+            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
+        }],
+        ast: None,
     })
 }
 
@@ -323,7 +368,7 @@ fn analyze_source_unfenced(
     entry_path: &Path,
     platform: Option<Platform>,
     workspace: &Workspace,
-) -> (Option<Program<'static>>, Vec<Error>) {
+) -> AnalyzedEntry {
     // The handwritten frontend lexes and parses in a single fast-and-rich pass,
     // always returning a tree — clean, or recovered from syntax errors — together
     // with every diagnostic (lexer and parser, span-ordered). Analysis below runs
@@ -339,7 +384,11 @@ fn analyze_source_unfenced(
         })
         .collect();
     let Some(mut root) = tree else {
-        return (None, diagnostics);
+        return AnalyzedEntry {
+            program: None,
+            diagnostics,
+            ast: None,
+        };
     };
 
     // A macro WORLD's entry gets the ambient meta prelude (macro-engine.md
@@ -408,7 +457,6 @@ fn analyze_source_unfenced(
     // raw trees, so source text prints back verbatim.
     elements::rewrite_items(&mut root.0, source);
     lift::rewrite_items(&mut root.0);
-    let root = Box::leak(Box::new(root));
     // The tally is a tree-proportional estimate — one `Spanned<Node>` of
     // storage per node — so growth in the tree is visible to the counters;
     // the root box alone would record a constant ~40 B whatever the file
@@ -425,7 +473,20 @@ fn analyze_source_unfenced(
         }
         total * std::mem::size_of::<span::Spanned<Node>>()
     }
-    leak_tally::record(leak_tally::LeakSite::EntryAst, tree_estimate(&root.0));
+    // A macro WORLD's entry is analysed through this same function, and its
+    // tree is kept by the cached world — bounded by `WORLDS`, not a per-
+    // analysis leak — so it records at its own site, and `EntryAst` means
+    // exactly the top-level entry's tree: the one a front-end may reclaim.
+    let tree_site = if macros::in_macro_world() {
+        leak_tally::LeakSite::MacroWorldAst
+    } else {
+        leak_tally::LeakSite::EntryAst
+    };
+    let estimate = tree_estimate(&root.0);
+    // Leaked with the handle kept: the `Program` below borrows `root` for
+    // `'static`; whoever drops that program may reclaim the tree through the
+    // handle (`analyze_source` drops the handle and keeps the leak).
+    let (ast, root) = leak_tally::Leaked::leak(Box::new(root), tree_site, estimate);
     // Use the front-end's resolved platform (e.g. from `vilan.toml`), else infer
     // one from the file's own imports: a file importing the browser DOM layer is a
     // browser file, otherwise Node. This keeps the platform gate from
@@ -452,9 +513,20 @@ fn analyze_source_unfenced(
     match analyzed {
         Ok(program) => {
             diagnostics.extend(program.diagnostics.iter().cloned());
-            (Some(program), diagnostics)
+            AnalyzedEntry {
+                program: Some(program),
+                diagnostics,
+                ast: Some(ast),
+            }
         }
-        Err(_) => (None, diagnostics),
+        // The analysis unwound inside its fence: every analyzer local went
+        // with it and nothing global borrowed the tree (leak-soak.md §7.2),
+        // so the handle is still the caller's to reclaim.
+        Err(_) => AnalyzedEntry {
+            program: None,
+            diagnostics,
+            ast: Some(ast),
+        },
     }
 }
 

@@ -18,6 +18,11 @@
 > 735-line `page.vl` and 0.74 MiB on kolt's 372-line `views.vl` — 6.1 GiB after
 > two thousand keystrokes in one file, none of it returnable. Filed as backlog
 > M7. The other three curves are dispositioned and closed in §4.
+>
+> **M7 is FIXED (2026-08-19, §7):** the language server now reclaims a
+> superseded analysis's entry text and AST when the `Document` replaces or
+> drops it. §7 is the design, its soundness argument, the new accounting, and
+> the soak re-run against §4.1's table.
 
 This paper is the record backlog M2 asked for, and it was written to be
 falsifiable rather than reassuring: the owner's brief was *"there might not be
@@ -554,3 +559,285 @@ memory for backtraces. All three are acceptable *behind an opt-in feature* and
 none is acceptable in the default build — which is exactly what the feature
 flag is for. Recommended, as the owner's call, and small: the whole change is a
 manifest entry, four lines in the crate root, and two in the soak.
+
+## 7. M7 — the fix (2026-08-19)
+
+§4.1 filed the number; this section is the refinement `analysis-reuse.md` §2
+left "recorded for the entry", designed before it was built. The goal is the
+one sentence the tracker states: **the language server's memory is bounded in
+the session** — the entry text and AST of a superseded analysis are reclaimed
+when the `Document` replaces it. Not a `drop` (the `Program` is parameterised
+on `'static`, and that stays so), and not a lifetime refactor of the compiler
+(a stop condition): a document-owned allocation, handed back when the analysis
+that borrowed it is gone.
+
+### 7.1 The shape
+
+Three pieces, each small, in the order the bytes flow:
+
+1. **`leak_tally::Leaked<T>`** (`crates/vilan-core/src/leak_tally.rs`) — the
+   one new primitive. A `Box::leak` whose site *kept the handle*:
+   `Leaked::leak(box, site, bytes)` records `bytes` at `site` exactly as
+   `record` does, leaks the box, and returns the handle together with the
+   `&'static T` borrow the leaking site needs. The handle has no `Drop`:
+   dropping it keeps the leak, which is what every caller that does not opt in
+   gets — today's behaviour, byte for byte. `unsafe fn reclaim(self)` frees
+   the allocation and calls the new `leak_tally::release(site, bytes)` with the
+   bytes it recorded, so a reclaimed site nets to zero *exactly*, estimate or
+   not. The `unsafe` is real and carries the whole contract in its doc: every
+   reference derived from the borrow `leak` returned must be dead.
+2. **`analyze_source_reclaimable`** (`crates/vilan-core/src/lib.rs`) — the
+   existing pipeline, returning what it always returned plus the
+   `Leaked<Spanned<NodeList<'static>>>` handle to the entry tree it leaked (a
+   `None` handle only when no tree was produced). `analyze_source` is now a
+   two-line wrapper that calls it and drops the handle, so every other caller —
+   the tests, the wasm front end, and the macro world's nested compile (whose
+   tree the cached world *must* keep) — is unchanged in behaviour and in
+   signature. `Program`'s lifetime is untouched.
+3. **`AnalyzedProgram`** (`crates/vilan-lsp/src/document.rs`) — the
+   `Document`'s `program` field becomes this pair: the `Option<Program<'static>>`
+   and the two `Leaked` handles it borrows from (the text copy
+   `analyze_on_this_thread` makes, and the tree from 2). Its `Drop` does the
+   ordering in one visible function — drop the program, *then* reclaim the two
+   allocations — rather than leaning on field declaration order. Its
+   constructor is `unsafe fn`, because that is where the invariant is
+   promised: *this program borrows only these two allocations (and immortal
+   ones), and nothing else borrows them.* `adopt_analysis` replaces the pair as
+   one value, so a superseded analysis's program and its allocations can never
+   be separated; a closed document drops the pair; the degraded
+   `internal_error` document holds `AnalyzedProgram::none()`.
+
+Nothing about what the server computes changes. Every `Document` query
+(hover, completion, symbols, tokens, references, quickfixes, diagnostics)
+returns owned values today, and still does; `main.rs` reads
+`document.program.as_ref()` transiently and stores nothing from it.
+
+### 7.2 The soundness condition, and the audit
+
+The condition: **no `&'static` borrow into the entry text or the entry AST may
+outlive the `Program` built from them.** The `Program` itself is full of such
+borrows (`Expr<'src>`, `&'src Span`, `&'src str` keys) and that is fine — it
+is dropped first. What had to be proved is that nothing *else* holds one: no
+process-global, no thread-local, nothing the server retains outside the
+`Document`. Every static and `thread_local!` in `vilan-core`, `vilan-lsp` and
+`vilan-embedded-std` was enumerated (`grep` over `static`/`thread_local!`/
+`OnceLock`/`Mutex<…>`) and read:
+
+| global | keyed by | holds | an entry borrow? |
+|---|---|---|---|
+| `BASE_CACHE` (`analyzer.rs`) — resolved pre-entry worlds | `BaseCacheKey`: owned `String`s | `World<'static>`, stored **scrubbed** | **No, by the cache's own invariant.** S3c's store path already had to prove this for its lifetime transmute: `source_texts[0]`, `sources[0]`, `source_hashes[0]` and `generated_by_source[SourceId(0)]` are emptied before the store; the entry's seeded module names (`std::` and `<dep>::`) go through `interned_display_name` *because* "a stored base world must hold no entry-text slices"; `pkg::` seeds, `[service]` blocks and macro-defining text (`contains("macro")`) bypass the cache; the entry's expansion is suppressed in the load region and runs over the world *after* the store; `register_file` stores `String`/`Arc<String>`/`PathBuf`, never the nodes it reads. The snapshot is taken before the entry walk, so the entry's names reach no scope. What was trivially true while the entry was immortal is now load-bearing, and it holds. |
+| `parse_clean_cached`'s `CACHE`/`BROKEN` (`lib.rs`) | `u64` content hash | its **own** leaked copy of each module text and tree | No. The LSP entry is parsed directly by `analyze_source`, never through this cache (§4.2 measured 0 B at both sites over 5,000 keystrokes); modules are read from the overlay or disk into owned `String`s and leaked afresh. |
+| `ERROR_CACHE` (`load_package_module`) | `u64` | its own leaked copies | No, same shape. |
+| macro `WORLDS` | `u64` world key | `World { JsProgram<'static>, HashMap<String,String> }` compiled from a **leaked blanked copy** of the defining file | No — the world's `analyze_source` runs on that leaked copy; its tree is its own (now tallied at `MacroWorldAst`, §7.3). |
+| macro `FAILURES` | `u64` | `Arc<Vec<Error>>` | No — `Error { span, msg: String, note: Option<Note{String}> }` is owned. |
+| macro `EXPANSIONS`, `PARSES` | `u64` | leaked copies of expansion text and its parse | No. |
+| `interned_display_name`'s `NAMES` | `String` | leaked copies | No. |
+| `DOCUMENT_OVERLAY` | `PathBuf` | `String` | No. |
+| every `thread_local!` (`RESOLVING_GENERICS`, `IN_MACRO_WORLD`, the build/recursion counters, `leak_tally`'s counters) | — | plain data | No. |
+| the server's `Backend` maps (`documents`, `semantic_token_cache`, `publish_state`, `line_indices`, `manifests`, `pending`) | `Url`/`PathBuf` | `Document`, owned LSP types, `PublishedDiagnostic` (owned) | No — the only `Program` anywhere is the one inside its `Document`. |
+
+Two further facts the argument uses: `Program` is not `Clone`, and `Document`
+is not `Clone` (and `adopt_analysis` destructures it, so `Document` carries
+no `Drop` of its own — the pairing lives in `AnalyzedProgram`). The panicked-
+analysis path (`analyze` unwinds inside its fence) drops every analyzer local
+during the unwind and touches no global with entry data (the base store
+happens pre-walk on a scrubbed world), so the tree handle is returned and
+reclaimed there too; the narrower outer-fence path (a panic between the leak
+and the handle's construction) keeps the tree leaked, as today — once per
+panic, which is a bug to fix, not a session rate.
+
+`Send`/`Sync`: `Document` crosses the analysis thread's join and lives in a
+`DashMap`; `Leaked<T>` is `Send`/`Sync` iff `T` is, which `str` and the AST
+(plain data, no `Rc`/`Cell`) are. The reclaim may run on a different thread
+from the leak (the server drops on a runtime thread what an analysis thread
+allocated) — fine for the global allocator, and §7.3 says what the
+thread-local tally does about it.
+
+### 7.3 The accounting
+
+`leak_tally` keeps its meaning — `record`/`bytes`/`total` are the **gross**
+bytes leaked at a site on this thread, so every shipped pin and the soak's
+`entry_text == window × source_bytes` claims still read the same numbers —
+and grows a counterpart: `release(site, bytes)`, `released(site)`, and
+`outstanding(site) -> isize` (= recorded − released) with `outstanding_total`.
+Signed, because the counters are thread-local by deliberate design (the module
+doc's reason stands) and a release is legitimately cross-thread: the shipped
+server's analysis thread records and dies, the runtime thread releases. The
+harness reads each thread's counters inside that thread and sums, as it
+already did (§1.3), so its per-window `outstanding` is exact; a field report
+(`VILAN_LEAK_REPORT`, printed on the analysis thread at the end of `analyze`)
+is unchanged in production — that thread reclaims nothing — and appends a
+`reclaimed …` clause only on a thread that did.
+
+One site is split: a macro world's blanked entry is analysed through the same
+`analyze_source`, so its tree used to land at `EntryAst` alongside the real
+entry's. It now records at **`MacroWorldAst`** (bounded by `WORLDS`/`FAILURES`,
+like its text and program), so `outstanding(EntryAst)` is exactly the claim
+"the document's own tree", zero after *any* document drops, cold world or
+warm.
+
+### 7.4 The pins
+
+- `leak_tally`: `Leaked::leak` records and `reclaim` releases the same bytes;
+  `outstanding` nets to zero; the report's `reclaimed` clause.
+- `vilan-core/tests/module_resolution.rs`: `analyze_source_reclaimable` hands
+  back a tree handle whose bytes equal what `EntryAst` recorded, and reclaiming
+  it (after the program is dropped) nets the site to zero; a macro-defining
+  entry records its world's tree at `MacroWorldAst`, not `EntryAst`.
+- `vilan-lsp/document.rs` (platform-independent, the counters need no
+  `/proc`): dropping a `Document` reclaims its entry text and AST to the byte;
+  **a `Document` that analyzes twice** (`adopt_analysis`, the server's path)
+  releases exactly the first analysis's allocations, keeps exactly the
+  second's outstanding, and still answers from the adopted program afterward;
+  a `Document::analyze` result (own thread) is reclaimed on the thread that
+  drops it, visible as a negative outstanding there.
+- The Phase-1 pin `per_analysis_leak_is_bounded_by_named_sites` keeps every
+  assertion it had and gains the reclaim: after a window whose documents are
+  dropped, `outstanding(LspEntryText) == 0` and `outstanding(EntryAst) == 0` —
+  renamed `per_analysis_leak_is_bounded_by_named_sites_and_the_entry_is_reclaimed`.
+  The soak and its smoke carry the same two columns (`entry_text_outstanding_b`,
+  `entry_ast_outstanding_b`) in every `LEAK` row and assert both are 0 on
+  both drivers.
+
+Non-vacuity was checked the cheap way: with the two `reclaim` calls in
+`AnalyzedProgram::drop` commented out, the document-level pins go red (the
+outstanding bytes are the full gross), and the core pin goes red when the
+handle is dropped instead of reclaimed.
+
+### 7.5 `parse_clean_cached` — a second, slower session leak (filed)
+
+§4.2 closed `parse_clean_cached` at 0 B for the soak's shape, and that shape
+is one open file. The shape it does not cover: **an edited file that another
+open document imports.** `did_change` updates the overlay, and after the
+edited document's own analysis lands, `reanalyze_dependents` re-analyzes every
+open document whose `Program.canonical_sources` contains the edited path
+(B39). The dependent's loader reads the edited buffer from the overlay and
+parses it through `parse_clean_cached` — content-keyed, so every *distinct*
+buffer content is leaked forever (text + tree), and a keystroke is a distinct
+content. A buffer that is mid-edit and does not parse clean takes
+`load_package_module`'s `ERROR_CACHE` instead — the same shape, one leaked
+source + tree + rendered errors per distinct broken content. All open
+dependents share one copy per content, so the rate is one (text + tree) of
+the *edited* file per landed keystroke, however many dependents are open, and
+zero when none is. It is bounded by distinct contents, which in an editor
+session is the keystroke count: a session leak, strictly slower than M7 (it
+needs a dependent open), of the same order per keystroke when one is.
+
+Measured rather than only reasoned (a throwaway probe in the LSP's test
+module, debug, 2026-08-19): `lib.vl` (62 B) open in the overlay and a
+`main.vl` importing `pkg::lib`, `lib.vl` rewritten under a fixed-width moving
+edit and `main.vl` re-analyzed after each rewrite through `adopt_analysis`,
+the server's shape. Over 50 rewrites spanning 27 *new* distinct contents,
+`ParseCleanCacheText` grew by exactly 27 × 62 = 1,674 B and
+`ParseCleanCacheAst` by 27 × 40 B root boxes (the shallow record; the tree
+behind each is the real cost) — one leak per distinct content, none for a
+repeated one (50 re-analyses of one content: 0 B at both sites). The same
+loop over 32 distinct *broken* contents leaked 32 × 76 B at `ModuleErrorText`
+and 2,048 B at `ModuleErrorAst` — `load_package_module`'s error cache, the
+same shape. Meanwhile the entry sites stayed at 0 B outstanding throughout,
+which is the M7 fix holding under the dependent-reanalysis flow too. Not
+fixed here — it is a different mechanism (a process-global content cache
+without eviction, also the CLI watch loop's entry reuse) and wants its own
+design (an eviction rule for the *previous* content of an open path, or an
+LRU by bytes). Filed in the report as a new find for the tracker, with the
+probe's shape as the repro.
+
+### 7.6 SHIPPED 2026-08-19 — the soak, re-run
+
+Same machine, same corpora, same command as §5.1 (release; `next` at
+410b280d plus this change; 5,040 analyses, **1588.8 s**, exit 0). Every
+assertion the soak had still holds — both windows byte-identical at every
+site on both drivers, `entry_text == window × source_bytes` — plus the new
+one: the outstanding balance at `LspEntryText` and `EntryAst` is **0 B** on
+every row, both drivers, after the window's documents dropped.
+
+**The counted leak, per keystroke — §4.1's table with the after column:**
+
+| corpus | driver | gross recorded B/keystroke (unchanged) | outstanding B/keystroke, before | outstanding B/keystroke, **after** |
+|---|---|---:|---:|---:|
+| `kolt/src/views.vl` (372 lines) | inline (1000 × 2) | 415,377 | 415,377 | **0** |
+| | per-thread (250 × 2) | 415,377 | 415,377 | **0** |
+| `vilan-website/src/page.vl` (735 lines) | inline (1000 × 2) | 974,768 | 974,768 | **0** |
+| | per-thread (250 × 2) | 974,768 | 974,768 | **0** |
+
+The gross column is deliberately the same number as before: every analysis
+still leaks one copy of the source and one tree, and gives both back. The
+`leak_tally` report's `reclaimed` clause and the `LEAK` rows'
+`entry_text_outstanding_b`/`entry_ast_outstanding_b` columns are where the
+fix shows.
+
+**RSS per keystroke — §2.2's table with the after column** (report only, as
+ever; the instrument is §1.1's):
+
+| corpus | driver | before (w1 / w2) | **after (w1 / w2)** | after 2,000 keystrokes, before → after |
+|---|---|---:|---:|---:|
+| `views.vl` | inline | 753.0 / 762.1 KiB | **49.4 / 43.7 KiB** | 1.4 GiB → ~90 MiB |
+| `views.vl` | per-thread | 803.2 / 766.4 KiB | **104.2 / 39.8 KiB** | |
+| `page.vl` | inline | 3,194.9 / 3,190.4 KiB | **1,529.9 / 1,521.8 KiB** | 6.1 GiB → 3.0 GiB |
+| `page.vl` | per-thread | 3,178.0 / 3,191.2 KiB | **1,507.7 / 1,550.6 KiB** | |
+
+Two readings, and the second is the important one:
+
+1. **The reclaim is complete for what it names.** On `views.vl` RSS growth fell
+   by 94 % and now *decelerates* window over window (49 → 44, 104 → 40),
+   which it never did before; a 12-line file (a release probe, 150-analysis
+   windows) gives **+0 KiB** of RSS in its second window, with or without a
+   `const` site — flat at the page granularity RSS has. The counters say the
+   two named sites net to zero and nothing unnamed grew; §7.7's allocator
+   split agrees once the second leak is subtracted.
+2. **`page.vl` still grows 1.5 MiB per keystroke, and it is not this leak.**
+   The counted balance is zero, yet RSS climbs at exactly the same rate in
+   both windows and on both drivers — a linear leak `leak_tally` cannot see,
+   which the 3.12 MiB it used to sit under made invisible to §2. §7.7 runs
+   it down: it is the const pass's evaluator, and `views.vl`'s residual 46 KiB
+   is the same mechanism at smaller scale.
+
+### 7.7 FILED — the const pass's evaluator leaves reference cycles, every analysis
+
+Found by the re-run's residual, attributed the same day with glibc's
+`mallinfo2` split into the harness (a throwaway probe; release; 100-analysis
+windows on `page.vl`, 150 on `views.vl`, 10 warm-up):
+
+| corpus | RSS per analysis | **in use (`uordblks`) per analysis** | free-but-retained (`fordblks`) per window |
+|---|---:|---:|---:|
+| `views.vl` | 39.9 / 65.4 KiB | **+45.8 / +45.9 KiB** | −1.4 / +2.9 MiB |
+| `page.vl` | 1,577.7 / 1,525.4 KiB | **+1,523.9 / +1,523.5 KiB** | +5.6 / −0.1 MiB |
+
+In-use bytes — allocated and never freed — grow at a rate flat to the
+kilobyte across windows, and the free-retained side is noise around zero: a
+genuine leak, not fragmentation. It is not a `Box::leak` (every site counts
+zero net), not an `Arc`/`Rc` outside one module (`grep`: `Rc<` lives only in
+`interpreter.rs`), and not a process-global container (§7.2's inventory).
+
+**The mechanism**, read in `crates/vilan-core/src/interpreter.rs`: an
+environment is `Rc<RefCell<Scope>>`; a function declaration is hoisted into
+its scope as `Value::Closure(Rc<ClosureData { env, .. }>)` whose `env` *is*
+that scope — a reference cycle per declared function, in the scope that
+declares it. `run_const` (const-eval.md §10.6) builds a fresh root scope per
+const site and hoists the site's whole lowered world into it, so every site of
+every analysis leaks its root scope with every function closure the world
+holds. `page.vl` has 35 `const` sites reaching `std::ui`/`style`; `views.vl`
+has none of its own but reaches std code that is const-evaluated
+(`style.vl`'s validation is const evaluation). The macro engine's
+`run_entry` has the same shape, reached only on an expansion-cache miss, so
+it is a per-distinct-expansion cost, not per keystroke.
+
+**Confirmed by the cheap experiment**: one line — `globals.borrow_mut().vars
+.clear()` after the result is extracted in `run_const`, breaking the root
+scope's cycles — re-measured under the same probe gives **+0.0 KiB in use per
+analysis on both corpora** (RSS +0 to +15 KiB per analysis, all of it on the
+free-retained side). That is the whole residual. Reverted, not shipped: it is
+the root scope only — a function declared inside a function body cycles with
+the *call* scope, unreachable from the root after the call returns, so the
+general fix is a per-run registry of every scope the evaluator creates
+(eight creation sites, all inside `Interpreter` methods), cleared when the
+run ends — a contained `interpreter.rs` change (the `Interpreter` struct
+gains the run's lifetime) with its own pins (a const-using fixture in the leak
+harness whose in-use bytes plateau, and the equivalence gate unchanged,
+because teardown runs after the result is plain data). The interpreter is the
+native evaluator const-eval.md and macro-engine.md own, so this is their
+item, not M7's; filed in the report with these numbers as a new find.
+
+With it fixed, the language server's session memory on `page.vl` would be
+flat to the allocator's noise — which is what §7's first sentence asked for
+and M7 alone delivers on the smaller file.
