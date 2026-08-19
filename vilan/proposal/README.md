@@ -82,6 +82,7 @@ Closing sweeps archive tombstones into
 | `reactive-batching.md` | shipped arc (2026-07-02) | Deferred notification and the `batch` turn. |
 | `reactive-turns.md` | shipped arc (2026-07-09) | Reactive turns — scoped flush, async turns, replacing global auto-flush (A6). |
 | `releases.md` | active | Installation, versioning, and the release pipeline — the process this project actually runs. |
+| `remote-sources.md` | draft, awaiting ruling (2026-08-18) | A25 — a remote mirror's subscription follows demand: a count on `RemoteSource` that rides owner disposal, `Unsubscribe` at zero, and `map`/`or`/`status` as the one seam into `Signal`; §6 holds four owner questions and three `#[ignore]`d pins stand in `inference.rs`. |
 | `requirement-polymorphism.md` | shipped arc (2026-08-02, backlog B51) | The owner-coverage fence follows instantiation chains through generic forwarders. |
 | `ret-checking.md` | shipped arc (2026-07-04) | Return-position type checking (backlog B10). |
 | `roadmap.md` | historical / superseded (banner 2026-08-18) | Pre-lettered-section ranked backlog; its strategic role now lives in `backlog-2026-08-18.md`'s Now/Next/Later block, its Done chronicle stays as history. |
