@@ -59,9 +59,9 @@ impl NotesStore {
 	fun add_note(self, token: str, title: str): i32 { … }
 }
 
-// browser side:
+// browser side, inside a view:
 let client = NotesClient::connect("/", json_codec())!;
-let _sync = client.notes.sub(|list| …);   // live-synced, typed
+let notes: Signal<List<Note>> = client.notes.or([]);   // live-synced, typed; subscribed while shown
 ```
 
 The [full-stack walkthrough](vilan/docs/guide/walkthrough.md) builds a

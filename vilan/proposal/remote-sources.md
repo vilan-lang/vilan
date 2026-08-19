@@ -1,6 +1,10 @@
 # Remote sources — subscribe by demand, unsubscribe at zero (A25)
 
-> Status: **RATIFIED 2026-08-19 as recommended** ("Recommendations in
+> Status: **BUILT 2026-08-19** on lane `a25-remote-sources` — all three
+> slices, ship record in §8 (one open item there: the six corpus goldens
+> the std change moves, stopped rather than regenerated on the lane).
+>
+> Prior: **RATIFIED 2026-08-19 as recommended** ("Recommendations in
 > remote-sources.md and docs-port.md look good") — §6's four answers
 > stand: **Q1** `sub` keeps `|T|`, no second public counted entry point in
 > v1; **Q2** no `Stale` in v1 (`Waiting`/`Ready` from the cache alone);
@@ -751,3 +755,248 @@ design adds a primitive to `reactive.vl` rather than only to `rpc.vl`.
   await-first-value shape). With `map` supplying the fallback and `status`
   supplying the knowledge, no site in the census wants it; it is recorded
   here as available, not proposed.
+
+## 8. Ship record (2026-08-19)
+
+Built as ratified, in §5's three slices, on lane `a25-remote-sources`
+(branched from `next`; three commits, one per slice, plus the records).
+Every behavior below was probed through the lane's fresh `target/debug/vilan`
+before its pin was written, and every new pin was planted red at least once
+(the rebind pin: drop the `closing` clear and it prints `{"Unsubscribe":99}`
+before `settled`).
+
+### S1 — the count and the `Unsubscribe`
+
+`std/src/reactive.vl`: `Subscription.release: Shared<Option<|| void>>`
+(a one-shot teardown hook; `Signal::sub` leaves it `None`; `dispose` takes
+it out before running it, so a by-hand dispose followed by the owner's
+cannot double-decrement) and `at_settle(id, action)` — the action rides
+the turn's pending queue as an ordinary `Subscriber`, deduped by `id`, and
+resolves its turn exactly as `Signal::notify` does (ambient, else the
+draining one, else inline). Nothing else in the scheduler moved.
+
+`std/src/rpc.vl`: `RemoteSource` replaces `wanted` with `count` and
+`closing` (§2a's shape) plus two fields §2a's sketch did not draw —
+`settle_id: i32` (a `fresh_id()` the deferred flush dedups under; channel
+ids share no counter with subscriber ids, so a channel id cannot serve)
+and `codec: Codec` (the `Unsubscribe` is encoded at flush time against the
+channel the mirror holds *then*, which is what makes a flush after a
+rebind name the right channel; pre-encoding it beside `subscribe` would
+have widened `rebind`'s signature and the generated rebinder list for no
+gain). `sub` is the present-only face of one private counted `lease`;
+`acquire`/`release`/`flush_close` are the four-line rule verbatim;
+`rebind` clears `closing` and re-subscribes iff `count > 0`;
+`ReactiveServer::start` is idempotent as a **no-op** for a channel whose
+forward is live (the proposal offered no-op or re-seed; a counted client
+never sends the duplicate, and a no-op is the smaller invariant).
+
+Measured frames (the relay harness of §5, pin A's program): `up
+{"Subscribe":0}` · `down {"Update":[0,0]}` · `down {"Update":[0,1]}` · `up
+{"Unsubscribe":0}` — and the post-dispose `set` puts nothing on the wire.
+Pin B prints its six lines. `sub`+`dispose`+`sub` in one `batch`: one
+`Subscribe`, no `Unsubscribe`, and the channel is still live after the
+settle. Two `map`s under one owner: one `Subscribe`, one `Unsubscribe`.
+
+Pins (all in `crates/vilan-core/tests/inference.rs`, the A25 block): **A**
+and **B** un-ignored; new — `a25_a_second_subscribe_frame_opens_no_second_forward`
+(server idempotence under a raw double `Subscribe`),
+`a25_a_same_turn_resubscribe_cancels_the_pending_unsubscribe`,
+`a25_a_pending_unsubscribe_does_not_cross_a_rebind`,
+`a25_a_counted_subscription_releases_its_lease_once`. Gates:
+`cargo test -p vilan-core --test inference` (2334 passed), `--test
+rpc_http` (6), `--test transport_robustness` (3, the reconnect legs
+included) — all exit 0.
+
+**One observation about "the ambient turn", recorded rather than
+designed around.** `at_settle` reads `turn_scope.get_safe()` from
+wherever it is called, and the call sits inside the lease's release hook
+— a *stored* closure. By spec §8.4 a closure captures its context at
+creation, so the turn the flush defers into is the one ambient when the
+lease was **taken**, not when it is disposed: a lease taken under a
+(since-settled) mount or event turn and disposed later enqueues onto that
+settled turn and drains on its late-enqueue microtask; a lease taken with
+no turn ambient and disposed inside a turn's *body* flushes inline (a
+dispose inside a *drain* still joins the draining turn, through the same
+device `Signal::set` uses). This is the rule every stored `set` callback
+already follows, and for the case the deferral exists for — a view that
+disposes and rebuilds in the same synchronous segment — the re-subscribe
+lands before either the settle or the microtask, so zero frames cross
+either way. The same-turn pins take their lease inside the `batch` so they
+exercise the settle path as written.
+
+### S2 — `map`, `or`, `status`
+
+As §2b–§2e, with one spelling difference: `map` hands its lease to the
+owner with `get_owner().take(lease)` rather than `defer(|| lease.dispose())`
+— same effect, and `Subscription` is already `Disposable`. `Status` sits
+beside `RemoteSource` in `rpc.vl` with `[derive(PartialEq, Debug)]` like
+`ConnectionState`. The honest sentence is in `status`'s doc comment and
+`Status::Waiting`'s.
+
+Pin **C** un-ignored as-is (its exact eight lines). New —
+`a25_map_outside_an_owner_scope_is_a_compile_error` and
+`a25_or_outside_an_owner_scope_is_a_compile_error` (`assert_fails_with` on
+the `owner_scope` coverage message),
+`a25_or_reads_the_initial_before_the_first_frame_and_the_value_after` (a
+relay that HOLDS upstream frames, so "before the first frame" is real
+over an in-process wire), `a25_two_maps_under_one_owner_take_one_subscribe`,
+`a25_status_alone_opens_nothing_and_stays_waiting`. Gates: inference (2340
+passed, 2 ignored — the two pre-existing pins, not A25's) and `cargo test
+-p vilan-core --test docs` (8 passed), both exit 0.
+
+A find while probing, not A25's to fix: a coverage failure's diagnostic
+cascades. With `std::rpc` loaded (or even without — `Signal::effect` at the
+top of `main` shows it too), the one true error ("context `owner_scope` is
+read here…") is accompanied by two spurious ones about an async closure
+reaching the host function `run` (`rpc.vl`'s `LocalTransport` and
+`task.vl`'s nursery). Pre-existing; the pins assert the true message.
+
+### S3 — consumers and docs
+
+`examples/walkthrough/src/{client,views}.vl` and
+`examples/todo/src/{client,todos}.vl`: the §4.1 diff — the hand mirror and
+the parameter go, the view reads `client.<field>.or([])`. `benchmarks/src/
+coalescing.vl` already disposed; `realtime.vl` now carries its three
+leases in `Session.watching` and disposes them when the measurement is
+done. Docs: `guide/services.md` ("Reading a mirror", a compiled browser
+fence with `mount_root` + `or` + `bind_each`, the count, the honest
+sentence, the Traps bullet about the local derivative),
+`guide/walkthrough.md` (the client fence matches the example; the `or`
+fragment), `std/rpc.md` (the generated field is a `RemoteSource<T>`; a
+"Mirrors" section with the five signatures and `Status`), `guide/reactive.md`
+140–143 and `std/reactive.md:87` (`sub` fires once immediately — both said
+the opposite; the second was not in the brief and is the same error),
+`std/reactive.md` lists `at_settle`, `README.md:64` shows `or`. Gates:
+docs (8 passed, exit 0); `cargo test -p vilan-cli --test benchmarks`
+(exit 0, the deterministic counts unchanged); both examples build from
+their tracked files.
+
+**The `or([])` annotation.** Every census site is a list mirror, and
+`let notes = client.notes.or([])` unannotated yields a `Signal` whose
+element type is lost — "cannot access field 'done' on type any" at the
+first use. It is not A25's: `Option<List<Todo>>::unwrap_or([])` loses it
+the same way ("cannot index this List: its element type is never
+determined"), so does a `map` with a `None => []` arm, and all three
+reproduce on the v0.30.0 binary — an empty `[]` through a `T`-typed
+parameter does not take `T` from the receiver's already-bound type
+argument. The examples and docs write the annotated form
+(`let notes: Signal<List<Note>> = client.notes.or([]);`), the docs say
+why in one sentence, and the gap is pinned `#[ignore]` as
+`a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation`
+(`AGENTS.md` gate 4) for the analyzer item that closes it.
+
+### The goldens — STOPPED, not regenerated
+
+`cargo test -p vilan-cli --test corpus` exits 101: **six goldens diverge**
+— `reactive.vl`, `reactive-flatten.vl`, `reactive-owner.vl`,
+`reactive-turns.vl`, `signal-update.vl`, `spread-parameters.vl`. The
+goldens inline the std code a program reaches, and §2a's `Subscription.release`
+reaches all of them: `Signal::sub`'s emitted constructor gains the third
+field (`[ self[1], id, __shared_new([ 1 ]) ]`), `Subscription::dispose`'s
+tail gains the release-hook match, and the minified helper names shift
+behind those two. No other change of shape. Each rebuilt program's stdout
+under node is byte-identical to its tracked golden's (all six compared).
+The split fixture's pinned artifacts (`crates/vilan-cli/tests/split/golden`,
+`the_split_fixture_emits_its_pinned_artifacts`) move for exactly the same
+reason — `app.js` by the constructor, the dispose tail and the renames
+behind them, the three route chunks by renames only, `app.chunks.json` not
+at all (diffed with the `$name`s normalized: nothing else changes). This is
+an inherent consequence of the ratified §2a design — the alternative the
+paper rejected, a bespoke `RemoteSubscription`, is the only shape that
+leaves `Signal::sub` untouched — and the brief says stop, so every golden
+is untouched on the lane; regenerating them (after `cargo build`; the split
+ritual is in `split.rs`'s header) is the merge's call. The full suite on
+the lane: `cargo nextest run --workspace` exits 100 — `3779 tests run:
+3777 passed (1 slow), 2 failed, 6 skipped`, the two being these; every
+other binary is green.
+
+### Outside this repo — the diffs to apply
+
+`vilan-playground/todo/src/client.vl`:
+
+```diff
+ async fun main() {
+-	let notes: Signal<List<Note>> = Signal::new([]);
+ 	let token = Signal::new(storage::get("notes-token"));
+ 	let route = current_path().map(parse);
+
+ 	match NotesClient::connect("/", json_codec()) {
+ 		Ok(let client) => {
+-			let _sync = client.notes.sub(|x| notes.set(x));
+-			let _root = mount_root("app", || app(client, notes, token, route));
++			let _root = mount_root("app", || app(client, token, route));
+ 		}
+ 		Err(let error) => print(i"connect failed: {error.debug()}")
+ 	}
+ }
+
+ fun app(
+ 	client: NotesClient<SocketTransport>,
+-	notes: Signal<List<Note>>,
+ 	token: Signal<str>,
+ 	route: Signal<Route>,
+ ) {
+ 	let note_name = Signal::new("");
++	// Counted, and released when this view is unmounted. `[]` is the
++	// fallback that used to be `Signal::new([])` two frames up.
++	let notes: Signal<List<Note>> = client.notes.or([]);
+```
+
+`kolt/src/client.vl` (and `screen` in `kolt/src/views.vl`):
+
+```diff
+ async fun main() {
+-	let items: Signal<List<Workspace>> = Signal::new([]);
+-	let tasks: Signal<List<Task>> = Signal::new([]);
+ 	let token = Signal::new(storage::get("kolt-token"));
+ 	let route = current_path().map(parse);
+
+ 	match KoltClient::connect("/", json_codec()) {
+ 		Ok(let client) => {
+-			let syncing = client.workspaces.sub(|list| items.set(list));
+-			let syncing_tasks = client.tasks.sub(|list| tasks.set(list));
+-			let root = mount_root("app", || screen(client, items, tasks, token, route));
++			let root = mount_root("app", || screen(client, token, route));
+ 		},
+ 		Err(let error) => print(i"connect failed: {error.debug()}"),
+ 	}
+ }
+```
+
+```diff
+ fun screen(
+ 	client: KoltClient<SocketTransport>,
+-	items: Signal<List<Workspace>>,
+-	tasks: Signal<List<Task>>,
+ 	token: Signal<str>,
+ 	route: Signal<Route>,
+ ): View {
++	// The two mirrors as plain signals: `[]` until the first sync, counted
++	// and released when the screen unmounts.
++	let items: Signal<List<Workspace>> = client.workspaces.or([]);
++	let tasks: Signal<List<Task>> = client.tasks.or([]);
+ 	view("div")
+```
+
+(`client.vl`'s `Task`/`Workspace` imports from `pkg::shared` become
+unused there and can go; `views.vl` already imports both.)
+
+`kolt/src/probe.vl` — a `main`-level probe with no view and no owner, so
+`sub` stays and gains the disposals it lacked, at the end of the observer
+arm (after the acting connection's block, before the arm closes):
+
+```diff
+ 							print(i"observer task count restored={observed_tasks.get() == tasks_before}");
+ 						},
+ 						Err(let error) => print(i"register rpc failed: {error.debug()}"),
+ 					}
+ 				},
+ 				Err(let error) => print(i"acting connect failed: {error.debug()}"),
+ 			}
++			// Done observing: release both leases, which closes both channels.
++			watching.dispose();
++			watching_tasks.dispose();
+ 		},
+ 		Err(let error) => print(i"observer connect failed: {error.debug()}"),
+ 	}
+```

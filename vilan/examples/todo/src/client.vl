@@ -1,31 +1,25 @@
-// The wiring — now ONE generated call (§4.2): `TodoClient::connect` opens the
+// The wiring — ONE generated call (§4.2): `TodoClient::connect` opens the
 // WebSocket, enforces the contract hash (a stale bundle is a clean error, not
-// mystery decode garbage), and wires the `todos` mirror. The UI never writes
-// `items` itself — the server owns the data, and every change (this tab's
-// included) arrives over the wire.
+// mystery decode garbage), and hands out the typed `todos` mirror
+// (`RemoteSource<List<Todo>>`: values arrive decoded — the wire's codec is
+// the only (de)serialization). The UI reads it through `client.todos.or([])`
+// inside the view, so the subscription opens at mount and closes at unmount.
+// The UI never writes the list itself — the server owns the data, and every
+// change (this tab's included) arrives over the wire.
 
 import std::json::json_codec;
 import std::print;
-import std::reactive::Signal;
 import std::result::Result::{ Err, Ok };
 import std::ui::mount_root;
 import pkg::store::TodoClient;
-import pkg::todo::Todo;
 import pkg::todos::todos;
 
 async fun main() {
-	// The local mirror of the server's list — the wire is its only writer.
-	let items: Signal<List<Todo>> = Signal::new([]);
 	// A relative WebSocket URL resolves against the page's origin (modern
 	// browsers); node clients pass an absolute ws:// URL.
 	match TodoClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			let root = mount_root("app", || todos(client, items));
-			// The mirror is typed (`RemoteSource<List<Todo>>`): values arrive
-			// decoded — the wire's codec is the only (de)serialization.
-			let syncing = client.todos.sub(|synced| {
-				items.set(synced);
-			});
+			let root = mount_root("app", || todos(client));
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}

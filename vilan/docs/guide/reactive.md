@@ -139,8 +139,11 @@ Two ways to run code on change. **Use `effect` by default.**
   when its surrounding UI (or other owner) goes away. Nothing to
   remember.
 - `signal.sub(observer): Subscription` is the manual version. It fires
-  only on *later* changes, and you keep the `Subscription` and call
-  `dispose()` on it yourself.
+  the same way — once now with the current value, then on every change —
+  but you keep the `Subscription` and call `dispose()` on it yourself.
+  (On a service mirror, `sub` is also **counted**: the first watcher
+  opens the channel and disposing the last one closes it — see
+  [Services: reading a mirror](services.md#reading-a-mirror).)
 
 ## Ownership: who cleans up
 

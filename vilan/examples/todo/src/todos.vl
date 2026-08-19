@@ -1,7 +1,9 @@
-// The UI over the server's list. `items` is fed by the wire (the server owns
-// the data); `draft` and `filter` are view-state and stay client-local — the
-// split the derived-signal combinators are for: `remaining` derives from the
-// shared list, `visible` combines it with this tab's own filter.
+// The UI over the server's list. `items` is the server's mirror read as a
+// plain signal (`client.todos.or([])` — `[]` until the first sync, counted
+// and released with this view); `draft` and `filter` are view-state and stay
+// client-local — the split the derived-signal combinators are for:
+// `remaining` derives from the shared list, `visible` combines it with this
+// tab's own filter.
 //
 // Mutations go through the typed `TodoClient` stub. Note what's ABSENT: no
 // local list edit, no refetch — the change comes back over the wire and lands
@@ -57,7 +59,8 @@ let remove_button = const button + style().margin_left(Length::auto());
 
 let empty_note = const style().opacity(0.6);
 
-fun todos(client: TodoClient<SocketTransport>, items: Signal<List<Todo>>): View {
+fun todos(client: TodoClient<SocketTransport>): View {
+	let items: Signal<List<Todo>> = client.todos.or([]);
 	let draft = Signal::new("");
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 
