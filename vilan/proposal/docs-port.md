@@ -682,6 +682,142 @@ item, not fixed here.
    externs for raw-byte read and `readdir` that `std::fs` gained in v0.34.0 —
    noted by the survey, and it belongs to whoever next opens that file.
 
+## 6. Ship record (2026-08-19)
+
+Lane `k6-book` (cycle 23, work order 5), branch `k6-book` off `next` at
+`410b280d`. The book's half of S1, S2, S3 (the light theme and the
+palette), S4 (the partials), and S6; the pages-repo half of S1 (the
+`docs.yml` `rm`) and the website's half of S3/S4 (the `theme.vl` light
+block, the exported fragment) are lane web-chrome's. Files, all under
+`vilan/docs/`: `book.toml`; `theme/css/variables.css`, `theme/css/vilan.css`,
+`theme/fonts/fonts.css`, `theme/highlight.css`, `theme/tomorrow-night.css`,
+`theme/ayu-highlight.css`, `theme/head.hbs`, `theme/header.hbs`,
+`theme/picker.js`; plus `design-language.md` §2.5. `theme/vilan.js`,
+`**/*.md` and `SUMMARY.md` untouched.
+
+**S1 (book half).** `[output.html.print] enable = false` in `book.toml`:
+`print.html` is gone from the build and the print button from the menu
+bar; 53 chapter pages, `index`/`404`/`toc`, search, all present, `mdbook
+build` exit 0. The `src = "."` sweep still copies every theme source
+verbatim into `book/` beside the hashed copies the pages load (probed
+again on v0.5.4): the leak list for the pages lane's `rm` is now
+`docs/book.toml` **plus every file under `docs/theme/` whose path equals a
+source path** — `theme/vilan.js`, `theme/picker.js`, `theme/head.hbs`,
+`theme/header.hbs`, `theme/{highlight,tomorrow-night,ayu-highlight}.css`,
+`theme/css/{variables,vilan}.css`, `theme/fonts/fonts.css` (the hashed
+`theme/vilan-<h>.js`, `theme/picker-<h>.js`, `theme/css/vilan-<h>.css`
+must stay — the pages load them). A robust form is
+`(cd toolchain/vilan/docs && find theme -type f) | while read f; do rm -f "docs/$f"; done`
+plus `rm docs/book.toml`.
+
+**S2 — tokens and faces.** `theme/css/variables.css` replaces mdBook's
+stock sheet: the role tokens are declared per theme on `html.navy` (the
+dark values copied from `vilan-website@6e549d2 src/theme.vl:70-106` and
+`code_palette`, `:185-206`) and `html.light` (§2.5), the three retired
+stock themes (`.rust` → light, `.coal`/`.ayu` → navy) aliased so a stale
+`localStorage` preference still renders; mdBook's 42 variables are mapped
+**once** on `:root` (which is the `<html>` element, so each `var(--role)`
+resolves against the theme class), and theme.vl's `--code-*` slots are
+minted the same way (alpha pulls via `color-mix`, so every hex is written
+once). It is the only file in the book naming a colour — checked by grep
+(`#hex`, `rgb()`, `hsl()` outside it: none). `theme/fonts/fonts.css`
+declares Inter (100–900, variable) and CommitMono V143 (200–700, variable)
+from `https://vilan-lang.org/assets/fonts/`; mdBook ships its font files
+only when no override exists, so `book/fonts/` holds one CSS file and the
+516 KB of Open Sans / Source Code Pro are not built. The feature set
+(ss01–ss05, cv04/cv06/cv08) and `font-synthesis: none` are applied on
+`code, kbd` in `theme/css/vilan.css` (the `additional-css` tool-register
+sheet: Inter on `html`, 15px body / 13px code, hairline separations,
+radii 4/6/8, one shadow on the two floating surfaces, 80–160 ms motion,
+the hljs mapping onto the `--code-*` slots, the code-block buttons, the
+masthead slot). The three stock highlight.js sheets are overridden by
+deliberately empty files (book.js switches between them by theme name;
+the mapping in `vilan.css` applies in every theme). "No stock font
+requested": the only remaining mention is the font-family *name* in
+stock `general.css`'s `html` rule, overridden by `vilan.css`; no
+`@font-face` for either stock face exists in the build.
+
+**S3 (book half) — the light theme and the palette.** `design-language.md`
+§2.5 (committed first, `79a3e09f`, for lane web-chrome) derives every role
+for the light theme: ink on blush, the ground the brand blush exactly as
+the dark ground is the brand ink (16.3:1 both ways), ladders stepping with
+the dark ladders' shape and ratios (panel 1.06:1, raised 1.09:1, text
+11.2 / 5.6:1), primary `#AE3611` (5.0:1) and accent `#922A7C` (5.9:1)
+deepened to carry text on blush, hover/active as ink at the dark alphas,
+`stroke-hard #CFAFBA` at 1.59:1, and the semantic rule: hues fixed, the
+`down-*` fills fixed, the `up-*` text tier steps down Tailwind's own
+ladder (rose-700, amber-800, zinc-700). The sections after it shifted by
+one (§2.6 playground fixes, §2.7 editor). **One subjective call, flagged
+for the owner's review:** the light ground at the full brand blush
+`#F9DFE7` (L 0.79 — about mdBook's own "rust" theme's ground) reads
+distinctly pink across a long page; the alternative is one ladder step
+paler (`#FBE7ED` ground, `#FDF3F6` panel, `#FFFAFB` raised), which keeps
+the derivation and costs the exact inversion. The picker shows Auto /
+Light / Dark: `vilan.css` hides the rust/coal/ayu entries (`li:has()`) and
+`theme/picker.js` (a new `additional-js` file — `index.hbs` not forked,
+`vilan.js` not touched) removes their `<li>` so book.js's arrow-key
+walk never lands on a hidden item, migrates a stale rust/coal/ayu
+preference through mdBook's own click path, and labels navy "Dark".
+`color-scheme` is honest: `--color-scheme` is `light` on `html.light`,
+`dark` on `html.navy`, and mdBook's `general.css` applies it to `:root`.
+
+**S4 (the partials).** `theme/head.hbs` links `/chrome/header.css`
+(absolute; 404 locally by design). `theme/header.hbs` is a minimal
+fallback masthead (home link + book title, `.vilan-masthead-fallback`
+styled by tokens in `vilan.css`), commented as replaced at deploy by
+`chrome/header.html` and never to be hand-copied. The slot (`.page`'s
+first child) is full-bleed and **static**: `general.css`'s `.page`
+margin of `-50px` (which hides the hover-placeholder above the viewport)
+would hide a masthead instead, so the page starts at 0 and the
+placeholder gives its height back by overlapping the menu bar; and the
+site's nav is `position: sticky; top: 0` (it pins itself on the site's
+pages), which on a book page would fight mdBook's sticky menu bar at the
+same offset — the slot sets `position: static`, the masthead scrolls away
+and the book's bar stays (v1 per §4 Q5). Lane web-chrome's export
+existed at `vilan-website/.claude/worktrees/web-chrome/export/chrome/`
+(read-only, `2a3e22e`) and was staged into a temp copy for the combined
+screenshots: one root `<nav>`, no braces, absolute asset paths, tokens
+only — and it follows the book's picker (light nav on a dark OS:
+`k6-combined-light-*.png`), because its `:root` token declarations land
+before `variables.css` in the cascade at equal specificity. Two notes
+for that lane, not defects here: (a) its `--space-*` gaps are `rem`, and
+mdBook sets `html { font-size: 62.5% }`, so 1rem is 10px in the book —
+the nav's link gaps come out at ~60% of the site's; px (or a px token)
+would hold; (b) the sticky/backdrop-blur is inert in the slot (above).
+
+**S6.** `cargo test -p vilan-core --test docs` → exit 0 (8 passed), with
+`crates/vilan-core/tests/docs.rs` unmodified; `git diff --name-only
+410b280d HEAD` lists only the files above — no `*.md` under
+`vilan/docs/` and no `SUMMARY.md` changed.
+
+**Screenshots** (Windows Chrome headless, 1440×1000 unless noted; the
+OS scheme is dark, so the light set is a temp copy with
+`preferred-dark-theme = "light"`), all at `/mnt/c/Temp/vilan-shots/`:
+before — `k6-before-{navy,light}-{landing,tour-hello,std-collections}.png`,
+`k6-before-navy-mobile-hello.png` (480 px); after —
+`k6-after-{navy,light}-{landing,tour-hello,std-collections,std-style}.png`,
+`k6-after-{navy,light}-mobile-hello.png`, `k6-after-light-tour-macros.png`,
+`k6-after-navy-guide-reactive.png`; tall pages (tables, toml, a
+blockquote) — `k6-tall-{navy,light}-std-style.png`,
+`k6-tall-{navy,light}-tour-projects.png`, `k6-tall-light-tour-macros.png`;
+the picker, search bar and code-block buttons forced visible —
+`k6-inspect-{navy,light}-cfj.png`; the masthead side by side with
+web-chrome's exported fragment — `k6-combined-{navy,light}-{landing,tour-hello}.png`.
+
+**Not verified here:** the live fetch of `/chrome/header.css` and the
+fonts at deploy (local builds fetch the fonts from the live site; the
+chrome sheet 404s locally as designed); real-device mobile (the 480 px
+headless capture shows the same code-block overflow as the stock theme,
+so not a regression, but not a phone); the menu bar's hide/reveal on
+scroll under the masthead (sidebar hidden) — reasoned from `book.js`,
+not driven; the no-script rendering. **Gates:** `mdbook build` exit 0
+(both themes), `print.html` absent, the docs gate above, and the full
+suite — `cargo nextest run --workspace > suite.log 2>&1; echo $?` → `0`
+(`Summary [ 354.312s] 3767 tests run: 3767 passed (1 slow), 8 skipped`),
+run after `git add` of every new file so the hygiene gate saw them; no
+Rust changed, so `cargo fmt` had nothing to do and the corpus is
+untouched by construction.
+
 ## 7. S5 ship record (2026-08-19)
 
 **Shipped: the run button, in `theme/vilan.js` alone** (lane k7-run; the
