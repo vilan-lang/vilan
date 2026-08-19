@@ -2360,3 +2360,95 @@ them ceremony, three boot-time reads and a hand-written shell — now runs
 at rung 2 with no path, file name, or MIME type in its server. The one
 behavioral change is the one the arc exists for: the page cannot disagree
 with the artifacts it names, because it is written from them.
+
+### 16.7 E65 shipped (2026-08-19)
+
+§16.2 filed it: the repository could not demonstrate rung 2 in an example,
+because two shipped gates refused one by construction. Both gates now tell
+the truth about a rung-2 server, and `examples/todo` stands on it.
+
+**`unlinked_stylesheets` has a second source of truth for "linked".** The
+first stays what it was — an `.html` in the staged tree with a
+`<link rel="stylesheet">` to the sheet. The second is the served page's
+other possible origin: a server that writes the page itself from the build.
+`tests/support/ladder.rs::documented_legs` reads a `.vl` source through the
+real lexer (`vilan_core::lexing::tokenize`) and matches the call shape
+`Document` `::` `of` `(` — a mention in a comment or a string literal is
+trivia or one `String` token and cannot satisfy it — then resolves the
+argument to the leg it describes: `require_build("leg")` / `build_of("leg")`
+inline, or a `let`/`mut` binding (type annotation allowed) to one. A build
+that arrives any other way (a parameter, a field) names no leg, and the
+gate says so rather than guessing. `examples.rs::documented_stylesheets`
+then joins those legs against the build's own statement — `styles` in
+`dist/<leg>.chunks.json`, the same manifest `Document::of` reads — so the
+claim is precisely "this server writes leg L's document, and L's build
+emitted this sheet". Two browser legs and one `Document::of` credit one
+sheet, not two. Four pins in `examples.rs`, each planted red: the
+recognized shapes (bound, inline, `build_of`+`!`, annotated, `mut`, two
+legs); a comment and a string that are not calls and a parameter that
+names no leg; a staged rung-2 tree that passes and the same tree with the
+call commented out that fails with `client.css` named; and the two-leg
+tree where `admin.css` is still unlinked. With the second truth removed,
+`every_example_builds` fails on `examples/todo` exactly as §16.2 predicted
+(`emitted stylesheets that no page links: ["client.css"]`); with it, the
+gate is green over all ten examples with no assertion moved.
+
+**`examples/todo` is at rung 2.** `src/app.html` is deleted; the server
+writes `Document::of(build).title("Vilan todos").body("<p …>…</p>").html()`
+— the one line of markup that was this app's own (the two-tabs hint) rides
+`body`, which is the escape hatch's first in-repo customer. Mirrors the
+shape §16.6 applied to the owner's playground app; `src/client.vl` is
+untouched (`mount_root("app", …)` is the generated document's default
+mount). Measured on a staged copy of the tracked files, built and booted:
+`GET /` 200 `text/html`; `/client.js` 200 `text/javascript`; `/client.css`
+200 `text/css`; `POST /rpc` 200 `application/json`; stopped clean. The
+served page against the deleted shell, indentation-blind: `<html lang="en">`
+(was bare `<html>`), the viewport `<meta>` added, `<meta charset>` and the
+`<link>` self-closing, a trailing newline — and nothing else: same title,
+same `<link>`, same `<div id="app">`, same `<p>`, same module `<script>`.
+By §1.2's line rule: `src/server.vl` 20 → 23 lines (the formatter gives the
+`Document::of` chain four lines; per call it is the one `require_shell`
+call it replaces) and `src/app.html` 13 → 0 — 33 lines across two files
+become 23 in one. The README's layout block loses `app.html` and says why.
+
+**The scaffold does not climb; the blessed-layout gate distinguishes.**
+`tests/init.rs::the_fullstack_template_matches_the_blessed_example_layout`
+asserted `src/app.html` on disk in the scaffold and all three examples as
+"the layout the manifest implies". The manifest implies the two entries'
+files, and only those are asserted in both now. The shell is a rung, not a
+layout: the scaffold keeps `src/app.html` and is asserted to — §6.3 and
+§10.6 RULED rung 1 + the validator for the scaffold ("a web developer
+opening a new project expects to find the HTML") and the owner ratified the
+§10 set, so the template moving would reverse a ruling, which is not a
+lane's call — while each example must stand on one rung: the shell on disk,
+or `src/server.vl` writing the `client` leg's document (`documented_legs`,
+the same recognizer). Planted red: commenting out todo's `Document::of`
+fails the gate with "todo stands on no rung". Consequently the init
+template is byte-identical, there is no CHANGELOG entry, and the
+`docs/guide/` touch is one paragraph: `walkthrough.md`'s "the shell is
+still an unchecked `fs::read_file_to_str`" had been stale since §16 moved
+that example to `require_shell`; it now says which rung the walkthrough
+stands on and points at `examples/todo` for the last one.
+
+**The gates.** `cargo test -p vilan-cli --test examples` (6 passed),
+`--test init` (12 passed), `cargo test -p vilan-cli --test corpus` (7
+passed, byte-identical — no compiler, std, or emitted JavaScript touched),
+`cargo test -p vilan-core --test docs` (8 passed), and the full suite by
+exit code (see the lane's report). Not verified: the browser client running
+against the rung-2 server (no browser here); the page's bytes are the
+measurement above.
+
+**Found in passing, not fixed here.** `Document::head()`/`body()`'s doc
+comment ("the markup goes through the same `check_shell` rules as anything
+else … is caught here too") and `docs/std/process.md` ("markup you add
+there is checked like any other") promise a check that `Document::html()`
+does not run for a generated document: probed on the rung-2 todo,
+`.head("<script type=\"module\" src=\"/client.Nope.js\"></script>")` — a
+script inside the leg's namespace the build never emitted, F3's
+`ScriptNotEmitted` — builds, boots, and is served. `tests/document.rs`
+proves the check CATCHES it when an app calls `check_shell` on the result,
+which is a different sentence. Either `of`'s `html()` runs `check_shell`
+over the generated markup when `head`/`body` were supplied (and §5.5's
+"every document `of` can produce passes `check_shell`" is then stated
+without the hatches), or the two comments stop promising it — a std
+semantic, the owner's to rule; filed in the lane's report.
