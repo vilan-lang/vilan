@@ -49,8 +49,8 @@ Closing sweeps archive tombstones into
 | `diagnostics-ledger.md` | active (living ledger) | Every `diagnostics.push` site with its audit verdict; updated per audit batch. |
 | `diagnostics-standard.md` | shipped / foundational (accepted 2026-07-16) | The rules a diagnostic message must follow, plus the audit plan the ledger executes. |
 | `distribution.md` | shipped arc (2026-07-25, provisioned 2026-07-29) | npm/Marketplace/Open VSX/Homebrew distribution (F7) plus the project-model deferrals (F5). |
-| `docs-audit-2026-08-18.md` | shipped arc (2026-08-18, backlog D15) | The book's currency audit against v0.34.0: a per-page inventory, what was fixed, the three-way keyword/grammar diff, and D16–D18 filed behind it. |
-| `docs-port.md` | RATIFIED 2026-08-19 as recommended (backlog K6/K7, K13 filed) | The docs port: the three-repo estate surveyed, the vilan-framework port costed and blocked on a markdown story, re-theming mdBook onto the ratified tokens ruled (option B, chrome mechanism (i)), with K7's run button and K5's light theme sliced behind it. |
+| `docs-audit-2026-08-18.md` | shipped arc (D15 2026-08-18; D17–D19 gates §5 2026-08-19) | The book's currency audit against v0.34.0: a per-page inventory, what was fixed, the three-way keyword/grammar diff, and D16–D18 filed behind it. |
+| `docs-port.md` | RATIFIED 2026-08-19; S5 SHIPPED (K7, §7); S1–S4/S6 in review (K6, §6) | The docs port: the three-repo estate surveyed, the vilan-framework port costed and blocked on a markdown story, re-theming mdBook onto the ratified tokens ruled (option B, chrome mechanism (i)), with K7's run button and K5's light theme sliced behind it. |
 | `docs-site.md` | shipped arc (2026-07-12) | The rendered docs site: mdBook, custom grammar, GitHub Pages publishing. |
 | `draft-reconnect.md` | shipped arc (2026-08-04) | `Draft` re-push on reconnect and the debounced commit — A14's last reactive residual. |
 | `documentation.md` | shipped arc (Phase 3, 2026-07-12) | D1a, the user-facing reference docs — what the book covers and its phasing. |
@@ -64,7 +64,7 @@ Closing sweeps archive tombstones into
 | `hmr.md` | shipped arc (2026-07-21) | Hot module replacement closing the dev loop (A13). |
 | `kolt-migration.md` | active (living document) | The kolt→vilan migration driver; tracks the reference app's porting status. |
 | `lazy.md` | draft, ratified but deferred (2026-07-21/22) | `lazy` parameters and module bindings — deferred by user call until real demand appears (backlog B30). |
-| `leak-soak.md` | shipped arc (M2, 2026-08-18) | The memory-leak soak: the LSP plateau scaled to real corpora at thousands of keystrokes through both allocation lifetimes, plus `scripts/soak.sh` over a `run --watch` session and a compiled Node server. §4 dispositions every curve — three closed, one filed (M7: 3.12 MiB of resident memory per keystroke on a 735-line file, by design and never returned); §6 sketches the dhat cross-check it deliberately does not add. |
+| `leak-soak.md` | shipped arc (M2 2026-08-18; M7 §7 2026-08-19) | The memory-leak soak: the LSP plateau scaled to real corpora at thousands of keystrokes through both allocation lifetimes, plus `scripts/soak.sh` over a `run --watch` session and a compiled Node server. §4 dispositions every curve — three closed, one filed (M7: 3.12 MiB of resident memory per keystroke on a 735-line file, by design and never returned); §6 sketches the dhat cross-check it deliberately does not add. |
 | `library-packages.md` | shipped arc (2026-06-23) | Library packages, replacing old roadmap item P4. |
 | `local-shadowing.md` | shipped arc (2026-07-28) | Positional visibility for local bindings (B34), including the same-scope shadowing fix. |
 | `lsp-snapshot-consistency.md` | shipped arc (approved/implemented 2026-07-28) | Semantic tokens never outrun the analysis they're served from. |
@@ -84,7 +84,7 @@ Closing sweeps archive tombstones into
 | `reactive-batching.md` | shipped arc (2026-07-02) | Deferred notification and the `batch` turn. |
 | `reactive-turns.md` | shipped arc (2026-07-09) | Reactive turns — scoped flush, async turns, replacing global auto-flush (A6). |
 | `releases.md` | active | Installation, versioning, and the release pipeline — the process this project actually runs. |
-| `remote-sources.md` | RATIFIED 2026-08-19 as recommended (backlog A25; S1–S3 in build) | A25 — a remote mirror's subscription follows demand: a count on `RemoteSource` that rides owner disposal, `Unsubscribe` at zero, and `map`/`or`/`status` as the one seam into `Signal`; §6's four questions ruled as recommended; three `#[ignore]`d pins stand in `inference.rs` until the slices land. |
+| `remote-sources.md` | SHIPPED 2026-08-19 (A25 S1–S3; §8 ship record) | A25 — a remote mirror's subscription follows demand: a count on `RemoteSource` that rides owner disposal, `Unsubscribe` at zero, and `map`/`or`/`status` as the one seam into `Signal`; §6's four questions ruled as recommended; the three pins stand un-ignored, nine more beside them; §8 holds the playground/kolt diffs still to apply. |
 | `requirement-polymorphism.md` | shipped arc (2026-08-02, backlog B51) | The owner-coverage fence follows instantiation chains through generic forwarders. |
 | `ret-checking.md` | shipped arc (2026-07-04) | Return-position type checking (backlog B10). |
 | `roadmap.md` | historical / superseded (banner 2026-08-18) | Pre-lettered-section ranked backlog; its strategic role now lives in `backlog-2026-08-18.md`'s Now/Next/Later block, its Done chronicle stays as history. |
