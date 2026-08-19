@@ -1,6 +1,8 @@
 # `const` — compile-time evaluation as a language feature
 
 Status: **SHIPPED 2026-07-10** — the full v1, same-day as the proposal.
+
+> **§10 (M4, 2026-08-18):** the profile and the local hoists shipped the same day; §10.5's structural remainder was RULED as recommended — **Option A, one shared const world per analysis** (no cache key, keeps the equivalence gate); Option B (cross-analysis memoization, §8.3's cache-key question) stays deferred. A's first step per §10.5: measure the distinct-function count that sizes its prize. Scheduled for the next order as M4-A.
 Slices 1–4 (the keyword, mark-and-forward + the free-variable rule, the
 evaluation pass, in-place serialization — 21 pins + corpus `const.vl`), then
 the **asset channel + const-only bit** (§2–3, the styling prerequisite):
@@ -1098,7 +1100,7 @@ anything: **2.3 s**, the `perf_baseline` binary's gate tests going 0.69 s →
 in-process measurements is admissible there where a relative-regression
 threshold is not.
 
-### 10.5 The remaining two thirds — DESIGN, not built
+### 10.5 The remaining two thirds — DESIGN, RULED 2026-08-18: Option A as recommended
 
 After the hoists, `evaluate` on the website is 2.80 s debug / 308 ms release,
 and it is now almost all *evaluation*: ~68 % interpreter, ~25 %
