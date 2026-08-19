@@ -2,6 +2,20 @@
 # for live-reload writing; `mdbook build vilan/docs` for the static output
 # in book/ (gitignored). The markdown stays the source of truth — this file
 # only adds navigation, search, and highlighting on top.
+#
+# The look is the vilan design language (proposal/design-language.md, ported
+# in proposal/docs-port.md §3.1): `theme/` overrides mdBook's palette
+# (css/variables.css — the only file that names a hex), its faces
+# (fonts/fonts.css — Inter + CommitMono from vilan-lang.org/assets/fonts/),
+# and its three highlight.js sheets (emptied; the code colours are token
+# slots), adds the tool-register stylesheet (css/vilan.css) and the picker
+# reduction (picker.js), and carries the masthead slot (head.hbs,
+# header.hbs — a local fallback that docs.yml replaces with the site's
+# exported chrome fragment at deploy). theme/vilan.js is the highlighter and
+# the playground links. Note that `src = "."` sweeps this file and every
+# theme source verbatim into book/ beside the hashed copies the pages load;
+# they are authoring files, not the site — the Pages repo's docs.yml drops
+# them after the build (docs-port.md §1.3, §3.1 S1).
 [book]
 title = "The Vilan documentation"
 language = "en"
@@ -11,6 +25,12 @@ src = "."
 build-dir = "book"
 
 [output.html]
-additional-js = ["theme/vilan.js"]
+additional-css = ["theme/css/vilan.css"]
+additional-js = ["theme/vilan.js", "theme/picker.js"]
 default-theme = "light"
 preferred-dark-theme = "navy"
+
+# No print.html: 712 KB of `noindex`, sitemap-excluded dead weight rebuilt
+# and committed daily (docs-port.md §5 N11, §3.1 S1).
+[output.html.print]
+enable = false

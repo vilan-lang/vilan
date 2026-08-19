@@ -1,0 +1,480 @@
+/* The book on the tool register — the vilan look, applied to mdBook's chrome.
+ *
+ * Loaded as `additional-css` (book.toml), after mdBook's own sheets, so a
+ * rule here wins over the stock `general.css` / `chrome.css` at equal
+ * specificity without forking either. Not one value below is a colour:
+ * every colour is `var(--role)` (or a `--code-*` slot, or an mdBook variable
+ * that `css/variables.css` already mapped onto a role) — `variables.css` is
+ * the only file in the book that names a hex (design-language.md §2.4).
+ *
+ * The register is design-language.md §2.2's tool surface: flat, hairline-
+ * separated (1px `--stroke-*`), dense (15px body / 13px code, 4–8px
+ * paddings), radii 4/6/8 by elevation (in text / on the ground / floating),
+ * shadows only on floating surfaces, motion under 200ms. Inter for prose,
+ * CommitMono V143 with the ratified feature set for every code surface
+ * (§2.3). */
+
+/* --- the faces and the register --- */
+
+html {
+    /* general.css hardcodes Open Sans here; Inter is the body face of every
+       vilan surface (theme.vl `body_face`) */
+    font-family: "Inter", system-ui, -apple-system, sans-serif;
+}
+
+body {
+    /* 15px, the top of the tool register's band (general.css: 1.6rem) */
+    font-size: 1.5rem;
+}
+
+/* Every code surface wears the face AND its feature settings together
+   (theme.vl `code_type`): stylistic sets ss01–ss05 and character variants
+   cv04/cv06/cv08 — the owner's editor settings, ratified as the canonical
+   form (design-language.md §2.3), ligatures included. `font-synthesis: none`
+   because a faked bold on a mono face breaks the grid. (On `code` and
+   `kbd`, not `pre`: the buttons a `pre` carries are set in Inter, whose
+   own ss01–ss03 would otherwise fire.) */
+code,
+kbd {
+    font-feature-settings: "ss01", "ss02", "ss03", "ss04", "ss05", "cv04", "cv06", "cv08";
+    font-synthesis: none;
+}
+
+/* --- the type hierarchy: weight and tone, not size --- */
+
+/* Headings are the `up-bright` tier; body copy is `--fg` (= up-normal). */
+h1, h2, h3, h4, h5, h6,
+.content .header:link,
+.content .header:visited {
+    color: var(--up-bright);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+h1 { font-size: 1.8em; letter-spacing: -0.02em; }
+h2 { font-size: 1.4em; }
+h3 { font-size: 1.15em; }
+h4, h5, h6 { font-size: 1em; }
+/* the stock 2.5em gap above an h2 is generous for this density */
+h2, h3 { margin-block-start: 2em; }
+
+.content p,
+.content ol,
+.content ul {
+    line-height: 1.55;
+}
+
+.content a:link,
+.content a:visited {
+    color: var(--links);
+}
+.content a:hover {
+    color: var(--up-bright);
+    text-decoration: underline;
+    text-decoration-color: var(--primary);
+    text-underline-offset: 0.15em;
+}
+
+hr {
+    border: 0;
+    border-block-start: 1px solid var(--stroke-soft);
+}
+
+/* --- the chrome --- */
+
+/* The menu bar: a flat strip on the ground, a hairline under it once the
+   page scrolls (book.js toggles `.bordered`). */
+#mdbook-menu-bar {
+    background-color: var(--bg);
+}
+#mdbook-menu-bar.bordered {
+    border-block-end-color: var(--stroke-soft);
+}
+/* The book's name in the bar reads as a label, not a headline — the
+   masthead above it carries the brand. */
+.menu-title {
+    font-size: 1.4rem;
+    font-weight: 500;
+    letter-spacing: 0;
+    color: var(--up-normal);
+}
+#mdbook-menu-bar .icon-button,
+#mdbook-menu-bar .fa-svg {
+    transition: color 80ms ease;
+}
+
+/* The sidebar is a panel on the ground, hairlined off it. */
+.sidebar {
+    border-inline-end: 1px solid var(--stroke-soft);
+}
+[dir=rtl] .sidebar {
+    border-inline-end: 0;
+    border-inline-start: 1px solid var(--stroke-soft);
+}
+/* Part titles ("The tour", "The std reference") as small labels. */
+.chapter li.part-title {
+    margin: 14px 0 4px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--up-dim);
+}
+.chapter li.chapter-item {
+    margin-block-start: 0.35em;
+}
+.chapter li a {
+    color: var(--sidebar-fg);
+    transition: color 80ms ease;
+}
+.chapter li a:hover,
+.chapter li a.active,
+.chapter a.current-header {
+    color: var(--sidebar-active);
+}
+/* The on-this-page outline rides a hairline, not a 4px bar. */
+.on-this-page {
+    border-inline-start-width: 1px;
+    border-inline-start-color: var(--stroke-hard);
+}
+.chapter .spacer {
+    height: 1px;
+    margin: 8px 0;
+}
+/* The sidebar's slide is a deliberate affordance: 160ms, not mdBook's 300. */
+html:not(.sidebar-resizing) .sidebar,
+html:not(.js) .page-wrapper,
+.js:not(.sidebar-resizing) .page-wrapper,
+[dir=rtl]:not(.js) .page-wrapper,
+[dir=rtl].js:not(.sidebar-resizing) .page-wrapper {
+    transition-duration: 160ms;
+}
+
+/* The theme picker: a floating surface — radius 8, the one shadow. The three
+   stock themes the book does not ship are hidden here (and removed by
+   `picker.js`, which also labels navy as Dark); the entries are hardcoded in
+   mdBook's index.hbs, which docs-port.md §4 Q5 rules against forking. */
+.theme-popup {
+    border-radius: 8px;
+    border-color: var(--stroke-hard);
+    background: var(--theme-popup-bg);
+    box-shadow: var(--shadow-float);
+    font-size: 1.3rem;
+    padding: 4px 0;
+}
+.theme-popup .theme {
+    padding: 4px 20px;
+    line-height: 22px;
+}
+#mdbook-theme-list li:has(> #mdbook-theme-rust),
+#mdbook-theme-list li:has(> #mdbook-theme-coal),
+#mdbook-theme-list li:has(> #mdbook-theme-ayu) {
+    display: none;
+}
+
+/* The search bar: a field on the ground with a hairline; focus is the
+   accent, not a glow. */
+#mdbook-searchbar {
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 1.4rem;
+    transition: border-color 80ms ease;
+}
+#mdbook-searchbar:focus,
+#mdbook-searchbar.active {
+    border-color: var(--primary);
+    box-shadow: none;
+    outline: none;
+}
+.searchresults-outer {
+    border-block-end-color: var(--stroke-soft);
+}
+ul#mdbook-searchresults li {
+    border-radius: 4px;
+}
+ul#mdbook-searchresults li.focus {
+    background-color: var(--down-hover);
+}
+
+/* The wide prev/next arrows: flat, the hover is the overlay. */
+.nav-chapters:hover {
+    background-color: var(--down-hover);
+}
+.mobile-nav-chapters {
+    border-radius: 6px;
+    background-color: var(--down-normal);
+    border: 1px solid var(--stroke-soft);
+}
+
+/* The help popup is the other floating surface. */
+#mdbook-help-popup {
+    border-radius: 8px;
+    border-color: var(--stroke-hard);
+    box-shadow: var(--shadow-float);
+}
+
+/* --- the content --- */
+
+/* Code blocks are panels on the ground: radius 6, a soft hairline, 13px. */
+pre > code {
+    padding: 10px 12px;
+    border: 1px solid var(--stroke-soft);
+    border-radius: 6px;
+    line-height: 1.5;
+}
+/* Inline code sits in text: radius 4, one step brighter than a block so it
+   reads against the prose without a border. */
+:not(pre) > .hljs {
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+}
+:not(pre):not(a) > .hljs {
+    background: var(--down-bright);
+}
+a > .hljs {
+    background: transparent;
+    padding: 0;
+}
+
+/* Tables: hairlines, no zebra heavier than a panel. */
+table td,
+table thead th {
+    padding: 4px 12px;
+    border: 1px solid var(--table-border-color);
+}
+table thead {
+    background: var(--table-header-bg);
+}
+table thead th {
+    font-weight: 600;
+    color: var(--up-bright);
+    text-align: start;
+}
+table thead tr {
+    border-color: var(--stroke-hard);
+}
+
+blockquote {
+    margin: 16px 0;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border-block-start: 0;
+    border-block-end: 0;
+    border-inline-start: 2px solid var(--quote-border);
+    color: var(--fg);
+}
+blockquote p:first-child { margin-block-start: 0.3em; }
+blockquote p:last-child { margin-block-end: 0.3em; }
+.blockquote-tag {
+    border-radius: 0 6px 6px 0;
+    border-inline-start-width: 2px;
+}
+
+kbd {
+    border-radius: 4px;
+    border: 1px solid var(--stroke-hard);
+    box-shadow: none;
+    background-color: var(--down-bright);
+    color: var(--up-bright);
+}
+
+/* --- the buttons on a code block: copy (book.js), ▶ playground (vilan.js) --- */
+
+pre > .buttons {
+    top: 6px;
+    right: 6px;
+    padding: 0;
+    display: flex;
+    gap: 4px;
+}
+pre > .buttons button,
+pre > .buttons a.vilan-playground-link {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    min-width: 24px;
+    margin: 0;
+    padding: 0 6px;
+    font-family: "Inter", system-ui, -apple-system, sans-serif;
+    font-size: 1.2rem;
+    line-height: 1;
+    border: 1px solid var(--stroke-hard);
+    border-radius: 4px;
+    background-color: var(--down-bright);
+    color: var(--up-dim);
+    transition: color 80ms ease, border-color 80ms ease, background-color 80ms ease;
+}
+pre > .buttons button:hover,
+pre > .buttons a.vilan-playground-link:hover {
+    color: var(--up-bright);
+    border-color: var(--up-dim);
+    background-color: var(--down-bright);
+}
+pre > .buttons a.vilan-playground-link {
+    color: var(--primary);
+}
+/* The copy icon is drawn in currentColor through a mask, so it takes the
+   button's colour tokens instead of mdBook's per-theme colorizing filter
+   (which variables.css therefore sets to none). The glyph is the clipboard
+   from octicons v2.0.0 (MIT), the same one chrome.css sets as `content`. */
+pre > .buttons button.clip-button {
+    padding: 0 5px;
+}
+pre > .buttons button.clip-button::before {
+    content: "";
+    display: block;
+    width: 14px;
+    height: 14px;
+    background-color: currentColor;
+    -webkit-mask: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 25"><path d="M18 20h2v3c0 1-1 2-2 2H2c-.998 0-2-1-2-2V5c0-.911.755-1.667 1.667-1.667h5A3.323 3.323 0 0110 0a3.323 3.323 0 013.333 3.333h5C19.245 3.333 20 4.09 20 5v8.333h-2V9H2v14h16v-3zM3 7h14c0-.911-.793-1.667-1.75-1.667H13.5c-.957 0-1.75-.755-1.75-1.666C11.75 2.755 10.957 2 10 2s-1.75.755-1.75 1.667c0 .911-.793 1.666-1.75 1.666H4.75C3.793 5.333 3 6.09 3 7z"/><path d="M4 19h6v2H4zM12 11H4v2h8zM4 17h4v-2H4zM15 15v-3l-4.5 4.5L15 21v-3l8.027-.032L23 15z"/></svg>') center / contain no-repeat;
+    mask: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 25"><path d="M18 20h2v3c0 1-1 2-2 2H2c-.998 0-2-1-2-2V5c0-.911.755-1.667 1.667-1.667h5A3.323 3.323 0 0110 0a3.323 3.323 0 013.333 3.333h5C19.245 3.333 20 4.09 20 5v8.333h-2V9H2v14h16v-3zM3 7h14c0-.911-.793-1.667-1.75-1.667H13.5c-.957 0-1.75-.755-1.75-1.666C11.75 2.755 10.957 2 10 2s-1.75.755-1.75 1.667c0 .911-.793 1.666-1.75 1.666H4.75C3.793 5.333 3 6.09 3 7z"/><path d="M4 19h6v2H4zM12 11H4v2h8zM4 17h4v-2H4zM15 15v-3l-4.5 4.5L15 21v-3l8.027-.032L23 15z"/></svg>') center / contain no-repeat;
+    filter: none;
+}
+pre > .buttons button.clip-button:hover::before {
+    filter: none;
+}
+/* The copied-tooltip is a floating surface too. */
+.tooltiptext {
+    color: var(--up-bright);
+    background-color: var(--down-bright);
+    border: 1px solid var(--stroke-hard);
+    border-radius: 6px;
+    font-size: 1.2rem;
+}
+
+/* --- highlight.js onto the code slots --- */
+
+/* The `--code-*` slots are theme.vl's `code_palette`, declared per theme in
+   variables.css; this is the same role-for-token mapping the playground's
+   CodeMirror theme makes (K10), so the book and the editor colour a keyword
+   with one decision. The three stock hljs sheets are emptied overrides
+   (theme/highlight.css, tomorrow-night.css, ayu-highlight.css), so this
+   mapping is the only one on the page in every theme. */
+.hljs {
+    display: block;
+    overflow-x: auto;
+    background: var(--code-bg);
+    color: var(--code-plain);
+}
+.hljs-comment,
+.hljs-quote {
+    color: var(--code-comment);
+    font-style: italic;
+}
+.hljs-keyword,
+.hljs-literal,
+.hljs-selector-tag {
+    color: var(--code-keyword);
+}
+/* the hole of an i-string: code inside a string, coloured as code */
+.hljs-subst {
+    color: var(--code-plain);
+}
+.hljs-string,
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-regexp {
+    color: var(--code-string);
+}
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-section {
+    color: var(--code-type);
+    font-weight: 600;
+}
+/* a function's name where it is defined (`fun main`) — the editor's `def` */
+.hljs-title {
+    color: var(--code-callable);
+    font-weight: 600;
+}
+/* calls and the element tags: the callable tint, plain weight */
+.hljs-built_in,
+.hljs-builtin-name,
+.hljs-name {
+    color: var(--code-callable);
+}
+/* attributes (`[derive(...)]`) — the editor's `attr`, dimmed and italic */
+.hljs-meta {
+    color: var(--code-attr);
+    font-style: italic;
+}
+/* everything else hljs names in the book's other fences (toml keys, html
+   tags and attributes, shell variables) reads as plain code, as it does in
+   the editor */
+.hljs-attr,
+.hljs-attribute,
+.hljs-tag,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-params,
+.hljs-selector-id,
+.hljs-selector-class,
+.hljs-link {
+    color: var(--code-plain);
+}
+.hljs-emphasis {
+    font-style: italic;
+}
+.hljs-strong {
+    font-weight: 600;
+}
+.hljs-addition {
+    color: var(--code-plain);
+    background-color: color-mix(in srgb, var(--down-info) 18%, transparent);
+}
+.hljs-deletion {
+    color: var(--code-plain);
+    background-color: color-mix(in srgb, var(--down-danger) 18%, transparent);
+}
+
+/* --- the masthead slot (theme/header.hbs) --- */
+
+/* `header.hbs` renders as the first child of `.page`, above mdBook's menu
+   bar (docs-port.md §2.2 B2). Two adjustments let it live there:
+   general.css pulls `.page` up by the menu-bar height to hide the
+   hover-placeholder above the viewport, which with a masthead first would
+   hide the masthead instead; so the page starts at zero and the placeholder
+   gives its height back by overlapping the menu bar, exactly the stock
+   overlap, one masthead lower. The slot is full-bleed across the page, and
+   it is STATIC: the masthead scrolls away with the page and mdBook's menu
+   bar (sticky, top 0) stays — the site's nav pins itself to the top of the
+   site's own pages, and two surfaces pinned at top 0 would paint over each
+   other here (v1 per docs-port.md §4 Q5; pinning the masthead too would
+   mean the menu bar sticks below it and every `:target` scroll margin grows
+   by its height). The masthead itself — the fallback below locally, the
+   website's exported fragment at deploy — is styled by `/chrome/header.css`
+   through the same role tokens; nothing else here reaches into it. */
+.page {
+    margin-block-start: 0;
+}
+#mdbook-menu-bar-hover-placeholder {
+    margin-block-end: calc(0px - var(--menu-bar-height));
+}
+.page > :first-child:not(#mdbook-menu-bar-hover-placeholder) {
+    position: static;
+    margin-inline: calc(0px - var(--page-padding));
+}
+
+/* The fallback masthead (local builds only — see theme/header.hbs). */
+.vilan-masthead-fallback {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 44px;
+    padding: 0 16px;
+    border-block-end: 1px solid var(--stroke-soft);
+    background: var(--down-normal);
+    font-size: 1.3rem;
+    color: var(--up-dim);
+}
+.vilan-masthead-fallback a {
+    color: var(--up-bright);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-decoration: none;
+}
+.vilan-masthead-fallback a:hover {
+    color: var(--primary);
+}

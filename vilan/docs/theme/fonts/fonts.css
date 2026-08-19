@@ -1,0 +1,38 @@
+/* The book's faces — Inter and CommitMono V143, the same two files the rest
+ * of vilan-lang.org loads (`vilan-website/src/app.html`).
+ *
+ * This file REPLACES mdBook's stock `fonts/fonts.css`, and with it the
+ * 516 KB of Open Sans + Source Code Pro the stock theme would otherwise
+ * copy into the build (mdBook ships its font files only when no override
+ * exists; probed on v0.5.4 — `book/fonts/` holds this file alone). The
+ * faces are the self-hosted OFL files already served from the Pages repo's
+ * hand-owned `assets/fonts/`, referenced absolutely so the book and the
+ * site share one cached copy. A local build fetches them from the live
+ * site; offline, the fallback stacks in `css/variables.css` (`--mono-font`)
+ * and `css/vilan.css` (the body face) take over.
+ *
+ * Inter is the variable file — one face for every weight. CommitMono V143
+ * is the variable font per the ratified spec (design-language.md §2.3):
+ * 200–700 is the font's REAL wght axis range, so declaring it keeps the axis
+ * live and lets the browser refuse to synthesize outside it. The feature
+ * settings (ss01–ss05, cv04/cv06/cv08) and `font-synthesis: none` (a faked
+ * bold on a mono face breaks the grid) are NOT set here — `font-synthesis`
+ * is an element property, not an @font-face descriptor — they are applied
+ * per code surface in `css/vilan.css`, as theme.vl applies them on the
+ * site. */
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url(https://vilan-lang.org/assets/fonts/inter-latin.woff2) format("woff2");
+}
+
+@font-face {
+  font-family: "CommitMonoV143";
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+  src: url(https://vilan-lang.org/assets/fonts/commit-mono-v143.woff2) format("woff2");
+}

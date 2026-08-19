@@ -1,0 +1,13 @@
+{{!-- The book's <head> additions (mdBook's `theme/head.hbs` partial — lands
+     inside <head>, before the stylesheet links; docs-port.md §3.1 S4).
+
+     One line: the site's chrome stylesheet, served from the Pages root by the
+     website's deploy alongside the masthead fragment it styles
+     (`chrome/header.html`, injected as `theme/header.hbs` by docs.yml).
+     Absolute, because the book lives under `/docs/` at any depth and the
+     stylesheet lives at the root; a local build 404s on it by design — the
+     fallback masthead in `header.hbs` is styled by the book's own
+     `css/vilan.css` instead. The faces (`fonts/fonts.css`) and the tokens
+     (`css/variables.css`) are already in mdBook's bundle — index.hbs links
+     them — so nothing else belongs here. --}}
+<link rel="stylesheet" href="/chrome/header.css">
