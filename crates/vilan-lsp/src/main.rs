@@ -3473,6 +3473,115 @@ mod snapshot_consistency_tests {
         );
     }
 
+    // E66 (editing-dx.md §18), at the protocol layer: the `.` after a CALL's
+    // closing paren, typed on a line the analysis has not seen. The trigger
+    // scan finds the dot in the live text; the receiver — the call's result,
+    // which no `expr_types` entry names — is resolved against the ANALYZED
+    // snapshot through `to_analyzed_offset`, so the answer is the result
+    // type's members and not the callee's signature.
+    #[tokio::test]
+    async fn completion_after_a_dot_typed_on_a_call_result_offers_its_members() {
+        const BASE: &str = "struct Widget {\n\tsize: i32,\n}\n\n\
+             fun build(): Widget { Widget { size = 1 } }\n\n\
+             fun main() {\n\tlet _w = build();\n}\n";
+        let live = BASE.replacen("\tlet _w = build();\n", "\tlet _w = build().\n", 1);
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(BASE));
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let position = position_at(&live, "build().\n", 8);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert!(document.is_stale(), "the buffer is ahead of the analysis");
+        }
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion after a call");
+        let labels: Vec<String> = match &response {
+            Some(CompletionResponse::Array(items)) => {
+                items.iter().map(|item| item.label.clone()).collect()
+            }
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels.contains(&"size".to_string()),
+            "the CALL's result type carries the members: {labels:?}",
+        );
+        assert!(
+            !labels.contains(&"build".to_string()),
+            "the callee is not the receiver: {labels:?}",
+        );
+    }
+
+    // E67 (editing-dx.md §18), at the protocol layer: a `.` typed inside an
+    // element's opening tag. The head context is read from a raw parse of the
+    // LIVE buffer — element syntax is desugared before analysis, so no element
+    // ever reaches `program` and the analyzed snapshot cannot answer this —
+    // while the `View` methods themselves come from the analyzed program.
+    #[tokio::test]
+    async fn completion_after_a_dot_in_an_element_head_offers_the_view_methods() {
+        const BASE: &str = "import std::ui::view;\n\nfun main() {\n\t<div></div>\n}\n";
+        let live = BASE.replacen("\t<div></div>\n", "\t<div .></div>\n", 1);
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(BASE));
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let position = position_at(&live, "<div .>", 6);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert!(document.is_stale(), "the buffer is ahead of the analysis");
+        }
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion in an element head");
+        let labels: Vec<String> = match &response {
+            Some(CompletionResponse::Array(items)) => {
+                items.iter().map(|item| item.label.clone()).collect()
+            }
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels.contains(&"bind_each".to_string()) && labels.contains(&"text".to_string()),
+            "the View chain's methods: {labels:?}",
+        );
+        assert!(
+            !labels.contains(&"attributes".to_string()),
+            "a View FIELD is not a chain link: {labels:?}",
+        );
+        assert!(
+            !labels.contains(&"fun".to_string()),
+            "a keyword candidate would mean the head context was missed: {labels:?}",
+        );
+    }
+
     // S4, pin 12: an analysis that finishes AFTER the document was closed is
     // dropped. Re-inserting it would resurrect a closed buffer — diagnostics
     // reappearing with no document behind them and nothing left to clear them,

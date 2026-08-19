@@ -13,7 +13,7 @@ use vilan_core::id::Id;
 use vilan_core::lexing::tokenize;
 use vilan_core::node::Convention;
 use vilan_core::token::Token;
-use vilan_core::type_::Type;
+use vilan_core::type_::{Type, TypeId};
 use vilan_core::{
     Error, Manifest, PackageSpec, Platform as BuildPlatform, Program, Span,
     Workspace as BuildWorkspace, analyze_source,
@@ -452,6 +452,12 @@ pub enum CompletionKind {
     /// bare keyword it accompanies.
     Snippet,
 }
+
+/// How far [`Document::expression_type_id`] follows a value through nesting
+/// shapes (a block's trailing expression, a closure-typed callee) before giving
+/// up. Real receivers nest a step or two; the bound is what keeps a malformed
+/// mid-edit tree from spinning.
+const EXPRESSION_TYPE_DEPTH_LIMIT: usize = 8;
 
 /// The vilan book's published base URL — keyword hovers deep-link into it.
 const BOOK_BASE: &str = "https://vilan-lang.org/docs/";
@@ -1076,6 +1082,61 @@ fn find_linked_tags(
     }
     node.0
         .for_each_child(&mut |child| find_linked_tags(child, offset, out));
+}
+
+/// The end of the TAG NAME of the innermost element whose opening tag could
+/// contain `offset` — the start of its head (E67).
+///
+/// Two shapes count, because element syntax is desugared before analysis
+/// (`elements.rs`) and so is only ever seen through a RAW parse, mid-edit:
+///
+/// - a parsed [`Node::Element`], which is what a complete tag gives; and
+/// - a [`Node::Error`] spanning `<…>`, which is what `parse_atom`'s element
+///   recovery leaves behind whenever a head item does not parse — `<div .>`
+///   (no method name after the dot) and `<div >` (no `</div>` yet) both land
+///   here, and they are exactly the buffers completion fires in.
+///
+/// Only the tag NAME bounds the answer; where the head ends, and whether the
+/// cursor is still at the head's own bracket depth, is
+/// [`Document::in_element_head`]'s token walk.
+fn innermost_open_tag_end(
+    node: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    offset: usize,
+    source: &str,
+    best: &mut Option<(usize, usize)>,
+) {
+    use vilan_core::node::Node;
+    let span = node.1.into_range();
+    if span.start <= offset && offset <= span.end {
+        let tag_end = match &node.0 {
+            Node::Element(body) => Some(body.tag.end),
+            Node::Error => error_tag_name_end(source, span.start, span.end),
+            _ => None,
+        };
+        if let Some(tag_end) = tag_end {
+            if tag_end <= offset && best.is_none_or(|(width, _)| span.end - span.start <= width) {
+                *best = Some((span.end - span.start, tag_end));
+            }
+        }
+    }
+    node.0
+        .for_each_child(&mut |child| innermost_open_tag_end(child, offset, source, best));
+}
+
+/// The end of the tag name in an error node the element recovery produced —
+/// `<` immediately followed by a name, the whole run closed by `>`. `None`
+/// for any other error node, so a failed expression is never mistaken for
+/// markup.
+fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
+    let slice = source.get(start..end)?;
+    if !slice.starts_with('<') || !slice.ends_with('>') {
+        return None;
+    }
+    let name: usize = slice[1..]
+        .bytes()
+        .take_while(|byte| is_identifier_byte(*byte) || *byte == b'-')
+        .count();
+    (name > 0).then_some(start + 1 + name)
 }
 
 /// Whether an expression is a value-position use of the definition `def_id` — the
@@ -3057,6 +3118,14 @@ impl Document {
         if start >= 1 && bytes[start - 1] == b'(' && text[..start - 1].ends_with("[derive") {
             return self.macro_name_completions(program);
         }
+        // An element's opening tag is its own world too (E67): between `<div`
+        // and `>` the desugar takes an attribute, an `on:event(…)` or a
+        // `.method(…)` chain link — and nothing that is merely in scope. The
+        // check runs from `start` (the head item being typed), and the `.`
+        // just before it is the same disambiguator the grammar uses.
+        if self.in_element_head(start) {
+            return self.element_head_completions(program, start >= 1 && bytes[start - 1] == b'.');
+        }
         // An import path is its own world (E57): a name there is being reached
         // FOR THE FIRST TIME, so none of the in-scope machinery below applies —
         // candidates come from the package tree, and the head of the path names
@@ -3114,6 +3183,121 @@ impl Document {
             }
         }
         candidates
+    }
+
+    /// Whether `offset` (LIVE space — see [`Self::completion`]) sits in an
+    /// element's OPENING TAG, where the desugar takes an attribute, an
+    /// `on:event(…)`, or a `.method(…)` chain link (element-syntax.md §2–4).
+    ///
+    /// "In the head" is *after the tag name, before the head's `>`, and at the
+    /// head's own bracket depth*. The depth clause is what keeps this honest:
+    /// a head item's ARGUMENT is ordinary expression ground — the cursor in
+    /// `<form on:submit(|event| { print(client.add(x).| ) })>` is inside a
+    /// closure, three brackets deep, and belongs to E66's answer, not to this
+    /// one. It is also what makes the recovered shape safe to use, since a
+    /// flattened `<…>` error node spans the arguments too.
+    ///
+    /// The token walk reads the LIVE buffer, like the rest of completion's
+    /// dispatch: the character being typed is live by nature.
+    fn in_element_head(&self, offset: usize) -> bool {
+        let text = self.line_index.text();
+        let Some(tag_end) = self.open_tag_end(text, offset) else {
+            return false;
+        };
+        let (tokens, _errors) = tokenize(text);
+        let mut depth = 0usize;
+        for (token, span) in &tokens {
+            let range = span.into_range();
+            if range.start < tag_end {
+                continue;
+            }
+            if range.start >= offset {
+                break;
+            }
+            match token {
+                Token::Ctrl('(' | '[' | '{') => depth += 1,
+                Token::Ctrl(')' | ']' | '}') => depth = depth.saturating_sub(1),
+                // The head is already closed: the cursor is among the children.
+                Token::Ctrl('>') if depth == 0 => return false,
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// The head start of the innermost element containing `offset` — a raw
+    /// parse of the live text, since no element survives into `program`.
+    fn open_tag_end(&self, text: &str, offset: usize) -> Option<usize> {
+        let (tree, _errors) = vilan_core::parsing::parse(text);
+        let root = tree?;
+        let mut best: Option<(usize, usize)> = None;
+        for item in &root.0 {
+            innermost_open_tag_end(item, offset, text, &mut best);
+        }
+        best.map(|(_, tag_end)| tag_end)
+    }
+
+    /// The candidates for an element's head (E67). `chain` says the cursor
+    /// follows a `.`, so the head item under construction is a chain link.
+    ///
+    /// Both halves come from the compiler's own knowledge, so neither can
+    /// drift: the chain form's vocabulary is the `View` type's method set,
+    /// read from the std declaration the program compiles against, and the
+    /// event form is a *grammar* form, not a name list. The undotted
+    /// ATTRIBUTE vocabulary is deliberately absent — element-syntax.md §2 and
+    /// §9 item 3 make the desugar name-blind (`name(x)` lowers to
+    /// `.attr("name", x)` whatever `name` is), so there is no list to offer
+    /// and inventing one here would be a second source of truth with nothing
+    /// to gate it. What the head position stops offering is the enclosing
+    /// scope: not one binding, type, keyword or construct snippet may appear
+    /// between `<div` and `>`.
+    fn element_head_completions(&self, program: &Program, chain: bool) -> Vec<Completion> {
+        let Some(view_id) = self.element_view_nominal_id(program) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        self.push_methods(program, view_id, true, &mut items);
+        if !chain {
+            // Undotted: the chain form is offered in its own spelling, dot
+            // included, because an undotted `text(…)` is an ATTRIBUTE named
+            // "text" — a different construct, and the one §4's warning exists
+            // to catch.
+            for item in &mut items {
+                item.label = format!(".{}", item.label);
+            }
+            items.push(Completion::snippet(
+                "on:",
+                "an event handler",
+                "on:${1:click}(|${2:event}| { $0 })",
+                "on:",
+            ));
+        }
+        items
+    }
+
+    /// The `View` the element desugar builds on: the nominal `view("tag")`
+    /// returns (element-syntax.md §4 — a head lowers to a `view(…)` chain),
+    /// read from the declaration rather than matched by name, so the browser
+    /// and process twins each answer for their own platform.
+    fn element_view_nominal_id(&self, program: &Program) -> Option<Id> {
+        let mut fallback = None;
+        for (id, function) in &program.functions {
+            if function.name != "view" {
+                continue;
+            }
+            let Some(nominal) = function
+                .return_type_id
+                .and_then(|type_id| nominal_type_id(program, type_id))
+            else {
+                continue;
+            };
+            // std's `view`, not a same-named entry-file function.
+            if program.source_of(*id) != Some(SourceId(0)) {
+                return Some(nominal);
+            }
+            fallback = fallback.or(Some(nominal));
+        }
+        fallback
     }
 
     /// Every registered macro name, for attribute-position completion. The
@@ -3204,16 +3388,25 @@ impl Document {
                 return self.nominal_member_completions(program, element);
             }
         }
-        // A complex receiver (`find(x)?.`): its rendered type's first generic
-        // argument names the element — another `program` lookup, so `entity_at`
-        // also takes the ANALYZED offset (E52).
+        // A complex receiver (`find(x)?.`): the first type argument of its own
+        // value type names the element — another `program` lookup, so
+        // `entity_at` also takes the ANALYZED offset (E52). A CALL receiver is
+        // resolved structurally (E66); the rendered label is the fallback for
+        // whatever that cannot type.
         question_offset
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
-            .and_then(|receiver| self.hover_label(program, receiver))
-            .and_then(|label| first_generic_argument(&label).map(str::to_string))
-            .and_then(|element| self.nominal_id_by_name(program, base_type_name(&element)))
+            .and_then(|receiver| {
+                self.expression_element_nominal_id(program, receiver)
+                    .or_else(|| {
+                        self.hover_label(program, receiver)
+                            .and_then(|label| first_generic_argument(&label).map(str::to_string))
+                            .and_then(|element| {
+                                self.nominal_id_by_name(program, base_type_name(&element))
+                            })
+                    })
+            })
             .map(|type_id| self.nominal_member_completions(program, type_id))
             .unwrap_or_default()
     }
@@ -3237,33 +3430,105 @@ impl Document {
                 return Some(nominal);
             }
         }
-        // A complex receiver (`foo().`, `a.b.`): the parsed entity's rendered
+        // A complex receiver (`foo().`, `a.b.`): the parsed entity's own value
         // type — another `program` lookup, so `entity_at` also takes the
-        // ANALYZED offset (E52).
+        // ANALYZED offset (E52). The rendered label is the FALLBACK, not the
+        // answer: it is hover's phrasing, and hover answers a constructor call
+        // with the thing being constructed (`Some(1)` -> `enum Option`), which
+        // is right here, but a plain call with the CALLEE's signature
+        // (`make()` -> `fn make(): Point`), which never names a type at all.
         dot_offset
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
-            .and_then(|receiver| self.hover_label(program, receiver))
-            .and_then(|label| self.nominal_id_by_name(program, base_type_name(&label)))
+            .and_then(|receiver| {
+                self.expression_nominal_id(program, receiver).or_else(|| {
+                    self.hover_label(program, receiver)
+                        .and_then(|label| self.nominal_id_by_name(program, base_type_name(&label)))
+                })
+            })
+    }
+
+    /// The nominal struct/enum id of the VALUE an expression produces — the
+    /// question member completion asks of a receiver, and a different one from
+    /// [`Self::hover_label`], which describes the expression *as written*.
+    ///
+    /// The analyzer records a type on an expression's own id only where one is
+    /// *produced*; a call, and a block whose value is one, are typed on demand
+    /// and store nothing (the same silence B85 hit on `for … in` iterables and
+    /// B70 on tuple elements). So `expr_types`/`expr_type_ids` answer a field, an
+    /// index, a literal and a struct initializer directly, and the shapes below
+    /// are resolved by structure instead (E66).
+    fn expression_nominal_id(&self, program: &Program, id: Id) -> Option<Id> {
+        nominal_type_id(program, self.expression_type_id(program, id, 0)?)
+    }
+
+    /// [`Self::expression_nominal_id`]'s LIFTED twin: the nominal of the
+    /// container's ELEMENT — `find(x)?.` on an `Option<Profile>` offers
+    /// Profile's members (proposal/try-and-lift.md §5).
+    fn expression_element_nominal_id(&self, program: &Program, id: Id) -> Option<Id> {
+        let type_id = self.expression_type_id(program, id, 0)?;
+        let element = match program.type_id_to_type_map.get(&type_id)? {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => *arguments.first()?,
+            _ => return None,
+        };
+        nominal_type_id(program, element)
+    }
+
+    /// The resolved type of the value `id` produces. `depth` bounds the walk
+    /// through the nesting shapes (a block's trailing expression is itself an
+    /// expression), so a malformed mid-edit tree cannot spin here.
+    fn expression_type_id(&self, program: &Program, id: Id, depth: usize) -> Option<TypeId> {
+        if depth > EXPRESSION_TYPE_DEPTH_LIMIT {
+            return None;
+        }
+        if let Some(type_id) = program.expr_type_ids.get(&id) {
+            return Some(*type_id);
+        }
+        match program.entity_map.get(&id)? {
+            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
+                binding_type_id(program, *binding)
+            }
+            Expr::Call(call_id) => self.call_result_type_id(program, *call_id, depth),
+            Expr::Block((_, tail)) => self.expression_type_id(program, *tail, depth + 1),
+            _ => None,
+        }
+    }
+
+    /// A call's result type, read off the callee's declaration: the return type
+    /// of the function it names, or the result of the closure type it holds.
+    ///
+    /// The type ARGUMENTS of a generic return (`Result<Note, RpcError>`) do not
+    /// have to be solved for this to be useful — member completion resolves
+    /// members on the nominal head, and that head is written in the declaration.
+    fn call_result_type_id(&self, program: &Program, call_id: Id, depth: usize) -> Option<TypeId> {
+        let subject_id = program.function_calls.get(&call_id)?.subject_id;
+        // The callee is reached as a bare reference to its declaration.
+        let callee_id = match program.entity_map.get(&subject_id) {
+            Some(Expr::Local(binding))
+            | Some(Expr::Variable(binding))
+            | Some(Expr::Parameter(binding)) => *binding,
+            _ => subject_id,
+        };
+        if let Some(function) = program.functions.get(&callee_id) {
+            if let Some(return_type_id) = function.return_type_id {
+                return Some(return_type_id);
+            }
+        }
+        if let Some(external) = program.external_functions.get(&callee_id) {
+            return Some(external.return_type_id);
+        }
+        // A closure-typed callee (`let render = || …; render().`).
+        let subject_type_id = self.expression_type_id(program, subject_id, depth + 1)?;
+        match program.type_id_to_type_map.get(&subject_type_id)? {
+            Type::Closure(_, return_type_id) => Some(*return_type_id),
+            _ => None,
+        }
     }
 
     /// The nominal struct/enum id a `let`/parameter binding's declared type names.
     fn binding_nominal_id(&self, program: &Program, binding: Id) -> Option<Id> {
-        let type_id = program
-            .variables
-            .get(&binding)
-            .map(|variable| variable.type_id)
-            .or_else(|| {
-                program
-                    .parameters
-                    .get(&binding)
-                    .map(|parameter| parameter.type_id)
-            })?;
-        match program.type_id_to_type_map.get(&type_id)? {
-            Type::Struct(id, _) | Type::Enum(id, _) => Some(*id),
-            _ => None,
-        }
+        nominal_type_id(program, binding_type_id(program, binding)?)
     }
 
     /// The nearest same-file `let`/`mut` binding named `name` declared before
@@ -3685,10 +3950,7 @@ impl Document {
 
     /// The nominal struct/enum id an impl's subject names, ignoring type arguments.
     fn impl_subject_id(&self, program: &Program, implementation: &Implementation) -> Option<Id> {
-        match program.type_id_to_type_map.get(&implementation.subject)? {
-            Type::Struct(id, _) | Type::Enum(id, _) => Some(*id),
-            _ => None,
-        }
+        nominal_type_id(program, implementation.subject)
     }
 
     /// The struct or enum named `name` (type arguments already stripped).
@@ -4056,6 +4318,29 @@ fn first_generic_argument(label: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// The nominal struct/enum id a resolved type names, ignoring its type
+/// arguments — the id member resolution is keyed by.
+fn nominal_type_id(program: &Program, type_id: TypeId) -> Option<Id> {
+    match program.type_id_to_type_map.get(&type_id)? {
+        Type::Struct(id, _) | Type::Enum(id, _) => Some(*id),
+        _ => None,
+    }
+}
+
+/// The declared type of a `let`/`mut` binding or a parameter.
+fn binding_type_id(program: &Program, binding: Id) -> Option<TypeId> {
+    program
+        .variables
+        .get(&binding)
+        .map(|variable| variable.type_id)
+        .or_else(|| {
+            program
+                .parameters
+                .get(&binding)
+                .map(|parameter| parameter.type_id)
+        })
 }
 
 fn base_type_name(label: &str) -> &str {
@@ -6434,6 +6719,21 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// [`completions_at_cursor`] with an explicit cursor marker — the element
+    /// pins carry closure literals, whose `|` the default marker would claim.
+    fn completions_at_marker(src: &str, marker: char) -> Vec<String> {
+        let offset = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("test source needs a `{marker}` cursor marker"));
+        let text = src.replace(marker, "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
     /// The full completion candidates offered at the `|` cursor in `src` —
     /// carrying `detail`, `documentation`, and `call_parameters` (WO-3).
     fn completion_items_at_cursor(src: &str) -> Vec<Completion> {
@@ -6518,6 +6818,262 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"x".to_string()),
             "incomplete member: {labels:?}"
+        );
+    }
+
+    // --- E66: a call receiver (editing-dx.md §18) ---------------------------
+    //
+    // The shapes below all end in a value the analyzer types on DEMAND and
+    // records nothing for, so none of them could resolve through `expr_types`
+    // the way a field or an index does. The name-receiver case they contrast
+    // with is pinned by `member_completion_lists_fields_and_methods` and
+    // `member_completion_on_incomplete_receiver` above.
+
+    /// The prelude the call-receiver pins share: a nominal with a field and a
+    /// method, a free function returning it, a method returning it, and an
+    /// `Option` producer for the lifted shape.
+    const CALL_RECEIVER_PRELUDE: &str = "import std::option::Option::{ self, Some, None };\n\
+         struct Point { x: i32, y: i32 }\n\
+         impl Point { fun twin(self): Point { self } }\n\
+         fun make(): Point { Point { x = 1, y = 2 } }\n\
+         fun find(): Option<Point> { None }\n\
+         fun echo(p: Point): Point { p }\n";
+
+    fn call_receiver_completions(body: &str) -> Vec<String> {
+        completions_at_cursor(&format!("{CALL_RECEIVER_PRELUDE}fun main() {{\n{body}}}\n"))
+    }
+
+    // E66: the owner's shape — a `.` typed straight after a call's closing
+    // paren. The receiver is the call's RESULT, never the callee.
+    #[test]
+    fn member_completion_on_a_call_receiver() {
+        let labels = call_receiver_completions("\tmake().|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+        assert!(
+            !labels.contains(&"make".to_string()),
+            "the RESULT's members, not the callee: {labels:?}"
+        );
+    }
+
+    // E66: a chained call — the receiver is itself a call on a call.
+    #[test]
+    fn member_completion_on_a_chained_call_receiver() {
+        let labels = call_receiver_completions("\tmake().twin().|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+    }
+
+    // E66: a method call on a bound name — the receiver resolves through the
+    // METHOD's return type, not the binding's.
+    #[test]
+    fn member_completion_on_a_method_call_receiver() {
+        let labels = call_receiver_completions("\tlet p = make();\n\tp.twin().|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+    }
+
+    // E66: a call in ARGUMENT position, the trailing `)` and `;` still to come
+    // — the shape the playground was actually being typed in.
+    #[test]
+    fn member_completion_on_a_call_in_argument_position() {
+        let labels = call_receiver_completions("\tlet _q = echo(make().|);\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+    }
+
+    // E66: a `?.`-lifted call offers the ELEMENT's members, exactly as the
+    // lifted NAME receiver does (`lifted_member_completion_offers_the_element`).
+    #[test]
+    fn lifted_member_completion_on_a_call_receiver() {
+        let labels = call_receiver_completions("\tfind()?.|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+        assert!(
+            !labels.contains(&"unwrap_or".to_string()),
+            "the ELEMENT's members, not Option's: {labels:?}"
+        );
+    }
+
+    // E66: a block's value is a call — the walk through the trailing
+    // expression, which `expr_types` records nothing for either.
+    #[test]
+    fn member_completion_on_a_block_receiver() {
+        let labels = call_receiver_completions("\t{ make() }.|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+    }
+
+    // E66: a constructor call still answers with the constructed type — the
+    // shape `hover_label` already covered, kept green by the fallback.
+    #[test]
+    fn member_completion_on_a_constructor_call_receiver() {
+        let labels = call_receiver_completions("\tSome(1).|\n");
+        assert!(
+            labels.contains(&"unwrap_or".to_string()),
+            "Option's members: {labels:?}"
+        );
+    }
+
+    // E66, the field case verbatim (vilan-playground/todo/src/client.vl:42):
+    // a generated client method's `Result<…>` result, reached inside a closure
+    // inside an element's `on:submit(…)` attribute.
+    #[test]
+    fn member_completion_on_a_call_inside_an_element_attribute_closure() {
+        let labels = completions_at_marker(
+            "import std::print;\n\
+             import std::reactive::Signal;\n\
+             import std::result::Result;\n\
+             import std::ui::view;\n\
+             struct Note { id: i32, text: str }\n\
+             struct NotesClient { }\n\
+             impl NotesClient {\n\
+             \tfun add(self, name: str): Result<Note, str> { Result::Ok(Note { id = 1, text = name }) }\n\
+             }\n\
+             fun app(client: NotesClient, note_name: Signal<str>) {\n\
+             \t<form on:submit(|event| { print(client.add(note_name.get()).~); })></form>\n\
+             }\n",
+            '~',
+        );
+        assert!(
+            labels.contains(&"is_ok".to_string()) && labels.contains(&"unwrap".to_string()),
+            "the client method's `Result` members: {labels:?}"
+        );
+    }
+
+    // --- E67: an element's opening tag (editing-dx.md §18) ------------------
+
+    /// The prelude the element-head pins share.
+    const ELEMENT_HEAD_PRELUDE: &str =
+        "import std::ui::view;\nimport std::reactive::Signal;\nimport std::print;\n";
+
+    fn element_head_completions(body: &str) -> Vec<String> {
+        completions_at_marker(
+            &format!("{ELEMENT_HEAD_PRELUDE}fun main() {{\n{body}}}\n"),
+            '~',
+        )
+    }
+
+    // E67: `<div .|>` is the chain's method-completion site — the head lowers
+    // to a `view("div")` chain (element-syntax.md §4), so the candidates are
+    // the `View` type's own methods.
+    #[test]
+    fn element_head_dot_offers_the_view_methods() {
+        let labels = element_head_completions("\t<div .~></div>\n");
+        for method in ["bind_each", "on", "text", "child", "styled"] {
+            assert!(
+                labels.contains(&method.to_string()),
+                "`{method}` is a View method: {labels:?}"
+            );
+        }
+        assert!(
+            !labels.iter().any(|label| label.starts_with('.')),
+            "the dot is already typed: {labels:?}"
+        );
+        // A head item is a CHAIN LINK, so the candidates are the View's
+        // methods and not its members: a `View` field is not something the
+        // desugar can splice into the chain, and offering one here is what an
+        // ordinary member completion on the desugared `view("div")` would do.
+        for field in ["tag", "attributes"] {
+            assert!(
+                !labels.contains(&field.to_string()),
+                "`{field}` is a View FIELD, not a chain link: {labels:?}"
+            );
+        }
+    }
+
+    // E67: `<div |>` — the undotted head position. The chain form is offered
+    // in its own spelling (dot included: undotted `text(…)` is an ATTRIBUTE),
+    // the event form as the grammar's `on:`, and nothing that is merely in
+    // scope: no bindings, no type names, no keywords, no construct snippets.
+    #[test]
+    fn element_head_offers_the_head_forms_and_nothing_in_scope() {
+        let labels = element_head_completions("\tlet caption = \"hi\";\n\t<div ~></div>\n");
+        assert!(
+            labels.contains(&".bind_each".to_string()) && labels.contains(&".on".to_string()),
+            "the chain form, dot included: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"on:".to_string()),
+            "the event form: {labels:?}"
+        );
+        for wrong in ["caption", "str", "view", "fun", "for … in { }"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` may not appear in a head: {labels:?}"
+            );
+        }
+    }
+
+    // E67: a NESTED tag under construction. The unfinished chain link used to
+    // flatten its own tag to an error atom and, nested, took the whole
+    // statement with it; the head-item recovery keeps both elements alive.
+    #[test]
+    fn element_head_dot_completes_in_a_nested_element() {
+        let labels = element_head_completions("\t<div><span .~></span></div>\n");
+        assert!(
+            labels.contains(&"bind_value".to_string())
+                && !labels.contains(&"attributes".to_string()),
+            "the inner tag's View methods: {labels:?}"
+        );
+        let self_closing = element_head_completions("\t<div><span .~ /></div>\n");
+        assert!(
+            self_closing.contains(&"bind_value".to_string()),
+            "a self-closing inner tag: {self_closing:?}"
+        );
+    }
+
+    // E67: mid-word (`<div .bi|>`) offers the same list — the editor filters
+    // it by the prefix, as everywhere else in completion.
+    #[test]
+    fn element_head_dot_mid_word_offers_the_view_methods() {
+        let labels = element_head_completions("\t<div .bi~></div>\n");
+        assert!(
+            labels.contains(&"bind_each".to_string())
+                && labels.contains(&"bind_value".to_string())
+                && !labels.contains(&"attributes".to_string()),
+            "{labels:?}"
+        );
+    }
+
+    // E67, the boundary: a head item's ARGUMENT is ordinary expression ground.
+    // The cursor sits inside a closure inside `on:click(…)` — brackets deep,
+    // so the head vocabulary does not apply and the receiver's members do.
+    #[test]
+    fn an_element_head_argument_is_not_head_position() {
+        let labels = element_head_completions(
+            "\t<div on:click(|| { let s = Signal::new(\"\"); s.~; })></div>\n",
+        );
+        assert!(
+            labels.contains(&"get".to_string()) && labels.contains(&"set".to_string()),
+            "the Signal's members: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"bind_each".to_string()),
+            "not the View's: {labels:?}"
+        );
+    }
+
+    // E67, the negative: a `.` outside any markup is untouched.
+    #[test]
+    fn a_dot_outside_an_element_still_completes_normally() {
+        let labels = element_head_completions("\tlet s = Signal::new(\"\");\n\ts.~\n");
+        assert!(
+            labels.contains(&"get".to_string()),
+            "the Signal's members: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"bind_each".to_string()),
+            "not the View's: {labels:?}"
+        );
+    }
+
+    // E67, the other negative: an element's CHILD position is expression
+    // ground too — `{expr}` holes complete from scope, not from the head.
+    #[test]
+    fn an_element_child_is_not_head_position() {
+        let labels = element_head_completions("\tlet caption = \"hi\";\n\t<div>{capt~}</div>\n");
+        assert!(
+            labels.contains(&"caption".to_string()),
+            "the binding in scope: {labels:?}"
         );
     }
 
