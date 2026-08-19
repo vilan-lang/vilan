@@ -2288,7 +2288,7 @@ references in the tree are teaching ones — `docs/guide/routing.md`,
 Not removed here. It is shipped std surface, the `serve_service` shape it
 exists for is still a supported spelling (§4.6), and deleting a public name is
 its own decision with its own changelog entry. The review §13.1 asked for is
-owed, and this is the note that opens it.
+owed, and this is the note that opens it. (Closed: §16.8.)
 
 ### 16.4 The drafts
 
@@ -2452,3 +2452,42 @@ over the generated markup when `head`/`body` were supplied (and §5.5's
 "every document `of` can produce passes `check_shell`" is then stated
 without the hatches), or the two comments stop promising it — a std
 semantic, the owner's to rule; filed in the lane's report.
+
+### 16.8 E64 — `build_handler` retired (2026-08-19)
+
+The owner RULED the review §13.1 asked for and §16.3 opened: retire it.
+`fun build_handler(build: LegBuild, fallback: |Request| Response):
+|Request| Response` is deleted from `std/src/process/http.vl`, and nothing
+else went with it — `load_build`, `asset_for`, `asset_response` and
+`asset_body` are `serve_build`'s and `respond_from_build`'s, and stay; the
+`pkg::build` import line is unchanged. It was exported from no list (std's
+modules are root-scoped), so the deletion is the one std edit. Corpus
+byte-identical with the std change in (no program compiled it), docs gate
+green, full suite green by exit code — the lane's report has the numbers.
+The one behavior that existed only in it, a sync `|Request| Response` over
+the build's routes for a boot function that owns its own `Server`, has no
+replacement by design: that boot-function shape is §3.7's complaint and
+§4.6's sugar, and the builder it is sugar over carries `serve_build`.
+
+Where the guides now point. `docs/guide/routing.md`'s deep-link section
+compiles the builder chain (`serve_build` + the `on_request` catch-all, a
+`norun` fence where it had a `serve_service(…, build_handler(…))`
+fragment) and says in prose that an rpc app adds `.with_service(…)` to the
+same chain under the same rule; `docs/guide/services.md`'s "The server
+side" shows the full chain — `.with_service(Service::new(…))`,
+`.serve_build(require_build("client"))`, `.on_request`, `.on_start` — and
+its "Growing past one service" opens from that chain rather than from
+`serve_service`; `docs/guide/persistence.md` lost its `build_handler`
+fragment and points at the services page for the chain with a service on
+it; `docs/std/process.md` lost the signature and says `serve_build` on the
+builder is the one way a server serves its build, with `with_service` for
+the rpc app; `docs/std/rpc.md` stopped naming it as what "usually fills"
+a `serve_*` fallback. No `vilan,fragment` fence names it any more.
+Outside the repo: `vilan-playground` and kolt's `vilan-migration` branch
+were grepped read-only — neither calls it (kolt is on `serve_service` with
+a hand-written fallback, §16.4's draft unapplied).
+
+Next: the owner has said the `serve_rpc` / `serve_service` /
+`serve_connected` trio is to be retired too — E71 in the tracker, a
+separate slice; this one touched none of them, and the guides' remaining
+`serve_service` mentions are that slice's to sweep.

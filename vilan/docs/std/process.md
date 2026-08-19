@@ -56,9 +56,6 @@ impl ServerBuilder {
 	fun serve_build(own self, build: LegBuild): ServerBuilder   // one route per artifact
 	fun build(self): Server
 }
-// The same routing for a boot function that hands you only a fallback
-// (`serve_service`, `serve_connected`):
-fun build_handler(build: LegBuild, fallback: |Request| Response): |Request| Response
 impl Server {
 	fun start(self)        // begin listening; holds the event loop
 	fun stop(self)         // stop listening; fires on_stop once the listener has closed
@@ -115,7 +112,10 @@ content-type table a full-stack server used to write by hand. It takes a
 every route chunk — in front of `on_request`, whatever order the chain was
 written in. So the app's catch-all still answers every path the build does
 not claim, and a leg that gains `split = true` gains its chunk routes with
-no server edit.
+no server edit. It is the one way a server serves its build: an rpc app
+that wants it puts its service on the same chain with `with_service`
+([below](#stdrpc_server)) rather than reaching for a `serve_*` boot
+function, which hands you only a fallback and no builder to install on.
 
 Three details are decisions, not defaults. The route shape is
 `/<file name>`, which is what every shell already asks for, so adopting it
