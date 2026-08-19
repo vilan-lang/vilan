@@ -43617,6 +43617,281 @@ fn a_const_site_reads_its_dependency_afresh_in_a_second_analysis() {
     );
 }
 
+/// Analyzes `source` on a large-stack worker and reports how many function
+/// bodies the const pass LOWERED. Same instrument, same reasoning and same
+/// isolation as [`name_seeds_built_by_one_analysis`] above.
+fn const_lowerings_of_one_analysis(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::transformer::reset_const_lowering_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let _ = program.expect("analysis should produce a program");
+            vilan_core::transformer::const_lowering_count()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn the_const_pass_lowers_its_world_once_however_many_sites_reach_it() {
+    // M4-A (`const-eval.md` §10.6). Every `const` site used to lower the whole
+    // function closure its expression reaches into a mini-program of its own —
+    // on the website's client entry, 3,873 function emissions across 188 sites
+    // for **106** distinct functions. The pass now lowers one world and
+    // evaluates every site against it, so the lowering is a fact about the
+    // program and not about how many sites read it.
+    //
+    // Only a counter can pin that: a world lowered once and a world lowered per
+    // site produce identical values and identical diagnostics — that is the
+    // whole claim — so nothing but the count distinguishes them.
+    let sites = |count: usize| {
+        let bindings: String = (0..count)
+            .map(|index| format!("let SITE{index}: i32 = const doubled({index});\n"))
+            .collect();
+        let sum: Vec<String> = (0..count).map(|index| format!("SITE{index}")).collect();
+        format!(
+            r#"
+            import std::print;
+            fun doubled(value: i32): i32 {{ value * 2 }}
+            {bindings}
+            fun main() {{ print({}); }}
+            "#,
+            sum.join(" + ")
+        )
+    };
+    let one = const_lowerings_of_one_analysis(&sites(1));
+    assert!(
+        one > 0,
+        "the probe must actually reach a function, or the pin measures nothing"
+    );
+    assert_eq!(
+        const_lowerings_of_one_analysis(&sites(3)),
+        one,
+        "three sites through one function must lower the same world one site does"
+    );
+    assert_eq!(
+        const_lowerings_of_one_analysis(&sites(6)),
+        one,
+        "doubling the const sites must not change how much the pass lowers"
+    );
+}
+
+#[test]
+fn const_sites_sharing_a_world_compute_what_they_computed_alone() {
+    // The other half of the claim above, stated over values: the sites share a
+    // lowering, so they must not share an ANSWER. Each folds its own argument
+    // through the same function, and the chain (a site reading a binding another
+    // site folded) folds against the shared world too.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        let SCALE: i32 = 10;
+
+        fun scaled(value: i32): i32 {
+            value * SCALE
+        }
+
+        let A: i32 = const scaled(2);
+        let B: i32 = const scaled(3);
+        let C: i32 = const scaled(2);
+        let CHAINED: i32 = const A + B + C;
+
+        fun main() {
+            print(A);
+            print(B);
+            print(C);
+            print(CHAINED);
+        }
+        main();
+        "#,
+        "20\n30\n20\n70\n",
+    );
+}
+
+#[test]
+fn a_const_site_reads_its_module_bindings_afresh_and_never_another_sites() {
+    // M4-A's isolation property (`const-eval.md` §10.6). What the world shares
+    // is the LOWERING — immutable `js::Node` trees, borrowed. Every site still
+    // runs in a scope of its own and re-executes its own prelude, so nothing one
+    // site's evaluation produced can reach the next one.
+    //
+    // Two sites take a copy of the same const-folded module binding and grow it;
+    // each must see the binding as its initializer left it. Planted to §10.5's
+    // literal shape — ONE interpreter scope for the pass, module bindings
+    // declared into it once — this reads `TABLE is not defined` and is red. It
+    // does NOT redden on a shared scope that still re-declares, because the copy
+    // is a copy; that the LEAK itself is unreachable is
+    // `no_const_site_can_reach_mutable_module_state_at_all` below, and the two
+    // together are why sharing the lowering is safe.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun seed(): List<i32> {
+            mut result: List<i32> = List::new();
+            result.push(1);
+            result
+        }
+
+        let TABLE: List<i32> = const seed();
+
+        fun grown(): i32 {
+            mut local = TABLE;
+            local.push(9);
+            local.len()
+        }
+
+        let FIRST: i32 = const grown();
+        let SECOND: i32 = const grown();
+
+        fun main() {
+            print(FIRST);
+            print(SECOND);
+        }
+        main();
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn no_const_site_can_reach_mutable_module_state_at_all() {
+    // Why the sharing above is safe rather than merely observed to be: there is
+    // no mutable module-level state a const evaluation can touch, and the two
+    // halves of the language close it from both ends. A `mut` module binding is
+    // not compile-time-known, so the const pass refuses to reach it; and an
+    // immutable one cannot be mutated, so the analyzer refuses that. A prelude
+    // therefore only ever declares values built fresh from literals and folded
+    // constants (`const-eval.md` §10.6).
+    assert_fails_with(
+        r#"
+        import std::print;
+        mut COUNTER: i32 = 0;
+        fun bump(): i32 {
+            COUNTER = COUNTER + 1;
+            COUNTER
+        }
+        let X: i32 = const bump();
+        fun main() { print(X); }
+        "#,
+        "this `const` expression reaches `COUNTER`, whose value is not compile-time-known",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun seed(): List<i32> {
+            mut result: List<i32> = List::new();
+            result.push(1);
+            result
+        }
+        let TABLE: List<i32> = const seed();
+        fun grow(): i32 {
+            TABLE.push(9);
+            TABLE.len()
+        }
+        let X: i32 = const grow();
+        fun main() { print(X); }
+        "#,
+        "cannot mutate immutable 'TABLE'",
+    );
+}
+
+#[test]
+fn a_const_site_is_refused_only_for_what_it_itself_reaches() {
+    // The shared world is one lowering, but a site's REACH is still its own —
+    // reconstructed per site from what each emission recorded (`const-eval.md`
+    // §10.6). A union would refuse the clean site beside the dirty one, and the
+    // multiplicity is the whole point of the pin. Both orders, because a site's
+    // reach must not depend on which site the pass evaluated first.
+    let capability = |dirty_first: bool| {
+        let sites = if dirty_first {
+            "let DIRTY: i32 = const impure();\nlet CLEAN: i32 = const doubled(21);"
+        } else {
+            "let CLEAN: i32 = const doubled(21);\nlet DIRTY: i32 = const impure();"
+        };
+        format!(
+            r#"
+            import std::print;
+            import std::random;
+            fun doubled(value: i32): i32 {{ value * 2 }}
+            fun impure(): i32 {{ random::range(1, 6) }}
+            {sites}
+            fun main() {{ print(CLEAN); print(DIRTY); }}
+            "#
+        )
+    };
+    assert_fails_once_with(&capability(false), "is not available at expansion time");
+    assert_fails_once_with(&capability(true), "is not available at expansion time");
+
+    // And the same for a binding that is not compile-time-known: the site that
+    // reaches it is refused, the site beside it folds.
+    assert_fails_once_with(
+        r#"
+        import std::print;
+        mut COUNTER: i32 = 0;
+        fun bump(): i32 { COUNTER = COUNTER + 1; COUNTER }
+        fun doubled(value: i32): i32 { value * 2 }
+        let DIRTY: i32 = const bump();
+        let CLEAN: i32 = const doubled(21);
+        fun main() { print(DIRTY); print(CLEAN); }
+        "#,
+        "whose value is not compile-time-known",
+    );
+}
+
+#[test]
+fn a_const_failure_names_the_function_that_failed_not_the_name_it_was_emitted_under() {
+    // §8.2's attribution reads the interpreter's frame trace, which carries
+    // EMITTED names — and one name generator now serves the whole pass, so two
+    // reached functions that share a source name cannot both be called by it:
+    // the second is minted `helper2`, a name no declaration carries. Matching a
+    // frame by identity rather than by string is what keeps the diagnostic
+    // reading the source (`const-eval.md` §10.6); matching by string drops the
+    // subject entirely, which is what this saw before the fix.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun table(): List<i32> {
+            mut result: List<i32> = List::new();
+            result.push(7);
+            result
+        }
+
+        mod alpha {
+            fun helper(values: List<i32>): i32 { values[0] }
+        }
+
+        mod beta {
+            fun helper(values: List<i32>): i32 { values[3] }
+        }
+
+        let GOOD: i32 = const alpha::helper(table());
+        let BAD: i32 = const beta::helper(table());
+
+        fun main() { print(GOOD); print(BAD); }
+        "#,
+        "const evaluation failed in `helper`: index out of bounds",
+    );
+}
+
 #[test]
 fn context_threading_owns_the_one_graph_that_cannot_be_shared() {
     // The exception that makes the rule honest. `context::apply` rewrites

@@ -112,6 +112,11 @@ What is left is now almost all evaluation, and cutting it further is a structura
 ---
 
 <!-- family: tooling -->
+
+
+---
+
+<!-- family: tooling -->
 **Completion answers after a call, and inside an element's opening tag.** Typing `.` after a call's closing paren — `client.add("blah").` — offered nothing, where the same `.` after a bound name offered that name's members. The member path resolved a receiver's type by asking for its hover label, and a hover on a call deliberately describes the *callee*: `make()` reads `fn make(): Point`, which names no type to look members up on. A call's own result type was never available to ask for, because the analyzer types a call on demand and records nothing on it, so the label was all there was. A receiver's value type is now resolved in its own right — a call through its callee's declared return type, a block through its trailing expression, a binding through its declaration — which covers the chained call, the call in argument position with the `)` and `;` still to come, the `?.`-lifted call, and the generated rpc client method whose `Result<Note, RpcError>` was the case that started this. A constructor call (`Some(1).`) still answers with the constructed enum.
 
 Inside `<div …>`, completion also knows it is inside markup. At `<div .|>` it now offers the `View` chain's methods — `.bind_each`, `.on`, `.text`, `.child`, the binding and styling methods — read from the `View` that std's `view(tag)` actually returns, so the list follows the platform and cannot drift from the type the program compiles against. At `<div |>` it offers those same links in their own spelling, dot included (undotted `text(…)` is an *attribute* named "text", a different construct), plus `on:` for the event form. What it stops offering there is everything else: an opening tag used to be answered with the whole enclosing scope, every primitive type name, every keyword and the `for …`/`fun …` construct snippets, none of which may appear between `<div` and `>`. A head item's argument is unaffected — the cursor inside `on:submit(|event| { … })` is ordinary expression ground and completes as one.
@@ -123,14 +128,22 @@ Getting there needed one parser fix, which helps beyond completion: a `.` in an 
 ---
 
 <!-- family: tooling -->
----
-
-<!-- family: tooling -->
 **The toolchain was soaked for leaks, thoroughly, and the numbers are written down.** Five thousand real keystrokes through the language server on kolt's `views.vl` and the website's `page.vl`, forty `vilan run --watch` rebuild rounds with a hundred and sixty browser connect/disconnects between them, and forty thousand requests against a compiled server. Every per-site leak counter plateaus **exactly** — two thousand-analysis windows over the same file leak byte-identical totals, and every site except the two named, by-design ones contributes zero. The dev channel's descriptor accounting, fixed earlier in this cycle, holds in the field: four browsers cost four descriptors and four threads while they are open and exactly nothing once they close, on all forty rounds, where the old behaviour would have banked a hundred and sixty. A compiled server's memory stops climbing after about fifteen thousand requests and completes the same work inside a 64 MiB V8 heap.
 
 The one thing worth reporting is a magnitude rather than a defect. Editing a file in the language server leaks its source and its parsed tree on purpose — the analysis borrows both for the life of the process — and nobody had measured what that costs across a session. It is **3.12 MiB of resident memory per keystroke** on a 735-line file and 0.74 MiB on a 372-line one, so a couple of hours in one large file grows the server by several gigabytes it never gives back. The parsed tree is 97 % of it. That is now a tracked item with a repro rather than a footnote, and nothing about it is new behaviour — only newly known.
 
 The instruments ship with it. `scripts/soak.sh` runs both long-lived processes for as long as you ask and prints a table per round; the language-server half is an `#[ignore]`d test the PR gate never pays for. Every fixture the soak writes expires on its own, every process it starts is killed *and* verified dead, and it sweeps for survivors by process name when it finishes. `vilan/proposal/leak-soak.md` is the record: the method, the tables, a disposition for every curve, and a sketch of what a heap profiler would add that these counters cannot.
+
+---
+
+<!-- family: tooling -->
+**The `const` pass compiles the world it evaluates against once, not once per `const` site.** The design above was ruled and built, and the first thing it had to do was count what the overlap actually was: across the promo site's three entries, **10,245 function emissions for 106, 94 and 111 distinct functions** — every styling chain enters through the same `style()` and re-compiled the same closure behind it, 36 to 43 times over. Timed rather than guessed, re-compiling that closure is **17 %** of the pass, not the 25–30 % the design estimated; the whole world costs 4 ms to compile once. It is now compiled once per analysis, and every site is evaluated against it.
+
+Only the *compilation* is shared. Each site still gets its own interpreter scope and declares its own module-level bindings afresh, so nothing one site evaluates can reach another — and each site still carries its own reach, so what it may read, which runtime helpers it needs and which host bindings it touches are per-site facts, not a union. That last part is the difference between a shared world and a wrong one: a single `const` expression that calls `random::range` refuses itself and nothing else, exactly as before, where a union would have refused every `const` in the file beside it.
+
+On the promo site: the const pass drops from 341 ms to 273 ms in release and 3.06 s to 2.62 s in debug, `vilan check` from 807 ms to 730 ms, and a keystroke in the site's main page from **252 ms to 237 ms** — 1.58× the 150 ms debounce budget, where M1 first measured it at 2.14×. The subjects with little or no `const` in them moved 0–4 %, which is the machine. Emitted output is byte-identical across all three real packages — the site's bundles, stylesheets and chunk manifests, kolt's, and the playground's todo app.
+
+One diagnostic got better on the way. A `const` evaluation that fails names the function it failed in, and it found that function by matching the *emitted* name against your source — which broke the moment one name generator served the whole pass and a second `helper` had to be emitted as `helper2`. Frames are now matched by identity instead, so the message reads your name whatever the compiler called it, a failure inside one of two same-named functions now points at the right declaration where it used to point at neither, and a frame belonging to a generated helper still never reaches you.
 
 ## v0.34.0 — 2026-08-12
 

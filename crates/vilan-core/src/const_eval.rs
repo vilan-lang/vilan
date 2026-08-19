@@ -70,15 +70,16 @@ pub fn evaluate(
     Vec<(Error, SourceId)>,
 ) {
     // A program that already failed analysis skips evaluation entirely: the
-    // transformer's entity lookups (used to build const mini-programs) assume
+    // transformer's entity lookups (used to lower the const world) assume
     // a clean program, exactly as `transform` itself does.
     if !program.diagnostics.is_empty() {
         return (HashMap::default(), Vec::new(), Vec::new());
     }
-    let mut state = State::new(program, options, Mode::Explicit, HashSet::default());
+    let mut world = transformer::ConstWorld::new(program, options);
+    let mut state = State::new(program, Mode::Explicit, HashSet::default());
     state.check_const_only(graph);
     for &expr_id in &program.const_exprs {
-        state.evaluate_one(expr_id);
+        state.evaluate_one(&mut world, expr_id);
     }
     (state.results, state.assets, state.errors)
 }
@@ -109,16 +110,16 @@ pub fn infer(program: &Program, options: &BuildOptions) -> HashMap<Id, ConstValu
     if candidates.is_empty() {
         return HashMap::default();
     }
+    let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(
         program,
-        options,
         Mode::Inferred,
         candidates.iter().copied().collect(),
     );
     // An inferred fold may read what the explicit pass already computed.
     state.results = program.const_results.clone();
     for &expr_id in &candidates {
-        state.evaluate_one(expr_id);
+        state.evaluate_one(&mut world, expr_id);
     }
     debug_assert!(
         state.errors.is_empty(),
@@ -265,7 +266,7 @@ fn render_call_chain(trace: &[String]) -> String {
 /// independent of the type parameters" — made operational. The explicit form
 /// pushes that judgement onto the author, who wrote the keyword. Inference has
 /// to make it itself, and the failure mode if it does not is the worst kind:
-/// `transform_const_program` walks the initializer with NO substitution
+/// the const world walks the initializer with NO substitution
 /// context, so `let total = T::default();` inside `List<T>::sum` does not fail
 /// — it quietly evaluates to `undefined`, and the folded program prints
 /// `undefined` where it used to print `0`. Found by the corpus differential on
@@ -524,7 +525,6 @@ impl LocalIndex {
 
 struct State<'p, 'src> {
     program: &'p Program<'src>,
-    options: &'p BuildOptions,
     /// Which form this is evaluating — see [`Mode`].
     mode: Mode,
     const_set: HashSet<Id>,
@@ -537,9 +537,6 @@ struct State<'p, 'src> {
     /// The `const` subtrees, as a per-source interval index — see
     /// [`SpanRegions`] and [`State::in_const_subtree`].
     const_regions: SpanRegions,
-    /// The per-analysis half of a mini-program build, hoisted out of the
-    /// per-site loop (const-eval.md §10).
-    program_seed: transformer::ConstProgramSeed,
     results: HashMap<Id, ConstValue>,
     assets: Vec<(String, String)>,
     failed: HashSet<Id>,
@@ -559,21 +556,14 @@ enum Known<'src> {
 }
 
 impl<'p, 'src> State<'p, 'src> {
-    fn new(
-        program: &'p Program<'src>,
-        options: &'p BuildOptions,
-        mode: Mode,
-        inferable: HashSet<Id>,
-    ) -> Self {
+    fn new(program: &'p Program<'src>, mode: Mode, inferable: HashSet<Id>) -> Self {
         Self {
             program,
-            options,
             mode,
             const_set: program.const_exprs.iter().copied().collect(),
             inferable,
             locals: LocalIndex::build(program),
             const_regions: SpanRegions::of(program, &program.const_exprs),
-            program_seed: transformer::ConstProgramSeed::build(program, options),
             results: HashMap::default(),
             assets: Vec::new(),
             failed: HashSet::default(),
@@ -597,7 +587,7 @@ impl<'p, 'src> State<'p, 'src> {
         self.errors.push((error, self.source_of(anchor)));
     }
 
-    fn evaluate_one(&mut self, expr_id: Id) -> bool {
+    fn evaluate_one<'w>(&mut self, world: &mut transformer::ConstWorld<'w>, expr_id: Id) -> bool {
         if self.results.contains_key(&expr_id) {
             return true;
         }
@@ -614,7 +604,7 @@ impl<'p, 'src> State<'p, 'src> {
             self.failed.insert(expr_id);
             return false;
         }
-        let ok = self.evaluate_inner(expr_id);
+        let ok = self.evaluate_inner(world, expr_id);
         self.in_progress.remove(&expr_id);
         if !ok {
             self.failed.insert(expr_id);
@@ -622,7 +612,7 @@ impl<'p, 'src> State<'p, 'src> {
         ok
     }
 
-    fn evaluate_inner(&mut self, expr_id: Id) -> bool {
+    fn evaluate_inner<'w>(&mut self, world: &mut transformer::ConstWorld<'w>, expr_id: Id) -> bool {
         // The free-variable rule, with precise spans at each reference.
         let mut ok = true;
         let free = self.free_locals(expr_id);
@@ -631,7 +621,7 @@ impl<'p, 'src> State<'p, 'src> {
             match self.classify(binding) {
                 Known::Ok => {}
                 Known::Const(dependency) => {
-                    if !self.evaluate_one(dependency) {
+                    if !self.evaluate_one(world, dependency) {
                         ok = false;
                     }
                 }
@@ -653,25 +643,19 @@ impl<'p, 'src> State<'p, 'src> {
             return false;
         }
 
-        // Assemble the mini-program. Bindings reached through CALLED functions
-        // surface as `unresolved` — const-initialized ones get evaluated and
-        // the assembly retried; anything else is a diagnostic.
+        // Assemble this site against the shared world (const-eval.md §10.6).
+        // Bindings reached through CALLED functions surface as `unresolved` —
+        // const-initialized ones get evaluated and the assembly retried;
+        // anything else is a diagnostic.
         let mut attempts = 0;
         loop {
-            let (mini, unresolved) = transformer::transform_const_program(
-                self.program,
-                self.options,
-                &self.program_seed,
-                expr_id,
-                &external,
-                &self.results,
-            );
+            let (reach, prelude, unresolved) = world.prepare(expr_id, &external, &self.results);
             let mut retry = false;
             for binding in &unresolved {
                 match self.classify(*binding) {
                     Known::Ok => {}
                     Known::Const(dependency) => {
-                        if self.evaluate_one(dependency) {
+                        if self.evaluate_one(world, dependency) {
                             retry = true;
                         } else {
                             ok = false;
@@ -698,15 +682,17 @@ impl<'p, 'src> State<'p, 'src> {
                 attempts += 1;
                 continue;
             }
+            let site = world.site(expr_id, &reach, prelude);
             return match self.mode {
-                Mode::Explicit => match interpreter::eval_const(&mini, EXPLICIT_LIMITS) {
+                Mode::Explicit => match interpreter::eval_const(&site, EXPLICIT_LIMITS) {
                     Ok((value, assets)) => {
                         self.results.insert(expr_id, value);
                         self.assets.extend(assets);
                         true
                     }
                     Err(failure) => {
-                        let error = self.failure_error(expr_id, failure);
+                        let frames = world.resolve_trace(&failure.trace);
+                        let error = self.failure_error(expr_id, failure, &frames);
                         self.report(expr_id, error);
                         false
                     }
@@ -715,7 +701,7 @@ impl<'p, 'src> State<'p, 'src> {
                 // channels (both inside `eval_inferred`), and the size cap —
                 // and any of the three missing is a silent fallback, which is
                 // simply `false` with nothing reported (const-eval.md §9.2/3).
-                Mode::Inferred => match interpreter::eval_inferred(&mini, INFERRED_LIMITS) {
+                Mode::Inferred => match interpreter::eval_inferred(&site, INFERRED_LIMITS) {
                     Ok(value) if value.literal_size() <= INFERRED_SIZE_CAP => {
                         self.results.insert(expr_id, value);
                         true
@@ -955,7 +941,18 @@ impl<'p, 'src> State<'p, 'src> {
     /// anchors at that function's declaration so the editor can reach it.
     /// A std frame is legal in a note and would not be legal as the primary
     /// span (diagnostics-standard A2, C3).
-    fn failure_error(&self, expr_id: Id, failure: interpreter::Failure) -> Error {
+    ///
+    /// `frames` is the trace resolved to the functions that emitted it
+    /// (`ConstWorld::resolve_trace`) — attribution by identity, not by the
+    /// emitted name, which is a generated artifact and never was the source's
+    /// (const-eval.md §10.6). A frame that resolves to nothing is a synthetic
+    /// or monomorphized one, which B1 says must never reach a user.
+    fn failure_error(
+        &self,
+        expr_id: Id,
+        failure: interpreter::Failure,
+        frames: &[Option<Id>],
+    ) -> Error {
         // The kind stops at the const boundary: a budget miss is not a program
         // error, and §4 promised it says so.
         let headline = match failure.kind {
@@ -964,32 +961,32 @@ impl<'p, 'src> State<'p, 'src> {
             }
             _ => "const evaluation failed",
         };
-        let innermost = failure
-            .trace
-            .first()
-            .filter(|name| self.functions_named(name) > 0);
-        let (subject, note) = match innermost {
+        let source_name = |function_id: Id| self.program.functions[&function_id].name;
+        let (subject, note) = match frames.first().copied().flatten() {
             None => (String::new(), None),
-            Some(name) => {
-                let subject = format!(" in `{name}`");
-                let note = self.unique_function_named(name).map(|function_id| {
-                    let source = self.source_of(function_id);
-                    Note {
-                        // The name, not the whole declaration (A1) — and the
-                        // file only when it differs from the primary span's.
-                        span: self.program.functions[&function_id].name_span,
-                        msg: if failure.trace.len() > 1 {
-                            format!(
-                                "the compile-time call chain: {}",
-                                render_call_chain(&failure.trace)
-                            )
-                        } else {
-                            format!("`{name}` is declared here")
-                        },
-                        source: (source != self.source_of(expr_id)).then_some(source),
-                    }
-                });
-                (subject, note)
+            Some(function_id) => {
+                let name = source_name(function_id);
+                let source = self.source_of(function_id);
+                let note = Note {
+                    // The name, not the whole declaration (A1) — and the
+                    // file only when it differs from the primary span's.
+                    span: self.program.functions[&function_id].name_span,
+                    msg: if failure.trace.len() > 1 {
+                        let chain: Vec<String> = frames
+                            .iter()
+                            .zip(&failure.trace)
+                            .map(|(resolved, emitted)| match resolved {
+                                Some(id) => source_name(*id).to_string(),
+                                None => emitted.clone(),
+                            })
+                            .collect();
+                        format!("the compile-time call chain: {}", render_call_chain(&chain))
+                    } else {
+                        format!("`{name}` is declared here")
+                    },
+                    source: (source != self.source_of(expr_id)).then_some(source),
+                };
+                (format!(" in `{name}`"), Some(note))
             }
         };
         Error {
@@ -997,33 +994,6 @@ impl<'p, 'src> State<'p, 'src> {
             span: self.span_of(expr_id),
             msg: format!("{headline}{subject}: {}", failure.message),
         }
-    }
-
-    /// How many declared functions carry a name — the guard against printing a
-    /// synthetic or monomorphized frame name at the user (B1).
-    fn functions_named(&self, name: &str) -> usize {
-        self.program
-            .functions
-            .values()
-            .filter(|function| function.name == name)
-            .count()
-    }
-
-    /// The one function with this name, or `None` when the name is ambiguous —
-    /// a note pointing at an arbitrary one of several would not be
-    /// deterministic (C1).
-    fn unique_function_named(&self, name: &str) -> Option<Id> {
-        let mut found = None;
-        for (id, function) in &self.program.functions {
-            if function.name != name {
-                continue;
-            }
-            if found.is_some() {
-                return None;
-            }
-            found = Some(*id);
-        }
-        found
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic
@@ -1110,7 +1080,7 @@ impl<'p, 'src> State<'p, 'src> {
             return Known::Runtime(variable.name);
         }
         // Items — functions, structs, enum constructors — are code, not
-        // runtime state; the mini-program emits them.
+        // runtime state; the const world lowers them.
         Known::Ok
     }
 
