@@ -1,13 +1,21 @@
 # Remote sources — subscribe by demand, unsubscribe at zero (A25)
 
-> **DRAFTED 2026-08-18, AWAITING RULING.** Proposal-only: nothing ships
-> under this paper. The brief is `backlog-2026-08-18.md` §A item 25,
-> including the owner's two refinements of the same day (a fallback
-> *without* having to supply an initial; "status", not "state"). §6 holds
-> the questions the design cannot decide alone. Three `#[ignore]`d pins
-> stand in `crates/vilan-core/tests/inference.rs` (§5); two of them assert
-> facts no ruling changes, the third asserts this paper's recommended API
-> and gets rewritten, not un-ignored, if the ruling differs.
+> Status: **RATIFIED 2026-08-19 as recommended** ("Recommendations in
+> remote-sources.md and docs-port.md look good") — §6's four answers
+> stand: **Q1** `sub` keeps `|T|`, no second public counted entry point in
+> v1; **Q2** no `Stale` in v1 (`Waiting`/`Ready` from the cache alone);
+> **Q3** the arms are `Waiting`/`Ready` and the seam is `or(initial)`;
+> **Q4** the `Unsubscribe` is deferred to turn settle (`at_settle`). The
+> design of §2 is the spec; §5's three slices are the build order, each
+> gated as written there; pin **C** un-ignores as-is (it asserted exactly
+> this API). Tracker: `backlog-2026-08-18.md` §A item 25.
+>
+> Prior status: DRAFTED 2026-08-18, awaiting ruling. The brief was
+> `backlog-2026-08-18.md` §A item 25, including the owner's two
+> refinements of the same day (a fallback *without* having to supply an
+> initial; "status", not "state"). Three `#[ignore]`d pins stand in
+> `crates/vilan-core/tests/inference.rs` (§5); two of them assert facts no
+> ruling changes, the third asserts this paper's API.
 
 ## 0. The thesis
 
@@ -693,7 +701,7 @@ each measured against this worktree's compiler so that none is vacuous:
 | **B** `a25_a_second_watcher_opens_no_second_server_forward` | six observer lines, one per watcher per change | ten lines — §1.2 | no |
 | **C** `a25_map_carries_a_fallback_and_the_count_rides_the_owner` | `status` before any frame, one `Subscribe` at `map`, one `Unsubscribe` at `scope.dispose()` | does not compile: no `map`/`status` on `RemoteSource` | **yes** — rewritten, not un-ignored, if §6 rules otherwise |
 
-## 6. Owner questions
+## 6. Owner questions — all RULED 2026-08-19, each as recommended
 
 **Q1 — `sub`'s observer shape (§2h).** Recommend keeping `sub(|T|)`
 present-only and confronting the `Option` only in `map`. The counted
