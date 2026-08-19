@@ -79,7 +79,18 @@ function dispose(self, $r) {
 	} else {
 		$t = undefined;
 	}
-	return $t;
+	$t;
+	const $u = self[2].v;
+	let $v = null;
+	if ($u[0] === 0) {
+		const release = $u[1];
+		self[2].v = [ 1 ];
+		release();
+		$v = undefined;
+	} else {
+		$v = undefined;
+	}
+	return $v;
 }
 function new2() {
 	return [ __shared_new([  ]) ];
@@ -138,7 +149,7 @@ function $o(self, observer) {
 		return;
 	} ]);
 	observer($d(self));
-	return [ self[1], id ];
+	return [ self[1], id, __shared_new([ 1 ]) ];
 }
 function $p(self, item, $q) {
 	self[0].v.push(() => {
@@ -147,8 +158,8 @@ function $p(self, item, $q) {
 	});
 	return __clone(item);
 }
-function $u(self, transform, $v) {
-	$e(self, transform($d(self)), $v);
+function $w(self, transform, $x) {
+	$e(self, transform($d(self)), $x);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -161,7 +172,7 @@ $p(owner, $o(doubled, (n) => {
 	return console.log(n);
 }), [ 1 ]);
 $e(count, 1, [ 1 ]);
-$u(count, (n) => {
+$w(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($d(doubled));

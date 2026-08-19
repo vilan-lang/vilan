@@ -44,7 +44,7 @@ function drain(turn) {
 		turn[1].v = true;
 		draining_turns.v.push(__clone(turn));
 		let budget = 100000;
-		while (!($t(turn[0].v)) && budget > 0) {
+		while (!($v(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;
 			turn[0].v = [  ];
 			for (const subscriber of wave) {
@@ -79,7 +79,18 @@ function dispose(self, $k) {
 	} else {
 		$m = undefined;
 	}
-	return $m;
+	$m;
+	const $n = self[2].v;
+	let $o = null;
+	if ($n[0] === 0) {
+		const release = $n[1];
+		self[2].v = [ 1 ];
+		release();
+		$o = undefined;
+	} else {
+		$o = undefined;
+	}
+	return $o;
 }
 function new2() {
 	return [ __shared_new([  ]) ];
@@ -107,7 +118,7 @@ function $g(self, observer) {
 		return;
 	} ]);
 	observer($h(self));
-	return [ self[1], id ];
+	return [ self[1], id, __shared_new([ 1 ]) ];
 }
 function $i(self, item, $j) {
 	self[0].v.push(() => {
@@ -119,42 +130,42 @@ function $i(self, item, $j) {
 function $c(self, observer, $d, $e) {
 	$i(get_owner($e), $g(self, observer), $d);
 }
-function $t(self) {
+function $v(self) {
 	return self.length === 0;
 }
-function $u(self) {
+function $w(self) {
 	return __list_get(self, self.length - 1);
 }
-function $p(self, $q) {
-	const $r = $q;
-	let $s = null;
-	if ($r[0] === 0) {
-		const turn = $r[1];
-		$s = enqueue(turn, self[1].v);
+function $r(self, $s) {
+	const $t = $s;
+	let $u = null;
+	if ($t[0] === 0) {
+		const turn = $t[1];
+		$u = enqueue(turn, self[1].v);
 	} else {
-		const $v = $u(draining_turns.v);
-		let $w = null;
-		if ($v[0] === 0) {
-			const draining = $v[1];
-			$w = enqueue(draining, self[1].v);
+		const $x = $w(draining_turns.v);
+		let $y = null;
+		if ($x[0] === 0) {
+			const draining = $x[1];
+			$y = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$w = undefined;
+			$y = undefined;
 		}
-		$s = $w;
+		$u = $y;
 	}
-	return $s;
+	return $u;
 }
-function $n(self, value, $o) {
+function $p(self, value, $q) {
 	self[0].v = value;
-	$p(self, $o);
+	$r(self, $q);
 }
-function $A(owner2, body) {
+function $C(owner2, body) {
 	return body(owner2);
 }
-function $C(body) {
+function $E(body) {
 	const scope2 = new2();
 	const result = body(scope2);
 	return [ result, __clone(scope2) ];
@@ -169,51 +180,51 @@ const owner = new2();
 	}, [ 1 ], $b);
 	return;
 })(owner);
-$n(count, 2, [ 1 ]);
+$p(count, 2, [ 1 ]);
 dispose2(owner);
-$n(count, 3, [ 1 ]);
+$p(count, 3, [ 1 ]);
 console.log("done");
 const outer = new2();
 const inner = new2();
-(($x) => {
-	(($y) => {
+(($z) => {
+	(($A) => {
 		$c(count, (value) => {
 			return console.log("inner " + value);
-		}, [ 1 ], $y);
+		}, [ 1 ], $A);
 		return;
 	})(inner);
 	$c(count, (value) => {
 		return console.log("outer " + value);
-	}, [ 1 ], $x);
-	return;
-})(outer);
-$n(count, 4, [ 1 ]);
-dispose2(inner);
-$n(count, 5, [ 1 ]);
-dispose2(outer);
-$n(count, 6, [ 1 ]);
-console.log("end");
-const wrapped = new2();
-$A(wrapped, ($z) => {
-	$c(count, (value) => {
-		return console.log("wrapped " + value);
 	}, [ 1 ], $z);
 	return;
+})(outer);
+$p(count, 4, [ 1 ]);
+dispose2(inner);
+$p(count, 5, [ 1 ]);
+dispose2(outer);
+$p(count, 6, [ 1 ]);
+console.log("end");
+const wrapped = new2();
+$C(wrapped, ($B) => {
+	$c(count, (value) => {
+		return console.log("wrapped " + value);
+	}, [ 1 ], $B);
+	return;
 });
-$n(count, 7, [ 1 ]);
+$p(count, 7, [ 1 ]);
 dispose2(wrapped);
-$n(count, 8, [ 1 ]);
+$p(count, 8, [ 1 ]);
 console.log("fin");
-const $D = $C(($B) => {
+const $F = $E(($D) => {
 	$c(count, (value) => {
 		return console.log("comp " + value);
-	}, [ 1 ], $B);
+	}, [ 1 ], $D);
 	return "built";
 });
-const label = $D[0];
-const scope = $D[1];
+const label = $F[0];
+const scope = $F[1];
 console.log(label);
-$n(count, 9, [ 1 ]);
+$p(count, 9, [ 1 ]);
 dispose2(scope);
-$n(count, 10, [ 1 ]);
+$p(count, 10, [ 1 ]);
 console.log("post");

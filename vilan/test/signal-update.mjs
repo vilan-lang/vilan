@@ -92,7 +92,18 @@ function dispose(self, $H) {
 	} else {
 		$J = undefined;
 	}
-	return $J;
+	$J;
+	const $K = self[2].v;
+	let $L = null;
+	if ($K[0] === 0) {
+		const release = $K[1];
+		self[2].v = [ 1 ];
+		release();
+		$L = undefined;
+	} else {
+		$L = undefined;
+	}
+	return $L;
 }
 function new4() {
 	return [ __shared_new([  ]) ];
@@ -215,7 +226,7 @@ function $E(self, observer) {
 		return;
 	} ]);
 	observer($l(self));
-	return [ self[1], id ];
+	return [ self[1], id, __shared_new([ 1 ]) ];
 }
 function $F(self, item, $G) {
 	self[0].v.push(() => {
@@ -224,27 +235,27 @@ function $F(self, item, $G) {
 	});
 	return __clone(item);
 }
-function $L(body, $M) {
-	const $N = $M;
-	let $O = null;
-	if ($N[0] === 0) {
-		const current = $N[1];
-		$O = body(current);
+function $N(body, $O) {
+	const $P = $O;
+	let $Q = null;
+	if ($P[0] === 0) {
+		const current = $P[1];
+		$Q = body(current);
 	} else {
 		const fresh = new3();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[2].v = true;
-		$O = result;
+		$Q = result;
 	}
-	return $O;
+	return $Q;
 }
-function $R(self, value, $S) {
+function $T(self, value, $U) {
 	self[0].v = value;
-	$y(self, $S);
+	$y(self, $U);
 }
-function $P(self, transform, $Q) {
-	$R(self, transform($D(self)), $Q);
+function $R(self, transform, $S) {
+	$T(self, transform($D(self)), $S);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -281,15 +292,15 @@ $b(watched, (list) => {
 	return;
 }, [ 1 ]);
 console.log("---");
-$L(($K) => {
+$N(($M) => {
 	$b(watched, (list) => {
 		list.push(3);
 		return;
-	}, [ 0, $K ]);
+	}, [ 0, $M ]);
 	$b(watched, (list) => {
 		list.push(4);
 		return;
-	}, [ 0, $K ]);
+	}, [ 0, $M ]);
 	console.log("inside");
 	return;
 }, [ 1 ]);
@@ -298,7 +309,7 @@ $b(todos, (list) => {
 	console.log("reentrant " + $l(todos).length);
 	return;
 }, [ 1 ]);
-$P(count, (n) => {
+$R(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($D(count));
