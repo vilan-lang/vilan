@@ -18,6 +18,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 ## Unreleased
 
 <!-- family: tooling -->
+**Hover and go-to-definition see through the context lowering.** The context-threading pass rewrites the analyzed program in place, and two of its rewrites — a covered `get_safe` (lowered to a `Some`-wrap of the hidden context parameter) and `Context::run` (lowered to a call of its body closure) — destroyed the only record naming the callee the source wrote: hovering those calls answered the lowered view (`enum Option`, the closure's type), and go-to-definition answered nothing or landed on `Some` in std's `option.vl`. The pass now records what it erases — each rewired call's original subject, and each minted hidden parameter with the context it threads — and the editor's resolvers read the record: hover on a covered `get_safe` or on `run` answers the source callee's signature with its doc, and go-to-definition on any context-lowered call (`get`, `get_safe`, `run`, `Context::new`) lands on its declaration in `context.vl`.
+
+The hidden parameter's entry doubles as an explicit tooling-invisible marker: the resolvers answer an honest nothing on it by design, no longer by its self-loop happening to meet the cycle guard the E73 crash fix added. It stays record-less on purpose — a fabricated parameter record would surface compiler plumbing in completion tab stops. (`proposal/editing-dx.md` §19.3; backlog E75.)
+
+---
+
+<!-- family: tooling -->
 **Fragment examples in the book no longer offer a Run that must fail.** The book's fence-tag shim reads the harness tag (`browser`/`fragment`/`norun`) out of a fence's class before highlighting, but it only knew the one-token form mdBook 0.4 wrote (`language-vilan,fragment`); mdBook 0.5 — what builds the book — splits the fence's info string into separate classes (`language-vilan fragment`), so every tag was silently lost. The visible consequence: the three `fragment` fences that contain a `fun main` — the walkthrough guide's server and client entries, and the collections reference's deliberately non-compiling iteration example — read as complete programs and carried the ▶ playground link and a Run button whose run could only fail. The shim now reads the tag in either class form (and only the harness's own tags, so a neighbouring class like `hljs` is never mistaken for one), those three fences carry no controls, and the extraction is pinned in the suite beside the grammar-drift gates — the shim is the same family of drift site, a grammar-adjacent list nothing gated. Re-swept in headless Chrome against the staged book and the published playground: every tag on all 319 fences survives, and the fences that should carry run controls are exactly the ones that do.
 
 ---

@@ -1463,12 +1463,17 @@ fn apply(program: &mut Program, plan: Plan) {
     // (context, node) -> the parameter id that holds the value inside that node.
     let mut source: HashMap<(Id, Id), Id> = HashMap::default();
 
-    // Give each function and `run` closure its own hidden parameter.
+    // Give each function and `run` closure its own hidden parameter. The
+    // parameter is deliberately record-less (no `parameters` entry, no span,
+    // no `expr_types` label — it is not source), so it is marked in
+    // `context_hidden_parameters` for tooling to recognize and answer
+    // honestly (editing-dx.md §19.3).
     for &(context, node) in &plan.param_nodes {
         let parameter = fresh();
         program
             .entity_map
             .insert(parameter, Expr::Parameter(parameter));
+        program.context_hidden_parameters.insert(parameter, context);
         if let Some(function) = program.functions.get_mut(&node) {
             function.parameters.push(parameter);
         } else if let Some(closure) = program.closures.get_mut(&node) {
@@ -1546,9 +1551,16 @@ fn apply(program: &mut Program, plan: Plan) {
                     .entity_map
                     .insert(value_reference, Expr::Local(parameter));
                 if let Some(call) = program.function_calls.get_mut(&call_id) {
+                    // Record the subject this rewire erases — the wired
+                    // `Local(get_safe_fn)` naming the SOURCE callee — so
+                    // tooling can still answer it (editing-dx.md §19.3).
+                    let erased_subject = call.subject_id;
                     call.subject_id = subject;
                     call.generic_argument_ids = Vec::new();
                     call.argument_ids = vec![value_reference];
+                    program
+                        .context_erased_subjects
+                        .insert(call_id, erased_subject);
                 }
                 program.method_call_substitution.remove(&call_id);
                 program.generic_dispatch.remove(&call_id);
@@ -1608,8 +1620,14 @@ fn apply(program: &mut Program, plan: Plan) {
     // parameter).
     for site in &plan.runs {
         if let Some(call) = program.function_calls.get_mut(&site.call_id) {
+            // As with the covered `get_safe`: the erased subject is the
+            // wired `Local(run_fn)`, recorded for tooling (§19.3).
+            let erased_subject = call.subject_id;
             call.subject_id = site.closure_entity;
             call.argument_ids = vec![site.value_id];
+            program
+                .context_erased_subjects
+                .insert(site.call_id, erased_subject);
         }
         // The call entity keeps its id, so purge the METHOD-call records the
         // analyzer attached to `Context::run` — a stale substitution would
