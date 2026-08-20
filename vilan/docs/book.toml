@@ -34,3 +34,11 @@ preferred-dark-theme = "navy"
 # and committed daily (docs-port.md §5 N11, §3.1 S1).
 [output.html.print]
 enable = false
+
+# Search stays fully on, its ~3.0 MB searchindex accepted (N14, measured
+# 2026-08-20): ~80% of the file is elasticlunr's inverted index, which no
+# [output.html.search] knob shrinks without degrading results —
+# heading-split-level 1 collapses 448 section targets into 55 page tops
+# (-18%), a per-chapter opt-out of appendix/ delists the error index and
+# the glossary (-10%), and limit-results / teaser-word-count only change
+# a query-time options header. Record: proposal/docs-port.md §4 Q4.
