@@ -18,6 +18,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 ## Unreleased
 
 <!-- family: tooling -->
+**The glossary's cross-references now land somewhere.** `appendix/glossary.md` cross-links its terms — `[view](#view)`, `[owner](#owner)`, 25 links — but wrote each term as bold text, which mdBook gives no anchor, so every one of those links scrolled the published page nowhere (D16). Each of the 49 terms now fronts an explicit HTML anchor named by its slug; the links resolve in the built book, and a pin beside the editor-page and hover-link gates (`book_sync.rs`) holds every anchor to its term and every fragment link to an anchor, so a future cross-link cannot ship dead.
+
+---
+
+<!-- family: tooling -->
 **Fragment examples in the book no longer offer a Run that must fail.** The book's fence-tag shim reads the harness tag (`browser`/`fragment`/`norun`) out of a fence's class before highlighting, but it only knew the one-token form mdBook 0.4 wrote (`language-vilan,fragment`); mdBook 0.5 — what builds the book — splits the fence's info string into separate classes (`language-vilan fragment`), so every tag was silently lost. The visible consequence: the three `fragment` fences that contain a `fun main` — the walkthrough guide's server and client entries, and the collections reference's deliberately non-compiling iteration example — read as complete programs and carried the ▶ playground link and a Run button whose run could only fail. The shim now reads the tag in either class form (and only the harness's own tags, so a neighbouring class like `hljs` is never mistaken for one), those three fences carry no controls, and the extraction is pinned in the suite beside the grammar-drift gates — the shim is the same family of drift site, a grammar-adjacent list nothing gated. Re-swept in headless Chrome against the staged book and the published playground: every tag on all 319 fences survives, and the fences that should carry run controls are exactly the ones that do.
 
 ---

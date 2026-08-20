@@ -433,6 +433,83 @@ fn mdbook_heading_ids_reproduces_the_known_shapes() {
     );
 }
 
+// --- D16: the glossary's cross-links -----------------------------------------
+
+/// The glossary writes each term as `<a id="term"></a>**term**: …` — mdBook
+/// gives bold text no anchor of its own, so the explicit `<a id>` planted
+/// beside each term is what the page's `[view](#view)`-style cross-links (25
+/// at the time of writing) resolve to (D16, ruled "update or drop"
+/// 2026-08-20 — updated). Three claims held: every anchor's id is exactly the
+/// slug of the term it fronts, ids stay unique, and every fragment link in
+/// the page hits a term anchor or a heading id. Floors on both extractions
+/// keep the pin non-vacuous.
+#[test]
+fn glossary_cross_links_resolve_to_a_term_anchor() {
+    let page = read(&docs_root().join("appendix/glossary.md"));
+
+    let mut anchors: BTreeSet<String> = BTreeSet::new();
+    let mut malformed = Vec::new();
+    let mut rest = page.as_str();
+    while let Some(position) = rest.find("<a id=\"") {
+        let after = &rest[position + "<a id=\"".len()..];
+        let Some((id, following)) = after.split_once("\"></a>") else {
+            panic!("unterminated `<a id=\"…\"></a>` in appendix/glossary.md");
+        };
+        let term = following
+            .strip_prefix("**")
+            .and_then(|bold| bold.split_once("**"))
+            .map(|(term, _)| term);
+        match term {
+            Some(term) if normalize_id(term) == id => {}
+            Some(term) => malformed.push(format!(
+                "`<a id=\"{id}\">` fronts `**{term}**`, whose slug is `{}`",
+                normalize_id(term)
+            )),
+            None => malformed.push(format!("`<a id=\"{id}\">` is not followed by a `**term**`")),
+        }
+        if !anchors.insert(id.to_string()) {
+            malformed.push(format!("duplicate anchor id `{id}`"));
+        }
+        rest = following;
+    }
+    let term_anchor_count = anchors.len();
+    anchors.extend(mdbook_heading_ids(&page));
+
+    let mut links = Vec::new();
+    let mut rest = page.as_str();
+    while let Some(position) = rest.find("](#") {
+        let after = &rest[position + "](#".len()..];
+        let Some(end) = after.find(')') else {
+            panic!("unterminated fragment link in appendix/glossary.md");
+        };
+        links.push(after[..end].to_string());
+        rest = &after[end..];
+    }
+    let broken: Vec<&String> = links
+        .iter()
+        .filter(|target| !anchors.contains(*target))
+        .collect();
+
+    assert!(
+        malformed.is_empty(),
+        "glossary term anchors out of shape:\n{}",
+        malformed.join("\n")
+    );
+    assert!(
+        broken.is_empty(),
+        "glossary cross-links resolving to no anchor: {broken:?}"
+    );
+    assert!(
+        term_anchor_count >= 45,
+        "only {term_anchor_count} term anchors extracted — did the page change shape?"
+    );
+    assert!(
+        links.len() >= 20,
+        "only {} cross-links extracted — did the page change shape?",
+        links.len()
+    );
+}
+
 // --- D18: the editor page ----------------------------------------------------
 
 const EDITOR_PAGE: &str = "vilan/docs/appendix/editor.md";

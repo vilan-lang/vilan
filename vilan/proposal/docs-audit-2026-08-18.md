@@ -266,6 +266,21 @@ changes how the page reads), or drop the links and let the alphabetical
 ordering do the navigating. It predates this audit and is orthogonal to
 currency, so it is filed rather than decided inside a currency sweep.
 
+*Resolved 2026-08-20 (ruled "update or drop"; Order 7's n-pages-hygiene
+lane): updated. Each of the 49 terms now fronts an explicit
+`<a id="term"></a>` anchor — the term's slug, spaces to hyphens — so all
+25 cross-links resolve; proven against a built book (26 in-page fragment
+hrefs in the rendered page, zero unresolved). Chosen over heading
+promotion (checked: the sidebar lists chapters only, so no pollution —
+but 49 `####`s change the one-line-per-term rhythm the page is built
+around, and mdBook 0.5 renders the anchors invisibly where headings
+re-typeset every entry) and over dropping the links (which removes the
+symptom and keeps the cause — bold terms had no anchors, so the next
+cross-link would ship dead again). Pinned beside the D18/D19 gates:
+`glossary_cross_links_resolve_to_a_term_anchor` in
+`crates/vilan-lsp/src/book_sync.rs` holds every anchor's id to its
+term's slug and every fragment link in the page to an anchor.*
+
 **D17 — nothing gates the three-place keyword rule.** AGENTS.md has said
 since the `resource` incident that a keyword lands in the lexer, the
 TextMate grammar and the book's highlight.js theme, and that the check is a
