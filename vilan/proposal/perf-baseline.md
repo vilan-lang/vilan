@@ -76,10 +76,11 @@ So:
   measured window is genuinely warm rather than "the first sample is cold
   and the rest are not".
 
-One honest gap, stated rather than smoothed over: `parse_clean_cached` has
-no clearer, so **cold here means world-cold, parse-warm** — the module
-re-load and re-resolve are measured, the module re-lex and re-parse are not.
-Two consequences follow, and both are handled:
+One honest gap, stated rather than smoothed over — **and closed 2026-08-19
+(M6, §6.2)**: at the time of this record `parse_clean_cached` had no
+clearer, so **cold here meant world-cold, parse-warm** — the module re-load
+and re-resolve were measured, the module re-lex and re-parse were not. Two
+consequences followed, and both were handled:
 
 1. Without care, the *first* subject measured in a process would be charged
    every module's parse and the later ones would inherit it — a cold table
@@ -89,10 +90,15 @@ Two consequences follow, and both are handled:
    attempt at this table, before priming, had the 119-line todo app costing
    **3.0×** the 943-line kolt app cold — 6.15 s against 2.03 s — purely
    because todo was measured first. That was the artifact, not a finding.)
+   *Since M6 the artifact is gone by construction — every cold iteration
+   clears the parse cache itself — and the prime survives for the narrower
+   job of absorbing one-time process costs.*
 2. The genuinely-cold shape — a fresh process with nothing parsed — is what
-   Section 2 measures, one process per run. Closing the in-process gap would
-   want a `#[doc(hidden)] pub fn parse_clean_cache_clear()` beside its two
-   siblings; that is filed as backlog M6 rather than taken here.
+   Section 2 measures, one process per run. Closing the in-process gap
+   wanted a `#[doc(hidden)] pub fn parse_clean_cache_clear()` beside its two
+   siblings; that was filed as backlog M6 rather than taken here, and §6.2
+   records it landing — **cold rows measured against this section's
+   semantics and rows measured after M6 are not comparable.**
 
 ### 1.3 The corpora, and why each one is in
 
@@ -305,7 +311,9 @@ what the unit is for.
 
 **Attributing a change to a pass** inside `post_analysis_passes` currently
 means patching `Instant` marks into it by hand and reverting them, which is
-how §4.3 below was measured. That is filed as backlog M5.
+how §4.3 below was measured. That is filed as backlog M5. **(Shipped
+2026-08-19 — §6.1: the `VILAN_PHASE_TIMING` line itself now carries the
+per-pass split, on both pipelines.)**
 
 ## 4. What the first run found
 
@@ -431,6 +439,151 @@ Three, all filed against `backlog-2026-08-18.md` §M:
 - **M4** — `const_eval::evaluate` is two thirds of a style-heavy compile
   (§4.3). The largest single finding.
 - **M5** — `VILAN_PHASE_TIMING` cannot see inside `post_analysis_passes`;
-  the split that found M4 had to be hand-patched (§3, §4.3).
+  the split that found M4 had to be hand-patched (§3, §4.3). *Shipped
+  2026-08-19, §6.1.*
 - **M6** — the in-process cold measurement cannot clear
-  `parse_clean_cached`, so "cold" is world-cold, parse-warm (§1.2).
+  `parse_clean_cached`, so "cold" is world-cold, parse-warm (§1.2). *Shipped
+  2026-08-19, §6.2.*
+
+## 6. Amendments, 2026-08-19 — the two instruments land (M5, M6), and the scaling pin's flake
+
+Cycle 24, work order 6 (lane `m5m6-instrumentation`). Everything below was
+measured on §2's box but NOT in §2's state: seven sibling lanes ran through
+the session (load ~7–40, stated per measurement where it matters), which is
+exactly the condition §6.3 is about. `perf-baseline.jsonl` is deliberately
+NOT amended, for §10.4-of-`const-eval.md`'s reason — §3 defines it as *the*
+recorded baseline, not an append log. What changes here is what a future
+run *means*, and §6.2 names the rows that stopped being comparable.
+
+### 6.1 M5 — the post-pass line names its passes
+
+The `post-passes` aggregate is now a per-pass breakdown, and it prints from
+inside `post_analysis_passes` itself — the one definition both pipelines
+call — so a `vilan check` or `build` shows it too. (Before, only the
+`analyze_source` path — the editor, wasm, the test harnesses — printed any
+post-pass line at all, which is half of why §4.3's split had to be
+hand-patched three times; the CLI is where the attribution was wanted.)
+Same env var, same shape as the in-analyze line — one stderr line of
+whitespace-separated `name value` pairs:
+
+```
+[vilan phase] post-passes 104.3ms call-graph 24.3ms async-infer 54.6ms view-suspensions 0.0ms async-drops 0.0ms context-drops 0.0ms platform-color 0.3ms const-eval 24.8ms const-lower 7.8ms const-interp 6.8ms init-order 0.3ms
+```
+
+(a one-`const`-site package, debug, contended — an illustration of shape,
+not a baseline). Reading it:
+
+- The buckets are the fixed sequence in `post_analysis_passes`:
+  `call-graph` is `context::thread_contexts` / `CallGraph::build` together
+  (context threading owns the graph decision, so they are one seam);
+  `async-infer`, `view-suspensions`, `async-drops`, `context-drops`,
+  `platform-color`, `const-eval`, `init-order` are their passes.
+- The named buckets do **not** sum to the `post-passes` total, which is
+  measured independently; the residual is the seam glue (the graph install,
+  diagnostic-order normalization).
+- `const-lower` / `const-interp` are a SUB-split of `const-eval`, not
+  siblings: the shared const world's lowering plus per-site assembly
+  (`ConstWorld::prepare`/`site`) against the interpreter evaluating the
+  lowered sites — the proportion `const-eval.md` §10.2 had to hand-measure.
+  They undercount `const-eval` by its classification (free locals,
+  `check_const_only`) and failure-attribution work.
+- Macro worlds print the line too, as the aggregate always did (the
+  in-analyze line suppresses itself in worlds; the post-pass line keeps its
+  shipped behavior).
+
+**Deliberately not in the line: first-vs-repeat function-body emission**
+(the split §10.6's second temporary instrument measured). After Option A
+there is no repeat lowering left to time — a memo hit is a map probe inside
+a larger walk, not a body walk — and the property is guarded structurally
+by the emission-count pins
+(`the_const_pass_lowers_its_world_once_however_many_sites_reach_it`).
+Timing it honestly would mean exclusive-self-time accounting: a timer
+stack threaded through every transformer emission path
+(`ensure_function_emitted` and each keyed-emission walk), which is surgery
+on codegen-critical code for a bucket the counters already pin at zero.
+Skipped, and this sentence is the record of which surgery it wanted.
+
+Pinned: `phase_timing_env_var_prints_the_post_pass_breakdown`
+(`vilan-cli/tests/diagnostics.rs`) asserts the line and every named bucket
+on the CLI pipeline — the pipeline that used to show nothing — and reddens
+with the print suppressed (planted, verified).
+
+### 6.2 M6 — in-process cold is now parse-cold
+
+`parse_clean_cache_clear()` landed beside `base_cache_clear()` and
+`macro_world_cache_clear()`, `#[doc(hidden)]` like both: it clears the
+clean-parse map AND the known-broken set. **The memory stays leaked** — the
+cache's values are `Box::leak`ed `'static` sources and ASTs that live
+programs may still borrow, so the clearer drops the pointers, never the
+allocations; it is a measurement/test surface, not a reclaim.
+
+The harness's cold iteration now clears all three caches, so **in-process
+cold means world-cold AND parse-cold**: every cold iteration pays module
+discovery, load, re-lex, re-parse, walk and resolve — the true
+first-compile shape, short of the process itself (startup and binary load
+remain Section 2's to measure). Warm rows and the end-to-end section are
+untouched, and the priming pass survives with a narrower job (one-time
+process costs; the position artifact it was born for is gone by
+construction). Pinned: `parse_clean_cache_clear_forces_a_reparse`
+(`vilan-core/tests/base_cache.rs`) — pointer identity across a hit, pointer
+inequality across the clear, deterministic because the first AST stays
+leaked and alive.
+
+**Old vs new, measured side by side** — one process, one session, the two
+semantics ALTERNATED per iteration (§8.4's discipline, so both sample the
+same contention and the delta is the semantics), release, min/median of 7,
+via a scratch driver replicating `measure_phases` exactly (same entry
+points, same clears, same synthetic subjects). Load ~7–16, which is why
+these sit above §2.1's idle rows — the OLD column is §2.1's semantics under
+today's load, and the **delta** is the claim:
+
+| corpus | cold semantics | analyze | post_passes | total |
+|---|---|---:|---:|---:|
+| tiny | OLD: world-cold, parse-warm | 23.2 / 27.0 | 2.3 / 2.7 | **26.2 / 30.0** |
+| tiny | NEW: + parse-cold | 41.5 / 45.3 | 2.4 / 3.2 | **44.7 / 48.7** |
+| std_wide | OLD: world-cold, parse-warm | 171.6 / 254.2 | 15.0 / 17.0 | **187.5 / 274.5** |
+| std_wide | NEW: + parse-cold | 225.8 / 292.5 | 12.1 / 16.9 | **238.4 / 321.3** |
+
+The parse tax lands in `analyze`, not the `parse` phase — modules are lexed
+and parsed inside the world load; the `parse` row times only the entry —
+and it is **+18 ms on tiny's min, +54 ms on std_wide's**: +71 % and +27 %
+of their old cold totals. Consequence: **the cold phase rows in
+`perf-baseline.jsonl` (2026-08-18) are parse-warm rows; do not diff a
+post-M6 cold row against them.** §2.1's cold column is history; the next
+quiet-machine full run is the first that can record a comparable cold
+table. Warm rows diff as before.
+
+### 6.3 The const-scaling pin under load — assessed, and repaired at the measurement
+
+The report (D17's lane, 2026-08-19):
+`the_const_pass_scales_with_its_const_sites_and_not_with_their_square`
+read **6.63×** against its 6× bound once under a load-25 contended run,
+passing alone.
+
+**The assessment: yes, the bound was load-sensitive by construction.** The
+pin compared two minimums drawn from two *sequential, disjoint* time
+windows — three small-subject rounds, then three large-subject rounds. §1.4
+argued the noise cancels because "both samples see the same runner, the
+same contention"; that holds only for contention that is uniform across the
+windows. A sibling lane's compile storm landing on one window and not the
+other inflates the ratio rather than cancelling in it, and min-of-3 under
+sustained load recovers no uncontended sample.
+
+**The repair is the measurement, not the bound.** The rounds now
+interleave — small, large, small, large… — so both minimums are drawn from
+rounds spanning the same period; this is §8.4-of-`const-eval.md`'s
+run-the-binaries-alternately discipline applied inside one process.
+Re-measured under a *worse* load than the flake's (~40): **3.13× and
+3.59×**, against the quiet machine's 3.44× — the construction, not the
+bound, was the flake.
+
+**Widening was tried and measured vacuous, which is why the bound stands at
+6×.** An 8× bound was the first draft of this repair. Planting a genuine
+cheap quadratic — one whole-world rebuild plus a re-walk of every other
+site, per site — reads **7.63×–8.01×** at gate-affordable size: an 8×
+bound waves a real quadratic through, 6× turns it red (verified both
+ways, plant in and plant out). The heavier historical plant (§10.4's
+whole-program mini-build per other site) read 13.89×. So 6× now has plant
+measurements on BOTH sides of it: linear-under-load reads ~3.1–3.6×, cheap
+quadratic reads ~7.6–8.0×. Gate cost is unchanged (the binary's gate leg,
+contended, 2.8 s against the recorded 2.96 s).

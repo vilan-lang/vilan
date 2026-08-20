@@ -581,6 +581,54 @@ fn phase_timing_env_var_prints_the_phase_split() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The post-pass half of the split, per pass (backlog M5,
+/// `perf-baseline.md` §6): the aggregate `post-passes` wall could not say
+/// which pass moved, and it printed only on the `analyze_source` path — a CLI
+/// build showed no post-pass line at all, which is why attributing M4 meant
+/// hand-patching `Instant` marks into `post_analysis_passes` three times. The
+/// breakdown now prints from inside that one shared function, so this pins
+/// the property that mattered: the CLI pipeline shows it too, named per pass,
+/// with the const pass's lowering/interpreting sub-split.
+#[test]
+fn phase_timing_env_var_prints_the_post_pass_breakdown() {
+    let dir = temp_package(
+        "phasepostpasses",
+        "import std::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_PHASE_TIMING", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("post-passes"),
+        "VILAN_PHASE_TIMING=1 printed no post-pass line on the CLI pipeline; \
+         stderr was: {stderr}"
+    );
+    for bucket in [
+        "call-graph",
+        "async-infer",
+        "view-suspensions",
+        "async-drops",
+        "context-drops",
+        "platform-color",
+        "const-eval",
+        "const-lower",
+        "const-interp",
+        "init-order",
+    ] {
+        assert!(
+            stderr.contains(bucket),
+            "the post-pass line must carry the `{bucket}` bucket — the whole \
+             point is that the next attribution is a run, not a hand-patch; \
+             stderr was: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The batch half of the blackout (`editing-dx.md` S6/§13.1, the P29 shape).
 ///
 /// `check`'s whole job is to answer questions about a file the user is still

@@ -54,6 +54,42 @@ enum Mode {
     Inferred,
 }
 
+thread_local! {
+    /// The `VILAN_PHASE_TIMING` sub-split of this pass (backlog M5): how much
+    /// of `evaluate`'s wall went to LOWERING — the shared const world's walks
+    /// plus per-site prelude and site assembly ([`transformer::ConstWorld`]'s
+    /// `prepare`/`site`) — against the interpreter EVALUATING the lowered
+    /// sites. The one-third/two-thirds proportion `const-eval.md` §10.2 had
+    /// to hand-patch marks in to learn, kept as a run instead. Accumulated
+    /// unconditionally on the analyzer's argument (a clock read per site is
+    /// noise next to the site), reset by [`evaluate`], read back by
+    /// `post_analysis_passes` for its phase line. Thread-local because an
+    /// analysis is single-threaded, the same way the transformer's
+    /// `CONST_LOWERING_COUNT` is.
+    static PHASE_LOWER: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    static PHASE_INTERP: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// (lowering, interpreting) — what [`evaluate`] spent since its last call, for
+/// the `VILAN_PHASE_TIMING` line. The two do NOT sum to the pass: the
+/// remainder is classification (free locals, `check_const_only`) and failure
+/// attribution.
+pub(crate) fn phase_split() -> (std::time::Duration, std::time::Duration) {
+    (
+        PHASE_LOWER.with(std::cell::Cell::get),
+        PHASE_INTERP.with(std::cell::Cell::get),
+    )
+}
+
+fn phase_add(
+    bucket: &'static std::thread::LocalKey<std::cell::Cell<std::time::Duration>>,
+    started: crate::PhaseClock,
+) {
+    bucket.with(|cell| cell.set(cell.get() + started.elapsed()));
+}
+
 /// Takes the analysis tail's shared call graph rather than building its own
 /// (E35). This pass writes nothing to the program at all — it takes `&Program`
 /// and RETURNS its results for the caller to store — so the graph it is handed
@@ -69,6 +105,10 @@ pub fn evaluate(
     // walks the whole program, so a `const` in a module reports in that module.
     Vec<(Error, SourceId)>,
 ) {
+    // Reset the phase buckets FIRST, before any early return, so the timing
+    // line never reports a previous analysis's accumulation.
+    PHASE_LOWER.with(|cell| cell.set(std::time::Duration::ZERO));
+    PHASE_INTERP.with(|cell| cell.set(std::time::Duration::ZERO));
     // A program that already failed analysis skips evaluation entirely: the
     // transformer's entity lookups (used to lower the const world) assume
     // a clean program, exactly as `transform` itself does.
@@ -649,7 +689,9 @@ impl<'p, 'src> State<'p, 'src> {
         // anything else is a diagnostic.
         let mut attempts = 0;
         loop {
+            let lower_started = crate::PhaseClock::now();
             let (reach, prelude, unresolved) = world.prepare(expr_id, &external, &self.results);
+            phase_add(&PHASE_LOWER, lower_started);
             let mut retry = false;
             for binding in &unresolved {
                 match self.classify(*binding) {
@@ -682,32 +724,44 @@ impl<'p, 'src> State<'p, 'src> {
                 attempts += 1;
                 continue;
             }
+            let lower_started = crate::PhaseClock::now();
             let site = world.site(expr_id, &reach, prelude);
+            phase_add(&PHASE_LOWER, lower_started);
             return match self.mode {
-                Mode::Explicit => match interpreter::eval_const(&site, EXPLICIT_LIMITS) {
-                    Ok((value, assets)) => {
-                        self.results.insert(expr_id, value);
-                        self.assets.extend(assets);
-                        true
+                Mode::Explicit => {
+                    let interp_started = crate::PhaseClock::now();
+                    let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS);
+                    phase_add(&PHASE_INTERP, interp_started);
+                    match evaluated {
+                        Ok((value, assets)) => {
+                            self.results.insert(expr_id, value);
+                            self.assets.extend(assets);
+                            true
+                        }
+                        Err(failure) => {
+                            let frames = world.resolve_trace(&failure.trace);
+                            let error = self.failure_error(expr_id, failure, &frames);
+                            self.report(expr_id, error);
+                            false
+                        }
                     }
-                    Err(failure) => {
-                        let frames = world.resolve_trace(&failure.trace);
-                        let error = self.failure_error(expr_id, failure, &frames);
-                        self.report(expr_id, error);
-                        false
-                    }
-                },
+                }
                 // The inferred form's tighter budgets, its closed effect
                 // channels (both inside `eval_inferred`), and the size cap —
                 // and any of the three missing is a silent fallback, which is
                 // simply `false` with nothing reported (const-eval.md §9.2/3).
-                Mode::Inferred => match interpreter::eval_inferred(&site, INFERRED_LIMITS) {
-                    Ok(value) if value.literal_size() <= INFERRED_SIZE_CAP => {
-                        self.results.insert(expr_id, value);
-                        true
+                Mode::Inferred => {
+                    let interp_started = crate::PhaseClock::now();
+                    let evaluated = interpreter::eval_inferred(&site, INFERRED_LIMITS);
+                    phase_add(&PHASE_INTERP, interp_started);
+                    match evaluated {
+                        Ok(value) if value.literal_size() <= INFERRED_SIZE_CAP => {
+                            self.results.insert(expr_id, value);
+                            true
+                        }
+                        _ => false,
                     }
-                    _ => false,
-                },
+                }
             };
         }
     }
