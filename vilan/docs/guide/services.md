@@ -281,9 +281,8 @@ struct Notes {
 fun notes_panel(client: NotesClient<SocketTransport>): View {
 	// Counted, and released when this view is unmounted: the channel is
 	// open while — and only while — the panel is showing. `[]` until the
-	// first sync. (Annotate the binding: an empty `[]` does not carry its
-	// element type through `or` by itself.)
-	let entries: Signal<List<Note>> = client.entries.or([]);
+	// first sync; the empty list takes its element type from the mirror.
+	let entries = client.entries.or([]);
 	view("ul").bind_each(entries, |note| note.id, |note| view("li").text(note.text))
 }
 

@@ -184,6 +184,13 @@ On the promo site: the const pass drops from 341 ms to 273 ms in release and 3.0
 
 One diagnostic got better on the way. A `const` evaluation that fails names the function it failed in, and it found that function by matching the *emitted* name against your source — which broke the moment one name generator served the whole pass and a second `helper` had to be emitted as `helper2`. Frames are now matched by identity instead, so the message reads your name whatever the compiler called it, a failure inside one of two same-named functions now points at the right declaration where it used to point at neither, and a frame belonging to a generated helper still never reaches you.
 
+---
+
+<!-- family: feature -->
+**An empty `[]` takes its element type from where it lands.** `let notes = client.notes.or([])` on a `RemoteSource<List<Note>>` used to come back as a `Signal<List<unknown>>` — the call knew `T` from the receiver, but the empty literal never took it, and worse, the argument's `List<unknown>` re-bound the `T` the receiver had already fixed. The gap was silent until the first field access ("cannot access field 'done' on type any"), so every consumer annotated the binding. `Option<List<Note>>::unwrap_or([])` lost the element the same way. Both predate the mirror API — the same programs fail on v0.30.0.
+
+Now an empty list literal in a position that expects a `List<Note>` — a call argument checked against a `T`-typed parameter with `T` already bound, an annotated binding, a match leg under a declared return type — grounds its element to `Note` on the spot. Only a fully determined expectation commits: an empty literal with no expected type anywhere, or one reaching only an abstract `T`, still reports "its element type is never determined", exactly as before. The services and walkthrough guides and the walkthrough example dropped their annotations; `std/rpc.md` stopped teaching the workaround. (The todo example keeps its one annotation for a different, still-open reason: a `.map` on a let-bound signal types its closure parameter before the binding lands — that gap reproduces with no `[]` anywhere and is pinned separately.)
+
 ## v0.34.0 — 2026-08-12
 
 **`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.

@@ -21209,6 +21209,37 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Whether a type is fully determined — no `Unknown`/`Unresolved` hole and
+    /// no residual `Generic` anywhere inside it. The empty-list grounding in
+    /// `infer_type_path` writes a type into a literal's element slot, and a
+    /// slot write is permanent (the slot is only filled while `Unknown`), so
+    /// only a type that can no longer change may commit: a mid-inference
+    /// (`Unresolved`), still-open (`Unknown`), or abstract (`Generic`) element
+    /// must keep deferring instead.
+    fn type_is_fully_determined(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Unknown | Type::Unresolved | Type::Generic(_) => false,
+            // Symbolic until its source tuple lands, so not determined yet.
+            Type::Mapped(..) => false,
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                arguments
+                    .iter()
+                    .all(|argument| self.type_is_fully_determined(&argument.get_type(self)))
+            }
+            Type::Tuple(items) => items
+                .iter()
+                .all(|item| self.type_is_fully_determined(&item.get_type(self))),
+            Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
+            Type::Closure(parameter_ids, return_id) => {
+                parameter_ids
+                    .iter()
+                    .all(|parameter| self.type_is_fully_determined(&parameter.get_type(self)))
+                    && self.type_is_fully_determined(&return_id.get_type(self))
+            }
+            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
+        }
+    }
+
     fn list_element_slot(&self, type_: &Type) -> Option<TypeId> {
         match type_ {
             Type::Struct(id, arguments) if self.is_slot_container(*id) && arguments.len() == 1 => {
@@ -21915,6 +21946,41 @@ impl<'src> Analyzer<'src> {
                                     slot
                                 }
                             };
+                            // B129: an empty `[]` takes its element type from
+                            // where it lands. When the expectation is `List<E>`
+                            // — a call argument checked against a substituted
+                            // `T`-typed parameter (`remote.or([])` on a
+                            // `RemoteSource<List<Note>>` arrives here with the
+                            // receiver-bound `List<Note>`), an annotated
+                            // binding, a match leg under an expectation — the
+                            // slot grounds to `E` instead of waiting for a
+                            // `push` that never comes. Without this the slot
+                            // stays `Unknown`, and the generic argument
+                            // binding then REBINDS the receiver-known `T` to
+                            // `List<unknown>` (reconcile's generic arm pushes
+                            // the raw argument side), which is the reported
+                            // `Signal<List<unknown>>` hover. Only an unfilled
+                            // slot takes the expectation, and only a fully
+                            // determined `E` commits — a slot write is
+                            // permanent, so a mid-inference or abstract
+                            // element keeps deferring. Empty literals only:
+                            // directing a NON-empty literal's elements by the
+                            // expectation is deliberately avoided (see the
+                            // `expected_element` comment below).
+                            if matches!(slot.get_type(self), Type::Unknown)
+                                && let Type::Struct(expected_struct_id, expected_arguments) =
+                                    &constraint
+                                && *expected_struct_id == list_id
+                                && let Some(expected_element_id) = expected_arguments.first()
+                            {
+                                let expected_element = self.substitute_type(
+                                    &expected_element_id.get_type(self),
+                                    substitution_context,
+                                );
+                                if self.type_is_fully_determined(&expected_element) {
+                                    self.write_type_slot(slot, expected_element);
+                                }
+                            }
                             Type::Struct(list_id, vec![slot])
                         }
                         None => Type::Unknown,

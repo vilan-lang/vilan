@@ -59081,20 +59081,24 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
     );
 }
 
-/// A pre-existing generic-inference gap that A25's `or` lands on squarely
-/// (every census site is a list mirror): an empty `[]` passed to a `T`-typed
-/// parameter does not take its element type from the receiver's already-bound
-/// `T`, so `remote.or([])` on a `RemoteSource<List<Todo>>` yields a signal
-/// whose element is `any`/unknown — "cannot access field 'done' on type any"
-/// at the first use. `Option<List<Todo>>::unwrap_or([])` has the same gap
-/// ("cannot index this List: its element type is never determined"), and so
-/// does a `map` whose arms are `Some(let list) => list, None => []`. The
-/// annotated form `let items: Signal<List<Todo>> = remote.or([])` works and is
-/// what the examples and docs write; this pin asserts the UNANNOTATED form
-/// and stays ignored until the analyzer binds `T` from the receiver first.
-/// Reproduces on the v0.30.0 binary, so it predates A25.
+/// B129 (found by A25's lane; repro'd on v0.30.0): an empty `[]` passed to a
+/// `T`-typed parameter did not take its element type from the receiver's
+/// already-bound `T` — `remote.or([])` on a `RemoteSource<List<Todo>>` gave a
+/// `Signal<List<unknown>>` ("cannot access field 'done' on type any" at the
+/// first use), and `Option<List<Todo>>::unwrap_or([])` lost it the same way.
+/// Fixed in the analyzer's empty-list arm: the literal's element slot grounds
+/// from the expectation (`List<E>`, `E` fully determined). This pin asserts
+/// the UNANNOTATED `or([])` with the element reaching field access.
+///
+/// The pin's ORIGINAL body consumed `items` through a second
+/// `items.map(|list| ..)` — which stacks a SECOND, independent gap on top of
+/// B129's: a `.map` on a `let`-bound signal freezes its closure parameter
+/// before the receiver's binding lands (B125/P21's solver-ordering family;
+/// it reproduces with a NON-empty initial and no `[]` anywhere, so it was
+/// never B129's). That shape is pinned separately below,
+/// `b129_a_map_on_a_let_bound_signal_types_its_closure_parameter`, still
+/// ignored; this body consumes the mirror through `get()` instead.
 #[test]
-#[ignore = "analyzer: an empty `[]` through a `T`-typed parameter loses the element type (also Option::unwrap_or([])) — A25 ship record, remote-sources.md §8"]
 fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
     assert_compiles_and_runs(
         r#"
@@ -59108,16 +59112,14 @@ fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
 
         fun open_count(remote: RemoteSource<List<Todo>>): i32 {
             let items = remote.or([]);
-            let remaining: Signal<i32> = items.map(|list| {
-                mut open = 0;
-                for todo in list {
-                    if !todo.done {
-                        open += 1;
-                    }
+            let list = items.get();
+            mut open = 0;
+            for todo in list {
+                if !todo.done {
+                    open += 1;
                 }
-                open
-            });
-            remaining.get()
+            }
+            open
         }
 
         fun main() {
@@ -59127,6 +59129,198 @@ fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
             let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let scope = Owner::new();
             print(owner_scope.run(scope, || open_count(remote)));
+            scope.dispose();
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// B129: `unwrap_or([])` on an `Option<List<Note>>` — the same shape without
+/// any reactive machinery. The receiver binds the impl's `T` to `List<Note>`;
+/// the empty argument grounds its element slot from it, so the result
+/// iterates and reaches fields on BOTH sides of the option.
+#[test]
+fn b129_unwrap_or_of_an_empty_list_takes_the_element_from_the_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{ Option, Some, None };
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun open_count(maybe: Option<List<Note>>): i32 {
+            let notes = maybe.unwrap_or([]);
+            mut open = 0;
+            for note in notes {
+                if !note.done {
+                    open += 1;
+                }
+            }
+            open
+        }
+
+        fun main() {
+            print(open_count(None));
+            print(open_count(Some([Note { id = 1, done = false }, Note { id = 2, done = true }])));
+        }
+        "#,
+        "0\n1\n",
+    );
+}
+
+/// B129 family, match-arm result position: a `None => []` leg takes its
+/// element type from the sibling leg's `List<Note>` through the match's leg
+/// unification, and the merged value reaches fields. (This shape already
+/// worked before the B129 fix — the legs unify — and is pinned so it stays
+/// working; the empty leg's OWN slot grounding is the previous pins'.)
+#[test]
+fn b129_a_none_arm_empty_list_takes_the_type_from_the_sibling_arm() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{ Option, Some, None };
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun open_count(maybe: Option<List<Note>>): i32 {
+            let notes = match maybe {
+                Some(let list) => list,
+                None => [],
+            };
+            mut open = 0;
+            for note in notes {
+                if !note.done {
+                    open += 1;
+                }
+            }
+            open
+        }
+
+        fun main() {
+            print(open_count(None));
+            print(open_count(Some([Note { id = 1, done = false }])));
+        }
+        "#,
+        "0\n1\n",
+    );
+}
+
+/// B129, match-arm result position under a DECLARED return type: when every
+/// leg is an empty `[]`, no sibling leg can supply the element — the
+/// function's declared `List<Note>` is the expectation that reaches the legs
+/// (`expected_types` flows into each leg body), and the returned list pushes
+/// and reads as `List<Note>`. A guard pin: the declared return type carries
+/// this shape with or without the slot grounding (planting the B129 fix out
+/// leaves it green), so it pins the flow, not the fix.
+#[test]
+fn b129_a_match_of_only_empty_lists_takes_the_declared_return_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun fallback(flag: bool): List<Note> {
+            match flag {
+                true => [],
+                false => [],
+            }
+        }
+
+        fun main() {
+            mut notes = fallback(true);
+            notes.push(Note { id = 7, done = false });
+            print(notes[0].id);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// B129 negative: an empty `[]` with NO expected type anywhere is still the
+/// ambiguity it always was, with the same message — the grounding only fires
+/// under a determined `List<E>` expectation.
+#[test]
+fn b129_an_empty_list_with_no_expected_type_still_errors() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+            let things = [];
+            print(things[0]);
+        }
+        "#,
+        "its element type is never determined",
+    );
+}
+
+/// B129 negative: an empty `[]` bound to a FREE generic (`head<T>(xs:
+/// List<T>)` with nothing else fixing `T`) must not ground — `T` stays
+/// abstract and a field access on it errors as before. A fully determined
+/// expectation is the grounding's precondition; an abstract one defers.
+#[test]
+fn b129_an_empty_list_argument_binding_a_free_generic_still_errors() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun head<T>(xs: List<T>): T {
+            xs[0]
+        }
+
+        fun main() {
+            print(head([]).id);
+        }
+        "#,
+        "cannot access field 'id' on type T",
+    );
+}
+
+/// The OTHER gap the original A25 pin's body carried, isolated: a `.map` on a
+/// `let`-bound signal freezes its closure parameter before the receiver's
+/// binding lands, so the parameter types as `any` and a field access on the
+/// element fails — with a NON-empty initial and no `[]` anywhere, so it is
+/// not B129's. Inlining the chain (`Signal::new(..).map(..)` in one
+/// expression) works; only the intermediate unannotated `let` trips it. This
+/// is B125/P21's solver-ordering family (the binding is read one level out,
+/// after the closure is already inferred — analyzer.rs's own P21 comment in
+/// the closure arm); it stays ignored until that design lands. Annotating the
+/// `let` sidesteps it, which is what the examples and docs do.
+#[test]
+#[ignore = "analyzer: a `.map` on a let-bound signal freezes its closure parameter before the receiver's binding lands — B125/P21 solver-ordering family, editing-dx.md §16; found isolating B129"]
+fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        [derive(PartialEq, Debug)]
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+            let scope = Owner::new();
+            let n = owner_scope.run(scope, || {
+                let items = Signal::new([Todo { id = 1, done = false }]);
+                let remaining: Signal<i32> = items.map(|list| {
+                    mut open = 0;
+                    for todo in list {
+                        if !todo.done {
+                            open += 1;
+                        }
+                    }
+                    open
+                });
+                remaining.get()
+            });
+            print(n);
             scope.dispose();
         }
         "#,
