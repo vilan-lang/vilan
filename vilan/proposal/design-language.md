@@ -243,6 +243,30 @@ advantage is a richer completion story, which buys nothing today
 because no completion source is wired at all (K9); if K9 later wants
 LSP-grade completion, CM6's autocomplete API is already in the bundle.
 
+### 2.7 K16 — the playground as a full-window app (2026-08-20, owner-approved)
+
+The playground leaves the article idiom entirely: the shell claims exactly
+the viewport and clips, a slim app bar (the toolbar absorbing the brand
+link at rail height) closes with the hard hairline, and the four working
+surfaces — Program | Result over Diagnostics | Console — are a CSS grid
+butting the window edges, ~60/40 columns over ~70/30 rows, stacking
+vertically under the lg break. Every seam is the grid's own 1px gap with
+`stroke-hard` showing through: one hairline per seam, no panel borders, no
+radii, no cards — cards survive only for small pieces (the confirm rail).
+Nothing scrolls but the panels themselves, each internally (CodeMirror's
+scroller, `overflow: auto` wells, the iframe's own document), so the page
+can never scroll its chrome away. The selects are drawn flat
+(`appearance: none`, a `currentcolor` chevron) because the native menulist
+answers the pointer with background floods the register forbids — hover
+moves the border, never the fill, and there is no press state — while the
+popup stays the OS-drawn one that `color-scheme` already themes. In the
+editor, line numbers carry equal insets and the lint gutter sits leftmost
+as a fixed glyph strip, VS Code's position. The rail (32px, `down-bright`,
+4px/8px insets) is now the page's only chrome object: the app bar, every
+panel header, and the confirm bar are the same rail. Shipped
+website@1e2875d (lane k16-playground-app, 7b7105a); the owner's six
+review points of 2026-08-20 are the spec (backlog archive, K16).
+
 ## 3. Open questions — all RULED 2026-08-18, each as recommended
 
 - **Q1 — the hero**: does the bloom/gradient marketing register survive
