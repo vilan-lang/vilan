@@ -73,7 +73,7 @@ Closing sweeps archive tombstones into
 | `memory-management-impl-plan.md` | shipped arc (Phases 1–6 essentials) | Implementation ledger for `Arena`/`Handle`/`Shared<T>`. |
 | `memory-management.md` | historical / superseded | Superseded by `memory-management-rev-1.md`. |
 | `memory-management-rev-1.md` | shipped arc (through Phase 6 essentials) | The memory-management design, revision 1 — largely superseded in turn by `claims-and-epochs.md` + `destruction.md`. |
-| `method-resolution.md` | ratified 2026-08-04; arc shipped | A deliberate method-resolution precedence rule + ambiguity diagnostic (B57); §9's specificity design stays open (backlog B73 — a blanket impl still beats a user's specific one). |
+| `method-resolution.md` | ratified 2026-08-04; arc shipped; §14 awaits an owner ruling | A deliberate method-resolution precedence rule + ambiguity diagnostic (B57); the specificity arc (B73, R1–R3) shipped 2026-08-18 (§13.8); §14 is B127's census paper — the std `Into<T>` blanket serves zero selecting sites, recommendation DELETE, owner ruling pending. |
 | `mut-parameters.md` | shipped arc (2026-08-03) | `mut` parameters — local rebindability of a callee's copy (backlog H9). |
 | `numeric-types.md` | shipped arc (2026-07-07); tail in backlog trailer | Sized numeric types (`u8`…`i64`/`f32`); native-width tail recorded, not filed as an open item. |
 | `org-migration.md` | shipped arc (migration complete 2026-07-29; tail resolved 2026-08-03) | The move to the `vilan-lang/vilan` org (F9), Pages tombstone, owner-string sweep. |

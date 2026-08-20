@@ -1348,3 +1348,243 @@ shapes the 13 do not cover.
 - **(c), the definition-site hybrid, remains available** as the purely
   additive layer §13.5 describes: R3's residue is exactly the pair set
   (c) would refuse early instead.
+
+## 14. B127 — is the blanket still earning its keep? (2026-08-20)
+
+> Status: **PAPER — recommendation DELETE, owner ruling pending** (the
+> question §13.6 Q3 deferred until R2's behavior was seen; it has now
+> been seen). Every claim below is measured: probes ran through this
+> worktree's `target/debug/vilan` (`cargo build` exit 0, branched from
+> `next` with R1–R3 in), and the deletion itself was run as a scratch
+> build with full gates, then reverted — the tree this section ships in
+> contains no code change (`git diff --stat`: this file and the README
+> index row only). Adjacent rulings: beta.md §5's Tier 3 row
+> (`std::into`, the table's only Tier 3 entry) and §5.1 Q3;
+> deprecation.md §5 ("Tier 3 owes no window — exercising the machinery
+> on a surface exempt from it proves nothing").
+
+### The census: where the blanket actually serves
+
+**Method — three legs that cross-check each other.** (1) An *import
+census*: `std::into` is not in the prelude (`std/src/lib.vl` re-exports
+`Default`, `assert`/`panic`/`print`, the numeric types, and `str` —
+`into` is absent), and a probe measured that without
+`import std::into::Into` the blanket does not even register:
+`foo.into()` in an import-free program is `Foo has no method 'into'`,
+exit 1. Registration therefore requires the import, so the candidate
+universe is *exactly the set of importers*, and grep enumerates it with
+certainty rather than heuristically. (2) A *probe pass* over every shape
+the module can serve, §13.2's harness method — scratch package with a
+`vilan.toml`, worktree binary, exit codes recorded. (3) The *deletion
+experiment* itself (next subsection) as ground truth: a serving site the
+first two legs missed cannot survive the deletion silently — it either
+loses its candidate or changes a diagnostic, and a gate goes red. Legs
+1–2 predicted leg 3's results exactly, which is what makes the census
+trustworthy.
+
+**The importers.** Zero `.vl` files anywhere — std itself, the corpus
+(`vilan/test/`), `examples/`, `benchmarks/`, `macro_std/` — import
+`std::into` or mention `Into<`/`.into()` (every `into` hit is the
+English word in a comment). Zero docs *fences* import it —
+`docs/std/strings.md` §Into's fence declares its own `trait Into<T>`
+fragment and never the impl. Zero hits in the website repo
+(`vilan-website`, swept read-only). The tree's importers are **eight
+embedded test programs, all in `crates/vilan-core/tests/inference.rs`**:
+the B98 carve-out pin (49340), the B84 legality pin (53320), and six B73
+pins (58224, 58254, 58280, 58310, 58641, 58674).
+
+**The probe pass** (worktree binary; "→" is printed output, exit 0
+unless said):
+
+| # | Shape | With the blanket (today) |
+|---|---|---|
+| A | `foo.into()`, no `import std::into` | `Foo has no method 'into'`, exit 1 — the blanket is not registered |
+| B | `let f: Foo = foo.into()`, import, no user impl | → `1` — the identity conversion; the blanket selected |
+| D | `let f = foo.into()`, only home | → `1` — selected unannotated |
+| F | `let f: Foo = foo.into()` beside a user `impl Foo with Into<str>` | → `5` — R2 picks the blanket's home `Into<Foo>` over the user's |
+| C | `fun accept<T: Into<Foo>>(x: T)` fed a `Foo` | **internal error, exit 1**: `internal: a call resolved to 'Into''s requirement 'into', which has no body — emitting it would produce an empty function and a runtime TypeError … please report this program`, anchored at the *import line* |
+| E | the row-4 shape — a bound reaching a *user* impl | → `101` — correct, blanket not involved |
+| G | a hand-written reflexive `impl Foo with Into<Foo>` beside the blanket, bound path | → `7` — the per-type impl works where the blanket internal-errors |
+
+**Finding 1 — resolution selects the blanket at zero sites in the
+tree, the test suite included.** In the eight importer programs the
+blanket never wins: three pins select the *user's* impl over it (rows
+1/3/5), three end in the ambiguity the blanket causes (rows 2 and the
+two diagnostic pins), two never call `into` at all (B98/B84). Its whole
+working surface, anywhere, is the direct-call identity conversion
+(probes B/D/F) — a no-op nothing in the tree writes.
+
+**Finding 2 — the blanket's flagship affordance is broken, with an
+internal compiler error.** The one thing a reflexive blanket is *for* is
+letting a `T: Into<Target>` bound accept a `Target` itself. Probe C
+measures that shape dying with "please report this program": the
+analyzer's bound satisfaction accepts via the blanket, but the
+transformer's `nominal_matches` cannot see a generic subject on the
+bound re-dispatch — §13.3's D3 ("The std blanket is invisible here"),
+whose remaining half R1–R3 deliberately left — and the no-body guard
+turns the invisibility into an internal refusal. Reproduced identically
+on the released binary (`vilan 0.34.0 (107d74671)`), so it is live for
+users, not a worktree artifact. **This wants filing as its own item**
+(this lane does not edit the backlog): today, the only program shape the
+blanket uniquely enables is a program that cannot compile.
+
+### What breaks if deleted — the scratch experiment
+
+Run honestly: `std/src/into.vl` lines 5–9 deleted (the trait kept),
+`cargo build` exit 0, gates by their own exit codes, then reverted and
+re-verified (`b73_*`: 23 passed after restore; `git status` clean).
+
+| Gate | Result |
+|---|---|
+| `cargo build` | exit 0 |
+| `cargo test -p vilan-core --test inference` | **exit 101 — 2363 passed, 3 FAILED**, 3 ignored (the pre-existing non-B73 ignores) |
+| `cargo test -p vilan-cli --test corpus` | exit 0 — **goldens byte-identical**, 7/7 |
+| `cargo test -p vilan-core --test docs` | exit 0 — every fence compiles, 8/8 |
+| `cargo test -p vilan-embedded-std` | exit 0 |
+
+The three failures, each a pin whose *premise* is the blanket rather
+than live behavior breaking:
+
+- `b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity`
+  (row 2) — "expected a compile error, but it compiled cleanly." Without
+  the blanket the user's `Into<str>` is the only home, and the program
+  prints `converted`, exit 0 (measured standalone) — which is §13.2's
+  own "Correct" column for row 2, its *first-choice* answer ("prints
+  `converted`, or an ambiguity error"). Today's blanket forces the
+  second-choice answer at every such call.
+- `b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them`
+  — no ambiguity remains, so the ledger-row-213 message never fires
+  (got: no diagnostic).
+- `b73_an_expectation_matching_no_home_leaves_the_call_ambiguous` — the
+  wrong-annotation shape becomes a plain
+  `Expected i32, but got str instead.` — arguably the better report,
+  since with one home there is nothing to be ambiguous *about*.
+
+And the deleted-world probes: B becomes `Foo has no method 'into'`
+(the identity spelling is gone); F becomes
+`Expected Foo, but got str instead.`; **C becomes a clean, steered
+refusal** — `'Foo' does not implement trait 'Into<Foo>', required by a
+generic bound of this call`, with a note at the bound's declaration,
+exit 1 — the internal error retired; G still prints `7` (the per-type
+reflexive impl carries the bound path with nothing else present).
+
+**The full breakage list, named:**
+
+- **std** — `into.vl` 5–9 gone; the `Into` trait stays; no other std
+  module references it (swept).
+- **Suite** — the three pins above rewritten (each keeps its R1/R2
+  behavior pinned with *two user impls* instead of user-plus-blanket,
+  e.g. `Into<str>` beside `Into<Bar>`); the B98 carve-out pin (49340)
+  loses its subject — keep it as the reflexive-impl-legality pin its
+  program already is, or retire it; stale *names and comments* on the
+  rows-1/3/5 pins and B84's "the live instance" comment (53320).
+- **Corpus** — nothing; byte-identical, measured.
+- **Docs fences** — nothing; gate green, measured. `strings.md` §Into
+  (72–83) teaches impl-plus-bound and never mentions the blanket;
+  `docs/README.md` 88's index row names the trait, which stays.
+- **Docs prose** — one real edit: `spec/types.md` 277–280 names
+  "`std::into`'s `impl type T with Into<T>` beside a type's own `Into`
+  impl" as the living overlap example; the example would move to a
+  user-written blanket or the conditional-impl pair the same sentence
+  already lists. `errors.md` 120–121 is the *arguments* rule
+  (`Into<Cup>`/`Into<Mug>`) — untouched.
+- **Records** — diagnostics-ledger row 213's B1 note reads "`Into<Foo>`
+  for std's blanket" (history; records don't retro-edit, but the
+  message's live exemplar changes); the Unreleased CHANGELOG entry
+  (119–123) narrates R1–R3 *in terms of* std's blanket — if deletion
+  landed in the same train, that entry would describe a surface the
+  release no longer has, so same-train landing wants a coordinating
+  edit.
+- **beta.md** — the Tier 3 row (318) and §5.1 Q3 (352) exist *because*
+  B127 is open; the ruling either way collapses them (delete → the row
+  vanishes with the module's impl question resolved; keep → §5.1 Q3's
+  "Tier 2 is the alternative"). Owner's file, owner's edit.
+- **Website** — nothing; zero mentions, swept.
+
+### What R2 makes better without it — and what rank keeps regardless
+
+**Deleting retires no machinery.** R1's argument key, R2's
+expected-type selection, and R3's subsumption order are all load-bearing
+for shapes users write with no std blanket anywhere: rows 6/7 (a *user*
+blanket), rows 9–14/17/21–22 (generic-vs-concrete and bound-strength
+overlaps), rows 18/19/20 (argument-distinct user impls — the
+type-confusion family R1 closed). `impl type T` is a language feature;
+std's blanket is merely its one in-tree *instance*. B128's deferred
+residue (backlog §B 128 — R2 selecting an unrankable home takes its
+first maximum instead of the ambiguity) is likewise constructible
+entirely from user impls: deletion neither closes nor shrinks it.
+
+**What deletion does buy** is user-facing, not mechanical: (i) the
+common case — one type, one conversion — stops paying an annotation tax.
+Today the blanket makes *every* `.into()` receiver a two-home call, so
+the natural `let s = foo.into()` with a single user impl is an ambiguity
+(row 2); without it, that program just runs and prints the §13.2-correct
+answer. (ii) std stops manufacturing the only overlap most programs will
+ever contain — R2/R3's ambiguity ceremony fires only where a *user*
+wrote an overlap. (iii) Probe C's internal error becomes a clean bound
+refusal — measured. (iv) Keeping the blanket carries an implied debt
+deletion cancels: making it *actually work* on the bound path means
+teaching the transformer to emit a generic-subject impl body
+per-instantiation (D3's remaining half) — real compiler work, currently
+serving zero users.
+
+**What keeping buys:** the reflexive-bound affordance (`T: Into<Target>`
+accepts a `Target`) — which does not work (probe C) and only pays after
+the D3 work above — and the identity `.into()` no-op (probes B/D/F),
+which nothing calls. variadic-generics.md 186–196 already measured the
+one design that wanted the affordance and chose a bespoke trait
+*because* "the identity `Into<Signal<A>>` competes and wins" — the
+blanket was that design's reason to flee, not its foundation.
+
+### Migration cost if deleted
+
+- **std:** the five-line impl; the trait, the module, and the import
+  path all stay.
+- **Call sites:** zero in the tree; corpus/docs/examples/website all
+  measured unaffected. For users: Tier 3 — "may be reworked wholesale
+  with a CHANGELOG note" (beta.md §5), and deprecation.md §5 records it
+  owes no window.
+- **Per-type impls:** a user wanting identity conversion writes the
+  three-line reflexive impl (`impl Foo with Into<Foo> { fun into(self):
+  Foo { self } }`) — already legal (the B98 pin's own program) and
+  *strictly more functional* than the blanket it replaces: it works on
+  the bound path today (probe G, both worlds), where the blanket
+  internal-errors.
+- **Docs teaching:** the `spec/types.md` 277–280 example swap;
+  `strings.md` untouched; a `breaking`-family CHANGELOG entry with the
+  migration line ("write the reflexive impl if you called identity
+  `.into()`").
+- **Tests:** the three pin rewrites plus the B98 pin's repurposing —
+  mechanical, shapes given above.
+
+**Recommendation: DELETE — in its own lane, after the ruling.** The
+census found zero selecting sites in every shipped surface *and* zero in
+the suite; the only working behavior is an identity no-op nothing calls;
+the flagship affordance is an internal compiler error in the released
+binary; deleting lands row 2 on §13.2's first-choice correct answer and
+un-taxes the single-impl `.into()` that `strings.md` actually teaches;
+keeping obligates D3 transformer work for zero users. This lane ships
+the paper only — under the work order's own letter the census is not
+"zero breakage" (three pins, one prose example, one contract row), so
+the deletion is a small scheduled change, not a drive-by: pin rewrites,
+the docs example, the CHANGELOG family entry, and the beta.md row in one
+commit, full gates.
+
+### 14.1 Owner question
+
+**Delete `std/src/into.vl` 5–9, or keep it and fund the fix?** Evidence
+for delete: resolution selects it *nowhere* in the tree, suite included
+(census above, three-legged and cross-checked); its one unique
+affordance — `T: Into<Foo>` fed a `Foo` — dies with `internal: … please
+report this program` on both this tree and released 0.34.0 (probe C);
+deleting turns that into a clean bound refusal, makes the unannotated
+single-impl `.into()` print the §13.2-correct `converted` instead of an
+ambiguity, costs three pin rewrites plus one docs-example swap
+(measured: corpus byte-identical, docs gate green), and closes beta.md
+§5.1 Q3 by removing the table's only Tier 3 row. Evidence for keep:
+Rust-shaped reflexive ergonomics — but they require paying D3's
+transformer debt before they exist at all, and the per-type reflexive
+impl already delivers them today (probe G: `7`, both worlds). If the
+ruling is delete, the bycatch stands regardless of timing: probe C's
+internal error is live in 0.34.0 and should be filed even if the blanket
+outlives it.
