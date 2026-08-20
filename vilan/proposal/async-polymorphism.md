@@ -165,6 +165,30 @@ declared; the newly-legal programs are exactly the ones that were refused.
 - **Externs are implicitly `sync`** for value-returning closure parameters
   (host code cannot await a vilan closure); void extern callbacks keep spawn
   (a `setTimeout` handler that awaits is a spawn, as today).
+
+  > **Narrowed 2026-08-19 (E68)** — the rule's domain is *host boundaries*,
+  > and `Context::run` is not one: it is `external` only as a type-checking
+  > fiction (context.vl's own header says so), and the context threading
+  > pass erases every `run` call it accepts before this check runs. The
+  > only way the check could ever see a `run` call was the error path —
+  > `thread_contexts` refusing its rewrite after reporting a coverage or
+  > `run`-shape error — where judging std's async-into-`run` bodies
+  > (task.vl's nursery, rpc.vl's wire turn) produced spurious host-await
+  > secondaries anchored in std beside the real primary: ANY `owner_scope`
+  > coverage failure, even a bare `Signal::effect` at the top of `main`,
+  > carried them. Both arms of the check (the direct host-boundary loop and
+  > the transitive `extern_violations_at`) now skip the intrinsic by its
+  > recorded id (`Program::context_run_fn_id`). This is not a demotion —
+  > the premise is false for the intrinsic in every reachable state, since
+  > a surviving `run` call implies the context pass already refused and
+  > said why. Real externs are unaffected. Pins:
+  > `e68_an_uncovered_effect_reports_only_the_coverage_primary`,
+  > `e68_a_refused_run_shape_reports_only_the_context_primaries`,
+  > `e68_a_generic_forward_into_run_does_not_cascade_transitively` (all
+  > three verified red pre-fix); the standing extern-misuse pins
+  > (`an_async_closure_into_an_extern_callback_is_refused`,
+  > `an_async_parameter_cannot_launder_into_a_host_callback`) hold the
+  > rule's real domain.
 - **Container elements**: `List<|| T>` element types accept no markers (J2
   record) and calls through elements do not adapt; unchanged, future work.
 
