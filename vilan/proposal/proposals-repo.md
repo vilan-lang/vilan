@@ -138,7 +138,7 @@ and tracker stay together.**
 
 **The concrete working arrangement:**
 
-- A sibling checkout at `/home/reed/code/vilan-lang/proposals`, beside
+- A sibling checkout at `<workspace>/proposals` (beside the other repos),
   `vilan/`, `vilan-website/`, `vilan-playground/`, `vilan-branding/`,
   `vilan-lang.github.io/` — the workspace already has this shape.
 - Branching: a single `main`, no `next`. The next/main split exists for
@@ -150,7 +150,7 @@ and tracker stay together.**
   arc-naming message discipline.
 - Lane briefs: spec pointers become `proposals/proposal/X.md`
   (workspace-relative; absolute
-  `/home/reed/code/vilan-lang/proposals/proposal/X.md` in briefs). A code
+  `<workspace>/proposals/proposal/X.md` in briefs). A code
   lane gets a worktree *pair* — its compiler worktree plus a proposals
   worktree for its record — and its report names both branches. The
   integration session merges both repos at cycle close; the memory files
@@ -273,7 +273,7 @@ at the price of five stub files. Exact membership is an owner call (§8).
    CLAUDE.md, the nine book links). Suite green — hygiene itself proves
    the allowlist cleanup right.
 5. **Update the machinery.** The sibling checkout cloned to
-   `/home/reed/code/vilan-lang/proposals`; memory files and brief
+   `<workspace>/proposals`; memory files and brief
    templates re-pointed; the integration worktree convention extended
    per §4.
 6. **First post-move cycle checklist:** briefs carry `proposals/…` spec
