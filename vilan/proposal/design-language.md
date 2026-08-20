@@ -332,7 +332,7 @@ advantage is a richer completion story, which buys nothing today
 because no completion source is wired at all (K9); if K9 later wants
 LSP-grade completion, CM6's autocomplete API is already in the bundle.
 
-### 2.7 K16 — the playground as a full-window app (2026-08-20, owner-approved)
+### 2.9 K16 — the playground as a full-window app (2026-08-20, owner-approved)
 
 The playground leaves the article idiom entirely: the shell claims exactly
 the viewport and clips, a slim app bar (the toolbar absorbing the brand
