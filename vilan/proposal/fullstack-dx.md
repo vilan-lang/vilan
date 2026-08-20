@@ -2643,3 +2643,35 @@ Either the hatches splice into a supplied shell (they have a located
 `<head>`/mount to aim at) and face the same check, or they refuse/warn on
 a supplied document; today they do neither. A std semantic, the owner's
 to rule; left for the tracker.
+
+### 16.11 K13 step 3 — the site takes rung 2 whole (2026-08-20)
+
+The first consumer outside this repository's examples took rung 2 whole
+(vilan-website, lane site-rung2, website@6036e21): both pages are written
+by `Document::of` over their legs' builds (`client`, `playground`), served
+over two `serve_build` calls on one builder, the two HTML shells deleted
+and the `<!--ssr-->` marker gone from the deploy gate — which now fails on
+an empty mount div, the one failure mode rung 2 leaves. Mount markup
+byte-identical, both pages pixel-identical before/after in both schemes;
+the wrapper deltas were the precedent's (self-closing generated tags, the
+head reordered to generated-prefix + hatch-suffix, one indent level, the
+shells' comments moving into `.vl`). What the hatches carried, and the
+ladder could not derive: the UA theme metas (`color-scheme`, two
+per-scheme `theme-color`s — palette values theme.vl knows, restated by
+hand), the description, the og:/twitter: card (whose og:title is not the
+document title), the icon set, and the `<style>` page-frame block §5.5
+predicted — three `@font-face`, ground and `::selection`, per-page frame
+rules, the reduced-motion kill; `body()` carried the landing page's
+out-of-mount SVG filter and the playground's two vendored plain scripts,
+whose load-before-the-bundle order the generated tag's position
+guarantees. All three of §15.2's declined helpers had a real customer on
+the first real site — §10.1's review clause has its requests (filed E79).
+One thing no hatch could say: the deployed site served the playground
+leg's pair under `/playground/`, and a generated document addresses
+`/{bundle}` — §5.4's declined route prefix is exactly what that page
+needed, so the deployment moved to the ladder's root namespace instead
+(the pair staged at the pages-repo root, stale copies retired), a live
+site's URL space following the ladder rather than a knob. `split = true`
+was not taken: no router, zero chunks — it belongs with K13's router
+step. Bycatch: docs-port.md §5 item 7's node externs replaced by
+`std::fs::read_bytes`/`read_dir`.
