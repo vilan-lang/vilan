@@ -383,7 +383,7 @@ pub fn analyze_source_reclaimable(
     }))
     .unwrap_or_else(|_| AnalyzedEntry {
         program: None,
-        diagnostics: vec![Error {
+        diagnostics: vec![Error { trace: Vec::new(),
             note: None,
             span: crate::span::Span::new((), 0..0),
             msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
@@ -409,6 +409,7 @@ fn analyze_source_unfenced(
     let mut diagnostics: Vec<Error> = parse_errors
         .iter()
         .map(|error| Error {
+            trace: Vec::new(),
             note: None,
             span: error.span,
             msg: parsing::render(error),

@@ -772,6 +772,106 @@ fn assert_fails_noting_nth(
     );
 }
 
+/// Like [`failure_diagnostics_with_notes`], but keeping each diagnostic's
+/// E78 requirement trace: `(message, span, trace)` with one
+/// `(label message, span range, cross-source?)` entry per hop, in the
+/// analyzer's own order — entry → read.
+fn failure_diagnostics_with_trace(
+    source: &str,
+) -> Vec<(
+    String,
+    std::ops::Range<usize>,
+    Vec<(String, std::ops::Range<usize>, bool)>,
+)> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            errors
+                .into_iter()
+                .map(|error| {
+                    (
+                        error.msg,
+                        error.span.into_range(),
+                        error
+                            .trace
+                            .into_iter()
+                            .map(|note| (note.msg, note.span.into_range(), note.source.is_some()))
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// Asserts the ONE diagnostic containing `message_part` carries EXACTLY the
+/// expected requirement trace (backlog E78): `expected` lists, in order
+/// (entry → read), each label's span as (snippet, 0-based occurrence in the
+/// source) plus a fragment of its message. Exactness is the pin: an extra
+/// label — a covered call taking blame, a hop past the cap — fails here as
+/// surely as a missing one.
+#[track_caller]
+fn assert_traces(source: &str, message_part: &str, expected: &[(&str, usize, &str)]) {
+    let occurrence_span = |snippet: &str, occurrence: usize| -> std::ops::Range<usize> {
+        let mut start = 0;
+        let mut at = None;
+        for _ in 0..=occurrence {
+            at = source[start..].find(snippet).map(|found| start + found);
+            match at {
+                Some(position) => start = position + 1,
+                None => panic!("occurrence {occurrence} of {snippet:?} not found"),
+            }
+        }
+        let found = at.unwrap();
+        found..found + snippet.len()
+    };
+    let diagnostics = failure_diagnostics_with_trace(source);
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _, _)| message.contains(message_part))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one diagnostic containing {message_part:?}; got: {diagnostics:#?}"
+    );
+    let (_, _, trace) = matching[0];
+    assert_eq!(
+        trace.len(),
+        expected.len(),
+        "the trace must carry exactly the expected labels; got: {trace:#?}"
+    );
+    for (index, ((snippet, occurrence, label_part), (label, range, cross_source))) in
+        expected.iter().zip(trace).enumerate()
+    {
+        let expected_range = occurrence_span(snippet, *occurrence);
+        assert!(
+            label.contains(label_part),
+            "trace[{index}] message {label:?} lacks {label_part:?}"
+        );
+        assert_eq!(
+            *range, expected_range,
+            "trace[{index}] must span occurrence {occurrence} of {snippet:?}"
+        );
+        assert!(
+            !cross_source,
+            "trace[{index}] unexpectedly points into another file"
+        );
+    }
+}
+
 /// `assert_fails_spanning`, but targeting the Nth occurrence (0-based) of
 /// `spanning` — for snippets that necessarily appear earlier in another
 /// role (an attribute name also being the macro definition's, a use after
@@ -15858,6 +15958,409 @@ main();
         "#,
         "late.effect(|value| print(value))",
         "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+// --- E78: the coverage refusal keeps the chain the walk traverses. ---
+
+/// The owner's acceptance example, comments as behavior: ONE diagnostic,
+/// primary at the read (E74's anchor for a user-written read), with `b`'s
+/// `a()` and `main`'s `b()` as trace labels ordered entry → read — and `c`'s
+/// covered `context.run(0, || a())` carrying nothing (the exact-length
+/// assertion is the covered-call stop's pin: mark the covered edge uncovered
+/// in the trace walk and the extra label fails here).
+#[test]
+fn e78_the_owners_example_traces_the_uncovered_chain_and_leaves_the_covered_call_clean() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    context.get();
+}
+
+fun b() {
+    a(); // error with trace
+}
+
+fun c() {
+    context.run(0, || a()); // ok
+}
+
+fun main() {
+    b(); // error with trace
+    c();
+}
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `context` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_spanning(
+        source,
+        "context.get()",
+        "context `context` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            // Occurrence 1 skips each function's own declaration.
+            ("b()", 1, "the context requirement flows through this call"),
+            ("a()", 1, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// A top-level call is an uncovered entry by construction, and it is a hop
+/// like any other: appending `main();` to the owner's example adds exactly
+/// one label, at the top-level call, ahead of the rest of the chain.
+#[test]
+fn e78_a_top_level_call_is_a_labeled_hop() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    context.get();
+}
+
+fun b() {
+    a();
+}
+
+fun c() {
+    context.run(0, || a());
+}
+
+fun main() {
+    b();
+    c();
+}
+main();
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            ("b()", 1, "the context requirement flows through this call"),
+            ("a()", 1, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// A two-hop chain through a capture: the closure's read blames its defining
+/// scope's callers — the capture hop itself crosses no call site and adds no
+/// label, so the chain is exactly the two calls.
+#[test]
+fn e78_a_chain_through_a_capture_labels_both_calls() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    let read = || context.get();
+    read();
+}
+
+fun b() {
+    a();
+}
+
+fun main() {
+    b();
+}
+        "#;
+    assert_fails_spanning(
+        source,
+        "context.get()",
+        "context `context` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            ("b()", 1, "the context requirement flows through this call"),
+            ("a()", 1, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// A dispatch hop carries E74's union-admission residual and must not
+/// overclaim: the site MAY select the reading implementation, so its label
+/// says so, while the direct call above it keeps the plain wording.
+#[test]
+fn e78_a_dispatch_hop_says_may_flow() {
+    let source = r#"
+import std::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+trait Probe {
+    fun name(self): str;
+
+    fun report(self) {
+        print(i"{self.name()}: {current.get()}");
+    }
+}
+
+struct Widget { tag: str }
+
+impl Widget with Probe {
+    fun name(self): str {
+        self.tag
+    }
+}
+
+fun announce<T: Probe>(subject: T) {
+    subject.report();
+}
+
+fun main() {
+    announce(Widget { tag = "w" });
+}
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "announce(Widget { tag = \"w\" })",
+                0,
+                "the context requirement flows through this call",
+            ),
+            (
+                "subject.report()",
+                0,
+                "the context requirement may flow through this call (dispatch may select a reader)",
+            ),
+        ],
+    );
+}
+
+/// The cap: a nine-hop chain labels its six ENTRY-side hops — the outermost
+/// frames, where the missing `run` belongs — and elides the read side behind
+/// the honest tail, anchored at the last kept hop.
+#[test]
+fn e78_a_deep_chain_caps_at_six_labels_with_an_honest_tail() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun f8() {
+    context.get();
+}
+fun f7() { f8(); }
+fun f6() { f7(); }
+fun f5() { f6(); }
+fun f4() { f5(); }
+fun f3() { f4(); }
+fun f2() { f3(); }
+fun f1() { f2(); }
+
+fun main() {
+    f1();
+}
+main();
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            ("f1()", 1, "the context requirement flows through this call"),
+            ("f2()", 1, "the context requirement flows through this call"),
+            ("f3()", 1, "the context requirement flows through this call"),
+            ("f4()", 1, "the context requirement flows through this call"),
+            ("f5()", 1, "the context requirement flows through this call"),
+            ("f5()", 1, "… 3 more uncovered calls on this path"),
+        ],
+    );
+}
+
+/// The covered-call stop, isolated: the read's function has two callers —
+/// one inside `run`, one not — and only the uncovered one's chain labels.
+/// This is the plant pin: treat the covered edge as uncovered in the trace
+/// walk and the `|| a()` call gains a label the exact-length check refuses.
+#[test]
+fn e78_a_covered_caller_beside_the_open_path_is_never_labeled() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    context.get();
+}
+
+fun covered() {
+    context.run(1, || a());
+}
+
+fun open_path() {
+    a();
+}
+
+fun main() {
+    covered();
+    open_path();
+}
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "open_path()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            ("a()", 2, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// The `owner_scope` coverage flavor rides the same walk: the primary stays
+/// at E74's anchor (the user's call entering std), the std read stays the C3
+/// note, and the frames ABOVE the entry now label, entry → read.
+#[test]
+fn e78_the_std_read_chain_labels_the_frames_above_the_entry() {
+    let source = r#"
+import std::print;
+import std::reactive::Signal;
+
+fun watch(count: Signal<i32>) {
+    count.effect(|value| print(value));
+}
+
+fun setup() {
+    let count = Signal::new(1);
+    watch(count);
+}
+
+fun main() {
+    setup();
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "count.effect(|value| print(value))",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "setup()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "watch(count)",
+                0,
+                "the context requirement flows through this call",
+            ),
+        ],
+    );
+}
+
+/// Several uncovered entries reaching one std read: each gets its OWN
+/// primary and its own chain — E74 kept only the least-id entry, so fixing
+/// the first call merely revealed the second on the next compile.
+#[test]
+fn e78_each_uncovered_entry_gets_its_own_diagnostic() {
+    let source = r#"
+import std::print;
+import std::reactive::Signal;
+
+fun main() {
+    let first = Signal::new(1);
+    first.effect(|value| print(value));
+    let second = Signal::new(2);
+    second.effect(|value| print(value));
+}
+main();
+        "#;
+    let message = "context `owner_scope` is read here, but this code can be reached without an enclosing `run`";
+    let diagnostics = failure_diagnostics(source);
+    let matching = diagnostics
+        .iter()
+        .filter(|(candidate, _)| candidate.contains(message))
+        .count();
+    assert_eq!(
+        matching, 2,
+        "one diagnostic per uncovered entry; got: {diagnostics:#?}"
+    );
+    assert_fails_spanning(source, "first.effect(|value| print(value))", message);
+    assert_fails_spanning(source, "second.effect(|value| print(value))", message);
+}
+
+/// The injected-call flavor (row 223) traces through the same walk: the
+/// uncovered `body()` call anchors the primary and its callers label,
+/// entry → read.
+#[test]
+fn e78_an_uncovered_injected_call_traces_its_chain() {
+    let source = r#"
+import std::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun call_it(body: (|| void) context current) {
+    body();
+}
+
+fun main() {
+    call_it(|| print(current.get()));
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "body()",
+        "an injected closure is called here, but this code can be reached without an enclosing `run` for context `current`",
+    );
+    assert_traces(
+        source,
+        "an injected closure is called here",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "call_it(|| print(current.get()))",
+                0,
+                "the context requirement flows through this call",
+            ),
+        ],
     );
 }
 

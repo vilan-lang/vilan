@@ -18,6 +18,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**The unprovided-context error now underlines the whole call chain, so a call can no longer make an error appear somewhere else entirely.** Calling a function that (transitively) reads an unprovided context put the "context `…` is read here, but this code can be reached without an enclosing `run`" error at the read — often in a function, or a file, far from the call you just wrote — with nothing connecting the two. The refusal now keeps the path the coverage walk already traverses: every uncovered call of yours between the program's entry and the read carries its own label ("the context requirement flows through this call"; at a generic-bound dispatch, "may flow through this call (dispatch may select a reader)" — the site might select an implementation that never reads), ordered entry → read, with chains deeper than six eliding honestly ("… N more uncovered calls on this path"). A call inside a covering `run` is clean and stops the trace. The CLI renders the chain as labels under the one error; editors get it as related information on the diagnostic, rust-analyzer-style, so each hop underlines in place.
+
+Two smaller sharpenings ride along: when several uncovered calls of yours enter the standard library toward one read (`effect` here, `map` there), each now gets its own error with its own chain — the old behavior reported only the earliest, so fixing it merely revealed the next — and the injected-closure flavor of the refusal traces identically.
+
+---
+
+<!-- family: diagnostics -->
 **The `owner_scope` coverage error now points at your call, not into the standard library.** A `Signal::effect` at the top of `main`, a `map`/`or` on a service mirror outside any scope — the "context `owner_scope` is read here, but this code can be reached without an enclosing `run`" refusal anchored at the strict read all three helpers funnel to: `get_owner`'s body in std's `reactive.vl`, a file you didn't write, sitting in a std cache directory. The message was right; the location failed the anchoring rules' second law (an error caused by user code never anchors in std).
 
 The coverage check now walks the uncovered path back from a std-internal read to the earliest user-written call that enters the standard library — a call inside a covering `run` is never blamed for the uncovered one beside it — and anchors there, demoting the std read to the secondary note the async-boundary refusals already use ("the read is inside `get_owner` here", labeled in its own file). A strict read you wrote yourself still anchors at itself, note-free, and the injected-closure flavor of the refusal carries the same walk-back.

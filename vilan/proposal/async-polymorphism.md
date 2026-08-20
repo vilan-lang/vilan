@@ -298,6 +298,50 @@ position outside the instance cannot pass both halves.
 > only — a covered call is never blamed — and anchors at the user's call,
 > with "the read is inside `get_owner` here" as the note. One mechanism,
 > two passes; diagnostics-ledger.md rows 222/223 carry the verdicts.
+>
+> **The walk now keeps its path (E78, 2026-08-20)** — the owner's ask:
+> every uncovered upstream call underlines, so a call can no longer make
+> the error appear "somewhere else entirely" (rust-analyzer's requirement
+> chains are the named prior art). The primary stays exactly where E74 put
+> it (the user-written read for a user-spanned site, the entering call for
+> a std-spanned one); the calls the walk traverses become a **requirement
+> trace** — `Error::trace`, a new channel beside the C3 note whose "one,
+> not a list" contract is untouched — rendered as ariadne sub-labels in
+> the CLI and as `DiagnosticRelatedInformation` (trace first, C3 note
+> last, vector order preserved) in the LSP. The lane's rulings, each
+> pinned (`inference.rs` `e78_*`, `publish.rs` the cross-file wire test):
+>
+> - **Only calls label.** A covered call is clean and stops the trace (the
+>   owner's acceptance example, comments as behavior: `b`'s `a()` and
+>   `main`'s `b()` carry labels, `c`'s `context.run(0, || a())` carries
+>   nothing); capture hops cross silently (no call site to label — the
+>   closure blames its defining scope's callers); std-internal calls are
+>   traversed but never labeled (A2 demotes std frames; the C3 note
+>   already names the std read); a TOP-LEVEL call (`main();`, a module
+>   initializer's call) is a labeled hop like any other.
+> - **Multiple uncovered entries each get their own diagnostic** — own
+>   primary, own chain, own std note — where E74's least-id rule kept only
+>   the first (so fixing it merely revealed the next). The least-id entry
+>   still leads; the rule survives as ordering, not selection. One
+>   dispatch site admitted for several needy candidates is still one entry.
+> - **Order is entry → read**: decreasing breadth-first depth from the
+>   primary's frame (on a many-chains DAG a level order — every hop's own
+>   upstream hop precedes it), ties in call-id (program) order, one label
+>   per call site. The CLI hands ariadne same-file labels in source order
+>   instead (ariadne opens a new windowed section per out-of-order label);
+>   the vector order is the contract and the LSP publishes it verbatim.
+> - **TRACE_CAP = 6**, keeping the ENTRY side — the outermost frames,
+>   where the missing `run` belongs; the read end is always visible as the
+>   primary or its note — with the honest tail "… N more uncovered calls
+>   on this path" anchored at the last kept hop.
+> - **Dispatch hops say "may flow through this call (dispatch may select
+>   a reader)"** — the union-admission residual above, carried into the
+>   label rather than overclaimed.
+>
+> Both flavors (the strict-read refusal and the injected-call one) trace
+> through the same two helpers (`user_entries_of`, `trace_of`).
+> diagnostics-ledger.md rows 240–242 carry the label heads; the E78 entry
+> in the tracker holds the owner's example.
 
 #### The precision residual, named
 

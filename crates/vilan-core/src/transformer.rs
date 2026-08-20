@@ -1764,6 +1764,7 @@ impl<'src> Transformer<'src> {
             .get("main")
             .and_then(|id| self.program.functions.get(id))
             .ok_or_else(|| Error {
+                trace: Vec::new(),
                 note: None,
                 msg: "Cannot execute program without a main function".to_string(),
                 span: Span::new((), 0..0),
@@ -2037,6 +2038,7 @@ impl<'src> Transformer<'src> {
                 None => format!("`{name}`"),
             };
             return Err(Error {
+                trace: Vec::new(),
                 note: None,
                 span: function
                     .map(|function| function.name_span)
@@ -2059,6 +2061,7 @@ impl<'src> Transformer<'src> {
         // is the class `drop(f(x))` belonged to; it must not leave here quietly.
         if let Some(&call_id) = self.unresolved_drop_sinks.first() {
             return Err(Error {
+                trace: Vec::new(),
                 note: None,
                 span: self
                     .program

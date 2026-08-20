@@ -636,6 +636,7 @@ impl<'p, 'src> State<'p, 'src> {
         }
         if !self.in_progress.insert(expr_id) {
             let error = Error {
+                trace: Vec::new(),
                 note: None,
                 span: self.span_of(expr_id),
                 msg: "`const` expressions form a dependency cycle".to_string(),
@@ -667,6 +668,7 @@ impl<'p, 'src> State<'p, 'src> {
                 }
                 Known::Runtime(name) => {
                     let error = Error {
+                        trace: Vec::new(),
                         note: None,
                         span: self.span_of(reference_id),
                         msg: format!(
@@ -705,6 +707,7 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                     Known::Runtime(name) => {
                         let error = Error {
+                            trace: Vec::new(),
                             note: None,
                             span: self.span_of(expr_id),
                             msg: format!(
@@ -866,6 +869,7 @@ impl<'p, 'src> State<'p, 'src> {
             let name = self.const_only_name(callee, emit_id);
             self.errors.push((
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self.span_of(site),
                     msg: format!(
@@ -963,6 +967,7 @@ impl<'p, 'src> State<'p, 'src> {
             };
             self.errors.push((
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self.span_of(site),
                     msg: format!(
@@ -1044,6 +1049,7 @@ impl<'p, 'src> State<'p, 'src> {
             }
         };
         Error {
+            trace: Vec::new(),
             note,
             span: self.span_of(expr_id),
             msg: format!("{headline}{subject}: {}", failure.message),

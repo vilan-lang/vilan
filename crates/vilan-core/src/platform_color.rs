@@ -117,6 +117,7 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> 
                 // The pattern is written in the fenced function's own file.
                 diagnostics.push((
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span: *pattern_span,
                         msg: format!(
@@ -658,6 +659,7 @@ fn violation(
     };
     (
         Error {
+            trace: Vec::new(),
             note: None,
             span: anchor.0,
             msg: format!(
