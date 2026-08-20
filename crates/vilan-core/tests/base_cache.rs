@@ -546,3 +546,32 @@ fn an_entry_declared_impl_resolves_through_a_cache_hit() {
     assert_eq!(cached.2, fresh.2, "emitted JS differs cached vs fresh");
     assert!(cached.2.is_some(), "and it must actually have emitted");
 }
+
+/// The third cold switch (backlog M6): `parse_clean_cached` serves the
+/// IDENTICAL leaked pointer for identical content — pointer identity is how
+/// reuse is proven without timing, per its own doc — and
+/// `parse_clean_cache_clear` drops the map, so the next ask re-parses into a
+/// fresh leak. The inequality after the clear is deterministic, not
+/// probabilistic: the first AST is still leaked and alive, so a new
+/// allocation can never land at its address.
+#[test]
+fn parse_clean_cache_clear_forces_a_reparse() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let source = "fun parse_cache_probe(): i32 {\n\tlet value = 21;\n\tvalue * 2\n}\n";
+
+    let (first, _) = vilan_core::parse_clean_cached(source).expect("a clean source parses");
+    let (second, _) = vilan_core::parse_clean_cached(source).expect("still clean");
+    assert!(
+        std::ptr::eq(first, second),
+        "identical content must be served back from the cache"
+    );
+
+    vilan_core::parse_clean_cache_clear();
+    let (third, _) = vilan_core::parse_clean_cached(source).expect("clean after the clear too");
+    assert!(
+        !std::ptr::eq(first, third),
+        "after the clear the same content must be re-parsed into a fresh leak"
+    );
+}

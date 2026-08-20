@@ -9,7 +9,8 @@
 //!    the same seam `VILAN_PHASE_TIMING` marks. Each corpus is measured **cold**
 //!    and **warm**, and the difference is *forced*, never assumed: a cold
 //!    iteration clears the process-global caches first
-//!    (`analyzer::base_cache_clear`, `macro_world_cache_clear`). Leaving that to
+//!    (`analyzer::base_cache_clear`, `macro_world_cache_clear`, and — since
+//!    backlog M6, 2026-08-19 — `parse_clean_cache_clear`). Leaving that to
 //!    chance is the exact drift `suite-speed.md` §2.1/E26 recorded — a number
 //!    attributed to a mechanism that the accounting never confirmed.
 //! 2. **End to end.** `vilan check` on real packages, spawned exactly as the
@@ -217,13 +218,16 @@ struct PhaseSample {
 /// leaving them yields the shape a language-server keystroke or a `--watch`
 /// round pays.
 ///
-/// One cache is deliberately NOT cleared: `parse_clean_cached`'s content-keyed
-/// store of module ASTs, which has no clearer and would need a new public
-/// accessor to get one. So "cold" here means *world-cold, parse-warm* — the
-/// module re-load, re-walk and re-resolve are paid, the module re-lex and
-/// re-parse are not. The end-to-end section below spawns a fresh process per
-/// measurement and therefore does pay both; the gap between the two is
-/// measured, not assumed.
+/// Since backlog M6 (2026-08-19) the third process-global cache —
+/// `parse_clean_cached`'s content-keyed store of module texts and ASTs — is
+/// cleared too, so "cold" here means *world-cold AND parse-cold*: every cold
+/// iteration re-lexes and re-parses every module it loads, the true
+/// first-compile shape. (It used to mean world-cold, parse-warm, because that
+/// cache had no clearer — cold rows measured before this date are NOT
+/// comparable to cold rows measured after it; `perf-baseline.md` §6 records
+/// the two side by side.) What still separates this from the end-to-end
+/// section's cold is the process itself: startup and binary load are paid
+/// only there.
 fn measure_phases(
     subject: &PhaseSubject,
     std: &PackageSpec,
@@ -233,6 +237,7 @@ fn measure_phases(
     if cold {
         vilan_core::analyzer::base_cache_clear();
         vilan_core::macro_world_cache_clear();
+        vilan_core::parse_clean_cache_clear();
     }
 
     // The pipeline borrows its source for `'static`, exactly as every front-end
@@ -527,16 +532,16 @@ fn phase_section(scale: Scale) -> Vec<Row> {
                 }
             }
 
-            // Prime, then measure. `cold` clears the resolved world and the
-            // macro worlds but CANNOT clear `parse_clean_cached` (there is no
-            // clearer), so without this pass the first subject in the process
-            // pays every module's lex-and-parse and the later ones inherit it —
-            // the cold rows would then rank the subjects by *position*, which is
-            // an ordering artifact wearing a measurement's clothes. One
-            // throwaway cold compile of every subject first puts all of them on
-            // the same parse-cache footing, and what the cold rows then compare
-            // is the module load, walk and resolve. The genuinely-cold case
-            // (fresh process, nothing parsed) is the end-to-end section's.
+            // Prime, then measure. This pass was born to cancel an ordering
+            // artifact that no longer exists: before `parse_clean_cache_clear`
+            // (backlog M6), cold could not clear the parse cache, so the first
+            // subject in the process paid every module's lex-and-parse and the
+            // later ones inherited it — cold rows ranked the subjects by
+            // *position*. Cold now clears all three caches per iteration, so
+            // every cold sample is self-contained; the prime is kept for the
+            // narrower job of absorbing the process's ONE-TIME costs (lazily
+            // built tables, allocator warm-up), so the first subject's first
+            // sample is not also the process's first-ever compile.
             for subject in &subjects {
                 let _ = measure_phases(subject, &std, platform, true);
             }
@@ -710,19 +715,46 @@ fn style_heavy_source(sites: usize) -> String {
     source
 }
 
-/// The `post_analysis_passes` wall for a style-heavy entry of `sites` const
-/// sites, warm and taken as the MINIMUM of a few rounds — the least-contended
-/// sample, which is the one a ratio should be built from on a machine that may
-/// be running a suite around it.
-fn const_pass_wall(sites: usize, std: &PackageSpec, platform: Platform) -> Duration {
-    let subject = PhaseSubject::synthetic(&format!("style_{sites}"), &style_heavy_source(sites));
-    // One throwaway compile puts the subject on the same cache footing as its
-    // sibling, exactly as `phase_section` primes its subjects.
-    let _ = measure_phases(&subject, std, platform, false);
-    (0..3)
-        .map(|_| measure_phases(&subject, std, platform, false).post)
-        .min()
-        .expect("at least one round")
+/// The `post_analysis_passes` walls for TWO style-heavy entries, measured
+/// warm, ALTERNATELY — small, large, small, large… — and each taken as the
+/// MINIMUM of its rounds, the least-contended sample.
+///
+/// The alternation is the point, and it is a 2026-08-19 repair (found by
+/// D17's lane): measured as two sequential blocks, the two mins were drawn
+/// from two *disjoint time windows*, and contention that differs between the
+/// windows — a sibling suite's compile storm landing on one block and not the
+/// other — inflates the ratio instead of cancelling in it. Under a load-25
+/// contended full-suite run the pin read **6.63×** against its 6× bound, and
+/// passed alone. Interleaving draws both mins from rounds that span the
+/// same period, which is §8.4's run-the-binaries-alternately discipline
+/// applied inside one process. (Both subjects import the same std names, so
+/// they share one base-cache world and stay warm across the alternation.)
+fn const_pass_walls(
+    small_sites: usize,
+    large_sites: usize,
+    std: &PackageSpec,
+    platform: Platform,
+) -> (Duration, Duration) {
+    const ROUNDS: usize = 3;
+    let small = PhaseSubject::synthetic(
+        &format!("style_{small_sites}"),
+        &style_heavy_source(small_sites),
+    );
+    let large = PhaseSubject::synthetic(
+        &format!("style_{large_sites}"),
+        &style_heavy_source(large_sites),
+    );
+    // One throwaway compile per subject puts both on the same cache footing,
+    // exactly as `phase_section` primes its subjects.
+    let _ = measure_phases(&small, std, platform, false);
+    let _ = measure_phases(&large, std, platform, false);
+    let mut small_wall = Duration::MAX;
+    let mut large_wall = Duration::MAX;
+    for _ in 0..ROUNDS {
+        small_wall = small_wall.min(measure_phases(&small, std, platform, false).post);
+        large_wall = large_wall.min(measure_phases(&large, std, platform, false).post);
+    }
+    (small_wall, large_wall)
 }
 
 /// The pass must stay LINEAR in its const sites.
@@ -743,7 +775,23 @@ fn const_pass_wall(sites: usize, std: &PackageSpec, platform: Platform) -> Durat
 /// three separate incidents of a clock in the gate, each fixed by replacing it
 /// with a ratio). The headroom is deliberately generous — a 4× ratio with 50 %
 /// slack — because the useful failure is a change of SHAPE, and a shape change
-/// blows through it by orders of magnitude while noise does not.
+/// blows through it while noise does not.
+///
+/// The 2026-08-19 flake, and why the repair is the MEASUREMENT and not the
+/// bound (`perf-baseline.md` §6.3). Under a load-25 contended full-suite run
+/// the pin read **6.63×** once and passed alone (found by D17's lane): the
+/// two mins were then drawn from two sequential, disjoint time windows, so a
+/// wall-clock ratio was load-sensitive by construction — contention landing
+/// unevenly across the windows inflates the ratio instead of cancelling in
+/// it. The rounds now interleave (see [`const_pass_walls`]); re-measured
+/// under a *worse* load (~40) the interleaved pin reads 3.13–3.59× against
+/// the quiet machine's 3.44×, so the construction, not the bound, was the
+/// flake. Widening instead was tried and measured VACUOUS: a genuinely
+/// quadratic plant — one whole-world rebuild plus a re-walk of every other
+/// site, per site — reads **7.63–8.01×** at this size, so an 8× bound waves
+/// a real quadratic through while 6× catches it. (The heavier historical
+/// plant, a whole-program mini-build per other site, read 13.89×.) 6×
+/// therefore stands, now with plant measurements on BOTH sides of it.
 ///
 /// Honest about what it does and does not catch, because a pin that is believed
 /// to catch more than it does is worse than none. At the site counts a gate can
@@ -762,7 +810,8 @@ fn the_const_pass_scales_with_its_const_sites_and_not_with_their_square() {
     const SITES: usize = 20;
     const FACTOR: usize = 4;
     // Generous, and argued for above: four times the work must not cost six
-    // times the time.
+    // times the time. Not wider — the cheap quadratic plant reads ~7.6–8.0×,
+    // so 8 would be vacuous (see the doc comment).
     const BOUND: f64 = 6.0;
 
     let (small, large) = std::thread::Builder::new()
@@ -770,10 +819,7 @@ fn the_const_pass_scales_with_its_const_sites_and_not_with_their_square() {
         .spawn(|| {
             let std = std_spec();
             let platform = Platform::default();
-            (
-                const_pass_wall(SITES, &std, platform),
-                const_pass_wall(SITES * FACTOR, &std, platform),
-            )
+            const_pass_walls(SITES, SITES * FACTOR, &std, platform)
         })
         .expect("spawn the const-scaling measurement thread")
         .join()
