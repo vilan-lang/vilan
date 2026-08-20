@@ -633,6 +633,23 @@ rebuild.
 the index weight as its own hygiene question rather than letting it decide
 the renderer.*
 
+*N14 measured 2026-08-20 (Order 7's n-pages-hygiene lane): accepted at
+3.0 MB. The weight is elasticlunr's serialized inverted index — 2.44 MB
+of the 3.06 MB JSON; the stored section texts are 580 KB — and no
+`[output.html.search]` knob moves it without degrading results.
+Measured on the built book (448 indexed sections), probed with signal,
+serve_build, match, context, epoch: `limit-results` and
+`teaser-word-count` change a query-time options header, not the index;
+`heading-split-level = 2` saves 2.5% (3,101,297 bytes); `= 1` saves
+18.5% (2,591,154) by collapsing 448 section targets into 55 page tops —
+"signal" then lands on "Reactive state" instead of the `Signal` type's
+section; excluding `appendix` via 0.5's per-chapter opt-out saves 10.0%
+(2,862,998) by delisting the error index, glossary, gotchas and CLI —
+the reference pages people search precisely when something fails.
+("deprecated" returns nothing at every setting: the language has no
+deprecation mechanism yet — that is L4, not an index gap.) book.toml
+carries the acceptance beside the knob it declines to set.*
+
 **Q5 — the masthead's shape.** `header.hbs` puts the bar beside the sidebar;
 edge-to-edge needs the 367-line `index.hbs` fork and its upgrade cost.
 *Recommendation: `header.hbs` for v1; revisit if the owner wants full-bleed.*
