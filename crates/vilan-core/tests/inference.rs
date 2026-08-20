@@ -43973,6 +43973,181 @@ fn a_const_failure_names_the_function_that_failed_not_the_name_it_was_emitted_un
 }
 
 #[test]
+fn a_const_function_evaluates_again_after_an_earlier_sites_scopes_were_cleared() {
+    // M8 (leak-soak.md §7.8). When a const site's run ends, the interpreter
+    // clears every scope the run created — that is what breaks the
+    // closure–scope reference cycles. What must survive the teardown is the
+    // pass's SHARED LOWERING (`const-eval.md` §10.6): immutable `js::Node`
+    // trees, which a later site re-hoists into a fresh scope of its own. So a
+    // function two sites reach — including one that declares a function
+    // INSIDE its body, the call-scope cycle the root-only experiment in
+    // leak-soak.md §7.7 could not break — must evaluate correctly at the
+    // later site, after the earlier site's teardown already ran.
+    //
+    // Planted to a teardown that runs BEFORE the result extraction, the first
+    // site cannot read `__const_result` back and this is red.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun bump_twice(value: i32): i32 {
+            let bump = |x: i32| { x + 1 };
+            bump(bump(value))
+        }
+
+        fun scaled(value: i32): i32 {
+            value * 3
+        }
+
+        let FIRST: i32 = const bump_twice(1);
+        let MIDDLE: i32 = const scaled(4);
+        let LAST: i32 = const bump_twice(40);
+
+        fun main() {
+            print(FIRST);
+            print(MIDDLE);
+            print(LAST);
+        }
+        main();
+        "#,
+        "3\n12\n42\n",
+    );
+}
+
+/// Analyzes `source` on a large-stack worker and reports the interpreter
+/// scopes still alive on that thread afterwards, plus how many function bodies
+/// the const pass lowered (the guard that the probe genuinely reached the
+/// evaluator). Same isolation as [`const_lowerings_of_one_analysis`].
+fn scopes_alive_after_one_analysis(source: &str) -> (isize, usize) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::transformer::reset_const_lowering_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let _ = program.expect("analysis should produce a program");
+            (
+                vilan_core::interpreter::live_scope_count(),
+                vilan_core::transformer::const_lowering_count(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn every_interpreter_scope_dies_with_its_const_run() {
+    // M8's mechanism pin (leak-soak.md §7.8). A scope that binds a function
+    // holds a `Value::Closure` whose `env` is that scope — a cycle `Rc`
+    // cannot collect — so before the per-run teardown, every const site of
+    // every analysis stranded its root scope, and a function declared inside
+    // a body stranded the CALL scope too. Only a counter can pin the fix: the
+    // teardown is behaviour-neutral by construction, so nothing observable
+    // distinguishes a run that cleans up from one that leaks. The fixture
+    // exercises every cycle shape §7.7 names: hoisted module functions (root
+    // scope), a closure declared inside a called function (call scope), and
+    // loop iterations between them.
+    let (alive, lowered) = scopes_alive_after_one_analysis(
+        r#"
+        import std::print;
+
+        fun labels(count: i32): List<str> {
+            let describe = |index: i32| { "a labelled entry" };
+            mut result: List<str> = List::new();
+            mut index = 0;
+            for index < count {
+                result.push(describe(index));
+                index = index + 1;
+            }
+            result
+        }
+
+        fun total(count: i32): i32 {
+            mut sum = 0;
+            mut index = 0;
+            for index < count {
+                sum = sum + index;
+                index = index + 1;
+            }
+            sum
+        }
+
+        let NAMES: List<str> = const labels(6);
+        let SUM: i32 = const total(6);
+        let AGAIN: i32 = const total(9);
+
+        fun main() {
+            print(NAMES.len());
+            print(SUM);
+            print(AGAIN);
+        }
+        main();
+        "#,
+    );
+    assert!(
+        lowered > 0,
+        "the probe must actually reach the const evaluator, or the pin measures nothing"
+    );
+    assert_eq!(
+        alive, 0,
+        "{alive} interpreter scope(s) outlived their const runs — a closure–scope \
+         reference cycle is stranding them (leak-soak.md §7.8)"
+    );
+}
+
+#[test]
+fn every_interpreter_scope_dies_with_its_macro_expansion() {
+    // The same mechanism pin over the OTHER caller `interpreter.rs` has: macro
+    // expansion (`run_entry`), whose world top level hoists functions into the
+    // run's root scope exactly as a const site does. The expansion cache keeps
+    // only the expansion TEXT, so the run's scopes have nothing left to serve
+    // once it returns — the teardown reaches this path too. The macro body is
+    // deliberately distinct from every other fixture in this binary, so the
+    // process-global expansion cache cannot serve it without running it.
+    let (alive, _) = scopes_alive_after_one_analysis(
+        r#"
+        import std::print;
+
+        macro fun sum_to_eleven(arguments: Arguments): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Arguments, Source };
+            mut sum = 0;
+            mut index = 0;
+            for index < 11 {
+                sum = sum + index;
+                index = index + 1;
+            }
+            source(i"{sum}")
+        }
+
+        fun main() {
+            print(macro sum_to_eleven());
+        }
+        main();
+        "#,
+    );
+    assert_eq!(
+        alive, 0,
+        "{alive} interpreter scope(s) outlived their macro expansion runs \
+         (leak-soak.md §7.8)"
+    );
+}
+
+#[test]
 fn context_threading_owns_the_one_graph_that_cannot_be_shared() {
     // The exception that makes the rule honest. `context::apply` rewrites
     // `entity_map` / `function_calls` / `generic_dispatch` — a threaded `get()`

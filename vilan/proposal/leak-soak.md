@@ -841,3 +841,158 @@ item, not M7's; filed in the report with these numbers as a new find.
 With it fixed, the language server's session memory on `page.vl` would be
 flat to the allocator's noise — which is what §7's first sentence asked for
 and M7 alone delivers on the smaller file.
+
+### 7.8 M8, SHIPPED 2026-08-20 — the per-run scope registry
+
+§7.7 named the mechanism and the general fix; this section is that fix, built
+the way M7 was: the soundness condition proved first, then the change, then
+the same soak. The one-line experiment cleared the ROOT scope and could not
+reach a function declared inside a called function's body — that closure
+cycles with the *call* scope, unreachable from the root once the call returns
+— so the shipped shape is the registry §7.7 sketched: the `Interpreter`
+records every scope its run creates and, when the run's result is owned plain
+data, clears every one of them.
+
+#### The shape
+
+`interpreter.rs` only. §7.7 counted eight scope-creation sites and eight is
+right: three roots (`run_const`, `run_program`, `run_entry` — one per public
+entry) and five children (the `while` iteration, the `for..of` iteration, the
+two `if`-branch bodies, the call frame). All eight now go through two methods
+on `Interpreter` — `root_scope` / `child_scope` — and the raw constructors
+are gone, so a scope cannot be born unregistered; a ninth creation site added
+later is forced through the registry by construction. The registry itself is
+`Vec<Weak<RefCell<Scope>>>` (the `Interpreter` struct gains the run's
+lifetime for it, as §7.7 said it would): **weak deliberately**, so the
+registry never extends a scope's life — a loop that churns ten thousand
+iteration scopes sees every one die exactly when it died before, at the cost
+of its 8-byte slot, and only a scope a cycle (or the run's own root handle)
+still holds is there for the teardown to upgrade and clear. `clear_scopes`
+drains the registry and clears each live scope's bindings: the closures drop,
+their `env` edges drop, and the whole scope graph unravels leaf-first. Values
+the extracted result still holds by `Rc` are unaffected — clearing a scope
+severs edges, it destroys nothing that anything else owns.
+
+#### The soundness condition, and why the macro path is in
+
+**No scope-held `Value` may be resolved after the clear.** What makes that
+provable in one place is that `Value`, `Scope`, `Env` and `ClosureData` are
+private to `interpreter.rs` and the module holds no `static` or
+`thread_local!` state that stores them (the one global added here is the pin's
+plain-integer counter) — so the only code that could read a scope after the
+teardown is the entry function that owns the run, and each of the three tears
+down as its LAST act, after its result is extracted to owned plain data:
+
+- `run_const` — the result is `value_to_const`'s `ConstValue` (a deep copy:
+  `String`s, `f64`s, owned `Vec`s), the asset lines are `(String, String)`
+  pairs built at emit time, stdout is the interpreter's own `String`, and a
+  `Failure` is `{ kind, String, Vec<String> }`. The teardown runs on the
+  error arms too, which matters: the INFERRED form's capability misses are a
+  routine per-site event (§9.2's silent fallback), and each one had built its
+  scopes before it failed.
+- `run_entry` — **the macro path gets the same registry, deliberately.** Its
+  result is the expansion's `String` (`text.to_string()` out of the `Source`
+  array); the caches above it (`WORLDS`, `EXPANSIONS`, `FAILURES`) store
+  lowered `JsProgram` trees, leaked text and owned errors, never an
+  interpreter `Value` — §7.2's inventory, re-read for this — so no later
+  expansion can be served out of an earlier run's scopes, and "cleared too
+  early" is structurally excluded: the clear is the entry's last statement,
+  behind the owned text. §7.7 called the macro leak bounded
+  (per-distinct-expansion, the worlds cached), but a session's distinct
+  expansions grow with edited macro arguments, so it is the same leak on a
+  slower clock, and leaving it would have meant a special case where the
+  general fix costs one method call.
+- `run_program` — the equivalence suite's entry; `RunOutput` is a `String`
+  and an `i32`. Same argument, same teardown.
+
+What the teardown does NOT cover, recorded honestly: a panic that unwinds out
+of a run leaves its cycles in place, exactly as M7's outer-fence path leaves
+one tree leaked — once per compiler bug, not a session rate. And the lowered
+world (`ConstSite.world`, the pass's shared `js::Node` trees) is untouched by
+design: scopes hold values, the world is the program, and a later site
+re-hoists from it into its own fresh root (§10.6's isolation, unchanged).
+
+#### The pins, and what planting them measured
+
+The mechanism's instrument is a new thread-local counter in `interpreter.rs`,
+`live_scope_count()` (scopes created minus scopes dropped — the same
+only-a-counter-can-see-it argument as the const pass's lowering counter,
+because the teardown is behaviour-neutral by construction). Four pins, each
+planted red before shipping:
+
+- `every_interpreter_scope_dies_with_its_const_run` (inference.rs) — a
+  three-site fixture covering every cycle shape §7.7 names: hoisted module
+  functions, a closure declared inside a called function's body, loop
+  iterations between them. Teardown planted out of `run_const`: **4 scopes
+  stranded** — exactly the predicted census, three site roots plus the one
+  call scope the closure cycles with.
+- `every_interpreter_scope_dies_with_its_macro_expansion` (inference.rs) — a
+  macro whose body is unique to the fixture (the expansion cache cannot serve
+  it unrun). Teardown planted out of `run_entry`: 1 scope, the world's root.
+- `a_const_function_evaluates_again_after_an_earlier_sites_scopes_were_cleared`
+  (inference.rs) — the behavioural half: a function two sites reach, one
+  declaring a closure in its body, correct at the LAST site after the first
+  site's teardown already ran, plus an untouched site between them. Planted
+  to a teardown that runs before the result extraction: red (the site cannot
+  read `__const_result` back).
+- `const_evaluations_in_use_bytes_plateau` (document.rs `leak_measurement`) —
+  §7.7's `mallinfo2` instrument, moved from the throwaway probe into the
+  harness proper: `heap_split_bytes()` reads `(uordblks, fordblks)`, every
+  window now records both deltas, and the soak's `LEAK` rows carry them as
+  `in_use_grown_b` / `free_retained_grown_b` (`null` off glibc). The pin runs
+  a const-heavy synthetic (five sites, closure-in-function, loops) for two
+  75-analysis windows and asserts the warm window's in-use growth under 2 KiB
+  per analysis — under nextest's process-per-test isolation only, because
+  `uordblks` is process-global: under `cargo test`'s in-process threads the
+  byte half is report-only (§1.1's reason RSS never gates) and the
+  thread-local scope counter carries the assertion. Measured at the shipped shape (debug): teardown in, **+240 /
+  +48 B in use per window** — under 4 B per analysis, allocator noise;
+  teardown planted out, **+8.4 KiB per analysis, flat to the half-percent
+  across both windows** — a leak's exact signature, beside an RSS column too
+  noisy to gate on. The 2 KiB cap sits 4× under the planted rate and two
+  orders over warm noise. The pin also reads `live_scope_count()` back to
+  zero on the measuring thread, so on a non-glibc host the mechanism half
+  still gates.
+
+The equivalence gate is untouched and rides the suite: the interpreter must
+agree with node on every in-subset corpus program (`tests/interpreter.rs`),
+and the macro suites hold expansion behaviour — teardown happens after a
+run's result exists, so there is nothing for either to see.
+
+#### The soak, re-run
+
+Same command as §5.1, same corpora (release; `next` at b52514f4 plus this
+change; 5,040 analyses, **1522 s**, exit 0 — the box was shared with other
+lanes' builds for part of the run, so the wall is context, not a measurement).
+`page.vl` has gained a line since §7.6 — 736 lines, 26,988 bytes per
+keystroke — so the gross columns moved with it: 975,068 B recorded *and
+reclaimed* per analysis, outstanding 0 B on every row, both windows
+byte-identical at every site on both drivers. Every assertion §7.6 added
+still holds, and every `LEAK` row now carries the two `mallinfo2` columns.
+
+**§7.7's table, with the after column** — in-use (`uordblks`) growth per
+analysis, window 1 / window 2 (§7.7's probe was inline-only; both its columns
+were windows of that driver):
+
+| corpus | driver | §7.7, before | **after** |
+|---|---|---:|---:|
+| `kolt/src/views.vl` | inline (1000 × 2) | +45.8 / +45.9 KiB | **+1.0 / +0.05 B** |
+| | per-thread (250 × 2) | | **+5.0 / +0.6 B** |
+| `vilan-website/src/page.vl` | inline (1000 × 2) | +1,523.9 / +1,523.5 KiB | **+0.3 / +0.1 B** |
+| | per-thread (250 × 2) | | **−4.7 / 0.0 B** |
+
+Free-retained stays noise around zero (−2.6 to +3.3 MiB per window), as it
+was in §7.7. And RSS, continuing §7.6's after column (KiB per analysis,
+w1 / w2): `views.vl` inline 49.4 / 43.7 → **0.9 / 0.3**, per-thread
+104.2 / 39.8 → **12.8 / 0.0**; `page.vl` inline 1,529.9 / 1,521.8 →
+**0.9 / 0.0**, per-thread 1,507.7 / 1,550.6 → **0.0 / 0.0** — the second
+window of every corpus-driver pair now grows zero or near-zero pages, which
+RSS had never done on `page.vl` under any prior fix.
+
+So §7's first sentence — *the language server's memory is bounded in the
+session* — now holds on the const-heavy file too: what a keystroke makes
+immortal is single-digit bytes, the allocator's own noise floor, and the
+1.5 MiB §7.6 could only attribute is gone at the mechanism. What remains
+open around session memory is §7.5's `parse_clean_cached` shape — a
+different mechanism, separately filed, reached only with a dependent open —
+and nothing else this soak can see.
