@@ -192,6 +192,13 @@ Breaking entry unconditionally.
 
 ## 5. The tier table (L3, 2026-08-20)
 
+> **§5.1's ruling DEFERRED 2026-08-20 (owner):** "Defer beta until the
+> beta switch is ready. The answers to those questions might change from
+> now until we officially enter beta." The table below stands as the
+> draft; re-present the questions with the switch's pre-work (§2's "At
+> the switch" list), not before. Interacts with L10 (std vs official
+> packages — the tier seam is that paper's input).
+
 > Status: PROPOSED — the L3 sweep's module-by-module table (§3.2's
 > "the module-by-module sweep is L3"). Owner rules; the docs page
 > lands at ratification, not before.
