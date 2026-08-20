@@ -23,6 +23,13 @@
 //! the `i64` direction — with the contextual words the grammars colour by
 //! position (`context`, `sync`, …) allowed explicitly and pinned to still lex
 //! as identifiers.
+//!
+//! Since `vilan.js` is already evaluated here, this file also pins its
+//! fence-tag shim: the harness tag (`browser`/`fragment`/`norun`) must survive
+//! into `data-vilan-tag` under both class forms mdBook renders (K14 — mdBook
+//! 0.5 splits ```` ```vilan,fragment ```` into `language-vilan fragment`,
+//! which the shim once read as bare `vilan`, putting run controls on
+//! fragments).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -531,6 +538,98 @@ fn the_attribute_markers_are_in_both_grammars() {
         "{HIGHLIGHT_THEME}'s attribute-marker list must be parsing.rs's KNOWN_ATTRIBUTE_MARKERS \
          (left is the theme, right is the parser)"
     );
+}
+
+// --- The fence-tag shim ------------------------------------------------------
+
+/// The class forms mdBook renders for a tagged fence, and the `data-vilan-tag`
+/// the shim in `vilan.js`'s first IIFE must stash before it normalizes the
+/// class away. mdBook 0.4 kept the fence's info string as one class token
+/// (`language-vilan,fragment`); the 0.5 line `docs.yml` pins splits it on the
+/// comma into separate classes (`language-vilan fragment`), which the shim
+/// used to capture as bare `vilan` — the K14 find: the lost `fragment` put run
+/// controls on three fences whose run could only fail. The tag vocabulary is
+/// docs.rs's (`browser`/`fragment`/`norun`), enumerated so a neighbouring
+/// class the harness never wrote (`hljs`, appended by mdBook's own first
+/// highlight pass) is not read as a tag.
+const FENCE_CLASS_FIXTURES: &[(&str, &str)] = &[
+    ("language-vilan", "vilan"),
+    // mdBook 0.5: the info string's comma becomes a space.
+    ("language-vilan fragment", "vilan,fragment"),
+    ("language-vilan browser", "vilan,browser"),
+    ("language-vilan norun", "vilan,norun"),
+    ("language-vilan browser norun", "vilan,browser,norun"),
+    // mdBook's bundled highlighter already ran: `hljs` sits beside the fence
+    // classes, before or after, and is no tag.
+    ("language-vilan fragment hljs", "vilan,fragment"),
+    ("hljs language-vilan fragment", "vilan,fragment"),
+    // mdBook 0.4: the whole info string is one class token.
+    ("language-vilan,fragment", "vilan,fragment"),
+    ("language-vilan,browser", "vilan,browser"),
+    ("language-vilan,norun", "vilan,norun"),
+];
+
+#[test]
+fn the_fence_tag_shim_reads_both_mdbook_class_forms() {
+    // The file is evaluated the way `highlight_grammar` evaluates it, but the
+    // stub `document` hands the shim's selector one fake block per fixture
+    // class; the script then reports what the shim left on each block. The
+    // fixtures travel as ONE probe joined on `;` — a fixture class may itself
+    // contain a comma, the helper's separator.
+    const SCRIPT: &str = r#"
+        const fs = require("fs");
+        const vm = require("vm");
+        const blocks = process.env.VILAN_PROBES.split(";").filter(Boolean).map((className) => ({
+            className,
+            dataset: {},
+            original: className,
+        }));
+        globalThis.hljs = {
+            registerLanguage() {},
+            highlightElement() {},
+        };
+        globalThis.document = {
+            querySelectorAll(selector) {
+                return selector.includes("language-vilan") ? blocks : [];
+            },
+        };
+        globalThis.window = {};
+        const file = process.env.VILAN_FILE;
+        vm.runInThisContext(fs.readFileSync(file, "utf8"), { filename: file });
+        for (const block of blocks) {
+            console.log(["tag", block.original, block.dataset.vilanTag || "", block.className].join("\t"));
+        }
+    "#;
+    let fixture_list = FENCE_CLASS_FIXTURES
+        .iter()
+        .map(|(class, _)| *class)
+        .collect::<Vec<_>>()
+        .join(";");
+    let lines = node(SCRIPT, &repo_root().join(HIGHLIGHT_THEME), &[&fixture_list]);
+    let mut reported = Vec::new();
+    for line in &lines {
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+        match fields.as_slice() {
+            ["tag", class, tag, normalized] => reported.push((*class, *tag, *normalized)),
+            _ => panic!("unexpected line from node: {line:?}"),
+        }
+    }
+    for (class, expected_tag) in FENCE_CLASS_FIXTURES {
+        let (_, tag, normalized) = reported
+            .iter()
+            .find(|(reported_class, _, _)| reported_class == class)
+            .unwrap_or_else(|| panic!("the shim reported nothing for class {class:?}"));
+        assert_eq!(
+            tag, expected_tag,
+            "{HIGHLIGHT_THEME}: a block with class {class:?} must carry data-vilan-tag \
+             {expected_tag:?} after the shim (the harness tag survives mdBook's class form)"
+        );
+        assert_eq!(
+            *normalized, "language-vilan",
+            "{HIGHLIGHT_THEME}: the shim must normalize class {class:?} to `language-vilan` \
+             for the highlighter"
+        );
+    }
 }
 
 // --- The extraction itself ---------------------------------------------------
