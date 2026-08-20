@@ -2525,3 +2525,89 @@ fallback (an index expression), and — `main.rs` — a member hover through
 the handler answering the house shape from the analyzed snapshot across a
 pending un-analyzed edit. All existing hover pins (`.contains`-based)
 passed unchanged; no shipped test was altered.
+
+### 19.3 E75 — the lowering records what it erases (2026-08-20)
+
+§19.2's residual, closed. The context pass (`context.rs::apply`) destroys
+source truth in exactly three shapes, and each gets its answer:
+
+1. **The two subject rewires** — a covered `get_safe` (the call record's
+   subject becomes a fresh `Local(Some)`, its arguments the hidden
+   parameter) and `Context::run` (the subject becomes the body closure) —
+   erase the only record naming the source callee.
+2. **The entity-record overwrites** — a plain `get` becomes
+   `Local(hidden)`, a none-rooted safe read `Local(None)`, a
+   `Context::new()` an opaque `Null` — erase the `Expr::Call(id)` entity
+   record, but the call record and its wired subject survive (§19.2
+   exploited this for hover; go-to-definition never did).
+3. **The minted hidden parameter** self-describes as
+   `Expr::Parameter(itself)` with no `parameters` record, no span, no
+   `expr_types` label — E73's crash armer, honest-`None`-by-cycle-guard
+   since, which is honesty by accident.
+
+**Decision: the small pass-side record, not the analyzed-vs-lowered
+split.** The split (the emitter takes its own lowered copy; analysis stays
+source-true) remains the deeper architecture, but it is disproportionate
+here: only the three shapes above erase anything, shape 2 is already
+reconstructible from surviving records, and the record for shapes 1 and 3
+is two maps. Filed as the escalation path if a future lowering multiplies
+erasure sites; not built today.
+
+Two new `Program` fields, filled only by `apply` (both pipelines run the
+pass, so no dual wiring is owed):
+
+- `context_erased_subjects: HashMap<Id, Id>` — rewired call id → the
+  subject entity the analyzer wired (`Local(get_safe_fn)` /
+  `Local(run_fn)`). The pass never deletes entities, so the erased subject
+  survives in `entity_map` and the id alone re-opens the whole chain:
+  signature, doc, declaration span.
+- `context_hidden_parameters: HashMap<Id, Id>` — minted parameter id →
+  the context binding whose value it threads.
+
+**The hidden parameter gets the MARKER, not real records** — because real
+records were found lying before they were written: a fabricated
+`parameters` entry would surface the hidden parameter as a tab stop in
+`call_parameter_names` (call-shaped completion) and in every other
+consumer keyed on `program.parameters` (signature rendering, semantic
+token classification). The parameter is not source; records would dress it
+as source. The marker keeps it invisible to enumeration while letting the
+chain walkers (`hover_label`, `definition_of`) answer an explicit, honest
+`None` on reaching it — by design, no longer by the accident of the
+self-loop meeting a cycle guard.
+
+**The resolvers read the record.** A shared `source_call_subject` answers
+a call's SOURCE subject — the erased original where recorded, the wired
+subject otherwise — and the three chain walkers (`hover_label`,
+`function_target`, `definition_of`) resolve every call → subject step
+through it. `definition_of` additionally gains the fallback
+`function_target` grew in §19.2: a call whose ENTITY record a lowering
+overwrote (shape 2 — the record is no longer `Expr::Call`) resolves
+through its surviving call record, so go-to-definition on a lowered plain
+`get`, an unprovided `get_safe`, or `Context::new()` lands on the std
+declaration instead of answering nothing (or, for the covered wrap,
+landing on `Some` in `option.vl` — the lowered view, traced through
+`definition_of`'s binding arm rather than observed live before the fix).
+
+**Pins** (document.rs, through `Document::analyze` + `hover` /
+`definition`): the covered `get_safe` (a `run`-closure read: hover answers
+the fenced `fun get_safe(self): Option<T>`, definition lands on
+`context.vl`'s `get_safe`, with the rewire asserted as the enabling
+precondition so the pin announces itself if the lowering changes);
+`Context::run` (hover answers `run`'s declaration, definition lands on
+it, same precondition); definition on the unprovided `get_safe` (shape 2,
+E73's fixture); and the marker itself (the minted parameter maps to its
+context binding; `hover_label` and `definition_of` answer `None` on it).
+E73's pins untouched and green — the minting convention did not change,
+only what stands beside it.
+
+**Shipped** (this lane, 2026-08-20): the two fields + fills
+(`analyzer.rs` `Program`, `context.rs::apply`), `source_call_subject` +
+the three walker changes + `definition_of`'s overwritten-call fallback
+(`document.rs`), six pins. Plant-proven three ways: the helper ignoring
+the record reddens the covered-`get_safe` and `run` pins; the
+`definition_of` fallback disabled reddens the unprovided-`get_safe` pin;
+the marker fill removed reddens the marker pin. Corpus byte-identical
+(the transformer reads neither field); no shipped test altered. One
+observed detail: `declaration_labels` renders `run` without its own
+`<U>` (`external fun run(self, value: T, body: || U): U`) — a label
+convention, not a §19.3 concern.

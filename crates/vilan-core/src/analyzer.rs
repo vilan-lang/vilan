@@ -31409,6 +31409,24 @@ pub struct Program<'src> {
     // ambient nursery in the spawn's scope, whether it is `Option`-wrapped).
     // The transformer passes the value as `__task`'s third argument.
     pub spawn_nursery_sources: HashMap<Id, (Id, bool)>,
+    /// What the context pass ERASED when it rewired a call record's subject
+    /// (editing-dx.md §19.3, backlog E75): rewired call id → the subject
+    /// entity the analyzer wired (`Local(get_safe_fn)` / `Local(run_fn)`).
+    /// Exactly two lowerings rewire the subject — a covered `get_safe`
+    /// becomes a `Some`-wrap of the hidden parameter, and `Context::run`
+    /// becomes a call of its body closure — destroying the only record that
+    /// names the SOURCE callee. The erased entity survives in `entity_map`,
+    /// so tooling resolves hover and go-to-definition through this map to
+    /// answer the source view.
+    pub context_erased_subjects: HashMap<Id, Id>,
+    /// The hidden context parameters the context pass minted (editing-dx.md
+    /// §19.3): parameter id → the context binding whose value it threads.
+    /// Deliberately a MARKER, not real records — a fabricated `parameters`
+    /// entry would surface the parameter in completion tab stops and every
+    /// other consumer keyed on `parameters`, dressing compiler plumbing as
+    /// source. Tooling checks membership here to answer an explicit, honest
+    /// "nothing" instead of relying on the self-loop cycle guard (E73).
+    pub context_hidden_parameters: HashMap<Id, Id>,
     // `external` std functions the transformer lowers to native JS or a runtime
     // helper (`str.trim()`, `scan()`, `random::range_i32(..)`, ...), keyed by fn id.
     // (The per-type `range_*` are forwarded to by the `Random` trait impls.)
@@ -36260,6 +36278,8 @@ fn analyze_over_world<'src>(
         nursery_fn_id,
         owned_nursery_enter_fn_id,
         spawn_nursery_sources: HashMap::default(),
+        context_erased_subjects: HashMap::default(),
+        context_hidden_parameters: HashMap::default(),
         bool_enum_id: analyzer.bool_enum_id,
         module_id_by_name: analyzer.module_id_by_name,
         modules: analyzer.modules,

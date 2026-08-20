@@ -1123,6 +1123,24 @@ fn span_of(program: &Program, id: Id) -> Option<Span> {
     program.span_map.get(&id).map(|span| **span)
 }
 
+/// The subject to resolve a call through: the SOURCE subject. Where the
+/// context lowering rewired the call record's subject — a covered
+/// `get_safe`'s `Some`-wrap, `Context::run`'s body-closure call — the
+/// erased original is read back from the pass's record (editing-dx.md
+/// §19.3); every other call answers its wired subject. The erased subject
+/// entity survives in `entity_map`, so a chain walk continues through it
+/// normally and lands on the declaration the source names.
+fn source_call_subject(program: &Program, call_id: Id) -> Option<Id> {
+    let call = program.function_calls.get(&call_id)?;
+    Some(
+        program
+            .context_erased_subjects
+            .get(&call_id)
+            .copied()
+            .unwrap_or(call.subject_id),
+    )
+}
+
 /// The markup spans of a raw parse (element-syntax S5): tag names (open and
 /// close), attribute and event names, and the desugar-scaffolding spans whose
 /// analyzed tokens the markup replaces.
@@ -2173,7 +2191,11 @@ impl Document {
                     return Some(*function_id);
                 }
                 Some(Expr::Call(call_id)) => {
-                    current = program.function_calls.get(call_id)?.subject_id;
+                    // Through the SOURCE subject: where the context pass
+                    // rewired the call record itself (a covered `get_safe`,
+                    // `Context::run`), the erased original is recorded and
+                    // still names the source callee (E75).
+                    current = source_call_subject(program, *call_id)?;
                     continue;
                 }
                 _ => {}
@@ -2184,8 +2206,8 @@ impl Document {
             // `Null` for `Context::new()` — but the call record and its wired
             // subject survive. Resolving through them is what lets the method
             // name hover as the declaration the source names.
-            if let Some(call) = program.function_calls.get(&current) {
-                current = call.subject_id;
+            if let Some(subject) = source_call_subject(program, current) {
+                current = subject;
                 continue;
             }
             return None;
@@ -2282,6 +2304,13 @@ impl Document {
         let mut seen: Vec<Id> = Vec::new();
         let mut current = id;
         loop {
+            // A hidden context parameter is compiler-minted and deliberately
+            // record-less — not source, so no label is the honest answer.
+            // Checked explicitly against the pass's marker (E75) rather than
+            // left to the self-loop happening to meet the cycle guard.
+            if program.context_hidden_parameters.contains_key(&current) {
+                return None;
+            }
             if let Some(label) = program.expr_types.get(&current) {
                 return Some(label.clone());
             }
@@ -2304,9 +2333,10 @@ impl Document {
                 }
                 // A constructor / call: hover the thing being called (e.g.
                 // `Ok(x)` shows the enum) when the call's own result type
-                // isn't recorded.
+                // isn't recorded — through the SOURCE subject where the
+                // context pass rewired the call record (E75).
                 Expr::Call(call_id) => {
-                    current = program.function_calls.get(call_id)?.subject_id;
+                    current = source_call_subject(program, *call_id)?;
                 }
                 _ => return None,
             }
@@ -2615,6 +2645,22 @@ impl Document {
                 return None;
             }
             seen.push(current);
+            // A hidden context parameter has no source declaration to land
+            // on — it is compiler-minted (E75). The explicit honest `None`.
+            if program.context_hidden_parameters.contains_key(&current) {
+                return None;
+            }
+            // A call whose ENTITY record the context pass overwrote (a plain
+            // `get` becomes a parameter read, a none-rooted safe read a
+            // `None` literal, `Context::new()` an opaque `Null`) still
+            // carries its call record, whose subject names the source
+            // callee — resolve through it, as `function_target` does (E75).
+            if program.function_calls.contains_key(&current)
+                && !matches!(program.entity_map.get(&current), Some(Expr::Call(_)))
+            {
+                current = source_call_subject(program, current)?;
+                continue;
+            }
             return match program.entity_map.get(&current)? {
                 Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
                     // Resolve to the name span of the thing the binding actually is —
@@ -2639,7 +2685,9 @@ impl Document {
                     Some((program.source_of(*enum_id)?, span_of(program, *enum_id)?))
                 }
                 Expr::Call(call_id) => {
-                    current = program.function_calls.get(call_id)?.subject_id;
+                    // The SOURCE subject: the erased original where the
+                    // context pass rewired the call record (E75).
+                    current = source_call_subject(program, *call_id)?;
                     continue;
                 }
                 Expr::Function(function_id) => Some((
@@ -6961,6 +7009,198 @@ pub(crate) mod tests {
         let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
             .expect("the index expression hovers");
         assert_eq!(hover, "```vilan\ni32\n```");
+    }
+
+    // --- E75: the context lowering records what it erases (editing-dx.md
+    // §19.3). The two lowerings that rewire `function_calls[call].subject_id`
+    // itself — a covered `get_safe` (the `Some`-wrap) and `Context::run` (the
+    // body closure becomes the subject) — record the erased original, and the
+    // resolvers answer the SOURCE view through it. --------------------------
+
+    /// A COVERED safe read: the `get_safe` sits in a `run` body, so its
+    /// holder carries the bare value and the pass rewires the call into
+    /// `Some(hidden)`.
+    const COVERED_CONTEXT_SOURCE: &str = "import std::context::Context;\n\nlet app_context = Context<i32>::new();\n\nfun main() {\n\tapp_context.run(7, || {\n\t\tapp_context.get_safe();\n\t});\n}\n";
+
+    #[test]
+    fn hover_on_a_covered_get_safe_shows_its_declaration() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        // The enabling shape, asserted so this pin announces itself if the
+        // lowering changes: the pass rewired the call record's subject away
+        // from the wired callee and recorded the erased original.
+        let call = program.function_calls.get(&id).expect("the call record");
+        let erased = program
+            .context_erased_subjects
+            .get(&id)
+            .expect("the pass records the subject it erases");
+        assert_ne!(
+            call.subject_id, *erased,
+            "the `Some`-wrap should have rewired the subject"
+        );
+        let hover = document
+            .hover(offset)
+            .expect("hovering the covered `get_safe` should answer");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(
+            hover.contains("fun get_safe(self): Option<T>"),
+            "the SOURCE callee's signature, not the lowered `Some`: {hover}"
+        );
+    }
+
+    #[test]
+    fn definition_on_a_covered_get_safe_lands_on_the_callee() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find("get_safe").unwrap() + 2;
+        let (source, span) = document
+            .definition(offset)
+            .expect("go-to-definition on the covered `get_safe` should answer");
+        let get_safe_fn = program
+            .context_get_safe_fn_id
+            .expect("std's context module loaded");
+        assert_eq!(
+            source,
+            program.source_of(get_safe_fn).expect("get_safe has a file"),
+            "the definition lives in std's context.vl"
+        );
+        let name_span = program
+            .external_functions
+            .get(&get_safe_fn)
+            .expect("`get_safe` is an external fn")
+            .name_span;
+        assert_eq!(span.into_range(), name_span.into_range());
+    }
+
+    #[test]
+    fn hover_on_context_run_shows_its_declaration() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find(".run(").unwrap() + 2;
+        let id = document.entity_at(offset).expect("an entity under `run`");
+        // The enabling shape: the body closure became the subject, the
+        // erased original is recorded.
+        let call = program.function_calls.get(&id).expect("the call record");
+        let erased = program
+            .context_erased_subjects
+            .get(&id)
+            .expect("the pass records the subject it erases");
+        assert_ne!(
+            call.subject_id, *erased,
+            "the `run` lowering should have rewired the subject"
+        );
+        let hover = document
+            .hover(offset)
+            .expect("hovering `run` should answer");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(
+            hover.contains("fun run(self, value: T, body: || U): U"),
+            "the SOURCE callee's signature, not the closure's type: {hover}"
+        );
+        assert!(
+            hover.contains("yields its body's value"),
+            "the declaration's doc rides along: {hover}"
+        );
+    }
+
+    #[test]
+    fn definition_on_context_run_lands_on_the_callee() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find(".run(").unwrap() + 2;
+        let (source, span) = document
+            .definition(offset)
+            .expect("go-to-definition on `run` should answer");
+        let run_fn = program
+            .context_run_fn_id
+            .expect("std's context module loaded");
+        assert_eq!(
+            source,
+            program.source_of(run_fn).expect("run has a file"),
+            "the definition lives in std's context.vl"
+        );
+        let name_span = program
+            .external_functions
+            .get(&run_fn)
+            .expect("`run` is an external fn")
+            .name_span;
+        assert_eq!(span.into_range(), name_span.into_range());
+    }
+
+    // The ENTITY-record overwrite (an unprovided `get_safe` lowers to a read
+    // of the hidden parameter): the call record survives with its wired
+    // subject, and `definition_of` now resolves through it — go-to-definition
+    // lands on the callee where it used to answer nothing.
+    #[test]
+    fn definition_on_an_unprovided_get_safe_lands_on_the_callee() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        // The enabling shape: the entity record is the lowered parameter
+        // read, not a call — the surviving call record is the only way back.
+        assert!(
+            matches!(program.entity_map.get(&id), Some(Expr::Local(_))),
+            "the lowering should have overwritten the entity record: {:?}",
+            program.entity_map.get(&id)
+        );
+        let (source, span) = document
+            .definition(offset)
+            .expect("go-to-definition on the lowered `get_safe` should answer");
+        let get_safe_fn = program
+            .context_get_safe_fn_id
+            .expect("std's context module loaded");
+        assert_eq!(
+            source,
+            program.source_of(get_safe_fn).expect("get_safe has a file")
+        );
+        let name_span = program
+            .external_functions
+            .get(&get_safe_fn)
+            .expect("`get_safe` is an external fn")
+            .name_span;
+        assert_eq!(span.into_range(), name_span.into_range());
+    }
+
+    // The minted hidden parameter carries the pass's marker — parameter id →
+    // the context binding it threads — and the chain walkers answer the
+    // explicit honest `None` on it (no label, no definition), by design
+    // rather than by the self-loop meeting the cycle guard.
+    #[test]
+    fn the_hidden_parameter_is_marked_and_answers_nothing() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        let Some(Expr::Local(hidden)) = program.entity_map.get(&id) else {
+            panic!(
+                "the lowered read should wire as a Local: {:?}",
+                program.entity_map.get(&id)
+            );
+        };
+        let app_context = program
+            .variables
+            .iter()
+            .find(|(_, variable)| variable.name == "app_context")
+            .map(|(id, _)| *id)
+            .expect("the context binding");
+        assert_eq!(
+            program.context_hidden_parameters.get(hidden),
+            Some(&app_context),
+            "the marker names the context the parameter threads"
+        );
+        assert_eq!(document.hover_label(program, *hidden), None);
+        assert_eq!(document.definition_of(program, *hidden), None);
     }
 
     // --- clamp_preview: the hover budget cuts at char boundaries ------------
