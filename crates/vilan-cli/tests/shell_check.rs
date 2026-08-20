@@ -367,6 +367,27 @@ fn a_renamed_mount_element_refuses_to_boot() {
 }
 
 #[test]
+fn the_refusal_header_names_the_file_and_the_leg() {
+    // The `fault_report` envelope's own words (diagnostics-ledger.md row 239's
+    // noted gap: every bullet was pinned, the header asserted nowhere). One
+    // broken shell, and the exact line `require_shell` panics with — the file
+    // FIRST, because a `ShellFault` is about markup and cannot know where the
+    // markup came from.
+    let staged = stage(
+        "header",
+        Client::Styled,
+        false,
+        &template_shell().replace("id=\"app\"", "id=\"root\""),
+    );
+    let boot = boot(&staged);
+    assert_refused(
+        &boot,
+        &["src/app.html does not match the `client` build:\n  - "],
+    );
+    cleanup(&staged);
+}
+
+#[test]
 fn a_module_script_over_a_splitting_leg_refuses_to_boot() {
     // F6 — latent in every shell in the tree, because no leg split until one
     // did. A split leg's chunk resolution reads `document.currentScript`, which

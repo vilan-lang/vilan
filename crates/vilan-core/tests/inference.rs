@@ -1624,6 +1624,30 @@ fn transparent_references_reject_view_into_value_binding() {
 }
 
 #[test]
+fn a_view_annotation_over_a_value_initializer_names_the_mismatch() {
+    // R1's view-annotated arm, textually (ledger row 18): the annotation
+    // promises a view and the initializer is a value.
+    assert_fails_with(
+        r#"
+        fun main() { mut a = 5; let v: &mut i32 = 9; }
+        "#,
+        "'v' is annotated as a view (`&[mut] T`) but its initializer is not a view; bind a `&[mut] place` to alias it.",
+    );
+}
+
+#[test]
+fn a_value_annotation_over_a_view_initializer_names_the_mismatch() {
+    // R1's value-annotated arm, textually (ledger row 18) — the textual twin
+    // of transparent_references_reject_view_into_value_binding above.
+    assert_fails_with(
+        r#"
+        fun main() { mut a = 5; let v: &mut i32 = &mut a; let b: i32 = v; }
+        "#,
+        "'b' is annotated as a value but its initializer is a view; write `*` to copy the value out, or annotate `&[mut] T` to alias it.",
+    );
+}
+
+#[test]
 fn an_inline_option_view_transient_writes_through() {
     // C5.2: constructing an `Option<&mut T>` inline and immediately matching it —
     // the transient the spec's open question sanctioned. The `Some(&mut a)` never
@@ -16031,6 +16055,113 @@ main();
     );
 }
 
+// Receiver shape: `get` threads by binding identity, so a context that
+// arrives as a call result has no name to thread by (ledger row 215).
+#[test]
+fn a_get_on_an_unnamed_context_receiver_is_rejected() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun pick(): Context<i32> {
+    current
+}
+
+fun main() {
+    let value = pick().get();
+}
+main();
+        "#,
+        "`get` must be called on a context bound to a name",
+    );
+}
+
+// Receiver shape, `run`'s short arm (ledger row 216): no named context could
+// be extracted at all. The message is a strict prefix of the closure-value
+// arm's (row 217), so the pin also asserts the continuation is ABSENT —
+// otherwise it could pass on the wrong arm.
+#[test]
+fn a_run_on_an_unnamed_context_receiver_is_rejected() {
+    let diagnostics = failure_diagnostics(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun pick(): Context<i32> {
+    current
+}
+
+fun main() {
+    pick().run(1, || {});
+}
+main();
+        "#,
+    );
+    assert!(
+        diagnostics.iter().any(|(message, _)| {
+            message.contains("`run` must be called on a named context with a closure literal body")
+                && !message.contains("or a closure value")
+        }),
+        "expected the short run-shape arm (no trailing closure-value alternative); got: {diagnostics:#?}"
+    );
+}
+
+// A clause-typed `let` binding is a NAMED injected closure: its initializer
+// must be a closure literal or a same-clause value — a call result is an
+// escape the threading cannot follow (ledger row 219).
+#[test]
+fn a_context_typed_binding_with_a_non_literal_initializer_is_rejected() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun make(): || void {
+    || {}
+}
+
+fun main() {
+    let handler: (|| void) context current = make();
+    handler();
+}
+main();
+        "#,
+        "a `context`-typed binding takes a closure literal, or a value with the same `context` clause",
+    );
+}
+
+// A clause parameter's argument must be a closure literal, a same-clause
+// value, or an adoptable local closure binding — anything else (here a call
+// result) cannot receive the threaded context (ledger row 220).
+#[test]
+fn a_context_typed_parameter_with_a_non_closure_argument_is_rejected() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun make(): || void {
+    || {}
+}
+
+fun call_it(body: (|| void) context current) {
+    body();
+}
+
+fun main() {
+    call_it(make());
+}
+main();
+        "#,
+        "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)",
+    );
+}
+
 // Clause placement: closure types only.
 #[test]
 fn a_clause_on_a_non_closure_type_errors() {
@@ -19435,6 +19566,23 @@ fn insufficient_indentation_is_an_error_naming_the_line() {
         "#,
         "              shallow",
         "line 2 of the triple-quoted string is not indented",
+    );
+}
+
+#[test]
+fn a_single_line_triple_quoted_string_is_rejected() {
+    // The layout's first rule (ledger row 23's remaining arm): the opening
+    // """ must be followed by a newline — a one-line `"""…"""` has no
+    // content line to lay out.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let x = """oops""";
+        }
+        main();
+        "#,
+        "oops",
+        "must be followed by a newline",
     );
 }
 
@@ -29059,6 +29207,26 @@ fn a_bare_module_name_is_not_a_value() {
         }
         "#,
         "`math` is a module, not a value",
+    );
+}
+
+#[test]
+fn a_bare_macro_name_is_not_a_value() {
+    // The family's macro arm (ledger row 120): a macro's name resolves, but
+    // it is dispatch machinery, not a runtime value.
+    assert_fails_with(
+        r#"
+        macro fun tagger(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source };
+            source("")
+        }
+
+        fun main() {
+            let q = tagger;
+        }
+        "#,
+        "`tagger` is a macro, not a value",
     );
 }
 
