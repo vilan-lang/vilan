@@ -5,8 +5,9 @@
 //    types, suffixed numbers, strings and i-strings, attributes, comments;
 //    lexer-true highlighting is the recorded v2).
 // 2. The fence-tag shim: docs fences carry harness tags the highlighter
-//    doesn't know (```vilan,browser → class "language-vilan,browser").
-//    Normalize those to plain vilan, then highlight. `text` fences (the
+//    doesn't know (```vilan,browser → class "language-vilan browser" under
+//    mdBook 0.5, "language-vilan,browser" under 0.4). Normalize those to
+//    plain vilan, then highlight. `text` fences (the
 //    ASCII diagrams) and `fragment`-tagged blocks highlight as vilan too —
 //    fragments are still vilan syntax, just not compilable standalone.
 (function () {
@@ -132,11 +133,17 @@
 	// entry point is highlightBlock; prefer highlightElement when a newer
 	// bundle provides it.) The harness tag is stashed on the element first:
 	// normalizing destroys it, and the playground-link pass below reads it.
+	// mdBook 0.4 rendered ```vilan,fragment as the single class token
+	// `language-vilan,fragment`; 0.5 splits the info string on the comma into
+	// separate classes, `language-vilan fragment`. Capture the harness tags in
+	// either form — only the harness's own tags (docs.rs's vocabulary), so a
+	// neighbouring class like `hljs` is never mistaken for one — and stash them
+	// in the comma form the controls pass below reads.
 	var highlight = hljs.highlightElement || hljs.highlightBlock;
 	document.querySelectorAll("code[class*='language-vilan']").forEach(function (block) {
-		var tagged = block.className.match(/language-(vilan[^\s]*)/);
+		var tagged = block.className.match(/language-(vilan(?:[\s,]+(?:browser|fragment|norun))*)/);
 		if (tagged) {
-			block.dataset.vilanTag = tagged[1];
+			block.dataset.vilanTag = tagged[1].replace(/[\s,]+/g, ",");
 		}
 		block.className = "language-vilan";
 		highlight.call(hljs, block);

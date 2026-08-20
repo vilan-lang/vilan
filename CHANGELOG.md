@@ -17,6 +17,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**Fragment examples in the book no longer offer a Run that must fail.** The book's fence-tag shim reads the harness tag (`browser`/`fragment`/`norun`) out of a fence's class before highlighting, but it only knew the one-token form mdBook 0.4 wrote (`language-vilan,fragment`); mdBook 0.5 — what builds the book — splits the fence's info string into separate classes (`language-vilan fragment`), so every tag was silently lost. The visible consequence: the three `fragment` fences that contain a `fun main` — the walkthrough guide's server and client entries, and the collections reference's deliberately non-compiling iteration example — read as complete programs and carried the ▶ playground link and a Run button whose run could only fail. The shim now reads the tag in either class form (and only the harness's own tags, so a neighbouring class like `hljs` is never mistaken for one), those three fences carry no controls, and the extraction is pinned in the suite beside the grammar-drift gates — the shim is the same family of drift site, a grammar-adjacent list nothing gated. Re-swept in headless Chrome against the staged book and the published playground: every tag on all 319 fences survives, and the fences that should carry run controls are exactly the ones that do.
+
+---
+
 <!-- family: breaking -->
 **`std::http`'s `build_handler` is removed.** It was `serve_build`'s fold as a plain `|Request| Response` — the same reads, the same routes, the same dev-mode freshness — packaged for a boot function that builds its own `Server` and hands you only a fallback, and it shipped with the full-stack sweep as a stopgap: `serve_service` handed over no builder to install `serve_build` on, and the two examples the book teaches from were still on `serve_service`. Both moved onto the builder, and nothing has called it since.
 

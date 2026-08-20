@@ -937,3 +937,42 @@ button is undiscoverable until the pointer is on the fence; a standing Run
 is k6-book's visual call. The white result canvas in the navy theme is the
 playground's look today; a themed canvas needs a `color-scheme`/token story
 inside the program's frame and is not this slice's.
+
+**K14 closed (2026-08-20, lane k14-fence-tags).** The shim reads the tag
+in either class form now: the match (`theme/vilan.js:144`) is
+`/language-(vilan(?:[\s,]+(?:browser|fragment|norun))*)/`, its capture
+normalized to the comma form the controls pass reads (`[\s,]+` → `,`), so
+mdBook 0.5's space-separated classes and 0.4's one-token form both land in
+`data-vilan-tag` — and only the harness's own tags are captured, so the
+`hljs` class mdBook's first highlight pass leaves beside them is never
+read as one. Pinned where the theme is already evaluated:
+`crates/vilan-cli/tests/grammar_sync.rs` gained
+`the_fence_tag_shim_reads_both_mdbook_class_forms`, which runs the file
+under the stub `hljs` with a fake block per class fixture (both mdBook
+forms, tag combinations, `hljs` on either side) and holds `data-vilan-tag`
+to the comma form and the block's class to plain `language-vilan`; proven
+non-vacuous by planting the old regex (red on `language-vilan fragment`,
+restored).
+
+Re-swept per this section's recipe (the staged book beside a copy of the
+published playground, headless Chrome 151 over CDP, every Run on every
+page clicked at once): all 319 fences carry their tag — 110 `vilan`, 21
+`vilan,browser`, 164 `vilan,fragment`, 24 `vilan,norun`, the source census
+exactly — the three `fun main` fragments (guide/walkthrough.md ×2,
+std/collections.md ×1) carry no controls any more, and 155 fences do. Not
+§0's 153, because the book moved after the K7 sweep: A25 S3 (dbcefdd7)
+added a browser fence to the services guide and E64 (1aba62d7) a norun
+fence to it, 153 + 2. Of the 155: **138 ran, 16 checked** (exactly the 16
+`&mode=node` links; ▶ links 155/155), 0 crashed, 0 unavailable — and
+**one failed, a find, not this lane's defect**: the services guide's new
+A25 fence (`client.entries.or([])`, browser-tagged) teaches an unreleased
+API against the published v0.34.0 wasm, so its in-page Run reports a real
+diagnostic until the v0.35.0 cut moves book and playground together.
+§2.4's agree-by-construction holds only for a book built from the
+released compiler; a HEAD book staged beside the released playground
+skews for exactly the span between a doc change and its cut — the same
+skew was invisible pre-fix only because that fence still ran (and failed)
+as a browser program either way: PROCESS_HINT does not match it, and no
+browser-tagged fence in today's book matches PROCESS_HINT (checked across
+all 319), so honoring the `browser` tag flips no fence between Check and
+Run, and the three fragments are the fix's entire behavioral delta.
