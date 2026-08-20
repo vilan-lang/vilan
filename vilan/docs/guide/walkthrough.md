@@ -251,7 +251,7 @@ the screen reads it where it is shown —
 
 ```vilan,fragment
 fun screen(client: NotesClient<SocketTransport>, token: Signal<str>, route: Signal<Route>): View {
-	let notes: Signal<List<Note>> = client.notes.or([]);
+	let notes = client.notes.or([]);
 	…
 }
 ```

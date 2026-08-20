@@ -67,9 +67,9 @@ correct — the channel was never opened.
 
 The `Signal<T>` that `or`/`map` return is a local derivative: writing it
 writes nothing back (the server owns the source) and the next update
-overwrites it. With an empty-list `initial`, annotate the binding
-(`let notes: Signal<List<Note>> = client.notes.or([]);`) — a bare `[]`
-does not carry its element type through `or`.
+overwrites it. An empty-list `initial` needs no annotation — the `[]`
+takes its element type from the mirror
+(`let notes = client.notes.or([]);` is a `Signal<List<Note>>`).
 
 ## Errors
 

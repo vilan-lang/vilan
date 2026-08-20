@@ -1000,3 +1000,92 @@ arm (after the acting connection's block, before the arm closes):
  		Err(let error) => print(i"observer connect failed: {error.debug()}"),
  	}
 ```
+
+## 9. B129: the empty `[]` takes its element type from where it lands (2026-08-20)
+
+§8's find, closed on lane `b129-empty-list`. The owner's 2026-08-19 report
+had the mechanism right: reconciliation between the receiver's known
+`RemoteSource<List<Note>>` and the un-annotated `[]` argument — the
+expected type never flowed into the empty literal. Traced, it is two
+steps, and the second is why the hover read `Signal<List<unknown>>`
+rather than merely erroring at first use:
+
+1. An empty list literal mints a stable element inference slot
+   (`list_element_slots`, B16's channel for `push`-grounding) and
+   **returned it ignoring its constraint** — `infer_type`'s `Expr::List`
+   empty arm consulted the expectation only for the fixed-array
+   elaboration. So `or(initial: T)`'s argument check, which DOES pass the
+   substituted `List<Note>` down as the constraint, arrived at a literal
+   that discarded it.
+2. The own-generics binding pass (`bind_callee_own_generics`) then
+   reconciled the parameter `T` against the argument's `List<unknown>`,
+   and `reconcile_type`'s generic arm pushes the RAW argument side as the
+   binding even when `T` is already bound — so the receiver-known
+   `T = List<Note>` was **re-bound to `List<unknown>`**, which is the
+   reported hover. (The comment on `callee_bindable_generics` — "an
+   already-bound id reconciles to itself and re-inserts harmlessly" —
+   was true for every argument except an empty literal.)
+
+**The propagation rule, as shipped** (analyzer.rs, the `Expr::List` empty
+arm): an empty `[]` whose expectation is `List<E>` grounds its element
+slot to `E` at the moment the expectation reaches it, iff (a) the slot is
+still unfilled — `Unknown`; a slot an earlier grounding filled is checked
+by the argument check, never overwritten — and (b) `E`, read through the
+active substitution, is **fully determined**: no `Unknown`, `Unresolved`,
+or residual `Generic` anywhere in its structure (`type_is_fully_determined`;
+a slot write is permanent, so a mid-inference or abstract element must
+keep deferring — grounding to an abstract `T` would also entangle one
+literal's slot across a generic function's instantiations). Expectations
+reach the literal wherever `infer_type` carries a constraint: the two
+call-argument passes (own-generics binding and the deferred
+`MethodArgCheck`, both of which substitute the parameter type first), an
+annotated `let`, and a match leg in a return position (`expected_types`
+flows into leg bodies). With no determined expectation anywhere the slot
+stays `Unknown` and the standing diagnostics are unchanged — both
+negative shapes are pinned.
+
+Non-empty literals are untouched: directing their elements by the
+expectation is the inference-shifting move the empty arm's neighboring
+comment warns against, and an empty literal has no elements to shift —
+its slot was simply never going to fill without a `push`.
+
+**Pins** (`crates/vilan-core/tests/inference.rs`): the §8 pin
+`a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation`
+un-ignored (see the split below); new —
+`b129_unwrap_or_of_an_empty_list_takes_the_element_from_the_receiver`
+(planted red with the grounding disabled, as was the A25 pin),
+`b129_a_none_arm_empty_list_takes_the_type_from_the_sibling_arm` and
+`b129_a_match_of_only_empty_lists_takes_the_declared_return_type` (guard
+pins — leg unification and the declared return carry both shapes even
+without the grounding; planted, they stay green),
+`b129_an_empty_list_with_no_expected_type_still_errors` and
+`b129_an_empty_list_argument_binding_a_free_generic_still_errors` (the
+negatives, today's messages verbatim). There is no empty-map analog to
+pin: the language has no map literal, and both `Map::new()` and
+`List::new()` as `unwrap_or` arguments already take their type from the
+expectation (probed).
+
+**The find: §8's pin was two gaps stacked, and the second is not this
+one.** The pin's original body consumed the mirror through a second
+`items.map(|list| ..)`, and that shape still fails **with a non-empty
+initial and no `[]` anywhere in the program** — `let items =
+Signal::new([Todo{..}]); items.map(|list| ..)` reproduces it with no rpc
+at all, on v0.34.0 as installed. A `.map` on a let-bound signal types its
+closure parameter before the receiver's binding lands (the closure arm's
+own P21 comment names the family: the binding is read one level out,
+after the closure is already inferred — B125, editing-dx.md §16;
+inlining the chain works, only the intermediate un-annotated `let` trips
+it). NOT chased here per the standing verdict that unblocking it is a
+solver-ordering design; isolated instead as the `#[ignore]`d
+`b129_a_map_on_a_let_bound_signal_types_its_closure_parameter`, and the
+A25 pin's body now consumes through `get()` so it pins exactly its title.
+
+**The §4.3 consumers, re-swept.** The annotation came off
+`docs/guide/services.md` ("Reading a mirror" — `bind_each` on the
+un-annotated binding compiles), `docs/guide/walkthrough.md`'s screen
+fragment, and `examples/walkthrough/src/views.vl` (the binding feeds an
+annotated parameter); `docs/std/rpc.md` now says the annotation is not
+needed. `examples/todo/src/todos.vl` KEEPS its one annotation — its
+`items.map(..)` is exactly the stacked second gap above — with a comment
+naming the true remaining reason. When B125's family closes, that
+annotation and the ignored pin fall together.
