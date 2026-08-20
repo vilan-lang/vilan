@@ -2125,19 +2125,32 @@ impl Document {
                 || program.external_functions.contains_key(id)
                 || self.platform_requirements.contains_key(id)
         };
-        if carries_requirement(&id) {
-            return Some(id);
-        }
-        match program.entity_map.get(&id)? {
-            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
-                carries_requirement(binding).then_some(*binding)
+        // Iterative through the call → subject chain, with a seen-list: the
+        // chain is `entity_map`/`function_calls` data, which a lowering can
+        // (and E73 showed does) rewire into shapes the analyzer never emits —
+        // a cycle here must answer `None`, not recurse off the stack.
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = id;
+        loop {
+            if carries_requirement(&current) {
+                return Some(current);
             }
-            Expr::Function(function_id) | Expr::ExternalFunction(function_id) => Some(*function_id),
-            Expr::Call(call_id) => {
-                let subject = program.function_calls.get(call_id)?.subject_id;
-                self.function_target(program, subject)
+            if seen.contains(&current) {
+                return None;
             }
-            _ => None,
+            seen.push(current);
+            match program.entity_map.get(&current)? {
+                Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
+                    return carries_requirement(binding).then_some(*binding);
+                }
+                Expr::Function(function_id) | Expr::ExternalFunction(function_id) => {
+                    return Some(*function_id);
+                }
+                Expr::Call(call_id) => {
+                    current = program.function_calls.get(call_id)?.subject_id;
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -2221,28 +2234,44 @@ impl Document {
     }
 
     fn hover_label(&self, program: &Program, id: Id) -> Option<String> {
-        if let Some(label) = program.expr_types.get(&id) {
-            return Some(label.clone());
-        }
-        // A bare use carries no type on its own id; resolve through its binding
-        // (and through that binding's own kind, e.g. an imported enum variant).
-        match program.entity_map.get(&id)? {
-            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => program
-                .expr_types
-                .get(binding)
-                .cloned()
-                .or_else(|| self.hover_label(program, *binding)),
-            Expr::EnumVariant(enum_id, _) => program
-                .enums
-                .get(enum_id)
-                .map(|e| format!("enum {}", e.name)),
-            // A constructor / call: hover the thing being called (e.g. `Ok(x)`
-            // shows the enum) when the call's own result type isn't recorded.
-            Expr::Call(call_id) => {
-                let subject = program.function_calls.get(call_id)?.subject_id;
-                self.hover_label(program, subject)
+        // The id → binding chain is data (`entity_map`), and a binding that
+        // never got a type can sit on a self-loop — the context-threading
+        // pass's hidden parameters self-describe as `Expr::Parameter(itself)`
+        // with no `expr_types` entry — or, in principle, a longer cycle. The
+        // walk carries a seen-list and answers an honest `None` when the
+        // chain closes on itself, instead of recursing off the stack (E73:
+        // the recursive form crashed the whole server on such a hover).
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = id;
+        loop {
+            if let Some(label) = program.expr_types.get(&current) {
+                return Some(label.clone());
             }
-            _ => None,
+            if seen.contains(&current) {
+                return None;
+            }
+            seen.push(current);
+            // A bare use carries no type on its own id; resolve through its
+            // binding (and through that binding's own kind, e.g. an imported
+            // enum variant).
+            match program.entity_map.get(&current)? {
+                Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
+                    current = *binding;
+                }
+                Expr::EnumVariant(enum_id, _) => {
+                    return program
+                        .enums
+                        .get(enum_id)
+                        .map(|e| format!("enum {}", e.name));
+                }
+                // A constructor / call: hover the thing being called (e.g.
+                // `Ok(x)` shows the enum) when the call's own result type
+                // isn't recorded.
+                Expr::Call(call_id) => {
+                    current = program.function_calls.get(call_id)?.subject_id;
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -2537,61 +2566,73 @@ impl Document {
     }
 
     fn definition_of(&self, program: &Program, id: Id) -> Option<(SourceId, Span)> {
-        match program.entity_map.get(&id)? {
-            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
-                // Resolve to the name span of the thing the binding actually is —
-                // a function, a `let`/`mut` variable, or (parameters/generics,
-                // whose `span_map` entry is already the name) the span itself.
-                if let Some(function) = program.functions.get(binding) {
-                    return Some((program.source_of(*binding)?, function.name_span));
+        // The call → subject chain is walked iteratively with a seen-list —
+        // the same guard as `hover_label` and `function_target` (E73): the
+        // chain is data a lowering can rewire, and a cycle must answer `None`
+        // rather than recurse off the stack.
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = id;
+        loop {
+            if seen.contains(&current) {
+                return None;
+            }
+            seen.push(current);
+            return match program.entity_map.get(&current)? {
+                Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
+                    // Resolve to the name span of the thing the binding actually is —
+                    // a function, a `let`/`mut` variable, or (parameters/generics,
+                    // whose `span_map` entry is already the name) the span itself.
+                    if let Some(function) = program.functions.get(binding) {
+                        return Some((program.source_of(*binding)?, function.name_span));
+                    }
+                    if let Some(function) = program.external_functions.get(binding) {
+                        return Some((program.source_of(*binding)?, function.name_span));
+                    }
+                    if let Some(variable) = program.variables.get(binding) {
+                        return Some((program.source_of(*binding)?, variable.name_span));
+                    }
+                    Some((program.source_of(*binding)?, span_of(program, *binding)?))
                 }
-                if let Some(function) = program.external_functions.get(binding) {
-                    return Some((program.source_of(*binding)?, function.name_span));
+                Expr::Field(_, struct_id, index) => {
+                    let field = program.structs.get(struct_id)?.fields.get(*index)?;
+                    Some((program.source_of(*struct_id)?, field.name_span))
                 }
-                if let Some(variable) = program.variables.get(binding) {
-                    return Some((program.source_of(*binding)?, variable.name_span));
+                Expr::EnumVariant(enum_id, _) => {
+                    Some((program.source_of(*enum_id)?, span_of(program, *enum_id)?))
                 }
-                Some((program.source_of(*binding)?, span_of(program, *binding)?))
-            }
-            Expr::Field(_, struct_id, index) => {
-                let field = program.structs.get(struct_id)?.fields.get(*index)?;
-                Some((program.source_of(*struct_id)?, field.name_span))
-            }
-            Expr::EnumVariant(enum_id, _) => {
-                Some((program.source_of(*enum_id)?, span_of(program, *enum_id)?))
-            }
-            Expr::Call(call_id) => {
-                let subject = program.function_calls.get(call_id)?.subject_id;
-                self.definition_of(program, subject)
-            }
-            Expr::Function(function_id) => Some((
-                program.source_of(*function_id)?,
-                program.functions.get(function_id)?.name_span,
-            )),
-            Expr::ExternalFunction(function_id) => Some((
-                program.source_of(*function_id)?,
-                program.external_functions.get(function_id)?.name_span,
-            )),
-            Expr::Struct(struct_id) => Some((
-                program.source_of(*struct_id)?,
-                program.structs.get(struct_id)?.name_span,
-            )),
-            Expr::StructInitializer(initializer_id, _) => {
-                let struct_id = program.struct_initializer_to_def.get(initializer_id)?;
-                Some((
+                Expr::Call(call_id) => {
+                    current = program.function_calls.get(call_id)?.subject_id;
+                    continue;
+                }
+                Expr::Function(function_id) => Some((
+                    program.source_of(*function_id)?,
+                    program.functions.get(function_id)?.name_span,
+                )),
+                Expr::ExternalFunction(function_id) => Some((
+                    program.source_of(*function_id)?,
+                    program.external_functions.get(function_id)?.name_span,
+                )),
+                Expr::Struct(struct_id) => Some((
                     program.source_of(*struct_id)?,
                     program.structs.get(struct_id)?.name_span,
-                ))
-            }
-            Expr::Enum(enum_id) => Some((
-                program.source_of(*enum_id)?,
-                program.enums.get(enum_id)?.name_span,
-            )),
-            Expr::Trait(trait_id) => Some((
-                program.source_of(*trait_id)?,
-                program.traits.get(trait_id)?.name_span,
-            )),
-            _ => None,
+                )),
+                Expr::StructInitializer(initializer_id, _) => {
+                    let struct_id = program.struct_initializer_to_def.get(initializer_id)?;
+                    Some((
+                        program.source_of(*struct_id)?,
+                        program.structs.get(struct_id)?.name_span,
+                    ))
+                }
+                Expr::Enum(enum_id) => Some((
+                    program.source_of(*enum_id)?,
+                    program.enums.get(enum_id)?.name_span,
+                )),
+                Expr::Trait(trait_id) => Some((
+                    program.source_of(*trait_id)?,
+                    program.traits.get(trait_id)?.name_span,
+                )),
+                _ => None,
+            };
         }
     }
 
@@ -6701,6 +6742,137 @@ pub(crate) mod tests {
         );
         let hover = hover_at_cursor(&source).expect("hover on the constant");
         assert!(hover.contains('…'), "the preview is clamped: {hover}");
+    }
+
+    // --- E73: the hover chain guard (editing-dx.md §19) ---------------------
+    //
+    // The context-threading pass (vilan-core `context.rs`, `apply`) lowers an
+    // unprovided `get_safe()` read to a plain read of a pass-minted hidden
+    // parameter: `entity_map[call] = Local(hidden)`, where `hidden`'s own
+    // entry is the self-describing `Parameter(hidden)` — a SELF-LOOP — with
+    // no `expr_types` entry and no `parameters` record. `hover_label`
+    // resolved id → binding recursively with no cycle guard, so hovering
+    // `get_safe` overflowed the server's stack: SIGABRT, five restarts, and
+    // the client stops restarting it (the owner's live crash, 2026-08-19).
+
+    /// The owner's crash shape, distilled: a module-level `Context<T>`
+    /// binding with no provider, `get_safe()` on it in a function nothing
+    /// calls.
+    const LOWERED_GET_SAFE_SOURCE: &str = "import std::context::Context;\n\nlet app_context = Context<i32>::new();\n\nfun probe() {\n\tapp_context.get_safe();\n}\n";
+
+    #[test]
+    fn hover_on_a_lowered_context_read_returns() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        // The enabling shape, asserted so this pin says so if the lowering
+        // ever stops minting it: the read resolves to a binding whose own
+        // entity record is a self-loop with no type.
+        let Some(Expr::Local(binding)) = program.entity_map.get(&id) else {
+            panic!(
+                "the lowered read should wire as a Local: {:?}",
+                program.entity_map.get(&id)
+            );
+        };
+        assert!(
+            matches!(program.entity_map.get(binding), Some(Expr::Parameter(parameter)) if parameter == binding),
+            "the hidden parameter should self-loop: {:?}",
+            program.entity_map.get(binding)
+        );
+        assert!(
+            program.expr_types.get(binding).is_none(),
+            "and carry no type"
+        );
+        // The pin is the RETURN: this call used to recurse to a stack
+        // overflow and abort the whole server.
+        let _ = document.hover(offset);
+    }
+
+    /// A guard on the general shape, not just the self-loop the lowering
+    /// mints today: a two-node `entity_map` cycle (constructed directly — no
+    /// analyzed program is known to wire one) answers the honest `None`.
+    #[test]
+    fn hover_label_answers_none_on_an_entity_cycle() {
+        let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
+        let program = document
+            .program
+            .program
+            .as_mut()
+            .expect("the program analyzes");
+        let first = Id(program.next_entity_id);
+        let second = Id(program.next_entity_id + 1);
+        program.entity_map.insert(first, Expr::Local(second));
+        program.entity_map.insert(second, Expr::Local(first));
+        let program = document.program.as_ref().unwrap();
+        assert_eq!(document.hover_label(program, first), None);
+        assert_eq!(document.hover_label(program, second), None);
+    }
+
+    /// The same through the call → subject arm: a call whose subject chains
+    /// back to the call itself (again constructed — the shape a rewiring
+    /// lowering could produce) answers `None` from every resolver that walks
+    /// it.
+    #[test]
+    fn resolvers_answer_none_on_a_call_cycle() {
+        let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
+        let program = document
+            .program
+            .program
+            .as_mut()
+            .expect("the program analyzes");
+        let call = Id(program.next_entity_id);
+        program.entity_map.insert(call, Expr::Call(call));
+        program.function_calls.insert(
+            call,
+            vilan_core::analyzer::FunctionCall {
+                id: call,
+                subject_id: call,
+                generic_argument_ids: Vec::new(),
+                argument_ids: Vec::new(),
+                arguments_span: vilan_core::span::Span::new((), 0..0),
+            },
+        );
+        let program = document.program.as_ref().unwrap();
+        assert_eq!(document.hover_label(program, call), None);
+        assert_eq!(document.function_target(program, call), None);
+        assert_eq!(document.definition_of(program, call), None);
+    }
+
+    /// A chain that ends on a record-less id (no type, no entity entry)
+    /// answers `None` — not a panic, not a made-up label.
+    #[test]
+    fn hover_label_answers_none_when_the_chain_yields_no_type() {
+        let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
+        let program = document
+            .program
+            .program
+            .as_mut()
+            .expect("the program analyzes");
+        let first = Id(program.next_entity_id);
+        let second = Id(program.next_entity_id + 1);
+        program.entity_map.insert(first, Expr::Local(second));
+        let program = document.program.as_ref().unwrap();
+        assert_eq!(document.hover_label(program, first), None);
+    }
+
+    /// The guard must not cut the legitimate chain: a use site still resolves
+    /// through its binding to the binding's type.
+    #[test]
+    fn hover_label_still_resolves_a_use_through_its_binding() {
+        let text = "fun main() {\n\tlet width = 3;\n\tlet doubled = width * 2;\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = text.rfind("width").unwrap() + 1;
+        let id = document.entity_at(offset).expect("the use entity");
+        assert!(
+            program.expr_types.get(&id).is_none(),
+            "the use must carry no type of its own, or this pins nothing"
+        );
+        assert_eq!(document.hover_label(program, id).as_deref(), Some("i32"));
     }
 
     // --- clamp_preview: the hover budget cuts at char boundaries ------------
