@@ -5,15 +5,19 @@
  * place in the book that names a color. Everything else — `vilan.css`, the
  * hljs mapping, the masthead fallback — says `var(--role)` and nothing more.
  *
- * Where the hexes live: the dark values are copied from the website's
- * `src/theme.vl` (the role tokens, `theme.vl:70-106`, and `code_palette`,
- * `theme.vl:185-206`, as of vilan-website@6e549d2 — last touched at
- * 8c98bbc); the light values are `design-language.md` §2.5, which derives
- * every one of them from the dark ladder and states the contrast. This
- * file is a MANUAL MIRROR of those two sources: when theme.vl or §2.5
- * moves, this file moves with it, by hand, until K10's generation
- * ("one token source, generated outward", design-language.md §2.4)
- * writes it from theme.vl at build time.
+ * Where the hexes live: the one source is the website's `src/theme.vl`
+ * (its `themed_values` table — the dark column is the brand as shipped,
+ * the light column design-language.md §2.5, which derives every value
+ * from the dark ladder and states the contrast). This file stays a local
+ * copy ON PURPOSE — a plain `mdbook build` must stand alone, fetching
+ * nothing — but since K10's generation (design-language.md §2.6) the
+ * copy is GATED, not trusted: the website's chrome leg renders the table
+ * into `tokens-fixture.css` beside this file, and the suite
+ * (crates/vilan-cli/tests/book_mirrors.rs) holds every role declared
+ * here — both themes, the no-script fallback block included — byte-equal
+ * to that fixture. When theme.vl moves: regenerate the fixture (the
+ * command in its header), and the red test walks this file forward in
+ * the same change-set.
  *
  * Shape: the role tokens are declared per theme on the <html> element —
  * `html.light` (mdBook's `.light` class) and `html.navy` — and mdBook's own
