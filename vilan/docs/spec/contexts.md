@@ -113,6 +113,14 @@ exempt (it cannot run uncovered); a function called from top level, or
 taken as a value, is entered without the value and is never covered,
 whatever its other callers.
 
+The error anchors at **your code**. A strict read you wrote reports at
+that read. A strict read that sits inside a standard-library helper —
+`effect`, `map`, and `or` all reach the ambient owner through one read
+in `std::reactive` — reports at the earliest of your calls that enters
+the library on an uncovered path (a call inside a covering `run` is
+never blamed), with a secondary note pointing at the library-internal
+read it reaches.
+
 A function that reads a context **cannot be used as a value**
 ("`…` reads context `…`, so it can't be used as a value"): an indirect
 call would bypass the hidden parameter. Wrap it in a closure literal at

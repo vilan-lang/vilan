@@ -15728,6 +15728,115 @@ main();
     );
 }
 
+// E74 (diagnostics-standard A2): the fence's strict read sits in STD when
+// reached through `effect` (`get_owner`'s body, reactive.vl) — the diagnostic
+// anchors at the USER'S call, with the std read demoted to the C3 note.
+#[test]
+fn e74_an_uncovered_effect_anchors_at_the_users_call() {
+    let source = r#"
+import std::print;
+import std::reactive::Signal;
+
+fun main() {
+    let count = Signal::new(1);
+    count.effect(|value| print(value));
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "count.effect(|value| print(value))",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+}
+
+// E74's top-level entry: a module-level initializer calling straight into
+// the std reader is an uncovered entry by construction, and the walk-back
+// anchors at that initializer call (the `top_level_incoming` arm — there is
+// no caller node to descend through).
+#[test]
+fn e74_a_module_initializer_entry_anchors_at_the_initializer_call() {
+    let source = r#"
+import std::print;
+import std::reactive::{ Owner, get_owner };
+
+let scope: Owner = get_owner();
+
+fun main() {
+    print("hi");
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "get_owner()",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+}
+
+// E74's no-over-correction half: a strict read the user WROTE anchors at
+// itself, with no std-frame note to demote.
+#[test]
+fn e74_a_direct_strict_read_still_anchors_at_itself() {
+    let source = r#"
+import std::print;
+import std::reactive::owner_scope;
+
+fun main() {
+    let owner = owner_scope.get();
+    print("hi");
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "owner_scope.get()",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    let diagnostics = failure_diagnostics_with_notes(source);
+    assert!(
+        diagnostics.iter().all(|(_, _, note)| note.is_none()),
+        "a user-written read must not carry the std-frame note; got: {diagnostics:#?}"
+    );
+}
+
+// E74's blame filter: the walk-back crosses only UNBOUND callers, so a
+// covered `effect` earlier in the program (a lower call id, which the
+// earliest-entry rule would otherwise prefer) is never blamed for the
+// uncovered one beside it.
+#[test]
+fn e74_a_covered_call_beside_the_uncovered_one_is_not_blamed() {
+    assert_fails_spanning(
+        r#"
+import std::print;
+import std::reactive::{ Owner, Signal, owner_scope };
+
+fun main() {
+    let early = Signal::new(1);
+    let owner = Owner::new();
+    owner_scope.run(owner, || {
+        early.effect(|value| print(value));
+    });
+    let late = Signal::new(2);
+    late.effect(|value| print(value));
+}
+main();
+        "#,
+        "late.effect(|value| print(value))",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
 // The dead-reader exemption: a program that imports `std::reactive` without
 // ever using the ambient layer must compile — an uncalled reader cannot run,
 // so it cannot run uncovered.
@@ -59138,6 +59247,70 @@ fn a25_or_outside_an_owner_scope_is_a_compile_error() {
         }
         "#,
         "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// E74 (diagnostics-standard A2): §2b's fence anchors at the USER'S `map`
+/// call — the strict read it trips sits in std (`get_owner`, reached from
+/// `RemoteSource::map`), which is where the diagnostic anchored before the
+/// walk-back; the std read is now the C3 note.
+#[test]
+fn e74_a25_map_anchors_at_the_users_call() {
+    let source = r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.map(|value| "seen");
+            print(text.get());
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        r#"remote.map(|value| "seen")"#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+}
+
+/// E74, §2c's shape: `or` IS `map`, so the walk-back crosses TWO std frames
+/// (`or` → `map` → `get_owner`) and still lands on the user's `.or` call.
+#[test]
+fn e74_a25_or_anchors_at_the_users_call() {
+    let source = r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.or(0);
+            print(text.get());
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "remote.or(0)",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
     );
 }
 

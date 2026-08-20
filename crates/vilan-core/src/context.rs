@@ -29,7 +29,7 @@
 
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
-use crate::error::Error;
+use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::Type;
@@ -200,6 +200,54 @@ fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
         },
         anchor,
     )
+}
+
+/// [`anchored`], carrying the C3 secondary note (diagnostics-standard.md §3).
+fn anchored_noting(program: &Program, anchor: Id, msg: String, note: Note) -> (Error, SourceId) {
+    program.anchored(
+        Error {
+            note: Some(note),
+            span: span_of(program, anchor),
+            msg,
+        },
+        anchor,
+    )
+}
+
+/// The C3 note that demotes a std-internal site under a user-anchored primary
+/// (diagnostics-standard.md A2): the site's own span, labeled with the std
+/// function whose body holds it (`the read is inside `get_owner` here`), in
+/// its own file. `what` names the site's role — "read" for a strict `get`,
+/// "injected call" for a call through a `context`-clause closure.
+fn std_frame_note(
+    program: &Program,
+    graph: &CallGraph,
+    site: Id,
+    site_owner: Id,
+    what: &str,
+    anchor: Id,
+) -> Note {
+    // The nearest enclosing FUNCTION of the site's owner node (a closure hops
+    // its lexical parents), for the label.
+    let mut current = site_owner;
+    let holder = loop {
+        if let Some(function) = program.functions.get(&current) {
+            break function.name;
+        }
+        match graph.closure_parent_of(current) {
+            Some(parent) => current = parent,
+            None => break "std",
+        }
+    };
+    Note {
+        span: span_of(program, site),
+        msg: format!("the {what} is inside `{holder}` here"),
+        // The `Note::source` contract: name the file only when it differs
+        // from the primary span's.
+        source: program
+            .note_source_of(site)
+            .filter(|source| Some(*source) != program.note_source_of(anchor)),
+    }
 }
 
 fn span_of(program: &Program, id: Id) -> crate::span::Span {
@@ -765,6 +813,57 @@ fn analyze(
         }
     }
 
+    // --- The A2 walk-back's inputs (E74, diagnostics-standard.md §1). ---
+    // A coverage refusal whose offending site sits in STD was caused by user
+    // code calling a std helper (`effect`/`map`/`or` all funnel to
+    // `get_owner`'s strict read), so the diagnostic must lead with the user's
+    // call, not std's body. The reporting loops below walk from the site's
+    // owner back along the same edges the strictness climbed, and these are
+    // those edges at call-site grain.
+    let mut dispatch_incoming: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
+    for (owner, call_id, candidates) in &dispatch_sites {
+        for &candidate in candidates {
+            dispatch_incoming
+                .entry(candidate)
+                .or_default()
+                .push((*owner, *call_id));
+        }
+    }
+    let std_spanned = |id: Id| -> bool {
+        program
+            .source_of(id)
+            .is_some_and(|source| program.std_sources.contains(&source))
+    };
+    // Whether a dispatch site can actually select `candidate` — the
+    // concrete-receiver narrowing the coverage refinement uses, applied at
+    // one site: a recorded receiver's HEAD selects among candidates, so a
+    // site whose receiver picks a different member never takes the blame for
+    // this one. `OnConstraint` sites resolve per ENTRY, not per site, so they
+    // stay admitted (the union), exactly as conservative as the union edges.
+    let dispatch_admits = |call_id: Id, candidate: Id| -> bool {
+        match crate::async_infer::dispatch_at(program, call_id) {
+            Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
+                match program.type_id_to_type_map.get(&receiver) {
+                    Some(resolved)
+                        if !matches!(
+                            resolved,
+                            Type::Generic(_)
+                                | Type::Any
+                                | Type::Unknown
+                                | Type::Unresolved
+                                | Type::Trait(..)
+                        ) =>
+                    {
+                        let selected = impl_members_for(resolved, member);
+                        selected.is_empty() || selected.contains(&candidate)
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    };
+
     // --- Injected (`context`-typed) closures — proposal/ambient-owner.md §5. ---
     // A clause on a parameter's closure type defers that closure's context
     // binding to its CALL sites: the literal passed in takes its own hidden
@@ -1154,27 +1253,108 @@ fn analyze(
             }
         }
 
+        // The A2 walk-back (E74): a refused site whose own span sits in std
+        // anchors at the EARLIEST user-written call that enters std on an
+        // uncovered path — the async-polymorphism origin discipline
+        // (`record_origin`: ids are minted in walk order, so the least call
+        // id is the earliest such call in the program), with the std site
+        // demoted to the C3 note. A site in user code anchors at itself and
+        // returns `None` here. The walk descends the same edges the
+        // strictness climbed — direct calls, admitted dispatch calls, the
+        // capture hop — and only through UNBOUND callers: a covered caller
+        // is not on the uncovered path and must not take the blame. No user
+        // entry found (an uncovered read reachable only from std's own load
+        // would be std's bug, not the user's) falls back to the std anchor.
+        let user_entry_of = |site: Id, start: Id| -> Option<Id> {
+            if !std_spanned(site) {
+                return None;
+            }
+            let mut best: Option<Id> = None;
+            let mut visited: HashSet<Id> = HashSet::default();
+            let mut walk: Vec<Id> = vec![start];
+            while let Some(node) = walk.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                for &(caller, call_id) in incoming_calls.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) {
+                        continue;
+                    }
+                    if std_spanned(call_id) {
+                        walk.push(caller);
+                    } else if best.is_none_or(|held| call_id.0 < held.0) {
+                        best = Some(call_id);
+                    }
+                }
+                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                        continue;
+                    }
+                    if std_spanned(call_id) {
+                        walk.push(caller);
+                    } else if best.is_none_or(|held| call_id.0 < held.0) {
+                        best = Some(call_id);
+                    }
+                }
+                // A top-level call is an uncovered entry by construction; it
+                // has no node to walk onward to.
+                for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
+                    if !std_spanned(call_id) && best.is_none_or(|held| call_id.0 < held.0) {
+                        best = Some(call_id);
+                    }
+                }
+                // The capture hop: an unbound closure's uncovered-ness came
+                // through its defining scope.
+                if let Some(parent) = graph.closure_parent_of(node) {
+                    if !bound.contains(&parent) {
+                        walk.push(parent);
+                    }
+                }
+            }
+            best
+        };
+
         // Any STRICT get whose owner stayed unbound is read outside every
         // `run`; a safe read never fences.
         for get in gets
             .iter()
             .filter(|get| get.context == context && !get.safe)
         {
-            if !bound.contains(&get.owner.id()) {
-                errors.push(anchored(program, get.call_id, format!(
-                        "context `{}` is read here, but this code can be reached without an enclosing `run`",
-                        context_name(program, context)
-                    )));
+            if bound.contains(&get.owner.id()) {
+                continue;
+            }
+            let message = format!(
+                "context `{}` is read here, but this code can be reached without an enclosing `run`",
+                context_name(program, context)
+            );
+            match user_entry_of(get.call_id, get.owner.id()) {
+                Some(entry) => errors.push(anchored_noting(
+                    program,
+                    entry,
+                    message,
+                    std_frame_note(program, graph, get.call_id, get.owner.id(), "read", entry),
+                )),
+                None => errors.push(anchored(program, get.call_id, message)),
             }
         }
         // Calling an injected closure IS a read: its deferred argument comes
         // from the caller, so an unbound caller has nothing to supply.
         for (owner, call_id) in injected_calls.get(&context).into_iter().flatten() {
-            if !bound.contains(&owner.id()) {
-                errors.push(anchored(program, *call_id, format!(
-                        "an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`",
-                        context_name(program, context)
-                    )));
+            if bound.contains(&owner.id()) {
+                continue;
+            }
+            let message = format!(
+                "an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`",
+                context_name(program, context)
+            );
+            match user_entry_of(*call_id, owner.id()) {
+                Some(entry) => errors.push(anchored_noting(
+                    program,
+                    entry,
+                    message,
+                    std_frame_note(program, graph, *call_id, owner.id(), "injected call", entry),
+                )),
+                None => errors.push(anchored(program, *call_id, message)),
             }
         }
 

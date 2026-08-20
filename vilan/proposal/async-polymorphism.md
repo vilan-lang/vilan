@@ -288,6 +288,17 @@ gated on "async **through** these bits and not without them": the bits are the
 callee's own parameter ids and the flags are the component's own members, so a
 position outside the instance cannot pass both halves.
 
+> **Adopted beyond this family (E74, 2026-08-20)** — this origin discipline
+> (primary at the earliest user-written originating call, least entity id;
+> the internal frame demoted to the cross-source C3 note) is now also how
+> the context pass anchors its `owner_scope` coverage refusal when the
+> strict read sits in std: `effect`/`map`/`or` all funnel to `get_owner`'s
+> read in `reactive.vl`, which used to be the primary span. `context.rs`'s
+> `user_entry_of` walks the strictness edges back through unbound callers
+> only — a covered call is never blamed — and anchors at the user's call,
+> with "the read is inside `get_owner` here" as the note. One mechanism,
+> two passes; diagnostics-ledger.md rows 222/223 carry the verdicts.
+
 #### The precision residual, named
 
 This is the **conservative sound** ruling, and it is the one A.4 already
