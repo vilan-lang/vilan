@@ -1356,3 +1356,30 @@ planting the bug it exists for and watching it redden.
 expression's cache key? A's 20 % came with no key at all; B's prize is the
 interpreter's 77 %, and only across analyses.
 
+### 10.7 M8, 2026-08-20 — the evaluator's scopes die with their run
+
+§10.6 kept a per-site interpreter scope "because it costs ~24 `Rc` allocations
+a site and removes the question". Those allocations turned out to be immortal:
+hoisting the site's reached world binds every function into the root scope as a
+`Value::Closure` whose `env` IS that scope — a reference cycle per function
+that `Rc` never collects — so every site of every analysis stranded its root
+scope with everything it bound, +1,523.9 KiB of in-use heap per analysis on
+`vilan-website/src/page.vl` (the find, the attribution and the fix's design
+are leak-soak.md §7.7–7.8; the fix is M8's, 2026-08-20). The interpreter now
+keeps a per-run registry of every scope a run creates — `Scope` construction
+moved inside `Interpreter`, so a scope cannot be born unregistered — and, once
+the run's result has been extracted to owned plain data (`ConstValue`, an
+expansion's text, a `Failure`), clears each registered scope's bindings,
+breaking every cycle including a function declared inside a called function's
+body (the call-scope cycle a root-only clear cannot reach). Nothing about
+§10.6's isolation moved: each site still evaluates in a fresh root scope of
+its own, the shared lowering is immutable `js::Node` trees the teardown never
+touches, and the macro engine's `run_entry` — the same evaluator — gets the
+same teardown by the same argument. The behavioural pin
+(`a_const_function_evaluates_again_after_an_earlier_sites_scopes_were_cleared`)
+holds a function two sites reach — one declaring a closure in its body —
+correct at the later site after the earlier site's teardown; the mechanism
+pins (`every_interpreter_scope_dies_with_its_const_run` / `…_macro_expansion`)
+count scopes created minus dropped back to zero; and §10.6's whole pin set,
+the interpreter equivalence suite and the corpus ride unchanged.
+

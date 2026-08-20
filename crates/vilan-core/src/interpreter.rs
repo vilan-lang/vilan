@@ -29,7 +29,7 @@ use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 /// Execution budgets. Fuel is decremented once per node evaluated; call depth
 /// bounds closure/function recursion. Both exhaust into clean errors.
@@ -242,44 +242,15 @@ fn run_const<'a>(
     allow_assets: bool,
 ) -> Result<ConstRun, Failure> {
     check_reach(&site.imports, &site.helpers)?;
-    let mut interpreter = Interpreter {
-        fuel: limits.fuel,
-        depth_left: limits.call_depth,
-        stdout: String::new(),
-        exited: None,
-        assets: Vec::new(),
-        allow_assets,
-    };
-    let globals = Scope::root();
-    // Hoisted as one body, then run as one body — a mini-program held the same
-    // three sections in the same order in a single `nodes` list.
-    Interpreter::hoist(site.world.iter().copied(), &globals)?;
-    Interpreter::hoist(site.prelude.iter(), &globals)?;
-    Interpreter::hoist(site.body.iter(), &globals)?;
-    for section in [
-        interpreter.exec_statements(site.world.iter().copied(), &globals)?,
-        interpreter.exec_statements(site.prelude.iter(), &globals)?,
-        interpreter.exec_statements(site.body.iter(), &globals)?,
-    ] {
-        if !matches!(section, Flow::Normal) {
-            return Err(Failure::internal(
-                "control flow escaped the const expression",
-            ));
-        }
-    }
-    let Some(result) = lookup(&globals, "__const_result") else {
-        return Err(Failure::internal(
-            "the const result binding was not emitted",
-        ));
-    };
-    let value = value_to_const(&result).map_err(|what| {
-        Failure::new(
-            FailureKind::Unsupported,
-            format!("a `const` result must be plain data; this evaluates to {what}"),
-        )
-    })?;
+    let mut interpreter = Interpreter::new(limits, allow_assets);
+    let value = interpreter.run_const_site(site);
+    // Either arm of `value` is owned plain data (`ConstValue` / `Failure`), and
+    // so is everything below — nothing borrows a scope-held `Value` past this
+    // point, so the run's scopes and their closure cycles are torn down here,
+    // on the error paths as much as the success one (leak-soak.md §7.8).
+    interpreter.clear_scopes();
     Ok(ConstRun {
-        value,
+        value: value?,
         assets: interpreter.assets,
         stdout: interpreter.stdout,
         exited: interpreter.exited,
@@ -337,16 +308,13 @@ pub struct RunOutput {
 /// macro expansion (Phase 1) drives the same evaluator per `macro fun` call.
 pub fn run_program<'a>(program: &'a JsProgram<'a>, limits: Limits) -> Result<RunOutput, Failure> {
     check_capabilities(program)?;
-    let mut interpreter = Interpreter {
-        fuel: limits.fuel,
-        depth_left: limits.call_depth,
-        stdout: String::new(),
-        exited: None,
-        assets: Vec::new(),
-        allow_assets: false,
-    };
-    let globals = Scope::root();
+    let mut interpreter = Interpreter::new(limits, false);
+    let globals = interpreter.root_scope();
     let result = interpreter.exec_body(&program.nodes, &globals);
+    // Everything read below — stdout, the exit code, the `Flow` variant, a
+    // `Failure` — is owned; no scope-held `Value` is looked at again, so the
+    // run's scopes are torn down first (leak-soak.md §7.8).
+    interpreter.clear_scopes();
     if let Some(exit_code) = interpreter.exited {
         return Ok(RunOutput {
             stdout: interpreter.stdout,
@@ -402,41 +370,14 @@ pub fn run_entry<'a>(
     limits: Limits,
 ) -> Result<String, Failure> {
     check_capabilities(program)?;
-    let mut interpreter = Interpreter {
-        fuel: limits.fuel,
-        depth_left: limits.call_depth,
-        stdout: String::new(),
-        exited: None,
-        assets: Vec::new(),
-        allow_assets: false,
-    };
-    let globals = Scope::root();
-    match interpreter.exec_body(&program.nodes, &globals)? {
-        Flow::Normal => {}
-        _ => return Err(Failure::internal("control flow escaped the top level")),
-    }
-    let Some(callee) = lookup(&globals, entry) else {
-        return Err(Failure::internal(format!(
-            "the macro entry `{entry}` was not emitted"
-        )));
-    };
-    let mut values = Vec::with_capacity(arguments.len());
-    for argument in arguments {
-        values.push(interpreter.eval(argument, &globals)?);
-    }
-    let result = interpreter.call_value(&callee, values)?;
-    // A `Source` is `struct Source { text: str }` — the one-field positional
-    // array `[text]`.
-    if let Value::Array(slots) = &result {
-        let slots = slots.borrow();
-        if let Some(Value::Str(text)) = slots.first() {
-            return Ok(text.to_string());
-        }
-    }
-    Err(Failure::new(
-        FailureKind::Thrown,
-        "the macro did not return a `Source` (build one with `macro_std::source(..)`)".to_string(),
-    ))
+    let mut interpreter = Interpreter::new(limits, false);
+    let text = interpreter.run_macro_entry(program, entry, arguments);
+    // The expansion is an owned `String` (a `Failure` likewise), and the
+    // expansion cache upstream stores only that text — no `Value` from a macro
+    // run outlives it, so a macro run's scopes are torn down exactly as a
+    // const run's are (leak-soak.md §7.8).
+    interpreter.clear_scopes();
+    text
 }
 
 // --- Values ---
@@ -519,19 +460,30 @@ struct Scope<'a> {
     parent: Option<Env<'a>>,
 }
 
-impl<'a> Scope<'a> {
-    fn root() -> Env<'a> {
-        Rc::new(RefCell::new(Scope {
-            vars: HashMap::new(),
-            parent: None,
-        }))
-    }
+thread_local! {
+    /// Scopes created minus scopes dropped, on this thread — the instrument
+    /// behind M8's pin (leak-soak.md §7.8). A scope that declares a function
+    /// holds a `Value::Closure` whose `env` is that scope: a reference cycle
+    /// `Rc` cannot collect, so before the per-run teardown every such scope
+    /// outlived its run and this counter grew without bound. With the teardown
+    /// it must return to exactly where it started once every run on the thread
+    /// has finished — only a counter can say so, because the leak is
+    /// behaviour-neutral by construction. One `Cell` bump per scope is
+    /// unmeasurable beside the `Rc`/`RefCell`/`HashMap` the scope itself costs.
+    static LIVE_SCOPE_COUNT: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
 
-    fn child(parent: &Env<'a>) -> Env<'a> {
-        Rc::new(RefCell::new(Scope {
-            vars: HashMap::new(),
-            parent: Some(parent.clone()),
-        }))
+/// Scopes currently alive on this thread (created minus dropped). Zero once
+/// every interpreter run on the thread has completed; a positive residue is a
+/// scope kept alive past its run's teardown — M8's leak. See
+/// [`LIVE_SCOPE_COUNT`].
+pub fn live_scope_count() -> isize {
+    LIVE_SCOPE_COUNT.with(std::cell::Cell::get)
+}
+
+impl Drop for Scope<'_> {
+    fn drop(&mut self) {
+        LIVE_SCOPE_COUNT.with(|count| count.set(count.get() - 1));
     }
 }
 
@@ -575,7 +527,7 @@ enum Flow<'a> {
     Continue,
 }
 
-struct Interpreter {
+struct Interpreter<'a> {
     fuel: u64,
     depth_left: u32,
     stdout: String,
@@ -588,9 +540,153 @@ struct Interpreter {
     /// `asset::emit` is live only under `eval_const`; anywhere else it is a
     /// capability miss.
     allow_assets: bool,
+    /// The per-run scope registry (leak-soak.md §7.8): every scope this run
+    /// created, weakly held. A hoisted or expression-position function is a
+    /// `Value::Closure` whose `env` is the scope holding it — a reference
+    /// cycle `Rc` cannot collect, one per function per scope that binds it,
+    /// so every run used to strand its root scope (and, for a function
+    /// declared inside a body, the call scope) with everything they bound.
+    /// [`Interpreter::clear_scopes`] walks this and breaks every cycle once
+    /// the run's result is owned plain data. Weak, so the registry never
+    /// extends a scope's life: one that died naturally mid-run costs its slot
+    /// and nothing else, and the run's liveness is exactly what it was.
+    scopes: Vec<Weak<RefCell<Scope<'a>>>>,
 }
 
-impl Interpreter {
+impl<'a> Interpreter<'a> {
+    fn new(limits: Limits, allow_assets: bool) -> Self {
+        Self {
+            fuel: limits.fuel,
+            depth_left: limits.call_depth,
+            stdout: String::new(),
+            exited: None,
+            assets: Vec::new(),
+            allow_assets,
+            scopes: Vec::new(),
+        }
+    }
+
+    // --- Scopes ---
+
+    /// A run's root scope. These two methods are the ONLY places a scope is
+    /// created, so every scope is born registered and the teardown below can
+    /// reach them all — a constructor outside the registry would quietly
+    /// reopen the leak.
+    fn root_scope(&mut self) -> Env<'a> {
+        self.register(Scope {
+            vars: HashMap::new(),
+            parent: None,
+        })
+    }
+
+    /// A child scope over `parent`: a block, a loop iteration, a call frame.
+    fn child_scope(&mut self, parent: &Env<'a>) -> Env<'a> {
+        self.register(Scope {
+            vars: HashMap::new(),
+            parent: Some(parent.clone()),
+        })
+    }
+
+    fn register(&mut self, scope: Scope<'a>) -> Env<'a> {
+        LIVE_SCOPE_COUNT.with(|count| count.set(count.get() + 1));
+        let scope = Rc::new(RefCell::new(scope));
+        self.scopes.push(Rc::downgrade(&scope));
+        scope
+    }
+
+    /// The teardown: clears the bindings of every registered scope still
+    /// alive, breaking every closure–scope cycle the run built.
+    ///
+    /// The soundness condition (leak-soak.md §7.8): a caller may invoke this
+    /// only once the run's result has been extracted to owned plain data —
+    /// `ConstValue`, `RunOutput`, an expansion's `String`, a `Failure` — so
+    /// no `Value` read after this point resolves through a cleared scope.
+    /// `Value`, `Scope` and `Env` are private to this module and the module
+    /// holds no statics, so nothing outside a run's own entry function can be
+    /// holding a scope-held `Value` when its entry returns.
+    fn clear_scopes(&mut self) {
+        for scope in self.scopes.drain(..) {
+            if let Some(scope) = scope.upgrade() {
+                scope.borrow_mut().vars.clear();
+            }
+        }
+    }
+
+    // --- Runs ---
+
+    /// One const site's evaluation, to the owned result: hoists the site's
+    /// three sections as one body, runs them as one body — a mini-program held
+    /// the same three sections in the same order in a single `nodes` list —
+    /// and extracts `__const_result` to plain data. Split from [`run_const`]
+    /// so the teardown there covers every exit, the error paths included.
+    fn run_const_site(&mut self, site: &'a ConstSite<'a>) -> Result<ConstValue, Failure> {
+        let globals = self.root_scope();
+        Self::hoist(site.world.iter().copied(), &globals)?;
+        Self::hoist(site.prelude.iter(), &globals)?;
+        Self::hoist(site.body.iter(), &globals)?;
+        for section in [
+            self.exec_statements(site.world.iter().copied(), &globals)?,
+            self.exec_statements(site.prelude.iter(), &globals)?,
+            self.exec_statements(site.body.iter(), &globals)?,
+        ] {
+            if !matches!(section, Flow::Normal) {
+                return Err(Failure::internal(
+                    "control flow escaped the const expression",
+                ));
+            }
+        }
+        let Some(result) = lookup(&globals, "__const_result") else {
+            return Err(Failure::internal(
+                "the const result binding was not emitted",
+            ));
+        };
+        value_to_const(&result).map_err(|what| {
+            Failure::new(
+                FailureKind::Unsupported,
+                format!("a `const` result must be plain data; this evaluates to {what}"),
+            )
+        })
+    }
+
+    /// One macro expansion, to the owned text: runs the world's top level,
+    /// calls `entry`, and reads the returned `Source`'s text. Split from
+    /// [`run_entry`] so the teardown there covers every exit.
+    fn run_macro_entry(
+        &mut self,
+        program: &'a JsProgram<'a>,
+        entry: &str,
+        arguments: &'a [js::Node<'a>],
+    ) -> Result<String, Failure> {
+        let globals = self.root_scope();
+        match self.exec_body(&program.nodes, &globals)? {
+            Flow::Normal => {}
+            _ => return Err(Failure::internal("control flow escaped the top level")),
+        }
+        let Some(callee) = lookup(&globals, entry) else {
+            return Err(Failure::internal(format!(
+                "the macro entry `{entry}` was not emitted"
+            )));
+        };
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            values.push(self.eval(argument, &globals)?);
+        }
+        let result = self.call_value(&callee, values)?;
+        // A `Source` is `struct Source { text: str }` — the one-field
+        // positional array `[text]`.
+        if let Value::Array(slots) = &result {
+            let slots = slots.borrow();
+            if let Some(Value::Str(text)) = slots.first() {
+                return Ok(text.to_string());
+            }
+        }
+        Err(Failure::new(
+            FailureKind::Thrown,
+            "the macro did not return a `Source` (build one with `macro_std::source(..)`)"
+                .to_string(),
+        ))
+    }
+
     fn charge(&mut self) -> Result<(), Failure> {
         if self.fuel == 0 {
             return Err(Failure::new(
@@ -607,11 +703,7 @@ impl Interpreter {
     /// Executes a statement list: function declarations hoist (bound over the
     /// current scope before anything runs, as JS hoists them), then statements
     /// run in order.
-    fn exec_body<'a>(
-        &mut self,
-        body: &'a [js::Node<'a>],
-        env: &Env<'a>,
-    ) -> Result<Flow<'a>, Failure> {
+    fn exec_body(&mut self, body: &'a [js::Node<'a>], env: &Env<'a>) -> Result<Flow<'a>, Failure> {
         Self::hoist(body.iter(), env)?;
         self.exec_statements(body.iter(), env)
     }
@@ -620,10 +712,7 @@ impl Interpreter {
     /// them — the first half of [`Interpreter::exec_body`], split out so a const
     /// site can hoist its shared world, its prelude and its own body together
     /// before any of the three runs (`const-eval.md` §10.6).
-    fn hoist<'a>(
-        nodes: impl Iterator<Item = &'a js::Node<'a>>,
-        env: &Env<'a>,
-    ) -> Result<(), Failure> {
+    fn hoist(nodes: impl Iterator<Item = &'a js::Node<'a>>, env: &Env<'a>) -> Result<(), Failure> {
         for node in nodes {
             if let js::Node::Function(function) = node {
                 if function.is_async {
@@ -644,7 +733,7 @@ impl Interpreter {
     }
 
     /// Runs `nodes` in order — the second half of [`Interpreter::exec_body`].
-    fn exec_statements<'a>(
+    fn exec_statements(
         &mut self,
         nodes: impl Iterator<Item = &'a js::Node<'a>>,
         env: &Env<'a>,
@@ -658,7 +747,7 @@ impl Interpreter {
         Ok(Flow::Normal)
     }
 
-    fn exec_statement<'a>(
+    fn exec_statement(
         &mut self,
         node: &'a js::Node<'a>,
         env: &Env<'a>,
@@ -708,7 +797,7 @@ impl Interpreter {
                     }
                     // A fresh scope per iteration: `let`s inside the body are
                     // per-iteration bindings (closures capture each turn's).
-                    let iteration = Scope::child(env);
+                    let iteration = self.child_scope(env);
                     match self.exec_body(body, &iteration)? {
                         Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
@@ -786,19 +875,19 @@ impl Interpreter {
         }
     }
 
-    fn run_for_iteration<'a>(
+    fn run_for_iteration(
         &mut self,
         binding: &'a str,
         element: Value<'a>,
         body: &'a [js::Node<'a>],
         env: &Env<'a>,
     ) -> Result<Flow<'a>, Failure> {
-        let iteration = Scope::child(env);
+        let iteration = self.child_scope(env);
         iteration.borrow_mut().vars.insert(binding, element);
         self.exec_body(body, &iteration)
     }
 
-    fn exec_if<'a>(
+    fn exec_if(
         &mut self,
         branch: &'a js::IfBranch<'a>,
         env: &Env<'a>,
@@ -807,7 +896,7 @@ impl Interpreter {
             js::IfBranch::If(condition, body, else_) => {
                 let condition = self.eval(condition, env)?;
                 if truthy(&condition) {
-                    let scope = Scope::child(env);
+                    let scope = self.child_scope(env);
                     self.exec_body(body, &scope)
                 } else if let Some(else_) = else_ {
                     self.exec_if(else_, env)
@@ -816,7 +905,7 @@ impl Interpreter {
                 }
             }
             js::IfBranch::Else(body) => {
-                let scope = Scope::child(env);
+                let scope = self.child_scope(env);
                 self.exec_body(body, &scope)
             }
         }
@@ -824,7 +913,7 @@ impl Interpreter {
 
     // --- Expressions ---
 
-    fn eval<'a>(&mut self, node: &'a js::Node<'a>, env: &Env<'a>) -> Result<Value<'a>, Failure> {
+    fn eval(&mut self, node: &'a js::Node<'a>, env: &Env<'a>) -> Result<Value<'a>, Failure> {
         self.charge()?;
         match node {
             js::Node::Void => Ok(Value::Undefined),
@@ -909,7 +998,7 @@ impl Interpreter {
         }
     }
 
-    fn eval_local<'a>(&mut self, name: &'a str, env: &Env<'a>) -> Result<Value<'a>, Failure> {
+    fn eval_local(&mut self, name: &'a str, env: &Env<'a>) -> Result<Value<'a>, Failure> {
         if let Some(value) = lookup(env, name) {
             return Ok(value);
         }
@@ -925,7 +1014,7 @@ impl Interpreter {
 
     // --- Calls ---
 
-    fn eval_call<'a>(
+    fn eval_call(
         &mut self,
         subject: &'a js::Node<'a>,
         arguments: &'a [js::Node<'a>],
@@ -964,7 +1053,7 @@ impl Interpreter {
         self.call_value(&callee, values)
     }
 
-    fn call_value<'a>(
+    fn call_value(
         &mut self,
         callee: &Value<'a>,
         arguments: Vec<Value<'a>>,
@@ -982,7 +1071,7 @@ impl Interpreter {
             ));
         }
         self.depth_left -= 1;
-        let scope = Scope::child(&closure.env);
+        let scope = self.child_scope(&closure.env);
         {
             let mut scope = scope.borrow_mut();
             for (index, parameter) in closure.parameters.iter().enumerate() {
@@ -1015,7 +1104,7 @@ impl Interpreter {
 
     /// `console.log(..)` and `process.exit(..)` — the only Property-shaped
     /// host calls the backend emits.
-    fn call_host_property<'a>(
+    fn call_host_property(
         &mut self,
         base: &str,
         method: &str,
@@ -1068,11 +1157,7 @@ impl Interpreter {
     /// Free-name host calls: the `__` runtime helpers (implemented natively,
     /// mirroring their JS sources in `helper_source`) and the dotted host
     /// globals the backend emits.
-    fn call_host<'a>(
-        &mut self,
-        name: &str,
-        arguments: Vec<Value<'a>>,
-    ) -> Result<Value<'a>, Failure> {
+    fn call_host(&mut self, name: &str, arguments: Vec<Value<'a>>) -> Result<Value<'a>, Failure> {
         let take = |index: usize| -> Value<'a> {
             if index < arguments.len() {
                 arguments[index].clone()
@@ -1611,7 +1696,7 @@ impl Interpreter {
 
     /// Method calls on values — the JS prototype methods the backend emits for
     /// intrinsics (`str.trim()`, `set.add(..)`, tuple-comprehension `.map`, …).
-    fn call_method<'a>(
+    fn call_method(
         &mut self,
         receiver: &Value<'a>,
         method: &str,
@@ -1747,7 +1832,7 @@ impl Interpreter {
         }
     }
 
-    fn call_string_method<'a>(
+    fn call_string_method(
         &mut self,
         s: &Rc<str>,
         method: &str,
@@ -1839,11 +1924,7 @@ impl Interpreter {
 
     // --- Property access ---
 
-    fn read_property<'a>(
-        &mut self,
-        subject: &Value<'a>,
-        member: &str,
-    ) -> Result<Value<'a>, Failure> {
+    fn read_property(&mut self, subject: &Value<'a>, member: &str) -> Result<Value<'a>, Failure> {
         match (subject, member) {
             (Value::Str(s), "length") => Ok(Value::Number(s.encode_utf16().count() as f64)),
             (Value::Array(items), "length") => Ok(Value::Number(items.borrow().len() as f64)),
@@ -1861,11 +1942,7 @@ impl Interpreter {
         }
     }
 
-    fn read_index<'a>(
-        &mut self,
-        subject: &Value<'a>,
-        index: &Value<'a>,
-    ) -> Result<Value<'a>, Failure> {
+    fn read_index(&mut self, subject: &Value<'a>, index: &Value<'a>) -> Result<Value<'a>, Failure> {
         match subject {
             Value::Array(items) => {
                 // JS canonicalizes string keys: `arr["0"]` is `arr[0]` (the
@@ -1899,7 +1976,7 @@ impl Interpreter {
         }
     }
 
-    fn write_target<'a>(
+    fn write_target(
         &mut self,
         target: &'a js::Node<'a>,
         value: Value<'a>,
@@ -1956,7 +2033,7 @@ impl Interpreter {
 
     // --- Operators ---
 
-    fn eval_binary<'a>(
+    fn eval_binary(
         &mut self,
         op: BinaryOp,
         lhs: &'a js::Node<'a>,

@@ -9517,6 +9517,43 @@ mod leak_measurement {
         pages * 4
     }
 
+    /// The allocator's own split of the heap, from glibc's `mallinfo2`:
+    /// `(uordblks, fordblks)` — bytes IN USE (allocated, never freed) and
+    /// bytes free but retained. The instrument leak-soak.md §7.7 attributed
+    /// the const evaluator's cycles with: in-use bytes growing flat to the
+    /// kilobyte across windows are a genuine leak, where RSS confounds it
+    /// with allocator retention. `None` off glibc — like `/proc` above, the
+    /// gate is about the instrument, not the claim.
+    #[cfg(target_env = "gnu")]
+    fn heap_split_bytes() -> Option<(isize, isize)> {
+        /// glibc's `struct mallinfo2` (malloc.h): ten `size_t` counters.
+        #[repr(C)]
+        struct MallInfo2 {
+            arena: usize,
+            ordblks: usize,
+            smblks: usize,
+            hblks: usize,
+            hblkhd: usize,
+            usmblks: usize,
+            fsmblks: usize,
+            uordblks: usize,
+            fordblks: usize,
+            keepcost: usize,
+        }
+        unsafe extern "C" {
+            fn mallinfo2() -> MallInfo2;
+        }
+        // SAFETY: mallinfo2 reads allocator statistics and touches nothing
+        // else; glibc ≥ 2.33 exports it with exactly this shape.
+        let info = unsafe { mallinfo2() };
+        Some((info.uordblks as isize, info.fordblks as isize))
+    }
+
+    #[cfg(not(target_env = "gnu"))]
+    fn heap_split_bytes() -> Option<(isize, isize)> {
+        None
+    }
+
     /// The macro-expansion leak sites. analysis-reuse.md §2's fix routes the
     /// stamped `parse_generated` calls through the content cache, so after an
     /// unchanged program's expansions are cached these must PLATEAU — leak zero
@@ -9609,6 +9646,13 @@ mod leak_measurement {
     /// growth (a noisy report, never asserted on).
     struct LeakReport {
         rss_grown: usize,
+        /// `uordblks` growth over the window — bytes allocated during it and
+        /// never freed (`None` off glibc). The M8 signal (leak-soak.md
+        /// §7.7/§7.8): flat once the const evaluator's cycles are broken.
+        in_use_grown: Option<isize>,
+        /// `fordblks` growth over the window — freed bytes the allocator kept.
+        /// Noise around zero; reported so the RSS number can be read.
+        free_retained_grown: Option<isize>,
         entry_text: usize,
         entry_ast: usize,
         entry_text_outstanding: isize,
@@ -9623,9 +9667,16 @@ mod leak_measurement {
     }
 
     impl LeakReport {
-        fn from_counts(counts: Counts, rss_grown: usize, measured: usize) -> LeakReport {
+        fn from_counts(
+            counts: Counts,
+            rss_grown: usize,
+            heap_grown: Option<(isize, isize)>,
+            measured: usize,
+        ) -> LeakReport {
             LeakReport {
                 rss_grown,
+                in_use_grown: heap_grown.map(|(in_use, _)| in_use),
+                free_retained_grown: heap_grown.map(|(_, free_retained)| free_retained),
                 entry_text: counts.entry_text,
                 entry_ast: counts.entry_ast,
                 entry_text_outstanding: counts.entry_text_outstanding,
@@ -9658,6 +9709,15 @@ mod leak_measurement {
                 self.rss_grown as f64 / self.measured as f64,
                 self.measured,
             );
+            if let (Some(in_use), Some(free_retained)) =
+                (self.in_use_grown, self.free_retained_grown)
+            {
+                println!(
+                    "[{label}] heap in use {in_use:+} B ≈ {:+.1} KiB/analysis; \
+                     free-retained {free_retained:+} B over the window (mallinfo2)",
+                    in_use as f64 / 1024.0 / self.measured as f64,
+                );
+            }
             println!(
                 "[{label}] counted leak over {} analyses: entry-text {} B, entry-AST {} B, \
                  display {} B, macro {} B, total {} B ≈ {:.0} B/analysis; outstanding after \
@@ -9782,30 +9842,46 @@ mod leak_measurement {
         let mut reports = Vec::with_capacity(windows);
         for index in 0..windows {
             let before_rss = rss_kib();
+            let before_heap = heap_split_bytes();
             let start = warmup + index * window;
             let counts = run_window(driver, &text_at, entry, &std_dir, start, window);
+            let heap_grown = before_heap.and_then(|(in_use, free_retained)| {
+                heap_split_bytes()
+                    .map(|(in_use_now, free_now)| (in_use_now - in_use, free_now - free_retained))
+            });
             reports.push(LeakReport::from_counts(
                 counts,
                 rss_kib().saturating_sub(before_rss),
+                heap_grown,
                 window,
             ));
         }
         reports
     }
 
-    /// Runs `warmup` then `measured` analyses of `text_at(i)` **on the current
-    /// thread** (via `analyze_on_this_thread`, so the leaks land in this
-    /// thread's `leak_tally`), zeroing the counters after warmup. Callers must
-    /// invoke this on a big-stack thread — the pipeline nests a full analysis
-    /// inside macro-world compiles.
-    fn measure(text_at: impl Fn(usize) -> String, warmup: usize, measured: usize) -> LeakReport {
+    /// [`measure_windows`] against a synthetic entry in a temp directory, on
+    /// the inline driver. Callers must invoke this on a big-stack thread — the
+    /// pipeline nests a full analysis inside macro-world compiles.
+    fn measure_windows_in_temp(
+        text_at: impl Fn(usize) -> String,
+        warmup: usize,
+        window: usize,
+        windows: usize,
+    ) -> Vec<LeakReport> {
         let dir = std::env::temp_dir().join(format!("vilan_leak_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let entry = dir.join("main.vl");
-        let mut reports = measure_windows(text_at, &entry, Driver::Inline, warmup, measured, 1);
+        let reports = measure_windows(text_at, &entry, Driver::Inline, warmup, window, windows);
         let _ = std::fs::remove_dir_all(&dir);
-        reports.remove(0)
+        reports
+    }
+
+    /// Runs `warmup` then `measured` analyses of `text_at(i)` **on the current
+    /// thread** (via `analyze_on_this_thread`, so the leaks land in this
+    /// thread's `leak_tally`), zeroing the counters after warmup.
+    fn measure(text_at: impl Fn(usize) -> String, warmup: usize, measured: usize) -> LeakReport {
+        measure_windows_in_temp(text_at, warmup, measured, 1).remove(0)
     }
 
     // A changing, std-using document with no macros. Each `i` differs (a
@@ -10043,6 +10119,99 @@ mod leak_measurement {
         );
     }
 
+    // A const-heavy document: every cycle shape leak-soak.md §7.7 names —
+    // hoisted world functions (a root-scope cycle per `const` site), a closure
+    // declared inside a called function's body (a call-scope cycle, the shape
+    // the root-only experiment could not reach), and loop iterations between
+    // them — with list results fat enough that a stranded root scope holds
+    // real bytes. Written for `moving_edit`, so every analysis is a distinct
+    // content of identical length.
+    const CONST_HEAVY_BASE: &str = "import std::print;\n\n\
+         fun labels(count: i32): List<str> {\n\
+         \tlet describe = |index: i32| { \"a labelled entry in the fixture\" };\n\
+         \tmut result: List<str> = List::new();\n\
+         \tmut index = 0;\n\
+         \tfor index < count {\n\t\tresult.push(describe(index));\n\t\tindex = index + 1;\n\t}\n\
+         \tresult\n\
+         }\n\n\
+         fun total(count: i32): i32 {\n\
+         \tmut sum = 0;\n\
+         \tmut index = 0;\n\
+         \tfor index < count {\n\t\tsum = sum + index;\n\t\tindex = index + 1;\n\t}\n\
+         \tsum\n\
+         }\n\n\
+         let NAMES: List<str> = const labels(12);\n\
+         let MORE: List<str> = const labels(18);\n\
+         let SUM: i32 = const total(15);\n\
+         let AGAIN: i32 = const total(24);\n\
+         let LAST: List<str> = const labels(9);\n\n\
+         fun main() {\n\
+         \tprint(NAMES.len());\n\tprint(MORE.len());\n\tprint(SUM);\n\tprint(AGAIN);\n\tprint(LAST.len());\n\
+         }\n";
+
+    // The M8 pin (leak-soak.md §7.8), in §7.7's mallinfo2 harness shape: a
+    // const-heavy document's IN-USE bytes — allocated and never freed, the
+    // counter that cannot confuse a leak with allocator retention — must be
+    // flat window over window. Before the per-run scope registry, every
+    // `const` site of every analysis stranded its root scope behind a
+    // closure–scope `Rc` cycle — measured with the teardown planted out:
+    // +8.4 KiB of in-use heap per analysis on this fixture, flat across both
+    // windows, exactly a leak's signature (+1,523.9 KiB per analysis on
+    // `vilan-website/src/page.vl`) — so in-use bytes grew linearly in
+    // keystrokes. The exact half of the pin
+    // is the scope counter: interpreter scopes created minus dropped on the
+    // measuring thread is zero once its runs are done, on any platform and
+    // under any test runner. The byte half is asserted only where the
+    // instrument exists (glibc), with a cap far under the broken rate and far
+    // over warm-window noise.
+    #[test]
+    fn const_evaluations_in_use_bytes_plateau() {
+        let warmup = 8;
+        let window = 75;
+        let (reports, scopes_alive) = on_big_stack(move || {
+            let reports =
+                measure_windows_in_temp(|i| moving_edit(CONST_HEAVY_BASE, i), warmup, window, 2);
+            (reports, vilan_core::interpreter::live_scope_count())
+        });
+        for (index, report) in reports.iter().enumerate() {
+            report.print(&format!("const-heavy w{}", index + 1));
+        }
+        assert!(
+            reports[0].entry_text > 0,
+            "the const-heavy fixture leaked no entry text — it may not be re-analyzing",
+        );
+        assert_eq!(
+            scopes_alive, 0,
+            "{scopes_alive} interpreter scope(s) outlived their runs on the measuring thread — \
+             the const evaluator's cycles are stranding scopes again (leak-soak.md §7.8)",
+        );
+        // `uordblks` is process-global, so the byte half asserts only under
+        // nextest's process-per-test isolation — under `cargo test`'s
+        // in-process threads a neighbouring test's live allocations would land
+        // in the window, which is exactly why RSS has always been report-only
+        // here. The scope counter above is thread-local and gates everywhere.
+        let isolated = std::env::var_os("NEXTEST").is_some();
+        match reports[1].in_use_grown {
+            Some(in_use) if isolated => {
+                let per_analysis = in_use / window as isize;
+                assert!(
+                    per_analysis < 2048,
+                    "the warm window grew {per_analysis} B of in-use heap per analysis over \
+                     {window} analyses ({in_use} B) — allocated-and-never-freed bytes should be \
+                     flat with the const evaluator's scopes torn down (leak-soak.md §7.8)",
+                );
+            }
+            Some(in_use) => println!(
+                "[const-heavy] shared-process run — in-use growth {in_use} B reported, not \
+                 asserted (the scope counter above still gates)"
+            ),
+            None => println!(
+                "[const-heavy] mallinfo2 unavailable — the in-use cap was not asserted \
+                 (the scope counter above still gates)"
+            ),
+        }
+    }
+
     // --- The soak: real corpora, thousands of analyses (proposal/leak-soak.md) --
 
     /// The sibling-repository corpora, addressed by environment variable and
@@ -10120,12 +10289,16 @@ mod leak_measurement {
         window_index: usize,
         report: &LeakReport,
     ) {
+        let json_or_null = |value: Option<isize>| {
+            value.map_or_else(|| "null".to_string(), |value| value.to_string())
+        };
         println!(
             "LEAK {{\"corpus\":\"{corpus}\",\"lines\":{lines},\"source_bytes\":{source_bytes},\
              \"driver\":\"{}\",\"window\":{window_index},\"analyses\":{},\"entry_text_b\":{},\
              \"entry_ast_b\":{},\"display_b\":{},\"macro_b\":{},\"total_b\":{},\
              \"bytes_per_analysis\":{},\"entry_text_outstanding_b\":{},\
-             \"entry_ast_outstanding_b\":{},\"rss_grown_kib\":{}}}",
+             \"entry_ast_outstanding_b\":{},\"rss_grown_kib\":{},\"in_use_grown_b\":{},\
+             \"free_retained_grown_b\":{}}}",
             driver.label(),
             report.measured,
             report.entry_text,
@@ -10137,6 +10310,8 @@ mod leak_measurement {
             report.entry_text_outstanding,
             report.entry_ast_outstanding,
             report.rss_grown,
+            json_or_null(report.in_use_grown),
+            json_or_null(report.free_retained_grown),
         );
     }
 
