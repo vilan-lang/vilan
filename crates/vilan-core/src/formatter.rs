@@ -6278,9 +6278,9 @@ mod signature_layout {
     //! and why it is intended rather than an oversight.
     //!
     //! Each pin runs the whole formatter contract through `assert_construct`.
+    use super::LINE_BUDGET;
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::{assert_over_budget, columns};
-    use super::{LINE_BUDGET, format};
 
     /// The motivating signature — `serve_connected` as it stood in
     /// `std/src/process/rpc_server.vl` (since retired, E71): 172 columns of
