@@ -362,9 +362,11 @@ async fun main() {
 `head`/`body` take raw markup and append (a favicon, an `og:` tag, a CSP,
 a `<noscript>`), which is what keeps the generated document small enough
 to be worth having: everything else is derived. They are an escape hatch,
-not an exemption — markup you add there is checked like any other, so a
-`<link>` to a stylesheet the build did not emit is caught wherever it came
-from.
+not an exemption — when `html()` writes the page, markup you added there
+is checked like any other, so a `<link>` to a stylesheet the build did not
+emit stops the boot exactly as it would in a hand-written shell. A
+document with no hatch markup is derived from the build alone and runs no
+check at all.
 
 `render(view)` is the server-rendering splice ([SSR](../guide/ssr.md)):
 the markup goes *inside the mount element*, because the document already
