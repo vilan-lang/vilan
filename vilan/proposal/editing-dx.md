@@ -2427,3 +2427,101 @@ red with the head-item recovery reverted to declining. The `?.`-lifted call pin
 is honestly vacuous against the E66 plant (§18.1's last note) and the three
 negatives are vacuous by construction — they pin the boundary, and the E67
 plant is exactly what they must survive.
+
+## 19. What shipped — the hover crash and the member format (E73/E72, 2026-08-20)
+
+Two owner reports from 2026-08-19, one lane (`e73-hover` off `next`), the crash
+first. Both live in the same function family — `Document::hover`'s fallback
+chain (`crates/vilan-lsp/src/document.rs`) — and the crash's mechanism turned
+out to be the format bug's mechanism too. Zero corpus golden movement by
+construction (LSP + docs only).
+
+### 19.1 E73 — hovering `get_safe` killed the server
+
+**The shape.** A module-level `let client_context =
+Context<TodoClient<SocketTransport>>::new();` with no provider, and a
+`fun probe() { client_context.get_safe(); }`. Hovering `get_safe`:
+"thread 'main' has overflowed its stack", SIGABRT, VS Code restarts the
+server, the re-hover re-kills it, five rounds, "will not be restarted".
+
+**Mechanism, verified by probe.** The tracker's framing ("a file whose
+analysis carries errors — the E68 cascade — is the enabling condition") is
+NOT what the probe shows: the distilled repro (`import std::context::Context;`
++ the two lines above, on `Context<i32>`) analyzes with **zero diagnostics**
+and still crashes. The enabling condition is the context-threading pass
+itself (`vilan-core/src/context.rs`, `apply`): it mints a hidden parameter
+per needs-context function — `entity_map[hidden] = Parameter(hidden)`, the
+self-describing convention real parameter declarations also use — but unlike
+the analyzer it records **no `parameters` entry, no span, no `expr_types`
+label**, and then rewires the `get_safe()` call's own entity record to
+`Local(hidden)`. So the hover chain under the member name reaches a
+self-looped, typeless binding: `hover_label`'s `Expr::Local/Variable/
+Parameter` arm resolved `id → binding` recursively (`.or_else(||
+self.hover_label(program, *binding))`) with no cycle guard, and recursed off
+the stack. The self-loop is therefore not itself mis-wiring — it is the
+normal declaration convention — the anomaly is a *tooling-invisible*
+parameter (typeless, spanless, recordless) reachable from a hover chain.
+
+**The fix** (general): `hover_label`, `function_target`, and `definition_of`
+walk their `id → binding` and `call → subject` chains iteratively with a
+seen-list and answer the honest `None` when a chain closes on itself. The
+other `entity_map` walkers were audited: `binding_hover`,
+`type_declaration_target`, `target_of`, `const_value_label` resolve one step
+and stop; `expression_type_id` (§18) already carries its depth bound.
+
+**Pins** (document.rs tests): the lowered `get_safe` shape end-to-end —
+`Document::analyze` + `hover` returns, with the enabling self-loop asserted
+as a precondition so the pin announces itself if the lowering changes — plus
+a synthetic two-node `entity_map` cycle, a synthetic call-record cycle
+through all three guarded resolvers, the honest `None` on a chain that ends
+recordless, and the legitimate use → binding chain still resolving.
+Plant-proven: with the recursive `hover_label` planted back, the end-to-end
+pin aborts with the owner's exact stack overflow.
+
+### 19.2 E72 — member hovers wore the pre-house-style bare label
+
+**The shape.** Hovering `bar` in `foo.bar` answered the raw analyzer type
+string (`str`, `List<i32>`) — no fence, no `name: T`; and
+`client_context.get_safe()` could hover as `enum Option` (or, per §19.1,
+crash).
+
+**Why `get_safe` missed `function_target`.** Not a resolution gap in the
+LSP's method path — a *lowering erasure*. For a normal method call the wired
+subject (`Expr::Local(method_fn)`) answers the declaration already. The
+context pass overwrites the lowered call's `entity_map` record
+(`Local(hidden)` for a plain get, `Null` for `Context::new()`), so
+`function_target`'s `Expr::Call` arm never fires — but the pass leaves
+`program.function_calls[call]` standing **with its original wired subject**
+(probe: `function_calls[call].subject → Local(get_safe_fn)`, label
+`external fun get_safe(self): Option<T>`). `function_target` now falls back
+to that surviving call record when the entity record resolves nothing —
+general (plain gets, `none_gets`, `Context::new()` all answer their source
+declaration), no `get_safe` special case.
+
+**The residual, named honestly:** the two lowerings that rewire
+`function_calls[call].subject_id` itself — a *covered* `get_safe` (the
+`Some`-wrap) and `Context::run` — leave nothing that names the source
+callee, so those hovers still answer the lowered view (`enum Option` /
+the closure's type, now fenced). Closing that wants the deeper fix: the
+lowering mutates the analyzed program in place, destroying source truth
+tooling needs. Either the pass records what it erases (a small side table)
+or the emitter gets its own lowered view of the program — a refactor filed
+here rather than built around.
+
+**The format fix:** `Document::hover` gained a `member_hover` step between
+`binding_hover` and the bare fallback — a member READ (a
+`member_name_spans` entry, no call record) answers the fenced
+`name: type_label`, the name sliced from the member span (tuple members —
+`pair.0` — get it free); and the bare `hover_label` fallback itself now
+wraps in the ```` ```vilan ```` fence, so every hover reads as code. The
+editor appendix's hover line names the member shapes
+(`docs/appendix/editor.md`; the D18 `book_sync` gate stayed green through
+the wording change).
+
+**Pins:** a field access (`p.x` ⇒ ```` ```vilan\nx: i32\n``` ````), a std
+method name (`name.len()` ⇒ the fenced `external fun len(self): i32`), the
+`get_safe` shape (the fenced declaration with its std doc), the fenced bare
+fallback (an index expression), and — `main.rs` — a member hover through
+the handler answering the house shape from the analyzed snapshot across a
+pending un-analyzed edit. All existing hover pins (`.contains`-based)
+passed unchanged; no shipped test was altered.

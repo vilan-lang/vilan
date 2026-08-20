@@ -38,7 +38,8 @@ breaking a shared module lights up its consumers rather than waiting for
 you to visit them.
 
 **Hover** — inferred types on locals and parameters, loan conventions
-included; your own doc comments; and documentation on the language's own
+included; a field's `name: type` and a method's full signature behind a
+`.`; your own doc comments; and documentation on the language's own
 keywords, deep-linked into this book.
 
 **Inlay hints** — the inferred type of a binding you left unannotated

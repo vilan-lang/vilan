@@ -35,6 +35,12 @@ The host-boundary check (direct and transitive arms both) now knows the intrinsi
 
 ---
 
+**The editor no longer crashes on a hover over an untyped chain, and member hovers wear the house format.** Hovering `get_safe` on a module-level `Context<…>` binding that nothing provides killed the language server outright — "thread 'main' has overflowed its stack", the client restarts it, the re-hover re-kills it, and after five rounds VS Code stops restarting it. The context-threading pass lowers such a read to a hidden, pass-minted parameter whose entity record points at itself and carries no type, and the hover resolver followed the id → binding chain recursively with no cycle guard, so that self-loop recursed the server off its stack. The entity-chain walkers — hover's, the requirement resolver's, go-to-definition's — now walk iteratively with a seen-list and answer an honest nothing when a chain closes on itself.
+
+And what a member hover *answers* is now the house shape. A field hovers as the fenced `bar: T` rather than the bare analyzer type string; a method name answers the method's full declaration with its doc — the lowered `get_safe` included, resolved through the call record the lowering leaves standing, where it used to answer `enum Option` or nothing; and whatever still falls through to a bare type label gets the `vilan` fence, so every hover reads as code. The editor appendix's hover line now names the member shapes.
+
+---
+
 <!-- family: breaking -->
 **`std::http`'s `build_handler` is removed.** It was `serve_build`'s fold as a plain `|Request| Response` — the same reads, the same routes, the same dev-mode freshness — packaged for a boot function that builds its own `Server` and hands you only a fallback, and it shipped with the full-stack sweep as a stopgap: `serve_service` handed over no builder to install `serve_build` on, and the two examples the book teaches from were still on `serve_service`. Both moved onto the builder, and nothing has called it since.
 

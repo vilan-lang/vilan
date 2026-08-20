@@ -3101,6 +3101,54 @@ mod snapshot_consistency_tests {
         assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
     }
 
+    // The member path (E72): a FIELD hover through the handler answers the
+    // house-styled `name: T`, and keeps answering the analyzed snapshot while
+    // an un-analyzed edit is pending — the same wiring pin as above, on the
+    // member fallback the format change routed differently.
+    #[tokio::test]
+    async fn member_hover_answers_the_house_style_while_typing() {
+        const MEMBER_SOURCE: &str = "struct Point {\n\tx: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet n = p.x;\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(MEMBER_SOURCE));
+        let field = position_at(MEMBER_SOURCE, "p.x", 2);
+        let params = |uri: &Url| HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: field,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let baseline = backend.hover(params(&uri)).await.expect("hover");
+        let rendered = format!("{baseline:?}");
+        assert!(
+            rendered.contains("x: i32"),
+            "the field hovers in the house shape: {rendered}"
+        );
+        // The un-analyzed edit: a prepended comment line skews every
+        // conversion below it.
+        let mut edited = String::from("// a new first line\n");
+        edited.push_str(MEMBER_SOURCE);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&edited);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert_ne!(
+                document.analyzed_offset(field),
+                document.line_index.offset(field),
+                "the fixture must skew the inbound conversion",
+            );
+        }
+        let mid_edit = backend.hover(params(&uri)).await.expect("hover mid-edit");
+        assert_eq!(rendered, format!("{mid_edit:?}"));
+    }
+
     #[tokio::test]
     async fn goto_definition_answers_the_analyzed_snapshot_while_typing() {
         let (service, _socket) = backend();
