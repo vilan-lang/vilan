@@ -153,8 +153,8 @@ import std::reactive::Signal;
 import std::json::json_codec;
 import std::option::Option::{ self, Some, None };
 import std::process::args;
-import std::http::Response;
-import std::rpc_server::serve_service;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
 import common::StatusBoard;
 
 async fun main() {
@@ -166,9 +166,13 @@ async fun main() {
 		None => 0,
 	};
 	let board = StatusBoard { status = Signal::new(initial) };
-	serve_service(9297, board.dispatcher().into_protocol(json_codec()), |request| {
-		Response::builder().code(404).body("nope").build()
-	}, |server| print(i"listening {initial}"));
+	Server::builder()
+		.port(9297)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"listening {initial}"))
+		.build()
+		.start();
 }
 "#;
 

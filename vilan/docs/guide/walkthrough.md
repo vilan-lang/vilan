@@ -203,9 +203,8 @@ plus [`with_service`](services.md#growing-past-one-service) installs the
 rpc routes and the WebSocket upgrade in front of `on_request`, so the page
 and the service share one port without one of them replacing the other's
 boot function — delete the `.with_service(…)` line and this file still
-compiles and still serves the page. (`serve_service(port, protocol,
-fallback, on_ready)` is the same layer pre-wired, and still the shorter
-spelling for a server that is only a service.)
+compiles and still serves the page. (A server that is only a service is
+the same chain with the `serve_build`/`on_request` lines left off.)
 
 `on_request` then serves the shell for every path neither the service nor
 the build claims. That's what makes deep links like `/note/7` load

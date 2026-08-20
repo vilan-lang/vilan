@@ -4,10 +4,11 @@
 //! longest mount first, independent of call order — and the segment match
 //! fixes the old `path.starts_with(…)` collision (§10.8).
 //!
-//! `rpc_http.rs`, `transport_robustness.rs` and `streaming.rs` are the wire
-//! pin for `serve_rpc`/`serve_service`/`serve_connected` themselves (unchanged
-//! programs, unchanged output); this file pins what's NEW — the layer those
-//! three functions are now four-line bodies over.
+//! `rpc_http.rs`, `transport_robustness.rs` and `streaming.rs` drive the
+//! layer's routes and lifecycle over real wires; this file pins the layer's
+//! own contract — the fold, the mounts, the segment match, and the recorded
+//! wire bytes (below) that survive the retirement of the `serve_rpc`/
+//! `serve_service`/`serve_connected` boot functions the layer replaced (E71).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -499,11 +500,17 @@ fn raw_http_bounded(port: u16, request: &str, timeout: Duration) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
+/// The wire-contract server: one service on `/`, a path-echoing fallback. Its
+/// responses are pinned below as literal bytes recorded BEFORE the layer
+/// existed, so the wire contract survives each respelling of the boot code —
+/// pre-layer `serve_service` (captured 2026-08-11), then `serve_service` as
+/// sugar over the layer, now the builder chain itself (`serve_service`
+/// retired 2026-08-20, E71).
 const BYTE_IDENTICAL_SERVER: &str = r#"import std::print;
 import std::shared::Shared;
 import std::json::json_codec;
-import std::http::Response;
-import std::rpc_server::serve_service;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
 
 [service(Client)]
 struct Counter {
@@ -520,20 +527,26 @@ impl Counter {
 
 fun main() {
 	let counter = Counter { count = Shared::new(0) };
-	serve_service(0, counter.dispatcher().into_protocol(json_codec()), |request| {
-		Response::builder().code(404).body(i"fallback:{request.path()}").build()
-	}, |server| print(i"ready {server.port()}"));
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body(i"fallback:{request.path()}").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
 }
 "#;
 
 #[test]
-fn serve_service_over_the_layer_is_byte_identical_on_the_wire() {
-    // §4.6/§8: `serve_service` becomes a four-line body over `with_service`,
-    // and the claim is that nothing about the wire moved. Pinned as EXACT
-    // status lines, header values and bodies for the three mounted routes
-    // plus the fallback — captured against the pre-layer implementation
-    // (2026-08-11) and reproduced here byte for byte (the connection id is
-    // deterministic: `next_connection` starts at 0 per fresh process).
+fn the_builders_wire_matches_the_bytes_recorded_from_serve_service() {
+    // §4.6/§8's claim was that `serve_service` over the layer moved nothing
+    // on the wire, pinned as EXACT status lines, header values and bodies for
+    // the three mounted routes plus the fallback — captured against the
+    // pre-layer implementation (2026-08-11). E71 retired `serve_service`
+    // (2026-08-20); the recorded bytes below are that capture, unchanged, and
+    // the builder chain — the layer the trio was sugar over — must still
+    // serve every one of them (the connection id stays deterministic:
+    // `next_connection` starts at 0 per fresh process).
     let dir = temp_project("byte_identical");
     write(
         &dir,

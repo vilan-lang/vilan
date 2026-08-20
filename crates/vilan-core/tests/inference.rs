@@ -11106,8 +11106,8 @@ fn client_connect_enforces_the_contract_and_wires_mirrors() {
     // call opens the socket, VERIFIES the contract hash (Q6 enforcement — the
     // drift case below refuses with Err(Contract) before any decode), calls
     // the generated __attach against the runtime session registry
-    // (serve_service), and wires one RemoteSource mirror per [expose]d field
-    // in declaration order — both mirrors deliver.
+    // (`Service::new`'s default lifecycle), and wires one RemoteSource mirror
+    // per [expose]d field in declaration order — both mirrors deliver.
     //
     // Both servers bind port 0 and the ready callbacks report what they got
     // (backlog E19): literals collided in the v0.12.0 release gate
@@ -11124,11 +11124,11 @@ import std::print;
         import std::json::{ Json, FromJson, json_codec };
         import std::reactive::Signal;
         import std::shared::Shared;
-        import std::rpc_server::serve_service;
-        import std::http::Response;
-        
+        import std::rpc_server::Service;
+        import std::http::{ Response, Server };
+
         // The whole paradigm, zero manual wiring: [expose]d state + [rpc] methods,
-        // serve_service on the server, Client::connect on the client.
+        // a Service on the server's builder, Client::connect on the client.
         [service(Client)]
         struct Board {
         	[expose] count: Signal<i32>,
@@ -11159,20 +11159,22 @@ import std::print;
         
         fun main() {
         	let board = Board { count = Signal::new(0), label = Signal::new(""), total = Shared::new(0) };
-        	serve_service(
-        		0,
-        		board.dispatcher().into_protocol(json_codec()),
-        		|request| Response::builder().code(404).body("probe").build(),
-        		|board_server| {
+        	Server::builder()
+        		.port(0)
+        		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+        		.on_request(|request| Response::builder().code(404).body("probe").build())
+        		.on_start(|board_server| {
         			let other = Other { value = Shared::new(0) };
-        			serve_service(
-        				0,
-        				other.dispatcher().into_protocol(json_codec()),
-        				|request| Response::builder().code(404).body("probe").build(),
-        				|other_server| drive(board_server.port(), other_server.port()),
-        			);
-        		},
-        	);
+        			Server::builder()
+        				.port(0)
+        				.with_service(Service::new(other.dispatcher().into_protocol(json_codec())))
+        				.on_request(|request| Response::builder().code(404).body("probe").build())
+        				.on_start(|other_server| drive(board_server.port(), other_server.port()))
+        				.build()
+        				.start();
+        		})
+        		.build()
+        		.start();
         }
         
         fun drive(board_port: i32, other_port: i32) {

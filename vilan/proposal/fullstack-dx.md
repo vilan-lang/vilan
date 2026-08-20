@@ -2491,3 +2491,82 @@ Next: the owner has said the `serve_rpc` / `serve_service` /
 `serve_connected` trio is to be retired too — E71 in the tracker, a
 separate slice; this one touched none of them, and the guides' remaining
 `serve_service` mentions are that slice's to sweep.
+
+### 16.9 E71 — the `serve_*` trio retired (2026-08-20)
+
+The owner RULED it with E64 ("I'd like the others retired soon as
+well"); the tracker carried it as E71. `serve_rpc`, `serve_service` and
+`serve_connected` are deleted from `std/src/process/rpc_server.vl`, and
+the audit found exactly one thing that died with them: `rpc_response`,
+the text-only rpc mount whose sole caller was `serve_rpc` (documented as
+composable into `on_request`, but no code, docs fence or example ever
+did). Everything else in the module is the builder path's and stays —
+`Service`, `with_service`, the request/upgrade folds, the connection
+registry, `accept_socket`, `ws_accept_key`, and `std::rpc`'s
+`register_session`/`drop_session` (which `Service::new`'s default
+lifecycle installs). The `Server` import fell out of the module as
+unused, and the lifecycle/leak prose that lived on `serve_connected`'s
+doc comment (a connection ends when its stream closes; `on_disconnect`
+is where the app drops its session) moved to the `Service` struct's.
+
+§4.6's migration story ("there isn't one") is superseded by the trio's
+own bodies, which ARE the migration: `serve_service(port, protocol,
+fallback, on_ready)` is `Server::builder().port(port).with_service(
+Service::new(protocol)).on_request(fallback).on_start(on_ready)
+.build().start()`; `serve_connected` puts its two hooks on the service
+(`.on_connect(…).on_disconnect(…)`); `serve_rpc` is the chain with no
+fallback — and one real wire change, the only one in the slice: the
+text mount answered rpc on EVERY path, the service answers on
+`{mount}rpc`, so an `HttpTransport` that dialed the bare origin dials
+`http://host:port/rpc` now. The changelog's breaking entry and
+`std/rpc.md` both say so.
+
+Where the consumers went. The four e2e suites spell the chain
+(`rpc_http.rs`'s six servers, `transport_robustness.rs`'s restartable
+server, `streaming.rs`'s comment); `inference.rs`'s
+`client_connect_enforces_the_contract_and_wires_mirrors` spells its two
+servers on it; the benchmarks moved with their no-op lifecycles kept
+no-op (`.on_connect(|id, end| {})` — no session registered per
+benchmark connection, where `Service::new`'s default would have
+registered one), and the throughput json-http leg dials `/rpc` where it
+dialed `/` — it now rides the same byte-reading route as its binary
+sibling, worth knowing when comparing against pre-E71 numbers.
+`guide/services.md`'s opening example teaches the chain and its
+"growing" section describes the layer without a sugar to contrast;
+`guide/walkthrough.md` lost the parenthetical; `std/rpc.md` and
+`std/process.md` lost the signatures; `persistence.md`, `ssr.md` and
+`routing.md` had nothing left to sweep (§16.8 got there first). The
+benchmarks README and `examples/todo`'s README each traded their one
+mention for the layer's name. `formatter.rs`'s two motivating-shape
+comments are marked historical (the test inputs keep the old
+signatures as data, which is what they always were).
+
+The wire pin survives its subject. `service_layer.rs`'s byte-identity
+test proved the layer against a `serve_service` program; with the trio
+gone that spelling is unbuildable, so the pin now states the contract
+directly: the RECORDED bytes — the same literals captured against the
+pre-layer implementation (2026-08-11) — asserted against the builder
+chain (`the_builders_wire_matches_the_bytes_recorded_from_serve_service`),
+with the capture's provenance in the test's comment. The wire contract
+outlives every respelling of the boot code, which was the §4.6 claim
+all along.
+
+Outside the repo: kolt's `vilan-migration` branch still calls
+`serve_service` (§16.4's and §16.8's read-only greps). With the trio
+gone that branch does not compile against v0.35.0, so
+`proposal/e63-drafts/kolt-server.patch` — together with the A25
+remote-sources migrations for the same branch (`kolt/src/client.vl`,
+`probe.vl`, `views.vl`; `remote-sources.md` §9) — is REQUIRED for kolt
+on v0.35.0, not optional modernization. The playground todo app was
+already moved (§16.6) and is unaffected.
+
+The gates. Corpus 7 passed, byte-identical (no golden moved — no corpus
+program named the trio); docs 8 passed; the migrated inference pin
+green; `rpc_http` 6, `service_layer` 5, `transport_robustness` 1,
+`streaming` 3, `benchmarks` 1 — all passed with no assertion moved
+except the byte-identity pin's reframing above; full suite green by
+exit code (the lane's report has the line). Not verified: a browser
+client against a migrated server (no browser here — the e2e wires are
+the measurement), and kolt itself (read-only by standing rule). E70
+(`Document::html()` over the head/body hatches) was NOT ruled and is
+untouched by this slice.
