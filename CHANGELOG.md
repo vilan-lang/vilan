@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**A failed `owner_scope` coverage check no longer drags spurious std-anchored "cannot await a Vilan closure" errors behind it.** Any `owner_scope` coverage failure — a `Signal::effect` at the top of `main`, a `map`/`or` on a service mirror outside any scope — reported the real error and then up to two spurious ones anchored inside the standard library itself (`task.vl`'s nursery body, `rpc.vl`'s wire turn): ``run` is a host (`external`) function: it cannot await a Vilan closure`. The mechanism: `Context::run` is `external` only as a type-checking fiction — the context threading pass erases every `run` call it accepts, so the host-await check never sees one in a program that compiles. When the coverage check refuses, the pass leaves the `run` calls standing, and the host-boundary check then judged std's own async-into-`run` bodies as misuses.
+
+The host-boundary check (direct and transitive arms both) now knows the intrinsic is never a host boundary, so a coverage failure reports exactly the coverage error — and a genuine async closure into a real `external` function still errors as before.
+
+---
+
 <!-- family: breaking -->
 **`std::http`'s `build_handler` is removed.** It was `serve_build`'s fold as a plain `|Request| Response` — the same reads, the same routes, the same dev-mode freshness — packaged for a boot function that builds its own `Server` and hands you only a fallback, and it shipped with the full-stack sweep as a stopgap: `serve_service` handed over no builder to install `serve_build` on, and the two examples the book teaches from were still on `serve_service`. Both moved onto the builder, and nothing has called it since.
 

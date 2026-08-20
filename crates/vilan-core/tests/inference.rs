@@ -32711,6 +32711,84 @@ fn an_async_closure_into_an_extern_callback_is_refused() {
     );
 }
 
+/// E68 — the coverage-error cascade. Any `owner_scope` coverage failure makes
+/// `thread_contexts` refuse its rewrite, leaving `Context::run` calls visible
+/// to the host-boundary check, which then judged std's own async-into-`run`
+/// bodies (task.vl's nursery, rpc.vl's wire turn) as host-await misuses — a
+/// false secondary anchored in std beside the primary. `run` is `external`
+/// only as a type-checking fiction (the threading pass erases every call it
+/// accepts), so it is never a host boundary; only the primary reports.
+#[test]
+fn e68_an_uncovered_effect_reports_only_the_coverage_primary() {
+    let source = r#"
+        import std::print;
+        import std::reactive::Signal;
+
+        fun main() {
+            let counter = Signal::new(0);
+            counter.effect(|value| print(value));
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "cannot await a Vilan closure");
+}
+
+/// E68's second probe shape: a closure VALUE passed to `run` trips the
+/// `run`-shape rule (and the coverage fence for the closure's own reads);
+/// the refused rewrite must not surface the host-await secondary either.
+#[test]
+fn e68_a_refused_run_shape_reports_only_the_context_primaries() {
+    let source = r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        fun main() {
+            let counter = Signal::new(0);
+            let body = || {
+                counter.effect(|value| print(value));
+            };
+            owner_scope.run(Owner::new(), body);
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "`run` must be called on a named context with a closure literal body",
+    );
+    assert_fails_without(source, "cannot await a Vilan closure");
+}
+
+/// E68's transitive arm: an async closure forwarded through a generic into
+/// `run` used to trip `extern_violations_at` too ("reaches the host
+/// (`external`) function `run`") — same false premise, same exemption. The
+/// `assert_fails_without` fragment appears in both the direct and the
+/// transitive spurious message, so this pin holds both arms shut.
+#[test]
+fn e68_a_generic_forward_into_run_does_not_cascade_transitively() {
+    let source = r#"
+        import std::reactive::{ Owner, owner_scope };
+        import std::time::sleep;
+
+        fun helper<T>(body: || T): T {
+            owner_scope.run(Owner::new(), body)
+        }
+
+        fun main() {
+            let value = helper(|| {
+                sleep(1);
+                2
+            });
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "`run` must be called on a named context with a closure literal body",
+    );
+    assert_fails_without(source, "cannot await a Vilan closure");
+}
+
 #[test]
 fn adaptation_cannot_ride_a_trait_dispatch() {
     assert_fails_with(
