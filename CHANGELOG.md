@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: feature -->
+**`head()`/`body()` now work on a supplied shell — and are checked there.** On a document from `require_shell`/`Document::from_shell`, the `head()`/`body()` escape hatches were silently inert: the call compiled, the boot succeeded, and the served page carried none of the markup — `html()`'s supplied arm served the shell's bytes plus the render splice, and the hatch fields never reached it. They now compose: `head()` markup splices in immediately before the shell's own `</head>`, `body()`'s immediately before its `</body>`, and the composed page runs the same `check_shell` rules a hand-written shell faces — `from_shell`'s check covered the shell alone — refusing the boot with the same report, its envelope naming the shell's source and the hatch provenance (`src/app.html composed with this document's `head`/`body` markup does not match…`). A shell that lacks the closing tag a used hatch aims at is refused at `html()` too, naming every missing tag and both fixes — `check_shell` guarantees the mount element and the bundle's script tag, not the closing tags, so composing would otherwise have to guess a position the author cannot see.
+
+Note plainly: previously-inert calls START DOING SOMETHING. A supplied-shell boot that silently ignored a `head()`/`body()` call yesterday now serves that markup — or refuses to start, if the markup never matched the build or the shell has no closing tag for it. A supplied document with no hatch markup is untouched: byte-identical output, no check beyond the one `require_shell` already ran. (`proposal/fullstack-dx.md` §16.12; tracker E77.)
+
+---
+
 <!-- family: diagnostics -->
 **The `owner_scope` coverage error now points at your call, not into the standard library.** A `Signal::effect` at the top of `main`, a `map`/`or` on a service mirror outside any scope — the "context `owner_scope` is read here, but this code can be reached without an enclosing `run`" refusal anchored at the strict read all three helpers funnel to: `get_owner`'s body in std's `reactive.vl`, a file you didn't write, sitting in a std cache directory. The message was right; the location failed the anchoring rules' second law (an error caused by user code never anchors in std).
 

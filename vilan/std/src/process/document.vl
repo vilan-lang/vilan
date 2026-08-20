@@ -21,9 +21,10 @@
 // takes a plain `str`: a shell read from disk, templated, or fetched from a CMS.
 // `Document` is a value over the same rules, and `Document::from_shell` is the
 // rung-0 escape hatch made safe — the markup is yours, and we will still tell
-// you when it is wrong. The generated document's own `head`/`body` hatches are
-// the same doctrine at rung 2: raw markup, still checked — at `html()`, where
-// the page is assembled (E70).
+// you when it is wrong. The `head`/`body` hatches are the same doctrine one
+// rung further: raw markup, still checked — at `html()`, where the page is
+// assembled, on a generated document (E70) and on a supplied shell alike
+// (E77, where the markup splices in before the shell's own closing tags).
 //
 // **How loud is loud** (§10.7, ruled): a fault stops the server from STARTING,
 // naming the file, the fault and the fix. That is defensible precisely because
@@ -200,6 +201,11 @@ struct Document {
 	/// The markup, when it was supplied (`from_shell`) rather than generated
 	/// (`of`) — and checked before this value existed.
 	shell: Option<str>,
+	/// Where a SUPPLIED shell's markup came from, for the composed page's own
+	/// report (E77): `require_shell`'s file path, or `from_shell`'s generic
+	/// name for markup that arrived as a value. Empty for a generated
+	/// document, whose report names the document itself.
+	source: str,
 	/// The `<title>`'s text. Empty until `title()` says otherwise: a document
 	/// that was not given one has no title rather than an invented one.
 	title: str,
@@ -239,6 +245,7 @@ impl Document {
 		Document {
 			build = build,
 			shell = None,
+			source = "",
 			title = "",
 			lang = "en",
 			mount = default_mount,
@@ -250,7 +257,10 @@ impl Document {
 	}
 
 	/// A hand-authored shell, CHECKED: the rung-0 escape hatch made safe — the
-	/// same `Document` value, its markup supplied rather than generated.
+	/// same `Document` value, its markup supplied rather than generated. The
+	/// `head`/`body` hatches compose into it too, spliced in before its
+	/// `</head>`/`</body>` when `html()` writes the page — and checked there
+	/// (E77).
 	///
 	/// The mount element is `"app"`, which is what every shell in this tree
 	/// uses. A shell that mounts elsewhere calls `check_shell(shell, build,
@@ -258,7 +268,7 @@ impl Document {
 	/// precisely so that dropping a rung never drops the check.
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>> {
 		match check_shell(shell, build, default_mount) {
-			Ok(let _checked) => Ok(Document { build = build, shell = Some(shell), title = "", lang = "en", mount = default_mount, head = "", body = "", rendered = "", splice = splice_point(shell, default_mount) }),
+			Ok(let _checked) => Ok(Document { build = build, shell = Some(shell), source = "this supplied shell", title = "", lang = "en", mount = default_mount, head = "", body = "", rendered = "", splice = splice_point(shell, default_mount) }),
 			Err(let faults) => Err(faults),
 		}
 	}
@@ -289,6 +299,10 @@ impl Document {
 
 	/// Raw markup appended inside `<head>`: a favicon, an `og:` tag, a CSP, an
 	/// inline `<style>` for the page frame. Repeatable — each call appends.
+	/// On a generated document it lands inside the `<head>` the document
+	/// writes; on a supplied shell it splices in immediately before the
+	/// shell's own `</head>` (E77) — a shell that carries no `</head>` stops
+	/// at `html()` rather than having the markup guessed into it.
 	///
 	/// It is raw on purpose (that is what an escape hatch is), and it is not an
 	/// exemption: when the page is written, `html()` runs the assembled markup
@@ -300,8 +314,10 @@ impl Document {
 		self
 	}
 
-	/// Raw markup appended inside `<body>`, before the script tag. Repeatable.
-	/// An escape hatch like `head`, and checked at `html()` like it too.
+	/// Raw markup appended inside `<body>` — before the script tag on a
+	/// generated document, immediately before the shell's own `</body>` on a
+	/// supplied one (E77). Repeatable. An escape hatch like `head`, and
+	/// checked at `html()` like it too.
 	fun body(own self, markup: str): Document {
 		self.body = self.body + markup;
 		self
@@ -332,20 +348,37 @@ impl Document {
 	/// and then it is a framework.
 	///
 	/// This is also where the `head`/`body` escape hatches meet the rules
-	/// (E70, §16.10): a generated page carrying hatch markup runs through
+	/// (E70, §16.10; E77, §16.12): a page carrying hatch markup runs through
 	/// `check_shell` before it is handed back, and a fault stops the boot —
-	/// every fault and its fix, exactly as a hand-written shell's would. A
-	/// page with no hatch markup runs no check at all: it is derived from the
-	/// build alone and cannot fail, so its bytes are exactly what they always
-	/// were. A supplied shell was checked when `from_shell` accepted it.
+	/// every fault and its fix, exactly as a hand-written shell's would. That
+	/// holds at both rungs: a generated page is checked as assembled, and a
+	/// supplied shell as COMPOSED — its own bytes plus the spliced hatch
+	/// markup — because `from_shell`'s check covered the shell alone. A page
+	/// with no hatch markup runs no check at all: the generated one is
+	/// derived from the build and cannot fail, and the supplied one is the
+	/// shell `from_shell` already accepted, byte for byte (plus the render
+	/// splice).
 	fun html(self): str {
 		match self.shell {
-			// Supplied: its own bytes, with any render spliced into the mount
-			// element the check located.
-			Some(let markup) => if self.rendered == "" {
-				markup
-			} else {
-				markup.substring(0, self.splice) + self.rendered + markup.substring(self.splice, markup.len())
+			// Supplied: its own bytes, composed — the render spliced into the
+			// mount element the check located, and any hatch markup spliced
+			// in before the closing tag it aims at (E77).
+			Some(let markup) => {
+				let composed = self.composed(markup);
+				// The same rule as the generated arm below, at the same
+				// moment: hatch markup is raw and can break what
+				// `from_shell`'s check proved, so a page carrying any is
+				// re-checked whole. The mount id is the one `from_shell`
+				// located — `mount()` documents that it does not move a
+				// supplied shell's mount, so the check does not read it
+				// either.
+				if self.head != "" || self.body != "" {
+					match check_shell(composed, self.build, default_mount) {
+						Ok(let _checked) => {},
+						Err(let faults) => panic(fault_report(i"{self.source} composed with this document's `head`/`body` markup", self.build, faults)),
+					}
+				}
+				composed
 			},
 			None => {
 				let markup = self.generated();
@@ -391,6 +424,54 @@ impl Document {
 		markup = markup + "\t\t" + script_tag(self.build) + "\n";
 		markup + "\t</body>\n</html>\n"
 	}
+
+	/// The supplied shell with this document's own markup spliced in: the
+	/// render inside the mount element `from_shell`'s check located (§5.8),
+	/// `head()`'s markup immediately before the shell's `</head>`, and
+	/// `body()`'s immediately before its `</body>` (E77). The closing tags
+	/// are read the way the check reads markup — a `</head>` inside a
+	/// comment or a script body is no splice point, for the same reason it
+	/// is no closing tag to a browser.
+	///
+	/// The check guarantees the mount element and the bundle's script tag,
+	/// NOT the closing tags — a browser tolerates their absence — so a shell
+	/// `from_shell` accepted can still lack the tag a used hatch aims at.
+	/// That stops here, naming every missing tag rather than the first
+	/// (§5.6's doctrine): the markup has nowhere to land, and guessing a
+	/// position would put it somewhere the author cannot see. A document
+	/// with no render and no hatch markup composes to the shell's own bytes,
+	/// untouched.
+	fun composed(self, shell: str): str {
+		mut insertions: List<(i32, str)> = [];
+		mut missing: List<str> = [];
+		if self.rendered != "" {
+			insertions.push((self.splice, self.rendered));
+		}
+		if self.head != "" {
+			match closing_point(shell, "head") {
+				Some(let at) => insertions.push((at, self.head)),
+				None => missing.push(missing_closing_tag(self.source, "head")),
+			}
+		}
+		if self.body != "" {
+			match closing_point(shell, "body") {
+				Some(let at) => insertions.push((at, self.body)),
+				None => missing.push(missing_closing_tag(self.source, "body")),
+			}
+		}
+		if !missing.is_empty() {
+			mut report = "";
+			for problem in missing {
+				report = if report == "" {
+					problem
+				} else {
+					report + "\n" + problem
+				};
+			}
+			panic(report);
+		}
+		spliced(shell, insertions)
+	}
 }
 
 /// The bundle's script tag, in the form the build requires (§3.5): a classic
@@ -417,6 +498,53 @@ fun splice_point(shell: str, mount: str): i32 {
 	0
 }
 
+/// Where hatch markup destined for inside an element goes in a supplied
+/// shell: the index of the shell's first `</name>` — insertion happens BEFORE
+/// the closing tag — or `None` when the shell carries no such tag (E77).
+fun closing_point(shell: str, name: str): Option<i32> {
+	for tag in tags_of(shell) {
+		if tag.closing && tag.name == name {
+			ret Some(tag.start);
+		}
+	}
+	None
+}
+
+/// A used hatch with no closing tag to land before — the compose-time
+/// refusal's one line per missing tag (E77). Both fixes are real: give the
+/// shell the tag, or give the markup to the shell.
+fun missing_closing_tag(source: str, name: str): str {
+	i"{source} has no </{name}> for this document's {name}() markup to splice before — add </{name}> to the shell, or write the markup into the shell itself"
+}
+
+/// `text` with each insertion's markup spliced in at its index. The indices
+/// are into the ORIGINAL text; insertions apply in ascending index order, and
+/// two at the same index keep their list order.
+fun spliced(text: str, insertions: List<(i32, str)>): str {
+	// A stable sort by index — at most three insertions ever arrive, so the
+	// quadratic count is fine and the clarity is not.
+	mut ordered: List<(i32, str)> = [];
+	for insertion in insertions {
+		let (at, _markup) = insertion;
+		mut index = 0;
+		for entry in ordered {
+			let (before, _before_markup) = entry;
+			if before <= at {
+				index = index + 1;
+			}
+		}
+		ordered.insert(index, insertion);
+	}
+	mut result = "";
+	mut cursor = 0;
+	for entry in ordered {
+		let (at, markup) = entry;
+		result = result + text.substring(cursor, at) + markup;
+		cursor = at;
+	}
+	result + text.substring(cursor, text.len())
+}
+
 /// The shell at `path`, read and checked against `build` — or a stop naming the
 /// file, every fault and its fix. The server-boot idiom, and §10.7's "refuse to
 /// boot" doctrine spelled once.
@@ -429,16 +557,23 @@ fun splice_point(shell: str, mount: str): i32 {
 /// while the founding bug's report wants to say `src/app.html` first.
 fun require_shell(path: str, build: LegBuild): Document {
 	match Document::from_shell(fs::read_file_to_str(path), build) {
-		Ok(let document) => document,
+		Ok(let document) => {
+			// The document knows where its markup came from, so the composed
+			// page's own report (E77) can say the file's name first too.
+			mut named = document;
+			named.source = path;
+			named
+		},
 		Err(let faults) => panic(fault_report(path, build, faults)),
 	}
 }
 
 /// The markup from `source` does not match `build`, spelled for a person: the
 /// source, the leg, and one line per fault. `source` is where the markup came
-/// from — `require_shell`'s file path, or `html()`'s name for a generated
-/// page's own escape hatches — because a `ShellFault` is about markup and
-/// cannot know that itself.
+/// from — `require_shell`'s file path, or `html()`'s name for the hatch
+/// markup it checked (the generated document's own, or the supplied shell
+/// composed with it) — because a `ShellFault` is about markup and cannot
+/// know that itself.
 fun fault_report(source: str, build: LegBuild, faults: List<ShellFault>): str {
 	mut report = i"{source} does not match the `{build.leg}` build:";
 	for fault in faults {
@@ -449,15 +584,24 @@ fun fault_report(source: str, build: LegBuild, faults: List<ShellFault>): str {
 
 // --- Reading the markup ---------------------------------------------------
 
-/// One tag, as the scanner found it.
+/// One tag, as the scanner found it — opening or closing.
 struct Tag {
-	/// The tag name, lowercased — `link`, `script`, `div`.
+	/// The tag name, lowercased — `link`, `script`, `div`. A closing tag's
+	/// name has its `/` stripped: `</head>` scans as `head` with `closing`
+	/// set.
 	name: str,
 	/// Its attributes in source order, as `(lowercased name, raw value)`.
+	/// Always empty for a closing tag — which is also what keeps the checks,
+	/// every one attribute-keyed, reading opening tags only.
 	attributes: List<(str, str)>,
+	/// The index of its `<`. For a closing tag, the last position still
+	/// inside the element — the splice point hatch markup wants (E77).
+	start: i32,
 	/// One past its `>`, i.e. where its content begins — the splice point a
 	/// server-rendered document needs (§5.8).
 	end: i32,
+	/// Whether this is a closing tag (`</head>`).
+	closing: bool,
 }
 
 /// The value of `tag`'s `name` attribute, or `""` when it carries none. A bare
@@ -553,10 +697,29 @@ fun tags_of(markup: str): List<Tag> {
 			jump continue;
 		}
 		let after = markup.substring(index + 1, index + 2);
-		// A doctype, a processing instruction or a closing tag: nothing to read
-		// off it, so skip to its `>`.
-		if after == "!" || after == "?" || after == "/" {
+		// A doctype or a processing instruction: nothing to read off it, so
+		// skip to its `>`.
+		if after == "!" || after == "?" {
 			index = past(index_of(markup, ">", index + 1), 1, length);
+			jump continue;
+		}
+		// A closing tag: no attributes to read, but its position matters —
+		// it is where the compose splice aims (E77).
+		if after == "/" {
+			mut cursor = index + 2;
+			for cursor < length && is_name_char(markup.substring(cursor, cursor + 1)) {
+				cursor = cursor + 1;
+			}
+			let name = markup.substring(index + 2, cursor).to_lowercase_ascii();
+			let end = past(index_of(markup, ">", cursor), 1, length);
+			tags.push(Tag {
+				name = name,
+				attributes = [],
+				start = index,
+				end = end,
+				closing = true,
+			});
+			index = end;
 			jump continue;
 		}
 		if !is_name_start(after) {
@@ -570,7 +733,13 @@ fun tags_of(markup: str): List<Tag> {
 		}
 		let name = markup.substring(index + 1, cursor).to_lowercase_ascii();
 		let (attributes, end) = attributes_of(markup, cursor);
-		tags.push(Tag { name = name, attributes = attributes, end = end });
+		tags.push(Tag {
+			name = name,
+			attributes = attributes,
+			start = index,
+			end = end,
+			closing = false,
+		});
 		index = if name == "script" || name == "style" {
 			skip_raw_text(markup, end, name)
 		} else {
