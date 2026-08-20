@@ -31,7 +31,7 @@ use std::collections::VecDeque;
 
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
-use crate::error::{Error, Note};
+use crate::error::{Error, Note, TraceHop};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::Type;
@@ -222,7 +222,7 @@ fn anchored_tracing(
     program: &Program,
     anchor: Id,
     msg: String,
-    trace: Vec<Note>,
+    trace: Vec<TraceHop>,
     note: Option<Note>,
 ) -> (Error, SourceId) {
     program.anchored(
@@ -1420,7 +1420,7 @@ fn analyze(
         // Past TRACE_CAP the entry side is kept and the rest elides behind
         // the honest tail. Each label follows the `Note::source` contract:
         // the file is named only when it differs from the anchor's.
-        let trace_of = |start: Id, anchor: Id| -> Vec<Note> {
+        let trace_of = |start: Id, anchor: Id| -> Vec<TraceHop> {
             let mut hops = uncovered_hops_from(start);
             hops.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.call.0.cmp(&b.call.0)));
             let mut seen: HashSet<Id> = HashSet::default();
@@ -1432,30 +1432,36 @@ fn analyze(
                     .filter(|source| Some(*source) != anchor_source)
             };
             let elided = hops.len().saturating_sub(TRACE_CAP);
-            let mut notes: Vec<Note> = hops
+            let mut entries: Vec<TraceHop> = hops
                 .iter()
                 .take(TRACE_CAP)
-                .map(|hop| Note {
-                    span: span_of(program, hop.call),
-                    msg: if hop.dispatch {
-                        "the context requirement may flow through this call (dispatch may select a reader)"
-                            .to_string()
-                    } else {
-                        "the context requirement flows through this call".to_string()
+                .map(|hop| TraceHop {
+                    note: Note {
+                        span: span_of(program, hop.call),
+                        msg: if hop.dispatch {
+                            "the context requirement may flow through this call (dispatch may select a reader)"
+                                .to_string()
+                        } else {
+                            "the context requirement flows through this call".to_string()
+                        },
+                        source: locate(hop.call),
                     },
-                    source: locate(hop.call),
+                    call: true,
                 })
                 .collect();
             if elided > 0 {
                 let last = &hops[TRACE_CAP - 1];
                 let plural = if elided == 1 { "call" } else { "calls" };
-                notes.push(Note {
-                    span: span_of(program, last.call),
-                    msg: format!("… {elided} more uncovered {plural} on this path"),
-                    source: locate(last.call),
+                entries.push(TraceHop {
+                    note: Note {
+                        span: span_of(program, last.call),
+                        msg: format!("… {elided} more uncovered {plural} on this path"),
+                        source: locate(last.call),
+                    },
+                    call: false,
                 });
             }
-            notes
+            entries
         };
 
         // Any STRICT get whose owner stayed unbound is read outside every

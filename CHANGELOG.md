@@ -30,7 +30,7 @@ Note plainly: previously-inert calls START DOING SOMETHING. A supplied-shell boo
 ---
 
 <!-- family: diagnostics -->
-**The unprovided-context error now underlines the whole call chain, so a call can no longer make an error appear somewhere else entirely.** Calling a function that (transitively) reads an unprovided context put the "context `…` is read here, but this code can be reached without an enclosing `run`" error at the read — often in a function, or a file, far from the call you just wrote — with nothing connecting the two. The refusal now keeps the path the coverage walk already traverses: every uncovered call of yours between the program's entry and the read carries its own label ("the context requirement flows through this call"; at a generic-bound dispatch, "may flow through this call (dispatch may select a reader)" — the site might select an implementation that never reads), ordered entry → read, with chains deeper than six eliding honestly ("… N more uncovered calls on this path"). A call inside a covering `run` is clean and stops the trace. The CLI renders the chain as labels under the one error; editors get it as related information on the diagnostic, rust-analyzer-style, so each hop underlines in place.
+**The unprovided-context error now underlines the whole call chain, so a call can no longer make an error appear somewhere else entirely.** Calling a function that (transitively) reads an unprovided context put the "context `…` is read here, but this code can be reached without an enclosing `run`" error at the read — often in a function, or a file, far from the call you just wrote — with nothing connecting the two. The refusal now keeps the path the coverage walk already traverses: every uncovered call of yours between the program's entry and the read carries its own label ("the context requirement flows through this call"; at a generic-bound dispatch, "may flow through this call (dispatch may select a reader)" — the site might select an implementation that never reads), ordered entry → read, with chains deeper than six eliding honestly ("… N more uncovered calls on this path"). A call inside a covering `run` is clean and stops the trace. The CLI renders the chain as labels under the one error; in the editor every uncovered call on the chain underlines in place, rust-analyzer-style — each hop publishes as its own error diagnostic at the call, carrying the rest of the chain (the other hops, then the read) as related information, and two reads reached through one shared call merge into a single underline there. The read's own diagnostic keeps the full chain as related information.
 
 Two smaller sharpenings ride along: when several uncovered calls of yours enter the standard library toward one read (`effect` here, `map` there), each now gets its own error with its own chain — the old behavior reported only the earliest, so fixing it merely revealed the next — and the injected-closure flavor of the refusal traces identically.
 
@@ -223,11 +223,6 @@ What is left is now almost all evaluation, and cutting it further is a structura
 
 <!-- family: tooling -->
 **The VS Code extension's lockfile picks up `brace-expansion` 5.0.9.** Dependabot — switched on for the repository this morning — flagged the transitive `brace-expansion` 5.0.8 (via `minimatch`) in `editors/vscode/package-lock.json` for GHSA-rgw5-rvv9-x895, a denial-of-service through unbounded intermediate arrays; 5.0.9 is the patched release. Lockfile-only bump, no source change; the extension the release packages picks it up at the next cut.
-
----
-
-<!-- family: tooling -->
-
 
 ---
 

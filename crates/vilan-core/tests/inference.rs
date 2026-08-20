@@ -805,7 +805,13 @@ fn failure_diagnostics_with_trace(
                         error
                             .trace
                             .into_iter()
-                            .map(|note| (note.msg, note.span.into_range(), note.source.is_some()))
+                            .map(|hop| {
+                                (
+                                    hop.note.msg,
+                                    hop.note.span.into_range(),
+                                    hop.note.source.is_some(),
+                                )
+                            })
                             .collect(),
                     )
                 })

@@ -32051,7 +32051,7 @@ impl<'src> Program<'src> {
                 error.note.as_ref().map(locate),
                 // The E78 requirement trace is part of what the reader sees,
                 // so it joins the content tail (empty for most diagnostics).
-                error.trace.iter().map(locate).collect(),
+                error.trace.iter().map(|hop| locate(&hop.note)).collect(),
             )
         }
         fn sort_in_step(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>) {

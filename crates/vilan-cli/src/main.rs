@@ -2761,7 +2761,13 @@ fn compile_to_js(
                 // render in it (the trait's declaration in std, a chain hop
                 // in an importing module). `None`, or the primary's own
                 // source, means the same file — which needs no second source.
-                let secondaries = || error.trace.iter().chain(error.note.as_ref());
+                let secondaries = || {
+                    error
+                        .trace
+                        .iter()
+                        .map(|hop| &hop.note)
+                        .chain(error.note.as_ref())
+                };
                 for secondary in secondaries() {
                     if let Some(label_source) = secondary
                         .source
@@ -3288,12 +3294,9 @@ fn report_error_with_labels(
         (file_rank(label_file), byte_span.start, byte_span.end)
     });
     let primary_char_span = char_range(src, &primary_span);
-    let mut report = Report::build(
-        ReportKind::Error,
-        (filename.to_string(), primary_char_span),
-    )
-    .with_config(diagnostic_config())
-    .with_message(error.msg.clone());
+    let mut report = Report::build(ReportKind::Error, (filename.to_string(), primary_char_span))
+        .with_config(diagnostic_config())
+        .with_message(error.msg.clone());
     for (label_filename, _byte_span, char_span, message, color) in labels {
         report = report.with_label(
             Label::new((label_filename.to_string(), char_span))

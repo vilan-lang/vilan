@@ -1119,8 +1119,22 @@ pub struct PublishedDiagnostic {
     /// The diagnostic's requirement trace (backlog E78), in the same
     /// per-location shape as `note`: one entry per uncovered upstream call,
     /// ordered entry → read — published as LSP related information ahead of
-    /// the note, preserving this order.
-    pub trace: Vec<(Span, String, Option<PathBuf>)>,
+    /// the note, preserving this order, and each CALL hop additionally as
+    /// its own diagnostic at the call (E81).
+    pub trace: Vec<PublishedHop>,
+}
+
+/// One requirement-trace entry as the publisher wants it (backlog E78):
+/// located like the C3 note, plus whether it marks an uncovered CALL — a
+/// call hop additionally publishes as its own diagnostic at that location
+/// (E81), while the elision tail only ever rides as related information
+/// (its span is the last kept hop's, already underlined by that hop's own
+/// diagnostic).
+pub struct PublishedHop {
+    pub span: Span,
+    pub message: String,
+    pub path: Option<PathBuf>,
+    pub call: bool,
 }
 
 /// The span of an entity, flattened from the `&Span` stored in `span_map`.
@@ -1485,7 +1499,21 @@ impl Document {
         };
         let note_of = |error: &Error| error.note.as_ref().map(locate);
         // The E78 requirement trace, each hop located exactly like the note.
-        let trace_of = |error: &Error| error.trace.iter().map(locate).collect::<Vec<_>>();
+        let trace_of = |error: &Error| {
+            error
+                .trace
+                .iter()
+                .map(|hop| {
+                    let (span, message, path) = locate(&hop.note);
+                    PublishedHop {
+                        span,
+                        message,
+                        path,
+                        call: hop.call,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
         for (index, error) in self.diagnostics.iter().enumerate() {
             let source = self
                 .diagnostic_sources
