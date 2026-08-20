@@ -1392,6 +1392,7 @@ fn anchored(
 ) -> (crate::error::Error, SourceId) {
     program.anchored(
         crate::error::Error {
+            trace: Vec::new(),
             note,
             span: span_of(program, id),
             msg,

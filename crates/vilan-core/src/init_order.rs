@@ -269,6 +269,7 @@ fn cycle_error(
     });
     program.anchored(
         Error {
+            trace: Vec::new(),
             span: anchor_span,
             msg: message,
             note,

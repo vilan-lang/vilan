@@ -1118,7 +1118,7 @@ pub(crate) fn read_enum_backing<'a>(
             match enum_backing {
                 Some((established, owner, owner_span)) if established != kind => {
                     backing_disagrees = true;
-                    diagnostics.push(Error {
+                    diagnostics.push(Error { trace: Vec::new(),
                         note: Some(Note {
                             span: owner_span,
                             msg: format!("'{owner}' backs '{enum_name}' with {}", established.label()),
@@ -1138,34 +1138,35 @@ pub(crate) fn read_enum_backing<'a>(
                 None => enum_backing = Some((kind, variant_name, written.span())),
             }
         }
-        let value = match explicit_backing {
-            Some(_) if backing_disagrees => None,
-            Some(written) => match backing_literal_value(written) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    diagnostics.push(error);
-                    None
-                }
-            },
-            None => {
-                // §3.1(a): C-style auto-increment is meaningful for integers and
-                // there is no successor of `"start"`, so a string backing must
-                // be written on EVERY variant. Deriving it from the variant name
-                // is rejected on §2.1's evidence: five of std's eleven CSS enums
-                // have names no case convention produces (`AlignItems::Start` is
-                // `"flex-start"`, `Display::Hidden` is `"none"`), and a rule that
-                // is right for six and silently wrong for five is worse than no
-                // rule.
-                // A payload anywhere in the enum already broke the placement
-                // rule and was reported there; the missing-string rule has
-                // nothing to add on top of it (one mistake, one message).
-                if enum_backing.map(|(kind, _, _)| kind) == Some(Backing::Str)
-                    && first_payload_variant.is_none()
-                {
-                    let (owner, owner_span) = enum_backing
-                        .map(|(_, owner, span)| (owner, span))
-                        .expect("a string backing was established");
-                    diagnostics.push(Error {
+        let value =
+            match explicit_backing {
+                Some(_) if backing_disagrees => None,
+                Some(written) => match backing_literal_value(written) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        diagnostics.push(error);
+                        None
+                    }
+                },
+                None => {
+                    // §3.1(a): C-style auto-increment is meaningful for integers and
+                    // there is no successor of `"start"`, so a string backing must
+                    // be written on EVERY variant. Deriving it from the variant name
+                    // is rejected on §2.1's evidence: five of std's eleven CSS enums
+                    // have names no case convention produces (`AlignItems::Start` is
+                    // `"flex-start"`, `Display::Hidden` is `"none"`), and a rule that
+                    // is right for six and silently wrong for five is worse than no
+                    // rule.
+                    // A payload anywhere in the enum already broke the placement
+                    // rule and was reported there; the missing-string rule has
+                    // nothing to add on top of it (one mistake, one message).
+                    if enum_backing.map(|(kind, _, _)| kind) == Some(Backing::Str)
+                        && first_payload_variant.is_none()
+                    {
+                        let (owner, owner_span) = enum_backing
+                            .map(|(_, owner, span)| (owner, span))
+                            .expect("a string backing was established");
+                        diagnostics.push(Error { trace: Vec::new(),
                         note: Some(Note {
                             span: owner_span,
                             msg: format!("'{owner}' backs '{enum_name}' with a string here"),
@@ -1178,10 +1179,10 @@ pub(crate) fn read_enum_backing<'a>(
                              '{enum_name}' its own string"
                         ),
                     });
-                    None
-                } else {
-                    if next_discriminant.is_none() {
-                        diagnostics.push(Error {
+                        None
+                    } else {
+                        if next_discriminant.is_none() {
+                            diagnostics.push(Error { trace: Vec::new(),
                             note: None,
                             span: variant.1,
                             msg: format!(
@@ -1190,11 +1191,11 @@ pub(crate) fn read_enum_backing<'a>(
                                  an explicit discriminant"
                             ),
                         });
+                        }
+                        next_discriminant.map(BackingValue::Int)
                     }
-                    next_discriminant.map(BackingValue::Int)
                 }
-            }
-        };
+            };
         if let Some(value) = &value {
             if let BackingValue::Int(discriminant) = value {
                 // The continuation stops at the same edge an explicit
@@ -1210,6 +1211,7 @@ pub(crate) fn read_enum_backing<'a>(
             };
             match backing_owners.get(&key) {
                 Some((owner, owner_span)) => diagnostics.push(Error {
+                    trace: Vec::new(),
                     // Both variants are in the one declaration, so the note
                     // needs no source of its own.
                     note: Some(Note {
@@ -1284,6 +1286,7 @@ fn backing_literal_value(written: &BackingLiteral<'_>) -> Result<BackingValue, E
     };
     let reject = |msg: String| {
         Err(Error {
+            trace: Vec::new(),
             note: None,
             span: written.span(),
             msg,
@@ -1340,6 +1343,7 @@ fn backing_placement_error(
 ) -> Option<Error> {
     if has_payload {
         return Some(Error {
+            trace: Vec::new(),
             note: None,
             span: written.span(),
             msg: format!(
@@ -1350,6 +1354,7 @@ fn backing_placement_error(
     }
     let (payload_variant, payload_span) = first_payload_variant?;
     Some(Error {
+        trace: Vec::new(),
         note: Some(Note {
             span: payload_span,
             msg: format!("'{payload_variant}' carries a payload here"),
@@ -3535,6 +3540,7 @@ impl<'src> Analyzer<'src> {
         for (id, span, msg) in errors {
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg,
@@ -3955,7 +3961,15 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (anchor, span, msg, note) in bound_declarations {
-            self.push_anchored(Error { note, span, msg }, anchor);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg,
+                },
+                anchor,
+            );
         }
     }
 
@@ -4279,6 +4293,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(type_node);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -4295,6 +4310,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(type_node);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -4394,7 +4410,7 @@ impl<'src> Analyzer<'src> {
                 // cannot be hashed by value (destruction.md §8).
                 if self.type_is_resource(*field_type_id) {
                     let rendered = render_type(type_node);
-                    self.push_anchored(Error {
+                    self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
                         msg: format!(
@@ -4407,7 +4423,7 @@ impl<'src> Analyzer<'src> {
                 }
                 if !self.is_hashable_type(type_node) {
                     let rendered = render_type(type_node);
-                    self.push_anchored(Error {
+                    self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
                         msg: format!(
@@ -4432,7 +4448,7 @@ impl<'src> Analyzer<'src> {
             for (label, type_node, field_type_id, span) in members {
                 if self.type_is_resource(*field_type_id) {
                     let rendered = render_type(type_node);
-                    self.push_anchored(Error {
+                    self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
                         msg: format!(
@@ -4462,6 +4478,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(type_node);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -4495,6 +4512,7 @@ impl<'src> Analyzer<'src> {
             if !self.type_is_resource(subject_type_id) {
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!(
@@ -4902,6 +4920,7 @@ impl<'src> Analyzer<'src> {
             let elsewhere = self.other_module_clause(first.impl_id, second.impl_id);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span: second.span,
                     msg: format!(
@@ -5159,6 +5178,7 @@ impl<'src> Analyzer<'src> {
             let span = self.declaration_name_span(second_id);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span,
                     msg: format!(
@@ -5259,6 +5279,7 @@ impl<'src> Analyzer<'src> {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span: impl_shape.name_span,
                     msg: format!(
@@ -5322,6 +5343,7 @@ impl<'src> Analyzer<'src> {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span: impl_shape.name_span,
                     msg: format!(
@@ -5352,6 +5374,7 @@ impl<'src> Analyzer<'src> {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note,
                         span: anchor,
                         msg: if trait_shape.is_self[0] {
@@ -5405,6 +5428,7 @@ impl<'src> Analyzer<'src> {
                 };
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note,
                         span: anchor,
                         msg,
@@ -5445,6 +5469,7 @@ impl<'src> Analyzer<'src> {
                 let actual_label = self.pretty_print_type(&actual_type, &HashMap::default());
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note,
                         span: anchor,
                         msg: format!(
@@ -5507,7 +5532,7 @@ impl<'src> Analyzer<'src> {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             let expected_label = self.pretty_print_type(&expected_return, &HashMap::default());
             let actual_label = self.pretty_print_type(&actual_return, &HashMap::default());
-            self.push_anchored(Error {
+            self.push_anchored(Error { trace: Vec::new(),
 
                 note,
                 span: impl_shape.name_span,
@@ -6612,6 +6637,7 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         self.push_in_source(
             Error {
+                trace: Vec::new(),
                 note,
                 span,
                 msg: format!(
@@ -6935,7 +6961,7 @@ impl<'src> Analyzer<'src> {
             if self.type_is_resource(type_id) {
                 let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
                 let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
-                self.push_anchored(Error {
+                self.push_anchored(Error { trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!(
@@ -7065,6 +7091,7 @@ impl<'src> Analyzer<'src> {
         };
         self.push_anchored(
             Error {
+                trace: Vec::new(),
                 note: Some(crate::error::Note::here(
                     span,
                     "only plain data transfers: scalars, `str`, lists, options, and \
@@ -9917,7 +9944,7 @@ impl<'src> Analyzer<'src> {
                     move_span,
                 } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "use of `{name}` after it was moved: a resource has a single owner"
@@ -9931,7 +9958,7 @@ impl<'src> Analyzer<'src> {
                         )),
                     }
                 }
-                ResourceMoveViolation::PartialMove { at } => Error {
+                ResourceMoveViolation::PartialMove { at } => Error { trace: Vec::new(),
                     span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot move a resource field out of a live aggregate: a resource has \
                           one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make \
@@ -9941,7 +9968,7 @@ impl<'src> Analyzer<'src> {
                 },
                 ResourceMoveViolation::ConditionalMove { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is moved on one path through this branch but not another: a \
@@ -9953,7 +9980,7 @@ impl<'src> Analyzer<'src> {
                 }
                 ResourceMoveViolation::LoopMove { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is declared outside this loop and moved inside it: the move \
@@ -9980,7 +10007,7 @@ impl<'src> Analyzer<'src> {
                         }
                     };
                     let owned = format!("own {name}");
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "cannot move the resource `{name}` out of this function: it is declared \
@@ -10003,7 +10030,7 @@ impl<'src> Analyzer<'src> {
                         Some(subject_name) => format!("`{subject_name}`"),
                         None => "the subject".to_string(),
                     };
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "cannot move the resource `{name}` out of this pattern: it captures \
@@ -10020,7 +10047,7 @@ impl<'src> Analyzer<'src> {
                     binding,
                 } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "a closure cannot capture the resource `{name}`; pass a loan into the \
@@ -10032,7 +10059,7 @@ impl<'src> Analyzer<'src> {
                 }
                 ResourceMoveViolation::ModuleLevelMove { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is a module-level resource: it has process lifetime and \
@@ -10044,7 +10071,7 @@ impl<'src> Analyzer<'src> {
                 }
                 ResourceMoveViolation::ModuleLevelOverwrite { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is a module-level resource: it has process lifetime and \
@@ -10373,6 +10400,7 @@ impl<'src> Analyzer<'src> {
         };
         self.push_anchored(
             Error {
+                trace: Vec::new(),
                 span: site,
                 msg: format!(
                     "`{name}` is not move-clean when instantiated with a resource: {summary}, \
@@ -10544,6 +10572,7 @@ impl<'src> Analyzer<'src> {
         };
         self.push_anchored(
             Error {
+                trace: Vec::new(),
                 span: site,
                 msg: format!(
                     "`{name}` is not move-clean when instantiated with a resource: this \
@@ -11116,6 +11145,7 @@ impl<'src> Analyzer<'src> {
             };
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     span: site,
                     msg: format!(
                         "`{name}` is not move-clean when instantiated with a resource: \
@@ -11183,6 +11213,7 @@ impl<'src> Analyzer<'src> {
                         let rendered = render_type(type_node);
                         self.push_anchored(
                             Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!(
@@ -11198,6 +11229,7 @@ impl<'src> Analyzer<'src> {
                     None => {
                         self.push_anchored(
                             Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!(
@@ -11233,6 +11265,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(element);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -11251,6 +11284,7 @@ impl<'src> Analyzer<'src> {
                         .unwrap_or_else(|| "_".to_string());
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -14510,7 +14544,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for expr_id in escapes {
-            self.push_anchored(Error { note: None,
+            self.push_anchored(Error { trace: Vec::new(), note: None,
                 span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                 msg: "a view cannot escape its scope: it may not be returned, stored in a field, placed in a collection, or carried in an enum payload. Return an owned value or a handle instead.".to_string(),
             }, expr_id);
@@ -15411,6 +15445,7 @@ impl<'src> Analyzer<'src> {
                 for (parameter_id, form) in view_parameters {
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
                             msg: async_view_parameter_message(form),
@@ -15488,6 +15523,7 @@ impl<'src> Analyzer<'src> {
             };
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&anchor).unwrap_or(&&EMPTY_SPAN),
                     msg,
@@ -15574,6 +15610,7 @@ impl<'src> Analyzer<'src> {
         for (reference_id, name) in errors {
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                     msg: async_view_capture_message(name),
@@ -16000,7 +16037,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (reseat_id, name) in violations {
-            self.push_anchored(Error { note: None,
+            self.push_anchored(Error { trace: Vec::new(), note: None,
                 span: **self.span_map.get(&reseat_id).unwrap_or(&&EMPTY_SPAN),
                 msg: format!(
                     "cannot reseat a view to '{name}', which goes out of scope before the view; the view would dangle. Reseat to a place that outlives the view, or use a handle."
@@ -16315,6 +16352,7 @@ impl<'src> Analyzer<'src> {
                 let advice = Self::immutability_advice(name, fix);
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!("cannot mutate immutable '{name}'; {advice}."),
@@ -16375,6 +16413,7 @@ impl<'src> Analyzer<'src> {
                         let advice = Self::immutability_advice(name, fix);
                         self.push_anchored(
                             Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!("cannot mutate immutable '{name}'; {advice}."),
@@ -16486,7 +16525,7 @@ impl<'src> Analyzer<'src> {
         }
         for leak in leaks {
             let span = **self.span_map.get(&leak).unwrap_or(&&EMPTY_SPAN);
-            self.push_anchored(Error { note: None,
+            self.push_anchored(Error { trace: Vec::new(), note: None,
                 span,
                 msg: "a view can't be read as a value here; write `*` to copy the value out \
                       (a view's value is explicit: `*v` is the only way to cross from view to value)"
@@ -16516,6 +16555,7 @@ impl<'src> Analyzer<'src> {
                 let advice = Self::immutability_advice(name, fix);
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -16565,7 +16605,7 @@ impl<'src> Analyzer<'src> {
                 initial.is_some_and(|initial_id| self.assignment_target_is_view(initial_id));
             // R7: a view binding may not be `mut`.
             if mutable && holds_view {
-                self.push_anchored(Error { note: None,
+                self.push_anchored(Error { trace: Vec::new(), note: None,
                     span: name_span,
                     msg: format!(
                         "view binding '{name}' cannot be `mut`: a view cannot be rebound. Declare it `let`, and mutate the referent by assigning through it (`{name} = …`)."
@@ -16587,6 +16627,7 @@ impl<'src> Analyzer<'src> {
                 };
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span: name_span,
                         msg,
@@ -16652,7 +16693,7 @@ impl<'src> Analyzer<'src> {
                     None => continue,
                 };
                 if !self.assignment_target_is_view(*argument_id) {
-                    self.push_anchored(Error { note: None,
+                    self.push_anchored(Error { trace: Vec::new(), note: None,
                         span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
@@ -16738,6 +16779,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             self.warnings.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: concat!(
@@ -16783,7 +16825,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             if self.call_is_must_use(*call_id) {
-                self.warnings.push(Error { note: None,
+                self.warnings.push(Error { trace: Vec::new(), note: None,
                     span: **self.span_map.get(&statement_id).unwrap_or(&&EMPTY_SPAN),
                     msg: "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string(),
                 });
@@ -17371,6 +17413,7 @@ impl<'src> Analyzer<'src> {
         for (parameter_id, name) in resource_rejections {
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -18074,6 +18117,7 @@ impl<'src> Analyzer<'src> {
             return length;
         }
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span: node.1,
             msg: "an array length must be a non-negative integer literal \
@@ -18097,6 +18141,7 @@ impl<'src> Analyzer<'src> {
     fn reject_lift_region_condition(&mut self, condition: &Spanned<Node<'src>>) {
         if matches!(condition.0, Node::LiftRegion(..)) {
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span: condition.1,
                 msg: "the `?` lifts this condition to an `Option`/`Result`, which a \
@@ -18117,6 +18162,7 @@ impl<'src> Analyzer<'src> {
             // caught here, with the idiom.
             if matches!(&inner.0, Node::Assign(..)) {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "Vilan has no const declarations; write `let x = const ..`".to_string(),
@@ -18181,6 +18227,7 @@ impl<'src> Analyzer<'src> {
                     // `i"""` whose malformed shape degraded to this node.
                     let base = node.1.end.saturating_sub(3 + x.len());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: (base + range.start..base + range.end).into(),
                         msg: message,
@@ -18236,6 +18283,7 @@ impl<'src> Analyzer<'src> {
                     Node::Number(name, fraction, suffix) => {
                         if suffix.is_some() {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: member.1,
                                 msg: "a tuple position is a bare number (`.0`, `.1`); drop the \
@@ -18294,6 +18342,7 @@ impl<'src> Analyzer<'src> {
                             }
                             _ => {
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: call_subject.1,
                                     msg: "expected a method name after `.`".to_string(),
@@ -18304,6 +18353,7 @@ impl<'src> Analyzer<'src> {
                     }
                     _ => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: member.1,
                             msg: "expected a field or method name after `.`".to_string(),
@@ -18373,6 +18423,7 @@ impl<'src> Analyzer<'src> {
                 // `[T; n]` is a TYPE — the type parser produces it in type
                 // position only; in value position it's a stray type annotation.
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a `[T; n]` array type isn't a value; write an array \
@@ -18497,6 +18548,7 @@ impl<'src> Analyzer<'src> {
             Node::MacroFun(function) => {
                 if !self.module_scope_ids.contains(&scope_id) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "a `macro fun` must be a top-level item".to_string(),
@@ -18571,6 +18623,7 @@ impl<'src> Analyzer<'src> {
                     // Reached only where expansion never runs — a macro body
                     // (the world walks the definition's original text).
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: format!(
@@ -18600,6 +18653,7 @@ impl<'src> Analyzer<'src> {
                 } else {
                     // Reached only where expansion never runs — a macro body.
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "this `macro { .. }` block was not expanded: a block cannot \
@@ -18617,6 +18671,7 @@ impl<'src> Analyzer<'src> {
                 // in a body has nothing to attach to.
                 if !self.module_scope_ids.contains(&scope_id) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "`export` is a module-level item and cannot appear inside a body"
@@ -18770,6 +18825,7 @@ impl<'src> Analyzer<'src> {
                     // function with a callable type so calls infer their return.
                     if function.body.is_some() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: function.name.1,
                             msg: "an `external` function cannot have a body".to_string(),
@@ -18834,6 +18890,7 @@ impl<'src> Analyzer<'src> {
                             // declared `external`.
                             if !self.walking_trait_body {
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: function.name.1,
                                     msg: format!(
@@ -19016,6 +19073,7 @@ impl<'src> Analyzer<'src> {
                 // mark is never silently dropped, it errors here.
                 self.walk_expr_node(inner, scope_id);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a bare `?` (expression lifting) is not supported in this position"
@@ -19032,6 +19090,7 @@ impl<'src> Analyzer<'src> {
                     && steps.get(index).is_some_and(|(_, is_split)| *is_split)
                 {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "`?` lifts nothing here: the region is the whole expression; \
@@ -19050,6 +19109,7 @@ impl<'src> Analyzer<'src> {
                         || contains_try_assert(&body.0);
                     if after_split_try_assert {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: node.1,
                             msg: "`!` cannot run after a `?` inside a lifted expression: it \
@@ -19119,7 +19179,7 @@ impl<'src> Analyzer<'src> {
                         });
                     }
                     _ => {
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: node.1,
                             msg: "`!` requires the nearest enclosing function to declare an `Option`/`Result`-compatible return type (closures and `async` blocks are not yet supported)"
                                 .to_string(),
@@ -19183,6 +19243,7 @@ impl<'src> Analyzer<'src> {
                     };
                     if !matches!(grouped, Node::ClosureType(..)) {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: clause_span,
                             msg: "a `context` clause is only supported on a closure type"
@@ -19279,6 +19340,7 @@ impl<'src> Analyzer<'src> {
                     }
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: node.1,
                             msg: "a destructuring `let` requires a value".to_string(),
@@ -19292,7 +19354,7 @@ impl<'src> Analyzer<'src> {
                 // rvalue — and may not be an assignment target. A view is written
                 // *through* directly (`x = v`), so `*x = v` is rejected.
                 if matches!(&target.0, Node::Dereference(_)) {
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span: target.1,
                         msg: "cannot assign through `*`: a view is written through directly; write `x = …`, not `*x = …`".to_string(),
                     });
@@ -19307,6 +19369,7 @@ impl<'src> Analyzer<'src> {
                 // assign into a lowering temp (proposal/try-and-lift.md §3).
                 if lift_target_of(target) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: target.1,
                         msg: "a lifted chain (`?.`) is not an assignment target".to_string(),
@@ -19352,6 +19415,7 @@ impl<'src> Analyzer<'src> {
                 // empty).
                 if !external && body.is_none() {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: format!(
@@ -19886,6 +19950,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::ClosureType(_, _) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a closure type is not valid here (expected an expression)".to_string(),
@@ -19894,6 +19959,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::TypeWithContexts(_, _) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg:
@@ -19904,6 +19970,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::AsyncType(_) | Node::SyncType(_) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a closure-type marker is not valid here (expected an expression)"
@@ -19913,6 +19980,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::MappedType { .. } => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a mapped tuple type is not valid here (expected an expression)"
@@ -20012,6 +20080,7 @@ impl<'src> Analyzer<'src> {
                 Node::ClosureType(..) | Node::AsyncType(..) | Node::SyncType(..)
             ) {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: clause_span,
                     msg: "a `context` clause is only supported on a closure type".to_string(),
@@ -20323,6 +20392,7 @@ impl<'src> Analyzer<'src> {
                         Some(entity) => entity,
                         None => {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!("cannot find '{}' in this scope", name),
@@ -20334,6 +20404,7 @@ impl<'src> Analyzer<'src> {
                     Some(Expr::EnumVariant(enum_id, variant_index)) => (*enum_id, *variant_index),
                     _ => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!("'{}' is not an enum variant", name),
@@ -20408,6 +20479,7 @@ impl<'src> Analyzer<'src> {
                             &HashMap::default(),
                         );
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -20424,6 +20496,7 @@ impl<'src> Analyzer<'src> {
                     Type::Generic(_) => {}
                     Type::Enum(_, _) => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!("variant '{}' does not belong to the matched enum", name),
@@ -20433,6 +20506,7 @@ impl<'src> Analyzer<'src> {
                     other => {
                         let subject_str = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -20467,6 +20541,7 @@ impl<'src> Analyzer<'src> {
                 let payload_patterns: &[WalkPattern] = payload.as_deref().unwrap_or(&[]);
                 if payload_patterns.len() != data_type_ids.len() {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!(
@@ -20527,6 +20602,7 @@ impl<'src> Analyzer<'src> {
                     Type::Array(element_id, length) => {
                         if length != patterns.len() {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: *span,
                                 msg: format!(
@@ -20544,6 +20620,7 @@ impl<'src> Analyzer<'src> {
                     other => {
                         let rendered = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -20575,6 +20652,7 @@ impl<'src> Analyzer<'src> {
                     let expected = self.pretty_print_type(&subject_type, &HashMap::default());
                     let got = self.pretty_print_type(&literal_type, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&literal_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -20729,7 +20807,7 @@ impl<'src> Analyzer<'src> {
             // is the inner closure type; the marker is peeled (and recorded)
             // only at parameters and `let` annotations (J2 v1).
             Node::AsyncType(inner) => {
-                self.diagnostics.push(Error {
+                self.diagnostics.push(Error { trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "an `async` closure type is only supported on parameters, `let` annotations, struct fields, and function return types"
@@ -20743,6 +20821,7 @@ impl<'src> Analyzer<'src> {
             // already refuses async stores.
             Node::SyncType(inner) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a `sync` closure contract is only supported on parameters".to_string(),
@@ -20751,6 +20830,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::TypeWithContexts(inner, _) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a `context` clause is only supported on a parameter's closure type"
@@ -21108,6 +21188,7 @@ impl<'src> Analyzer<'src> {
             .or_else(|| self.span_map.get(&for_each_id))
             .unwrap_or(&&EMPTY_SPAN);
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span,
             msg,
@@ -21894,7 +21975,7 @@ impl<'src> Analyzer<'src> {
                 if let Type::Array(element_type_id, length) = constraint {
                     let element_type = element_type_id.get_type(self);
                     if item_ids.len() != length && self.reported_literal_errors.insert(expr_id) {
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
                                 "this array literal has {} element{}, but its type is `[_; {length}]`",
@@ -21925,7 +22006,7 @@ impl<'src> Analyzer<'src> {
                             let expected =
                                 self.pretty_print_type(&element_type, &HashMap::default());
                             let got = self.pretty_print_type(&item_type, &HashMap::default());
-                            self.diagnostics.push(Error { note: None,
+                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                 span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
                                     "Expected {expected} (this literal's element type), but got {got} instead."
@@ -22037,7 +22118,7 @@ impl<'src> Analyzer<'src> {
                                 let expected =
                                     self.pretty_print_type(&element_type, &HashMap::default());
                                 let got = self.pretty_print_type(&item_type, &HashMap::default());
-                                self.diagnostics.push(Error { note: None,
+                                self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                     span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
                                         "Expected {expected} (this literal's element type), but got {got} instead."
@@ -22774,6 +22855,7 @@ impl<'src> Analyzer<'src> {
                                 .any(|d| d.span == brace_span && d.msg == msg)
                             {
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: brace_span,
                                     msg,
@@ -23733,6 +23815,7 @@ impl<'src> Analyzer<'src> {
                 None => {
                     if report {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: "`self` import has no enclosing namespace".to_string(),
@@ -23753,6 +23836,7 @@ impl<'src> Analyzer<'src> {
             None => {
                 if report {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: root_span,
                         msg: format!("cannot find module '{}' to import", root),
@@ -23789,6 +23873,7 @@ impl<'src> Analyzer<'src> {
                 None => {
                     if report {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: part_span,
                             msg: format!("cannot find '{}' in the imported path", part),
@@ -24153,6 +24238,7 @@ impl<'src> Analyzer<'src> {
         let fixed = parameters.len() - 1;
         if argument_ids.len() < fixed {
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span: arguments_span,
                 msg: format!(
@@ -24676,6 +24762,7 @@ impl<'src> Analyzer<'src> {
                 let type_label = self.pretty_print_type(&receiver_type, &HashMap::default());
                 let trait_label = self.trait_label_for(&receiver_type, trait_id);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&receiver_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -24732,6 +24819,7 @@ impl<'src> Analyzer<'src> {
         if let Type::Closure(parameter_type_ids, _) = &subject_type {
             if argument_ids.len() != parameter_type_ids.len() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: arguments_span,
                     msg: format!(
@@ -24797,6 +24885,7 @@ impl<'src> Analyzer<'src> {
                             None => (String::new(), None),
                         };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&argument_id).unwrap(),
                         msg: format!("Expected {}, but got {} instead.{}", expected, got, origin),
@@ -24825,6 +24914,7 @@ impl<'src> Analyzer<'src> {
                         .clone();
                     if argument_ids.len() != data_type_ids.len() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: arguments_span,
                             msg: format!(
@@ -24853,6 +24943,7 @@ impl<'src> Analyzer<'src> {
                                 self.pretty_print_type(&data_type, &substitution_context);
                             let got = self.pretty_print_type(&argument_type, &substitution_context);
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&argument_id).unwrap(),
                                 msg: format!("Expected {}, but got {} instead.", expected, got),
@@ -24927,6 +25018,7 @@ impl<'src> Analyzer<'src> {
                     };
                     if argument_ids.len() != parameters.len() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: self.declared_here_note(function_id),
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
                             msg: self.argument_count_message(
@@ -25061,6 +25153,7 @@ impl<'src> Analyzer<'src> {
                                     &substitution_context,
                                 );
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note,
                                     span: **self.span_map.get(&argument_id).unwrap(),
                                     msg,
@@ -25135,7 +25228,7 @@ impl<'src> Analyzer<'src> {
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                         self.not_callable_message(&subject_type)
                     };
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         // The SUBJECT is what isn't callable (A1).
                         span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
                         msg: match struct_name {
@@ -25166,6 +25259,7 @@ impl<'src> Analyzer<'src> {
                 let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                 let msg = self.not_callable_message(&subject_type);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     // The SUBJECT is what isn't callable (A1) — anchor there.
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
@@ -25258,6 +25352,7 @@ impl<'src> Analyzer<'src> {
             if member_name != "len" {
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     // The method NAME identifies the problem (A1/A4), not
                     // the argument list.
@@ -25273,6 +25368,7 @@ impl<'src> Analyzer<'src> {
             }
             if !argument_ids.is_empty() || !generic_argument_ids.is_empty() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: arguments_span,
                     msg: "`len` takes no arguments".to_string(),
@@ -25671,6 +25767,7 @@ impl<'src> Analyzer<'src> {
                     .unimported_trait_method_steer(&subject_type, member_name)
                     .unwrap_or_default();
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self
                         .member_name_spans
@@ -25709,6 +25806,7 @@ impl<'src> Analyzer<'src> {
                     })
                     .collect();
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     // The member NAME is what is ambiguous (A1/A4) — the same
                     // anchor "has no method" uses.
@@ -25746,6 +25844,7 @@ impl<'src> Analyzer<'src> {
                     .map(|home| format!("'{}'", self.home_label(home)))
                     .collect();
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     // The member NAME is what is ambiguous (A1/A4) — the same
                     // anchor the two-trait ambiguity uses.
@@ -25779,6 +25878,7 @@ impl<'src> Analyzer<'src> {
                     })
                     .collect();
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self
                         .member_name_spans
@@ -25801,6 +25901,7 @@ impl<'src> Analyzer<'src> {
             MethodLookup::NotCallable => {
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self
                         .member_name_spans
@@ -25818,6 +25919,7 @@ impl<'src> Analyzer<'src> {
                     .map(|trait_| trait_.name)
                     .unwrap_or("trait");
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -25853,6 +25955,7 @@ impl<'src> Analyzer<'src> {
                 let expected = self.pretty_print_type(&slot_type, &HashMap::default());
                 let got = self.pretty_print_type(&argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!("Expected {}, but got {} instead.", expected, got),
@@ -25896,6 +25999,7 @@ impl<'src> Analyzer<'src> {
             // with parameters 1.. only.
             let argument_parameter_ids = parameter_ids.get(1..).unwrap_or(&[]);
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: self.declared_here_note(member_id),
                 span: self.clamp_span_to_first_line(arguments_span, call_id),
                 msg: self.argument_count_message(
@@ -25943,6 +26047,7 @@ impl<'src> Analyzer<'src> {
                 let expected = self.pretty_print_type(&parameter_type, &HashMap::default());
                 let got = self.pretty_print_type(&argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!("Expected {}, but got {} instead.", expected, got),
@@ -25983,6 +26088,7 @@ impl<'src> Analyzer<'src> {
             other => {
                 let got = self.pretty_print_type(&other, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -26069,6 +26175,7 @@ impl<'src> Analyzer<'src> {
                         self.pretty_print_type(&variable_type, &substitution_context);
                     let got_str = self.pretty_print_type(&value_type, &substitution_context);
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&first_value_id).unwrap(),
                         msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
@@ -26115,6 +26222,7 @@ impl<'src> Analyzer<'src> {
                         )
                     });
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&value_id).unwrap(),
                         msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
@@ -26182,6 +26290,7 @@ impl<'src> Analyzer<'src> {
             ReturnPositionCheck::Mismatched(msg) => {
                 let span = **self.span_map.get(&body_id).unwrap_or(&&EMPTY_SPAN);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg,
@@ -26456,7 +26565,7 @@ impl<'src> Analyzer<'src> {
                         self.pretty_print_type(&subject_error_type, &HashMap::default());
                     let continuation_rendered =
                         self.pretty_print_type(&continuation_error_type, &HashMap::default());
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span,
                         msg: format!(
                             "`?.` flattens into the chain's own `Result`, so the error types must match: the subject's is {subject_rendered}, the chain yields {continuation_rendered}. Convert the error first with `.map_err(…)`."
@@ -26540,6 +26649,7 @@ impl<'src> Analyzer<'src> {
                     let Some((nominal_id, arguments)) = self.lift_element_of(&other) else {
                         let rendered = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: step_span,
                             msg: format!(
@@ -26568,6 +26678,7 @@ impl<'src> Analyzer<'src> {
                             ""
                         };
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -26599,6 +26710,7 @@ impl<'src> Analyzer<'src> {
                             let second =
                                 self.pretty_print_type(&step_error_type, &HashMap::default());
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: step_span,
                                 msg: format!(
@@ -26654,6 +26766,7 @@ impl<'src> Analyzer<'src> {
                     let first = self.pretty_print_type(&region_error_type, &HashMap::default());
                     let second = self.pretty_print_type(&body_error_type, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!(
@@ -26956,6 +27069,7 @@ impl<'src> Analyzer<'src> {
     fn lift_opt_in_error(&mut self, operator: &str, subject_type: &Type, span: Span) {
         let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span,
             msg: format!(
@@ -26982,6 +27096,7 @@ impl<'src> Analyzer<'src> {
         }
         let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span,
             msg: format!(
@@ -27020,6 +27135,7 @@ impl<'src> Analyzer<'src> {
         let Some((nominal_id, arguments)) = self.lift_element_of(&subject_type) else {
             let rendered = self.pretty_print_type(&subject_type, &HashMap::default());
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: format!("`?.` needs a container with an element type; this is {rendered}"),
@@ -27125,7 +27241,7 @@ impl<'src> Analyzer<'src> {
                 None => {
                     if !tail_yields_no_value {
                         let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: *span,
                             msg: format!(
                                 "a bare `ret` exits a closure whose body yields {tail_rendered}; return a value"
@@ -27139,7 +27255,7 @@ impl<'src> Analyzer<'src> {
                         return Resolution::Deferred;
                     }
                     if tail_yields_no_value && !matches!(value_type, Type::Void) {
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: *span,
                             msg: "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail"
                                 .to_string(),
@@ -27151,7 +27267,7 @@ impl<'src> Analyzer<'src> {
                         let value_rendered =
                             self.pretty_print_type(&value_type, &HashMap::default());
                         let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: *span,
                             msg: format!(
                                 "this `ret` returns {value_rendered}, but the closure's body yields {tail_rendered}"
@@ -27229,7 +27345,7 @@ impl<'src> Analyzer<'src> {
                 Type::Enum(return_enum, _) if Some(*return_enum) == self.option_enum_id => {}
                 other => {
                     let rendered = self.pretty_print_type(other, &HashMap::default());
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span,
                         msg: format!(
                             "`!` on an `Option` returns `None` early, so the enclosing function must return `Option`; it returns {rendered}. If it returns `Result`, convert first: `.ok_or(err)` turns `None` into an `Err`."
@@ -27266,7 +27382,7 @@ impl<'src> Analyzer<'src> {
                         let receiver_rendered = self.pretty_print_type(&bad, &HashMap::default());
                         let return_rendered =
                             self.pretty_print_type(&return_bad, &HashMap::default());
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span,
                             msg: format!(
                                 "`!` returns this `Result`'s error as-is, so the error types must match: the value's is {receiver_rendered}, the function returns {return_rendered}. Convert the error first: `.map_err(…)` before `!`."
@@ -27276,7 +27392,7 @@ impl<'src> Analyzer<'src> {
                 }
                 other => {
                     let rendered = self.pretty_print_type(other, &HashMap::default());
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span,
                         msg: format!(
                             "`!` on a `Result` returns the error early, so the enclosing function must return `Result`; it returns {rendered}"
@@ -27315,7 +27431,7 @@ impl<'src> Analyzer<'src> {
         }
         let Some(impl_index) = try_impl else {
             let rendered = self.pretty_print_type(&receiver_type, &HashMap::default());
-            self.diagnostics.push(Error { note: None,
+            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                 span,
                 msg: format!(
                     "`!` needs a value implementing `Try` (an `Option`, a `Result`, or a type with an `impl .. with Try<..>`); this is {rendered}"
@@ -27339,6 +27455,7 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         let (Some(verdict_id), Some(from_bad_id)) = (verdict_id, from_bad_id) else {
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: "the `Try` impl is missing `verdict`/`from_bad`".to_string(),
@@ -27374,7 +27491,7 @@ impl<'src> Analyzer<'src> {
         {
             let receiver_rendered = self.pretty_print_type(&receiver_type, &HashMap::default());
             let return_rendered = self.pretty_print_type(&return_type, &HashMap::default());
-            self.diagnostics.push(Error { note: None,
+            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                 span,
                 msg: format!(
                     "`!` on a `Try` type returns `from_bad(..)`, which rebuilds {receiver_rendered}; the enclosing function returns {return_rendered} (for user `Try` types the two must match exactly, v1)"
@@ -27682,6 +27799,7 @@ impl<'src> Analyzer<'src> {
                 } else if !self.compare_type(&guard_type, &self.bool_type(), &HashMap::default()) {
                     let got = self.pretty_print_type(&guard_type, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&guard_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!("match guard must be a bool, but got {}", got),
@@ -27810,6 +27928,7 @@ impl<'src> Analyzer<'src> {
                     )
                 };
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: guarded_leg_note(self, &guards),
                     span: prepped.span,
                     msg,
@@ -27864,7 +27983,7 @@ impl<'src> Analyzer<'src> {
                                 .get(body_id)
                                 .map(|span| **span)
                                 .unwrap_or(prepped.span);
-                            self.diagnostics.push(Error { note: None,
+                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: leg_span,
                             msg: format!(
                                 "match legs have mismatched types: expected {}, but got {} instead.",
@@ -27967,6 +28086,7 @@ impl<'src> Analyzer<'src> {
                         .import_steer(constraint.struct_name)
                         .unwrap_or_default();
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!("unknown struct: {}{}", constraint.struct_name, steer),
@@ -27983,6 +28103,7 @@ impl<'src> Analyzer<'src> {
                 .map(|span| **span)
                 .unwrap_or(constraint.fields_span);
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: format!("cannot initialize a non-struct: {}", constraint.struct_name),
@@ -28020,7 +28141,12 @@ impl<'src> Analyzer<'src> {
                 msg: format!("`{}` is declared here", constraint.struct_name),
                 source: self.source_of_id(struct_id),
             });
-            self.diagnostics.push(Error { note, span, msg });
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note,
+                span,
+                msg,
+            });
             return Resolution::Failed;
         }
         let initializer_id = constraint.initializer_id;
@@ -28053,6 +28179,7 @@ impl<'src> Analyzer<'src> {
                         Note::here(*field_name_span, format!("did you mean `{suggestion}`?"))
                     });
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         // The NAME's span, not the value's (E58 — see
                         // `StructInitializerConstraint::fields`'s doc): the
@@ -28085,6 +28212,7 @@ impl<'src> Analyzer<'src> {
                 // value, not the whole `{ .. }` block — E7) but still record
                 // the type for downstream consumers.
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: *field_value_span,
                     msg: format!(
@@ -28226,6 +28354,7 @@ impl<'src> Analyzer<'src> {
                             &HashMap::default(),
                         );
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: tuple_access_error(&label, member_name, problem),
@@ -28240,6 +28369,7 @@ impl<'src> Analyzer<'src> {
                     Some(struct_) => struct_,
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap(),
                             msg: format!("subject is not a struct: {}", struct_id.0),
@@ -28292,6 +28422,7 @@ impl<'src> Analyzer<'src> {
                     }
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!("struct '{}' has no field '{}'", struct_name, member_name),
@@ -28310,6 +28441,7 @@ impl<'src> Analyzer<'src> {
                 }
                 let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -28375,6 +28507,7 @@ impl<'src> Analyzer<'src> {
             // (only a `List` is indexable)" — say what is actually missing.
             Type::Struct(struct_id, _) if Some(struct_id) == list_id => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot index this List: its element type is never determined \
@@ -28396,6 +28529,7 @@ impl<'src> Analyzer<'src> {
                     && literal_index >= length
                 {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -28416,6 +28550,7 @@ impl<'src> Analyzer<'src> {
             subject_type => {
                 let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -28529,6 +28664,7 @@ impl<'src> Analyzer<'src> {
                 Some(entity) => entity,
                 None => {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: root_span,
                         msg: format!("cannot find '{}' in this scope", root),
@@ -28551,6 +28687,7 @@ impl<'src> Analyzer<'src> {
                 };
                 let Some(namespace_scope_id) = namespace_scope_id else {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: segment_span,
                         msg: "`use` requires a namespace (a module or an enum)".to_string(),
@@ -28567,6 +28704,7 @@ impl<'src> Analyzer<'src> {
                     Some(entity) => entity,
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: segment_span,
                             msg: format!("cannot find '{}' in the `use` path", segment),
@@ -28627,6 +28765,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                         let diagnostics_before = self.diagnostics.len();
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: message,
@@ -28680,6 +28819,7 @@ impl<'src> Analyzer<'src> {
                     );
                     let note = note.or_else(|| self.element_view_import_note(id, name));
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!("cannot find '{}' in this scope{}", name, steer),
@@ -28719,6 +28859,7 @@ impl<'src> Analyzer<'src> {
             // `check_readonly_mutation`.
             if self.variables.get(&variable_id).is_none() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot assign to this expression".to_string(),
@@ -28830,6 +28971,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(trait_id) = bare_trait_id {
                         let (message, note) = self.bare_trait_in_value_position(trait_id, scope_id);
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note,
                             span,
                             msg: message,
@@ -28862,6 +29004,7 @@ impl<'src> Analyzer<'src> {
                         format!("cannot find type '{}'{}", name, steer)
                     };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: message,
@@ -28887,6 +29030,7 @@ impl<'src> Analyzer<'src> {
                         }
                         None => {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!(
@@ -28909,6 +29053,7 @@ impl<'src> Analyzer<'src> {
                         let subject_str =
                             self.pretty_print_type(&subject_type, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -29111,6 +29256,7 @@ impl<'src> Analyzer<'src> {
                                 })
                                 .collect();
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -29156,6 +29302,7 @@ impl<'src> Analyzer<'src> {
                                 })
                                 .collect();
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -29183,6 +29330,7 @@ impl<'src> Analyzer<'src> {
                             })
                             .unwrap_or_default();
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -29205,6 +29353,7 @@ impl<'src> Analyzer<'src> {
                         }
                         None => {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -29222,6 +29371,7 @@ impl<'src> Analyzer<'src> {
                     let bound_trait_ids = self.generic_bound_trait_ids(constraint_id);
                     if bound_trait_ids.is_empty() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -29267,6 +29417,7 @@ impl<'src> Analyzer<'src> {
                                     .collect::<Vec<_>>()
                                     .join(" + ");
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
@@ -29289,6 +29440,7 @@ impl<'src> Analyzer<'src> {
                 None => {
                     let steer = self.import_steer(check.trait_name).unwrap_or_default();
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: check.span,
                         msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
@@ -29301,6 +29453,7 @@ impl<'src> Analyzer<'src> {
             // provide it.
             if !self.traits.contains_key(&trait_id) {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: check.span,
                     msg: format!("'{}' is not a trait", check.trait_name),
@@ -29473,6 +29626,7 @@ impl<'src> Analyzer<'src> {
                     })
                     .unwrap_or((String::new(), None));
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note,
                     span: check.span,
                     msg: format!(
@@ -29884,6 +30038,7 @@ impl<'src> Analyzer<'src> {
                 {
                     let label = self.pretty_print_type(&condition, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&condition_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -29962,7 +30117,7 @@ impl<'src> Analyzer<'src> {
                             && !self.compare_type(&bool_type, &operand, &HashMap::default())
                         {
                             let label = self.pretty_print_type(&operand, &HashMap::default());
-                            self.diagnostics.push(Error { note: None,
+                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                 span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
                                     "`{symbol}` takes `bool` operands; the {side} operand is `{label}`"
@@ -29979,6 +30134,7 @@ impl<'src> Analyzer<'src> {
                 if is_ordering_operator(op) && grounded(&lhs_type) {
                     if is_bool(&lhs_type) {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -29998,6 +30154,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(enum_) = self.string_backed_enum(&lhs_type) {
                         let enum_name = enum_.name;
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -30024,6 +30181,7 @@ impl<'src> Analyzer<'src> {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -30142,6 +30300,7 @@ impl<'src> Analyzer<'src> {
                         method_name
                     };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -30167,6 +30326,7 @@ impl<'src> Analyzer<'src> {
             for (name, name_span) in names {
                 let Some(target) = self.try_get_expr_id_by_name(name, scope_id) else {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: name_span,
                         msg: format!("cannot find context `{name}` in this scope"),
@@ -30182,6 +30342,7 @@ impl<'src> Analyzer<'src> {
                 };
                 if context_ids.contains(&target) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: name_span,
                         msg: format!("duplicate context `{name}` in this clause"),
@@ -30226,6 +30387,7 @@ impl<'src> Analyzer<'src> {
                         _ => "",
                     };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!("unknown numeric suffix `{suffix}`{hint}"),
@@ -30293,6 +30455,7 @@ impl<'src> Analyzer<'src> {
             if let Some(span) = self.span_map.get(&literal_id) {
                 let span = **span;
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!("the literal `{whole}` is out of range for `{name}` ({range})"),
@@ -30316,16 +30479,19 @@ impl<'src> Analyzer<'src> {
             for constraint in &self.constraints {
                 match constraint {
                     Constraint::StructInitializer(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: constraint.fields_span,
                         msg: "type of struct initializer could not be resolved".to_string(),
                     }),
                     Constraint::FieldAccessor(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **(self.span_map.get(&constraint.id).unwrap_or(&&EMPTY_SPAN)),
                         msg: "type of accessor subject could not be resolved".to_string(),
                     }),
                     Constraint::Variable(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **(self
                             .span_map
@@ -30340,6 +30506,7 @@ impl<'src> Analyzer<'src> {
                         ),
                     }),
                     Constraint::CallSubject(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: constraint.arguments_span,
                         msg: "type of function call arguments could not be resolved".to_string(),
@@ -30364,6 +30531,7 @@ impl<'src> Analyzer<'src> {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             if self.list_element_slot(&subject_type).is_some() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&subscript_id).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot index this List: its element type is never determined \
@@ -30387,6 +30555,7 @@ impl<'src> Analyzer<'src> {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: format!(
@@ -30482,6 +30651,7 @@ impl<'src> Analyzer<'src> {
                     .unwrap_or("unknown");
                 let rendered = self.pretty_print_type(&variable_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!(
@@ -31759,7 +31929,9 @@ impl<'src> Program<'src> {
                 error.span = origin_span;
                 // A note points into generated text too, and its own file is
                 // then meaningless; the attribute says everything there is.
+                // The same goes for a requirement trace's labels.
                 error.note = None;
+                error.trace = Vec::new();
                 (error, origin_source)
             }
             None => {
@@ -31861,20 +32033,25 @@ impl<'src> Program<'src> {
             usize,
             &'a str,
             Option<(u32, usize, usize, &'a str)>,
+            Vec<(u32, usize, usize, &'a str)>,
         ) {
+            let locate = |note: &'a Note| {
+                (
+                    note.source.unwrap_or(source).0,
+                    note.span.start,
+                    note.span.end,
+                    note.msg.as_str(),
+                )
+            };
             (
                 source.0,
                 error.span.start,
                 error.span.end,
                 error.msg.as_str(),
-                error.note.as_ref().map(|note| {
-                    (
-                        note.source.unwrap_or(source).0,
-                        note.span.start,
-                        note.span.end,
-                        note.msg.as_str(),
-                    )
-                }),
+                error.note.as_ref().map(locate),
+                // The E78 requirement trace is part of what the reader sees,
+                // so it joins the content tail (empty for most diagnostics).
+                error.trace.iter().map(locate).collect(),
             )
         }
         fn sort_in_step(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>) {
@@ -32231,6 +32408,7 @@ fn report_module_parse_errors(diagnostics: &mut Vec<Error>, path: &Path, loaded:
             continue;
         }
         diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span: EMPTY_SPAN,
             msg,
@@ -33608,6 +33786,7 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
                     continue;
                 }
                 diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!(
@@ -34576,6 +34755,7 @@ fn analyze_inner<'src>(
             let lib_path = std_module_path(&spec.base_root, "lib.vl");
             let Some(lib_loaded) = load_package_module(&lib_path) else {
                 analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: EMPTY_SPAN,
                     msg: format!("library at `{}` has no `lib.vl`", spec.base_root.display()),
@@ -34614,7 +34794,7 @@ fn analyze_inner<'src>(
                 if resolve_module_file(&spec.base_root, module).is_some() {
                     to_load.push((Origin::Dep(index), module));
                 } else if resolve_module_in_roots(&spec.search_roots(platform), module).is_some() {
-                    analyzer.diagnostics.push(Error {
+                    analyzer.diagnostics.push(Error { trace: Vec::new(),
                         note: None,
                         span: EMPTY_SPAN,
                         msg: format!(
@@ -34744,6 +34924,7 @@ fn analyze_inner<'src>(
             let module_path = resolution.path;
             if resolution.ambiguous {
                 analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: EMPTY_SPAN,
                     msg: format!(
@@ -34762,6 +34943,7 @@ fn analyze_inner<'src>(
                 crate::util::case_exact_mismatch(&resolution.root, &resolution.relative)
             {
                 analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: EMPTY_SPAN,
                     msg: format!(
@@ -36414,6 +36596,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
             });
         violations.push(program.anchored(
             Error {
+                trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(anchor).unwrap_or(&&EMPTY_SPAN),
                 msg: view_crossing_message(view_name, root_name, callee),
@@ -36427,6 +36610,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
         }
         violations.push(program.anchored(
             Error {
+                trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(parameter_id).unwrap_or(&&EMPTY_SPAN),
                 msg: async_view_parameter_message(form),
@@ -36440,6 +36624,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
         }
         violations.push(program.anchored(
             Error {
+                trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(reference_id).unwrap_or(&&EMPTY_SPAN),
                 msg: async_view_capture_message(name),
@@ -36469,6 +36654,7 @@ pub fn check_async_drops(program: &mut Program) {
         .map(|(function_id, span, subject)| {
             program.anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: *span,
                     msg: format!(
@@ -36500,6 +36686,7 @@ pub fn check_context_drops(program: &mut Program) {
         .map(|(function_id, span, subject)| {
             program.anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: *span,
                     msg: format!(

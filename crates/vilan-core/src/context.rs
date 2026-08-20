@@ -27,12 +27,24 @@
 //! The pass is a no-op for programs that never create a `Context`, so it can't
 //! change the output of any existing program.
 
+use std::collections::VecDeque;
+
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
 use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::Type;
+
+/// How many upstream calls a coverage refusal's requirement trace labels
+/// (backlog E78) before it elides the rest behind an honest "… N more" tail.
+/// Six keeps a full report about a screen tall: chains deeper than that are
+/// recursion- or framework-shaped noise past the point where the reader has
+/// seen where the requirement enters, and the ENTRY side is what the cap
+/// keeps — the outermost uncovered frames, where the missing `run` belongs —
+/// while the read end is always visible anyway as the primary (or its C3
+/// note, when the read sits in std).
+const TRACE_CAP: usize = 6;
 
 /// Entry point: thread every context in `program`, or record diagnostics if any
 /// context is read where its value can't be supplied.
@@ -194,6 +206,7 @@ fn local_target(program: &Program, entity_id: Id) -> Option<Id> {
 fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
     program.anchored(
         Error {
+            trace: Vec::new(),
             note: None,
             span: span_of(program, anchor),
             msg,
@@ -202,11 +215,20 @@ fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
     )
 }
 
-/// [`anchored`], carrying the C3 secondary note (diagnostics-standard.md §3).
-fn anchored_noting(program: &Program, anchor: Id, msg: String, note: Note) -> (Error, SourceId) {
+/// [`anchored`], carrying the E78 requirement trace (one label per uncovered
+/// user-written call, ordered entry → site) and, when the offending site sits
+/// in std, the C3 note that demotes the std frame.
+fn anchored_tracing(
+    program: &Program,
+    anchor: Id,
+    msg: String,
+    trace: Vec<Note>,
+    note: Option<Note>,
+) -> (Error, SourceId) {
     program.anchored(
         Error {
-            note: Some(note),
+            note,
+            trace,
             span: span_of(program, anchor),
             msg,
         },
@@ -1254,22 +1276,25 @@ fn analyze(
         }
 
         // The A2 walk-back (E74): a refused site whose own span sits in std
-        // anchors at the EARLIEST user-written call that enters std on an
-        // uncovered path — the async-polymorphism origin discipline
-        // (`record_origin`: ids are minted in walk order, so the least call
-        // id is the earliest such call in the program), with the std site
-        // demoted to the C3 note. A site in user code anchors at itself and
-        // returns `None` here. The walk descends the same edges the
+        // anchors at the user-written calls that enter std on an uncovered
+        // path — the async-polymorphism origin discipline (`record_origin`:
+        // ids are minted in walk order, so call-id order is program order),
+        // with the std site demoted to the C3 note. E74 kept only the
+        // least-id entry; E78 keeps them all — each uncovered entry becomes
+        // its own diagnostic (fixing the first must not merely reveal the
+        // next), returned in id order so the least-id one still leads,
+        // exactly where E74 anchored. A site in user code anchors at itself
+        // and returns no entries here. The walk descends the same edges the
         // strictness climbed — direct calls, admitted dispatch calls, the
         // capture hop — and only through UNBOUND callers: a covered caller
         // is not on the uncovered path and must not take the blame. No user
         // entry found (an uncovered read reachable only from std's own load
         // would be std's bug, not the user's) falls back to the std anchor.
-        let user_entry_of = |site: Id, start: Id| -> Option<Id> {
+        let user_entries_of = |site: Id, start: Id| -> Vec<Id> {
             if !std_spanned(site) {
-                return None;
+                return Vec::new();
             }
-            let mut best: Option<Id> = None;
+            let mut entries: Vec<Id> = Vec::new();
             let mut visited: HashSet<Id> = HashSet::default();
             let mut walk: Vec<Id> = vec![start];
             while let Some(node) = walk.pop() {
@@ -1282,8 +1307,8 @@ fn analyze(
                     }
                     if std_spanned(call_id) {
                         walk.push(caller);
-                    } else if best.is_none_or(|held| call_id.0 < held.0) {
-                        best = Some(call_id);
+                    } else {
+                        entries.push(call_id);
                     }
                 }
                 for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
@@ -1292,15 +1317,15 @@ fn analyze(
                     }
                     if std_spanned(call_id) {
                         walk.push(caller);
-                    } else if best.is_none_or(|held| call_id.0 < held.0) {
-                        best = Some(call_id);
+                    } else {
+                        entries.push(call_id);
                     }
                 }
                 // A top-level call is an uncovered entry by construction; it
                 // has no node to walk onward to.
                 for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
-                    if !std_spanned(call_id) && best.is_none_or(|held| call_id.0 < held.0) {
-                        best = Some(call_id);
+                    if !std_spanned(call_id) {
+                        entries.push(call_id);
                     }
                 }
                 // The capture hop: an unbound closure's uncovered-ness came
@@ -1311,7 +1336,126 @@ fn analyze(
                     }
                 }
             }
-            best
+            // One dispatch site reaches the walk once per visited candidate;
+            // a diagnostic per site, not per candidate.
+            entries.sort_by_key(|entry| entry.0);
+            entries.dedup();
+            entries
+        };
+
+        // The requirement trace (backlog E78): the refusal keeps the PATH
+        // the walk traverses, not just its endpoint. One hop per uncovered
+        // user-written call upstream of `start` (the frame holding the
+        // primary), breadth-first so a hop's depth is its least distance
+        // from that frame. A covered caller's edge is skipped exactly as in
+        // the walk above — a providing call is never labeled and stops the
+        // trace — and std-internal calls are traversed but never labeled
+        // (A2 demotes std frames; the C3 note already names the std site).
+        // The capture hop crosses no call site, so it adds no label and no
+        // depth: the closure blames its defining scope's callers directly.
+        struct Hop {
+            call: Id,
+            /// A dispatch edge is union-admitted (row 222's residual): the
+            /// site MAY select the needy candidate, so its label must not
+            /// overclaim.
+            dispatch: bool,
+            depth: usize,
+        }
+        let uncovered_hops_from = |start: Id| -> Vec<Hop> {
+            let mut hops: Vec<Hop> = Vec::new();
+            let mut visited: HashSet<Id> = HashSet::default();
+            let mut frontier: VecDeque<(Id, usize)> = VecDeque::from([(start, 0)]);
+            while let Some((node, depth)) = frontier.pop_front() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                for &(caller, call_id) in incoming_calls.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) {
+                        continue;
+                    }
+                    if !std_spanned(call_id) {
+                        hops.push(Hop {
+                            call: call_id,
+                            dispatch: false,
+                            depth,
+                        });
+                    }
+                    frontier.push_back((caller, depth + 1));
+                }
+                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                        continue;
+                    }
+                    if !std_spanned(call_id) {
+                        hops.push(Hop {
+                            call: call_id,
+                            dispatch: true,
+                            depth,
+                        });
+                    }
+                    frontier.push_back((caller, depth + 1));
+                }
+                for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
+                    if !std_spanned(call_id) {
+                        hops.push(Hop {
+                            call: call_id,
+                            dispatch: false,
+                            depth,
+                        });
+                    }
+                }
+                if let Some(parent) = graph.closure_parent_of(node) {
+                    if !bound.contains(&parent) {
+                        frontier.push_back((parent, depth));
+                    }
+                }
+            }
+            hops
+        };
+
+        // Hops as trace labels, ordered entry → read: decreasing depth reads
+        // from the outermost uncovered frame down toward the primary (a
+        // level order — on a many-chains DAG every hop's own upstream hop
+        // precedes it), ties in id (program) order; one label per call site.
+        // Past TRACE_CAP the entry side is kept and the rest elides behind
+        // the honest tail. Each label follows the `Note::source` contract:
+        // the file is named only when it differs from the anchor's.
+        let trace_of = |start: Id, anchor: Id| -> Vec<Note> {
+            let mut hops = uncovered_hops_from(start);
+            hops.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.call.0.cmp(&b.call.0)));
+            let mut seen: HashSet<Id> = HashSet::default();
+            hops.retain(|hop| seen.insert(hop.call));
+            let anchor_source = program.note_source_of(anchor);
+            let locate = |call: Id| {
+                program
+                    .note_source_of(call)
+                    .filter(|source| Some(*source) != anchor_source)
+            };
+            let elided = hops.len().saturating_sub(TRACE_CAP);
+            let mut notes: Vec<Note> = hops
+                .iter()
+                .take(TRACE_CAP)
+                .map(|hop| Note {
+                    span: span_of(program, hop.call),
+                    msg: if hop.dispatch {
+                        "the context requirement may flow through this call (dispatch may select a reader)"
+                            .to_string()
+                    } else {
+                        "the context requirement flows through this call".to_string()
+                    },
+                    source: locate(hop.call),
+                })
+                .collect();
+            if elided > 0 {
+                let last = &hops[TRACE_CAP - 1];
+                let plural = if elided == 1 { "call" } else { "calls" };
+                notes.push(Note {
+                    span: span_of(program, last.call),
+                    msg: format!("… {elided} more uncovered {plural} on this path"),
+                    source: locate(last.call),
+                });
+            }
+            notes
         };
 
         // Any STRICT get whose owner stayed unbound is read outside every
@@ -1327,14 +1471,40 @@ fn analyze(
                 "context `{}` is read here, but this code can be reached without an enclosing `run`",
                 context_name(program, context)
             );
-            match user_entry_of(get.call_id, get.owner.id()) {
-                Some(entry) => errors.push(anchored_noting(
-                    program,
-                    entry,
-                    message,
-                    std_frame_note(program, graph, get.call_id, get.owner.id(), "read", entry),
-                )),
-                None => errors.push(anchored(program, get.call_id, message)),
+            let entries = user_entries_of(get.call_id, get.owner.id());
+            if entries.is_empty() {
+                // A user-written read anchors at itself (E74), now carrying
+                // its upstream chain; a std-spanned read no user entry
+                // reaches keeps the bare std anchor, trace-free.
+                let trace = if std_spanned(get.call_id) {
+                    Vec::new()
+                } else {
+                    trace_of(get.owner.id(), get.call_id)
+                };
+                errors.push(anchored_tracing(program, get.call_id, message, trace, None));
+            } else {
+                for entry in entries {
+                    // The chain climbs from the frame holding the entry call;
+                    // a top-level entry has no frame and nothing above it.
+                    let trace = owner_of
+                        .get(&entry)
+                        .map(|frame| trace_of(frame.id(), entry))
+                        .unwrap_or_default();
+                    errors.push(anchored_tracing(
+                        program,
+                        entry,
+                        message.clone(),
+                        trace,
+                        Some(std_frame_note(
+                            program,
+                            graph,
+                            get.call_id,
+                            get.owner.id(),
+                            "read",
+                            entry,
+                        )),
+                    ));
+                }
             }
         }
         // Calling an injected closure IS a read: its deferred argument comes
@@ -1347,14 +1517,35 @@ fn analyze(
                 "an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`",
                 context_name(program, context)
             );
-            match user_entry_of(*call_id, owner.id()) {
-                Some(entry) => errors.push(anchored_noting(
-                    program,
-                    entry,
-                    message,
-                    std_frame_note(program, graph, *call_id, owner.id(), "injected call", entry),
-                )),
-                None => errors.push(anchored(program, *call_id, message)),
+            let entries = user_entries_of(*call_id, owner.id());
+            if entries.is_empty() {
+                let trace = if std_spanned(*call_id) {
+                    Vec::new()
+                } else {
+                    trace_of(owner.id(), *call_id)
+                };
+                errors.push(anchored_tracing(program, *call_id, message, trace, None));
+            } else {
+                for entry in entries {
+                    let trace = owner_of
+                        .get(&entry)
+                        .map(|frame| trace_of(frame.id(), entry))
+                        .unwrap_or_default();
+                    errors.push(anchored_tracing(
+                        program,
+                        entry,
+                        message.clone(),
+                        trace,
+                        Some(std_frame_note(
+                            program,
+                            graph,
+                            *call_id,
+                            owner.id(),
+                            "injected call",
+                            entry,
+                        )),
+                    ));
+                }
             }
         }
 
@@ -1615,6 +1806,7 @@ fn analyze(
             // problem, reported against the entry.
             _ => errors.push((
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: crate::span::Span { start: 0, end: 0 },
                     msg: "`get_safe` needs `std::option::Option` loaded".to_string(),

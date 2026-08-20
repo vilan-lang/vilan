@@ -1116,6 +1116,11 @@ pub struct PublishedDiagnostic {
     /// message, and the note's own file when it lives elsewhere (`None` =
     /// the diagnostic's file) — published as LSP related information.
     pub note: Option<(Span, String, Option<PathBuf>)>,
+    /// The diagnostic's requirement trace (backlog E78), in the same
+    /// per-location shape as `note`: one entry per uncovered upstream call,
+    /// ordered entry → read — published as LSP related information ahead of
+    /// the note, preserving this order.
+    pub trace: Vec<(Span, String, Option<PathBuf>)>,
 }
 
 /// The span of an entity, flattened from the `&Span` stored in `span_map`.
@@ -1312,7 +1317,7 @@ impl Document {
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program: AnalyzedProgram::none(),
-            diagnostics: vec![Error {
+            diagnostics: vec![Error { trace: Vec::new(),
                 note: None,
                 span: vilan_core::span::Span::new((), 0..0),
                 msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
@@ -1471,15 +1476,16 @@ impl Document {
         // The C3 note as the publisher wants it: its span, its message, and the
         // file it lives in when it has one of its own (`None` = the
         // diagnostic's own file, whichever that is — backlog E17).
-        let note_of = |error: &Error| {
-            error.note.as_ref().map(|note| {
-                let note_path = note
-                    .source
-                    .and_then(|source| self.program.as_ref()?.source_path(source))
-                    .map(Path::to_path_buf);
-                (note.span, note.msg.clone(), note_path)
-            })
+        let locate = |note: &vilan_core::error::Note| {
+            let note_path = note
+                .source
+                .and_then(|source| self.program.as_ref()?.source_path(source))
+                .map(Path::to_path_buf);
+            (note.span, note.msg.clone(), note_path)
         };
+        let note_of = |error: &Error| error.note.as_ref().map(locate);
+        // The E78 requirement trace, each hop located exactly like the note.
+        let trace_of = |error: &Error| error.trace.iter().map(locate).collect::<Vec<_>>();
         for (index, error) in self.diagnostics.iter().enumerate() {
             let source = self
                 .diagnostic_sources
@@ -1493,6 +1499,7 @@ impl Document {
                     message: error.msg.clone(),
                     warning: false,
                     note: note_of(error),
+                    trace: trace_of(error),
                 });
             } else if source == DERIVED_SOURCE {
                 published.push(PublishedDiagnostic {
@@ -1501,6 +1508,7 @@ impl Document {
                     message: format!("(in generated code) {}", error.msg),
                     warning: false,
                     note: None,
+                    trace: Vec::new(),
                 });
             } else {
                 let path = self
@@ -1520,6 +1528,7 @@ impl Document {
                         message: error.msg.clone(),
                         warning: false,
                         note: note_of(error),
+                        trace: trace_of(error),
                     }),
                     // An unknown source (shouldn't happen): keep the error
                     // visible on the entry rather than dropping it.
@@ -1529,6 +1538,7 @@ impl Document {
                         message: error.msg.clone(),
                         warning: false,
                         note: None,
+                        trace: Vec::new(),
                     }),
                 }
             }
@@ -1555,6 +1565,7 @@ impl Document {
                     message: warning.msg.clone(),
                     warning: true,
                     note: note_of(warning),
+                    trace: trace_of(warning),
                 }),
                 Some(Some(path)) => published.push(PublishedDiagnostic {
                     path: Some(path),
@@ -1562,6 +1573,7 @@ impl Document {
                     message: warning.msg.clone(),
                     warning: true,
                     note: note_of(warning),
+                    trace: trace_of(warning),
                 }),
                 // A source with no file (generated code): keep it visible on
                 // the entry rather than at that offset in the wrong text.
@@ -1571,6 +1583,7 @@ impl Document {
                     message: warning.msg.clone(),
                     warning: true,
                     note: None,
+                    trace: Vec::new(),
                 }),
             }
         }
@@ -1589,6 +1602,7 @@ impl Document {
                 message: problem.message.clone(),
                 warning: problem.warning,
                 note: None,
+                trace: Vec::new(),
             });
         }
         published
