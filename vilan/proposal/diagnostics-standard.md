@@ -76,6 +76,18 @@ boundary sketch, and this week's diagnostics (the B13 origin-naming, the
   `note: (Span, String)` rendered as an ariadne sub-label — one, not a
   list, to keep diagnostics terse. **Open question 1.**
 
+  **E76 (2026-08-20)** — the rendering of that sub-label carries a
+  header/label agreement rule: a `file:line:col` header and the label
+  beneath it derive from ONE converted position. Compiler spans are byte
+  offsets; the CLI re-expresses every span in char offsets exactly once
+  (`char_range`, `vilan-cli/src/main.rs`) and hands ariadne that single
+  index space. Under `IndexType::Byte`, ariadne 0.6 derived a
+  cross-source note's sub-header by re-converting the label's
+  already-converted char offset as if it were still bytes, printing the
+  header a couple of lines above the label whenever multibyte text
+  preceded it in the noted file. Pinned in
+  `vilan-cli/tests/diagnostics.rs` (`e76_*`).
+
 ## 4. The classes outside `diagnostics.push`
 
 - **Lexer/parser errors** are chumsky-generated expected-lists ("found X,

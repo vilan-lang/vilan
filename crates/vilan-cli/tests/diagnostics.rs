@@ -698,3 +698,153 @@ fn build_reports_only_the_parse_error_and_emits_nothing() {
         "and nothing is written from a tree that did not parse"
     );
 }
+
+// --- E76: a header and the label under it name the same position -------------
+//
+// Every span reaches ariadne in ONE index space (char offsets, converted once
+// per span by `char_range` in main.rs). Before that, `IndexType::Byte` let
+// ariadne derive a cross-source group's `file:line:col` sub-header from the
+// label's already-converted CHAR offset as if it were still bytes, so any
+// multibyte character earlier in the noted file dragged the sub-header a
+// couple of lines above the label it heads (`reactive.vl:363:26` over a
+// line-365 label). These pins parse the rendered report itself: the line a
+// header names must be the gutter line number of the first quoted source line
+// under it. std's own files carry the multibyte characters that made the two
+// diverge, so the cross-source pins are non-vacuous against the byte-mode
+// renderer (proven red on a revert of the `char_range` conversion).
+
+/// The line number named by the first rendered header mentioning `file`
+/// (`╭─[ file:line:col ]` or `├─[ file:line:col ]`), plus the gutter number
+/// and text of the first quoted source line under it.
+fn header_line_and_first_quoted_line(stderr: &str, file: &str) -> Option<(usize, usize, String)> {
+    let mut lines = stderr.lines();
+    let header = lines.find(|line| line.contains("─[ ") && line.contains(file))?;
+    let inside = header.split("─[ ").nth(1)?.split(" ]").next()?;
+    let mut fields = inside.rsplitn(3, ':');
+    let _column: usize = fields.next()?.parse().ok()?;
+    let header_line: usize = fields.next()?.parse().ok()?;
+    let quoted = lines.find_map(|line| {
+        let trimmed = line.trim_start();
+        let digits: String = trimmed.chars().take_while(char::is_ascii_digit).collect();
+        let rest = trimmed[digits.len()..].trim_start();
+        (!digits.is_empty() && rest.starts_with('│')).then(|| {
+            (
+                digits.parse::<usize>().unwrap(),
+                rest[3..].trim().to_string(),
+            )
+        })
+    })?;
+    Some((header_line, quoted.0, quoted.1))
+}
+
+#[test]
+fn e76_the_coverage_notes_sub_header_agrees_with_its_label() {
+    // The E74 flavor: `Signal::effect` at the top of `main` anchors at the
+    // user's call and notes std's strict read — a cross-source note into
+    // `reactive.vl`, whose sub-header must head the very line it labels.
+    let dir = temp_package(
+        "e76_coverage",
+        "import std::print;\n\
+         import std::reactive::Signal;\n\
+         \n\
+         fun main() {\n\
+         \tlet count = Signal::new(1);\n\
+         \tcount.effect(|value| print(value));\n\
+         }\n\
+         main();\n",
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the uncovered effect must fail");
+    let (header_line, label_line, quoted) =
+        header_line_and_first_quoted_line(&stderr, "reactive.vl")
+            .unwrap_or_else(|| panic!("a reactive.vl sub-header must render: {stderr}"));
+    assert!(
+        quoted.contains("owner_scope.get()"),
+        "the note labels std's strict read: {stderr}"
+    );
+    assert_eq!(
+        header_line, label_line,
+        "the sub-header names the line its label sits on: {stderr}"
+    );
+}
+
+#[test]
+fn e76_the_generic_leak_notes_sub_header_agrees_with_its_label() {
+    // The R11 flavor: `Option::map` at a resource is rejected at the user's
+    // instantiation with a note into the generic body — a cross-source note
+    // into `option.vl`, the other note-producer live today.
+    let dir = temp_package(
+        "e76_generic_leak",
+        "import std::option::Option::{ self, Some };\n\
+         resource struct Db { handle: i32 }\n\
+         fun main() {\n\
+         \tlet db = Db { handle = 1 };\n\
+         \tlet opt: Option<Db> = Some(db);\n\
+         \tlet n = opt.map(|d| d.handle);\n\
+         }\n\
+         main();\n",
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the resource `map` must fail");
+    let (header_line, label_line, quoted) = header_line_and_first_quoted_line(&stderr, "option.vl")
+        .unwrap_or_else(|| panic!("an option.vl sub-header must render: {stderr}"));
+    assert!(
+        quoted.contains("Some(fn(x))"),
+        "the note labels `map`'s own arm: {stderr}"
+    );
+    assert_eq!(
+        header_line, label_line,
+        "the sub-header names the line its label sits on: {stderr}"
+    );
+}
+
+#[test]
+fn e76_a_same_file_note_is_unmoved_by_the_char_conversion() {
+    // The no-churn half: a note in the SAME file renders under the one
+    // header, and that header still names the primary's exact position even
+    // with multibyte trivia above it (the case where byte and char offsets
+    // diverge — a wrong conversion would move this header).
+    let dir = temp_package(
+        "e76_same_file",
+        "// café — café — café — multibyte trivia so byte and char offsets diverge\n\
+         struct Cat { name: str }\n\
+         fun main() {\n\
+         \tlet w = welcome(Cat { name = \"tom\" });\n\
+         }\n\
+         trait Greet {\n\
+         \tfun greet(self): str;\n\
+         }\n\
+         fun welcome<type T: Greet>(guest: T): str {\n\
+         \tguest.greet()\n\
+         }\n\
+         main();\n",
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the unmet bound must fail");
+    let (header_line, label_line, quoted) = header_line_and_first_quoted_line(&stderr, "main.vl")
+        .unwrap_or_else(|| panic!("the main.vl header must render: {stderr}"));
+    assert!(
+        stderr.contains("main.vl:4:10 ]"),
+        "the header names the primary's exact line:col, unmoved: {stderr}"
+    );
+    assert_eq!(header_line, 4, "…which is line 4: {stderr}");
+    assert_eq!(header_line, label_line, "…the line the primary labels");
+    assert!(
+        quoted.contains("welcome(Cat"),
+        "quoting the call line: {stderr}"
+    );
+    assert!(
+        !stderr.contains("├─["),
+        "one file, one group — no sub-header at all: {stderr}"
+    );
+    assert!(
+        stderr.contains("the bound is declared here"),
+        "and the note still renders with it: {stderr}"
+    );
+}
