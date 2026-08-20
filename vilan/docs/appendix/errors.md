@@ -549,7 +549,9 @@ closure or a UI handler, `match` instead.
 **"context `owner_scope` is read here, but this code can be reached without an enclosing `run`"**
 The most common first UI error: you built reactive state (an `effect`, a
 binding) outside every ownership boundary. Wrap the entry point in
-`mount_root`, or `run_with_owner` in a test.
+`mount_root`, or `run_with_owner` in a test. The error points at your
+`effect`/`map`/`or` call; the note under it shows the read inside the
+standard library that your call reaches.
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
 
 **"`…` reads context `…`, so it can't be used as a value"**

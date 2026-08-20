@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**The `owner_scope` coverage error now points at your call, not into the standard library.** A `Signal::effect` at the top of `main`, a `map`/`or` on a service mirror outside any scope — the "context `owner_scope` is read here, but this code can be reached without an enclosing `run`" refusal anchored at the strict read all three helpers funnel to: `get_owner`'s body in std's `reactive.vl`, a file you didn't write, sitting in a std cache directory. The message was right; the location failed the anchoring rules' second law (an error caused by user code never anchors in std).
+
+The coverage check now walks the uncovered path back from a std-internal read to the earliest user-written call that enters the standard library — a call inside a covering `run` is never blamed for the uncovered one beside it — and anchors there, demoting the std read to the secondary note the async-boundary refusals already use ("the read is inside `get_owner` here", labeled in its own file). A strict read you wrote yourself still anchors at itself, note-free, and the injected-closure flavor of the refusal carries the same walk-back.
+
+---
+
 <!-- family: tooling -->
 **The glossary's cross-references now land somewhere.** `appendix/glossary.md` cross-links its terms — `[view](#view)`, `[owner](#owner)`, 25 links — but wrote each term as bold text, which mdBook gives no anchor, so every one of those links scrolled the published page nowhere (D16). Each of the 49 terms now fronts an explicit HTML anchor named by its slug; the links resolve in the built book, and a pin beside the editor-page and hover-link gates (`book_sync.rs`) holds every anchor to its term and every fragment link to an anchor, so a future cross-link cannot ship dead.
 
