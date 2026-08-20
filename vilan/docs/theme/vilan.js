@@ -155,9 +155,11 @@
 //
 // - "Open in the vilan playground" (▶): a link putting the code itself in the
 //   URL fragment - deflate-raw, base64url, the SAME codec the playground's
-//   Share writes (playground/editor-src/editor.mjs in the website repo;
-//   resync both when either moves — re-verified byte-for-byte over every
-//   fence 2026-08-19). A process-leg example carries `&mode=node`, so it
+//   Share writes (playground/codec.js in the website repo — the codec's one
+//   home, which the editor bundle imports; the copy below is pinned
+//   byte-equal to the committed codec-fixture.js beside this file by
+//   crates/vilan-cli/tests/book_mirrors.rs, so it cannot drift silently —
+//   K15). A process-leg example carries `&mode=node`, so it
 //   opens straight into the server check and the platform story shows
 //   itself. A browser without CompressionStream simply sees no links.
 // - "Run" (or "Check" for a process-leg example): compiles the same source
@@ -199,20 +201,28 @@
 		/\bstd::(build|db|document|fs|http|process|rpc_server|watch)\b|\bstd::ui::(?:\{[^}]*\brender\b|render\b)/;
 
 	// --- the share codec -------------------------------------------------
+	//
+	// The two functions the links need, copied from the codec's one home
+	// (the website repo's playground/codec.js) and held byte-equal to the
+	// committed codec-fixture.js beside this file by the suite
+	// (crates/vilan-cli/tests/book_mirrors.rs). This file is a classic
+	// script on a book that must keep working locally with no served
+	// playground, so it copies rather than imports — the gate is what keeps
+	// the copy honest. Edit the codec at its home, never here first.
 
 	function encodeBase64Url(bytes) {
-		var binary = "";
-		for (var i = 0; i < bytes.length; i++) {
-			binary += String.fromCharCode(bytes[i]);
+		let binary = "";
+		for (const byte of bytes) {
+			binary += String.fromCharCode(byte);
 		}
-		return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+		return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 	}
 
-	function deflate(text) {
-		var stream = new Blob([new TextEncoder().encode(text)])
+	async function deflate(text) {
+		const stream = new Blob([new TextEncoder().encode(text)])
 			.stream()
 			.pipeThrough(new CompressionStream("deflate-raw"));
-		return new Response(stream).arrayBuffer();
+		return new Uint8Array(await new Response(stream).arrayBuffer());
 	}
 
 	// --- the styles -------------------------------------------------------
@@ -731,11 +741,11 @@
 			buttons.insertBefore(button, buttons.firstChild);
 		}
 		if (canLink) {
-			deflate(source).then(function (buffer) {
+			deflate(source).then(function (bytes) {
 				var link = document.createElement("a");
 				link.className = "vilan-playground-link";
 				link.href =
-					PLAYGROUND + "#code=" + encodeBase64Url(new Uint8Array(buffer)) + (node ? "&mode=node" : "");
+					PLAYGROUND + "#code=" + encodeBase64Url(bytes) + (node ? "&mode=node" : "");
 				link.target = "_blank";
 				link.rel = "noopener";
 				link.title = node

@@ -976,3 +976,118 @@ as a browser program either way: PROCESS_HINT does not match it, and no
 browser-tagged fence in today's book matches PROCESS_HINT (checked across
 all 319), so honoring the `browser` tag flips no fence between Check and
 Run, and the three fragments are the fix's entire behavioral delta.
+
+## 8. K10/K15 ship record (2026-08-20)
+
+Lane `k10-token-source` (cycle 25, work order 7); design in
+design-language.md §2.6, which this record ships. Both repos moved:
+website branch `k10-token-source` (off `main`) and this repo's
+`k10-token-source` (off `next`).
+
+**The estate, re-verified before building.** The tracker's K10 text
+names three manual mirrors of `theme.vl`'s palette; the tree shows one.
+The CodeMirror theme stopped being a mirror at K5 slice 2 — `editor.mjs`
+names only `--code-*` slots minted by `code_palette`, so a token edit
+re-themes the committed bundle with no rebuild — and `chrome/header.css`
+is generated from `theme.vl` on every build. For that reason the
+"generated CodeMirror theme module" half of the K10 order was **not
+built**: it would replace a mechanism that needs no rebuild with one
+that does, and reintroduce a generated second copy of the palette — the
+argument is §2.6's. The one manual mirror, the book's `variables.css`,
+is what the gate below covers.
+
+**Website half (K10).** `theme.vl`'s themed custom properties moved
+into one const table, `themed_values` (`ThemedValue { name, dark,
+light }`, `tint-comment`'s per-theme alpha pulls included); `token()`
+became a lookup that **fails the build at const eval** on a name the
+table lacks (probed: a misspelled name errors the build), so the values
+have exactly one home and the typed consts cannot disagree with it. The
+`:root{…}@media (prefers-color-scheme: light){…}` string is one
+formatter, `themed_declaration`, shared by `token()` and the generator.
+The chrome leg now writes four files: `header.html`/`header.css` as
+before, `tokens.css` (the whole palette, first the site's own
+`prefers-color-scheme` form — the exact strings the compiled
+stylesheets carry — then the class-scoped `html.navy`/`html.light`
+form, the book's picker model; served but linked by nothing yet, by
+design), and `tokens-fixture.css` (the class-scoped form under a
+provenance header — the file this repo commits; the deploy stages
+`tokens.css` and deliberately not the fixture). Verified: `vilan build .`
+exit 0 with every `dist/*.css` and both browser bundles **byte-identical**
+to the pre-change build; smoke exit 0; playground and landing
+screenshots byte-identical to the pre-change captures (Windows Chrome
+headless 1440×1000, fixed virtual-time budget — the after-shot equals a
+baseline shot byte for byte, zero pixels moved).
+
+**Book half (K10).** `variables.css` keeps its role declarations as the
+local source — a plain `mdbook build` stands alone (re-verified, exit 0)
+— and its header now names the gate instead of promising hand-resync:
+`vilan/docs/theme/css/tokens-fixture.css` is committed (byte-identical
+to the generator's output), and `crates/vilan-cli/tests/book_mirrors.rs`
+parses every role-token declaration per theme — the `.navy` block, the
+`.light` block, and the no-script `@media` copy, so the file's own
+internal third copy is gated too — and holds each value byte-equal to
+the fixture, refuses role-shaped names the fixture does not generate,
+and pins the file's shape (1 dark + 1 light + 1 no-script dark block).
+Three fixture rows are allowlisted as deliberately unmirrored, with
+reasons in the test: `tint-comment` (the book states the same fact as
+`--code-comment-alpha` + `color-mix`), `shadow` and `art-error` (the
+art never renders in the book). Proven non-vacuous four ways: a planted
+wrong hex (both dark copies went red), a declaration dropped from the
+no-script copy alone, a planted invented role, and a planted codec edit
+(below) — each red with a naming message, each restored.
+
+**The fixture regeneration command** (from the website repo root, the
+toolchain repo checked out beside it — also in the fixture's header):
+
+    vilan build . && node dist/chrome.mjs export/chrome
+    cp export/chrome/tokens-fixture.css ../vilan/vilan/docs/theme/css/tokens-fixture.css
+
+**K15, decided: the byte-equal gate, with the module built anyway.**
+The codec now has one home on the website side — `playground/codec.js`
+(encode/decode/deflate/inflate), imported by `editor.mjs` and inlined
+by esbuild, so the editor build fails if the module is missing; the
+committed bundle was rebuilt from it and the shipped payloads verified
+equal (old codec vs new over probe programs, node; a canonical-encoded
+`#code=` link decoded into the served playground's editor, headless
+Chrome). The book does **not** import it, and §7's instinct stands on
+examination: `vilan.js` is a classic script, so only a dynamic
+`import()` could reach `/playground/codec.js`, and the ▶ links are
+built eagerly at page load with no server dependency at all today — on
+every locally built book the import would 404 and every link would
+vanish silently. The `worker.js` precedent the tracker offers does not
+carry: the Run button's dependence is click-gated and explains itself
+in the panel; the links' would be load-time and silent. So the book's
+copy (now exactly the two functions it needs, `encodeBase64Url` and an
+async `deflate`, rewritten byte-equal to the canonical text; the call
+site takes the returned `Uint8Array` directly — link payloads
+unchanged, verified as above) is pinned instead:
+`vilan/docs/theme/codec-fixture.js` is a byte-identical committed copy
+of `playground/codec.js` (`cp playground/codec.js
+../vilan/vilan/docs/theme/codec-fixture.js` to regenerate), and
+`book_mirrors.rs` holds every fixture function the book defines
+byte-equal (modulo the IIFE's one tab), requires the two the links
+need, and requires all four in the fixture so it cannot go vacuous.
+Neither IIFE's behavior moved: the grammar is untouched
+(`grammar_sync` green), and the runner's only changes are the codec
+block and its one call site.
+
+**Bycatch.** The pages repo's `docs.yml` already sweeps every file
+under `theme/` out of the served book by enumeration (`find theme
+-type f`), so both fixtures ride the existing recipe — no pages-repo
+change. The book's no-script dark copy in `variables.css` was an
+ungated third copy inside the book itself; the gate reads it as a dark
+block like any other, which is how the dropped-declaration plant was
+caught.
+
+**Gates.** Website: `vilan build .` exit 0 (outputs byte-identical as
+above), `node scripts/smoke-playground.mjs` exit 0, screenshots
+byte-identical, `vilan fmt` run on both touched `.vl` files. This
+repo: `mdbook build` exit 0, `cargo test -p vilan-core --test docs`
+exit 0, `cargo test -p vilan-cli --test book_mirrors` exit 0 (2
+passed), `cargo fmt`, and the full suite by exit code after `git add`
+of every new file: `cargo nextest run --workspace > suite.log 2>&1;
+echo $?` → `0` (`Summary [ 291.530s] 3832 tests run: 3832 passed
+(5 slow), 7 skipped` — book_mirrors' two among them; this sentence is
+the one edit after that run, and no test reads `vilan/proposal/`).
+No CHANGELOG entry: `vilan.js`'s links are byte-for-byte the links it
+built before, so nothing is user-visible.

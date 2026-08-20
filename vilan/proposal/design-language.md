@@ -11,6 +11,9 @@
 > §2.5 (the light variant) added 2026-08-19 by K6 S3 — the value
 > table Q2 deferred to the docs port; the sections after it shifted by
 > one (the playground fixes are §2.6, the editor ruling §2.7).
+> §2.6 (the generation) added 2026-08-20 by K10/K15 — the sections
+> after it shifted again (the playground fixes are §2.7, the editor
+> ruling §2.8).
 >
 > Prior status: DRAFT 2026-08-18.
 >
@@ -127,7 +130,8 @@ settings — the canonical form for every vilan code surface):**
 The hand-sync between `theme.vl` and the editor's hardcoded theme
 object dies: the site is a vilan program, so emit the CodeMirror theme
 (and anything else that needs raw values — the docs stylesheet once K6
-ports it) from `theme.vl`'s constants at build time. Filed as K10.
+ports it) from `theme.vl`'s constants at build time. Filed as K10; the
+mechanism as actually shipped is §2.6.
 
 ### 2.5 The light variant (K6 S3, 2026-08-19)
 
@@ -203,7 +207,92 @@ single edit.
 (mdBook's `general.css` applies it to `:root`); the site's light block
 must flip `app.html:6` the same way when it lands.
 
-### 2.6 The playground, made honest (the K-fixes this paper frames)
+### 2.6 The generation (K10/K15, 2026-08-20)
+
+§2.4 promised one token source, generated outward; this section is the
+mechanism, designed against the estate as it actually stands. Two of
+the "three mirrors" the tracker names were already dead when this lane
+opened: the CodeMirror theme stopped being a mirror at K5 slice 2
+(`editor.mjs`'s theme object names only `--code-*` slots minted by
+`theme.vl`'s `code_palette` — a token edit re-themes the committed
+bundle with **no rebuild**, which is strictly better than a generated
+theme module, so none is built), and the exported `chrome/header.css`
+is *generated* from `theme.vl` on every build, not hand-synced. The
+one manual mirror left is the book's `variables.css`. What this
+section adds: the palette gets one home *inside* `theme.vl`, the
+chrome leg publishes it in every form a consumer needs, and the book's
+mirror is held to the generated values by a suite gate instead of by
+eyes.
+
+**One home inside `theme.vl`.** The themed custom properties move into
+a single const table, `themed_values` (`ThemedValue { name, dark,
+light }` — every `token()` value, `tint-comment`'s per-theme alpha
+pulls included, stated as the strings they compile to). The typed
+`Color` consts the site consumes keep their names and their values:
+`token(name)` becomes a lookup into the table, and a name the table
+does not carry **fails the build at const eval** — so the table and
+the consts can never disagree, and no hex is stated twice. The
+`:root{…}@media (prefers-color-scheme: light){…}` declaration string
+is factored into `themed_declaration`, the one formatter both
+`token()` and the generator below call — parse-free reuse of the same
+text the compiled stylesheets carry, never a re-statement.
+
+**The generator.** The chrome leg (`src/chrome.vl` — already the
+book-facing export, already run by every deploy) renders the table
+into two more files beside `header.html`/`header.css`:
+
+- `chrome/tokens.css` — the whole themed palette in BOTH forms
+  consumers need: the site's own `prefers-color-scheme` form (the
+  exact `themed_declaration` strings), then the class-scoped form on
+  `html.light` / `html.navy` — the book's picker model, which beats
+  the `:root` form by specificity wherever both load. Nothing links it
+  yet by design (the book stays standalone, below); it is the palette
+  as a served artifact, for the docs port (K13), kolt, or any consumer
+  after them.
+- `chrome/tokens-fixture.css` — the class-scoped form again, under a
+  provenance header, byte-for-byte what the vilan repo commits as
+  `vilan/docs/theme/css/tokens-fixture.css`. Regeneration is a copy,
+  never an edit:
+  `vilan build . && node dist/chrome.mjs export/chrome && cp
+  export/chrome/tokens-fixture.css
+  ../vilan/vilan/docs/theme/css/tokens-fixture.css` (paths from the
+  website repo root; deploy does not stage this file).
+
+**The book's gate.** `variables.css` keeps its role declarations as
+the LOCAL source — a plain `mdbook build` must stand alone, so the
+book fetches nothing — but the mirror stops being trusted:
+`crates/vilan-cli/tests/book_mirrors.rs` parses every role-token
+declaration in `variables.css` per theme (the `.navy` block, the
+`.light` block, and the no-script `@media` copy — the file's own
+third copy, which could drift internally) and holds each value
+byte-equal to the committed fixture. Three fixture rows are
+deliberately not mirrored and are allowlisted by name with the
+reason: `tint-comment` (the book states the same fact as
+`--code-comment-alpha` + `color-mix`, so the alpha is the shared
+truth, not the composed color) and `shadow`/`art-error` (the art
+never renders in the book). Drift between `theme.vl` and the book now
+turns the suite red: a `theme.vl` change regenerates the fixture (the
+copy command above), and the red test then forces `variables.css` to
+move in the same change-set.
+
+**The codec, same discipline (K15).** The share codec exists once on
+the website side: `playground/codec.js` (encode/decode/deflate/
+inflate), imported by the editor bundle — esbuild inlines it, so the
+editor build fails if the module is missing. The book's `vilan.js`
+keeps an inline copy of the two functions it needs (`encodeBase64Url`,
+`deflate`) rather than importing the module: `vilan.js` is a classic
+script, so only a dynamic `import()` could reach `/playground/codec.js`
+— and that would make every ▶ link on every locally built book vanish
+silently (the links are built eagerly at page load and today need no
+server at all), a strictly worse failure than the run button's
+click-gated, panel-explained dependence on `/playground/worker.js`.
+So the copy is pinned instead: `vilan/docs/theme/codec-fixture.js` is
+the committed copy of `codec.js`, and the same `book_mirrors.rs` holds
+`vilan.js`'s two functions byte-equal (modulo the IIFE's one
+indentation level) to the fixture's, with the fixture's four functions
+required present so the gate cannot go vacuous.
+
+### 2.7 The playground, made honest (the K-fixes this paper frames)
 
 - **K1** — the playground joins the site nav: today `top_bar()` renders
   exactly three links, none of them the playground
@@ -232,7 +321,7 @@ must flip `app.html:6` the same way when it lands.
   DOM list via `playground.vl:266-344`) from one worker payload —
   fine, but the restyle should treat them as one designed system.
 
-### 2.7 The editor stays CodeMirror 6
+### 2.8 The editor stays CodeMirror 6
 
 Recommendation, firm: **stay on CM6.** The study found the restyle is
 "small, mechanical, well-contained" (one theme object, one tokenizer,
@@ -253,7 +342,7 @@ LSP-grade completion, CM6's autocomplete API is already in the bundle.
   *Recommendation: role tokens now, light variant with K6's docs port —
   docs are where light mode earns its keep.*
 - **Q3 — CommitMono** for all code surfaces? *Recommendation: yes.*
-- **Q4 — editor stack**: ratify §2.7 (stay CM6)?
+- **Q4 — editor stack**: ratify §2.8 (stay CM6)?
 - **Q5 — token vocabulary**: adopt kolt's `up`/`down`/`stroke`/`primary`
   names verbatim, or rename for vilan? *Recommendation: verbatim — the
   system is proven, and one vocabulary across kolt and the web estate
