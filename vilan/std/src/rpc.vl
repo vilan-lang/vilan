@@ -78,7 +78,8 @@ impl LocalTransport with Transport {
 /// client↔server transport. The address is programmatic (Q5): construct it with
 /// the endpoint URL (`HttpTransport { url = "http://localhost:4000/rpc" }`);
 /// where the string comes from — hardcoded, env, config — is the app's choice.
-/// The server side is `std::rpc_server`'s `serve_rpc` / `rpc_response` mount.
+/// The server side is a mounted `Service`'s `{mount}rpc` route
+/// (`std::rpc_server`, installed with `ServerBuilder::with_service`).
 struct HttpTransport {
 	url: str,
 }
@@ -160,7 +161,7 @@ fun bridge<Tx: DuplexTransport>(wire: Tx): DuplexEnd {
 /// The real duplex transport over plain HTTP (§5's fallback, no WebSocket needed):
 /// server→client frames arrive on a long-lived SSE stream (`GET {base}/events`),
 /// and client→server frames POST to `{base}/send?c=<connection>`. The server side
-/// is `std::rpc_server`'s `serve_connected`; open one with `connect_split(base_url)`.
+/// is a mounted `Service` (`std::rpc_server`); open one with `connect_split(base_url)`.
 /// A true WebSocket transport becomes a drop-in sibling once it lands.
 struct SplitDuplex {
 	// The connection id the server announced — apps use it to correlate this
@@ -390,7 +391,7 @@ struct PendingCall {
 /// The socket's binary channel tags (§5's multiplex, byte form): a binary WS
 /// message is `0x64` ('d') + a duplex frame, or `0x72` ('r') + a 4-byte LE
 /// request id + an RPC frame — the byte mirror of the `d:`/`r:<id>:` text
-/// prefixes, shared verbatim with `serve_connected`'s upgrade path.
+/// prefixes, shared verbatim with the service upgrade path (`std::rpc_server`).
 fun tag_duplex_bytes(payload: Bytes): Bytes {
 	let tag = Bytes::alloc(1);
 	tag.set(0, 0x64);
@@ -409,8 +410,9 @@ fun tag_rpc_bytes(request: i32, payload: Bytes): Bytes {
 
 /// The true duplex transport (§5): one WebSocket carrying BOTH protocols and
 /// BOTH frame kinds — text messages use the `d:<frame>`/`r:<id>:<frame>`
-/// prefixes, binary messages the tag bytes above. The server side is
-/// `serve_connected`'s upgrade path; open one with `connect_socket(url)` — the
+/// prefixes, binary messages the tag bytes above. The server side is the
+/// service upgrade handshake (`ServerBuilder::with_service`); open one with
+/// `connect_socket(url)` — the
 /// drop-in swap for `connect_split`, same `__conn:<id>` handshake, same
 /// `.connection` for RPC correlation.
 ///
@@ -1011,9 +1013,10 @@ fun encode_update(codec: Codec, channel: i32, describe: |Serializer| void): Fram
 // --- The session registry (Client::connect's server half, §4.2) -------------
 
 /// Per-connection reactive sessions, keyed by connection id — what the
-/// generated `__attach` route answers from. `serve_service` populates it on
-/// connect and disposes on disconnect; apps wanting custom per-connection
-/// state keep the manual pattern (`serve_connected` + their own registry).
+/// generated `__attach` route answers from. `Service::new`'s default
+/// lifecycle populates it on connect and disposes on disconnect; apps wanting
+/// custom per-connection state keep the manual pattern
+/// (`Service::on_connect`/`on_disconnect` + their own registry).
 let reactive_sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 /// Adopt a fresh connection: one reactive session on its wire, speaking the

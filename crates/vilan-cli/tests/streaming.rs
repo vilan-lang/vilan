@@ -3,7 +3,7 @@
 //! held-open response — with an ASYNC `on_open` (spawn semantics; the sleeps
 //! interleave with serving) — and the same process reads them back through
 //! `fetch`'s body stream until the server closes. The rpc realtime/SSE suites
-//! cover the `serve_connected` mount built on this; this pins the PUBLIC
+//! cover the service layer's SSE mount built on this; this pins the PUBLIC
 //! surface directly.
 
 use std::io::Read;

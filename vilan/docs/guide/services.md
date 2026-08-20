@@ -21,8 +21,8 @@ Here's a complete little server:
 import std::print;
 import std::reactive::Signal;
 import std::json::json_codec;
-import std::http::Response;
-import std::rpc_server::serve_service;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
 import std::shared::Shared;
 
 [derive(Wire, PartialEq, Debug)]
@@ -56,9 +56,13 @@ fun main() {
 		entries = Signal::new([]),
 		next_id = Shared::new(1),
 	};
-	serve_service(4000, notes.dispatcher().into_protocol(json_codec()), |request| {
-		Response::builder().body("app shell here").build()
-	}, |server| print(i"listening on {server.url()}"));
+	Server::builder()
+		.port(4000)
+		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().body("app shell here").build())
+		.on_start(|server| print(i"listening on {server.url()}"))
+		.build()
+		.start();
 }
 ```
 
@@ -426,7 +430,7 @@ default session lifecycle (see the [rpc reference](../std/rpc.md)).
 ## Growing past one service
 
 That chain is the whole layer — `Service::new(protocol)`, installed with
-`ServerBuilder::with_service` — and `serve_service` is sugar over it. A
+`ServerBuilder::with_service`. A
 service's routes answer before `on_request`, which is what lets a page
 and a service sit on the same builder chain instead of one replacing the
 other:
@@ -464,15 +468,16 @@ fun main() {
 ```
 
 Delete the `.with_service(…)` line and the program still compiles and
-still serves the page — the property a boot function built around
-`serve_service` can't have. `with_service` is repeatable: a second
+still serves the page — the property a boot function that owns the
+whole port can't have. `with_service` is repeatable: a second
 service goes on its own mount, `.at("/admin/")`, so
 `Client::connect("/admin/", codec)` reaches it and the first service's
 routes are untouched. Two constants either way: services always answer
 before `on_request` (so an app route can't accidentally shadow a
-service route), and `serve_rpc`/`serve_service`/`serve_connected` keep
-working unchanged — they're this same layer with the registry lifecycle
-(or a custom one) already wired in.
+service route), and the connection lifecycle is the service's own knob —
+`Service::on_connect`/`on_disconnect` swap the default session registry
+for the app's per-connection state (an auth identity, an app-written
+attach) without changing anything else about the chain.
 
 ## Traps
 

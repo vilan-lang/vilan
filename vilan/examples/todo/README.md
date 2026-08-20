@@ -88,7 +88,7 @@ graph.
   all generated/runtime now (`Client::connect` and the session registry).
   This example used to hand-write an `attach` method and a sessions map; apps
   needing custom per-connection state (auth identity, say) still can, via
-  `serve_connected` and their own registry.
+  `Service::on_connect`/`on_disconnect` and their own registry.
 - The mirror still delivers JSON strings the client decodes at the site
   (`List::from_json`); typed mirrors land with the reactive-on-codec
   follow-up.

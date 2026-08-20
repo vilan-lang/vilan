@@ -135,8 +135,8 @@ headers are written, `on_open` receives the live `ResponseStream` and
 writes chunks over time (SSE's shape; a suspending `on_open` runs as
 spawned work). `on_upgrade` mounts a WebSocket-style handshake handler
 over the raw bindings (`NodeRequest`/`NodeSocket`). For an rpc-serving
-app you won't touch any of this directly: `serve_service` wraps it
-(below), and `serve_connected` itself now rides this surface.
+app you won't touch any of this directly: the service layer
+(`with_service`, below) rides this surface.
 
 `Server::stop()` closes the listener and fires `on_stop` once it has
 actually closed — call it from `on_start` (stash the `Server` value
@@ -147,18 +147,9 @@ route) or from inside a request handler. Stopping a `Server` value
 ## std::rpc_server
 
 ```vilan,fragment
-fun serve_service(
-	port: i32,
-	protocol: RpcProtocol,             // service.dispatcher().into_protocol(codec)
-	fallback: |Request| Response,      // plain-http requests
-	on_ready: |Server| void,           // `server.port()` is the port actually bound
-)
-
-fun serve_connected(port, protocol, on_connection, fallback, on_ready)
-	// the same server with the per-connection hook exposed (custom attach/auth)
-
 impl Service {
-	fun new(protocol: RpcProtocol): Service   // mounted at "/"; the session-registry lifecycle
+	fun new(protocol: RpcProtocol): Service   // service.dispatcher().into_protocol(codec);
+	                                          // mounted at "/"; the session-registry lifecycle
 	fun at(own self, prefix: str): Service    // mount elsewhere instead, e.g. "/admin/"
 	fun on_connect(own self, handler: |i32, DuplexEnd| void): Service
 	fun on_disconnect(own self, handler: |i32| void): Service
@@ -169,11 +160,11 @@ impl ServerBuilder {
 ```
 
 Websocket upgrade + session registry (mirror attach/detach) + rpc dispatch;
-each handler runs in a turn (`AtEnd`). `serve_rpc`/`serve_service`/
-`serve_connected` are sugar over `Server::builder().with_service(…)` —
-the underlying layer a server can grow into: install a second service on
-its own mount, or a plain page alongside one, by adding a call rather
-than swapping to a different `serve_*` function. Details and the client
+each handler runs in a turn (`AtEnd`). `Server::builder().with_service(…)`
+is the one spelling, and the server grows by adding a call rather than
+swapping boot functions: a second service on its own mount, a plain page
+alongside one, the build's artifacts via `serve_build` — all on the same
+chain. Details and the client
 side: [Services & RPC](../guide/services.md) and the
 [rpc reference](rpc.md).
 

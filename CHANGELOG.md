@@ -29,6 +29,13 @@ What replaces it is the builder. A server that serves its build says `.serve_bui
 
 ---
 
+<!-- family: breaking -->
+**`std::rpc_server`'s `serve_rpc`, `serve_service` and `serve_connected` are removed.** The builder chain they were four-line bodies over is the one spelling: `Server::builder().port(port).with_service(Service::new(protocol)).serve_build(build).on_request(fallback).on_start(on_ready).build().start()` — leave off `serve_build`/`on_request` when there is no build or no fallback, and put a custom connection lifecycle on the service itself, `Service::new(protocol).on_connect(…).on_disconnect(…)`, which is exactly the pair `serve_connected` took. The reason is the shape of the arc that ends here: E63 moved the last examples onto the chain and E64 retired `build_handler`, the helper that existed to smuggle a build into `serve_service`'s fallback — the builder is the composable form, growing by an added call rather than a swapped boot function, and the trio had no caller left that wasn't teaching it.
+
+`serve_rpc`'s text-only mount (`rpc_response`, every path answering rpc) went with it: a mounted service's `{mount}rpc` route is the server side of `std::rpc`'s `HttpTransport`, so a request/response client dials `http://host:port/rpc` rather than the bare origin. Nothing else about the wire moved — the routes, the SSE framing, the WebSocket handshake and the session lifecycle are pinned in `service_layer.rs` as the exact bytes recorded before the layer existed, now asserted against the builder chain directly.
+
+---
+
 <!-- family: feature -->
 **A service mirror is subscribed while — and only while — something is watching it, and it reads as a plain signal where it is shown.** `RemoteSource::sub` opened a channel that nothing ever closed: the client's only control-frame builder was called with `"Subscribe"` at both of its call sites, so the server's `stop` was unreachable, and disposing the `Subscription` that `sub` handed back stopped the local observer and nothing else — the server kept forwarding every change to a client that had stopped listening, and a second local watcher opened a *second* server-side forward on the same channel, so every value crossed the wire twice. Measured through a frame-logging relay: after the only subscription was disposed, the next `set` still put an `Update` on the wire.
 

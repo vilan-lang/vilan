@@ -19,7 +19,7 @@ client.transport: SocketTransport               // connection state lives here
 
 // server side
 foo.dispatcher(): Dispatcher                    // the method table
-dispatcher.into_protocol(codec: Codec): RpcProtocol   // what serve_service takes
+dispatcher.into_protocol(codec: Codec): RpcProtocol   // what Service::new takes
 ```
 
 `connect` accepts a relative url (`"/"`) in the browser; it dials the same
@@ -159,38 +159,26 @@ impl Service {
 impl ServerBuilder {
 	fun with_service(own self, service: Service): ServerBuilder   // repeatable
 }
-
-// The boot functions, each a few lines over `Server::builder()`:
-fun serve_rpc(port: i32, protocol: RpcProtocol, on_ready: |Server| void)
-fun serve_service(
-	port: i32,
-	protocol: RpcProtocol,
-	fallback: |Request| Response,   // plain-http requests: assets + app shell
-	on_ready: |Server| void,        // `server.port()` is the port actually bound
-)
-fun serve_connected(port, protocol, on_connection, fallback, on_ready)
 ```
 
 A service is WebSocket upgrade + per-connection session registration
 (mirror attach/detach) + rpc dispatch. Each handler runs in a turn
-(`AtEnd`). `ServerBuilder::with_service` is the layer underneath: it
-installs those routes and the handshake on a `Server::builder()` chain,
+(`AtEnd`). `ServerBuilder::with_service` installs those routes and the
+handshake on a `Server::builder()` chain,
 answering **before** `on_request`, so a page and a service sit on one
 builder instead of one replacing the other. It is repeatable — a second
 service goes on its own mount (`Service::new(protocol).at("/admin/")`),
 picked by longest mount and independent of call order.
 
-`serve_service` and `serve_connected` are short bodies over
-`with_service` and keep their exact signatures: the first installs the
-runtime session registry as the connection lifecycle, the second exposes
-the per-connection hook instead (connection-scoped auth, an app-written
-attach). Both take an http `fallback` for every path the service does not
-claim — the app shell, usually; serving the build's own artifacts is
-`ServerBuilder::serve_build`'s job, on the builder. `serve_rpc` is the
-odd one out and deliberately so: no upgrade, no session registry, no
-fallback, just the protocol answering every request — the server side of
-`std::rpc`'s `HttpTransport`. Reach for `with_service` when the app owns
-its builder; reach for a `serve_*` when it does not. Details:
+`Service::new(protocol)` wires the runtime session registry as the
+connection lifecycle — what `Client::connect`'s generated `__attach`
+answers from; `on_connect`/`on_disconnect` replace it for apps holding
+their own per-connection state (connection-scoped auth, an app-written
+attach). The `{mount}rpc` route is the server side of `std::rpc`'s
+`HttpTransport` (`HttpTransport { url = "http://host:port/rpc" }`), and
+`on_request` answers every path no service claims — the app shell,
+usually; serving the build's own artifacts is
+`ServerBuilder::serve_build`'s job, on the same builder. Details:
 [Services & RPC](../guide/services.md#growing-past-one-service) and the
 [process reference](process.md#stdrpc_server).
 
