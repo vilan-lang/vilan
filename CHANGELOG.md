@@ -139,8 +139,6 @@ Nothing that can fall through is affected: an `if` with no `else`, a branch that
 
 ---
 
----
-
 <!-- family: tooling -->
 **A long `vilan run --watch` session no longer banks a dead socket for every browser that disconnects.** The dev channel kept each connected browser's socket in a list and only ever *noticed* one was gone when a rebuild tried to write to it. Between rebuilds nothing looked. A tab refresh, a second tab closed, `EventSource`'s own reconnect after a blip — each left its socket in the list, and the leak was one file descriptor per disconnect, unbounded across a session. Measured on the real thing: 100 connect/disconnect cycles against a watching CLI, with no rebuild in between, left 100 leaked descriptors on the process; the next rebuild reclaimed none of them, because a write to a peer that closed cleanly *succeeds* — it is the write after that one which fails, so a dead client survived its first push and only left on its second.
 
@@ -698,8 +696,6 @@ That cost was measured rather than assumed. The blunt fix — read *every* patte
 The three payload shapes keep the doctrine v0.32.0 settled, and each is now pinned on the owned path against its viewed twin: a value materializes, an aggregate copies (it already did), and a resource materializes **bare** — no copy, because there is no copy spelling for a resource and inventing one would mint a second owner with a second destructor. Fifteen pins, planted red on four separate axes.
 
 Found on the way and filed, not fixed: a method returning a `&mut` projection (`fun slot(&mut self): &mut T borrows self`) hands its pattern a subject the capture pass does not recognise as one at all, so *neither* rule fires there — the aggregate capture aliases the receiver outright, which is the original v0.23.6 bug surviving in a third spelling. Pinned `#[ignore]`d. Record: `proposal/capture-clones.md` §7.
-
----
 
 ---
 
