@@ -5640,6 +5640,18 @@ mod tests {
     }
 
     #[test]
+    fn render_expects_a_method_name_in_an_unfinished_chain_link() {
+        // E67 (editing-dx.md §18): an element head's `.` with no member after
+        // it is a COMMITTED chain link failing — the recovery keeps the
+        // element (parser_recovery.rs pins the shape); this pins the curated
+        // expectation's rendered text (ledger row 204's flagged gap).
+        assert_eq!(
+            rendered_errors("fun main() { let p = <div><span .></span></div>; }\n"),
+            vec!["found '>' expected a method name".to_string()]
+        );
+    }
+
+    #[test]
     fn render_steers_a_missing_list_separator() {
         // FIX (frontend.md S5 review): a missing separator between comma-list items
         // — at every ~committed closer, not just parameters — steers to `,` or the
