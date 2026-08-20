@@ -996,3 +996,189 @@ immortal is single-digit bytes, the allocator's own noise floor, and the
 open around session memory is §7.5's `parse_clean_cached` shape — a
 different mechanism, separately filed, reached only with a dependent open —
 and nothing else this soak can see.
+
+### 7.9 M9 — evicting an open path's previous content (design, 2026-08-20; STOPPED before building)
+
+§7.5 filed the leak; backlog M9 asks for the fix, and named the shape to
+evaluate first: the cache knows hashes and the LSP knows paths, so core keeps
+a small path→hash map beside `parse_clean_cached`, and on a document change
+the LSP tells core "path P's content is now H" — core evicts and reclaims the
+PRIOR hash it had recorded for P, through M7's `Leaked` machinery. This
+section is that design pass, done the way §7 and §7.8 were done — the
+soundness condition first, proved against the tree, before any `unsafe`. The
+finding is negative and specific: **freeing a shared, content-keyed cache
+entry is sound only under a cross-analysis ownership protocol** (per-entry
+refcounts or epochs threaded through every loader entry point and both world
+caches), which is exactly the not-contained shape the work order names as the
+stop condition. So this section is the design and the proof, plus the
+mechanism that IS contained and reaches M9's bound — recommended for the
+owner's ratification — and no code ships with it.
+
+#### 7.9.1 The measurement, re-run
+
+§7.5's probe was throwaway; re-created in the same shape on today's tree
+(`next` at 96b4272b; debug, one process, the counters read on the analyzing
+thread). A 40-byte `helper.vl` "open" in the overlay, a `main.vl` importing
+`pkg::helper`, the entry re-analyzed after each helper rewrite and landed
+through `adopt_analysis` — the server's dependent-reanalysis flow. Warmup of
+3 analyses fills std's parses and the base world; each phase then resets the
+tally and reads it at the end:
+
+| phase | `ParseCleanCacheText` | `ParseCleanCacheAst` | `ModuleErrorText` | `ModuleErrorAst` | entry sites outstanding |
+|---|---:|---:|---:|---:|---:|
+| 30 **distinct** clean contents (40 B each) | 1,200 B = 30 × 40 | 1,200 B = 30 × 40 | 0 | 0 | 0 / 0 |
+| 30 re-analyses of ONE content | 0 | 0 | 0 | 0 | 0 / 0 |
+| 20 **distinct** broken contents (38 B each) | 760 B = 20 × 38 | 0 | 760 B = 20 × 38 | 1,760 B = 20 × 88 | 0 / 0 |
+
+§7.5's finding, byte-exact, still: one text + one tree per DISTINCT content,
+nothing for a repeat, the error cache the same shape one seam over, and the
+entry sites at zero outstanding throughout (M7 holds under this flow). One
+detail §7.5 did not call out, visible in the third row's first column: **a
+distinct broken content leaks its text TWICE** — `parse_clean_cached` leaks
+the source *before* it knows the parse is clean (the tree borrows it), so a
+non-clean content leaves that copy behind at `ParseCleanCacheText` and
+`load_package_module`'s rich path then leaks its own at `ModuleErrorText`.
+Whatever fixes M9 must cover the pre-cleanliness leak too.
+
+#### 7.9.2 Who borrows a module entry — the inventory the eviction shape runs into
+
+The condition is M7's, one level deeper: the evicted text and tree may be
+freed only when **no live borrower exists**, and for a *module* entry the
+borrowers are not §7.2's short list. Each of these was read in the tree, not
+assumed:
+
+1. **Every live adopted `Program`.** The analyzer pushes the loaded module's
+   text straight into `source_texts` (`analyzer.rs`, the load region) and its
+   tree's nodes into scopes and `span_map` — a dependent analyzed against the
+   old content holds `&'static` slices into it until its next
+   `adopt_analysis` or close. `AnalyzedProgram`'s own invariant says it in so
+   many words: the program borrows its two handles *"and allocations that are
+   immortal (std and module texts in `parse_clean_cached`, interned names,
+   cached macro worlds)"*. Eviction deletes the word "immortal" from that
+   sentence; every consumer of the invariant has to be re-proved against
+   whatever replaces it.
+2. **Every in-flight analysis.** Two analyses of one document can be in
+   flight at once (`land`'s doc), and dependent sweeps of successive
+   generations overlap. An analysis that called `load_package_module(P)`
+   before the flip holds the old `LoadedModule` borrows in analyzer locals
+   for its whole run — and its result still LANDS, because landing is gated
+   on the dependent's own text, not on the imported file's. "Evict at
+   `did_change`" frees memory a running analysis is reading; "evict after the
+   sweep" is not enough either, because a previous generation's sweep can
+   still be mid-flight when this one finishes.
+3. **`BASE_CACHE`.** The store's lifetime transmute is *justified by* this
+   cache's immortality — the SAFETY comment reads "module/dep texts and ASTs
+   live in `parse_clean_cached`'s leaked cache". A stored world borrows every
+   recorded std/dep module; dependency-package files are exactly the files a
+   multi-package workspace has open in the editor. Validation is per-hit and
+   lazy, so a world nobody looks up retains its borrows indefinitely — and
+   the sharpest edge is that validation compares CONTENT hashes: an undo that
+   returns the file to its prior content makes the stale world *valid* again,
+   and it is cloned and analyzed against. Evict that prior content and the
+   use-after-free is reached by pressing ctrl-Z.
+4. **Macro `WORLDS`.** `compile_world` runs the world's analysis with the
+   real `std` plus `macro_std`, loads those modules through this same cache,
+   and `Box::leak`s the world's `Program<'static>` — an immortal program
+   holding module borrows, keyed by the blanked DEFINING file's content and
+   never content-revalidated. The `Arc<World>` is additionally memoized per
+   `MacroDef` inside registries that live in stored base worlds and live
+   programs (`macro_world_cache_clear`'s doc records exactly this
+   reachability), so no purge of the map ends it.
+5. **Content aliasing.** The cache is keyed by CONTENT; the proposed rule
+   evicts by PATH. Two files with identical content — two empty files, two
+   license stubs — share one entry, and evicting P's previous hash frees what
+   a live program borrowed via unrelated, unedited Q. No path→hash map can
+   see this; attribution has to be by content (which `Program.source_hashes`
+   does record, and the transient callers below do not).
+6. **Ownerless transient reads.** `module_importables` (E57 import
+   completion, on the request thread) and `infer_platform`'s `declares` read
+   entries with no recorded lifetime at all; an eviction on another thread
+   races them.
+
+#### 7.9.3 What a sound eviction would need, stated so its size is visible
+
+Per-entry reference counts (or epoch stamps — same protocol, coarser grain),
+acquired **under the cache lock** at every `parse_clean_cached` and
+`ERROR_CACHE` acquisition so a borrow is never unprotected, held by: a
+thread-local acquisition scope per analysis, drained into `AnalyzedEntry` and
+released by `AnalyzedProgram::drop` (the release set is
+`Program.source_hashes`, helpfully already recorded); a ref set per stored
+base world, acquired at store, re-acquired into the hitting analysis's scope
+under the base-cache lock, released at staleness eviction and `clear()`; a
+permanent pin per compiled macro world; and a guard for every transient
+caller. Evicted-but-referenced entries wait on a condemned list serviced by
+the releases. That is an ownership protocol threaded through every loader
+entry point in three crates plus both world caches — the "epoch scheme
+across analyses" the work order names as the point to stop and report rather
+than build. §7.5's other candidate, an LRU by bytes, needs the identical
+protocol: an LRU only chooses WHICH entry to condemn, never when freeing it
+is sound — and it would happily condemn a std entry a macro world borrows
+forever.
+
+#### 7.9.4 The contained mechanism, recommended: stop sharing what churns
+
+The growth §7.5 measures is the cache faithfully doing its job on contents
+that can never recur — keystrokes. What the cache was built for (E12) is
+std and dependency modules: stable disk content, reused across every compile
+in the process. The contents that churn are exactly the OVERLAY's — open
+buffers. So instead of evicting the shared entry, never create it: **a
+module read served from the overlay, during an analysis that opted in,
+bypasses the process-global caches and parses into analysis-owned
+allocations** — `Leaked` handles (text + tree; on the non-clean path text +
+tree + rendered errors, which also retires 7.9.1's double-leak), pushed onto
+a thread-local collection scope, drained into `AnalyzedEntry` beside the
+entry's own two handles, owned by `AnalyzedProgram`, reclaimed in its `Drop`
+after the program. This is M7's proven pattern applied one level down, and it
+dissolves every hazard in 7.9.2 instead of ordering around them: nothing
+shared is ever freed, each analysis owns its copies, supersession reclaims
+them, no epochs, no condemned lists, no cross-thread barrier.
+
+The bound it reaches is M9's stated target: outstanding module bytes = the
+sum, over open documents, of the overlay-served modules their CURRENT
+analysis loaded — the open set — and per-distinct-content growth is zero.
+The cost is honest and small: a dependent's analysis re-parses each
+overlay-resident import (a handful of files, in the frontend — the cheap
+phase), and nothing changes for modules on disk.
+
+The proof obligations the builder owes, each pinned per case:
+
+- **(a) The base-world gate.** The analysis's program must be the ONLY
+  borrower of its owned copies, so `base_cache_store` must refuse to store a
+  world that loaded any overlay-served source (the collection scope carries
+  the flag; the store already runs inside the analysis that owns it). S3c's
+  transmute justification gains an explicit clause instead of silently losing
+  one. Consequence to record: base-world caching is forfeited while a std or
+  dependency file is open in the editor — correct, bounded, and visible in
+  the base-cache stats.
+- **(b) The macro-world carve-out.** A world outlives every analysis by
+  design, so a world compile keeps the global cache — `in_macro_world`
+  already marks the region; the loader gains the check. Toolchain content
+  edited in an open buffer therefore stays a session leak (per distinct
+  content) on that path; out of M9's scope, recorded here.
+- **(c) Transient callers keep today's behavior.** With no scope active
+  (`module_importables`, `declares`, the CLI, the wasm front end — which
+  serves everything from the overlay and must NOT be switched), the global
+  cache is used exactly as now. The wasm and CLI paths stay byte-for-byte
+  unchanged because activation is the LSP's explicit opt-in on the
+  reclaimable entry point, not an ambient property of the overlay.
+- **(d) A per-scope path memo**, so a module reached twice in one analysis
+  (a lib surface and a direct import) is parsed and owned once.
+- **(e) The pins**: distinct-content growth zero at both cache sites with a
+  dependent open; outstanding nets to zero when the documents drop; the
+  error-path copies reclaimed the same way; a base world not stored while a
+  loaded source is overlaid, stored again once it closes; repeated-content,
+  no-dependent and multi-dependent shapes; the 7.9.1 probe promoted into the
+  harness as the measurement; and an ASan-checked use-after-reclaim plant
+  like M7's.
+
+#### 7.9.5 Verdict
+
+Design and stop. The path→prior-hash eviction M9 named is unsound as a
+contained change — 7.9.2 items 2 through 5 are each individually fatal, and
+the protocol in 7.9.3 that would make it sound is the work order's own stop
+condition. The mechanism in 7.9.4 reaches M9's bound with machinery this
+paper has already proven twice, but it inverts the loader's ownership story
+and conditions the S3c transmute argument — a semantics-level change the
+owner should ratify before `unsafe` is written. Nothing shipped with this
+section: the probe behind 7.9.1 was run and reverted, and its shape is one
+paragraph to re-create.
