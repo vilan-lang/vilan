@@ -265,7 +265,7 @@ impl Document {
 	fun lang(own self, lang: str): Document
 	fun mount(own self, id: str): Document                // the other end of mount_root
 	fun head(own self, markup: str): Document             // raw, appended inside <head>
-	fun body(own self, markup: str): Document             // raw, before the script tag
+	fun body(own self, markup: str): Document             // raw, appended inside <body>
 	fun render(self, view: View): Document                // SSR markup, inside the mount element
 
 	fun html(self): str
@@ -361,12 +361,17 @@ async fun main() {
 
 `head`/`body` take raw markup and append (a favicon, an `og:` tag, a CSP,
 a `<noscript>`), which is what keeps the generated document small enough
-to be worth having: everything else is derived. They are an escape hatch,
-not an exemption — when `html()` writes the page, markup you added there
-is checked like any other, so a `<link>` to a stylesheet the build did not
-emit stops the boot exactly as it would in a hand-written shell. A
-document with no hatch markup is derived from the build alone and runs no
-check at all.
+to be worth having: everything else is derived. They work on a supplied
+shell too (`require_shell`, `from_shell`): `head()` markup splices in
+immediately before the shell's own `</head>`, `body()`'s immediately
+before its `</body>` — and a shell that lacks the closing tag a used
+hatch needs stops at `html()` rather than having the markup guessed into
+it. They are an escape hatch, not an exemption — when `html()` writes the
+page, markup you added there is checked like any other, so a `<link>` to
+a stylesheet the build did not emit stops the boot exactly as it would in
+a hand-written shell. A document with no hatch markup runs no check at
+all: a generated one is derived from the build alone, and a supplied one
+serves the shell's own bytes, exactly as `require_shell` checked them.
 
 `render(view)` is the server-rendering splice ([SSR](../guide/ssr.md)):
 the markup goes *inside the mount element*, because the document already

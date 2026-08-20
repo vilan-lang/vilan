@@ -2675,3 +2675,84 @@ site's URL space following the ladder rather than a knob. `split = true`
 was not taken: no router, zero chunks — it belongs with K13's router
 step. Bycatch: docs-port.md §5 item 7's node externs replaced by
 `std::fs::read_bytes`/`read_dir`.
+
+### 16.12 E77 — the hatches compose into a supplied shell (2026-08-20)
+
+The owner RULED §16.10's found-in-passing item (COMPOSE, as recommended;
+tracker E77): the hatches splice into the supplied shell, and the
+composed page runs the `check_shell` rules, uniform with E70's generated
+arm.
+
+**The splice points, defined against what the shell contract
+guarantees.** `head()` markup goes immediately before the shell's own
+`</head>`, `body()`'s immediately before its `</body>`, the render (as
+before) at the mount element's content start — all indices into the
+original shell, applied in ascending order. The closing tags are read
+the way the check reads markup: the scanner (`tags_of`) now records
+closing tags too (`Tag` gains `start` and `closing`; a closing tag
+carries no attributes, which is what keeps every attribute-keyed check
+reading opening tags only), so a `</head>` inside a comment or a script
+body is no splice point, for the same reason it is no closing tag to a
+browser. And the contract argument: `require_shell`'s check guarantees
+the mount element and the bundle's script tag — NOT the closing tags,
+which a browser tolerates missing — so a shell `from_shell` accepted can
+lack the tag a used hatch aims at. That is a compose-time refusal at
+`html()` (ledger row 240): one line per missing tag, not the first
+(§5.6's doctrine), naming both fixes — add the tag, or write the markup
+into the shell itself. A missing tag no used hatch aims at refuses
+nothing.
+
+**The check, uniform with E70.** Exactly when `self.head != "" ||
+self.body != ""`, the COMPOSED page runs `check_shell` — same faults,
+same heads, nothing reworded — against the mount `from_shell` located
+(`default_mount`, not `self.mount`: `mount()` documents that it does not
+move a supplied shell's mount, so the check must not read it either, or
+a documented no-op call would refuse a working page). The
+`fault_report` envelope's slot names both provenances the way E70's
+names the generated document: `{source} composed with this document's
+`head`/`body` markup`, where `source` is `require_shell`'s file path
+(`Document` gains the field; `require_shell` fills it) or `from_shell`'s
+generic `this supplied shell` (row 239's third filling). The hatch-less
+supplied path is untouched: the shell's own bytes (plus the render
+splice), no check beyond the one `from_shell` ran — E70's emptiness flag,
+same arm shape.
+
+**The pins** (`tests/document.rs`, six of seven planted red against the
+pre-change std — each red for the ruling's own reason, the inert hatch):
+the inert case dies over a REAL build, observed in the SERVED bytes
+(`a_head_hatch_on_a_supplied_shell_now_rides_the_served_page`: the meta
+rides immediately before `</head>`); a bad hatch refuses the boot
+(`a_bad_hatch_on_a_supplied_shell_refuses_the_boot`, F3's
+`/client.Nope.js` with the envelope naming `src/app.html`, on the shared
+boot harness); a second family through bare `from_shell`
+(`a_bad_hatch_through_from_shell_names_the_supplied_shell`, F2, the
+generic source name); the three-way composition
+(`a_valid_hatch_composes_at_every_splice_point_and_passes`: head, body
+and render in one page, each at its defined position); the no-closing-tag
+refusal (`a_used_hatch_with_no_closing_tag_to_splice_before_refuses`,
+both lines) and its complement
+(`a_closing_tag_only_an_unused_hatch_would_need_is_not_required`); and
+the hatch-less half
+(`a_hatchless_supplied_shell_is_byte_identical_and_runs_no_check`, green
+before and after by design — byte-identity, plus the absence of the
+check observed through rendered markup that WOULD trip it, a
+`view("script").attr("src", "/client.Nope.js")` still riding the page:
+the check keys on the hatches alone at both arms, E70's own condition).
+
+**In-tree supplied-shell users hold.** `examples/walkthrough` and
+`examples/ssr` (`require_shell`, no hatches) ride the hatch-less path,
+byte-identical; `examples/todo`'s `.body()` is on a generated document
+(E70's arm). `docs/std/process.md`'s hatch paragraph now states both
+rungs and the closing-tag refusal; the std doc comments align
+(`head`/`body`, `html`, `from_shell`, the module header). The CHANGELOG
+carries one `feature` entry saying plainly that previously-inert calls
+start doing something — a served page can change, a boot that silently
+ignored its hatches can refuse.
+
+**The gates.** `cargo test -p vilan-cli --test document` (16 passed),
+`--test shell_check` (9 passed), `--test corpus` (7 passed,
+byte-identical), `--test examples` (6 passed), `cargo test -p vilan-core
+--test docs` (8 passed), and the full suite by exit code — the lane's
+report has the lines. Not verified: a browser against a composed page
+(no browser here; the served bytes and the refusal's stderr are the
+measurement).

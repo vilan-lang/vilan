@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: feature -->
+**`head()`/`body()` now work on a supplied shell — and are checked there.** On a document from `require_shell`/`Document::from_shell`, the `head()`/`body()` escape hatches were silently inert: the call compiled, the boot succeeded, and the served page carried none of the markup — `html()`'s supplied arm served the shell's bytes plus the render splice, and the hatch fields never reached it. They now compose: `head()` markup splices in immediately before the shell's own `</head>`, `body()`'s immediately before its `</body>`, and the composed page runs the same `check_shell` rules a hand-written shell faces — `from_shell`'s check covered the shell alone — refusing the boot with the same report, its envelope naming the shell's source and the hatch provenance (`src/app.html composed with this document's `head`/`body` markup does not match…`). A shell that lacks the closing tag a used hatch aims at is refused at `html()` too, naming every missing tag and both fixes — `check_shell` guarantees the mount element and the bundle's script tag, not the closing tags, so composing would otherwise have to guess a position the author cannot see.
+
+Note plainly: previously-inert calls START DOING SOMETHING. A supplied-shell boot that silently ignored a `head()`/`body()` call yesterday now serves that markup — or refuses to start, if the markup never matched the build or the shell has no closing tag for it. A supplied document with no hatch markup is untouched: byte-identical output, no check beyond the one `require_shell` already ran. (`proposal/fullstack-dx.md` §16.12; tracker E77.)
+
+---
+
 <!-- family: diagnostics -->
 **A cross-source note's `file:line:col` header now names the line it labels.** When an error notes a location in another file — the `owner_scope` coverage refusal noting std's read in `reactive.vl`, a generic-leak refusal noting `map`'s own arm in `option.vl` — the note's sub-header printed a position a couple of lines above the label under it (a `reactive.vl:363:26` header over a line-365 label). The renderer's byte-indexed mode re-converted the label's already-converted offset when deriving the sub-header, so any multibyte character earlier in the noted file dragged the header up while the label stayed put. Every span now reaches the renderer in one index space, converted exactly once, so a header and the label beneath it derive from the same position and cannot disagree. The header positions move: anything parsing a cross-source sub-header out of stderr now sees the labeled line's own `line:col`. Same-file diagnostics render byte-identically.
 
