@@ -2570,3 +2570,76 @@ client against a migrated server (no browser here — the e2e wires are
 the measurement), and kolt itself (read-only by standing rule). E70
 (`Document::html()` over the head/body hatches) was NOT ruled and is
 untouched by this slice.
+
+### 16.10 E70 — the escape hatches meet the rules at `html()` (2026-08-20)
+
+The owner RULED §16.7's found-in-passing question ("Yes" — `html()` runs
+the `check_shell` rules when a hatch was used; tracker E70). The std doc
+comments on `head()`/`body()` promised "the markup goes through the same
+`check_shell` rules as anything else … is caught here too" and
+`docs/std/process.md` promised "markup you add there is checked like any
+other" — and neither was true: §16.7's probe
+(`.head("<script type=\"module\" src=\"/client.Nope.js\"></script>")`,
+in-namespace, F3) built, booted, and served that page.
+
+**The change is one site, and it is where the page is assembled.**
+`Document::html()`'s generated arm now runs `check_shell` over the
+assembled page — the same faults, the same message heads (the ledger keys
+them; nothing reworded) — exactly when `self.head != "" || self.body !=
+""`, and a fault panics with `fault_report`'s envelope, its slot filled
+with `this generated document's `head`/`body` markup` (the parameter
+renamed `path` → `source`; rows 234–239 note the second reachable site
+and the moved pin). The emptiness test is the whole cost of the
+hatch-less path: no check, no re-reading of the page's own output, and
+byte-identical output — pinned against the pre-change bytes, recorded
+2026-08-20. §5.5's property now holds in two ways: by construction for
+everything `of` derives (unchanged), and by the check for the raw markup
+the hatches admit — a hatched page that would fail is never handed back.
+A supplied shell is untouched: `from_shell` checked it before the value
+existed, and its arm of `html()` did not move.
+
+**The pins** (`tests/document.rs`, every refusal planted red against the
+pre-change std — all four booted or handed the page back — then green):
+§16.7's probe as a boot refusal over a REAL build
+(`a_hatch_loading_a_script_the_build_did_not_emit_refuses_the_boot`,
+naming `/client.Nope.js`); one per remaining fault family the hatches can
+trip — stylesheet (F2, `a_hatch_linking_a_stylesheet…`), mount (F4, an
+unclosed `<!--` in `head()` that hides the mount element from the scanner
+and from a real browser alike, tripping F4 + the bundle's F3), and the
+bundle tag's form (F6, a module-script copy of the bundle over a
+splitting leg). A valid hatch passes and rides the page; the hatch-less
+pin proves both halves of the flag (bytes identical to the recorded
+pre-E70 output, and a page `check_shell` WOULD refuse — an empty mount id
+— still handed back, the absence of the check observed). F1
+(`StylesNotLinked`) is not reachable through `html()`: the generated
+`<link>` precedes any hatch markup, and a comment can only swallow
+forward. The property test's trailing hand-called demonstration (build a
+faulty page, call `check_shell` on it yourself) is superseded by the
+refusal pins — the page it demonstrated on can no longer be produced —
+and its 1152-document count now doubles as 1056 hatched documents
+passing through the internal check. The boot harness (`Boot`/`boot`/
+`assert_refused`) moved from `shell_check.rs` to `tests/support/boot.rs`,
+shared by both suites, no assertion moved.
+
+**In-tree hatch users hold.** `examples/todo`'s server (`.body()`, §16.7)
+now runs the check at boot and passes; the walkthrough's `Document::of`
+fences carry no hatch and run none. `docs/std/process.md`'s hatch
+paragraph states the now-true rule and its other half (no hatch markup →
+no check); the CHANGELOG carries one `feature` entry saying plainly that
+a boot which served a wrong page yesterday refuses today.
+
+**The gates.** `cargo test -p vilan-cli --test document` (9 passed),
+`--test shell_check` (8 passed, on the shared harness), `--test corpus`
+(7 passed, byte-identical), `--test examples`, `cargo test -p vilan-core
+--test docs` (8 passed), and the full suite by exit code — the lane's
+report has the lines. Not verified: a browser against a refused boot (no
+browser here; the refusal's stderr and exit code are the measurement).
+
+**Found in passing, not fixed here.** `head()`/`body()` on a SUPPLIED
+shell are silently inert: `html()`'s supplied arm serves the shell's own
+bytes plus the render splice, and the hatch fields never reach it — so
+`require_shell(…).head("<meta …>")` compiles, boots, and appends nothing.
+Either the hatches splice into a supplied shell (they have a located
+`<head>`/mount to aim at) and face the same check, or they refuse/warn on
+a supplied document; today they do neither. A std semantic, the owner's
+to rule; left for the tracker.

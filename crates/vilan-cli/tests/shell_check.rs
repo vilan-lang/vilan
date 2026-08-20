@@ -30,11 +30,12 @@
 //! (the Windows `uv_handle` assertion line) is tolerated by construction.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
 
 mod support;
+
+use support::boot::{assert_refused, boot};
 
 /// A browser leg that compiles a `const style()`, so its build emits a sidecar
 /// and the manifest names one — the shape the template's own client has.
@@ -181,82 +182,6 @@ fn build(staged: &Path) {
         "vilan build failed:\n{}",
         combined(&output)
     );
-}
-
-/// What a boot did.
-struct Boot {
-    /// The server was still running when the wait ran out — for every pin here
-    /// that IS the failure: the check did not fire and the process took the
-    /// port and the event loop with it.
-    started: bool,
-    /// It exited non-zero, which is what refusing to boot looks like.
-    refused: bool,
-    /// Everything it printed, stdout and stderr together.
-    report: String,
-}
-
-/// Boot the built server from the project root and wait for it to STOP.
-///
-/// A server that refuses to boot exits on its own; one that (wrongly) started
-/// holds the event loop for as long as anything lets it, so the wait is bounded
-/// and a child still alive at the deadline is killed BY THE HARNESS and reported
-/// as a started server rather than left to outlive the suite.
-fn boot(staged: &Path) -> Boot {
-    let log = staged.join("boot.log");
-    let file = std::fs::File::create(&log).expect("create the boot log");
-    let mut server: Child = Command::new("node")
-        .arg("dist/server.mjs")
-        .current_dir(staged)
-        .stdout(Stdio::from(file.try_clone().expect("clone the log handle")))
-        .stderr(Stdio::from(file))
-        .spawn()
-        .expect("spawn the server");
-
-    let deadline = Instant::now() + support::run_liveness();
-    let mut refused = false;
-    let mut started = true;
-    while Instant::now() < deadline {
-        match server.try_wait() {
-            Ok(Some(status)) => {
-                started = false;
-                refused = !status.success();
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => panic!("wait for the server: {error}"),
-        }
-    }
-    if started {
-        let _ = server.kill();
-        let _ = server.wait();
-    }
-    let report = std::fs::read_to_string(&log).unwrap_or_default();
-    Boot {
-        started,
-        refused,
-        report,
-    }
-}
-
-/// The claim every fault pin makes: the server stopped, non-zero, saying so.
-fn assert_refused(boot: &Boot, expected: &[&str]) {
-    assert!(
-        !boot.started,
-        "the server STARTED over a shell that does not match its build — the check did not fire:\n{}",
-        boot.report
-    );
-    assert!(
-        boot.refused,
-        "a refused boot must exit non-zero:\n{}",
-        boot.report
-    );
-    for needle in expected {
-        assert!(
-            boot.report.contains(needle),
-            "the refusal should name {needle}:\n{}",
-            boot.report
-        );
-    }
 }
 
 fn cleanup(staged: &Path) {
