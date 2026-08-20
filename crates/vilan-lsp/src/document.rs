@@ -1916,16 +1916,22 @@ impl Document {
             }
         }
         // A variable (`let`/`mut`, local or module-level, or a destructured
-        // binder) or a parameter: its typed declaration, else the bare type.
-        let type_label = self.binding_hover(program, id).or_else(|| {
-            self.hover_label(program, id).map(|label| {
-                // A constant shows its VALUE beside its type (E9).
-                match self.const_value_label(program, id) {
-                    Some(value) => format!("{label} = {value}"),
-                    None => label,
-                }
-            })
-        });
+        // binder) or a parameter: its typed declaration; a member read: the
+        // fenced `name: T` (E72); else the bare type — fenced too, so every
+        // hover reads as code.
+        let type_label = self
+            .binding_hover(program, id)
+            .or_else(|| self.member_hover(program, id))
+            .or_else(|| {
+                self.hover_label(program, id).map(|label| {
+                    // A constant shows its VALUE beside its type (E9).
+                    let label = match self.const_value_label(program, id) {
+                        Some(value) => format!("{label} = {value}"),
+                        None => label,
+                    };
+                    format!("```vilan\n{label}\n```")
+                })
+            });
         let requirement = self
             .function_target(program, id)
             .and_then(|function| self.platform_requirements.get(&function))
@@ -2029,6 +2035,24 @@ impl Document {
             ));
         }
         None
+    }
+
+    /// The hover for a MEMBER read — `foo.bar` with the cursor on the member
+    /// expression — in the house style (E72): the fenced `bar: T`, the
+    /// member's name from the expression itself, the type the analyzer
+    /// rendered for it. A member *call* resolves through
+    /// [`Self::function_target`] to its declaration before this runs; the
+    /// call shape is skipped here rather than dressed in a field's clothes.
+    /// `None` for anything that is not a member read, leaving the bare-type
+    /// path.
+    fn member_hover(&self, program: &Program, id: Id) -> Option<String> {
+        let member_span = program.member_name_spans.get(&id)?;
+        if program.function_calls.contains_key(&id) {
+            return None;
+        }
+        let name = self.analyzed_text().get(member_span.into_range())?;
+        let type_label = self.hover_label(program, id)?;
+        Some(format!("```vilan\n{name}: {type_label}\n```"))
     }
 
     /// The struct/enum definition an entity names in VALUE position — a
@@ -2139,18 +2163,32 @@ impl Document {
                 return None;
             }
             seen.push(current);
-            match program.entity_map.get(&current)? {
-                Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
-                    return carries_requirement(binding).then_some(*binding);
+            match program.entity_map.get(&current) {
+                Some(Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding)) => {
+                    if carries_requirement(binding) {
+                        return Some(*binding);
+                    }
                 }
-                Expr::Function(function_id) | Expr::ExternalFunction(function_id) => {
+                Some(Expr::Function(function_id) | Expr::ExternalFunction(function_id)) => {
                     return Some(*function_id);
                 }
-                Expr::Call(call_id) => {
+                Some(Expr::Call(call_id)) => {
                     current = program.function_calls.get(call_id)?.subject_id;
+                    continue;
                 }
-                _ => return None,
+                _ => {}
             }
+            // A call a lowering rewrote (E72): the context pass replaces an
+            // unprovided `get_safe()`'s entity record with the lowered form —
+            // a read of its hidden parameter, a `None` literal, an opaque
+            // `Null` for `Context::new()` — but the call record and its wired
+            // subject survive. Resolving through them is what lets the method
+            // name hover as the declaration the source names.
+            if let Some(call) = program.function_calls.get(&current) {
+                current = call.subject_id;
+                continue;
+            }
+            return None;
         }
     }
 
@@ -6873,6 +6911,56 @@ pub(crate) mod tests {
             "the use must carry no type of its own, or this pins nothing"
         );
         assert_eq!(document.hover_label(program, id).as_deref(), Some("i32"));
+    }
+
+    // --- E72: member hovers wear the house style (editing-dx.md §19) --------
+
+    // A FIELD hovers as the fenced `name: T` — not the bare pre-house-style
+    // type string the fallback used to hand back.
+    #[test]
+    fn hover_on_a_field_shows_the_fenced_name_and_type() {
+        let hover = hover_at_cursor(
+            "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet n = p.|x;\n}\n",
+        )
+        .expect("hovering the field should produce a label");
+        assert_eq!(hover, "```vilan\nx: i32\n```");
+    }
+
+    // A std METHOD name answers the method's declaration, fenced — through
+    // `function_target`'s wired subject, like a user method.
+    #[test]
+    fn hover_on_a_std_method_name_shows_its_signature() {
+        let hover =
+            hover_at_cursor("fun main() {\n\tlet name = \"vilan\";\n\tlet n = name.l|en();\n}\n")
+                .expect("hovering the method should produce a label");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(hover.contains("fun len(self): i32"), "{hover}");
+    }
+
+    // The E73 crash shape, now answering: the context pass lowers the
+    // unprovided `get_safe()` to a hidden-parameter read and rewrites the
+    // call's entity record, but the call record's wired subject survives —
+    // `function_target` resolves through it to the declaration the source
+    // names, instead of the lowered view (`enum Option`, or nothing).
+    #[test]
+    fn hover_on_an_unprovided_get_safe_shows_its_declaration() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let hover = document
+            .hover(offset)
+            .expect("hovering `get_safe` should answer");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(hover.contains("fun get_safe(self): Option<T>"), "{hover}");
+    }
+
+    // "Anything else" keeps the bare rendered type but gains the fence: an
+    // index expression's hover is its element type, as code.
+    #[test]
+    fn a_bare_expression_type_hover_wears_the_fence() {
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+            .expect("the index expression hovers");
+        assert_eq!(hover, "```vilan\ni32\n```");
     }
 
     // --- clamp_preview: the hover budget cuts at char boundaries ------------
