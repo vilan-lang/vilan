@@ -18,6 +18,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 ## Unreleased
 
 <!-- family: diagnostics -->
+**A cross-source note's `file:line:col` header now names the line it labels.** When an error notes a location in another file — the `owner_scope` coverage refusal noting std's read in `reactive.vl`, a generic-leak refusal noting `map`'s own arm in `option.vl` — the note's sub-header printed a position a couple of lines above the label under it (a `reactive.vl:363:26` header over a line-365 label). The renderer's byte-indexed mode re-converted the label's already-converted offset when deriving the sub-header, so any multibyte character earlier in the noted file dragged the header up while the label stayed put. Every span now reaches the renderer in one index space, converted exactly once, so a header and the label beneath it derive from the same position and cannot disagree. The header positions move: anything parsing a cross-source sub-header out of stderr now sees the labeled line's own `line:col`. Same-file diagnostics render byte-identically.
+
+---
+
+<!-- family: diagnostics -->
 **The `owner_scope` coverage error now points at your call, not into the standard library.** A `Signal::effect` at the top of `main`, a `map`/`or` on a service mirror outside any scope — the "context `owner_scope` is read here, but this code can be reached without an enclosing `run`" refusal anchored at the strict read all three helpers funnel to: `get_owner`'s body in std's `reactive.vl`, a file you didn't write, sitting in a std cache directory. The message was right; the location failed the anchoring rules' second law (an error caused by user code never anchors in std).
 
 The coverage check now walks the uncovered path back from a std-internal read to the earliest user-written call that enters the standard library — a call inside a covering `run` is never blamed for the uncovered one beside it — and anchors there, demoting the std read to the secondary note the async-boundary refusals already use ("the read is inside `get_owner` here", labeled in its own file). A strict read you wrote yourself still anchors at itself, note-free, and the injected-closure flavor of the refusal carries the same walk-back.

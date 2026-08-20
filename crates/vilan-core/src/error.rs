@@ -5,7 +5,9 @@ use crate::span::Span;
 /// "first call here", "the trait declares it here". One, not a list —
 /// diagnostics stay terse. `source` names the note's file when it differs
 /// from the primary span's (`None` = the same file); the CLI renders it as
-/// an ariadne sub-label, the language server as related information.
+/// an ariadne sub-label whose `file:line:col` sub-header and label derive
+/// from one converted position (`char_range` in the CLI — E76), the
+/// language server as related information.
 #[derive(Debug, Clone)]
 pub struct Note {
     pub span: Span,

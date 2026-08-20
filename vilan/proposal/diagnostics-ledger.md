@@ -7,6 +7,18 @@ A-rules) · **REWORD** (fails B-rules) · **DEMOTE** (cascade) ·
 snapshot at generation; the message head is the stable key. Updated per
 audit batch, in the batch's commit.
 
+Rendering convention (E76, 2026-08-20): a rendered `file:line:col` header
+and the label beneath it name the SAME position — every span reaches
+ariadne in one index space (char offsets, converted exactly once per span
+by `char_range` at the CLI's render boundary, reused for the report
+location and its label). `IndexType::Byte` broke this for every
+cross-source note: ariadne 0.6 derives a secondary group's sub-header
+from the label's already-converted char offset as if it were still bytes,
+so multibyte text earlier in the noted file dragged the sub-header lines
+above its label (`reactive.vl:363:26` over a line-365 label). Pinned end
+to end in `vilan-cli/tests/diagnostics.rs` (the three `e76_*` pins: both
+live note flavors agree, a same-file note is byte-identical).
+
 **Batch 7 (continuation), 2026-07-21.** The standard's "180/180 —
 AUDIT COMPLETE" is the 2026-07-16 snapshot. The arcs that shipped after it
 (C4 resources/destruction, R11 generic-resource, B29 conformance, A13 HMR
