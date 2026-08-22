@@ -108,6 +108,21 @@ instance), connects an `EventSource` to the embedded port, and reacts:
   browser). The next successful round's event clears it. (Vite's overlay,
   §7 — the single most-loved piece of its dev loop.)
 
+  > **Amendment (2026-08-22, E80):** the `error` text stays a plain-text blob
+  > the shim classes line by line — `file:line:col` location lines (counted
+  > for the badge), indented `note:` lines — and gains a third class: a
+  > diagnostic's requirement trace (E78, `Error::trace`) renders between its
+  > message and its note as one indented line per entry, entry → read:
+  > `    via src/client.vl:13:8 — the context requirement flows through this
+  > call` for a call hop, the elision tail's text alone on its own indented
+  > line. Each hop is located at capture in ITS file (`Note::source`), the
+  > way the diagnostic itself is (E16). The shim tests the trace class
+  > before the location regex — a `via` line names a location too — so a
+  > chain colours as a chain and never inflates the badge. Pinned in
+  > `hmr.rs` (exact strings), `tests/hmr_overlay.rs` (the shim's count and
+  > classes) and `tests/hmr.rs` (a cross-module chain through a live
+  > session).
+
 On connect, the CLI sends the current `version`; the dev runtime compares it to
 the version embedded in its own bundle and immediately requests a swap if stale.
 This heals the fresh-tab-staleness case for free: the common serving idiom reads

@@ -250,6 +250,12 @@
     // A source line that names a location (`app.vl:12:5`) — styled as a distinct
     // accent line in the overlay, and counted for the header badge.
     var LOCATION_LINE = /:\d+:\d+(\s|$)/;
+    // A requirement-trace line (E80): indented `via app.vl:3:5 — the context
+    // requirement flows through this call`, or the chain's indented elision
+    // tail (`… 2 more uncovered calls on this path`). A `via` line names a
+    // location too, so this class is tested BEFORE `LOCATION_LINE` wherever
+    // that regex runs: a diagnostic with three hops counts ONCE in the badge.
+    var TRACE_LINE = /^\s+(via |…)/;
 
     function removeOverlay() {
         var existing = document.getElementById(OVERLAY_ID);
@@ -271,7 +277,7 @@
         var lines = message.split("\n");
         var count = 0;
         for (var i = 0; i < lines.length; i++) {
-            if (LOCATION_LINE.test(lines[i])) {
+            if (!TRACE_LINE.test(lines[i]) && LOCATION_LINE.test(lines[i])) {
                 count += 1;
             }
         }
@@ -311,7 +317,11 @@
         for (var j = 0; j < lines.length; j++) {
             var line = lines[j];
             var row = document.createElement("div");
-            if (LOCATION_LINE.test(line)) {
+            if (TRACE_LINE.test(line)) {
+                // The chain: a notch deeper than the message, in a muted
+                // slate that reads as context rather than as a new location.
+                row.style.cssText = "color:#9fb3c8;padding-left:1em;";
+            } else if (LOCATION_LINE.test(line)) {
                 row.style.cssText = "color:#7fd0ff;font-weight:600;margin-top:12px;";
             } else if (/^\s*note:/.test(line)) {
                 row.style.cssText = "color:#d6a25f;";
