@@ -10,7 +10,9 @@
 > trigger already answers it. Beta is not declared by this paper or by
 > anyone; it is declared when process.md §5.4's four conditions hold,
 > and today none of them do — (b) cannot be satisfied before
-> 2026-08-29 at the earliest (two clean trains from v0.35.0), (c) now
+> 2026-08-29 at the earliest (two clean trains from v0.35.0 — which
+> shipped 2026-08-21, a day early by the owner's call: the first counted
+> train, fold 8d7fe41b), (c) now
 > waits on B73, (a) on kolt's migration, (d) on D5. So: the charter
 > stands, the pre-switch work (§2) proceeds at ordinary priority as the
 > low-regret hygiene it is, and **nothing beta-branded ships publicly

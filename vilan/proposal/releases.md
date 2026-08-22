@@ -312,7 +312,10 @@ person cutting does, start to finish. It is written down here because until
 repo's `docs.yml` header.
 
 **Steps 1–3 are executed by `scripts/cut-release.sh <X.Y.Z>` and steps 6–10 by
-`scripts/fold-release.sh v<X.Y.Z>`** (2026-08-18, backlog L2). **This prose
+`scripts/fold-release.sh v<X.Y.Z>`** (2026-08-18, backlog L2; first executed
+end to end at v0.35.0 on 2026-08-21 — the cut refused nothing and flagged one
+records-only entry for confirmation, the fold ran all ten steps clean with the
+ruleset's bypass notice on the `main` push, as expected). **This prose
 stays the authority; the scripts execute it.** A disagreement between the two
 is a bug in the script, and a change to the sequence is made here first. Both
 carry a `--dry-run` that performs only the read-only checks and prints every
