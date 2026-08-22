@@ -482,3 +482,278 @@ fn a_diagnostic_after_a_parse_error_keeps_its_own_file() {
         "the program's half must be the module's type error: {last:#?}"
     );
 }
+
+// --- complete: the playground's completion contract (K9) --------------------
+//
+// `complete_program` answers from the analysis the LAST compile retained, on
+// this thread (`proposal/playground-completion.md` §5). Each pin below compiles
+// first, under the same serialization the compile pins use, then completes —
+// usually on a DIFFERENT text than it compiled, because that is the shape of
+// every real request: the visitor has just typed the character that triggered
+// it, and the debounced check has not landed yet.
+
+use vilan_wasm::CompletionItem;
+
+fn complete_after(compiled: &str, live: &str, line: u32, character: u32) -> Vec<CompletionItem> {
+    let _guard = compiler();
+    compile_program(compiled);
+    vilan_wasm::complete_program(live, line, character)
+}
+
+fn labels(items: &[CompletionItem]) -> Vec<&str> {
+    items.iter().map(|item| item.label.as_str()).collect()
+}
+
+fn named<'a>(items: &'a [CompletionItem], label: &str) -> &'a CompletionItem {
+    items
+        .iter()
+        .find(|item| item.label == label)
+        .unwrap_or_else(|| panic!("no `{label}` offered: {:?}", labels(items)))
+}
+
+const POINT_PROGRAM: &str = "struct Point {\n\
+    \tx: i32,\n\
+    \ty: i32,\n\
+    }\n\
+    \n\
+    impl Point {\n\
+    \t/// The point's size.\n\
+    \tfun size(self): i32 {\n\
+    \t\tself.x + self.y\n\
+    \t}\n\
+    }\n\
+    \n\
+    fun main() {\n\
+    \tlet p = Point { x = 1, y = 2 };\n\
+    \tp\n\
+    }\n";
+
+/// The headline: a `.` typed after a receiver offers its fields and methods,
+/// with the method call-shaped and carrying its signature and doc — the
+/// language server's answer, from the retained analysis, on a buffer the
+/// analysis has not seen (the `.` itself is new).
+#[test]
+fn member_completion_answers_from_the_retained_analysis() {
+    let live = POINT_PROGRAM.replace("\tp\n}", "\tp.\n}");
+    let items = complete_after(POINT_PROGRAM, &live, 14, 3);
+    let offered = labels(&items);
+    for expected in ["x", "y", "size"] {
+        assert!(
+            offered.contains(&expected),
+            "{expected} missing: {offered:?}"
+        );
+    }
+    let size = named(&items, "size");
+    assert_eq!(size.kind, "method");
+    assert_eq!(size.insert, "size()$0", "a zero-parameter call shape");
+    assert!(size.is_snippet, "the `$0` cursor makes it a snippet");
+    assert_eq!(size.boost, 0, "an in-scope candidate sits in the top band");
+    assert!(
+        size.detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("size(self)")),
+        "the signature rides as detail: {:?}",
+        size.detail
+    );
+    assert_eq!(size.documentation.as_deref(), Some("The point's size."));
+    assert_eq!(named(&items, "x").kind, "field");
+    assert!(
+        !named(&items, "x").is_snippet,
+        "a field inserts its bare name"
+    );
+}
+
+/// Import-path completion with no filesystem: `import std::` enumerates the
+/// embedded toolchain's modules out of the document overlay (the
+/// `modules_in_root` overlay listing, pinned in core), plus the names std's
+/// `lib.vl` surface publishes; `import std::json::` reads the module's own
+/// importables through the loader's overlay-aware read.
+#[test]
+fn import_path_completion_enumerates_the_embedded_toolchain() {
+    let compiled = "import std::json::encode_json;\n\nfun main() {}\n";
+    let live = "import std::json::encode_json;\nimport std::\n\nfun main() {}\n";
+    let items = complete_after(compiled, live, 1, 12);
+    let offered = labels(&items);
+    for module in ["json", "math", "option", "list"] {
+        assert!(
+            offered.contains(&module),
+            "std::{module} missing: {offered:?}"
+        );
+    }
+    assert!(
+        offered.contains(&"print"),
+        "the surface's re-exports are offered too: {offered:?}"
+    );
+    assert!(
+        !offered.contains(&"lib"),
+        "the surface file is not a module: {offered:?}"
+    );
+    assert_eq!(named(&items, "json").kind, "module");
+
+    let live = "import std::json::encode_json;\nimport std::json::\n\nfun main() {}\n";
+    let items = complete_after(compiled, live, 1, 18);
+    let offered = labels(&items);
+    for importable in ["json_codec", "decode_json"] {
+        assert!(
+            offered.contains(&importable),
+            "std::json::{importable} missing: {offered:?}"
+        );
+    }
+    assert!(
+        !named(&items, "json_codec").is_snippet,
+        "an import binds a name, it never calls it"
+    );
+}
+
+/// The snippet forms, as the page receives them: a construct snippet's
+/// tab-stopped body in the lowest band, a call-shaped function with its
+/// parameters as named tab-stops (the server's `Full` default), and a plain
+/// keyword as plain text.
+#[test]
+fn construct_snippets_and_call_shapes_come_back_as_snippets() {
+    let program = "import std::print;\n\nfun main() {\n\t\n}\n";
+    let items = complete_after(program, program, 3, 1);
+    let for_snippet = named(&items, "for … in { }");
+    assert_eq!(for_snippet.kind, "snippet");
+    assert!(for_snippet.is_snippet);
+    assert_eq!(for_snippet.insert, "for ${1:item} in ${2:items} {\n\t$0\n}");
+    assert_eq!(
+        for_snippet.boost, -9,
+        "a construct snippet sorts below every name"
+    );
+    assert_eq!(
+        for_snippet.detail.as_deref(),
+        Some("iterate over a collection")
+    );
+    let print = named(&items, "print");
+    assert_eq!(print.kind, "function");
+    assert_eq!(print.insert, "print(${1:message})$0");
+    assert!(print.is_snippet);
+    assert_eq!(print.boost, 0);
+    let keyword = named(&items, "let");
+    assert_eq!(keyword.kind, "keyword");
+    assert_eq!(keyword.insert, "let");
+    assert!(!keyword.is_snippet);
+    assert_eq!(keyword.boost, 0);
+}
+
+/// The stale-buffer rule (E52), on the playground's side of the fence: the
+/// live text is shorter than the analyzed one before the cursor (a line above
+/// was shortened), and the `.` is typed in `b`, whose `p` is an `Other`. The
+/// cursor converts to the analyzed text through LINE/CHARACTER, landing in
+/// `b`; as a byte offset it would land back inside `a`, resolve `a`'s `p`, and
+/// offer `Point`'s `x` instead.
+#[test]
+fn a_stale_buffer_maps_through_line_and_character_not_bytes() {
+    let padding = "a".repeat(80);
+    let compiled = format!(
+        "struct Point {{\n\tx: i32,\n}}\nstruct Other {{\n\ty: i32,\n}}\nfun a() {{\n\
+         \tlet p = Point {{ x = 1 }};\n\tlet padding = \"{padding}\";\n}}\nfun b() {{\n\
+         \tlet p = Other {{ y = 2 }};\n\tp\n}}\n"
+    );
+    let live = compiled.replace(&padding, "a").replace("\tp\n}", "\tp.\n}");
+    let items = complete_after(&compiled, &live, 12, 3);
+    let offered = labels(&items);
+    assert!(offered.contains(&"y"), "b's `p` is an Other: {offered:?}");
+    assert!(
+        !offered.contains(&"x"),
+        "a's `p` must not answer for b's: {offered:?}"
+    );
+}
+
+/// Nothing retained, nothing offered — and nothing crashes: a fresh thread
+/// (a fresh instance) answers empty before its first compile, and a position
+/// past the end of the text clamps rather than panicking the instance.
+#[test]
+fn completion_before_any_compile_is_empty_and_an_out_of_range_position_clamps() {
+    let _guard = compiler();
+    assert!(
+        vilan_wasm::complete_program("fun main() {}\n", 0, 5).is_empty(),
+        "no analysis retained on this thread yet"
+    );
+    let program = "import std::print;\n\nfun main() {\n\tprint(1);\n}\n";
+    compile_program(program);
+    let items = vilan_wasm::complete_program(program, 999, 999);
+    assert!(
+        !items.is_empty(),
+        "a clamped position still answers the scope at the text's end"
+    );
+}
+
+/// `complete` is pure over the retained state: it leaks nothing (the tally
+/// stays at zero across requests) and so pays nothing toward the page's
+/// recycle budget — which is why the page never counts it as a compile.
+#[test]
+fn completing_leaks_nothing() {
+    use vilan_core::leak_tally;
+    let _guard = compiler();
+    let program = "import std::json::encode_json;\n\nfun main() {\n\t\n}\n";
+    compile_program(program);
+    leak_tally::reset();
+    for live in [
+        "import std::json::encode_json;\n\nfun main() {\n\tenc\n}\n",
+        "import std::json::encode_json;\nimport std::json::\n\nfun main() {\n\t\n}\n",
+        program,
+    ] {
+        let items = vilan_wasm::complete_program(live, 3, 1);
+        assert!(!items.is_empty());
+    }
+    assert_eq!(
+        leak_tally::total(),
+        0,
+        "a completion request must not leak: {}",
+        leak_tally::report()
+    );
+}
+
+/// An auto-import candidate's edit (E54c) is positioned in the LIVE text's
+/// coordinates — the text the edit was computed against — not the analyzed
+/// one: the live buffer here has a blank line inserted above the import, so
+/// the two disagree by exactly one line. Every candidate's edit is checked,
+/// by its shape: one that EXTENDS the existing import (`{ a, b }`) sits on
+/// the import's live line, 1, past its start; a new import line sorted
+/// before the existing one lands at the start of line 1, one sorted after
+/// it at the start of line 2. Mapped through the analyzed text each would
+/// sit one line up (and the sorted-before one a character in).
+#[test]
+fn an_auto_import_edit_is_positioned_in_the_live_text() {
+    let compiled = "import std::json::encode_json;\n\nfun main() {\n\t\n}\n";
+    let live = "\nimport std::json::encode_json;\n\nfun main() {\n\t\n}\n";
+    let items = complete_after(compiled, live, 4, 1);
+    let candidates: Vec<&CompletionItem> = items
+        .iter()
+        .filter(|item| item.import_edit.is_some())
+        .collect();
+    assert!(
+        !candidates.is_empty(),
+        "auto-import candidates are offered: {:?}",
+        labels(&items)
+    );
+    for candidate in candidates {
+        let edit = candidate.import_edit.as_ref().unwrap();
+        assert!(
+            candidate
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("std::")),
+            "labeled with its module: {:?}",
+            candidate.detail
+        );
+        assert_eq!(
+            candidate.boost, -3,
+            "a std candidate sits in the auto-import band below pkg's"
+        );
+        let expected = if edit.text.starts_with("import ") {
+            let sorts_before = edit.text.as_str() < "import std::json";
+            (if sorts_before { 1 } else { 2 }, 0)
+        } else {
+            (1, edit.character.max(1))
+        };
+        assert_eq!(
+            (edit.line, edit.character),
+            expected,
+            "{}'s edit {edit:?} is in the live text's coordinates",
+            candidate.label
+        );
+    }
+}

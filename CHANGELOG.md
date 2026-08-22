@@ -15,6 +15,13 @@ the cut and REFUSES an entry that carries none, rather than guessing.
 proposal/releases.md §7.2 step 3 defines the four.
 -->
 
+## Unreleased
+
+<!-- family: tooling -->
+**The playground completes.** The editor at vilan-lang.org/playground bundled CodeMirror's autocompletion for a year and never registered a source (K9: "imported, never wired"), because the wasm compiler exported nothing a completion source could ask. It now offers what the language server offers — members after `.` (call-shaped methods with their signature and `///` doc), `::` paths, import paths out of the embedded toolchain (`import std::` lists every module with no filesystem behind it), element heads, names in scope, the construct snippets, and auto-import candidates that add their import on accept — from the same engine, answered from the analysis the page's last check retained: a keystroke never pays for an analysis, and the answer arrives in a few milliseconds on the walkthrough app (median of 20, worker round trip included; `proposal/playground-completion.md` §9 has the numbers). The engine moved out of the language server into a new `vilan-ide` crate that both front-ends share, with the line index unforked (one implementation, the LSP's `Position` mapped at its edge); the server's completion wire is byte-identical and every one of its completion pins drives the moved code unchanged. Record: `proposal/playground-completion.md`.
+
+---
+
 ## v0.35.0 — 2026-08-21
 
 <!-- family: breaking -->

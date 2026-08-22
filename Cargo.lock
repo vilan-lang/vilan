@@ -1074,6 +1074,13 @@ name = "vilan-embedded-std"
 version = "0.35.0"
 
 [[package]]
+name = "vilan-ide"
+version = "0.35.0"
+dependencies = [
+ "vilan-core",
+]
+
+[[package]]
 name = "vilan-lsp"
 version = "0.35.0"
 dependencies = [
@@ -1083,6 +1090,7 @@ dependencies = [
  "tower-lsp",
  "vilan-core",
  "vilan-embedded-std",
+ "vilan-ide",
 ]
 
 [[package]]
@@ -1091,6 +1099,7 @@ version = "0.35.0"
 dependencies = [
  "vilan-core",
  "vilan-embedded-std",
+ "vilan-ide",
  "wasm-bindgen",
 ]
 

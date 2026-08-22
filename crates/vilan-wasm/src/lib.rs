@@ -22,16 +22,27 @@
 //! Those caches also leak by design (`Box::leak`, tallied by core's
 //! `leak_tally`), which is why the page recycles the instance rather than
 //! trusting it to run forever.
+//!
+//! ## What is retained between calls
+//!
+//! One thing, since K9 (`proposal/playground-completion.md` §5): the analysis
+//! the last compile produced, so that [`complete_program`] can answer a
+//! keystroke without analyzing. Every `compile_program_for` replaces it; the
+//! instance dying (the page's recycle) discards it; `complete_program` only
+//! reads it, leaks nothing, and answers empty when nothing is retained. The
+//! same single-threaded discipline covers it: a completion never runs
+//! concurrently with an analysis because nothing here runs concurrently.
 
-mod line_index;
-
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use line_index::LineIndex;
+use vilan_core::fx::FxHashMap as HashMap;
+use vilan_core::id::Id;
 use vilan_core::{
-    BuildOptions, Layer, PackageSpec, Platform, PlatformPattern, Workspace, analyze_source,
-    transform,
+    BuildOptions, Layer, PackageSpec, Platform, PlatformPattern, Program, Workspace,
+    analyze_source, transform,
 };
+use vilan_ide::{Analysis, Completion, CompletionKind, ImportRoots, LineIndex, Position};
 
 /// The synthetic root the embedded toolchain is registered under. It never
 /// exists on any disk; `util::canonical_path` normalizes a non-existent path
@@ -71,6 +82,154 @@ pub struct CompileOutput {
     pub js: Option<String>,
     pub css: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// One completion candidate, in the shape the page consumes
+/// (`proposal/playground-completion.md` §6): the language server's
+/// `CompletionItem` mapping (`main.rs::to_completion_item`) with the wire's
+/// sort bands as a CodeMirror `boost`, and the call shape fixed at the
+/// server's defaults (`Full`, snippets on) because the page has no settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// The name shown, and matched against the typed prefix.
+    pub label: String,
+    /// `macro` `function` `method` `field` `struct` `enum` `enum_variant`
+    /// `trait` `variable` `module` `keyword` `snippet` — the page maps these
+    /// to its icon set.
+    pub kind: &'static str,
+    /// The signature (functions/methods), the type (variables), or the module
+    /// an auto-import candidate comes from.
+    pub detail: Option<String>,
+    /// The first paragraph of the declaration's `///` doc.
+    pub documentation: Option<String>,
+    /// What accepting inserts: the bare label, the call shape, or a construct
+    /// snippet's body.
+    pub insert: String,
+    /// `insert` is an LSP-syntax snippet (`${1:name}` tab-stops, `$0` the
+    /// final cursor) rather than plain text.
+    pub is_snippet: bool,
+    /// The language server's `sort_text` bands as a CodeMirror boost: an
+    /// in-scope candidate `0`, an auto-import candidate `-(1 + tier)` (the
+    /// user's own `pkg` above `std`), a construct snippet `-9`.
+    pub boost: i32,
+    /// The import an auto-import candidate adds when accepted (E54c), in the
+    /// LIVE text's coordinates.
+    pub import_edit: Option<ImportEdit>,
+}
+
+/// A text edit that adds an import: the range to replace (zero-based line,
+/// UTF-16 character — the same units as [`Diagnostic`]) and its replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportEdit {
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub text: String,
+}
+
+impl CompletionItem {
+    /// The page's shape of one engine candidate — the same decisions as the
+    /// language server's `to_completion_item`, minus the wire types.
+    fn from_completion(completion: Completion, live: &LineIndex) -> CompletionItem {
+        let kind = match completion.kind {
+            CompletionKind::Macro => "macro",
+            CompletionKind::Function => "function",
+            CompletionKind::Method => "method",
+            CompletionKind::Field => "field",
+            CompletionKind::Struct => "struct",
+            CompletionKind::Enum => "enum",
+            CompletionKind::EnumVariant => "enum_variant",
+            CompletionKind::Trait => "trait",
+            CompletionKind::Variable => "variable",
+            CompletionKind::Module => "module",
+            CompletionKind::Keyword => "keyword",
+            CompletionKind::Snippet => "snippet",
+        };
+        let mut detail = completion.detail;
+        let (mut insert, mut is_snippet) = (completion.label.clone(), false);
+        let mut boost = 0;
+        if let Some(parameters) = &completion.call_parameters {
+            if let Some(call) = vilan_ide::call_insertion(
+                &completion.label,
+                parameters,
+                vilan_ide::CompletionFunctionCall::Full,
+                true,
+            ) {
+                insert = call.text;
+                is_snippet = call.is_snippet;
+            }
+        }
+        if let Some(snippet) = completion.snippet {
+            insert = snippet.body;
+            is_snippet = true;
+            boost = -9;
+        }
+        let import_edit = completion.needs_import.map(|auto_import| {
+            detail = Some(auto_import.module_path.join("::"));
+            boost = -(1 + i32::from(auto_import.origin_tier));
+            let (start, end) = live.range(&auto_import.edit_span);
+            ImportEdit {
+                line: start.line,
+                character: start.character,
+                end_line: end.line,
+                end_character: end.character,
+                text: auto_import.edit_replacement,
+            }
+        });
+        CompletionItem {
+            label: completion.label,
+            kind,
+            detail,
+            documentation: completion.documentation,
+            insert,
+            is_snippet,
+            boost,
+            import_edit,
+        }
+    }
+}
+
+/// The analysis the last compile left behind, kept for [`complete_program`]
+/// (`proposal/playground-completion.md` §5). The program borrows only
+/// `'static` data — the interned entry text and the leaked tree
+/// `analyze_source` never reclaims — so holding it costs no new leak; it is
+/// dropped when the next compile replaces it.
+struct Retained {
+    /// The interned entry text the program was analyzed from — the key a
+    /// completion request's live text is compared against.
+    text: &'static str,
+    program: Program<'static>,
+    /// The index of `text`: the coordinate space the program's spans live in.
+    analyzed: LineIndex,
+    entity_spans: Vec<(usize, usize, Id)>,
+    platform_requirements: HashMap<Id, String>,
+    import_roots: ImportRoots,
+}
+
+impl Retained {
+    fn new(text: &'static str, program: Program<'static>) -> Retained {
+        let entity_spans = vilan_ide::entity_spans(&program);
+        let platform_requirements = vilan_core::platform_color::requirements(&program);
+        Retained {
+            text,
+            program,
+            analyzed: LineIndex::new(text),
+            entity_spans,
+            platform_requirements,
+            import_roots: ImportRoots {
+                std: embedded_std_spec(),
+                pkg_root: PathBuf::from(PROJECT_ROOT),
+                dependencies: Vec::new(),
+            },
+        }
+    }
+}
+
+thread_local! {
+    /// One per instance — the instance is one thread. (Natively, the tests
+    /// each run on their own thread and see exactly their own compiles.)
+    static RETAINED: RefCell<Option<Retained>> = const { RefCell::new(None) };
 }
 
 /// The `PackageSpec` `resolve_std` would build for the embedded std, without
@@ -202,16 +361,60 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         &Workspace::default(),
     );
 
-    // The visitor's own file is the common case for a span, so index it once.
-    let entry_index = LineIndex::new(source);
+    let Some(program) = program else {
+        // No tree at all (a panic past the fence): nothing to answer
+        // completion from either, so the previous program does not linger.
+        RETAINED.with(|slot| *slot.borrow_mut() = None);
+        let entry_index = LineIndex::new(source);
+        let diagnostics = errors
+            .iter()
+            .map(|error| entry_diagnostic(error, &entry_index))
+            .collect();
+        return CompileOutput {
+            js: None,
+            css: None,
+            diagnostics,
+        };
+    };
+    let retained = Retained::new(leaked, program);
+    let output = emit(&retained.program, &retained.analyzed, &entry_path, &errors);
+    RETAINED.with(|slot| *slot.borrow_mut() = Some(retained));
+    output
+}
+
+/// A diagnostic of the visitor's own file, for the no-program path.
+fn entry_diagnostic(error: &vilan_core::Error, entry_index: &LineIndex) -> Diagnostic {
+    let range = error.span.into_range();
+    let start = entry_index.position(range.start);
+    Diagnostic {
+        start: range.start,
+        end: range.end,
+        line: start.line,
+        column: start.character,
+        message: error.msg.clone(),
+        note: error.note.as_ref().map(|note| note.msg.clone()),
+        severity: "error",
+        file: ENTRY_NAME.to_string(),
+    }
+}
+
+/// The diagnostics and, when clean, the emitted program — over an analysis
+/// that is about to be retained. `entry_index` indexes the entry text the
+/// program was analyzed from.
+fn emit(
+    program: &Program<'static>,
+    entry_index: &LineIndex,
+    entry_path: &Path,
+    errors: &[vilan_core::Error],
+) -> CompileOutput {
     let mut indices: Vec<(PathBuf, LineIndex)> = Vec::new();
     let mut diagnostics = Vec::new();
 
     let mut convert = |error: &vilan_core::Error, severity: &'static str, path: Option<&Path>| {
         let range = error.span.into_range();
         let (index, file) = match path {
-            None => (&entry_index, ENTRY_NAME.to_string()),
-            Some(path) if path == entry_path => (&entry_index, ENTRY_NAME.to_string()),
+            None => (entry_index, ENTRY_NAME.to_string()),
+            Some(path) if path == entry_path => (entry_index, ENTRY_NAME.to_string()),
             Some(path) => {
                 if !indices.iter().any(|(known, _)| known == path) {
                     let text = vilan_core::util::read_source(path).unwrap_or_default();
@@ -221,7 +424,7 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
                     .iter()
                     .find(|(known, _)| known == path)
                     .map(|(_, index)| index)
-                    .unwrap_or(&entry_index);
+                    .unwrap_or(entry_index);
                 (index, display_path(path))
             }
         };
@@ -236,17 +439,6 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
             severity,
             file,
         });
-    };
-
-    let Some(program) = program else {
-        for error in &errors {
-            convert(error, "error", None);
-        }
-        return CompileOutput {
-            js: None,
-            css: None,
-            diagnostics,
-        };
     };
 
     // `errors` is the ENTRY's own lex/parse errors followed by the program's
@@ -278,7 +470,7 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         .remove("css")
         .filter(|content| !content.is_empty());
 
-    match transform(&program, &BuildOptions::default()) {
+    match transform(program, &BuildOptions::default()) {
         Ok(javascript) => CompileOutput {
             js: Some(javascript),
             css,
@@ -293,6 +485,50 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
             }
         }
     }
+}
+
+/// Completion candidates at a cursor in `source` — `line` zero-based, and
+/// `character` a UTF-16 offset within it, the units the page already speaks
+/// for diagnostics — answered from the analysis the last compile retained
+/// (`proposal/playground-completion.md` §5–§6). Never analyzes: a keystroke
+/// cannot pay for one, and the page's debounced check keeps the retained
+/// program at most one debounce behind the buffer. Empty when nothing is
+/// retained (a fresh instance before its first check).
+///
+/// When `source` is the retained text the two coordinate spaces coincide.
+/// When it is not — the usual case, the visitor having just typed the
+/// character that triggered this — the engine reads the trigger off the live
+/// text and converts to the analyzed text through line/character, E52's rule
+/// (`lsp-snapshot-consistency.md`), exactly as the language server does
+/// between a keystroke and its debounced re-analysis.
+pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<CompletionItem> {
+    RETAINED.with(|slot| {
+        let slot = slot.borrow();
+        let Some(retained) = slot.as_ref() else {
+            return Vec::new();
+        };
+        let live_index;
+        let live: &LineIndex = if source == retained.text {
+            &retained.analyzed
+        } else {
+            live_index = LineIndex::new(source);
+            &live_index
+        };
+        let analysis = Analysis {
+            program: &retained.program,
+            analyzed: &retained.analyzed,
+            live,
+            entity_spans: &retained.entity_spans,
+            platform_requirements: &retained.platform_requirements,
+            import_roots: Some(&retained.import_roots),
+        };
+        let offset = live.offset(Position { line, character });
+        analysis
+            .completion(offset)
+            .into_iter()
+            .map(|completion| CompletionItem::from_completion(completion, live))
+            .collect()
+    })
 }
 
 /// Formats one Vilan source string — the CLI's `vilan fmt` rule exactly
@@ -412,5 +648,54 @@ mod bindings {
     #[wasm_bindgen]
     pub fn version() -> String {
         crate::version().to_string()
+    }
+
+    // --- completion (K9) — its own block, beside the compile surface ---------
+
+    /// One completion candidate, as the page consumes it. The auto-import
+    /// edit rides as five optional flat fields rather than a nested struct,
+    /// which `wasm_bindgen` does not pass by value.
+    #[wasm_bindgen(getter_with_clone)]
+    pub struct CompletionItem {
+        pub label: String,
+        pub kind: String,
+        pub detail: Option<String>,
+        pub documentation: Option<String>,
+        pub insert: String,
+        pub is_snippet: bool,
+        pub boost: i32,
+        pub import_line: Option<u32>,
+        pub import_character: Option<u32>,
+        pub import_end_line: Option<u32>,
+        pub import_end_character: Option<u32>,
+        pub import_text: Option<String>,
+    }
+
+    /// Completion candidates at `line`/`character` (zero-based line, UTF-16
+    /// character) in `source`, from the analysis the last compile retained;
+    /// empty before any compile. The page feature-detects this export, so a
+    /// glue built before it existed simply registers no completion source.
+    #[wasm_bindgen]
+    pub fn complete(source: String, line: u32, character: u32) -> Vec<CompletionItem> {
+        crate::complete_program(&source, line, character)
+            .into_iter()
+            .map(|item| {
+                let edit = item.import_edit;
+                CompletionItem {
+                    label: item.label,
+                    kind: item.kind.to_string(),
+                    detail: item.detail,
+                    documentation: item.documentation,
+                    insert: item.insert,
+                    is_snippet: item.is_snippet,
+                    boost: item.boost,
+                    import_line: edit.as_ref().map(|edit| edit.line),
+                    import_character: edit.as_ref().map(|edit| edit.character),
+                    import_end_line: edit.as_ref().map(|edit| edit.end_line),
+                    import_end_character: edit.as_ref().map(|edit| edit.end_character),
+                    import_text: edit.map(|edit| edit.text),
+                }
+            })
+            .collect()
     }
 }

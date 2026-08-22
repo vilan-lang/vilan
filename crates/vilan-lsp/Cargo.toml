@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 vilan-core = { path = "../vilan-core" }
+# The completion engine, the line index, and the navigation primitives hover
+# and definition read — shared with the playground (K9,
+# proposal/playground-completion.md §3).
+vilan-ide = { path = "../vilan-ide" }
 vilan-embedded-std = { path = "../vilan-embedded-std" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "io-std", "macros", "time"] }

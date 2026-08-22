@@ -13,6 +13,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 vilan-core = { path = "../vilan-core" }
+# The completion engine and the line index, shared with the language server
+# (K9, proposal/playground-completion.md §3) — core-only, so it builds for
+# wasm32 exactly as it does natively.
+vilan-ide = { path = "../vilan-ide" }
 vilan-embedded-std = { path = "../vilan-embedded-std" }
 
 # Only the binding layer needs wasm-bindgen, so the host build and the native

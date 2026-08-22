@@ -1,9 +1,9 @@
 # Playground completion — the completion core's seam for wasm (K9)
 
-> Status: DESIGN 2026-08-22 (lane k9-playground-completion, cycle 27,
-> design-first). The seam was measured before anything moved: the helper
-> graph below is the verdict that let the build go ahead. §9 and §10 are
-> the build record and are filled in by the same lane.
+> Status: DESIGNED AND BUILT 2026-08-22 (lane k9-playground-completion,
+> cycle 27, design-first). The seam was measured before anything moved:
+> the helper graph below is the verdict that let the build go ahead. §9
+> is the latency record, §10 what shipped, §11 the owner's questions.
 >
 > Filed from backlog-2026-08-18.md §K9 ("autocomplete is imported, never
 > wired") and design-language.md §2.7's K9 entry. This is its own paper
@@ -350,11 +350,104 @@ pins hold (`complete` adds no leak site). The recycle policy.
 
 ## 9. Latency
 
-_Build record — filled by §10's lane._
+**Method.** The walkthrough app (`vilan/examples/walkthrough`, the docs'
+team-notes app) folded into one browser-leg file — `notes.vl`, `routes.vl`,
+`views.vl` and `client.vl` verbatim minus their `pkg::` imports, plus the
+store's `[service(NotesClient)]` declaration with in-memory bodies in place
+of the SQLite ones, so the generated `NotesClient` is the real one — 407
+lines, 11.7 KB, compiles clean (71 KB of JS). The release wasm
+(`wasm-release` profile, `wasm-bindgen --target web`, the pair the deploy
+ships) loaded under node 24 exactly as `scripts/smoke-playground.mjs` loads
+it; each figure is the median of 20 calls after one warm-up compile, on the
+2026-08-22 tree. "Worker round trip" is a `worker_threads` worker answering
+the page's `complete` message shape — post the whole buffer and the cursor,
+receive the plain items — which is what a keystroke pays before CodeMirror
+renders; the browser's `postMessage` is the same structured clone.
+
+| site | in-process `complete` | items |
+|---|---|---|
+| member: `.` just typed after `client` (stale text — the real keystroke case, E52's mapping) | **2.6 ms** | 10 |
+| member, same text as analyzed (identity mapping) | 2.6 ms | 10 |
+| import path: `import std::` (overlay listing + surface) | 2.6 ms | 71 |
+| scope: a bare position inside `screen` (names + keywords + snippets + auto-imports) | 51 ms | 131 |
+
+Worker round trip, member case: **2.9 ms** median (min 2.7, max 6.1).
+For scale: the page's `check` on the same program — the full analysis it
+already pays per 400 ms debounce — is 150 ms warm and 440 ms cold.
+
+So a `.` costs the keystroke ~3 ms end to end; the page never waits on an
+analysis for it. The one slow shape is the bare scope position, and it is the
+engine's own cost, not the playground's: `auto_import_completions` runs
+`formatter::insert_import` per surviving candidate (up to the cap of 20),
+and each call parses the whole buffer; `entity_completion` reads a std
+declaration's `///` doc through `read_source`, which clones the module's
+text per candidate. The language server pays the same today. Parsing the
+buffer once per request would take the scope case to the member case's
+cost; it is a change to the E54c/WO-3 engine with its own pins, filed under
+§11.5 rather than folded into a move that promised to move code verbatim.
+
+Not measured: a real browser's paint. No browser is reachable from this
+lane's environment; the figures above end where the worker's reply is in
+the page's hands, and the render that follows is CodeMirror's own popup.
 
 ## 10. What shipped
 
-_Build record — filled by §10's lane._
+**Compiler repo**, branch `k9-playground-completion` off `next`:
+
+- `crates/vilan-ide` (new): `line_index.rs` (the one `LineIndex`,
+  `Position`, eight pins — both forks' plus the inbound direction's clamp
+  and a UTF-16 round trip); `analysis.rs` (`Analysis`, `entity_spans`,
+  `entity_at`, `span_of`, `source_call_subject`, `signature_label`,
+  `call_parameter_names`, and the shared primitives as methods);
+  `completion.rs` (the value types, `KEYWORD_DOCS`, `CONSTRUCT_SNIPPETS`,
+  `keyword_lexeme`, `ImportRoots`, the gatherers verbatim, the free
+  helpers, `CompletionFunctionCall`/`InsertText`/`call_insertion`).
+- `crates/vilan-lsp`: `document.rs` lost 1,859 lines; `Document::completion`
+  delegates; `analysis(program)` builds the seam; hover/definition call the
+  primitives through it; `line_index.rs` is the 60-line newtype;
+  `main.rs`'s `call_insertion` wraps the shared rule; `book_sync.rs`
+  imports the tables. `cargo test -p vilan-lsp`: 342 passed, 0 failed, 3
+  ignored (the pre-existing three) — every completion pin drives the moved
+  code through the unchanged harness.
+- `crates/vilan-core`: `modules_in_root` lists the overlay (§6);
+  `document_overlay_paths` (crate-private). Pin
+  `an_overlay_module_lists_under_its_root` in `module_resolution.rs` —
+  plant-proven red with the overlay loop disabled.
+- `crates/vilan-wasm`: `line_index.rs` deleted; `Retained` + the
+  thread-local; `compile_program_for` split into the retention and `emit`;
+  `complete_program`; `CompletionItem`/`ImportEdit`; the `complete` export
+  and its `wasm_bindgen` struct in their own block. Seven pins in
+  `tests/compile.rs`, each plant-proven red with the targeted binary:
+  `member_completion_answers_from_the_retained_analysis` (retention
+  disabled), `import_path_completion_enumerates_the_embedded_toolchain`
+  (the overlay listing disabled), `construct_snippets_and_call_shapes_come_back_as_snippets`
+  (the snippet band dropped to 0), `a_stale_buffer_maps_through_line_and_character_not_bytes`
+  (identity mapping forced — it offers `Point`'s `x` for `b`'s `Other`),
+  `completion_before_any_compile_is_empty_and_an_out_of_range_position_clamps`,
+  `completing_leaks_nothing` (a planted `Box::leak` + tally in `complete`),
+  `an_auto_import_edit_is_positioned_in_the_live_text` (the edit mapped
+  through the analyzed index — its first form was vacuous under that plant
+  and was tightened to the exact line/character per edit shape before it
+  went red).
+- Records: this paper; `design-language.md` §2.7 K9 and §2.8; `editing-dx.md`
+  §20; `CHANGELOG.md` (tooling); `proposal/README.md`. Scripts:
+  `cut-release.sh`'s `RELEASE_FILES` and the notices test's workspace list
+  learn the crate.
+- Corpus goldens untouched; no new diagnostic head (no ledger row).
+
+**Website repo**, branch `k9-playground-completion` off `main`:
+
+- `playground/worker.js`: `canComplete` on `ready`; the `complete` action
+  (its own block, away from the diagnostic map lane e80 edits); items
+  flattened to plain objects and freed.
+- `playground/editor-src/editor.mjs`: `autocompletion` registered with
+  the worker-backed source (§7); the request map; `abandonCompletions` on
+  recycle; the popup theme on the `--code-*` slots; the header comment
+  rewritten. `playground/editor.js` rebuilt (the orchestrator regenerates
+  it at merge).
+- `scripts/smoke-playground.mjs`: the guarded completion probe (claim 4).
+  Run against the freshly built wasm: every example ok, `completion: ok
+  (12 candidates after \`count.\`)`.
 
 ## 11. Open questions for the owner
 
@@ -372,6 +465,13 @@ _Build record — filled by §10's lane._
    matching; if the popup reads busy in practice, the page can drop
    `keyword` items (a presentation filter, not a language decision) — the
    export still carries them.
-4. **`activateOnTyping`.** The playground opens the popup as you type
-   (CodeMirror's default), the same as VS Code; the alternative is
-   trigger-only (`.`, `::`, Ctrl-Space). Taste.
+4. **When the popup opens.** As built: on a typed identifier character,
+   on `.`/`:` (the language server's own trigger characters), and on
+   Ctrl-Space — not after a space or a newline, which would float the
+   keyword list after every token. VS Code opens on every character.
+   Taste; one line in `vilanCompletions`.
+5. **The scope position's 51 ms** (§9). `insert_import` parses the buffer
+   once per auto-import candidate; parsing once per request is a small
+   engine change (the E54c path) that would also speed the language server.
+   Recommend filing it; not done here because this lane moved the engine
+   verbatim.

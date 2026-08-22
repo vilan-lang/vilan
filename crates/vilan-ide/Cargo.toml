@@ -1,0 +1,13 @@
+[package]
+name = "vilan-ide"
+version = "0.35.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The editor-facing queries the language server and the playground share: a line index, the completion engine, and the navigation primitives it reads."
+
+# `vilan-core` only, on purpose: this crate is the half of the editor story
+# that is NOT a protocol, so it must build wherever core builds — including
+# `wasm32-unknown-unknown`, where the language server's tower-lsp/tokio stack
+# cannot follow (proposal/playground-completion.md §3).
+[dependencies]
+vilan-core = { path = "../vilan-core" }

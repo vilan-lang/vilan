@@ -2611,3 +2611,17 @@ the marker fill removed reddens the marker pin. Corpus byte-identical
 observed detail: `declaration_labels` renders `run` without its own
 `<U>` (`external fun run(self, value: T, body: || U): U`) — a label
 convention, not a §19.3 concern.
+
+## 20. Where the completion engine lives now (K9, 2026-08-22)
+
+§18's engine — `Document::completion` and everything it reaches — moved
+verbatim out of `crates/vilan-lsp/src/document.rs` into the shared
+`vilan-ide` crate, so the playground can run it through the wasm's
+`complete` export. Nothing it answers changed; every completion pin in
+this paper's record (§18.3, and the E52/E57 pins before it) still drives
+the moved code through `Document::analyze` + `document.completion`. The
+seam, the measured helper graph that licensed the move (completion shares
+nine primitives with hover and none of its composition), what the wasm
+retains between calls, and the export's shape are
+`proposal/playground-completion.md`. Future completion behaviour work still
+records here; where the engine lives records there.
