@@ -269,6 +269,221 @@ fn the_cut_refuses_an_entry_it_cannot_classify_instead_of_guessing() {
     assert!(report.contains("the unknown family `refactor`"), "{report}");
 }
 
+/// The 1-based line `needle` sits on, for a refusal that must name it.
+fn line_of(text: &str, needle: &str) -> usize {
+    text.lines()
+        .position(|line| line == needle)
+        .map(|index| index + 1)
+        .unwrap_or_else(|| panic!("no line of the fixture reads `{needle}`"))
+}
+
+fn refuse(name: &str, changelog: &str) -> String {
+    let fixture = Fixture::new(name, changelog);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.9",
+        ],
+    );
+    assert!(!ok, "the cut accepted a section it must refuse:\n{report}");
+    assert!(
+        report.contains("refusing to cut"),
+        "the refusal must say nothing was changed:\n{report}"
+    );
+    assert!(!out.exists(), "a refused cut must write nothing");
+    assert!(fixture.read("CHANGELOG.md").contains("## Unreleased"));
+    report
+}
+
+/// The 2026-08-20 shape (backlog L11): a `<!-- family: ... -->` line that a
+/// CHANGELOG merge-union left with nothing under it — blank lines, then the
+/// next rule. The parser used to let the rule clear the pending family and
+/// the dry-run stayed green, so the dangling comment would have ridden into
+/// the release section. A marker that reaches a rule, another marker of its
+/// kind, or the section's end without a bold head is refused, by line.
+#[test]
+fn the_cut_refuses_a_marker_that_opens_no_entry() {
+    let stranded = SCRAMBLED.replace(
+        "---\n\n---\n\n<!-- family: miscompile -->",
+        "---\n\n<!-- family: diagnostics -->\n\n\n---\n\n<!-- family: miscompile -->",
+    );
+    let line = line_of(&stranded, "<!-- family: diagnostics -->");
+    let report = refuse("orphan-family", &stranded);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "the refusal must name the stranded marker and its line:\n{report}"
+    );
+    // Refusing is not a reason to stop reporting: the sweep still traces the
+    // four entries the section does hold.
+    assert_eq!(report.matches("  ok    ").count(), 4, "{report}");
+
+    // A `commit:` marker is a marker too.
+    let stranded = SCRAMBLED.replace(
+        "---\n\n---\n\n<!-- family: miscompile -->",
+        "---\n\n<!-- commit: 0123abcd -->\n---\n\n<!-- family: miscompile -->",
+    );
+    let line = line_of(&stranded, "<!-- commit: 0123abcd -->");
+    let report = refuse("orphan-commit", &stranded);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- commit: 0123abcd -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+
+    // Two family markers in a row: the first opens nothing.
+    let doubled = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.**",
+        "<!-- family: diagnostics -->\n<!-- family: feature -->\n**A feature entry.**",
+    );
+    let line = line_of(&doubled, "<!-- family: diagnostics -->");
+    let report = refuse("doubled-family", &doubled);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+    // The second marker is the one the entry carries: it is placed, and the
+    // stranded first marker is the only red.
+    assert!(
+        !report.contains("carries no `<!-- family: ... -->` marker"),
+        "{report}"
+    );
+    assert_eq!(report.matches("  RED   ").count(), 1, "{report}");
+
+    // A marker the next section's heading cuts off, and one the file ends on.
+    let at_heading = SCRAMBLED.replace(
+        "---\n\n## v0.1.0",
+        "---\n\n<!-- family: diagnostics -->\n## v0.1.0",
+    );
+    let line = line_of(&at_heading, "<!-- family: diagnostics -->");
+    let report = refuse("orphan-at-heading", &at_heading);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+    let at_end = format!(
+        "{}<!-- family: diagnostics -->\n",
+        &SCRAMBLED[..SCRAMBLED.find("## v0.1.0").expect("the released section")]
+    );
+    let line = line_of(&at_end, "<!-- family: diagnostics -->");
+    let report = refuse("orphan-at-end", &at_end);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+}
+
+/// A marker sits directly above its head — the changelog's own writing note
+/// says so, every marker in the tree does so, and the only marker a blank
+/// line ever followed was the 2026-08-20 orphan. So a blank between the two
+/// is refused rather than tolerated, and the head below it is then an entry
+/// with no family: both reds name the one fault, from each side.
+#[test]
+fn the_cut_refuses_a_marker_parted_from_its_head_by_a_blank_line() {
+    let parted = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.**",
+        "<!-- family: feature -->\n\n**A feature entry.**",
+    );
+    let line = line_of(&parted, "<!-- family: feature -->");
+    let report = refuse("parted-marker", &parted);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: feature -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains("carries no `<!-- family: ... -->` marker: A feature entry."),
+        "{report}"
+    );
+}
+
+/// A marker followed by prose instead of a bold head: the prose was already
+/// refused as text that begins no entry, and the marker above it is now
+/// refused as well.
+#[test]
+fn the_cut_refuses_a_marker_followed_by_prose() {
+    let prose = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.** What is newly possible.",
+        "<!-- family: feature -->\nA feature entry, with no bold head to open it.",
+    );
+    let line = line_of(&prose, "<!-- family: feature -->");
+    let report = refuse("marker-then-prose", &prose);
+    assert!(
+        report.contains(
+            "text under `## Unreleased` that begins no entry: A feature entry, with no bold head to open it."
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: feature -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+}
+
+/// The legitimate shapes: a `commit:` marker above or below the `family:`
+/// marker, each directly above the head. Both cut, and the rewrite puts the
+/// two lines in one order.
+#[test]
+fn the_cut_accepts_a_commit_marker_on_either_side_of_the_family_marker() {
+    let fixture = Fixture::new("commit-marker-order", SCRAMBLED);
+    let sha = String::from_utf8_lossy(&fixture.git(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    let claimed = SCRAMBLED
+        .replace(
+            "<!-- family: breaking -->",
+            &format!("<!-- commit: {sha} -->\n<!-- family: breaking -->"),
+        )
+        .replace(
+            "<!-- family: feature -->",
+            &format!("<!-- family: feature -->\n<!-- commit: {sha} -->"),
+        );
+    fs::write(fixture.root.join("CHANGELOG.md"), claimed).expect("write the changelog");
+    fixture.git(&["commit", "-am", "records: name the commits"]);
+
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.9",
+        ],
+    );
+    assert!(
+        ok,
+        "the cut refused a commit marker beside a family marker:\n{report}"
+    );
+    assert_eq!(report.matches("  ok    ").count(), 4, "{report}");
+    let proposed = fs::read_to_string(&out).expect("read the proposed changelog");
+    for family in ["breaking", "feature"] {
+        let expected =
+            format!("<!-- commit: {sha} -->\n<!-- family: {family} -->\n**A {family} entry.**");
+        assert!(
+            proposed.contains(&expected),
+            "expected the {family} entry to carry both markers, commit first:\n{proposed}"
+        );
+    }
+}
+
 #[test]
 fn the_sweep_reds_an_entry_whose_commit_is_not_an_ancestor_of_the_tag() {
     // The drift §7.1 was written about: an entry filed under Unreleased whose

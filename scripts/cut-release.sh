@@ -32,7 +32,12 @@
 # carries rather than infers: a
 # `<!-- family: breaking|miscompile|feature|tooling -->` line above the entry's
 # head. An entry with no family, or one this script does not know, is REFUSED
-# and printed - never guessed. Within a family the authored order is preserved
+# and printed - never guessed. So is the converse: a marker that opens no entry
+# (a `family:` or `commit:` line that reaches a blank line, a `---` rule, a
+# second marker of its kind, prose, or the section's end before a bold head -
+# the debris a CHANGELOG merge-union leaves), because a marker sits directly
+# above its head and a dangling one would ride into the release section as a
+# comment nobody wrote. Within a family the authored order is preserved
 # exactly, so a thematic grouping a human wrote survives the sort.
 set -eu
 
@@ -155,6 +160,14 @@ function marker_value(line, key,   rest, stop) {
     return rest
 }
 function dash(value) { return value == "" ? "-" : value }
+function strand(marker, line) {
+    problem("marker `" marker "` at line " line " opens no entry (a marker sits directly above its head)")
+}
+function strand_pending() {
+    if (pending_family != "") strand(family_marker, family_line)
+    if (pending_commit != "") strand(commit_marker, commit_line)
+    pending_family = ""; pending_commit = ""
+}
 function close_entry(   text) {
     if (!open) return
     text = body[count]
@@ -166,6 +179,7 @@ function emit_section(   wanted, i, printed) {
     if (emitted) return
     emitted = 1
     close_entry()
+    strand_pending()
     if (count == 0) problem("the `## Unreleased` section holds no entries")
     for (i = 1; i <= count; i++) {
         if (head[i] == "") {
@@ -206,6 +220,7 @@ function emit_section(   wanted, i, printed) {
 BEGIN {
     stage = 0; count = 0; open = 0; emitted = 0; refusals = 0
     pending_family = ""; pending_commit = ""; boundary = 1
+    family_marker = ""; family_line = 0; commit_marker = ""; commit_line = 0
 }
 stage == 0 {
     if ($0 == "## Unreleased") {
@@ -225,16 +240,23 @@ stage == 1 {
     }
     if ($0 ~ /^<!--[ \t]*family:[ \t]*[A-Za-z-]+[ \t]*-->[ \t]*$/) {
         close_entry()
+        if (pending_family != "") strand(family_marker, family_line)
         pending_family = marker_value($0, "family:")
+        family_marker = $0; family_line = NR
         boundary = 1
         next
     }
     if ($0 ~ /^<!--[ \t]*commit:[ \t]*[0-9a-fA-F]+[ \t]*-->[ \t]*$/) {
         close_entry()
+        if (pending_commit != "") strand(commit_marker, commit_line)
         pending_commit = marker_value($0, "commit:")
+        commit_marker = $0; commit_line = NR
         boundary = 1
         next
     }
+    # Past the markers, only a bold head may follow a marker. Anything else -
+    # a rule, a blank line, prose, the heading above - strands it.
+    if (substr($0, 1, 2) != "**") strand_pending()
     if ($0 ~ /^-{3,}[ \t]*$/) {
         close_entry()
         boundary = 1
@@ -283,7 +305,7 @@ say ""
 
 REFUSED="$AWK_STATUS"
 if [ "$REFUSED" = 3 ]; then
-    say 'REFUSED — an entry has no family, and this script never guesses one.'
+    say 'REFUSED — the section is not in the shape §7.2 step 3 asks for, and this script never guesses.'
     say '  <!-- family: breaking -->    a program that compiles today may stop, or change behaviour'
     say '  <!-- family: miscompile -->  the compiler was wrong about a program it accepted'
     say '  <!-- family: feature -->     a new capability'
