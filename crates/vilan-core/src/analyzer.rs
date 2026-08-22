@@ -25275,6 +25275,21 @@ impl<'src> Analyzer<'src> {
     /// later `push` may fill) is unresolved.
     fn resolve_for_each_item(&mut self, item_id: Id, iterable_id: Id) -> Resolution {
         let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
+        // Iterating an unannotated closure parameter (`items.map(|list| { for
+        // todo in list { .. } })`) waits for bidirectional inference to fill it
+        // — the rule the field-accessor, method-call, call-subject and match
+        // resolvers already apply to an unknown closure parameter (C′'s
+        // family). `Unknown` is not `Unresolved`, so without this the item
+        // committed to `any` on the first pass whenever the owning call had
+        // not yet resolved (an un-annotated receiver, a receiver that is itself
+        // a call), and every field access on the item failed "on type any" —
+        // B129's second gap, whose "let-bound signal" framing was the symptom,
+        // not the cause. A parameter never filled by the end of the fixpoint
+        // still takes `finalize_build`'s `any` default, as before.
+        if matches!(iterable_type, Type::Unknown) && self.is_unknown_closure_parameter(iterable_id)
+        {
+            return Resolution::Deferred;
+        }
         let next_method = self.for_each_next_method(Some(item_id));
         let element_type = self.iterable_element_type(&iterable_type, next_method);
         if matches!(iterable_type, Type::Unresolved)
@@ -28484,6 +28499,13 @@ impl<'src> Analyzer<'src> {
         let list_id = self.primitive_struct_ids.get("List").copied();
         match subject_type {
             Type::Unresolved => Resolution::Deferred,
+            // An unannotated closure parameter awaiting bidirectional inference
+            // (`items.map(|list| list[0])`) — typed when its owning call
+            // resolves; the same defer the field accessor applies (B129's
+            // second gap, see `resolve_for_each_item`). One still unknown at
+            // the end of the fixpoint reports through the leftover sweep's
+            // never-determined path, never silently.
+            Type::Unknown if self.is_unknown_closure_parameter(subject_id) => Resolution::Deferred,
             Type::Struct(struct_id, arguments)
                 if Some(struct_id) == list_id && arguments.len() == 1 =>
             {

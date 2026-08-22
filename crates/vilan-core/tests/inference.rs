@@ -60389,18 +60389,20 @@ fn b129_an_empty_list_argument_binding_a_free_generic_still_errors() {
     );
 }
 
-/// The OTHER gap the original A25 pin's body carried, isolated: a `.map` on a
-/// `let`-bound signal freezes its closure parameter before the receiver's
-/// binding lands, so the parameter types as `any` and a field access on the
-/// element fails — with a NON-empty initial and no `[]` anywhere, so it is
-/// not B129's. Inlining the chain (`Signal::new(..).map(..)` in one
-/// expression) works; only the intermediate unannotated `let` trips it. This
-/// is B125/P21's solver-ordering family (the binding is read one level out,
-/// after the closure is already inferred — analyzer.rs's own P21 comment in
-/// the closure arm); it stays ignored until that design lands. Annotating the
-/// `let` sidesteps it, which is what the examples and docs do.
+/// The OTHER gap the original A25 pin's body carried, isolated — and, closed,
+/// re-diagnosed (B125's lane, type-solver.md "What B129's second gap actually
+/// was"): it was never P21's family and never about the `let`. The closure
+/// parameter `list` is filled fine once `.map` resolves; what went wrong is
+/// that `for todo in list` resolved FIRST — `ForEachItem` sits at priority 8,
+/// the `.map` call deferred to the next pass because its receiver had not
+/// grounded yet, and the for-each resolver committed the item to `any` on
+/// sight of an `Unknown` iterable instead of deferring on an unknown closure
+/// parameter the way the field-accessor, method-call, call-subject and match
+/// resolvers already do. Annotating `items` only worked because it let the
+/// call resolve at priority 6 of the first pass, ahead of the loop; the
+/// inline chain failed the same way (its receiver is a call). The resolver
+/// now defers; `resolve_subscript` got the same rule.
 #[test]
-#[ignore = "analyzer: a `.map` on a let-bound signal freezes its closure parameter before the receiver's binding lands — B125/P21 solver-ordering family, editing-dx.md §16; found isolating B129"]
 fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
     assert_compiles_and_runs(
         r#"
@@ -60430,5 +60432,125 @@ fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
         }
         "#,
         "1\n",
+    );
+}
+
+/// The same defect on `List` with no signal and no `let` in the way beyond the
+/// receiver's own: indexing the parameter (`resolve_subscript` reported
+/// "cannot index unknown" on the first pass, before the call filled it).
+#[test]
+fn b129_indexing_an_unannotated_closure_parameter_waits_for_its_owning_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let items = [[Todo { id = 1, done = false }]];
+        	let ids: List<i32> = items.map(|list| list[0].id);
+        	print(ids[0]);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// Iterating it — the for-each shape of the todo example, on a plain nested
+/// list whose receiver grounds only at priority 10 of the first pass.
+#[test]
+fn b129_iterating_an_unannotated_closure_parameter_waits_for_its_owning_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let items = [[Todo { id = 1, done = false }, Todo { id = 2, done = true }]];
+        	let remaining: List<i32> = items.map(|list| {
+        		mut open = 0;
+        		for todo in list {
+        			if !todo.done {
+        				open += 1;
+        			}
+        		}
+        		open
+        	});
+        	print(remaining[0]);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The inline chain the old pin's comment said worked — it did not (the
+/// receiver is a call, resolved at priority 11, so the loop ran first just
+/// the same), and it is pinned here so the claim is checked rather than
+/// remembered.
+#[test]
+fn b129_the_inline_chain_types_its_closure_parameter_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let scope = Owner::new();
+        	let n = owner_scope.run(scope, || {
+        		let remaining = Signal::new([Todo { id = 1, done = false }]).map(|list| {
+        			mut open = 0;
+        			for todo in list {
+        				if !todo.done {
+        					open += 1;
+        				}
+        			}
+        			open
+        		});
+        		remaining.get()
+        	});
+        	print(n);
+        	scope.dispose();
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The bound on the defer: a parameter NO call ever fills stays open to the
+/// end of the fixpoint and reports through the leftover sweep — it is not
+/// silently accepted. Indexing it used to report "cannot index unknown" on
+/// the first pass; iterating it used to type the item `any` and compile
+/// clean (the `any` leaking out of an untyped parameter). Both now report
+/// the way a never-pushed `List::new()` always has.
+#[test]
+fn b129_a_never_called_closures_parameter_still_reports() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let first = |xs| xs[0];
+        	print(1);
+        }
+        "#,
+        "could not be resolved",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let walk = |xs| {
+        		for x in xs {
+        			print(x);
+        		}
+        	};
+        	print(1);
+        }
+        "#,
+        "could not be resolved",
     );
 }
