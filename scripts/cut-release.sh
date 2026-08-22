@@ -415,7 +415,7 @@ say ""
 
 RELEASE_FILES="CHANGELOG.md Cargo.lock crates/vilan-cli/Cargo.toml
 crates/vilan-core/Cargo.toml crates/vilan-embedded-std/Cargo.toml
-crates/vilan-lsp/Cargo.toml crates/vilan-wasm/Cargo.toml
+crates/vilan-lsp/Cargo.toml crates/vilan-wasm/Cargo.toml crates/vilan-ide/Cargo.toml
 editors/vscode/package.json editors/vscode/package-lock.json"
 
 if [ "$DO_COMMIT" = 1 ]; then

@@ -32223,6 +32223,18 @@ pub fn set_document_overlay(path: &Path, text: Option<String>) {
     }
 }
 
+/// Every path the overlay holds — the listing side of the overlay, for
+/// `modules_in_root`. Keys only; no buffer is cloned.
+pub(crate) fn document_overlay_paths() -> Vec<PathBuf> {
+    let Some(overlay) = DOCUMENT_OVERLAY.get() else {
+        return Vec::new();
+    };
+    let overlay = overlay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    overlay.keys().cloned().collect()
+}
+
 pub(crate) fn document_overlay_get(path: &Path) -> Option<String> {
     let overlay = DOCUMENT_OVERLAY.get()?;
     let overlay = overlay
@@ -33707,25 +33719,63 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
 /// listed under the name `lib`, because that is what the directory holds. A
 /// caller offering module names to a user filters it out (it is the package's
 /// surface, integrated into the package name itself).
+///
+/// The document overlay is listed too (K9): a module that exists only as a
+/// buffer — an unsaved new sibling in the editor, or every toolchain file in
+/// the playground, which has no filesystem at all — lists under the root the
+/// same way the loader resolves it (`resolve_module_file` asks
+/// `document_overlay_contains` beside the disk). A name present in both is
+/// listed once, with its on-disk path.
 pub fn modules_in_root(root: &Path) -> Vec<(String, PathBuf)> {
-    let mut modules = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return modules;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension() == Some(std::ffi::OsStr::new("vl")) {
-            if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
-                modules.push((name.to_string(), path.clone()));
-            }
-        } else if path.is_dir() {
-            let lib = path.join("lib.vl");
-            if lib.is_file() {
-                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                    modules.push((name.to_string(), lib));
+    let mut modules: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension() == Some(std::ffi::OsStr::new("vl")) {
+                if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    modules.push((name.to_string(), path.clone()));
+                }
+            } else if path.is_dir() {
+                let lib = path.join("lib.vl");
+                if lib.is_file() {
+                    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                        modules.push((name.to_string(), lib));
+                    }
                 }
             }
         }
+    }
+    // Overlay keys are canonical, so the root is canonicalized to match
+    // (`util::canonical_path` normalizes a path that is not on disk lexically,
+    // which is what keeps the playground's synthetic roots comparable).
+    let root = crate::util::canonical_path(root);
+    for path in document_overlay_paths() {
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let mut components = relative.components();
+        let name = match (components.next(), components.next(), components.next()) {
+            // A flat `name.vl` directly under the root.
+            (Some(first), None, _) => {
+                let first = Path::new(first.as_os_str());
+                if first.extension() != Some(std::ffi::OsStr::new("vl")) {
+                    continue;
+                }
+                first.file_stem().and_then(|stem| stem.to_str())
+            }
+            // A directory module, `name/lib.vl`.
+            (Some(first), Some(second), None) if second.as_os_str() == "lib.vl" => {
+                first.as_os_str().to_str()
+            }
+            _ => continue,
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        if modules.iter().any(|(known, _)| known == name) {
+            continue;
+        }
+        modules.push((name.to_string(), path));
     }
     modules.sort();
     modules

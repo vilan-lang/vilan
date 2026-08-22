@@ -1848,6 +1848,46 @@ fn std_module_names(platform: Platform) -> Vec<String> {
     names
 }
 
+/// A module that exists only in the document overlay lists under its root
+/// (K9, `playground-completion.md` §6): the playground has no filesystem, so
+/// `import std::|` can only enumerate std this way, and in the editor an
+/// unsaved new sibling completes as `import pkg::<name>` before it is saved.
+/// Both module forms list, `lib.vl` lists as `lib` like the disk listing
+/// does, a nested file is not a module, and a name also on disk is not
+/// listed twice.
+#[test]
+fn an_overlay_module_lists_under_its_root() {
+    let root = PathBuf::from(format!("/vilan_overlay_listing_{}", std::process::id()));
+    let flat = root.join("flat.vl");
+    let nested = root.join("nested").join("lib.vl");
+    let surface = root.join("lib.vl");
+    let deep = root.join("nested").join("deeper").join("deep.vl");
+    let elsewhere =
+        PathBuf::from(format!("/vilan_overlay_elsewhere_{}", std::process::id())).join("other.vl");
+    for path in [&flat, &nested, &surface, &deep, &elsewhere] {
+        vilan_core::analyzer::set_document_overlay(path, Some("fun f() {}\n".to_string()));
+    }
+    let listed = vilan_core::analyzer::modules_in_root(&root);
+    for path in [&flat, &nested, &surface, &deep, &elsewhere] {
+        vilan_core::analyzer::set_document_overlay(path, None);
+    }
+    let names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["flat", "lib", "nested"],
+        "the overlay's modules under the root, sorted: {listed:?}"
+    );
+    let nested_path = &listed
+        .iter()
+        .find(|(name, _)| name == "nested")
+        .expect("nested is listed")
+        .1;
+    assert!(
+        nested_path.ends_with("nested/lib.vl"),
+        "a directory module lists its lib.vl: {nested_path:?}"
+    );
+}
+
 #[test]
 fn the_std_listing_comes_from_the_std_tree() {
     let names = std_module_names(Platform::default());

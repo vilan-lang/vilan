@@ -311,11 +311,15 @@ required present so the gate cannot go vacuous.
   unconditionally (`playground.vl:204-214` →
   `editor_set_doc(example_source(name))`) — a dirty buffer dies with no
   confirmation.
-- **K9** — autocomplete is imported, never wired: the editor bundles
-  `@codemirror/autocomplete` but registers no completion source
-  (`editor.mjs:331-362` — `closeBrackets` only). Either wire a real
-  source from the wasm analyzer or drop the import; shipping the
-  dependency and not the feature is the worst of both.
+- **K9** — ~~autocomplete is imported, never wired~~ **WIRED 2026-08-22**
+  (`proposal/playground-completion.md`): the editor registers a
+  completion source backed by the wasm's `complete` export — the
+  language server's own engine, lifted into the shared `vilan-ide`
+  crate, answered from the analysis the page's last check retained
+  (~4 ms per keystroke on the walkthrough app, worker round trip
+  included). The popup wears the lint tooltip's slots; no new tokens.
+  A pinned older compiler that predates the export reports
+  `canComplete: false` and the source answers nothing.
 - Noted, not a defect: diagnostics fan out to two consumers (the lint
   gutter via `applyEditorDiagnostics`, `editor.mjs:409-428`, and the
   DOM list via `playground.vl:266-344`) from one worker payload —
@@ -328,9 +332,10 @@ Recommendation, firm: **stay on CM6.** The study found the restyle is
 a tight extension list); Monaco cannot wear a bespoke skin — it always
 reads as VS Code, the opposite of this paper's goal — costs roughly an
 order of magnitude more bundle, and is weak on mobile. Monaco's real
-advantage is a richer completion story, which buys nothing today
-because no completion source is wired at all (K9); if K9 later wants
-LSP-grade completion, CM6's autocomplete API is already in the bundle.
+advantage is a richer completion story, which bought nothing while no
+completion source was wired (K9); K9 has since wired LSP-grade
+completion through CM6's own autocomplete API (2026-08-22), which is
+the bet this ruling made.
 
 ### 2.9 K16 — the playground as a full-window app (2026-08-20, owner-approved)
 

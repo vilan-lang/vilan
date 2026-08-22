@@ -23,29 +23,14 @@ use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result};
 use vilan_core::Span;
 use vilan_core::analyzer::SourceId;
 
-use crate::document::{
-    Completion, CompletionKind as VilanCompletionKind, Document, Symbol,
-    SymbolKind as VilanSymbolKind, hash_text,
-};
+use crate::document::{Document, Symbol, SymbolKind as VilanSymbolKind, hash_text};
 use crate::line_index::LineIndex;
 use crate::publish::PublishState;
+use vilan_ide::{Completion, CompletionFunctionCall, CompletionKind as VilanCompletionKind};
 
 /// How long to wait after the last edit before re-analyzing, so a burst of
 /// keystrokes collapses to a single analysis instead of one per character.
 const DEBOUNCE_MS: u64 = 150;
-
-/// How completion inserts a function or method call — the `vilan.completion.functionCall`
-/// setting, consumed by [`to_completion_item`]: `Full` fills named parameter
-/// tab-stops, `ParensOnly` inserts the parentheses, `None` inserts the bare name.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CompletionFunctionCall {
-    /// Insert the name only.
-    None,
-    /// Insert `name()` (empty parentheses).
-    ParensOnly,
-    /// Insert `name(…)` with a placeholder argument list.
-    Full,
-}
 
 /// The client's feature settings (VS Code `contributes.configuration`), received
 /// as `initializationOptions` at startup and refreshed live by
@@ -229,41 +214,22 @@ fn to_completion_item(
 }
 
 /// The insert text (and its format) for a call-shaped completion, or `None` when
-/// the setting is `none` — leaving the bare label. `full` fills each parameter
-/// as a named tab-stop (`name(${1:a}, ${2:b})$0`); `parensOnly` positions the
-/// cursor between the parens (`name($0)`); both write `name()$0` for a
-/// zero-parameter callable. Without client snippet support every shape degrades
-/// to the plain `name()` (cursor after) — a snippet's tab-stops would otherwise
-/// surface as literal text.
+/// the setting is `none` — leaving the bare label. The rule itself is
+/// `vilan_ide::call_insertion`, shared with the playground (K9); this maps its
+/// snippet flag to the wire's `InsertTextFormat`.
 fn call_insertion(
     label: &str,
     parameters: &[String],
     mode: CompletionFunctionCall,
     snippet_support: bool,
 ) -> Option<(String, InsertTextFormat)> {
-    if matches!(mode, CompletionFunctionCall::None) {
-        return None;
-    }
-    if !snippet_support {
-        return Some((format!("{label}()"), InsertTextFormat::PLAIN_TEXT));
-    }
-    let snippet = if parameters.is_empty() {
-        format!("{label}()$0")
+    let insertion = vilan_ide::call_insertion(label, parameters, mode, snippet_support)?;
+    let format = if insertion.is_snippet {
+        InsertTextFormat::SNIPPET
     } else {
-        match mode {
-            CompletionFunctionCall::Full => {
-                let placeholders: Vec<String> = parameters
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| format!("${{{}:{name}}}", index + 1))
-                    .collect();
-                format!("{label}({})$0", placeholders.join(", "))
-            }
-            // `parensOnly` (with parameters): cursor inside the parens.
-            _ => format!("{label}($0)"),
-        }
+        InsertTextFormat::PLAIN_TEXT
     };
-    Some((snippet, InsertTextFormat::SNIPPET))
+    Some((insertion.text, format))
 }
 
 /// Delta-encode classified spans (E2) into the LSP semantic-token wire form:
@@ -708,9 +674,9 @@ mod manifest_routing_tests {
 #[cfg(test)]
 mod completion_item_tests {
     use super::{CompletionFunctionCall, to_completion_item};
-    use crate::document::{AutoImport, Completion, CompletionKind, SnippetInsertion};
     use crate::line_index::LineIndex;
     use tower_lsp::lsp_types::{CompletionItemKind, Documentation, InsertTextFormat};
+    use vilan_ide::{AutoImport, Completion, CompletionKind, SnippetInsertion};
 
     /// An empty-buffer index — every fixture below whose `needs_import` is
     /// `None` never consults it, so its content doesn't matter.
