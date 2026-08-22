@@ -23,7 +23,18 @@ import pkg::io::panic;
 import pkg::json::JsonValue;
 import pkg::option::Option::{ None, Some, self };
 import pkg::promise::Promise;
-import pkg::reactive::{ Disposable, FlushPolicy, Signal, Source, Subscription, batch, turn };
+import pkg::reactive::{
+	Disposable,
+	FlushPolicy,
+	Signal,
+	Source,
+	Subscription,
+	at_settle,
+	batch,
+	fresh_id,
+	get_owner,
+	turn,
+};
 import pkg::result::Result::{ Err, Ok, self };
 import pkg::shared::Shared;
 import pkg::task::Task;
@@ -67,7 +78,8 @@ impl LocalTransport with Transport {
 /// client↔server transport. The address is programmatic (Q5): construct it with
 /// the endpoint URL (`HttpTransport { url = "http://localhost:4000/rpc" }`);
 /// where the string comes from — hardcoded, env, config — is the app's choice.
-/// The server side is `std::rpc_server`'s `serve_rpc` / `rpc_response` mount.
+/// The server side is a mounted `Service`'s `{mount}rpc` route
+/// (`std::rpc_server`, installed with `ServerBuilder::with_service`).
 struct HttpTransport {
 	url: str,
 }
@@ -149,7 +161,7 @@ fun bridge<Tx: DuplexTransport>(wire: Tx): DuplexEnd {
 /// The real duplex transport over plain HTTP (§5's fallback, no WebSocket needed):
 /// server→client frames arrive on a long-lived SSE stream (`GET {base}/events`),
 /// and client→server frames POST to `{base}/send?c=<connection>`. The server side
-/// is `std::rpc_server`'s `serve_connected`; open one with `connect_split(base_url)`.
+/// is a mounted `Service` (`std::rpc_server`); open one with `connect_split(base_url)`.
 /// A true WebSocket transport becomes a drop-in sibling once it lands.
 struct SplitDuplex {
 	// The connection id the server announced — apps use it to correlate this
@@ -379,7 +391,7 @@ struct PendingCall {
 /// The socket's binary channel tags (§5's multiplex, byte form): a binary WS
 /// message is `0x64` ('d') + a duplex frame, or `0x72` ('r') + a 4-byte LE
 /// request id + an RPC frame — the byte mirror of the `d:`/`r:<id>:` text
-/// prefixes, shared verbatim with `serve_connected`'s upgrade path.
+/// prefixes, shared verbatim with the service upgrade path (`std::rpc_server`).
 fun tag_duplex_bytes(payload: Bytes): Bytes {
 	let tag = Bytes::alloc(1);
 	tag.set(0, 0x64);
@@ -398,8 +410,9 @@ fun tag_rpc_bytes(request: i32, payload: Bytes): Bytes {
 
 /// The true duplex transport (§5): one WebSocket carrying BOTH protocols and
 /// BOTH frame kinds — text messages use the `d:<frame>`/`r:<id>:<frame>`
-/// prefixes, binary messages the tag bytes above. The server side is
-/// `serve_connected`'s upgrade path; open one with `connect_socket(url)` — the
+/// prefixes, binary messages the tag bytes above. The server side is the
+/// service upgrade handshake (`ServerBuilder::with_service`); open one with
+/// `connect_socket(url)` — the
 /// drop-in swap for `connect_split`, same `__conn:<id>` handshake, same
 /// `.connection` for RPC correlation.
 ///
@@ -1000,9 +1013,10 @@ fun encode_update(codec: Codec, channel: i32, describe: |Serializer| void): Fram
 // --- The session registry (Client::connect's server half, §4.2) -------------
 
 /// Per-connection reactive sessions, keyed by connection id — what the
-/// generated `__attach` route answers from. `serve_service` populates it on
-/// connect and disposes on disconnect; apps wanting custom per-connection
-/// state keep the manual pattern (`serve_connected` + their own registry).
+/// generated `__attach` route answers from. `Service::new`'s default
+/// lifecycle populates it on connect and disposes on disconnect; apps wanting
+/// custom per-connection state keep the manual pattern
+/// (`Service::on_connect`/`on_disconnect` + their own registry).
 let reactive_sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 /// Adopt a fresh connection: one reactive session on its wire, speaking the
@@ -1099,8 +1113,17 @@ impl ReactiveServer {
 
 	/// A client subscribed: start the channel's forward. `sub` fires immediately
 	/// with the current value, so a subscriber gets the present state before any
-	/// change.
+	/// change. IDEMPOTENT: a `Subscribe` for a channel whose forward is already
+	/// live is a no-op — one channel, one forward, however many times a client
+	/// asks (`proposal/remote-sources.md` §3; a counted client never asks
+	/// twice, and the server does not rely on that for its own correctness).
 	fun start(self, channel: i32) {
+		for entry in self.live.read() {
+			let (id, _forward) = entry;
+			if id == channel {
+				ret;
+			}
+		}
 		for entry in self.sources.read() {
 			let (id, starter) = entry;
 			if id == channel {
@@ -1210,7 +1233,10 @@ impl ReactiveClient {
 		RemoteSource {
 			channel = channel_cell,
 			subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)),
-			wanted = Shared::new(false),
+			count = Shared::new(0),
+			closing = Shared::new(false),
+			settle_id = fresh_id(),
+			codec = self.codec,
 			transport = self.transport,
 			cache,
 		}
@@ -1239,6 +1265,18 @@ impl ReactiveClient {
 	}
 }
 
+/// What is locally KNOWN about a mirror (`RemoteSource::status`): whether a
+/// value has arrived. Derived from the cache alone — so an UNWATCHED mirror
+/// reads `Waiting` forever, correctly: nothing opened its channel.
+[derive(PartialEq, Debug)]
+enum Status {
+	/// Nothing has arrived yet. This is what an unwatched mirror reads, for
+	/// as long as it stays unwatched — `status` reports, it does not ask.
+	Waiting,
+	/// The cache holds a value.
+	Ready,
+}
+
 /// A remote read-only handle, typed end to end: the local mirror holds
 /// `Option<T>` — `None` until the first update arrives, the typed replacement
 /// for the old `""` sentinel — `sub` opens the channel (a pre-encoded
@@ -1248,6 +1286,11 @@ impl ReactiveClient {
 /// immediate current-value `Update` lands synchronously, so the observer fires
 /// at once with the present state; over a real wire it fires when that update
 /// arrives.
+///
+/// Subscription follows demand exactly (`proposal/remote-sources.md`): every
+/// observing path takes a COUNTED lease, the 0→1 transition sends `Subscribe`,
+/// the 1→0 transition sends `Unsubscribe` — so the channel is open while, and
+/// only while, something is watching. `get` is passive: no lease, no frame.
 struct RemoteSource<T> {
 	// Cells, not plain fields: a reconnect rebind points the mirror at the
 	// fresh connection's channel (the id cell is SHARED with the
@@ -1255,24 +1298,87 @@ struct RemoteSource<T> {
 	channel: Shared<i32>,
 	// The channel's `Subscribe` frame — re-encoded on rebind.
 	subscribe: Shared<Frame>,
-	// Whether anyone ever subscribed — a rebind re-subscribes only mirrors
-	// that are actually watched.
-	wanted: Shared<bool>,
+	// Live demand: how many leases are outstanding. A cell, so every copy of
+	// the handle counts into the same total; a rebind re-subscribes only a
+	// mirror that is actually watched (`count > 0`).
+	count: Shared<i32>,
+	// A 1→0 that has not yet been flushed as an `Unsubscribe`. Cancelled by
+	// a 0→1 in the same turn: the channel never actually closed.
+	closing: Shared<bool>,
+	// The id under which the deferred close rides the turn queue
+	// (`at_settle` dedups by it), fixed for the mirror's lifetime.
+	settle_id: i32,
+	// The wiring-time codec — the `Unsubscribe` is encoded at flush time
+	// against the channel the mirror holds THEN (a rebind may have moved it).
+	codec: Codec,
 	transport: DuplexEnd,
 	cache: Signal<Option<T>>,
 }
 
 impl RemoteSource<type T> {
 	/// The mirror's current value: `None` until the first update lands.
+	/// Passive — no lease, no frame; an unwatched mirror reads `None`
+	/// forever, which is correct: nothing asked.
 	fun get(self): Option<T> {
 		self.cache.get()
 	}
 
+	/// Observe the mirror through `transform`, as a plain `Signal<U>` — the
+	/// one seam into the ordinary reactive world (`bind_each`, `bind_text`,
+	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
+	/// it opens the channel if nothing else has, and the lease is released
+	/// when the enclosing owner is disposed, which for a view is unmount. So
+	/// it requires an ambient owner, statically: calling it where no
+	/// `owner_scope.run` encloses is a compile error, which makes "a network
+	/// subscription must have an owner" a compile-time law. `transform` sees
+	/// `None` until the first frame lands — the one place the `Option` is
+	/// confronted, and where a fallback of a DIFFERENT type than `T` belongs
+	/// (`"Loading…"` from a `RemoteSource<i32>`).
+	fun map<U>(self, transform: sync |Option<T>| U): Signal<U> {
+		let derived = Signal::new(transform(self.get()));
+		get_owner().take(self.lease(|value| {
+			derived.set(transform(value));
+		}));
+		derived
+	}
+
+	/// `map` for the same-type case: `initial` until the first frame, the
+	/// mirrored value after. Counted and owner-released exactly like `map`,
+	/// because it IS `map` — `client.notes.or([])` inside a view replaces the
+	/// hand-built `Signal::new([])` + never-disposed `sub` pair, and the
+	/// subscription now dies with the view instead of with the tab.
+	fun or(self, initial: T): Signal<T> {
+		self.map(|value| match value {
+			Some(let present) => present,
+			None => initial,
+		})
+	}
+
+	/// What is locally KNOWN about this mirror, as a `Signal<Status>`.
+	/// Passive: opens no channel, takes no lease, needs no owner — derived
+	/// from the cache alone, so it is callable at the top of `main` where
+	/// `map` is not. The honest sentence: a `status` observer ALONE never
+	/// sees `Waiting → Ready`. `status` reports; it does not ask. If nothing
+	/// else is subscribed, the mirror stays `Waiting` forever, and that is
+	/// correct — the channel was never opened. Any path that renders the value
+	/// when it arrives (`sub`, `map`, `or`) subscribes; the count is what
+	/// makes that harmless.
+	fun status(self): Signal<Status> {
+		self.cache.map(|value| match value {
+			Some(let _present) => Status::Ready,
+			None => Status::Waiting,
+		})
+	}
+
+	/// Observe each value as it lands, present values only (the `None` before
+	/// the first frame is skipped). COUNTED: this lease opens the channel if
+	/// nothing else holds one, and disposing the returned `Subscription`
+	/// releases it — the last release closes the channel (an `Unsubscribe`,
+	/// deferred to the ambient turn's settle so a same-turn re-subscribe
+	/// cancels it; with no ambient turn, sent at once).
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription {
-		self.wanted.write() = true;
-		(self.transport).send(self.subscribe.read());
-		self.cache.sub(|value| {
+		self.lease(|value| {
 			match value {
 				Some(let present) => observer(present),
 				None => {},
@@ -1280,13 +1386,70 @@ impl RemoteSource<type T> {
 		})
 	}
 
+	/// The one counted primitive under every observing path: subscribe
+	/// `observer` to the cache (it fires at once with the current value, `None`
+	/// included) and hold a lease on the channel until the subscription is
+	/// disposed. One count, one place the frames are decided.
+	fun lease(self, observer: |Option<T>| void): Subscription {
+		self.acquire();
+		let subscription = self.cache.sub(observer);
+		subscription.release.write() = Some(|| self.release());
+		subscription
+	}
+
+	/// Take a lease. 0→1 with no close pending sends `Subscribe` — eagerly,
+	/// not at settle: the server's immediate current-value `Update` is how the
+	/// mirror seeds, and deferring it would cost every first paint a turn. 0→1
+	/// with a close pending sends nothing and cancels the close: the channel is
+	/// still open server-side, so a dispose-and-rebuild inside one turn (a
+	/// `bind_each` row refreshing) churns no frames at all.
+	fun acquire(self) {
+		let before = self.count.read();
+		self.count.write() = before + 1;
+		if before == 0 {
+			if self.closing.read() {
+				self.closing.write() = false;
+			} else {
+				(self.transport).send(self.subscribe.read());
+			}
+		}
+	}
+
+	/// Release a lease. 1→0 marks the mirror closing and defers the
+	/// `Unsubscribe` to the ambient turn's settle (`at_settle`); a 0→1 before
+	/// then cancels it. The `Unsubscribe` is pure economy, so it can afford to
+	/// wait — and waiting is what makes the common re-render free.
+	fun release(self) {
+		let after = self.count.read() - 1;
+		self.count.write() = after;
+		if after == 0 {
+			self.closing.write() = true;
+			at_settle(self.settle_id, || self.flush_close());
+		}
+	}
+
+	/// The deferred half of `release`: if the close is still owed, send the
+	/// `Unsubscribe` for the channel the mirror holds NOW and clear it.
+	fun flush_close(self) {
+		if self.closing.read() {
+			self.closing.write() = false;
+			(self.transport).send(encode_control(self.codec, "Unsubscribe", self.channel.read()));
+		}
+	}
+
 	/// Point the mirror at a fresh channel after a reconnect
 	/// (proposal/transport-robustness.md §2.5) and, when watched, re-subscribe
-	/// — the server's immediate current-value `Update` resyncs the cache.
+	/// — the server's immediate current-value `Update` resyncs the cache. The
+	/// count is client-local demand, so it never moves; a pending close is
+	/// dropped, because it names the OLD channel on a dead connection
+	/// (flushed after the rebind it would be a no-op on a closed socket at
+	/// best, and at worst name an id the fresh session has since minted for
+	/// something else).
 	fun rebind(self, channel: i32, subscribe: Frame) {
 		self.channel.write() = channel;
 		self.subscribe.write() = subscribe;
-		if self.wanted.read() {
+		self.closing.write() = false;
+		if self.count.read() > 0 {
 			(self.transport).send(subscribe);
 		}
 	}

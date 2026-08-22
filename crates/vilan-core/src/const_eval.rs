@@ -54,6 +54,42 @@ enum Mode {
     Inferred,
 }
 
+thread_local! {
+    /// The `VILAN_PHASE_TIMING` sub-split of this pass (backlog M5): how much
+    /// of `evaluate`'s wall went to LOWERING — the shared const world's walks
+    /// plus per-site prelude and site assembly ([`transformer::ConstWorld`]'s
+    /// `prepare`/`site`) — against the interpreter EVALUATING the lowered
+    /// sites. The one-third/two-thirds proportion `const-eval.md` §10.2 had
+    /// to hand-patch marks in to learn, kept as a run instead. Accumulated
+    /// unconditionally on the analyzer's argument (a clock read per site is
+    /// noise next to the site), reset by [`evaluate`], read back by
+    /// `post_analysis_passes` for its phase line. Thread-local because an
+    /// analysis is single-threaded, the same way the transformer's
+    /// `CONST_LOWERING_COUNT` is.
+    static PHASE_LOWER: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    static PHASE_INTERP: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// (lowering, interpreting) — what [`evaluate`] spent since its last call, for
+/// the `VILAN_PHASE_TIMING` line. The two do NOT sum to the pass: the
+/// remainder is classification (free locals, `check_const_only`) and failure
+/// attribution.
+pub(crate) fn phase_split() -> (std::time::Duration, std::time::Duration) {
+    (
+        PHASE_LOWER.with(std::cell::Cell::get),
+        PHASE_INTERP.with(std::cell::Cell::get),
+    )
+}
+
+fn phase_add(
+    bucket: &'static std::thread::LocalKey<std::cell::Cell<std::time::Duration>>,
+    started: crate::PhaseClock,
+) {
+    bucket.with(|cell| cell.set(cell.get() + started.elapsed()));
+}
+
 /// Takes the analysis tail's shared call graph rather than building its own
 /// (E35). This pass writes nothing to the program at all — it takes `&Program`
 /// and RETURNS its results for the caller to store — so the graph it is handed
@@ -69,16 +105,21 @@ pub fn evaluate(
     // walks the whole program, so a `const` in a module reports in that module.
     Vec<(Error, SourceId)>,
 ) {
+    // Reset the phase buckets FIRST, before any early return, so the timing
+    // line never reports a previous analysis's accumulation.
+    PHASE_LOWER.with(|cell| cell.set(std::time::Duration::ZERO));
+    PHASE_INTERP.with(|cell| cell.set(std::time::Duration::ZERO));
     // A program that already failed analysis skips evaluation entirely: the
-    // transformer's entity lookups (used to build const mini-programs) assume
+    // transformer's entity lookups (used to lower the const world) assume
     // a clean program, exactly as `transform` itself does.
     if !program.diagnostics.is_empty() {
         return (HashMap::default(), Vec::new(), Vec::new());
     }
-    let mut state = State::new(program, options, Mode::Explicit, HashSet::default());
+    let mut world = transformer::ConstWorld::new(program, options);
+    let mut state = State::new(program, Mode::Explicit, HashSet::default());
     state.check_const_only(graph);
     for &expr_id in &program.const_exprs {
-        state.evaluate_one(expr_id);
+        state.evaluate_one(&mut world, expr_id);
     }
     (state.results, state.assets, state.errors)
 }
@@ -109,16 +150,16 @@ pub fn infer(program: &Program, options: &BuildOptions) -> HashMap<Id, ConstValu
     if candidates.is_empty() {
         return HashMap::default();
     }
+    let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(
         program,
-        options,
         Mode::Inferred,
         candidates.iter().copied().collect(),
     );
     // An inferred fold may read what the explicit pass already computed.
     state.results = program.const_results.clone();
     for &expr_id in &candidates {
-        state.evaluate_one(expr_id);
+        state.evaluate_one(&mut world, expr_id);
     }
     debug_assert!(
         state.errors.is_empty(),
@@ -265,7 +306,7 @@ fn render_call_chain(trace: &[String]) -> String {
 /// independent of the type parameters" — made operational. The explicit form
 /// pushes that judgement onto the author, who wrote the keyword. Inference has
 /// to make it itself, and the failure mode if it does not is the worst kind:
-/// `transform_const_program` walks the initializer with NO substitution
+/// the const world walks the initializer with NO substitution
 /// context, so `let total = T::default();` inside `List<T>::sum` does not fail
 /// — it quietly evaluates to `undefined`, and the folded program prints
 /// `undefined` where it used to print `0`. Found by the corpus differential on
@@ -280,35 +321,63 @@ fn render_call_chain(trace: &[String]) -> String {
 ///
 /// Stored per source as a merged, sorted, DISJOINT interval list, so nesting
 /// (a closure inside a generic function) needs no special case and a
-/// containment test is one binary search.
+/// containment test is one binary search. See [`SpanRegions`].
 struct GenericRegions {
-    by_source: HashMap<u32, Vec<(usize, usize)>>,
+    regions: SpanRegions,
 }
 
 impl GenericRegions {
     fn build(program: &Program) -> Self {
-        let mut by_source: HashMap<u32, Vec<(usize, usize)>> = HashMap::default();
         let mut mentions = TypeParameterScan::new(program);
-        for (function_id, function) in &program.functions {
-            let dependent = !function.generic_parameter_constraint_ids.is_empty()
-                || function
-                    .return_type_id
-                    .is_some_and(|type_id| mentions.reaches_a_type_parameter(type_id))
-                || function.parameters.iter().any(|parameter_id| {
-                    program
-                        .parameters
-                        .get(parameter_id)
-                        .is_some_and(|parameter| {
-                            mentions.reaches_a_type_parameter(parameter.type_id)
-                        })
-                });
-            if !dependent {
-                continue;
-            }
-            let (Some(source), Some(span)) = (
-                program.source_of(*function_id),
-                program.span_map.get(function_id),
-            ) else {
+        let dependent: Vec<Id> = program
+            .functions
+            .iter()
+            .filter(|(_, function)| {
+                !function.generic_parameter_constraint_ids.is_empty()
+                    || function
+                        .return_type_id
+                        .is_some_and(|type_id| mentions.reaches_a_type_parameter(type_id))
+                    || function.parameters.iter().any(|parameter_id| {
+                        program
+                            .parameters
+                            .get(parameter_id)
+                            .is_some_and(|parameter| {
+                                mentions.reaches_a_type_parameter(parameter.type_id)
+                            })
+                    })
+            })
+            .map(|(function_id, _)| *function_id)
+            .collect();
+        Self {
+            regions: SpanRegions::of(program, &dependent),
+        }
+    }
+
+    fn covers(&self, program: &Program, id: Id) -> bool {
+        self.regions.contains(program, id)
+    }
+}
+
+/// A set of source regions, indexed for containment: per source, the spans
+/// sorted and merged into DISJOINT intervals, so a test is one binary search
+/// instead of a scan of every region.
+///
+/// Merging is sound for the two things indexed here — function bodies and
+/// `const` subtrees — because both are syntax subtrees, so two of them in one
+/// file are nested or disjoint, never partially overlapping. A nested one is
+/// absorbed by its enclosing one, which is the answer containment wants anyway.
+struct SpanRegions {
+    by_source: HashMap<u32, Vec<(usize, usize)>>,
+}
+
+impl SpanRegions {
+    /// The index over `roots`' own spans. An entity with no source or no span
+    /// contributes nothing, and is contained by nothing.
+    fn of(program: &Program, roots: &[Id]) -> Self {
+        let mut by_source: HashMap<u32, Vec<(usize, usize)>> = HashMap::default();
+        for root in roots {
+            let (Some(source), Some(span)) = (program.source_of(*root), program.span_map.get(root))
+            else {
                 continue;
             };
             by_source
@@ -318,9 +387,6 @@ impl GenericRegions {
         }
         for regions in by_source.values_mut() {
             regions.sort_unstable();
-            // Merge into disjoint intervals: a nested function's span is
-            // absorbed by its enclosing one, so `covers` never has to look at
-            // more than the single interval a binary search lands in.
             let mut merged: Vec<(usize, usize)> = Vec::with_capacity(regions.len());
             for &(start, end) in regions.iter() {
                 match merged.last_mut() {
@@ -333,7 +399,8 @@ impl GenericRegions {
         Self { by_source }
     }
 
-    fn covers(&self, program: &Program, id: Id) -> bool {
+    /// Whether `id`'s span lies inside one of the regions, in the same file.
+    fn contains(&self, program: &Program, id: Id) -> bool {
         let (Some(source), Some(span)) = (program.source_of(id), program.span_map.get(&id)) else {
             return false;
         };
@@ -498,7 +565,6 @@ impl LocalIndex {
 
 struct State<'p, 'src> {
     program: &'p Program<'src>,
-    options: &'p BuildOptions,
     /// Which form this is evaluating — see [`Mode`].
     mode: Mode,
     const_set: HashSet<Id>,
@@ -508,6 +574,9 @@ struct State<'p, 'src> {
     /// fold both (const-eval.md §9.5).
     inferable: HashSet<Id>,
     locals: LocalIndex,
+    /// The `const` subtrees, as a per-source interval index — see
+    /// [`SpanRegions`] and [`State::in_const_subtree`].
+    const_regions: SpanRegions,
     results: HashMap<Id, ConstValue>,
     assets: Vec<(String, String)>,
     failed: HashSet<Id>,
@@ -527,19 +596,14 @@ enum Known<'src> {
 }
 
 impl<'p, 'src> State<'p, 'src> {
-    fn new(
-        program: &'p Program<'src>,
-        options: &'p BuildOptions,
-        mode: Mode,
-        inferable: HashSet<Id>,
-    ) -> Self {
+    fn new(program: &'p Program<'src>, mode: Mode, inferable: HashSet<Id>) -> Self {
         Self {
             program,
-            options,
             mode,
             const_set: program.const_exprs.iter().copied().collect(),
             inferable,
             locals: LocalIndex::build(program),
+            const_regions: SpanRegions::of(program, &program.const_exprs),
             results: HashMap::default(),
             assets: Vec::new(),
             failed: HashSet::default(),
@@ -563,7 +627,7 @@ impl<'p, 'src> State<'p, 'src> {
         self.errors.push((error, self.source_of(anchor)));
     }
 
-    fn evaluate_one(&mut self, expr_id: Id) -> bool {
+    fn evaluate_one<'w>(&mut self, world: &mut transformer::ConstWorld<'w>, expr_id: Id) -> bool {
         if self.results.contains_key(&expr_id) {
             return true;
         }
@@ -572,6 +636,7 @@ impl<'p, 'src> State<'p, 'src> {
         }
         if !self.in_progress.insert(expr_id) {
             let error = Error {
+                trace: Vec::new(),
                 note: None,
                 span: self.span_of(expr_id),
                 msg: "`const` expressions form a dependency cycle".to_string(),
@@ -580,7 +645,7 @@ impl<'p, 'src> State<'p, 'src> {
             self.failed.insert(expr_id);
             return false;
         }
-        let ok = self.evaluate_inner(expr_id);
+        let ok = self.evaluate_inner(world, expr_id);
         self.in_progress.remove(&expr_id);
         if !ok {
             self.failed.insert(expr_id);
@@ -588,7 +653,7 @@ impl<'p, 'src> State<'p, 'src> {
         ok
     }
 
-    fn evaluate_inner(&mut self, expr_id: Id) -> bool {
+    fn evaluate_inner<'w>(&mut self, world: &mut transformer::ConstWorld<'w>, expr_id: Id) -> bool {
         // The free-variable rule, with precise spans at each reference.
         let mut ok = true;
         let free = self.free_locals(expr_id);
@@ -597,12 +662,13 @@ impl<'p, 'src> State<'p, 'src> {
             match self.classify(binding) {
                 Known::Ok => {}
                 Known::Const(dependency) => {
-                    if !self.evaluate_one(dependency) {
+                    if !self.evaluate_one(world, dependency) {
                         ok = false;
                     }
                 }
                 Known::Runtime(name) => {
                     let error = Error {
+                        trace: Vec::new(),
                         note: None,
                         span: self.span_of(reference_id),
                         msg: format!(
@@ -619,24 +685,21 @@ impl<'p, 'src> State<'p, 'src> {
             return false;
         }
 
-        // Assemble the mini-program. Bindings reached through CALLED functions
-        // surface as `unresolved` — const-initialized ones get evaluated and
-        // the assembly retried; anything else is a diagnostic.
+        // Assemble this site against the shared world (const-eval.md §10.6).
+        // Bindings reached through CALLED functions surface as `unresolved` —
+        // const-initialized ones get evaluated and the assembly retried;
+        // anything else is a diagnostic.
         let mut attempts = 0;
         loop {
-            let (mini, unresolved) = transformer::transform_const_program(
-                self.program,
-                self.options,
-                expr_id,
-                &external,
-                &self.results,
-            );
+            let lower_started = crate::PhaseClock::now();
+            let (reach, prelude, unresolved) = world.prepare(expr_id, &external, &self.results);
+            phase_add(&PHASE_LOWER, lower_started);
             let mut retry = false;
             for binding in &unresolved {
                 match self.classify(*binding) {
                     Known::Ok => {}
                     Known::Const(dependency) => {
-                        if self.evaluate_one(dependency) {
+                        if self.evaluate_one(world, dependency) {
                             retry = true;
                         } else {
                             ok = false;
@@ -644,6 +707,7 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                     Known::Runtime(name) => {
                         let error = Error {
+                            trace: Vec::new(),
                             note: None,
                             span: self.span_of(expr_id),
                             msg: format!(
@@ -663,30 +727,44 @@ impl<'p, 'src> State<'p, 'src> {
                 attempts += 1;
                 continue;
             }
+            let lower_started = crate::PhaseClock::now();
+            let site = world.site(expr_id, &reach, prelude);
+            phase_add(&PHASE_LOWER, lower_started);
             return match self.mode {
-                Mode::Explicit => match interpreter::eval_const(&mini, EXPLICIT_LIMITS) {
-                    Ok((value, assets)) => {
-                        self.results.insert(expr_id, value);
-                        self.assets.extend(assets);
-                        true
+                Mode::Explicit => {
+                    let interp_started = crate::PhaseClock::now();
+                    let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS);
+                    phase_add(&PHASE_INTERP, interp_started);
+                    match evaluated {
+                        Ok((value, assets)) => {
+                            self.results.insert(expr_id, value);
+                            self.assets.extend(assets);
+                            true
+                        }
+                        Err(failure) => {
+                            let frames = world.resolve_trace(&failure.trace);
+                            let error = self.failure_error(expr_id, failure, &frames);
+                            self.report(expr_id, error);
+                            false
+                        }
                     }
-                    Err(failure) => {
-                        let error = self.failure_error(expr_id, failure);
-                        self.report(expr_id, error);
-                        false
-                    }
-                },
+                }
                 // The inferred form's tighter budgets, its closed effect
                 // channels (both inside `eval_inferred`), and the size cap —
                 // and any of the three missing is a silent fallback, which is
                 // simply `false` with nothing reported (const-eval.md §9.2/3).
-                Mode::Inferred => match interpreter::eval_inferred(&mini, INFERRED_LIMITS) {
-                    Ok(value) if value.literal_size() <= INFERRED_SIZE_CAP => {
-                        self.results.insert(expr_id, value);
-                        true
+                Mode::Inferred => {
+                    let interp_started = crate::PhaseClock::now();
+                    let evaluated = interpreter::eval_inferred(&site, INFERRED_LIMITS);
+                    phase_add(&PHASE_INTERP, interp_started);
+                    match evaluated {
+                        Ok(value) if value.literal_size() <= INFERRED_SIZE_CAP => {
+                            self.results.insert(expr_id, value);
+                            true
+                        }
+                        _ => false,
                     }
-                    _ => false,
-                },
+                }
             };
         }
     }
@@ -791,6 +869,7 @@ impl<'p, 'src> State<'p, 'src> {
             let name = self.const_only_name(callee, emit_id);
             self.errors.push((
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self.span_of(site),
                     msg: format!(
@@ -888,6 +967,7 @@ impl<'p, 'src> State<'p, 'src> {
             };
             self.errors.push((
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self.span_of(site),
                     msg: format!(
@@ -920,7 +1000,18 @@ impl<'p, 'src> State<'p, 'src> {
     /// anchors at that function's declaration so the editor can reach it.
     /// A std frame is legal in a note and would not be legal as the primary
     /// span (diagnostics-standard A2, C3).
-    fn failure_error(&self, expr_id: Id, failure: interpreter::Failure) -> Error {
+    ///
+    /// `frames` is the trace resolved to the functions that emitted it
+    /// (`ConstWorld::resolve_trace`) — attribution by identity, not by the
+    /// emitted name, which is a generated artifact and never was the source's
+    /// (const-eval.md §10.6). A frame that resolves to nothing is a synthetic
+    /// or monomorphized one, which B1 says must never reach a user.
+    fn failure_error(
+        &self,
+        expr_id: Id,
+        failure: interpreter::Failure,
+        frames: &[Option<Id>],
+    ) -> Error {
         // The kind stops at the const boundary: a budget miss is not a program
         // error, and §4 promised it says so.
         let headline = match failure.kind {
@@ -929,66 +1020,40 @@ impl<'p, 'src> State<'p, 'src> {
             }
             _ => "const evaluation failed",
         };
-        let innermost = failure
-            .trace
-            .first()
-            .filter(|name| self.functions_named(name) > 0);
-        let (subject, note) = match innermost {
+        let source_name = |function_id: Id| self.program.functions[&function_id].name;
+        let (subject, note) = match frames.first().copied().flatten() {
             None => (String::new(), None),
-            Some(name) => {
-                let subject = format!(" in `{name}`");
-                let note = self.unique_function_named(name).map(|function_id| {
-                    let source = self.source_of(function_id);
-                    Note {
-                        // The name, not the whole declaration (A1) — and the
-                        // file only when it differs from the primary span's.
-                        span: self.program.functions[&function_id].name_span,
-                        msg: if failure.trace.len() > 1 {
-                            format!(
-                                "the compile-time call chain: {}",
-                                render_call_chain(&failure.trace)
-                            )
-                        } else {
-                            format!("`{name}` is declared here")
-                        },
-                        source: (source != self.source_of(expr_id)).then_some(source),
-                    }
-                });
-                (subject, note)
+            Some(function_id) => {
+                let name = source_name(function_id);
+                let source = self.source_of(function_id);
+                let note = Note {
+                    // The name, not the whole declaration (A1) — and the
+                    // file only when it differs from the primary span's.
+                    span: self.program.functions[&function_id].name_span,
+                    msg: if failure.trace.len() > 1 {
+                        let chain: Vec<String> = frames
+                            .iter()
+                            .zip(&failure.trace)
+                            .map(|(resolved, emitted)| match resolved {
+                                Some(id) => source_name(*id).to_string(),
+                                None => emitted.clone(),
+                            })
+                            .collect();
+                        format!("the compile-time call chain: {}", render_call_chain(&chain))
+                    } else {
+                        format!("`{name}` is declared here")
+                    },
+                    source: (source != self.source_of(expr_id)).then_some(source),
+                };
+                (format!(" in `{name}`"), Some(note))
             }
         };
         Error {
+            trace: Vec::new(),
             note,
             span: self.span_of(expr_id),
             msg: format!("{headline}{subject}: {}", failure.message),
         }
-    }
-
-    /// How many declared functions carry a name — the guard against printing a
-    /// synthetic or monomorphized frame name at the user (B1).
-    fn functions_named(&self, name: &str) -> usize {
-        self.program
-            .functions
-            .values()
-            .filter(|function| function.name == name)
-            .count()
-    }
-
-    /// The one function with this name, or `None` when the name is ambiguous —
-    /// a note pointing at an arbitrary one of several would not be
-    /// deterministic (C1).
-    fn unique_function_named(&self, name: &str) -> Option<Id> {
-        let mut found = None;
-        for (id, function) in &self.program.functions {
-            if function.name != name {
-                continue;
-            }
-            if found.is_some() {
-                return None;
-            }
-            found = Some(*id);
-        }
-        found
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic
@@ -1000,17 +1065,14 @@ impl<'p, 'src> State<'p, 'src> {
 
     /// Whether an entity sits inside any `const` expression's span (same
     /// source file) — the site test the capability check cuts edges by.
+    ///
+    /// Answered from the interval index rather than by scanning every `const`
+    /// expression: `check_const_only` asks this once per call site in the
+    /// program, so the scan was the pass's one super-linear term — O(call sites
+    /// × const sites), 64 ms of the website's server entry at 210 sites and
+    /// growing as the square (const-eval.md §10).
     fn in_const_subtree(&self, id: Id) -> bool {
-        let Some(source) = self.program.source_of(id) else {
-            return false;
-        };
-        let span = self.span_of(id);
-        self.program.const_exprs.iter().any(|&root| {
-            self.program.source_of(root) == Some(source) && {
-                let root_span = self.span_of(root);
-                span.start >= root_span.start && span.end <= root_span.end
-            }
-        })
+        self.const_regions.contains(self.program, id)
     }
 
     /// The free local references of the const subtree: every `Expr::Local`
@@ -1078,7 +1140,7 @@ impl<'p, 'src> State<'p, 'src> {
             return Known::Runtime(variable.name);
         }
         // Items — functions, structs, enum constructors — are code, not
-        // runtime state; the mini-program emits them.
+        // runtime state; the const world lowers them.
         Known::Ok
     }
 

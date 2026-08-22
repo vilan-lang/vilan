@@ -115,6 +115,35 @@ fn recovers_a_garbled_element_to_an_error_atom() {
 }
 
 #[test]
+fn recovers_an_unfinished_chain_link_keeping_the_element() {
+    // E67 (editing-dx.md §18): a head item whose `.` has no method name yet is
+    // a COMMITTED production failing — the dot already chose the chain form —
+    // so it recovers in place: the item is dropped and reported, and the
+    // element survives. Declining instead let the element recovery above
+    // flatten the tag to an `Error` atom and, with the tag nested, take the
+    // whole statement with it, which is what left the language server with
+    // nothing to answer from inside a tag under construction.
+    for_each_frontend(
+        "fun main() { let p = <div><span .></span></div>; }\n",
+        |name, tree, errors| {
+            assert!(
+                errors > 0,
+                "[{name}] an unfinished chain link must report (c): {tree}"
+            );
+            assert_eq!(
+                tree.matches("ElementBody").count(),
+                2,
+                "[{name}] both elements survive the recovery (b); got: {tree}"
+            );
+            assert!(
+                !tree.contains("Error"),
+                "[{name}] no error atom is left behind (b); got: {tree}"
+            );
+        },
+    );
+}
+
+#[test]
 fn recovers_garbled_struct_initializer_fields() {
     // parser.rs ~299: a garbled `Name { .. }` struct-initializer field list
     // recovers via `|span| (None, span)` (then mapped to an empty vec) to EMPTY

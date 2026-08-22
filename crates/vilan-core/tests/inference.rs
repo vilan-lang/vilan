@@ -772,6 +772,112 @@ fn assert_fails_noting_nth(
     );
 }
 
+/// Like [`failure_diagnostics_with_notes`], but keeping each diagnostic's
+/// E78 requirement trace: `(message, span, trace)` with one
+/// `(label message, span range, cross-source?)` entry per hop, in the
+/// analyzer's own order — entry → read.
+fn failure_diagnostics_with_trace(
+    source: &str,
+) -> Vec<(
+    String,
+    std::ops::Range<usize>,
+    Vec<(String, std::ops::Range<usize>, bool)>,
+)> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            errors
+                .into_iter()
+                .map(|error| {
+                    (
+                        error.msg,
+                        error.span.into_range(),
+                        error
+                            .trace
+                            .into_iter()
+                            .map(|hop| {
+                                (
+                                    hop.note.msg,
+                                    hop.note.span.into_range(),
+                                    hop.note.source.is_some(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// Asserts the ONE diagnostic containing `message_part` carries EXACTLY the
+/// expected requirement trace (backlog E78): `expected` lists, in order
+/// (entry → read), each label's span as (snippet, 0-based occurrence in the
+/// source) plus a fragment of its message. Exactness is the pin: an extra
+/// label — a covered call taking blame, a hop past the cap — fails here as
+/// surely as a missing one.
+#[track_caller]
+fn assert_traces(source: &str, message_part: &str, expected: &[(&str, usize, &str)]) {
+    let occurrence_span = |snippet: &str, occurrence: usize| -> std::ops::Range<usize> {
+        let mut start = 0;
+        let mut at = None;
+        for _ in 0..=occurrence {
+            at = source[start..].find(snippet).map(|found| start + found);
+            match at {
+                Some(position) => start = position + 1,
+                None => panic!("occurrence {occurrence} of {snippet:?} not found"),
+            }
+        }
+        let found = at.unwrap();
+        found..found + snippet.len()
+    };
+    let diagnostics = failure_diagnostics_with_trace(source);
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _, _)| message.contains(message_part))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one diagnostic containing {message_part:?}; got: {diagnostics:#?}"
+    );
+    let (_, _, trace) = matching[0];
+    assert_eq!(
+        trace.len(),
+        expected.len(),
+        "the trace must carry exactly the expected labels; got: {trace:#?}"
+    );
+    for (index, ((snippet, occurrence, label_part), (label, range, cross_source))) in
+        expected.iter().zip(trace).enumerate()
+    {
+        let expected_range = occurrence_span(snippet, *occurrence);
+        assert!(
+            label.contains(label_part),
+            "trace[{index}] message {label:?} lacks {label_part:?}"
+        );
+        assert_eq!(
+            *range, expected_range,
+            "trace[{index}] must span occurrence {occurrence} of {snippet:?}"
+        );
+        assert!(
+            !cross_source,
+            "trace[{index}] unexpectedly points into another file"
+        );
+    }
+}
+
 /// `assert_fails_spanning`, but targeting the Nth occurrence (0-based) of
 /// `spanning` — for snippets that necessarily appear earlier in another
 /// role (an attribute name also being the macro definition's, a use after
@@ -1620,6 +1726,30 @@ fn transparent_references_reject_view_into_value_binding() {
         r#"
         fun main() { mut a = 5; let v: &mut i32 = &mut a; let b: i32 = v; }
         "#,
+    );
+}
+
+#[test]
+fn a_view_annotation_over_a_value_initializer_names_the_mismatch() {
+    // R1's view-annotated arm, textually (ledger row 18): the annotation
+    // promises a view and the initializer is a value.
+    assert_fails_with(
+        r#"
+        fun main() { mut a = 5; let v: &mut i32 = 9; }
+        "#,
+        "'v' is annotated as a view (`&[mut] T`) but its initializer is not a view; bind a `&[mut] place` to alias it.",
+    );
+}
+
+#[test]
+fn a_value_annotation_over_a_view_initializer_names_the_mismatch() {
+    // R1's value-annotated arm, textually (ledger row 18) — the textual twin
+    // of transparent_references_reject_view_into_value_binding above.
+    assert_fails_with(
+        r#"
+        fun main() { mut a = 5; let v: &mut i32 = &mut a; let b: i32 = v; }
+        "#,
+        "'b' is annotated as a value but its initializer is a view; write `*` to copy the value out, or annotate `&[mut] T` to alias it.",
     );
 }
 
@@ -11106,8 +11236,8 @@ fn client_connect_enforces_the_contract_and_wires_mirrors() {
     // call opens the socket, VERIFIES the contract hash (Q6 enforcement — the
     // drift case below refuses with Err(Contract) before any decode), calls
     // the generated __attach against the runtime session registry
-    // (serve_service), and wires one RemoteSource mirror per [expose]d field
-    // in declaration order — both mirrors deliver.
+    // (`Service::new`'s default lifecycle), and wires one RemoteSource mirror
+    // per [expose]d field in declaration order — both mirrors deliver.
     //
     // Both servers bind port 0 and the ready callbacks report what they got
     // (backlog E19): literals collided in the v0.12.0 release gate
@@ -11124,11 +11254,11 @@ import std::print;
         import std::json::{ Json, FromJson, json_codec };
         import std::reactive::Signal;
         import std::shared::Shared;
-        import std::rpc_server::serve_service;
-        import std::http::Response;
-        
+        import std::rpc_server::Service;
+        import std::http::{ Response, Server };
+
         // The whole paradigm, zero manual wiring: [expose]d state + [rpc] methods,
-        // serve_service on the server, Client::connect on the client.
+        // a Service on the server's builder, Client::connect on the client.
         [service(Client)]
         struct Board {
         	[expose] count: Signal<i32>,
@@ -11159,20 +11289,22 @@ import std::print;
         
         fun main() {
         	let board = Board { count = Signal::new(0), label = Signal::new(""), total = Shared::new(0) };
-        	serve_service(
-        		0,
-        		board.dispatcher().into_protocol(json_codec()),
-        		|request| Response::builder().code(404).body("probe").build(),
-        		|board_server| {
+        	Server::builder()
+        		.port(0)
+        		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+        		.on_request(|request| Response::builder().code(404).body("probe").build())
+        		.on_start(|board_server| {
         			let other = Other { value = Shared::new(0) };
-        			serve_service(
-        				0,
-        				other.dispatcher().into_protocol(json_codec()),
-        				|request| Response::builder().code(404).body("probe").build(),
-        				|other_server| drive(board_server.port(), other_server.port()),
-        			);
-        		},
-        	);
+        			Server::builder()
+        				.port(0)
+        				.with_service(Service::new(other.dispatcher().into_protocol(json_codec())))
+        				.on_request(|request| Response::builder().code(404).body("probe").build())
+        				.on_start(|other_server| drive(board_server.port(), other_server.port()))
+        				.build()
+        				.start();
+        		})
+        		.build()
+        		.start();
         }
         
         fun drive(board_port: i32, other_port: i32) {
@@ -11677,9 +11809,10 @@ fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
 // §17.2): a bare `ret` in a value-returning function used to report the
 // same root cause twice (once at the `ret`, once at the synthesized void
 // tail after it — both correctly anchored since S3's parser fix, which is
-// what made the duplicate visible enough to fix). The tail-construction
-// site now knows a preceding `ret` already diverged and skips its own
-// redundant constraint, so only the `ret`'s own check fires.
+// what made the duplicate visible enough to fix). B124 (§17.7) generalized
+// the dedup: `check_return_position` asks whether the last statement
+// DIVERGES, of which "is a `ret`" is one case, so only the `ret`'s own
+// check fires.
 #[test]
 fn a_bare_ret_no_longer_duplicates_the_synthesized_tail_diagnostic() {
     let source = r#"
@@ -11723,6 +11856,460 @@ fn a_mistyped_ret_value_no_longer_duplicates_the_synthesized_tail_diagnostic() {
         }
         "#,
         "Expected i32, but got",
+    );
+}
+
+// --- B124: a branch that LEAVES contributes no tail value (editing-dx.md
+// §17.7). Every pin below reproduced `Expected str, but got void instead.`
+// against complete code before the fix, because each branch unified on its
+// own synthesized void tail rather than on the `ret` that actually left.
+
+// The item's own shape: an exhaustive `if`/`else` where every branch is a
+// bare `ret`. The whole `if` is the function's tail, so the false mismatch
+// landed on the `if` itself.
+#[test]
+fn an_exhaustive_if_else_of_bare_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "positive\nnon-positive\n",
+    );
+}
+
+// The chained spelling — `else if` legs are branches of the same `if`, and
+// each one has to be asked about divergence separately.
+#[test]
+fn an_if_else_if_else_chain_of_bare_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else if value < 0 {
+        		ret "negative";
+        	} else {
+        		ret "zero";
+        	}
+        }
+
+        fun main() {
+        	print(classify(3));
+        	print(classify(-3));
+        	print(classify(0));
+        }
+        "#,
+        "positive\nnegative\nzero\n",
+    );
+}
+
+// Nesting: an outer branch whose own body is an exhaustive `if`/`else` of
+// `ret`s leaves too — the divergence question recurses rather than stopping
+// at the first level.
+#[test]
+fn a_nested_if_else_of_bare_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		if value > 10 {
+        			ret "big";
+        		} else {
+        			ret "small";
+        		}
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(20));
+        	print(classify(2));
+        	print(classify(-2));
+        }
+        "#,
+        "big\nsmall\nnon-positive\n",
+    );
+}
+
+// A plain block of `ret`s in tail position: no `if` at all, so this one is
+// carried by `check_return_position`'s own divergence question rather than
+// by the branch merge.
+#[test]
+fn a_block_of_rets_in_tail_position_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	{
+        		ret "positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        }
+        "#,
+        "positive\n",
+    );
+}
+
+// The `match` spelling of the same mistake: every leg's body is a block
+// whose tail is the synthesized void after its `ret`, so the leg
+// unification made the whole match `void`.
+#[test]
+fn a_match_whose_every_leg_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	match value {
+        		0 => {
+        			ret "zero";
+        		},
+        		_ => {
+        			ret "other";
+        		},
+        	}
+        }
+
+        fun main() {
+        	print(classify(0));
+        	print(classify(7));
+        }
+        "#,
+        "zero\nother\n",
+    );
+}
+
+// Mixed: one branch leaves, the other yields. The `if` is the yielded
+// type — `Never` yields in `reconcile_type` — where before the fix the
+// leaving branch's void won the merge and the whole `if` typed as void.
+#[test]
+fn an_if_branch_that_rets_beside_one_that_yields_takes_the_yielded_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		"non-positive"
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "positive\nnon-positive\n",
+    );
+}
+
+// The `match` twin of the mixed shape, which before the fix reported the
+// missing return AND a bogus `match legs have mismatched types: expected
+// void, but got str` on the leg that was right.
+#[test]
+fn a_match_leg_that_rets_beside_one_that_yields_takes_the_yielded_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	match value {
+        		0 => {
+        			ret "zero";
+        		},
+        		_ => "other",
+        	}
+        }
+
+        fun main() {
+        	print(classify(0));
+        	print(classify(7));
+        }
+        "#,
+        "zero\nother\n",
+    );
+}
+
+// The same merge in VALUE position rather than return position: a `let`
+// bound to an `if` one of whose branches leaves the enclosing function.
+#[test]
+fn a_diverging_if_branch_in_a_let_takes_the_live_branchs_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	let label = if value > 0 {
+        		ret "early";
+        	} else {
+        		"other"
+        	};
+        	label
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "early\nother\n",
+    );
+}
+
+// The STATEMENT spelling (a trailing `;` on the `if`), where the body's
+// tail is the parser's synthesized void rather than the `if` itself: the
+// tail is dead code after a last statement that leaves, so holding it to
+// the declared type was §17.2's `ret`-only dedup missing its general case.
+#[test]
+fn a_last_statement_if_that_diverges_leaves_no_tail_to_check() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	let doubled = value * 2;
+        	if doubled > 0 {
+        		ret "positive";
+        	} else {
+        		ret "non-positive";
+        	};
+        }
+
+        fun main() {
+        	print(classify(1));
+        	print(classify(-1));
+        }
+        "#,
+        "positive\nnon-positive\n",
+    );
+}
+
+// The same, for a `match` — the shape that forced the check to resolve
+// time: at walk time a `match` is not yet in `expr_id_to_expr_map` (it is
+// inserted by `resolve_match`), so a walk-time divergence question cannot
+// see this one leave at all.
+#[test]
+fn a_last_statement_match_that_diverges_leaves_no_tail_to_check() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun classify(value: i32): str {
+        	match value {
+        		0 => {
+        			ret "zero";
+        		},
+        		_ => {
+        			ret "other";
+        		},
+        	};
+        }
+
+        fun main() {
+        	print(classify(0));
+        	print(classify(7));
+        }
+        "#,
+        "zero\nother\n",
+    );
+}
+
+// The async instance of the same function: the inferred-async pass runs
+// over the same tail, and the false mismatch reproduced there too.
+#[test]
+fn an_async_function_whose_tail_is_an_if_else_of_rets_is_not_a_missing_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+
+        fun classify(value: i32): str {
+        	sleep(1);
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	print(classify(1));
+        }
+        "#,
+        "positive\n",
+    );
+}
+
+// A closure whose body is an exhaustive `if`/`else` of value-`ret`s. The
+// FALSE mismatch on the closure is gone; ret-checking.md §4's deliberate
+// guidance ("make the ret'd value the body's tail" — the conservative rule
+// that avoids the diverging-tail swamp) is untouched, since B124 does not
+// reopen closure return inference.
+#[test]
+fn a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance() {
+    let source = r#"
+        fun run(f: |i32| str): str {
+        	f(1)
+        }
+
+        fun main() {
+        	run(|value| {
+        		if value > 0 {
+        			ret "positive";
+        		} else {
+        			ret "non-positive";
+        		}
+        	});
+        }
+        "#;
+    assert_fails_without(source, "Expected str, but got void instead.");
+    assert_fails_with(
+        source,
+        "the closure's body ends without a value, but this `ret` returns one",
+    );
+}
+
+// The boundary that `tail_yields_no_value` guards: a closure whose body
+// leaves by BARE `ret`s yields nothing, exactly as a void-tailed one does,
+// so rule 4's bare-`ret` leg must stay silent rather than newly complain
+// that the body "yields never".
+#[test]
+fn a_closure_whose_body_is_an_if_else_of_bare_rets_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run(f: |i32|) {
+        	f(1);
+        }
+
+        fun main() {
+        	run(|value| {
+        		if value > 0 {
+        			ret;
+        		} else {
+        			ret;
+        		}
+        	});
+        	print("done");
+        }
+        "#,
+        "done\n",
+    );
+}
+
+// --- B124's negatives: the missing-return diagnostics the fix must NOT
+// weaken. `expr_diverges` needs EVERY path out to leave, so anything that
+// can fall through is still diagnosed.
+
+// No `else`, so the `if` falls through — regime 2's wording, unchanged.
+#[test]
+fn an_if_with_no_else_of_rets_still_reports_the_missing_return() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// One branch leaves, the other reaches its end without a value: the `if`
+// still merges to void, and the missing return is still a real mistake.
+#[test]
+fn an_if_branch_that_rets_beside_one_that_falls_through_still_reports() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		let ignored = 1;
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead.",
+    );
+}
+
+// A live branch whose value is the WRONG type, beside a leaving one: the
+// leaving branch yields in the merge, so the mismatch is the live branch's
+// own and is still reported against the declared type.
+#[test]
+fn a_wrongly_typed_branch_beside_a_ret_branch_is_still_diagnosed() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret "positive";
+        	} else {
+        		5
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
+    );
+}
+
+// A `ret` whose VALUE is wrong inside an otherwise-exhaustive `if`/`else`:
+// each `ret` still owns its own return-position constraint, which is the
+// whole reason the unreachable tail after it needs no second check.
+#[test]
+fn a_mistyped_ret_inside_an_exhaustive_if_else_is_still_diagnosed() {
+    assert_fails_with(
+        r#"
+        fun classify(value: i32): str {
+        	if value > 0 {
+        		ret 5;
+        	} else {
+        		ret "non-positive";
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
     );
 }
 
@@ -15271,6 +15858,518 @@ main();
     );
 }
 
+// E74 (diagnostics-standard A2): the fence's strict read sits in STD when
+// reached through `effect` (`get_owner`'s body, reactive.vl) — the diagnostic
+// anchors at the USER'S call, with the std read demoted to the C3 note.
+#[test]
+fn e74_an_uncovered_effect_anchors_at_the_users_call() {
+    let source = r#"
+import std::print;
+import std::reactive::Signal;
+
+fun main() {
+    let count = Signal::new(1);
+    count.effect(|value| print(value));
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "count.effect(|value| print(value))",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+}
+
+// E74's top-level entry: a module-level initializer calling straight into
+// the std reader is an uncovered entry by construction, and the walk-back
+// anchors at that initializer call (the `top_level_incoming` arm — there is
+// no caller node to descend through).
+#[test]
+fn e74_a_module_initializer_entry_anchors_at_the_initializer_call() {
+    let source = r#"
+import std::print;
+import std::reactive::{ Owner, get_owner };
+
+let scope: Owner = get_owner();
+
+fun main() {
+    print("hi");
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "get_owner()",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+}
+
+// E74's no-over-correction half: a strict read the user WROTE anchors at
+// itself, with no std-frame note to demote.
+#[test]
+fn e74_a_direct_strict_read_still_anchors_at_itself() {
+    let source = r#"
+import std::print;
+import std::reactive::owner_scope;
+
+fun main() {
+    let owner = owner_scope.get();
+    print("hi");
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "owner_scope.get()",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    let diagnostics = failure_diagnostics_with_notes(source);
+    assert!(
+        diagnostics.iter().all(|(_, _, note)| note.is_none()),
+        "a user-written read must not carry the std-frame note; got: {diagnostics:#?}"
+    );
+}
+
+// E74's blame filter: the walk-back crosses only UNBOUND callers, so a
+// covered `effect` earlier in the program (a lower call id, which the
+// earliest-entry rule would otherwise prefer) is never blamed for the
+// uncovered one beside it.
+#[test]
+fn e74_a_covered_call_beside_the_uncovered_one_is_not_blamed() {
+    assert_fails_spanning(
+        r#"
+import std::print;
+import std::reactive::{ Owner, Signal, owner_scope };
+
+fun main() {
+    let early = Signal::new(1);
+    let owner = Owner::new();
+    owner_scope.run(owner, || {
+        early.effect(|value| print(value));
+    });
+    let late = Signal::new(2);
+    late.effect(|value| print(value));
+}
+main();
+        "#,
+        "late.effect(|value| print(value))",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+// --- E78: the coverage refusal keeps the chain the walk traverses. ---
+
+/// The owner's acceptance example, comments as behavior: ONE diagnostic,
+/// primary at the read (E74's anchor for a user-written read), with `b`'s
+/// `a()` and `main`'s `b()` as trace labels ordered entry → read — and `c`'s
+/// covered `context.run(0, || a())` carrying nothing (the exact-length
+/// assertion is the covered-call stop's pin: mark the covered edge uncovered
+/// in the trace walk and the extra label fails here).
+#[test]
+fn e78_the_owners_example_traces_the_uncovered_chain_and_leaves_the_covered_call_clean() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    context.get();
+}
+
+fun b() {
+    a(); // error with trace
+}
+
+fun c() {
+    context.run(0, || a()); // ok
+}
+
+fun main() {
+    b(); // error with trace
+    c();
+}
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `context` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_spanning(
+        source,
+        "context.get()",
+        "context `context` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            // Occurrence 1 skips each function's own declaration.
+            ("b()", 1, "the context requirement flows through this call"),
+            ("a()", 1, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// A top-level call is an uncovered entry by construction, and it is a hop
+/// like any other: appending `main();` to the owner's example adds exactly
+/// one label, at the top-level call, ahead of the rest of the chain.
+#[test]
+fn e78_a_top_level_call_is_a_labeled_hop() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    context.get();
+}
+
+fun b() {
+    a();
+}
+
+fun c() {
+    context.run(0, || a());
+}
+
+fun main() {
+    b();
+    c();
+}
+main();
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            ("b()", 1, "the context requirement flows through this call"),
+            ("a()", 1, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// A two-hop chain through a capture: the closure's read blames its defining
+/// scope's callers — the capture hop itself crosses no call site and adds no
+/// label, so the chain is exactly the two calls.
+#[test]
+fn e78_a_chain_through_a_capture_labels_both_calls() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    let read = || context.get();
+    read();
+}
+
+fun b() {
+    a();
+}
+
+fun main() {
+    b();
+}
+        "#;
+    assert_fails_spanning(
+        source,
+        "context.get()",
+        "context `context` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            ("b()", 1, "the context requirement flows through this call"),
+            ("a()", 1, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// A dispatch hop carries E74's union-admission residual and must not
+/// overclaim: the site MAY select the reading implementation, so its label
+/// says so, while the direct call above it keeps the plain wording.
+#[test]
+fn e78_a_dispatch_hop_says_may_flow() {
+    let source = r#"
+import std::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+trait Probe {
+    fun name(self): str;
+
+    fun report(self) {
+        print(i"{self.name()}: {current.get()}");
+    }
+}
+
+struct Widget { tag: str }
+
+impl Widget with Probe {
+    fun name(self): str {
+        self.tag
+    }
+}
+
+fun announce<T: Probe>(subject: T) {
+    subject.report();
+}
+
+fun main() {
+    announce(Widget { tag = "w" });
+}
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "announce(Widget { tag = \"w\" })",
+                0,
+                "the context requirement flows through this call",
+            ),
+            (
+                "subject.report()",
+                0,
+                "the context requirement may flow through this call (dispatch may select a reader)",
+            ),
+        ],
+    );
+}
+
+/// The cap: a nine-hop chain labels its six ENTRY-side hops — the outermost
+/// frames, where the missing `run` belongs — and elides the read side behind
+/// the honest tail, anchored at the last kept hop.
+#[test]
+fn e78_a_deep_chain_caps_at_six_labels_with_an_honest_tail() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun f8() {
+    context.get();
+}
+fun f7() { f8(); }
+fun f6() { f7(); }
+fun f5() { f6(); }
+fun f4() { f5(); }
+fun f3() { f4(); }
+fun f2() { f3(); }
+fun f1() { f2(); }
+
+fun main() {
+    f1();
+}
+main();
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            ("f1()", 1, "the context requirement flows through this call"),
+            ("f2()", 1, "the context requirement flows through this call"),
+            ("f3()", 1, "the context requirement flows through this call"),
+            ("f4()", 1, "the context requirement flows through this call"),
+            ("f5()", 1, "the context requirement flows through this call"),
+            ("f5()", 1, "… 3 more uncovered calls on this path"),
+        ],
+    );
+}
+
+/// The covered-call stop, isolated: the read's function has two callers —
+/// one inside `run`, one not — and only the uncovered one's chain labels.
+/// This is the plant pin: treat the covered edge as uncovered in the trace
+/// walk and the `|| a()` call gains a label the exact-length check refuses.
+#[test]
+fn e78_a_covered_caller_beside_the_open_path_is_never_labeled() {
+    let source = r#"
+import std::context::Context;
+
+let context: Context<u32> = Context::new();
+
+fun a() {
+    context.get();
+}
+
+fun covered() {
+    context.run(1, || a());
+}
+
+fun open_path() {
+    a();
+}
+
+fun main() {
+    covered();
+    open_path();
+}
+        "#;
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "open_path()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            ("a()", 2, "the context requirement flows through this call"),
+        ],
+    );
+}
+
+/// The `owner_scope` coverage flavor rides the same walk: the primary stays
+/// at E74's anchor (the user's call entering std), the std read stays the C3
+/// note, and the frames ABOVE the entry now label, entry → read.
+#[test]
+fn e78_the_std_read_chain_labels_the_frames_above_the_entry() {
+    let source = r#"
+import std::print;
+import std::reactive::Signal;
+
+fun watch(count: Signal<i32>) {
+    count.effect(|value| print(value));
+}
+
+fun setup() {
+    let count = Signal::new(1);
+    watch(count);
+}
+
+fun main() {
+    setup();
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "count.effect(|value| print(value))",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+    assert_traces(
+        source,
+        "can be reached without an enclosing `run`",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "setup()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "watch(count)",
+                0,
+                "the context requirement flows through this call",
+            ),
+        ],
+    );
+}
+
+/// Several uncovered entries reaching one std read: each gets its OWN
+/// primary and its own chain — E74 kept only the least-id entry, so fixing
+/// the first call merely revealed the second on the next compile.
+#[test]
+fn e78_each_uncovered_entry_gets_its_own_diagnostic() {
+    let source = r#"
+import std::print;
+import std::reactive::Signal;
+
+fun main() {
+    let first = Signal::new(1);
+    first.effect(|value| print(value));
+    let second = Signal::new(2);
+    second.effect(|value| print(value));
+}
+main();
+        "#;
+    let message = "context `owner_scope` is read here, but this code can be reached without an enclosing `run`";
+    let diagnostics = failure_diagnostics(source);
+    let matching = diagnostics
+        .iter()
+        .filter(|(candidate, _)| candidate.contains(message))
+        .count();
+    assert_eq!(
+        matching, 2,
+        "one diagnostic per uncovered entry; got: {diagnostics:#?}"
+    );
+    assert_fails_spanning(source, "first.effect(|value| print(value))", message);
+    assert_fails_spanning(source, "second.effect(|value| print(value))", message);
+}
+
+/// The injected-call flavor (row 223) traces through the same walk: the
+/// uncovered `body()` call anchors the primary and its callers label,
+/// entry → read.
+#[test]
+fn e78_an_uncovered_injected_call_traces_its_chain() {
+    let source = r#"
+import std::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun call_it(body: (|| void) context current) {
+    body();
+}
+
+fun main() {
+    call_it(|| print(current.get()));
+}
+main();
+        "#;
+    assert_fails_spanning(
+        source,
+        "body()",
+        "an injected closure is called here, but this code can be reached without an enclosing `run` for context `current`",
+    );
+    assert_traces(
+        source,
+        "an injected closure is called here",
+        &[
+            (
+                "main()",
+                1,
+                "the context requirement flows through this call",
+            ),
+            (
+                "call_it(|| print(current.get()))",
+                0,
+                "the context requirement flows through this call",
+            ),
+        ],
+    );
+}
+
 // The dead-reader exemption: a program that imports `std::reactive` without
 // ever using the ambient layer must compile — an uncalled reader cannot run,
 // so it cannot run uncovered.
@@ -15571,6 +16670,113 @@ main();
             .iter()
             .any(|(message, _)| message.contains("names a value that is not a context")),
         "expected the non-context clause error; got: {diagnostics:#?}"
+    );
+}
+
+// Receiver shape: `get` threads by binding identity, so a context that
+// arrives as a call result has no name to thread by (ledger row 215).
+#[test]
+fn a_get_on_an_unnamed_context_receiver_is_rejected() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun pick(): Context<i32> {
+    current
+}
+
+fun main() {
+    let value = pick().get();
+}
+main();
+        "#,
+        "`get` must be called on a context bound to a name",
+    );
+}
+
+// Receiver shape, `run`'s short arm (ledger row 216): no named context could
+// be extracted at all. The message is a strict prefix of the closure-value
+// arm's (row 217), so the pin also asserts the continuation is ABSENT —
+// otherwise it could pass on the wrong arm.
+#[test]
+fn a_run_on_an_unnamed_context_receiver_is_rejected() {
+    let diagnostics = failure_diagnostics(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun pick(): Context<i32> {
+    current
+}
+
+fun main() {
+    pick().run(1, || {});
+}
+main();
+        "#,
+    );
+    assert!(
+        diagnostics.iter().any(|(message, _)| {
+            message.contains("`run` must be called on a named context with a closure literal body")
+                && !message.contains("or a closure value")
+        }),
+        "expected the short run-shape arm (no trailing closure-value alternative); got: {diagnostics:#?}"
+    );
+}
+
+// A clause-typed `let` binding is a NAMED injected closure: its initializer
+// must be a closure literal or a same-clause value — a call result is an
+// escape the threading cannot follow (ledger row 219).
+#[test]
+fn a_context_typed_binding_with_a_non_literal_initializer_is_rejected() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun make(): || void {
+    || {}
+}
+
+fun main() {
+    let handler: (|| void) context current = make();
+    handler();
+}
+main();
+        "#,
+        "a `context`-typed binding takes a closure literal, or a value with the same `context` clause",
+    );
+}
+
+// A clause parameter's argument must be a closure literal, a same-clause
+// value, or an adoptable local closure binding — anything else (here a call
+// result) cannot receive the threaded context (ledger row 220).
+#[test]
+fn a_context_typed_parameter_with_a_non_closure_argument_is_rejected() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun make(): || void {
+    || {}
+}
+
+fun call_it(body: (|| void) context current) {
+    body();
+}
+
+fun main() {
+    call_it(make());
+}
+main();
+        "#,
+        "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)",
     );
 }
 
@@ -18978,6 +20184,23 @@ fn insufficient_indentation_is_an_error_naming_the_line() {
         "#,
         "              shallow",
         "line 2 of the triple-quoted string is not indented",
+    );
+}
+
+#[test]
+fn a_single_line_triple_quoted_string_is_rejected() {
+    // The layout's first rule (ledger row 23's remaining arm): the opening
+    // """ must be followed by a newline — a one-line `"""…"""` has no
+    // content line to lay out.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let x = """oops""";
+        }
+        main();
+        "#,
+        "oops",
+        "must be followed by a newline",
     );
 }
 
@@ -28606,6 +29829,26 @@ fn a_bare_module_name_is_not_a_value() {
 }
 
 #[test]
+fn a_bare_macro_name_is_not_a_value() {
+    // The family's macro arm (ledger row 120): a macro's name resolves, but
+    // it is dispatch machinery, not a runtime value.
+    assert_fails_with(
+        r#"
+        macro fun tagger(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source };
+            source("")
+        }
+
+        fun main() {
+            let q = tagger;
+        }
+        "#,
+        "`tagger` is a macro, not a value",
+    );
+}
+
+#[test]
 fn an_unparenthesized_struct_literal_condition_is_rejected_not_misparsed() {
     // The realistic shape: a user writes a struct-literal comparison in a
     // condition. H.1 parses `p == Point` (struct-free condition); B.27 then
@@ -32254,6 +33497,84 @@ fn an_async_closure_into_an_extern_callback_is_refused() {
         "#,
         "`host_transform` is a host (`external`) function: it cannot await a Vilan closure",
     );
+}
+
+/// E68 — the coverage-error cascade. Any `owner_scope` coverage failure makes
+/// `thread_contexts` refuse its rewrite, leaving `Context::run` calls visible
+/// to the host-boundary check, which then judged std's own async-into-`run`
+/// bodies (task.vl's nursery, rpc.vl's wire turn) as host-await misuses — a
+/// false secondary anchored in std beside the primary. `run` is `external`
+/// only as a type-checking fiction (the threading pass erases every call it
+/// accepts), so it is never a host boundary; only the primary reports.
+#[test]
+fn e68_an_uncovered_effect_reports_only_the_coverage_primary() {
+    let source = r#"
+        import std::print;
+        import std::reactive::Signal;
+
+        fun main() {
+            let counter = Signal::new(0);
+            counter.effect(|value| print(value));
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "cannot await a Vilan closure");
+}
+
+/// E68's second probe shape: a closure VALUE passed to `run` trips the
+/// `run`-shape rule (and the coverage fence for the closure's own reads);
+/// the refused rewrite must not surface the host-await secondary either.
+#[test]
+fn e68_a_refused_run_shape_reports_only_the_context_primaries() {
+    let source = r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        fun main() {
+            let counter = Signal::new(0);
+            let body = || {
+                counter.effect(|value| print(value));
+            };
+            owner_scope.run(Owner::new(), body);
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "`run` must be called on a named context with a closure literal body",
+    );
+    assert_fails_without(source, "cannot await a Vilan closure");
+}
+
+/// E68's transitive arm: an async closure forwarded through a generic into
+/// `run` used to trip `extern_violations_at` too ("reaches the host
+/// (`external`) function `run`") — same false premise, same exemption. The
+/// `assert_fails_without` fragment appears in both the direct and the
+/// transitive spurious message, so this pin holds both arms shut.
+#[test]
+fn e68_a_generic_forward_into_run_does_not_cascade_transitively() {
+    let source = r#"
+        import std::reactive::{ Owner, owner_scope };
+        import std::time::sleep;
+
+        fun helper<T>(body: || T): T {
+            owner_scope.run(Owner::new(), body)
+        }
+
+        fun main() {
+            let value = helper(|| {
+                sleep(1);
+                2
+            });
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "`run` must be called on a named context with a closure literal body",
+    );
+    assert_fails_without(source, "cannot await a Vilan closure");
 }
 
 #[test]
@@ -43027,6 +44348,588 @@ fn one_call_graph_per_analysis() {
         ),
         1,
         "a program that threads no context must build exactly ONE call graph"
+    );
+}
+
+/// Analyzes `source` on a large-stack worker and reports how many transformer
+/// name seeds the whole analysis built. Same instrument, same reasoning and
+/// same isolation as [`call_graphs_built_by_one_analysis`] above.
+fn name_seeds_built_by_one_analysis(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::transformer::reset_name_seed_build_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let _ = program.expect("analysis should produce a program");
+            vilan_core::transformer::name_seed_build_count()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn the_const_pass_builds_one_name_seed_however_many_const_sites_there_are() {
+    // M4 (`const-eval.md` §10). Every `const` site is compiled to its own
+    // mini-program, and each one used to start by rebuilding the transformer's
+    // name seed — a map of every variable, function and parameter in the
+    // reachable world (4,184 entries with `std` loaded), plus the reserved-name
+    // set. That is per-site work with a per-analysis answer, and on the
+    // website's 210-site entry it was 210 rebuilds. The seed is now built once
+    // per pass and shared.
+    //
+    // Only a counter can pin it: the shared seed produces byte-identical
+    // mini-programs, so no behaviour test can distinguish one build from N.
+    // Three sites rather than one, because a per-site rebuild reads 1 on a
+    // one-site program and would slip through.
+    let three_sites = r#"
+        import std::print;
+        let A: i32 = const 1 + 2;
+        let B: i32 = const 3 * 4;
+        let C: i32 = const 5 - 6;
+        fun main() { print(A + B + C); }
+        "#;
+    assert_eq!(
+        name_seeds_built_by_one_analysis(three_sites),
+        1,
+        "the const pass must build ONE name seed, not one per const site"
+    );
+    // And the count must not move with the site count — the property that makes
+    // the pass linear in its sites rather than linear in sites × program size.
+    let six_sites = r#"
+        import std::print;
+        let A: i32 = const 1 + 2;
+        let B: i32 = const 3 * 4;
+        let C: i32 = const 5 - 6;
+        let D: i32 = const 7 + 8;
+        let E: i32 = const 9 * 10;
+        let F: i32 = const 11 - 12;
+        fun main() { print(A + B + C + D + E + F); }
+        "#;
+    assert_eq!(
+        name_seeds_built_by_one_analysis(six_sites),
+        name_seeds_built_by_one_analysis(three_sites),
+        "doubling the const sites must not change how many name seeds are built"
+    );
+}
+
+#[test]
+fn a_const_site_reads_its_dependency_afresh_in_a_second_analysis() {
+    // The memo M4 adds is per-ANALYSIS, and this is what says so: the same
+    // process analyzes an edited source and must fold the new value. A seed
+    // (or any other const-pass state) that leaked across analyses would fold
+    // the first source's answer into the second's program — the failure mode a
+    // cache keyed on nothing has.
+    let fold = |literal: &str| -> String {
+        let source = format!(
+            r#"
+            import std::print;
+            let STEP: i32 = {literal};
+            let SCALED: i32 = const STEP * 10;
+            fun main() {{ print(SCALED); }}
+            "#
+        );
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let leaked: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    leaked,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("test.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+                assert!(
+                    messages.is_empty(),
+                    "expected a clean analysis, got: {messages:#?}"
+                );
+                let program = program.expect("analysis should produce a program");
+                vilan_core::transform(&program, &vilan_core::BuildOptions::default())
+                    .expect("the folded program should emit")
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    };
+
+    // Both analyses run in THIS process, in this order — the point of the pin.
+    let first = fold("4");
+    let second = fold("7");
+    assert!(
+        first.contains("40"),
+        "the first analysis should fold `4 * 10`; emitted:\n{first}"
+    );
+    assert!(
+        second.contains("70") && !second.contains("40"),
+        "the second analysis must fold the EDITED dependency, not the first \
+         analysis's; emitted:\n{second}"
+    );
+}
+
+/// Analyzes `source` on a large-stack worker and reports how many function
+/// bodies the const pass LOWERED. Same instrument, same reasoning and same
+/// isolation as [`name_seeds_built_by_one_analysis`] above.
+fn const_lowerings_of_one_analysis(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::transformer::reset_const_lowering_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let _ = program.expect("analysis should produce a program");
+            vilan_core::transformer::const_lowering_count()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn the_const_pass_lowers_its_world_once_however_many_sites_reach_it() {
+    // M4-A (`const-eval.md` §10.6). Every `const` site used to lower the whole
+    // function closure its expression reaches into a mini-program of its own —
+    // on the website's client entry, 3,873 function emissions across 188 sites
+    // for **106** distinct functions. The pass now lowers one world and
+    // evaluates every site against it, so the lowering is a fact about the
+    // program and not about how many sites read it.
+    //
+    // Only a counter can pin that: a world lowered once and a world lowered per
+    // site produce identical values and identical diagnostics — that is the
+    // whole claim — so nothing but the count distinguishes them.
+    let sites = |count: usize| {
+        let bindings: String = (0..count)
+            .map(|index| format!("let SITE{index}: i32 = const doubled({index});\n"))
+            .collect();
+        let sum: Vec<String> = (0..count).map(|index| format!("SITE{index}")).collect();
+        format!(
+            r#"
+            import std::print;
+            fun doubled(value: i32): i32 {{ value * 2 }}
+            {bindings}
+            fun main() {{ print({}); }}
+            "#,
+            sum.join(" + ")
+        )
+    };
+    let one = const_lowerings_of_one_analysis(&sites(1));
+    assert!(
+        one > 0,
+        "the probe must actually reach a function, or the pin measures nothing"
+    );
+    assert_eq!(
+        const_lowerings_of_one_analysis(&sites(3)),
+        one,
+        "three sites through one function must lower the same world one site does"
+    );
+    assert_eq!(
+        const_lowerings_of_one_analysis(&sites(6)),
+        one,
+        "doubling the const sites must not change how much the pass lowers"
+    );
+}
+
+#[test]
+fn const_sites_sharing_a_world_compute_what_they_computed_alone() {
+    // The other half of the claim above, stated over values: the sites share a
+    // lowering, so they must not share an ANSWER. Each folds its own argument
+    // through the same function, and the chain (a site reading a binding another
+    // site folded) folds against the shared world too.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        let SCALE: i32 = 10;
+
+        fun scaled(value: i32): i32 {
+            value * SCALE
+        }
+
+        let A: i32 = const scaled(2);
+        let B: i32 = const scaled(3);
+        let C: i32 = const scaled(2);
+        let CHAINED: i32 = const A + B + C;
+
+        fun main() {
+            print(A);
+            print(B);
+            print(C);
+            print(CHAINED);
+        }
+        main();
+        "#,
+        "20\n30\n20\n70\n",
+    );
+}
+
+#[test]
+fn a_const_site_reads_its_module_bindings_afresh_and_never_another_sites() {
+    // M4-A's isolation property (`const-eval.md` §10.6). What the world shares
+    // is the LOWERING — immutable `js::Node` trees, borrowed. Every site still
+    // runs in a scope of its own and re-executes its own prelude, so nothing one
+    // site's evaluation produced can reach the next one.
+    //
+    // Two sites take a copy of the same const-folded module binding and grow it;
+    // each must see the binding as its initializer left it. Planted to §10.5's
+    // literal shape — ONE interpreter scope for the pass, module bindings
+    // declared into it once — this reads `TABLE is not defined` and is red. It
+    // does NOT redden on a shared scope that still re-declares, because the copy
+    // is a copy; that the LEAK itself is unreachable is
+    // `no_const_site_can_reach_mutable_module_state_at_all` below, and the two
+    // together are why sharing the lowering is safe.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun seed(): List<i32> {
+            mut result: List<i32> = List::new();
+            result.push(1);
+            result
+        }
+
+        let TABLE: List<i32> = const seed();
+
+        fun grown(): i32 {
+            mut local = TABLE;
+            local.push(9);
+            local.len()
+        }
+
+        let FIRST: i32 = const grown();
+        let SECOND: i32 = const grown();
+
+        fun main() {
+            print(FIRST);
+            print(SECOND);
+        }
+        main();
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn no_const_site_can_reach_mutable_module_state_at_all() {
+    // Why the sharing above is safe rather than merely observed to be: there is
+    // no mutable module-level state a const evaluation can touch, and the two
+    // halves of the language close it from both ends. A `mut` module binding is
+    // not compile-time-known, so the const pass refuses to reach it; and an
+    // immutable one cannot be mutated, so the analyzer refuses that. A prelude
+    // therefore only ever declares values built fresh from literals and folded
+    // constants (`const-eval.md` §10.6).
+    assert_fails_with(
+        r#"
+        import std::print;
+        mut COUNTER: i32 = 0;
+        fun bump(): i32 {
+            COUNTER = COUNTER + 1;
+            COUNTER
+        }
+        let X: i32 = const bump();
+        fun main() { print(X); }
+        "#,
+        "this `const` expression reaches `COUNTER`, whose value is not compile-time-known",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun seed(): List<i32> {
+            mut result: List<i32> = List::new();
+            result.push(1);
+            result
+        }
+        let TABLE: List<i32> = const seed();
+        fun grow(): i32 {
+            TABLE.push(9);
+            TABLE.len()
+        }
+        let X: i32 = const grow();
+        fun main() { print(X); }
+        "#,
+        "cannot mutate immutable 'TABLE'",
+    );
+}
+
+#[test]
+fn a_const_site_is_refused_only_for_what_it_itself_reaches() {
+    // The shared world is one lowering, but a site's REACH is still its own —
+    // reconstructed per site from what each emission recorded (`const-eval.md`
+    // §10.6). A union would refuse the clean site beside the dirty one, and the
+    // multiplicity is the whole point of the pin. Both orders, because a site's
+    // reach must not depend on which site the pass evaluated first.
+    let capability = |dirty_first: bool| {
+        let sites = if dirty_first {
+            "let DIRTY: i32 = const impure();\nlet CLEAN: i32 = const doubled(21);"
+        } else {
+            "let CLEAN: i32 = const doubled(21);\nlet DIRTY: i32 = const impure();"
+        };
+        format!(
+            r#"
+            import std::print;
+            import std::random;
+            fun doubled(value: i32): i32 {{ value * 2 }}
+            fun impure(): i32 {{ random::range(1, 6) }}
+            {sites}
+            fun main() {{ print(CLEAN); print(DIRTY); }}
+            "#
+        )
+    };
+    assert_fails_once_with(&capability(false), "is not available at expansion time");
+    assert_fails_once_with(&capability(true), "is not available at expansion time");
+
+    // And the same for a binding that is not compile-time-known: the site that
+    // reaches it is refused, the site beside it folds.
+    assert_fails_once_with(
+        r#"
+        import std::print;
+        mut COUNTER: i32 = 0;
+        fun bump(): i32 { COUNTER = COUNTER + 1; COUNTER }
+        fun doubled(value: i32): i32 { value * 2 }
+        let DIRTY: i32 = const bump();
+        let CLEAN: i32 = const doubled(21);
+        fun main() { print(DIRTY); print(CLEAN); }
+        "#,
+        "whose value is not compile-time-known",
+    );
+}
+
+#[test]
+fn a_const_failure_names_the_function_that_failed_not_the_name_it_was_emitted_under() {
+    // §8.2's attribution reads the interpreter's frame trace, which carries
+    // EMITTED names — and one name generator now serves the whole pass, so two
+    // reached functions that share a source name cannot both be called by it:
+    // the second is minted `helper2`, a name no declaration carries. Matching a
+    // frame by identity rather than by string is what keeps the diagnostic
+    // reading the source (`const-eval.md` §10.6); matching by string drops the
+    // subject entirely, which is what this saw before the fix.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun table(): List<i32> {
+            mut result: List<i32> = List::new();
+            result.push(7);
+            result
+        }
+
+        mod alpha {
+            fun helper(values: List<i32>): i32 { values[0] }
+        }
+
+        mod beta {
+            fun helper(values: List<i32>): i32 { values[3] }
+        }
+
+        let GOOD: i32 = const alpha::helper(table());
+        let BAD: i32 = const beta::helper(table());
+
+        fun main() { print(GOOD); print(BAD); }
+        "#,
+        "const evaluation failed in `helper`: index out of bounds",
+    );
+}
+
+#[test]
+fn a_const_function_evaluates_again_after_an_earlier_sites_scopes_were_cleared() {
+    // M8 (leak-soak.md §7.8). When a const site's run ends, the interpreter
+    // clears every scope the run created — that is what breaks the
+    // closure–scope reference cycles. What must survive the teardown is the
+    // pass's SHARED LOWERING (`const-eval.md` §10.6): immutable `js::Node`
+    // trees, which a later site re-hoists into a fresh scope of its own. So a
+    // function two sites reach — including one that declares a function
+    // INSIDE its body, the call-scope cycle the root-only experiment in
+    // leak-soak.md §7.7 could not break — must evaluate correctly at the
+    // later site, after the earlier site's teardown already ran.
+    //
+    // Planted to a teardown that runs BEFORE the result extraction, the first
+    // site cannot read `__const_result` back and this is red.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun bump_twice(value: i32): i32 {
+            let bump = |x: i32| { x + 1 };
+            bump(bump(value))
+        }
+
+        fun scaled(value: i32): i32 {
+            value * 3
+        }
+
+        let FIRST: i32 = const bump_twice(1);
+        let MIDDLE: i32 = const scaled(4);
+        let LAST: i32 = const bump_twice(40);
+
+        fun main() {
+            print(FIRST);
+            print(MIDDLE);
+            print(LAST);
+        }
+        main();
+        "#,
+        "3\n12\n42\n",
+    );
+}
+
+/// Analyzes `source` on a large-stack worker and reports the interpreter
+/// scopes still alive on that thread afterwards, plus how many function bodies
+/// the const pass lowered (the guard that the probe genuinely reached the
+/// evaluator). Same isolation as [`const_lowerings_of_one_analysis`].
+fn scopes_alive_after_one_analysis(source: &str) -> (isize, usize) {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::transformer::reset_const_lowering_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let _ = program.expect("analysis should produce a program");
+            (
+                vilan_core::interpreter::live_scope_count(),
+                vilan_core::transformer::const_lowering_count(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn every_interpreter_scope_dies_with_its_const_run() {
+    // M8's mechanism pin (leak-soak.md §7.8). A scope that binds a function
+    // holds a `Value::Closure` whose `env` is that scope — a cycle `Rc`
+    // cannot collect — so before the per-run teardown, every const site of
+    // every analysis stranded its root scope, and a function declared inside
+    // a body stranded the CALL scope too. Only a counter can pin the fix: the
+    // teardown is behaviour-neutral by construction, so nothing observable
+    // distinguishes a run that cleans up from one that leaks. The fixture
+    // exercises every cycle shape §7.7 names: hoisted module functions (root
+    // scope), a closure declared inside a called function (call scope), and
+    // loop iterations between them.
+    let (alive, lowered) = scopes_alive_after_one_analysis(
+        r#"
+        import std::print;
+
+        fun labels(count: i32): List<str> {
+            let describe = |index: i32| { "a labelled entry" };
+            mut result: List<str> = List::new();
+            mut index = 0;
+            for index < count {
+                result.push(describe(index));
+                index = index + 1;
+            }
+            result
+        }
+
+        fun total(count: i32): i32 {
+            mut sum = 0;
+            mut index = 0;
+            for index < count {
+                sum = sum + index;
+                index = index + 1;
+            }
+            sum
+        }
+
+        let NAMES: List<str> = const labels(6);
+        let SUM: i32 = const total(6);
+        let AGAIN: i32 = const total(9);
+
+        fun main() {
+            print(NAMES.len());
+            print(SUM);
+            print(AGAIN);
+        }
+        main();
+        "#,
+    );
+    assert!(
+        lowered > 0,
+        "the probe must actually reach the const evaluator, or the pin measures nothing"
+    );
+    assert_eq!(
+        alive, 0,
+        "{alive} interpreter scope(s) outlived their const runs — a closure–scope \
+         reference cycle is stranding them (leak-soak.md §7.8)"
+    );
+}
+
+#[test]
+fn every_interpreter_scope_dies_with_its_macro_expansion() {
+    // The same mechanism pin over the OTHER caller `interpreter.rs` has: macro
+    // expansion (`run_entry`), whose world top level hoists functions into the
+    // run's root scope exactly as a const site does. The expansion cache keeps
+    // only the expansion TEXT, so the run's scopes have nothing left to serve
+    // once it returns — the teardown reaches this path too. The macro body is
+    // deliberately distinct from every other fixture in this binary, so the
+    // process-global expansion cache cannot serve it without running it.
+    let (alive, _) = scopes_alive_after_one_analysis(
+        r#"
+        import std::print;
+
+        macro fun sum_to_eleven(arguments: Arguments): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Arguments, Source };
+            mut sum = 0;
+            mut index = 0;
+            for index < 11 {
+                sum = sum + index;
+                index = index + 1;
+            }
+            source(i"{sum}")
+        }
+
+        fun main() {
+            print(macro sum_to_eleven());
+        }
+        main();
+        "#,
+    );
+    assert_eq!(
+        alive, 0,
+        "{alive} interpreter scope(s) outlived their macro expansion runs \
+         (leak-soak.md §7.8)"
     );
 }
 
@@ -56810,4 +58713,1722 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
         "one missing token, one diagnostic — and no `cannot find 'origin'`: {messages:#?}"
     );
     assert!(messages[0].contains("expected `;` to end this statement"));
+}
+
+// --- B73: blanket-vs-specific (method-resolution.md §13) ---------------------
+//
+// RULED 2026-08-18 as recommended and SHIPPED the same day (R1 eafe5a3e,
+// R2 4e086a5d, R3 9d72f2e6 — method-resolution.md §13.8). Every pin below is
+// LIVE and asserts the shipped semantics — R1 (the trait's effective
+// arguments join the resolution key), R2 (the expected type selects among
+// argument-distinct homes), R3 (specificity ranks a genuine overlap). The
+// residue no row exercises is B128, deferred.
+
+/// §13.2 row 1, closed by R2. Before it: `Expected Bar, but got Foo instead.`
+/// — std's `impl type T with Into<T>` (`std/src/into.vl` 5–9) is a candidate for
+/// every receiver and, being tier 0, sorted first, so the user's own impl was
+/// dead code. R1 makes the two separate homes (`Into<Foo>` and `Into<Bar>`) and
+/// R2 lets the `let`'s annotation say which was meant.
+#[test]
+fn b73_a_user_into_impl_beats_the_std_blanket() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
+        }
+
+        fun main() {
+            let b: Bar = Foo { n = 1 }.into();
+            print(b.n);
+        }
+        "#,
+        "101\n",
+    );
+}
+
+/// §13.2 row 2 — the beta-critical miscompile, closed by R1. Before it, this
+/// compiled clean, exited 0, and printed `[ 1 ]`: the blanket's
+/// `fun into(self): T { self }` was emitted (`function $a(self) { return
+/// __clone(self); }`) and the user's `into` never was. With the trait's
+/// arguments in the resolution key the two are separate homes (`Into<Foo>` and
+/// `Into<str>`), and with no expected type to steer R2's selection the call is
+/// reported rather than silently resolved.
+#[test]
+fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "ambiguous",
+    );
+}
+
+/// §13.2 row 3, closed by R2 — the same defect in RETURN position, where the
+/// expectation comes from the declared return type rather than from a `let`.
+/// Before: `Expected Bar, but got Foo instead.` on the `x.into()` tail.
+#[test]
+fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
+        }
+
+        fun to_bar(x: Foo): Bar { x.into() }
+
+        fun main() { print(to_bar(Foo { n = 1 }).n); }
+        "#,
+        "101\n",
+    );
+}
+
+/// §13.2 row 5, closed by R2. §3.1's disambiguator is no escape hatch here —
+/// both candidates have the same trait head, so naming it settles nothing; the
+/// annotation is what picks the home. Two defects stood between: the path head
+/// `Into::into` never reached §3.1's re-point at all, because the blanket's
+/// GENERIC subject compare_types the bare trait type and answered the static
+/// path itself (a `self`-method can no longer do that); and the re-point's own
+/// provider scan then took the first impl of the trait rather than the one the
+/// expectation names.
+#[test]
+fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
+        }
+
+        fun main() {
+            let b: Bar = Into::into(Foo { n = 1 });
+            print(b.n);
+        }
+        "#,
+        "101\n",
+    );
+}
+
+/// §13.2 rows 6–7, the ordering-sensitive form: a user-written blanket, so std's
+/// tier-0 position is not what decides it. Before, the blanket-first program
+/// printed `1` and the specific-first program printed `101` — the same two
+/// impls, two answers, decided by which block was typed above the other.
+///
+/// Closed by **R2**, not R3 as §13.4(a) predicted: `impl type T with Conv<T>`
+/// instantiates as `Conv<Foo>` on a `Foo` while the specific impl is
+/// `Conv<Bar>`, so the two are argument-distinct HOMES and the `let`'s
+/// annotation selects between them before specificity is ever consulted. Rows
+/// 21–22, whose trait takes no arguments, are the shape that genuinely needs
+/// ranking.
+#[test]
+fn b73_a_user_blanket_loses_to_a_specific_impl_whatever_the_order() {
+    let blanket_first = r#"
+        import std::print;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl type T with Conv<T> { fun conv(self): T { self } }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = self.n + 100 } } }
+
+        fun main() {
+            let b: Bar = Foo { n = 1 }.conv();
+            print(b.n);
+        }
+        "#;
+    let specific_first = r#"
+        import std::print;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = self.n + 100 } } }
+
+        impl type T with Conv<T> { fun conv(self): T { self } }
+
+        fun main() {
+            let b: Bar = Foo { n = 1 }.conv();
+            print(b.n);
+        }
+        "#;
+    assert_compiles_and_runs(blanket_first, "101\n");
+    assert_compiles_and_runs(specific_first, "101\n");
+}
+
+/// §13.2 rows 9–10, closed by R3. The plainest specificity case and the one
+/// §13.4(a)'s subsumption rule exists for: `Box<i32>` is matched by
+/// `Box<type T>` but not conversely, so the concrete impl is strictly more
+/// specific. Before: `1` when the generic block was first, `2` when the
+/// concrete one was.
+#[test]
+fn b73_a_concrete_impl_subject_outranks_a_generic_one() {
+    let generic_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        impl Box<i32> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    let concrete_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<i32> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    assert_compiles_and_runs(generic_first, "2\n");
+    assert_compiles_and_runs(concrete_first, "2\n");
+}
+
+/// §13.2 rows 11–12, closed by R3's second tier. Equal subject shapes ranked by
+/// their binders' BOUNDS — the comparison B98 already runs for its sameness key
+/// (`trait-objects.md` §15.8, "Bounds, not identity"). Before: `1`
+/// unbounded-first, `2` bounded-first.
+#[test]
+fn b73_a_bounded_impl_subject_outranks_an_unbounded_one() {
+    let unbounded_first = r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    let bounded_first = r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#;
+    assert_compiles_and_runs(unbounded_first, "2\n");
+    assert_compiles_and_runs(bounded_first, "2\n");
+}
+
+/// §13.2 rows 13–14, closed by R3 — the NESTED form: specificity has to see
+/// through a type argument's own arguments, not just the outermost head.
+/// Before: `1` generic-first, `2` concrete-first.
+#[test]
+fn b73_a_nested_concrete_impl_subject_outranks_a_generic_one() {
+    let generic_first = r#"
+        import std::print;
+        import std::list::List;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        impl Box<List<i32>> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = [1, 2, 3] }.tag()); }
+        "#;
+    let concrete_first = r#"
+        import std::print;
+        import std::list::List;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<List<i32>> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = [1, 2, 3] }.tag()); }
+        "#;
+    assert_compiles_and_runs(generic_first, "2\n");
+    assert_compiles_and_runs(concrete_first, "2\n");
+}
+
+/// §13.2 row 15 — the same defect as a FALSE REJECTION, and §13.6 Q6's subject,
+/// ruled in scope and closed by R3's applicability step. Candidate selection
+/// ignored whether an impl's bounds hold, so the `Display`-bounded block won the
+/// race on `Box<Opaque>` and then failed its own bound check while the unbounded
+/// block that does apply sat below it: `'Opaque' does not implement trait
+/// 'Display', required by a generic bound of this call`.
+#[test]
+fn b73_an_applicable_unbounded_impl_survives_an_inapplicable_bounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+        struct Opaque { z: i32 }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Box { v = Opaque { z = 1 } }.tag()); }
+        "#,
+        "1\n",
+    );
+}
+
+/// §13.2 row 17, and §13.6 Q5 (ruled `9`) — the least obvious row in the table,
+/// closed by R3. A blanket that DECLARES the name beat a more specific impl
+/// taking the trait's default, because only a declaration contributed a
+/// candidate: `1` in BOTH orders, so the default `9` was unreachable for `Foo`
+/// no matter how the file was arranged. An impl that inherits its trait's
+/// default now contributes a candidate too — but only into a home some
+/// declaring impl already occupies, so §3's declaration-over-default tier and
+/// Gap E's fallback are untouched — and the more specific impl wins, bringing
+/// its inherited default with it.
+#[test]
+fn b73_a_specific_impl_taking_the_trait_default_outranks_a_blanket_declaration() {
+    let blanket_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32 { 9 } }
+
+        struct Foo { n: i32 }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        impl Foo with Tag { }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#;
+    let specific_first = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32 { 9 } }
+
+        struct Foo { n: i32 }
+
+        impl Foo with Tag { }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#;
+    assert_compiles_and_runs(blanket_first, "9\n");
+    assert_compiles_and_runs(specific_first, "9\n");
+}
+
+/// §13.2 rows 18–19, and R1's whole point: `spec/types.md` 271–275 says
+/// `Conv<Bar>` and `Conv<Baz>` on one subject are two implementations, and B98's
+/// pair key agrees — but resolution collapsed them to one home
+/// (`member_home_trait` returned a bare trait `Id`), so only the first-declared
+/// was ever reachable. Before: the `Baz` annotation reported `Expected Baz, but
+/// got Bar instead.` while the `Bar` one compiled and printed `2`.
+///
+/// It takes R1 *and* R2, against §13.5's reading that R1 alone would do it:
+/// splitting the homes is what makes both reachable, and choosing between two
+/// reachable homes on one receiver is exactly what the expected type is for.
+#[test]
+fn b73_two_impls_of_one_trait_at_different_arguments_are_both_reachable() {
+    let source = r#"
+        import std::print;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+        struct Baz { n: i32 }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Foo with Conv<Baz> { fun conv(self): Baz { Baz { n = 3 } } }
+
+        fun main() {
+            let b: ANNOTATION = Foo { n = 1 }.conv();
+            print(b.n);
+        }
+        "#;
+    assert_compiles_and_runs(&source.replace("ANNOTATION", "Baz"), "3\n");
+    assert_compiles_and_runs(&source.replace("ANNOTATION", "Bar"), "2\n");
+}
+
+/// §13.2 row 20 — TYPE CONFUSION, closed by R1, and the reason deleting std's
+/// blanket would not have closed beta trigger (c): there is no blanket in this
+/// program. The bound names `Conv<Baz>`, the analyzer types the call as `Baz`,
+/// and the transformer's `resolve_member_on_trait_impl` re-dispatched on
+/// `trait_ids.contains(&Conv)` alone and emitted the `Conv<Bar>` body: it
+/// compiled clean, exited 0, and printed `2` — an `i32` read out of a field
+/// declared `str`. R1 carries the bound's own arguments into
+/// `bound_dispatch_traits`, so the re-dispatch keys on `Conv<Baz>`.
+#[test]
+fn b73_a_bound_selects_the_impl_matching_its_trait_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+        struct Baz { tag: str }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Foo with Conv<Baz> { fun conv(self): Baz { Baz { tag = "baz" } } }
+
+        fun to_baz<T: Conv<Baz>>(x: T): Baz { x.conv() }
+
+        fun main() {
+            let z: Baz = to_baz(Foo { n = 1 });
+            print(z.tag);
+        }
+        "#,
+        "baz\n",
+    );
+}
+
+/// R1's diagnostic (C2). The two homes are named as THIS receiver instantiates
+/// them — `Into<Foo>` for std's blanket, `Into<str>` for the user's impl —
+/// because `Into` twice tells the reader nothing, and the message says what
+/// does select rather than offering an `Into::into` spelling that cannot
+/// (B83's "an impossible steer is worse than no steer"). Anchored at the method
+/// name (A1/A4), the same span the two-trait ambiguity uses.
+#[test]
+fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them() {
+    // The third `into` in the source is the CALL — the first two are the import
+    // path and the impl's declaration.
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "into",
+        2,
+        "'into' is ambiguous on 'Foo': both 'Into<Foo>' and 'Into<str>' provide it, and \
+         'Into::into' names only the trait, not which of its instantiations; annotate the \
+         type this call must produce to pick one",
+    );
+}
+
+/// R2's ZERO-match leg. An expectation that fits neither home does not get to
+/// pick one by being nearest: the call stays ambiguous and says so, rather than
+/// resolving to some impl and then reporting a type mismatch against it. That
+/// second message would name a home the program never chose.
+#[test]
+fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s: i32 = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "'into' is ambiguous on 'Foo': both 'Into<Foo>' and 'Into<str>' provide it",
+    );
+}
+
+/// R1's key from the other side, and the edge case row 20 does not cover: BOTH
+/// bounds are written, so each must reach its own impl. Row 20 alone would pass
+/// a filter that always picked the LAST impl; this one fails such a filter,
+/// because `Conv<Bar>` is the first-declared and `Conv<Baz>` the second.
+#[test]
+fn b73_two_bounds_at_different_arguments_each_reach_their_own_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Foo { n: i32 }
+        struct Bar { n: i32 }
+        struct Baz { tag: str }
+
+        impl Foo with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Foo with Conv<Baz> { fun conv(self): Baz { Baz { tag = "baz" } } }
+
+        fun to_bar<T: Conv<Bar>>(x: T): Bar { x.conv() }
+
+        fun to_baz<T: Conv<Baz>>(x: T): Baz { x.conv() }
+
+        fun main() {
+            print(to_bar(Foo { n = 1 }).n);
+            print(to_baz(Foo { n = 1 }).tag);
+        }
+        "#,
+        "2\nbaz\n",
+    );
+}
+
+/// The permissive half of R1's emission filter, which is what keeps every
+/// existing golden byte-identical: an impl whose trait argument is its OWN
+/// binder (`impl Box<type T> with Tagged<T>`) is still abstract at the
+/// comparison, so the filter proves nothing about it and must keep it. The
+/// trait carries a DEFAULT here on purpose — that is what makes the pin
+/// non-vacuous: a filter demanding equality drops the impl, and the
+/// re-dispatch then silently emits the default (`1`) in place of the override.
+#[test]
+fn b73_an_impl_whose_trait_argument_is_its_own_binder_survives_the_filter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Tagged<T> { fun tagged(self): i32 { 1 } }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> with Tagged<T> { fun tagged(self): i32 { 2 } }
+
+        fun grab<S: Tagged<i32>>(x: S): i32 { x.tagged() }
+
+        fun main() { print(grab(Box { v = 7 })); }
+        "#,
+        "2\n",
+    );
+}
+
+/// R3's residue (§13.4(a)(3)), reported at the call site per §13.6 Q4. Two
+/// impls bounded by unrelated traits both apply to a `Box<i32>` and neither
+/// subsumes the other, so specificity deliberately does not rank them. There is
+/// no `Trait::tag(..)` steer — both candidates are the same trait at the same
+/// instantiation — so the message states the rule that failed to apply and
+/// sends the reader to the two definitions, naming each subject WITH its
+/// binder's bound, without which the two render identically.
+#[test]
+fn b73_two_impls_bounded_by_unrelated_traits_are_an_unrankable_overlap() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        import std::display::Display;
+        import std::compare::Ord;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        impl Box<type U: Ord> with Tag { fun tag(self): i32 { 3 } }
+
+        fun main() { print(Box { v = 5 }.tag()); }
+        "#,
+        "tag",
+        3,
+        "'tag' is ambiguous on 'Box<i32>': both 'Box<T> where T: Display' and \
+         'Box<U> where U: Ord' provide it and neither impl subject is more specific than \
+         the other; vilan picks the more specific of two overlapping impls, so narrow one \
+         subject until it is",
+    );
+}
+
+/// §13.6 Q6's other half, `spec/types.md` §5.4's soundness note: a conditional
+/// impl must not let a type satisfy a bound its own binder's bound refuses.
+/// Measured both with and without R3's applicability step, this was ALREADY
+/// rejected — bound satisfaction goes through `type_implements_trait`, which
+/// asks `compare_type`, which resolves a bounded binder to its constraint. The
+/// note's own example is stale, for reasons that predate this arc; the pin is
+/// here so the claim the spec now makes is gated rather than asserted.
+#[test]
+fn b73_a_conditional_impl_does_not_satisfy_a_bound_its_binder_refuses() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Marker { fun mark(self): i32; }
+
+        struct Wrap<T> { v: T }
+        struct Plain { z: i32 }
+
+        impl Wrap<type T: Marker> with Marker { fun mark(self): i32 { 1 } }
+
+        fun need<M: Marker>(m: M): i32 { m.mark() }
+
+        fun main() { print(need(Wrap { v = Plain { z = 1 } })); }
+        "#,
+        "'Wrap<Plain>' does not implement trait 'Marker'",
+    );
+}
+
+/// R3's applicability step NARROWS the field and never empties it. With the
+/// bounded impl the only one there is, the receiver that fails its bound keeps
+/// the bound diagnostic it has always had — which is the right message when no
+/// impl fits, and much better than "`Box<Opaque>` has no method 'tag'".
+#[test]
+fn b73_an_inapplicable_impl_that_is_the_only_one_still_reports_its_bound() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+        struct Opaque { z: i32 }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = Opaque { z = 1 } }.tag()); }
+        "#,
+        "'Opaque' does not implement trait 'Display'",
+    );
+}
+
+/// Row 15's other order, which the row-15 pin does not cover: the APPLICABLE
+/// impl declared first must still win, so the fix cannot be "prefer the later
+/// block". Ordering-sensitivity is the whole complaint B73 was filed about.
+#[test]
+fn b73_an_applicable_impl_wins_whichever_side_of_the_inapplicable_one_it_sits() {
+    let applicable_first = r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Box<T> { v: T }
+        struct Opaque { z: i32 }
+
+        impl Box<type T> with Tag { fun tag(self): i32 { 1 } }
+
+        impl Box<type T: Display> with Tag { fun tag(self): i32 { 2 } }
+
+        fun main() { print(Box { v = Opaque { z = 1 } }.tag()); }
+        "#;
+    assert_compiles_and_runs(applicable_first, "1\n");
+}
+
+/// R3 ranks INSIDE one home and moves no tier (§13.4(a), "Composition with
+/// §3"). An inherent `tag` still beats every trait-provided one, including the
+/// specific impl row 17's rule would otherwise hand the call to — §13.2 row 23's
+/// guarantee, restated for the shape R3 introduced.
+#[test]
+fn b73_an_inherent_member_still_outranks_the_most_specific_trait_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32 { 9 } }
+
+        struct Foo { n: i32 }
+
+        impl Foo { fun tag(self): i32 { 101 } }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        impl Foo with Tag { }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#,
+        "101\n",
+    );
+}
+
+/// §13.2 row 16, correct before B73 and still correct: a blanket that declares
+/// NOTHING contributes no candidate, so the specific impl's own declaration is
+/// what runs. R3's new inherited-default candidates must not disturb it — the
+/// trait here has no default body to inherit.
+#[test]
+fn b73_a_blanket_declaring_nothing_leaves_the_specific_impl_alone() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Foo { n: i32 }
+
+        impl type T with Tag { }
+
+        impl Foo with Tag { fun tag(self): i32 { 7 } }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#,
+        "7\n",
+    );
+}
+
+/// §13.2 rows 21–22, closed by R3 — one program, two answers, which is the
+/// sharpest argument for ranking rather than refusing. The direct call resolved
+/// through the analyzer's `compare_type` filter, where the blanket matches
+/// everything and sorted first, and printed `1`; the bounded call re-dispatches
+/// through the transformer's `nominal_matches`, where a generic subject matches
+/// nothing, and printed `7`. Half the compiler already preferred the specific
+/// impl; R3 is the analyzer agreeing with it. `Tag` takes no arguments, so this
+/// is the shape R1/R2 cannot reach — one home, two impls, ranked.
+#[test]
+fn b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins() {
+    let direct = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Foo { n: i32 }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        impl Foo with Tag { fun tag(self): i32 { 7 } }
+
+        fun main() { print(Foo { n = 1 }.tag()); }
+        "#;
+    let through_a_bound = r#"
+        import std::print;
+
+        trait Tag { fun tag(self): i32; }
+
+        struct Foo { n: i32 }
+
+        impl type T with Tag { fun tag(self): i32 { 1 } }
+
+        impl Foo with Tag { fun tag(self): i32 { 7 } }
+
+        fun show<T: Tag>(x: T): i32 { x.tag() }
+
+        fun main() { print(show(Foo { n = 1 })); }
+        "#;
+    assert_compiles_and_runs(direct, "7\n");
+    assert_compiles_and_runs(through_a_bound, "7\n");
+}
+
+// --- A25: remote sources — subscribe by demand, unsubscribe at zero ---------
+//
+// RATIFIED 2026-08-19 and shipped (`vilan/proposal/remote-sources.md` §2, §5,
+// §8). Every observing path on a `RemoteSource` takes a COUNTED lease: the
+// 0→1 transition sends `Subscribe` (eagerly — the server's immediate
+// current-value `Update` is how the mirror seeds), the 1→0 transition sends
+// `Unsubscribe` (deferred to the turn's settle via `at_settle`, so a
+// same-turn re-subscribe cancels it and a dispose-and-rebuild re-render
+// churns no frames). `get`/`status` are passive; `map`/`or` confront the
+// `Option` once and ride the ambient owner.
+//
+// Before A25, the client's only control frame builder was `encode_control`
+// and both its call sites passed `"Subscribe"`: nothing ever constructed an
+// `Unsubscribe`, the server's `stop` was unreachable, and `RemoteSource::sub`
+// handed back the LOCAL cache's `Subscription` — disposing it stopped the
+// observer, never the channel. The "before" comments on pins A–C record what
+// each program printed then, so none of them is vacuous.
+//
+// The harness is a frame-logging relay between two `duplex_pair` ends: every
+// frame is printed before it is forwarded — the cheapest wire tap the tree
+// allows, and the first place the suite observes a reactive frame at all.
+
+/// §1.1 — the headline. Before A25 the last line was `down {"Update":[0,2]}`:
+/// the server kept forwarding to a client that had disposed its only
+/// subscription, and `remote.get()` afterwards still read `Some(2)`. Under
+/// the count, the 1→0 transition sends `Unsubscribe` (inline here: no
+/// ambient turn) and the post-dispose `set` puts nothing on the wire at all.
+#[test]
+fn a25_disposing_the_last_remote_subscription_sends_unsubscribe() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            // A logging relay between the two ends: client <-> spy <-> server.
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(0);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let watching = remote.sub(|_n| {});
+            counter.set(1);
+            watching.dispose();
+            counter.set(2);
+        }
+        "#,
+        "up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,0]}\n\
+         down {\"Update\":[0,1]}\n\
+         up   {\"Unsubscribe\":0}\n",
+    );
+}
+
+/// §1.2 — the defect that fell out of the same probe. Before A25
+/// `ReactiveServer::start` pushed a NEW live forward per `Subscribe`, and
+/// `RemoteSource::sub` sent one on EVERY call, so two local watchers opened two
+/// server-side forwards on one channel: this printed ten lines — `A sees 1`
+/// twice (B's `Subscribe` re-delivered the current value to A), then `A sees
+/// 2` / `B sees 2` twice (two Update frames), and `A sees 3` twice even after
+/// B disposed, because the dispose closed nothing. Under the count a second
+/// `sub` sends no frame at all when the count is already ≥1, and B's dispose
+/// (2→1) sends none either.
+#[test]
+fn a25_a_second_watcher_opens_no_second_server_forward() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(0);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let first = remote.sub(|n| print(i"A sees {n}"));
+            counter.set(1);
+            let second = remote.sub(|n| print(i"B sees {n}"));
+            counter.set(2);
+            second.dispose();
+            counter.set(3);
+            first.dispose();
+        }
+        "#,
+        "A sees 0\n\
+         A sees 1\n\
+         B sees 1\n\
+         A sees 2\n\
+         B sees 2\n\
+         A sees 3\n",
+    );
+}
+
+/// §3 — the server's half of §1.2, independent of the client: `start` is
+/// idempotent. A raw client that says `Subscribe` twice on one channel gets
+/// ONE forward (one `Update` per change, no re-seed for the duplicate), and
+/// one `Unsubscribe` stops it. Before A25 the second `Subscribe` opened a
+/// second forward: `down {"Update":[0,0]}` twice, then `down
+/// {"Update":[0,1]}` twice.
+#[test]
+fn a25_a_second_subscribe_frame_opens_no_second_forward() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveServer, duplex_pair, encode_control };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(0);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            client_end.on_frame(|frame| print(i"down {text_of(frame)}"));
+            client_end.send(encode_control(json_codec(), "Subscribe", channel));
+            client_end.send(encode_control(json_codec(), "Subscribe", channel));
+            counter.set(1);
+            client_end.send(encode_control(json_codec(), "Unsubscribe", channel));
+            counter.set(2);
+            print("done");
+        }
+        "#,
+        "down {\"Update\":[0,0]}\n\
+         down {\"Update\":[0,1]}\n\
+         done\n",
+    );
+}
+
+/// §2a — the case the deferral buys: `sub` + `dispose` + `sub` inside ONE
+/// turn is exactly one `Subscribe` and no `Unsubscribe`. The first `sub`
+/// sends its `Subscribe` eagerly (the value lands, A fires); the dispose
+/// (1→0) marks the mirror closing and defers the `Unsubscribe` to the turn's
+/// settle; the second `sub` (0→1) finds the close pending, cancels it, and
+/// sends nothing — the channel never closed server-side. After the settle
+/// the channel is still live: the `set` reaches B.
+#[test]
+fn a25_a_same_turn_resubscribe_cancels_the_pending_unsubscribe() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::{ Signal, batch };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(0);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            batch(|| {
+                let first = remote.sub(|n| print(i"A sees {n}"));
+                first.dispose();
+                let _second = remote.sub(|n| print(i"B sees {n}"));
+            });
+            print("settled");
+            counter.set(1);
+        }
+        "#,
+        "up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,0]}\n\
+         A sees 0\n\
+         B sees 0\n\
+         settled\n\
+         down {\"Update\":[0,1]}\n\
+         B sees 1\n",
+    );
+}
+
+/// §2a/§3 — a pending close cannot cross a rebind. The last lease goes inside
+/// a turn (the `Unsubscribe` is owed, deferred to settle); a reconnect lands
+/// in the same turn and `rebind`s the mirror to a fresh channel. The pending
+/// close named the OLD channel on a dead connection, so `rebind` drops it:
+/// nothing flushes at settle (without the clear, the flush would send
+/// `{"Unsubscribe":99}` — the NEW channel's id — before `settled`). Nothing
+/// is watched, so the rebind sends no `Subscribe` either; the next `sub`
+/// subscribes on the new channel and its dispose closes it.
+#[test]
+fn a25_a_pending_unsubscribe_does_not_cross_a_rebind() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::{ Signal, batch };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair, encode_control };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(0);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            batch(|| {
+                let watching = remote.sub(|n| print(i"sees {n}"));
+                watching.dispose();
+                remote.rebind(99, encode_control(json_codec(), "Subscribe", 99));
+            });
+            print("settled");
+            let again = remote.sub(|n| print(i"sees {n}"));
+            again.dispose();
+        }
+        "#,
+        "up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,0]}\n\
+         sees 0\n\
+         settled\n\
+         up   {\"Subscribe\":99}\n\
+         sees 0\n\
+         up   {\"Unsubscribe\":99}\n",
+    );
+}
+
+/// §2a — `Subscription.release` runs ONCE. A counted subscription disposed by
+/// hand and then again by the owner it was taken into decrements a single
+/// time: with `second` still watching, the count is 1 after both disposes,
+/// and only `second`'s own dispose closes the channel. A double decrement
+/// would put the `Unsubscribe` before `owner disposed`.
+#[test]
+fn a25_a_counted_subscription_releases_its_lease_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::{ Owner, Signal };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| spy_client.send(frame));
+
+            let counter: Signal<i32> = Signal::new(0);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let owner = Owner::new();
+            let first = owner.take(remote.sub(|_n| {}));
+            let second = remote.sub(|_n| {});
+            first.dispose();
+            print("first disposed by hand");
+            owner.dispose();
+            print("owner disposed");
+            second.dispose();
+            print("second disposed");
+        }
+        "#,
+        "up   {\"Subscribe\":0}\n\
+         first disposed by hand\n\
+         owner disposed\n\
+         up   {\"Unsubscribe\":0}\n\
+         second disposed\n",
+    );
+}
+
+/// §2b/§2c/§2d — the ratified surface, in one program. Before A25 this did
+/// not compile: "cannot find 'Status' in the imported path" and
+/// "RemoteSource<i32> has no method 'map'". It pins four things at once:
+/// `status()` is passive (it reads `Waiting` with no frame on the wire and
+/// needs no owner); `map` carries a fallback of a DIFFERENT type than `T`
+/// (`str` from an `i32` mirror); the count rides ownership (one `Subscribe`
+/// when the scope's `map` takes its lease, one `Unsubscribe` when the scope
+/// is disposed); and the owner-coverage fence propagates through a plain call
+/// — `label` is one function call down from `owner_scope.run` and compiles,
+/// where the same call outside any scope is a hard error (the next pins).
+#[test]
+fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::option::Option::{ None, Some, self };
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, Status, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        // One plain call down from the scope — coverage propagates here.
+        fun label(mirror: RemoteSource<i32>): Signal<str> {
+            mirror.map(|value| match value {
+                Some(let n) => i"{n}",
+                None => "Loading...",
+            })
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            // Passive: no lease, no owner, no frame.
+            match remote.status().get() {
+                Status::Waiting => print("status = Waiting"),
+                Status::Ready => print("status = Ready"),
+            }
+
+            let scope = Owner::new();
+            let text = owner_scope.run(scope, || label(remote));
+            print(i"text = {text.get()}");
+            counter.set(8);
+            print(i"text = {text.get()}");
+            scope.dispose();
+            counter.set(9);
+            print(i"text = {text.get()}");
+        }
+        "#,
+        "status = Waiting\n\
+         up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,7]}\n\
+         text = 7\n\
+         down {\"Update\":[0,8]}\n\
+         text = 8\n\
+         up   {\"Unsubscribe\":0}\n\
+         text = 8\n",
+    );
+}
+
+/// §2b — `map` requires an ambient owner, statically: a network subscription
+/// must have an owner, and `get_owner()` inside `map` is a strict context
+/// read, so calling it from `main` (the run-less root) is the coverage error.
+#[test]
+fn a25_map_outside_an_owner_scope_is_a_compile_error() {
+    assert_fails_with(
+        r#"
+        import std::json::json_codec;
+        import std::option::Option::{ None, Some, self };
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.map(|value| match value {
+                Some(let n) => i"{n}",
+                None => "Loading...",
+            });
+            print(text.get());
+        }
+        "#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// §2c — `or` IS `map`, so it carries the same law: no owner, no compile.
+#[test]
+fn a25_or_outside_an_owner_scope_is_a_compile_error() {
+    assert_fails_with(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.or(0);
+            print(text.get());
+        }
+        "#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// E74 (diagnostics-standard A2): §2b's fence anchors at the USER'S `map`
+/// call — the strict read it trips sits in std (`get_owner`, reached from
+/// `RemoteSource::map`), which is where the diagnostic anchored before the
+/// walk-back; the std read is now the C3 note.
+#[test]
+fn e74_a25_map_anchors_at_the_users_call() {
+    let source = r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.map(|value| "seen");
+            print(text.get());
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        r#"remote.map(|value| "seen")"#,
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+}
+
+/// E74, §2c's shape: `or` IS `map`, so the walk-back crosses TWO std frames
+/// (`or` → `map` → `get_owner`) and still lands on the user's `.or` call.
+#[test]
+fn e74_a25_or_anchors_at_the_users_call() {
+    let source = r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let counter: Signal<i32> = Signal::new(7);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let text = remote.or(0);
+            print(text.get());
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "remote.or(0)",
+        "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_only_failure_noting_into_std(
+        source,
+        "without an enclosing `run`",
+        "the read is inside `get_owner` here",
+    );
+}
+
+/// §2c — `or` reads `initial` before the first frame and the mirrored value
+/// after. Over an in-process transport the server's seed `Update` lands
+/// synchronously on `Subscribe`, so the relay HOLDS upstream frames until the
+/// program releases them: `or` is read with the `Subscribe` still in hand
+/// (`(pending)`), then the frame goes through and the derived signal follows
+/// the cache — the seed, then a later change. The scope's dispose sends the
+/// `Unsubscribe` (held too, so it prints but never reaches the server).
+#[test]
+fn a25_or_reads_the_initial_before_the_first_frame_and_the_value_after() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::shared::Shared;
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            let held: Shared<List<Frame>> = Shared::new([]);
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)} (held)");
+                held.write().push(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let title: Signal<str> = Signal::new("hello");
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(title);
+            let remote: RemoteSource<str> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let scope = Owner::new();
+            let shown = owner_scope.run(scope, || remote.or("(pending)"));
+            print(i"before the first frame: {shown.get()}");
+            for frame in held.read() {
+                spy_server.send(frame);
+            }
+            print(i"after the first frame: {shown.get()}");
+            title.set("hello again");
+            print(i"after a change: {shown.get()}");
+            scope.dispose();
+        }
+        "#,
+        "up   {\"Subscribe\":0} (held)\n\
+         before the first frame: (pending)\n\
+         down {\"Update\":[0,\"hello\"]}\n\
+         after the first frame: hello\n\
+         down {\"Update\":[0,\"hello again\"]}\n\
+         after a change: hello again\n\
+         up   {\"Unsubscribe\":0} (held)\n",
+    );
+}
+
+/// §2b — two `map`s under one owner take ONE lease each on one count: one
+/// `Subscribe` for both (the second finds the count at 1 and sends nothing),
+/// both derived signals follow the mirror, and the owner's dispose releases
+/// both leases — one `Unsubscribe`, after which neither moves.
+#[test]
+fn a25_two_maps_under_one_owner_take_one_subscribe() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::option::Option::{ None, Some, self };
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(1);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let scope = Owner::new();
+            let (doubled, label) = owner_scope.run(scope, || {
+                let doubled = remote.map(|value| match value {
+                    Some(let n) => n * 2,
+                    None => 0,
+                });
+                let label = remote.map(|value| match value {
+                    Some(let n) => i"n={n}",
+                    None => "n=?",
+                });
+                (doubled, label)
+            });
+            print(i"{doubled.get()} {label.get()}");
+            counter.set(2);
+            print(i"{doubled.get()} {label.get()}");
+            scope.dispose();
+            counter.set(3);
+            print(i"{doubled.get()} {label.get()}");
+        }
+        "#,
+        "up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,1]}\n\
+         2 n=1\n\
+         down {\"Update\":[0,2]}\n\
+         4 n=2\n\
+         up   {\"Unsubscribe\":0}\n\
+         4 n=2\n",
+    );
+}
+
+/// §2d — the honest sentence, pinned: a `status` observer ALONE puts nothing
+/// on the wire and stays `Waiting` through a server-side change, because
+/// `status` reports and does not ask — the channel was never opened. Only a
+/// real observer (`sub`) subscribes; then the cache fills and `status`
+/// follows it to `Ready`.
+#[test]
+fn a25_status_alone_opens_nothing_and_stays_waiting() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::Signal;
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, Status, duplex_pair };
+        import std::wire::Frame;
+
+        fun text_of(frame: Frame): str {
+            match frame {
+                Frame::Text(let text) => text,
+                Frame::Binary(let _bytes) => "<binary>",
+            }
+        }
+
+        fun describe(status: Status): str {
+            match status {
+                Status::Waiting => "Waiting",
+                Status::Ready => "Ready",
+            }
+        }
+
+        fun main() {
+            let (client_end, spy_client) = duplex_pair();
+            let (spy_server, server_end) = duplex_pair();
+            spy_client.on_frame(|frame| {
+                print(i"up   {text_of(frame)}");
+                spy_server.send(frame);
+            });
+            spy_server.on_frame(|frame| {
+                print(i"down {text_of(frame)}");
+                spy_client.send(frame);
+            });
+
+            let counter: Signal<i32> = Signal::new(1);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(counter);
+            let remote: RemoteSource<i32> = ReactiveClient::new(client_end, json_codec()).source(channel);
+
+            let watching_status = remote.status().sub(|status| print(i"status: {describe(status)}"));
+            counter.set(2);
+            print(i"after a change: {describe(remote.status().get())}");
+            let watching = remote.sub(|n| print(i"sees {n}"));
+            watching.dispose();
+            watching_status.dispose();
+        }
+        "#,
+        "status: Waiting\n\
+         after a change: Waiting\n\
+         up   {\"Subscribe\":0}\n\
+         down {\"Update\":[0,2]}\n\
+         status: Ready\n\
+         sees 2\n\
+         up   {\"Unsubscribe\":0}\n",
+    );
+}
+
+/// B129 (found by A25's lane; repro'd on v0.30.0): an empty `[]` passed to a
+/// `T`-typed parameter did not take its element type from the receiver's
+/// already-bound `T` — `remote.or([])` on a `RemoteSource<List<Todo>>` gave a
+/// `Signal<List<unknown>>` ("cannot access field 'done' on type any" at the
+/// first use), and `Option<List<Todo>>::unwrap_or([])` lost it the same way.
+/// Fixed in the analyzer's empty-list arm: the literal's element slot grounds
+/// from the expectation (`List<E>`, `E` fully determined). This pin asserts
+/// the UNANNOTATED `or([])` with the element reaching field access.
+///
+/// The pin's ORIGINAL body consumed `items` through a second
+/// `items.map(|list| ..)` — which stacks a SECOND, independent gap on top of
+/// B129's: a `.map` on a `let`-bound signal freezes its closure parameter
+/// before the receiver's binding lands (B125/P21's solver-ordering family;
+/// it reproduces with a NON-empty initial and no `[]` anywhere, so it was
+/// never B129's). That shape is pinned separately below,
+/// `b129_a_map_on_a_let_bound_signal_types_its_closure_parameter`, still
+/// ignored; this body consumes the mirror through `get()` instead.
+#[test]
+fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::json::json_codec;
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        [derive(Wire, PartialEq, Debug)]
+        struct Todo { id: i32, done: bool }
+
+        fun open_count(remote: RemoteSource<List<Todo>>): i32 {
+            let items = remote.or([]);
+            let list = items.get();
+            mut open = 0;
+            for todo in list {
+                if !todo.done {
+                    open += 1;
+                }
+            }
+            open
+        }
+
+        fun main() {
+            let (client_end, server_end) = duplex_pair();
+            let todos: Signal<List<Todo>> = Signal::new([Todo { id = 1, done = false }, Todo { id = 2, done = true }]);
+            let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
+            let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
+            let scope = Owner::new();
+            print(owner_scope.run(scope, || open_count(remote)));
+            scope.dispose();
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// B129: `unwrap_or([])` on an `Option<List<Note>>` — the same shape without
+/// any reactive machinery. The receiver binds the impl's `T` to `List<Note>`;
+/// the empty argument grounds its element slot from it, so the result
+/// iterates and reaches fields on BOTH sides of the option.
+#[test]
+fn b129_unwrap_or_of_an_empty_list_takes_the_element_from_the_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{ Option, Some, None };
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun open_count(maybe: Option<List<Note>>): i32 {
+            let notes = maybe.unwrap_or([]);
+            mut open = 0;
+            for note in notes {
+                if !note.done {
+                    open += 1;
+                }
+            }
+            open
+        }
+
+        fun main() {
+            print(open_count(None));
+            print(open_count(Some([Note { id = 1, done = false }, Note { id = 2, done = true }])));
+        }
+        "#,
+        "0\n1\n",
+    );
+}
+
+/// B129 family, match-arm result position: a `None => []` leg takes its
+/// element type from the sibling leg's `List<Note>` through the match's leg
+/// unification, and the merged value reaches fields. (This shape already
+/// worked before the B129 fix — the legs unify — and is pinned so it stays
+/// working; the empty leg's OWN slot grounding is the previous pins'.)
+#[test]
+fn b129_a_none_arm_empty_list_takes_the_type_from_the_sibling_arm() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{ Option, Some, None };
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun open_count(maybe: Option<List<Note>>): i32 {
+            let notes = match maybe {
+                Some(let list) => list,
+                None => [],
+            };
+            mut open = 0;
+            for note in notes {
+                if !note.done {
+                    open += 1;
+                }
+            }
+            open
+        }
+
+        fun main() {
+            print(open_count(None));
+            print(open_count(Some([Note { id = 1, done = false }])));
+        }
+        "#,
+        "0\n1\n",
+    );
+}
+
+/// B129, match-arm result position under a DECLARED return type: when every
+/// leg is an empty `[]`, no sibling leg can supply the element — the
+/// function's declared `List<Note>` is the expectation that reaches the legs
+/// (`expected_types` flows into each leg body), and the returned list pushes
+/// and reads as `List<Note>`. A guard pin: the declared return type carries
+/// this shape with or without the slot grounding (planting the B129 fix out
+/// leaves it green), so it pins the flow, not the fix.
+#[test]
+fn b129_a_match_of_only_empty_lists_takes_the_declared_return_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun fallback(flag: bool): List<Note> {
+            match flag {
+                true => [],
+                false => [],
+            }
+        }
+
+        fun main() {
+            mut notes = fallback(true);
+            notes.push(Note { id = 7, done = false });
+            print(notes[0].id);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// B129 negative: an empty `[]` with NO expected type anywhere is still the
+/// ambiguity it always was, with the same message — the grounding only fires
+/// under a determined `List<E>` expectation.
+#[test]
+fn b129_an_empty_list_with_no_expected_type_still_errors() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+            let things = [];
+            print(things[0]);
+        }
+        "#,
+        "its element type is never determined",
+    );
+}
+
+/// B129 negative: an empty `[]` bound to a FREE generic (`head<T>(xs:
+/// List<T>)` with nothing else fixing `T`) must not ground — `T` stays
+/// abstract and a field access on it errors as before. A fully determined
+/// expectation is the grounding's precondition; an abstract one defers.
+#[test]
+fn b129_an_empty_list_argument_binding_a_free_generic_still_errors() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        [derive(PartialEq, Debug)]
+        struct Note { id: i32, done: bool }
+
+        fun head<T>(xs: List<T>): T {
+            xs[0]
+        }
+
+        fun main() {
+            print(head([]).id);
+        }
+        "#,
+        "cannot access field 'id' on type T",
+    );
+}
+
+/// The OTHER gap the original A25 pin's body carried, isolated: a `.map` on a
+/// `let`-bound signal freezes its closure parameter before the receiver's
+/// binding lands, so the parameter types as `any` and a field access on the
+/// element fails — with a NON-empty initial and no `[]` anywhere, so it is
+/// not B129's. Inlining the chain (`Signal::new(..).map(..)` in one
+/// expression) works; only the intermediate unannotated `let` trips it. This
+/// is B125/P21's solver-ordering family (the binding is read one level out,
+/// after the closure is already inferred — analyzer.rs's own P21 comment in
+/// the closure arm); it stays ignored until that design lands. Annotating the
+/// `let` sidesteps it, which is what the examples and docs do.
+#[test]
+#[ignore = "analyzer: a `.map` on a let-bound signal freezes its closure parameter before the receiver's binding lands — B125/P21 solver-ordering family, editing-dx.md §16; found isolating B129"]
+fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        [derive(PartialEq, Debug)]
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+            let scope = Owner::new();
+            let n = owner_scope.run(scope, || {
+                let items = Signal::new([Todo { id = 1, done = false }]);
+                let remaining: Signal<i32> = items.map(|list| {
+                    mut open = 0;
+                    for todo in list {
+                        if !todo.done {
+                            open += 1;
+                        }
+                    }
+                    open
+                });
+                remaining.get()
+            });
+            print(n);
+            scope.dispose();
+        }
+        "#,
+        "1\n",
+    );
 }

@@ -68,9 +68,8 @@ synchronous too), and there is no connection pool to manage.
 
 ## Serving http: `std::http`
 
-For an rpc app, `serve_service` (from the [services guide](services.md))
-owns the port, and you only supply the http **fallback** for plain
-requests. The plain server underneath is usable on its own too:
+Every server in vilan is a `Server::builder()` chain — a port, a handler,
+and `start()`:
 
 ```vilan,norun
 import std::print;
@@ -95,20 +94,41 @@ fun main() {
 }
 ```
 
-`Request` gives you `path()`, `method()`, and `body()`. Responses come
-from a builder: `.code(i32)` (200 by default),
-`.set_header(name, value)`, `.body(str)`, `.build()`.
+`Request` gives you `path()`, `method()`, and `body()` (`bytes()` for a
+binary POST). Responses come from a builder: `.code(i32)` (200 by
+default), `.set_header(name, value)`, `.body(str)`, `.build()`.
 
-Here is the standard full-stack fallback. `build_handler` serves the
-client leg's own artifacts — the bundle, its stylesheet, any route chunks
-— and your closure answers *every other path* with the HTML shell, so deep
-links load (see [Routing](routing.md)):
+A full-stack server adds two more links to that chain, and neither of them
+names a file. **`serve_build`** installs one route per artifact the client
+leg's build actually wrote — the bundle, the stylesheet if the leg emitted
+one, every route chunk — and **`with_service`** installs an rpc service's
+routes and its WebSocket handshake. Both answer *before* `on_request`,
+whatever order you wrote the chain in, so your own handler still gets
+every path they do not claim and deep links keep working (see
+[Routing](routing.md)):
 
-```vilan,fragment
-build_handler(require_build("client"), |request| {
-	Response::builder().set_header("Content-Type", "text/html").body(app_html).build()
-})
+```vilan,norun
+import std::build::require_build;
+import std::document::require_shell;
+import std::http::{ Response, Server };
+
+async fun main() {
+	let build = require_build("client");
+	let page = require_shell("src/app.html", build).html();
+
+	Server::builder()
+		.port(8080)
+		.serve_build(build)         // /client.js, /client.css, every chunk
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.build()
+		.start();
+}
 ```
+
+Renaming the leg, adding a stylesheet, or turning `split = true` on needs
+no edit here: the build says what it emitted and the server believes it.
+An rpc app adds `.with_service(Service::new(protocol))` to the same chain
+— [Services & RPC](services.md#the-server-side) has it whole.
 
 ## Files: `std::fs`
 
@@ -116,11 +136,26 @@ build_handler(require_build("client"), |request| {
 fun exists(path: str): bool                 // sync — boot code can branch on it
 fun read_file_to_str(path: str): str        // async (implicitly awaited), UTF-8
 fun read_file_to_str_sync(path: str): str   // sync — for a callback that can't suspend
+fun read_file_encoded(path: str, encoding: str): str   // async — any host encoding
+fun read_bytes(path: str): Bytes            // async — the true binary read
 fun write_file(path: str, contents: str)    // async
+fun read_dir(path: str): List<str>          // async — entry names, flat
+fun stat(path: str): Option<Stat>           // async — None if the path isn't there
 ```
 
-The typical server reads the client bundle and shell into memory once at
-boot, then serves from the strings.
+`read_bytes` is what serves an image, a font or a favicon: the host's
+buffer binds to `Bytes` with no decode in between. `read_dir` lists a
+directory's immediate entries by name — flat and unordered, so call `stat`
+per entry when you need file-vs-directory. `stat` reads `size`,
+`modified_at_ms` (epoch millis) and `is_directory`, and is the one read
+here that answers `None` instead of throwing on a missing path: it exists
+for a caller asking "is this here yet". Full signatures:
+[the process reference](../std/process.md#stdfs).
+
+What a server does *not* read by hand any more is its own build.
+`serve_build` knows the bundle's name, the stylesheet's, and every chunk's,
+so the boot reads and the content-type table that used to live here are
+gone.
 
 ## The process: `std::process`
 
@@ -143,12 +178,24 @@ The boot sequence of a full-stack server, in order:
 
 1. `Database::open`, then `exec` the schema
    (`CREATE TABLE IF NOT EXISTS …`).
-2. Load the mirrored state from SQLite into the service's signals.
-3. Wire the service's handlers to statements. Write SQL first, then
+2. `require_build("client")` — ask the client leg's build what it emitted.
+3. `require_shell("src/app.html", build)` — hold your page against that
+   build ([SSR](ssr.md), [Styling](styling.md#getting-the-stylesheet-onto-the-page)).
+   `Document::of(build)` writes the page from the build instead, if you
+   would rather not keep a shell at all.
+4. Load the mirrored state from SQLite into the service's signals.
+5. Wire the service's handlers to statements. Write SQL first, then
    update the signal (the mirror broadcasts the signal).
-4. `fs::read_file_to_str` the client bundle and shell.
-5. `serve_service(port, protocol, fallback, on_ready)`.
+6. `Server::builder()` with `serve_build(build)`, a `with_service(…)` if
+   the app speaks rpc, your `on_request` fallback, and `start()`.
 
-The ordering inside step 3 matters. Persist first, then update the
-signal. That way a crash between the two can never broadcast state that
-was never stored.
+Steps 2 and 3 both **refuse rather than degrade**, and that is why they
+belong at boot. A leg that was never built and a page whose stylesheet
+`<link>` went missing are not conditions to discover one request at a
+time: the first would 404 every asset for the life of the process, the
+second renders unstyled and entirely correct-looking. Each stops the
+server instead, naming the file and the leg.
+
+The ordering inside step 5 matters for its own reason. Persist first, then
+update the signal. That way a crash between the two can never broadcast
+state that was never stored.

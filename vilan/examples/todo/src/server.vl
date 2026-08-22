@@ -1,27 +1,47 @@
 // The server: boots the one authoritative `TodoStore` (which owns its own
-// persistence — see `store.vl`), serves the browser leg's build, and mounts the
-// store's generated dispatcher on a connected server
-// (`std::rpc_server::serve_service`) — `POST /rpc` carries the client's
-// calls, and each session's SSE stream (`GET /events`) carries the list's
-// changes out to every subscribed tab.
+// persistence — see `store.vl`), serves the browser leg's build, writes the
+// page that loads it, and installs the store's generated dispatcher as a
+// service on the same builder (`ServerBuilder::with_service`) — `POST /rpc`
+// carries the client's calls, and each session's SSE stream (`GET /events`)
+// carries the list's changes out to every subscribed tab. One chain, three
+// claims on the port: the service's routes, the build's artifacts, and the
+// page for everything else.
 
 import std::build::require_build;
-import std::fs;
-import std::http::{ Response, build_handler };
+import std::document::Document;
+import std::http::{ Response, Server };
 import std::json::json_codec;
 import std::print;
-import std::rpc_server::serve_service;
+import std::rpc_server::Service;
 import pkg::store::boot;
 
 async fun main() {
 	// What the build wrote for the browser leg: the bundle, and the stylesheet
 	// its `const` styles emitted. Nothing here names a file or a content type —
-	// `build_handler` installs one route per artifact in front of the page.
+	// `serve_build` installs one route per artifact in front of the page.
 	let build = require_build("client");
-	let app_html = fs::read_file_to_str("src/app.html");
+	// The page, written FROM that build rather than read from a file: the
+	// `<link>`, the `<script>` and the mount `<div id>` are all derived from
+	// what the build emitted, so they cannot disagree with the artifacts they
+	// name. There is no `src/app.html` in this example — `body` carries the one
+	// line of markup that is this app's own. (`require_shell("src/app.html",
+	// build)` is the other rung: your markup, checked against the build at
+	// every boot — what `examples/walkthrough` and the `vilan init` scaffold
+	// ship.)
+	let page = Document::of(build)
+		.title("Vilan todos")
+		.body("<p style=\"opacity:0.6;font-size:0.875rem\">The list lives on the server — open this page in a second tab and watch them stay in sync.</p>")
+		.html();
 
 	// Reload, seed ids, subscribe persistence — the store's own lifecycle.
 	let store = boot();
 
-	serve_service(59386, store.dispatcher().into_protocol(json_codec()), build_handler(build, |request| Response::builder().set_header("Content-Type", "text/html").body(app_html).build()), |server| print(i"todo server: {server.url()} — open it in two tabs"));
+	Server::builder()
+		.port(59386)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_start(|server| print(i"todo server: {server.url()} — open it in two tabs"))
+		.build()
+		.start();
 }

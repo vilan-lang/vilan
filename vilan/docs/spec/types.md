@@ -274,19 +274,32 @@ it defaults to (`with Combine` is `with Combine<Bag>` on subject `Bag`).
 A trait parameterized differently is a different implementation:
 `impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` both stand.
 
-*Implementation note (tracked): the rule refuses only exact repeats, not
-OVERLAP. A blanket impl and a specific one that both match a type — the
-`impl type T with Into<T>` of `std::into` beside a type's own `Into` impl,
-or two conditional impls with different bounds — are accepted, and which
-one a call selects is still decided by declaration order. A specificity
-rule is owed.*
+The rule refuses exact repeats, not OVERLAP: a blanket impl and a specific
+one that both match a type — `std::into`'s `impl type T with Into<T>`
+beside a type's own `Into` impl, or two conditional impls with different
+bounds — both stand, and a call is answered by the **more specific** of
+them, never by whichever was declared first. More specific means, in
+order: the impl whose subject pattern the other's matches and not
+conversely (`Box<i32>` and `Box<List<i32>>` over `Box<type T>`, and any
+named type over a bare `type T`), then — for subjects of the same shape —
+the impl whose binders carry the stronger bounds (`Box<type T: Display>`
+over `Box<type T>`). The winner brings its own member, which may be the
+trait's default body where it declares none.
 
-*Implementation note (soundness gap, tracked): a conditional impl's
-bounds are not yet re-checked when the impl is selected through a
-GENERIC bound: `List<B>` can satisfy a `Marker` bound via
-`impl List<type T: Marker>` even when `B` lacks `Marker`. Derive-based
-checks (`Wire`, `Json`) therefore verify field trees syntactically rather
-than through trait bounds.*
+Two impls that neither subsumes the other — `Box<type T: Display>` and
+`Box<type U: Ord>` for a `Box<i32>` that satisfies both — are not ranked.
+They are legal to write, and a call that reaches both is reported at the
+call site; narrowing one subject is the fix.
+
+Which trait *instantiation* a call means is decided before specificity is
+consulted: `impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` are two
+implementations, so `bag.into()` is answered by the one whose result fits
+the type the call site expects (`let cup: Cup = bag.into()`). A call with
+no such expectation, or one that fits both or neither, is reported rather
+than resolved.
+
+*Implementation note (tracked): derive-based checks (`Wire`, `Json`)
+verify field trees syntactically rather than through trait bounds.*
 
 ## 5.5 Traits
 
@@ -549,10 +562,12 @@ Normative rejection cases (each is a compile error):
   literal).
 
 *Implementation note (tracked gaps): a closure bound to a local and
-called directly does not infer its parameter types from the call;
+called directly does not infer its parameter types from the call, and
 `effect`'s unannotated closure parameter can type against the impl's
-abstract `T` (B23); and a closure passed to a **method's** own generic
-parameter reaches its body with that parameter still abstract, so a
-pattern inside it is not checked at all — the free-function twin
-substitutes and is. Each has a pinned test; the workaround is an
-annotation or a binding.*
+abstract `T` (B23). Each has a pinned test; the workaround is an
+annotation or a binding. (A closure passed to a method's own generic
+parameter was a third such gap — its body reached the checker with the
+parameter still abstract, so a pattern inside it was not checked at all.
+Both call paths now bind from the non-closure arguments and defer before
+typing any closure, so the substitution has landed by the time the body
+is read.)*

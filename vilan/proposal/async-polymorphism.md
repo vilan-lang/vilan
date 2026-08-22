@@ -165,6 +165,30 @@ declared; the newly-legal programs are exactly the ones that were refused.
 - **Externs are implicitly `sync`** for value-returning closure parameters
   (host code cannot await a vilan closure); void extern callbacks keep spawn
   (a `setTimeout` handler that awaits is a spawn, as today).
+
+  > **Narrowed 2026-08-19 (E68)** — the rule's domain is *host boundaries*,
+  > and `Context::run` is not one: it is `external` only as a type-checking
+  > fiction (context.vl's own header says so), and the context threading
+  > pass erases every `run` call it accepts before this check runs. The
+  > only way the check could ever see a `run` call was the error path —
+  > `thread_contexts` refusing its rewrite after reporting a coverage or
+  > `run`-shape error — where judging std's async-into-`run` bodies
+  > (task.vl's nursery, rpc.vl's wire turn) produced spurious host-await
+  > secondaries anchored in std beside the real primary: ANY `owner_scope`
+  > coverage failure, even a bare `Signal::effect` at the top of `main`,
+  > carried them. Both arms of the check (the direct host-boundary loop and
+  > the transitive `extern_violations_at`) now skip the intrinsic by its
+  > recorded id (`Program::context_run_fn_id`). This is not a demotion —
+  > the premise is false for the intrinsic in every reachable state, since
+  > a surviving `run` call implies the context pass already refused and
+  > said why. Real externs are unaffected. Pins:
+  > `e68_an_uncovered_effect_reports_only_the_coverage_primary`,
+  > `e68_a_refused_run_shape_reports_only_the_context_primaries`,
+  > `e68_a_generic_forward_into_run_does_not_cascade_transitively` (all
+  > three verified red pre-fix); the standing extern-misuse pins
+  > (`an_async_closure_into_an_extern_callback_is_refused`,
+  > `an_async_parameter_cannot_launder_into_a_host_callback`) hold the
+  > rule's real domain.
 - **Container elements**: `List<|| T>` element types accept no markers (J2
   record) and calls through elements do not adapt; unchanged, future work.
 
@@ -263,6 +287,61 @@ Scanning every escape position per instance is sound because the report is
 gated on "async **through** these bits and not without them": the bits are the
 callee's own parameter ids and the flags are the component's own members, so a
 position outside the instance cannot pass both halves.
+
+> **Adopted beyond this family (E74, 2026-08-20)** — this origin discipline
+> (primary at the earliest user-written originating call, least entity id;
+> the internal frame demoted to the cross-source C3 note) is now also how
+> the context pass anchors its `owner_scope` coverage refusal when the
+> strict read sits in std: `effect`/`map`/`or` all funnel to `get_owner`'s
+> read in `reactive.vl`, which used to be the primary span. `context.rs`'s
+> `user_entry_of` walks the strictness edges back through unbound callers
+> only — a covered call is never blamed — and anchors at the user's call,
+> with "the read is inside `get_owner` here" as the note. One mechanism,
+> two passes; diagnostics-ledger.md rows 222/223 carry the verdicts.
+>
+> **The walk now keeps its path (E78, 2026-08-20)** — the owner's ask:
+> every uncovered upstream call underlines, so a call can no longer make
+> the error appear "somewhere else entirely" (rust-analyzer's requirement
+> chains are the named prior art). The primary stays exactly where E74 put
+> it (the user-written read for a user-spanned site, the entering call for
+> a std-spanned one); the calls the walk traverses become a **requirement
+> trace** — `Error::trace`, a new channel beside the C3 note whose "one,
+> not a list" contract is untouched — rendered as ariadne sub-labels in
+> the CLI and as `DiagnosticRelatedInformation` (trace first, C3 note
+> last, vector order preserved) in the LSP. The lane's rulings, each
+> pinned (`inference.rs` `e78_*`, `publish.rs` the cross-file wire test):
+>
+> - **Only calls label.** A covered call is clean and stops the trace (the
+>   owner's acceptance example, comments as behavior: `b`'s `a()` and
+>   `main`'s `b()` carry labels, `c`'s `context.run(0, || a())` carries
+>   nothing); capture hops cross silently (no call site to label — the
+>   closure blames its defining scope's callers); std-internal calls are
+>   traversed but never labeled (A2 demotes std frames; the C3 note
+>   already names the std read); a TOP-LEVEL call (`main();`, a module
+>   initializer's call) is a labeled hop like any other.
+> - **Multiple uncovered entries each get their own diagnostic** — own
+>   primary, own chain, own std note — where E74's least-id rule kept only
+>   the first (so fixing it merely revealed the next). The least-id entry
+>   still leads; the rule survives as ordering, not selection. One
+>   dispatch site admitted for several needy candidates is still one entry.
+> - **Order is entry → read**: decreasing breadth-first depth from the
+>   primary's frame (on a many-chains DAG a level order — every hop's own
+>   upstream hop precedes it), ties in call-id (program) order, one label
+>   per call site. The CLI hands ariadne same-file labels in source order
+>   instead (ariadne opens a new windowed section per out-of-order label);
+>   the vector order is the contract and the LSP publishes it verbatim.
+> - **TRACE_CAP = 6**, keeping the ENTRY side — the outermost frames,
+>   where the missing `run` belongs; the read end is always visible as the
+>   primary or its note — with the honest tail "… N more uncovered calls
+>   on this path" anchored at the last kept hop.
+> - **Dispatch hops say "may flow through this call (dispatch may select
+>   a reader)"** — the union-admission residual above, carried into the
+>   label rather than overclaimed.
+>
+> Both flavors (the strict-read refusal and the injected-call one) trace
+> through the same two helpers (`user_entries_of`, `trace_of`).
+> diagnostics-ledger.md rows 240–242 carry the label heads; the E78 entry
+> in the tracker holds the owner's example.
 
 #### The precision residual, named
 

@@ -23,7 +23,7 @@ assumes only that the `vilan` command is on your PATH.
 - **[Specification](spec/)**: the formal definition. Grammar, type
   rules, the memory model, execution. This is the advanced tier. The tour
   teaches; the spec defines; where they disagree, the spec wins.
-- **[Appendix](appendix/)**: the [error index](appendix/errors.md) ("you saw this message, go here"), the [gotchas checklist](appendix/gotchas.md), and the [glossary](appendix/glossary.md).
+- **[Appendix](appendix/)**: the [CLI reference](appendix/cli.md), [the editor](appendix/editor.md) (what the language server gives you), the [error index](appendix/errors.md) ("you saw this message, go here"), the [gotchas checklist](appendix/gotchas.md), and the [glossary](appendix/glossary.md).
 
 ## Where this book lives
 
@@ -56,6 +56,7 @@ vilan/docs` gives you the same site locally with live reload.
 |---|---|
 | [Coming from JavaScript](tour/coming-from-javascript.md) | the three big shifts, a JS→Vilan phrasebook |
 | [Hello Vilan](tour/hello-vilan.md) | installing, the CLI, `vilan.toml`, packages & workspaces, imports |
+| [Projects & dependencies](tour/projects.md) | manifests, workspaces, declaring and resolving dependencies |
 | [Values & types](tour/values-and-types.md) | bindings, primitives & numeric widths, strings & interpolation, tuples, collections |
 | [Functions & closures](tour/functions-and-closures.md) | `fun`, closure types, named-fn coercion, async closures and their seams, context clauses |
 | [Data & traits](tour/data-and-traits.md) | structs, enums, `impl`, generics & bounds, traits, derives |
@@ -96,7 +97,7 @@ vilan/docs` gives you the same site locally with live reload.
 | [rpc](std/rpc.md) | `std::rpc`: transports, clients, frames |
 | [browser](std/browser.md) | `std::dom`, `std::ui`, `std::router`, `std::storage` |
 | [dev / HMR](std/dev.md) | `std::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
-| [process](std/process.md) | db, http, fs, process, rpc_server |
+| [process](std/process.md) | db, http, fs, build, document, process, rpc_server, watch |
 | [misc](std/misc.md) | io, task, promise, context, crypto, jwt, asset |
 
 ### Specification

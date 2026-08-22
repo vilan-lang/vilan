@@ -2194,3 +2194,420 @@ added (§16). The standing `#[ignore]`d pin
 (`missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed`)
 is left exactly as §16 shipped it — untouched, not re-verdicted, not
 touched by any commit in this lane.
+
+### 17.7 B124 — a branch that leaves contributes no tail value — SHIPPED
+
+The live bug §17.2 recorded rather than fixed in passing, root-caused: the
+analyzer already had the whole divergence vocabulary
+(`expr_diverges`/`block_diverges`/`if_diverges`, `analyzer.rs:9455-9483`,
+and `Expr::FunctionReturn(_) | Expr::Jump(_) => Type::Never` in
+`infer_type_path`), and the merges that decide a branching expression's
+type simply never asked it. `infer_type_path`'s `Expr::If` arm collected
+only each branch's TRAILING id and unified those — for a branch ending in
+a bare `ret` that trailing is the parser's synthesized `Expr::Void`,
+control never reaches it, and unifying on it made an exhaustive `if`/`else`
+of `ret`s type as `void` regardless of what the `ret`s carried;
+`resolve_match`'s leg unification had the same hole one level down (each
+leg body is a block whose tail is that same synthesized void), which is why
+a `ret` leg beside a value leg ALSO produced a spurious `match legs have
+mismatched types: expected void, but got str`. The fix collects each `if`
+branch's `(statements, trailing)` pair and contributes `Type::Never` when
+`block_diverges` holds (`analyzer.rs:21825-21875`, with the merge seed
+changed from `Type::Unknown` to `Type::Never` — the merge's identity, since
+`reconcile_type`'s `(Never, _)` arm already YIELDS — so an all-diverging
+`if` types as `never` rather than falling out as `Unknown`), and asks
+`expr_diverges` per leg in `resolve_match` (`analyzer.rs:26984`). Both are
+the existing "`ret`/`jump` never produce a value where they stand" rule
+applied at the two places that merge branch values, not a new one.
+
+The second half is reachability. `check_return_position` now returns
+`Matched` when the body itself diverges, or when the block's last STATEMENT
+does and the synthesized void tail after it is dead code
+(`analyzer.rs:25417`) — which subsumes and deletes §17.2's `ret`-only dedup
+at the walk-time tail-construction site (`analyzer.rs:18220`, now an
+unconditional push). It had to move to resolve time: at walk time a `match`
+is not yet in `expr_id_to_expr_map` (`resolve_match` inserts it), so a
+walk-time question cannot see a body leave through one. Nothing is
+weakened — `expr_diverges` requires EVERY path to leave, so an `if` with no
+`else`, a branch that falls through beside one that `ret`s, and a wrongly
+typed `ret` all still report. One diagnostic improved as bycatch: a live
+branch of the wrong type beside a leaving one now reads `got i32` (the
+branch actually at fault) instead of `got void` (the merge).
+
+Closure return inference is deliberately NOT reopened: ret-checking.md §4
+settled the conservative "make the ret'd value the body's tail" rule
+explicitly to avoid the diverging-tail swamp, so `resolve_closure_returns`
+reads a `Never` tail exactly as it reads a `Void` one
+(`tail_yields_no_value`, `analyzer.rs:26263`) and its guidance is unchanged
+— without that, a closure leaving by BARE `ret`s would have been newly
+rejected for "exiting a closure whose body yields never". What the closure
+shape does lose is the FALSE `Expected str, but got void` that used to
+accompany the guidance.
+
+Pins (`crates/vilan-core/tests/inference.rs`): thirteen for the shapes
+fixed — the plain `if`/`else`, the `else if` chain, the nested form, a bare
+block of `ret`s in tail position, the all-`ret` `match`, the mixed
+`if` and mixed `match`, the `let`-bound diverging `if`, the statement
+spellings of the `if` and the `match`, the async instance, the closure's
+lost cascade, and the closure bare-`ret` boundary — all thirteen
+plant-proven red against the reverted analyzer; four for the negatives
+(`if` with no `else`, a fall-through branch beside a `ret`, a wrongly typed
+branch beside a `ret`, a mistyped `ret` inside an exhaustive `if`/`else`),
+plant-proven red against an over-reaching guard (`if true ||` at
+`check_return_position`'s new check, and the narrowed `tail_yields_no_value`
+for the closure pair). Zero corpus golden movement, docs gate green.
+
+## 18. What shipped — the playground's second field test — completion gaps (E66/E67, 2026-08-18)
+
+Two completion holes the owner hit writing `vilan-playground/todo/src/client.vl`
+and filed as backlog E66 and E67. Both are the same family as §14's E52/E57
+work — completion answering the wrong question mid-edit — but neither is a
+snapshot-mapping bug: the offsets were right, and what was missing was, in one
+case, the type of the thing under the cursor, and in the other, any notion that
+the cursor was inside markup at all. One lane, `e66-e67-completion` off `next`.
+Zero corpus golden movement (`cargo test -p vilan-cli --test corpus`).
+
+### 18.1 E66 — `client.add("blah").|` offered nothing
+
+**The shape.** `client.vl:42`, inside `print(client.add(note_name.get()))`: a
+`.` typed after the call's closing paren offers nothing, where the same `.`
+after a bound name offers that name's members.
+
+**Mechanism.** Not the snapshot, not the closure, not the element — the three
+hypotheses the item raised, all disproved by probe. `Document::completion`'s
+member branch resolves a receiver two ways
+(`crates/vilan-lsp/src/document.rs`, `receiver_nominal_id`): a bare NAME
+through its binding, and anything else through `entity_at` → `hover_label` →
+`nominal_id_by_name`. The second path is the one a call takes, and it cannot
+work, for two compounding reasons:
+
+1. `hover_label` answers a `Expr::Call` with the CALLEE's signature — `make()`
+   labels as `fn make(): Point`, which is what a *hover* wants and what
+   `base_type_name` then reduces to nonsense. The `Expr::Call` arm's own
+   comment says it is a fallback for "when the call's own result type isn't
+   recorded", and it is always taken, because —
+2. `program.expr_types` / `expr_type_ids` hold a type only where one is
+   *produced*. A call is typed ON DEMAND (`Analyzer::infer_type_inner`'s
+   `Expr::Call` arm) and stores nothing on its own expr id — the same silence
+   B85 hit on `for … in` iterables and B70 on tuple elements, both of which
+   were closed by recording the type at the site into a dedicated map.
+
+So a field receiver (`p.x.`) and an index receiver (`xs[0].`) worked all along
+— those DO carry `expr_types` entries — and every call shape did not. Probed
+per shape before the fix: name ✓, field ✓, index ✓, call ✗, chained call ✗,
+call in argument position ✗, block ✗.
+
+**The fix** (LSP-side, general): a receiver's VALUE type gets its own
+resolution, separate from hover's phrasing.
+`Document::expression_type_id` answers from `expr_type_ids` where the analyzer
+recorded one and walks the structure where it did not — a binding through its
+declared type, a **call through its callee's declared return type**
+(`Function::return_type_id` / `ExternalFunction::return_type_id`, or a
+closure-typed callee's result), a block through its trailing expression, with a
+depth bound. `expression_nominal_id` reduces that to the nominal id member
+resolution is keyed by, and `expression_element_nominal_id` is its lifted twin
+(the container's first type argument) for `?.`.
+
+Type ARGUMENTS are deliberately not solved: member completion resolves on the
+nominal head, and the head is written in the declaration. That is why the
+owner's case works — the `[service(Client)]` expansion declares its client
+stubs `: Result<{return}, RpcError>` (`vilan/std/src/rpc.vl` §"The client
+sibling"), so `client.add("blah").` offers `Result`'s members without the
+solver having to have finished.
+
+The old label path is KEPT as the fallback, because it carries one shape the
+structural walk does not: a constructor call (`Some(1).`), which
+`hover_label` answers with the constructed enum. Both are pinned.
+
+**Not broken, found while pinning:** the `?.`-lifted CALL shape
+(`find()?.`) already worked — `first_generic_argument` reads
+`Option<Point>` straight out of the callee signature label. It is pinned
+anyway (the item asked for the shape), and the pin stays green when the new
+resolution is planted out.
+
+### 18.2 E67 — `<div |>` and `<div .|>` offered nothing usable
+
+**Mechanism, part one — no context.** Element syntax is desugared before
+analysis (`crates/vilan-core/src/elements.rs`, hooked at every parse entry), so
+no element node ever reaches `program`; completion had no way to know the
+cursor was between `<div` and `>`. It therefore fell through to the ordinary
+dispatch, which offered — measured — the entire enclosing scope, every
+primitive type name, every keyword and the construct snippets at `<div |>`,
+and nothing at all at `<div .|>`. Every one of those candidates is invalid in a
+head.
+
+**Mechanism, part two — no tree.** `parse_element_head_item`'s chain arm
+consumed the `.` and then required `parse_member_call` to succeed. A dot with
+no name yet declined, `parse_element` declined with it, and `parse_atom`'s
+element recovery flattened the whole tag to a `Node::Error`. Nested — which is
+every real component — the flattening took the ENTIRE statement: probed,
+`<div><span .></span></div>` recovered to nothing at all, because
+`recover_delimited`'s balanced `<…>` scan cannot close over sibling tags.
+
+**Fix, part two first** (`crates/vilan-core/src/parsing.rs`): the dot COMMITS
+the item to the chain form, so a failure after it is a committed production
+failing, and E49's rule for those is to report and carry on rather than
+decline. `parse_element_head_item` now returns `Option<Option<…>>` — the inner
+`None` being "reported, dropped, keep going" — and the bare-dot case emits its
+failure (`found …, expected a method name`) and drops the item. The element
+survives, nested or not; the file still does not compile (the diagnostic
+count is unchanged at one), and `vilan fmt` never sees the truncated head
+because the formatter refuses a tree with parse errors
+(`formatter.rs:768`). The attribute arm is deliberately untouched: a name that
+is not a name (`<div 1 2>`) means "this is not a head item at all", a different
+situation, and the shipped pin `recovers_a_garbled_element_to_an_error_atom`
+still holds it.
+
+**Fix, part one** (`crates/vilan-lsp/src/document.rs`): `in_element_head`
+answers whether a LIVE offset sits in an opening tag, from a raw parse of the
+live text — recognizing both a parsed `Node::Element` and the `<…>`-shaped
+`Node::Error` the recovery still leaves for a tag with no closer yet — and then
+a token walk from the tag name that requires the cursor to be *before the
+head's `>` and at the head's own bracket depth*. The depth clause is the whole
+boundary: the cursor in `<form on:submit(|event| { … })>` is three brackets
+deep inside a head item's ARGUMENT, which is ordinary expression ground and
+E66's answer, not this one. It is also what makes the flattened error node safe
+to read, since that node spans the arguments too.
+
+`element_head_completions` then answers from the desugar's own knowledge:
+
+- `<div .|>` — the `View` type's METHODS, found by resolving what std's
+  `view(tag)` returns (`element_view_nominal_id`), so the browser and process
+  twins each answer for their own platform and the list cannot drift from the
+  `View` the program compiles against. Methods only: a `View` FIELD is not
+  something the desugar can splice into a chain, and an ordinary member
+  completion on the desugared `view("div")` would offer them.
+- `<div |>` — the same methods in their own spelling, **dot included**
+  (undotted `text(…)` is an ATTRIBUTE named "text", a different construct and
+  the one §4's warning exists to catch), plus `on:` as a snippet for the event
+  form. And nothing from scope.
+
+**What is deliberately NOT offered, and why:** an attribute-name vocabulary.
+element-syntax.md §2 and §9 item 3 make the desugar name-blind on purpose —
+`name(x)` lowers to `.attr("name", x)` whatever `name` is, "no special-cased
+names in the lowering table, ever" — so there is no table to consume, and a
+list of HTML attribute names written into the language server would be a second
+source of truth with nothing to gate it: exactly the drift the item asked to
+avoid. Deriving one from the DOM bindings was considered and rejected: IDL
+property names are not attribute names (`className` vs `class`), and the
+desugar sets attributes, not properties. If the owner wants it, it wants to be
+data the compiler also reads, and that is a semantics change to §9 item 3.
+
+**Also not attempted:** completion for TAG names (`<di|`) and for a child
+position (`<div>|</div>`, where the grammar takes only an element, a string, or
+a `{expr}` hole, and scope candidates are still offered). Neither is in E67.
+
+### 18.3 Pins
+
+`crates/vilan-lsp/src/document.rs` — eight for E66 (call receiver, chained
+call, method call, call in argument position with the `)` and `;` still to
+come, `?.`-lifted call, block, constructor call, and the field case verbatim —
+a generated client method's `Result` reached inside a closure inside an
+element's `on:submit(…)`), and seven for E67 (`<div .|>`, `<div |>`, a nested
+tag and a nested self-closing tag, `<div .bi|>` mid-word, and three negatives:
+a head item's argument, a `.` outside any markup, and an element CHILD). The
+name-receiver contrast stays pinned where it was
+(`member_completion_lists_fields_and_methods`,
+`member_completion_on_incomplete_receiver`).
+
+`crates/vilan-lsp/src/main.rs` — one per item at the protocol layer, both on a
+STALE buffer, since each exercises a different half of the live/analyzed split:
+E66's receiver resolves against the analyzed program through
+`to_analyzed_offset`, while E67's head context can only come from the LIVE
+text (no element survives into `program` at all).
+
+`crates/vilan-core/tests/parser_recovery.rs` — one for the head-item recovery:
+both elements of the nested shape survive, no error atom is left, and the
+diagnostic is still reported.
+
+Plant-proven: the six structural E66 pins (plus the protocol one) red with
+`expression_nominal_id` planted out; all five positive E67 pins red with the
+head dispatch planted out; the three `>`-terminated E67 pins and the parser pin
+red with the head-item recovery reverted to declining. The `?.`-lifted call pin
+is honestly vacuous against the E66 plant (§18.1's last note) and the three
+negatives are vacuous by construction — they pin the boundary, and the E67
+plant is exactly what they must survive.
+
+## 19. What shipped — the hover crash and the member format (E73/E72, 2026-08-20)
+
+Two owner reports from 2026-08-19, one lane (`e73-hover` off `next`), the crash
+first. Both live in the same function family — `Document::hover`'s fallback
+chain (`crates/vilan-lsp/src/document.rs`) — and the crash's mechanism turned
+out to be the format bug's mechanism too. Zero corpus golden movement by
+construction (LSP + docs only).
+
+### 19.1 E73 — hovering `get_safe` killed the server
+
+**The shape.** A module-level `let client_context =
+Context<TodoClient<SocketTransport>>::new();` with no provider, and a
+`fun probe() { client_context.get_safe(); }`. Hovering `get_safe`:
+"thread 'main' has overflowed its stack", SIGABRT, VS Code restarts the
+server, the re-hover re-kills it, five rounds, "will not be restarted".
+
+**Mechanism, verified by probe.** The tracker's framing ("a file whose
+analysis carries errors — the E68 cascade — is the enabling condition") is
+NOT what the probe shows: the distilled repro (`import std::context::Context;`
++ the two lines above, on `Context<i32>`) analyzes with **zero diagnostics**
+and still crashes. The enabling condition is the context-threading pass
+itself (`vilan-core/src/context.rs`, `apply`): it mints a hidden parameter
+per needs-context function — `entity_map[hidden] = Parameter(hidden)`, the
+self-describing convention real parameter declarations also use — but unlike
+the analyzer it records **no `parameters` entry, no span, no `expr_types`
+label**, and then rewires the `get_safe()` call's own entity record to
+`Local(hidden)`. So the hover chain under the member name reaches a
+self-looped, typeless binding: `hover_label`'s `Expr::Local/Variable/
+Parameter` arm resolved `id → binding` recursively (`.or_else(||
+self.hover_label(program, *binding))`) with no cycle guard, and recursed off
+the stack. The self-loop is therefore not itself mis-wiring — it is the
+normal declaration convention — the anomaly is a *tooling-invisible*
+parameter (typeless, spanless, recordless) reachable from a hover chain.
+
+**The fix** (general): `hover_label`, `function_target`, and `definition_of`
+walk their `id → binding` and `call → subject` chains iteratively with a
+seen-list and answer the honest `None` when a chain closes on itself. The
+other `entity_map` walkers were audited: `binding_hover`,
+`type_declaration_target`, `target_of`, `const_value_label` resolve one step
+and stop; `expression_type_id` (§18) already carries its depth bound.
+
+**Pins** (document.rs tests): the lowered `get_safe` shape end-to-end —
+`Document::analyze` + `hover` returns, with the enabling self-loop asserted
+as a precondition so the pin announces itself if the lowering changes — plus
+a synthetic two-node `entity_map` cycle, a synthetic call-record cycle
+through all three guarded resolvers, the honest `None` on a chain that ends
+recordless, and the legitimate use → binding chain still resolving.
+Plant-proven: with the recursive `hover_label` planted back, the end-to-end
+pin aborts with the owner's exact stack overflow.
+
+### 19.2 E72 — member hovers wore the pre-house-style bare label
+
+**The shape.** Hovering `bar` in `foo.bar` answered the raw analyzer type
+string (`str`, `List<i32>`) — no fence, no `name: T`; and
+`client_context.get_safe()` could hover as `enum Option` (or, per §19.1,
+crash).
+
+**Why `get_safe` missed `function_target`.** Not a resolution gap in the
+LSP's method path — a *lowering erasure*. For a normal method call the wired
+subject (`Expr::Local(method_fn)`) answers the declaration already. The
+context pass overwrites the lowered call's `entity_map` record
+(`Local(hidden)` for a plain get, `Null` for `Context::new()`), so
+`function_target`'s `Expr::Call` arm never fires — but the pass leaves
+`program.function_calls[call]` standing **with its original wired subject**
+(probe: `function_calls[call].subject → Local(get_safe_fn)`, label
+`external fun get_safe(self): Option<T>`). `function_target` now falls back
+to that surviving call record when the entity record resolves nothing —
+general (plain gets, `none_gets`, `Context::new()` all answer their source
+declaration), no `get_safe` special case.
+
+**The residual, named honestly:** the two lowerings that rewire
+`function_calls[call].subject_id` itself — a *covered* `get_safe` (the
+`Some`-wrap) and `Context::run` — leave nothing that names the source
+callee, so those hovers still answer the lowered view (`enum Option` /
+the closure's type, now fenced). Closing that wants the deeper fix: the
+lowering mutates the analyzed program in place, destroying source truth
+tooling needs. Either the pass records what it erases (a small side table)
+or the emitter gets its own lowered view of the program — a refactor filed
+here rather than built around.
+
+**The format fix:** `Document::hover` gained a `member_hover` step between
+`binding_hover` and the bare fallback — a member READ (a
+`member_name_spans` entry, no call record) answers the fenced
+`name: type_label`, the name sliced from the member span (tuple members —
+`pair.0` — get it free); and the bare `hover_label` fallback itself now
+wraps in the ```` ```vilan ```` fence, so every hover reads as code. The
+editor appendix's hover line names the member shapes
+(`docs/appendix/editor.md`; the D18 `book_sync` gate stayed green through
+the wording change).
+
+**Pins:** a field access (`p.x` ⇒ ```` ```vilan\nx: i32\n``` ````), a std
+method name (`name.len()` ⇒ the fenced `external fun len(self): i32`), the
+`get_safe` shape (the fenced declaration with its std doc), the fenced bare
+fallback (an index expression), and — `main.rs` — a member hover through
+the handler answering the house shape from the analyzed snapshot across a
+pending un-analyzed edit. All existing hover pins (`.contains`-based)
+passed unchanged; no shipped test was altered.
+
+### 19.3 E75 — the lowering records what it erases (2026-08-20)
+
+§19.2's residual, closed. The context pass (`context.rs::apply`) destroys
+source truth in exactly three shapes, and each gets its answer:
+
+1. **The two subject rewires** — a covered `get_safe` (the call record's
+   subject becomes a fresh `Local(Some)`, its arguments the hidden
+   parameter) and `Context::run` (the subject becomes the body closure) —
+   erase the only record naming the source callee.
+2. **The entity-record overwrites** — a plain `get` becomes
+   `Local(hidden)`, a none-rooted safe read `Local(None)`, a
+   `Context::new()` an opaque `Null` — erase the `Expr::Call(id)` entity
+   record, but the call record and its wired subject survive (§19.2
+   exploited this for hover; go-to-definition never did).
+3. **The minted hidden parameter** self-describes as
+   `Expr::Parameter(itself)` with no `parameters` record, no span, no
+   `expr_types` label — E73's crash armer, honest-`None`-by-cycle-guard
+   since, which is honesty by accident.
+
+**Decision: the small pass-side record, not the analyzed-vs-lowered
+split.** The split (the emitter takes its own lowered copy; analysis stays
+source-true) remains the deeper architecture, but it is disproportionate
+here: only the three shapes above erase anything, shape 2 is already
+reconstructible from surviving records, and the record for shapes 1 and 3
+is two maps. Filed as the escalation path if a future lowering multiplies
+erasure sites; not built today.
+
+Two new `Program` fields, filled only by `apply` (both pipelines run the
+pass, so no dual wiring is owed):
+
+- `context_erased_subjects: HashMap<Id, Id>` — rewired call id → the
+  subject entity the analyzer wired (`Local(get_safe_fn)` /
+  `Local(run_fn)`). The pass never deletes entities, so the erased subject
+  survives in `entity_map` and the id alone re-opens the whole chain:
+  signature, doc, declaration span.
+- `context_hidden_parameters: HashMap<Id, Id>` — minted parameter id →
+  the context binding whose value it threads.
+
+**The hidden parameter gets the MARKER, not real records** — because real
+records were found lying before they were written: a fabricated
+`parameters` entry would surface the hidden parameter as a tab stop in
+`call_parameter_names` (call-shaped completion) and in every other
+consumer keyed on `program.parameters` (signature rendering, semantic
+token classification). The parameter is not source; records would dress it
+as source. The marker keeps it invisible to enumeration while letting the
+chain walkers (`hover_label`, `definition_of`) answer an explicit, honest
+`None` on reaching it — by design, no longer by the accident of the
+self-loop meeting a cycle guard.
+
+**The resolvers read the record.** A shared `source_call_subject` answers
+a call's SOURCE subject — the erased original where recorded, the wired
+subject otherwise — and the three chain walkers (`hover_label`,
+`function_target`, `definition_of`) resolve every call → subject step
+through it. `definition_of` additionally gains the fallback
+`function_target` grew in §19.2: a call whose ENTITY record a lowering
+overwrote (shape 2 — the record is no longer `Expr::Call`) resolves
+through its surviving call record, so go-to-definition on a lowered plain
+`get`, an unprovided `get_safe`, or `Context::new()` lands on the std
+declaration instead of answering nothing (or, for the covered wrap,
+landing on `Some` in `option.vl` — the lowered view, traced through
+`definition_of`'s binding arm rather than observed live before the fix).
+
+**Pins** (document.rs, through `Document::analyze` + `hover` /
+`definition`): the covered `get_safe` (a `run`-closure read: hover answers
+the fenced `fun get_safe(self): Option<T>`, definition lands on
+`context.vl`'s `get_safe`, with the rewire asserted as the enabling
+precondition so the pin announces itself if the lowering changes);
+`Context::run` (hover answers `run`'s declaration, definition lands on
+it, same precondition); definition on the unprovided `get_safe` (shape 2,
+E73's fixture); and the marker itself (the minted parameter maps to its
+context binding; `hover_label` and `definition_of` answer `None` on it).
+E73's pins untouched and green — the minting convention did not change,
+only what stands beside it.
+
+**Shipped** (this lane, 2026-08-20): the two fields + fills
+(`analyzer.rs` `Program`, `context.rs::apply`), `source_call_subject` +
+the three walker changes + `definition_of`'s overwritten-call fallback
+(`document.rs`), six pins. Plant-proven three ways: the helper ignoring
+the record reddens the covered-`get_safe` and `run` pins; the
+`definition_of` fallback disabled reddens the unprovided-`get_safe` pin;
+the marker fill removed reddens the marker pin. Corpus byte-identical
+(the transformer reads neither field); no shipped test altered. One
+observed detail: `declaration_labels` renders `run` without its own
+`<U>` (`external fun run(self, value: T, body: || U): U`) — a label
+convention, not a §19.3 concern.

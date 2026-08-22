@@ -197,7 +197,7 @@
     {
      "comment": "Bracket attributes: the built-in markers anywhere, plus GENERIC macro attributes `[name]` / `[name(args)]` at the start of a line (an expression's list literal never opens an item line, which keeps `[1, 2]` and `[x]` out).",
      "name": "meta.attribute.vilan",
-     "begin": "(\\[)(?=\\s*(extern|derive|must_use|service|rpc|expose|trait_only|doc)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
+     "begin": "(\\[)(?=\\s*(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
      "beginCaptures": {
       "1": {
        "name": "punctuation.definition.attribute.begin.vilan"
@@ -214,7 +214,7 @@
      },
      "patterns": [
       {
-       "match": "\\b(extern|derive|must_use|service|rpc|expose|trait_only|doc)\\b",
+       "match": "\\b(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform)\\b",
        "name": "keyword.other.attribute.vilan"
       },
       {
@@ -314,6 +314,15 @@
      }
     },
     {
+     "comment": "The `sync` MARKER on a closure type \u2014 `(sync || View) context owner_scope`. Contextual like `context` above (a bare `sync` is a type name), and it only ever opens a parenthesized closure type \u2014 so the guard is: keyword only right after a `(`.",
+     "match": "(?<=\\()(sync)\\b",
+     "captures": {
+      "1": {
+       "name": "storage.modifier.vilan"
+      }
+     }
+    },
+    {
      "name": "constant.language.vilan",
      "match": "\\b(true|false|null)\\b"
     },
@@ -328,7 +337,7 @@
     {
      "comment": "Primitive types.",
      "name": "support.type.primitive.vilan",
-     "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|str|bool|void|any)\\b"
+     "match": "\\b(i8|i16|i32|i53|u8|u16|u32|u53|f32|f64|str|bool|void|any)\\b"
     },
     {
      "comment": "User types / variants \u2014 PascalCase identifiers (and `Self`).",

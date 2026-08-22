@@ -235,12 +235,25 @@ does nothing visible (its `dist/` bundle refreshes, but nothing restarts).
 
 ## The CSS `<link>` idiom
 
-CSS hot-swap works by bumping the cache-buster on your stylesheet `<link>`, so
-it needs the stylesheet to *be* a `<link>` to `dist/<leg>.css`:
+CSS hot-swap finds your stylesheet by looking for a `<link>`, so it needs
+the stylesheet to *be* a `<link>` to `dist/<leg>.css`:
 
 ```text
 <link rel="stylesheet" href="/client.css">
 ```
+
+What it does *not* do is re-fetch that href. The href is your own server's
+route, and the common shape reads that file once at boot and serves the
+same bytes for the life of the process — a css-only round never restarts
+the server, so re-requesting the route would land right back on the
+boot-time snapshot: a style edit that visibly does nothing. So the fresh
+bytes come from the **dev channel's** own `/asset/<name>` route, which
+serves current `dist/*.css` every round, and land as an injected `<style>`
+that supersedes the `<link>` (disabled, its href untouched). A plain page
+reload therefore always starts clean, and a fetch that fails warns and
+leaves the current stylesheet exactly as it was rather than reloading onto
+stale bytes. A named sidecar updates only the `<link>` whose file it is, so
+a workspace with two browser legs refreshes exactly the one that changed.
 
 An app that inlines its CSS into the page instead gets a full swap on a
 style change rather than the flicker-free stylesheet reload. That is still

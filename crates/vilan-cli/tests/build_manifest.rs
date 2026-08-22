@@ -298,3 +298,107 @@ async fun main() {
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// The corrupt-manifest arm, shared by the two `Unreadable` tests below: build
+/// the real project, then overwrite `dist/client.chunks.json` with `contents`
+/// and assert `build_of` reports `BuildError::Unreadable`'s own sentence.
+fn an_overwritten_manifest_is_unreadable(tag: &str, contents: &str) {
+    let directory = two_leg_project(tag, false);
+    write(&directory, "src/server.vl", PROBE_SERVER);
+    let built = vilan(&directory, &["build", "."]);
+    assert!(
+        built.status.success(),
+        "build failed:\n{}",
+        combined(&built)
+    );
+    write(&directory, "dist/client.chunks.json", contents);
+
+    let ran = Command::new("node")
+        .arg("dist/server.mjs")
+        .current_dir(&directory)
+        .output()
+        .expect("run the probe server");
+    let report = combined(&ran);
+    assert!(
+        ran.status.success(),
+        "a corrupt manifest is a value to handle, not a crash:\n{report}"
+    );
+    assert!(
+        report.contains(
+            "dist/client.chunks.json is not a build manifest this toolchain wrote \
+             — rebuild the leg (`vilan build .`)"
+        ),
+        "the error disowns the manifest and names the rebuild:\n{report}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_manifest_that_is_not_json_is_the_unreadable_error() {
+    // Ledger row 231's flagged gap (diagnostics-ledger.md batch 8): nothing
+    // drove the corrupt-manifest arm. A manifest that does not parse at all —
+    // a half-written or hand-mangled file — is `Unreadable`, named, not a
+    // JSON exception from inside std.
+    an_overwritten_manifest_is_unreadable("notjson", "not a manifest");
+}
+
+#[test]
+fn a_manifest_missing_this_toolchains_fields_is_the_unreadable_error() {
+    // The checked-shape arm of the same row: valid JSON that does not carry
+    // the fields this toolchain writes. Checked rather than coerced, because
+    // `coerce_str` over an absent field yields `"undefined"` — which would
+    // become a route.
+    an_overwritten_manifest_is_unreadable("wrongshape", "{\"leg\": \"client\"}");
+}
+
+#[test]
+fn require_build_stops_the_boot_naming_the_missing_manifest() {
+    // Batch 8's other flagged gap: no test drove `require_build` to its own
+    // panic (its message was pinned only through `build_of`'s returned
+    // error). The server-boot idiom end-to-end: a server whose manifest is
+    // gone must STOP, with `BuildError`'s own sentence, before it serves
+    // anything.
+    let directory = two_leg_project("requireboot", false);
+    write(
+        &directory,
+        "src/server.vl",
+        r#"import std::build::require_build;
+import std::print;
+
+async fun main() {
+	let build = require_build("client");
+	print(i"described {build.leg}");
+}
+"#,
+    );
+    let built = vilan(&directory, &["build", "."]);
+    assert!(
+        built.status.success(),
+        "build failed:\n{}",
+        combined(&built)
+    );
+    std::fs::remove_file(directory.join("dist/client.chunks.json")).expect("remove the manifest");
+
+    let ran = Command::new("node")
+        .arg("dist/server.mjs")
+        .current_dir(&directory)
+        .output()
+        .expect("run the server");
+    let report = combined(&ran);
+    assert!(
+        !ran.status.success(),
+        "a server that cannot describe its own build must not start:\n{report}"
+    );
+    assert!(
+        report.contains(
+            "no build manifest at dist/client.chunks.json — build the leg first \
+             (`vilan build .`), and run the server from the project root"
+        ),
+        "the panic carries the named error's own sentence:\n{report}"
+    );
+    assert!(
+        !report.contains("described"),
+        "and nothing after the boot line ran:\n{report}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}

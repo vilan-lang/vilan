@@ -483,22 +483,29 @@ fn extern_binding_from_args<'src>(args: &[ExternArg<'src>]) -> ExternBinding<'sr
     }
 }
 
-/// The built-in attribute-marker names, excluded from a *user* macro attribute's
-/// name (they keep their own parsers, fused into `function`/`struct` or earlier in
-/// the statement choice). Mirrors the chumsky `macro_attribute_name` guard.
+/// The built-in attribute-marker names — `[derive(..)]`, `[service]`, … — each
+/// with its own parser, fused into `function`/`struct` or earlier in the
+/// statement choice, and therefore excluded from a *user* macro attribute's name
+/// ([`is_known_attribute_marker`]). The one source of truth for the list: both
+/// highlighting grammars (`editors/vscode/syntaxes/vilan.tmLanguage.json`,
+/// `vilan/docs/theme/vilan.js`) carry a copy, held to this one by
+/// `crates/vilan-cli/tests/grammar_sync.rs` (AGENTS.md's three-place rule).
+pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
+    "derive",
+    "service",
+    "extern",
+    "must_use",
+    "rpc",
+    "trait_only",
+    "doc",
+    "expose",
+    "platform",
+];
+
+/// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
+/// `macro_attribute_name` guard.
 fn is_known_attribute_marker(name: &str) -> bool {
-    matches!(
-        name,
-        "derive"
-            | "service"
-            | "extern"
-            | "must_use"
-            | "rpc"
-            | "trait_only"
-            | "doc"
-            | "expose"
-            | "platform"
-    )
+    KNOWN_ATTRIBUTE_MARKERS.contains(&name)
 }
 
 impl<'a, 'src> Parser<'a, 'src> {
@@ -2266,7 +2273,9 @@ impl<'a, 'src> Parser<'a, 'src> {
                 self.note_expected("`>` or `/>`");
                 return None;
             }
-            head.push(self.parse_element_head_item()?);
+            if let Some(item) = self.parse_element_head_item()? {
+                head.push(item);
+            }
         };
         let (children, self_closing, close_tag) = children;
         let body = ElementBody {
@@ -2283,12 +2292,30 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// attribute `name(value)`, or a bare boolean attribute `name`
     /// (proposal/element-syntax.md §2 — the dot is the disambiguator, so the
     /// grammar never consults any method list).
-    fn parse_element_head_item(&mut self) -> Option<ElementHeadItem<'src>> {
+    ///
+    /// `Some(None)` is the recovered case: a head item that could not be
+    /// completed, already reported, which the head loop drops while keeping the
+    /// element (see the chain arm).
+    fn parse_element_head_item(&mut self) -> Option<Option<ElementHeadItem<'src>>> {
         // Chain form — the link node exactly as a written chain builds it.
         if self.peek_is_ctrl('.') {
             self.bump();
-            let link = self.parse_member_call()?;
-            return Some(ElementHeadItem::Chain(link));
+            let Some(link) = self.attempt(Self::parse_member_call) else {
+                // A dot with no name after it: the shape a head is in while a
+                // chain link is being TYPED (`<div .`). The dot has already
+                // committed the item to the chain form, so this is a committed
+                // production failing — recover it the way E49 recovers every
+                // other one, by reporting and carrying on, rather than by
+                // declining and letting `parse_atom`'s element recovery flatten
+                // the whole tag (and, nested, the whole statement) to an error
+                // atom. Keeping the element is what lets the language server
+                // still answer inside a tag under construction (E67).
+                self.note_expected("a method name");
+                let context = self.context_stack.clone();
+                self.emit_failure(self.position, vec!["a method name".to_string()], context);
+                return Some(None);
+            };
+            return Some(Some(ElementHeadItem::Chain(link)));
         }
         // Event form — `on`, an adjacent `:`, an adjacent event name.
         if matches!(self.peek(), Some(Token::Ident("on")))
@@ -2308,10 +2335,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.expect_ctrl('(')?;
             let handler = self.parse_expression()?;
             self.expect_ctrl(')')?;
-            return Some(ElementHeadItem::Event(
+            return Some(Some(ElementHeadItem::Event(
                 (event, event_span),
                 Box::new(handler),
-            ));
+            )));
         }
         // Attribute form.
         let Some((name, _)) = self.parse_element_name() else {
@@ -2319,7 +2346,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         };
         if !self.peek_is_ctrl('(') {
-            return Some(ElementHeadItem::Attribute(name, None));
+            return Some(Some(ElementHeadItem::Attribute(name, None)));
         }
         self.bump();
         let value = self.parse_expression()?;
@@ -2328,7 +2355,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         }
         self.expect_ctrl(')')?;
-        Some(ElementHeadItem::Attribute(name, Some(value)))
+        Some(Some(ElementHeadItem::Attribute(name, Some(value))))
     }
 
     /// Children up to the matching `</tag>`: nested elements, quoted strings
@@ -5609,6 +5636,18 @@ mod tests {
         assert_eq!(
             rendered_errors("fun f(x: i32 y: i32) {}\n"),
             vec!["found 'y' expected ',' or ')'".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_expects_a_method_name_in_an_unfinished_chain_link() {
+        // E67 (editing-dx.md §18): an element head's `.` with no member after
+        // it is a COMMITTED chain link failing — the recovery keeps the
+        // element (parser_recovery.rs pins the shape); this pins the curated
+        // expectation's rendered text (ledger row 204's flagged gap).
+        assert_eq!(
+            rendered_errors("fun main() { let p = <div><span .></span></div>; }\n"),
+            vec!["found '>' expected a method name".to_string()]
         );
     }
 

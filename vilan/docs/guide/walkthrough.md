@@ -170,58 +170,95 @@ is now the boring file, which is the point:
 ```vilan,fragment
 async fun main() {
 	let build = require_build("client");
-	let app_html = fs::read_file_to_str("src/app.html");
+	let page = require_shell("src/app.html", build).html();
 
 	let store = boot();
 
-	serve_service(
-		4600,
-		store.dispatcher().into_protocol(json_codec()),
-		build_handler(build, |request| Response::builder().set_header("Content-Type", "text/html").body(app_html).build()),
-		|server| print(i"notes server listening on {server.url()}"),
-	);
+	Server::builder()
+		.port(4600)
+		.with_service(Service::new(store.dispatcher().into_protocol(json_codec())))
+		.serve_build(build)
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_start(|server| print(i"notes server listening on {server.url()}"))
+		.build()
+		.start();
 }
 ```
 
 `require_build("client")` asks what the client leg's build emitted — the
 bundle, and the stylesheet its `const` styles produced — and
-`build_handler` turns that into one route per artifact, with the content
+`serve_build` turns that into one route per artifact, with the content
 type each extension implies. No `dist/` path is spelled here, so renaming
-the leg cannot leave this file compiling and the page blank. (When the app
-owns its builder, `Server::builder().serve_build(build)` is the same thing
-installed on the chain.)
+the leg cannot leave this file compiling and the page blank.
 
-The fallback then serves the shell for every path the build does not
-claim. That's what makes deep links like `/note/7` load
+`require_shell` reads `src/app.html` once at boot and holds it against
+that same build: a `<link>` for a stylesheet the build no longer emits, a
+`<script>` naming a bundle that was renamed, a mount `<div id>` that
+drifted from `mount_root("app", …)` — each stops the server here, naming
+the file and the fix, instead of serving a page that renders wrong and
+looks right.
+
+The service goes on the same chain as everything else. `Service::new(…)`
+plus [`with_service`](services.md#growing-past-one-service) installs the
+rpc routes and the WebSocket upgrade in front of `on_request`, so the page
+and the service share one port without one of them replacing the other's
+boot function — delete the `.with_service(…)` line and this file still
+compiles and still serves the page. (A server that is only a service is
+the same chain with the `serve_build`/`on_request` lines left off.)
+
+`on_request` then serves the shell for every path neither the service nor
+the build claims. That's what makes deep links like `/note/7` load
 ([Routing](routing.md#deep-links-and-the-server)). `vilan build` compiles
 browser entries first, so the client's artifacts are always there by the
 time the server entry builds.
 
-## The client entry: four signals and a mount
+This file is quoted from the example as it stands, and the example is one
+rung below the top of the ladder: the shell is still a file you write,
+held against the build. The last rung is `Document::of(build)`, which
+skips the shell altogether and writes the page from the build — the
+`<link>`, the `<script>` and the mount `<div id>` derived from what the
+build emitted, so there is nothing left to check. The
+[to-do example](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/todo/)
+stands there: it has no `app.html` at all. Both rungs are covered in
+[Persistence](persistence.md#putting-it-together); which one you want is a
+question of whether you care about the document.
+
+## The client entry: two signals, a connect, and a mount
 
 [`src/client.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/client.vl) is
 the whole wiring diagram:
 
 ```vilan,fragment
 async fun main() {
-	let notes: Signal<List<Note>> = Signal::new([]);
 	let token = Signal::new(storage::get("notes-token"));
 	let route = current_path().map(parse);
 
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			let _sync = client.notes.sub(|list| notes.set(list));
-			let _root = mount_root("app", || screen(client, notes, token, route));
+			let _root = mount_root("app", || screen(client, token, route));
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}
 }
 ```
 
-Read it as: mirror in, token from `localStorage` (a reload stays signed
-in), the typed route derived from the URL, connect, mount. `NotesClient`
-comes from `import pkg::store::NotesClient;`, the same module whose
-bodies run SQL on the server. This build sees only the stub.
+Read it as: token from `localStorage` (a reload stays signed in), the
+typed route derived from the URL, connect, mount. `NotesClient` comes
+from `import pkg::store::NotesClient;`, the same module whose bodies run
+SQL on the server. This build sees only the stub. The mirror is not
+wired here at all: `client.notes` is a `RemoteSource<List<Note>>`, and
+the screen reads it where it is shown —
+
+```vilan,fragment
+fun screen(client: NotesClient<SocketTransport>, token: Signal<str>, route: Signal<Route>): View {
+	let notes = client.notes.or([]);
+	…
+}
+```
+
+— `[]` until the first sync, the live list after, and a subscription
+that opens when the screen mounts and closes when it unmounts
+([Services: reading a mirror](services.md#reading-a-mirror)).
 Everything after this line is views reading those signals.
 
 ## Routes

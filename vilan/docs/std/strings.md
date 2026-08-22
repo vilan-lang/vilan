@@ -24,6 +24,7 @@ impl str {
 	fun substring(self, start: i32, end: i32): str   // end-exclusive
 	fun code_at(self, index: i32): u32               // UTF-16 code unit
 	fun parse_i32(self): Option<i32>                 // declared in std::option
+	fun parse_f64(self): Option<f64>                 // likewise
 }
 ```
 

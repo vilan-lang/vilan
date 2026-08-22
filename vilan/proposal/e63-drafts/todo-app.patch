@@ -1,0 +1,145 @@
+E63 draft — vilan-playground/todo onto the full-stack ladder (rung 2)
+=====================================================================
+
+A PROPOSAL, not an applied change. Nothing outside the vilan repository was
+touched to produce it. Apply with:
+
+    cd vilan-playground/todo && git apply /path/to/todo-app.patch
+
+(or `patch -p1 < todo-app.patch` if that tree is not under git). Everything
+above the first `diff --git` line is ignored by both.
+
+WHAT MOVES
+
+This is the app fullstack-dx.md §2.1 measured as the charter's own evidence:
+19 counted lines, 10 of them ceremony. It goes to the top of the ladder,
+because its shell is exactly what `Document::of` writes.
+
+  - The three boot reads (`dist/client.js`, `dist/client.css`,
+    `src/app.html`) become one `require_build("client")`. No path, no file
+    name, no MIME type is spelled in this file any more.
+  - The four-arm `match request.path()` becomes `.serve_build(build)`, which
+    installs one route per artifact the build wrote — with the content type
+    its extension implies, and with the chunk routes too if you ever set
+    `split = true` on the client leg, with no further server edit.
+  - `serve_service(port, protocol, fallback, on_ready)` becomes a
+    `Server::builder()` chain the service is INSTALLED on
+    (`.with_service(Service::new(protocol))`). Same routes, same wire; the
+    difference is that the page and the service now compose instead of one
+    owning the boot function. Delete the `.with_service(…)` line and the
+    program still compiles and still serves the page.
+  - `src/app.html` is DELETED, and `Document::of(build).title("Todo")` writes
+    the page instead. The `<link>`, the `<script>` and the mount `<div id>`
+    are all derived from the build, so they cannot disagree with the
+    artifacts they name — which is the failure this whole arc exists to
+    remove.
+
+Counted by fullstack-dx.md §1.2's rule (non-blank, non-comment lines):
+src/server.vl 19 → 20 lines, 10 → 6 ceremony, and src/app.html's 13 lines go
+to zero. 32 lines across two files become 20 in one.
+
+WHAT TO VERIFY WHEN YOU APPLY IT
+
+1. The generated page against your `src/app.html`. They are semantically the
+   same document and differ in four cosmetic ways — verified by fetching `/`
+   from the migrated server on a scratch copy:
+
+       -<!DOCTYPE html>            +<!doctype html>
+       -\t<html lang="en">         +<html lang="en">      (your stray indent)
+       -<meta charset="UTF-8">     +<meta charset="utf-8" />
+       -…initial-scale=1.0">       +…initial-scale=1" />
+
+   Nothing else moves: same title, same stylesheet link, same
+   `<div id="app">`, same module `<script src="/client.js">`.
+
+2. That you are happy losing the file. If you would rather keep it, drop the
+   `src/app.html` hunk and swap one line —
+
+       let page = require_shell("src/app.html", build).html();
+
+   with `import std::document::require_shell;` in place of
+   `import std::document::Document;`. That is rung 1 + rung 0+: your markup,
+   still yours, and now CHECKED against the build at every boot (a `<link>`
+   to a stylesheet the build no longer emits stops the server, naming the
+   file and the fix, instead of serving an unstyled page that looks right).
+   This is the rung the `vilan init` scaffold and the in-repo examples ship
+   at, for the reason §6.3 gives.
+
+3. The port and the greeting are unchanged (4600, "notes server listening
+   on …"), and so is `Notes::new()` and everything in `src/store.vl`.
+
+VERIFIED HERE
+
+On a scratch copy of the whole app (it is small enough to copy whole):
+`vilan build .` exits 0, `node dist/server.mjs` boots, `/` serves the
+generated document above, `/client.js` answers `text/javascript`,
+`/client.css` answers `text/css`. Checked with vilan 0.34.0.
+
+NOT VERIFIED: the browser client actually running against it (no browser
+here). Nothing in `src/store.vl` was touched — `Notes` is still the same
+in-memory service it was.
+
+diff --git a/src/app.html b/src/app.html
+deleted file mode 100644
+index e7f7677..0000000
+--- a/src/app.html
++++ /dev/null
+@@ -1,13 +0,0 @@
+-<!DOCTYPE html>
+-	<html lang="en">
+-	<head>
+-		<meta charset="UTF-8">
+-		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+-		<title>Todo</title>
+-		<link rel="stylesheet" href="/client.css" />
+-	</head>
+-	<body>
+-		<div id="app"></div>
+-		<script type="module" src="/client.js"></script>
+-	</body>
+-</html>
+\ No newline at end of file
+diff --git a/src/server.vl b/src/server.vl
+index aeaedd5..379a67e 100644
+--- a/src/server.vl
++++ b/src/server.vl
+@@ -1,22 +1,26 @@
+-import std::fs;
+-import std::http::Response;
++import std::build::require_build;
++import std::document::Document;
++import std::http::{ Response, Server };
+ import std::io::print;
+ import std::json::json_codec;
+-import std::rpc_server::serve_service;
++import std::rpc_server::Service;
+ import pkg::store::Notes;
+ 
+ async fun main() {
+-	let client_js = fs::read_file_to_str("dist/client.js");
+-	let client_css = fs::read_file_to_str("dist/client.css");
+-	let app_html = fs::read_file_to_str("src/app.html");
++	// What the build wrote for the browser leg: the bundle and the stylesheet.
++	// `serve_build` installs one route per artifact, and `Document::of` writes
++	// the page that loads them — so no file name is spelled twice.
++	let build = require_build("client");
++	let page = Document::of(build).title("Todo").html();
+ 
+ 	let notes = Notes::new();
+ 
+-	serve_service(4600, notes.dispatcher().into_protocol(json_codec()), |request| {
+-		match request.path() {
+-			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+-			"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
+-			_ => Response::builder().set_header("Content-Type", "text/html").body(app_html).build(),
+-		}
+-	}, |server| print(i"notes server listening on {server.url()}"));
++	Server::builder()
++		.port(4600)
++		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec())))
++		.serve_build(build)
++		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
++		.on_start(|server| print(i"notes server listening on {server.url()}"))
++		.build()
++		.start();
+ }

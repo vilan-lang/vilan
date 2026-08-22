@@ -1,8 +1,23 @@
 # Method resolution — a deliberate precedence rule (B57)
 
-> Status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
+> **§13 SHIPPED 2026-08-18** — R1, R2 and R3 all landed the day of the
+> ruling; the ship record, including the four places the measurement
+> differed from §13.2's prediction, is **§13.8**. All 13 pins are
+> un-ignored and 10 more were added. What follows is the ruling as given.
+>
+> **§13 RULED 2026-08-18 as recommended** ("Go with B73 as recommended"): Q1 (a) — R1 → R2 → R3 in that order, (b) not taken, (c) stays available as a later additive layer; Q2 yes — the expected type steers among argument-distinct homes; Q3 the std blanket STAYS — deleting it remains an independent simplification (tracked as B127, deferred), not part of B73; Q4 call site; Q5 `9` — a more specific impl takes the trait's default; Q6 in scope — bounds are part of applicability (row 15's pin is one of the thirteen). The fix is scheduled (Order 3, cycle 21); the 13 `b73_*` pins un-ignore as each rule lands. BETA-CRITICAL per beta.md Q2.
+> 
+> Prior status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
 > inherent-over-trait, duplicate-inherent as a hard error, trait-vs-trait
 > ambiguity error with `Trait::method(receiver)` disambiguation.
+>
+> **§13 (B73, the blanket-vs-specific design) — drafted 2026-08-18, RULED
+> the same day (above).** §9(6) declined the specificity question and §15.8 of
+> `trait-objects.md` left the overlap it names to B73; beta.md Q2 (ruled
+> 2026-08-18) made it beta-critical. §13 is proposal-only: no fix ships
+> under it, and its thirteen pins are `#[ignore]`d until the owner rules.
+> Everything §3 ratified stands unchanged — §13 layers inside the trait
+> tier and does not move a tier boundary.
 
 ## 0. The problem and the thesis
 
@@ -795,3 +810,781 @@ recorded the inversion in a note, deliberately unpinned — now asserts the
 value: `1`, the inherent one. The two claims sit on one program, which is
 the honest place for them: the trait's declaration is not a DUPLICATE of
 the inherent one (B74), it is OUTRANKED by it (B57).
+
+## 13. Specificity: the blanket-vs-specific design (B73)
+
+> Status: **SHIPPED 2026-08-18** (ruled the same day; record at §13.8).
+> Everything below §13.6 is the design as it was written before the fix;
+> §13.8 records what each rule became and where it differed. §9(6) declined this question ("a specificity
+> question, which §3(b) declines"); `trait-objects.md` §15.8(3) left the
+> overlap to it ("Blanket-vs-specific OVERLAP stays legal, and stays
+> B73's"); `spec/types.md` §5.4's implementation note says a specificity
+> rule "is owed". beta.md Q2, ruled 2026-08-18, made it beta-critical:
+> a wrong resolution from a clean compile is miscompile-shaped, so
+> process.md §5.4's trigger (c) waits on it.
+
+### 13.1 What the arc found that the filing did not say
+
+B73 is filed as one bug — "a blanket trait impl beats a user's specific
+one by declaration order". Probing it (§13.2) found that sentence
+describes a *symptom* of two independent defects, and under-describes the
+damage in three ways that matter to the ruling:
+
+1. **The headline shape is a false rejection, not the miscompile.**
+   `let b: Bar = foo.into()` with a user `impl Foo with Into<Bar>` reports
+   `Expected Bar, but got Foo instead.` and exits 1 (row 1). The *silent*
+   wrong answer is the unannotated call: `let s = foo.into(); print(s)`
+   with `impl Foo with Into<str>` compiles clean, exits 0, and prints
+   `[ 1 ]` — the raw struct — where the user's impl says `converted`
+   (row 2). The emitted JS is the blanket's body verbatim
+   (`function $a(self) { return __clone(self); }`); the user's `into` is
+   never emitted at all.
+
+2. **There is a second, sharper miscompile in the same family with no
+   blanket anywhere in it.** Two impls of one trait at *different*
+   arguments are legal by the language's own rule (`spec/types.md`
+   271–275: "`impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` both
+   stand"), and reaching one through a generic bound picks the FIRST
+   declared regardless of which the bound names. `to_baz<T: Conv<Baz>>`
+   against `impl Foo with Conv<Bar>` (declared first) and
+   `impl Foo with Conv<Baz>` returns a `Bar` under the static type `Baz`;
+   `let z: Baz = to_baz(foo); print(z.tag)` prints `2` — an `i32` where a
+   `str` was declared — clean, exit 0 (row 20). That is type confusion, a
+   strictly worse failure than row 2, and it survives deleting the std
+   blanket. **Removing `impl type T with Into<T>` would therefore NOT
+   close trigger (c)** (§13.6 Q3).
+
+3. **The compiler already disagrees with itself.** The identical program
+   answers `1` through `foo.tag()` and `7` through
+   `fun show<T: Tag>(x: T) { x.tag() }` (rows 21/22), because the analyzer
+   matches candidate impls with `compare_type` (a generic subject matches
+   every type) and the transformer matches them with `nominal_matches` (a
+   generic subject matches nothing). **Half the compiler already
+   implements "a blanket never beats a nominal impl."** Any specificity
+   rule that says the same thing is making the analyzer agree with shipped
+   behavior, not inventing a preference.
+
+### 13.2 The fact table
+
+Every row run through this worktree's `target/debug/vilan run`
+(`cargo build` exit 0), in a scratch package carrying a `vilan.toml`.
+"Correct" is the intuitively right answer, which §13.4's recommendation
+adopts as the pinned semantics.
+
+| # | Shape | Today | Correct |
+|---|---|---|---|
+| 1 | `impl Foo with Into<Bar>`; `let b: Bar = foo.into()` | exit 1, `Expected Bar, but got Foo instead.` | compiles; `Bar` |
+| 2 | same with `Into<str>`; `let s = foo.into(); print(s)` | **exit 0, prints `[ 1 ]`** — silent wrong answer | prints `converted`, or an ambiguity error |
+| 3 | same; `fun to_bar(x: Foo): Bar { x.into() }` | exit 1, `Expected Bar, but got Foo` | compiles |
+| 4 | same; `fun to_bar<T: Into<Bar>>(x: T): Bar { x.into() }` | exit 0, `101` — **correct today** | unchanged |
+| 5 | same; `Into::into(foo)` (the §3.1 disambiguator) | exit 0, `1` — the blanket | reaches the user's impl, or errors |
+| 6 | user blanket `impl type T with Conv<T>` **before** `impl Foo with Conv<Bar>` | `1` (blanket) | `101` (specific) |
+| 7 | the same two impls, **specific first** | `101` (specific) | `101` — order must not decide |
+| 8 | a user's own `impl type T with Into<T>` beside std's | exit 1, B98 duplicate-pair refusal | unchanged |
+| 9 | `impl Box<type T> with Tag` before `impl Box<i32> with Tag` | `1` (generic) | `2` (concrete) |
+| 10 | the same two, **concrete first** | `2` | `2` |
+| 11 | `impl Box<type T> with Tag` before `impl Box<type T: Display> with Tag` | `1` (unbounded) | `2` (bounded) |
+| 12 | the same two, **bounded first** | `2` | `2` |
+| 13 | `impl Box<type T> with Tag` before `impl Box<List<i32>> with Tag` | `1` (generic) | `2` (nested concrete) |
+| 14 | the same two, **nested concrete first** | `2` | `2` |
+| 15 | `impl Box<type T: Display>` (bound unsatisfiable here) first, applicable `impl Box<type T>` second | exit 1, `'Opaque' does not implement trait 'Display'` — false rejection | `1`; the applicable impl is used |
+| 16 | blanket `impl type T with Tag { }` (declares nothing) + `impl Foo with Tag { fun tag }` | `7`, both orders | `7` |
+| 17 | blanket DECLARES `tag`; `impl Foo with Tag { }` takes the trait's default | `1`, **both orders** — the default never runs | `9` (the default, via the more specific impl) |
+| 18 | `impl Foo with Conv<Bar>` then `impl Foo with Conv<Baz>`; `let b: Baz = foo.conv()` | exit 1, `Expected Baz, but got Bar` | compiles; `3` |
+| 19 | the same two; `let b: Bar = foo.conv()` (the FIRST) | exit 0, `2` | `2` |
+| 20 | the same two; `fun to_baz<T: Conv<Baz>>(x: T): Baz { x.conv() }`, `Baz { tag: str }` | **exit 0, prints `2`** — a `Bar` under the type `Baz`; **type confusion** | prints `baz` |
+| 21 | true overlap `impl type T with Tag` + `impl Foo with Tag`; direct `foo.tag()` | `1` (blanket) | `7` |
+| 22 | the same program through `fun show<T: Tag>(x: T) { x.tag() }` | **`7`** — the other path already prefers the specific one | `7` |
+| 23 | inherent `impl Foo { fun into(self): Bar }` beside the std blanket | `101` — inherent tier wins (§3) | unchanged |
+| 24 | `fun to_bar<T: Into<Bar>>(x: T)` given a `Foo` with no `Into<Bar>` impl | exit 1, `'Foo' does not implement trait 'Into<Bar>'` — **arguments compared correctly** | unchanged |
+
+Rows 2, 20 and 21/22 are the beta-relevant ones: a clean compile with a
+wrong runtime answer. Rows 1, 3, 15 and 18 are false rejections of valid
+code. Rows 8, 23 and 24 are the parts that already work and must keep
+working.
+
+### 13.3 The mechanism, as it stands
+
+**Candidate collection** — `impl_member_candidates`
+(`crates/vilan-core/src/analyzer.rs` 11278–11324). The row of impls
+declaring the name comes from `implementations_by_member`
+(11292–11297; written at registration, 19039–19051), is filtered by
+`compare_type(subject_type, implementation.subject, …)` (11299–11304),
+sorted by `declaration_order` (11321) — which is the member's entity id,
+`member_id.0` (11439–11441), minted in walk order: textual within a file,
+canonical module order across files, **std first and the entry file
+last** (§2) — and deduped only by `member_id` (11322).
+
+That filter is the first defect's ground. `compare_type` is
+*compatibility*: a generic position is a hole and an unbounded one matches
+anything, which is exactly what `trait-objects.md` §15.8 measured when it
+had to reject `compare_type` as the duplicate key ("a `compare_type` key
+calls std's `impl type T with Into<T>` a duplicate of every user `Into`
+impl"). So `impl type T with Into<T>` (`vilan/std/src/into.vl` 5–9) is a
+candidate for every receiver in the program, and — std being tier 0 — it
+sorts first for every one of them.
+
+**Ranking** — `rank_member_candidates` (analyzer.rs 11338–11369). Tier 1
+takes the first candidate with `home_trait: None` (11343–11348). Tier 2
+collects distinct homes and errors only when there are two or more
+(11352–11362); otherwise `candidates.first()` wins (11363–11366). The
+home is `member_home_trait`'s return (11376–11389): **a trait `Id`, with
+the arguments discarded.** So `Into<Foo>` (the blanket, instantiated at
+this receiver) and `Into<Bar>` (the user's) are *one home*, `homes.len()`
+is 1, no ambiguity is raised, and declaration order decides — rows 2, 6,
+18, 19.
+
+**The bound path** — analyzer.rs 24662–24734. A `Type::Generic` receiver
+walks `generic_bound_traits`, takes the first bound trait declaring the
+name, and records `GenericDispatch::OnConstraint` plus the *trait id* in
+`bound_dispatch_traits` (24725–24731). Arguments are used to substitute
+the method's signature (24705–24718) but are **not carried into the
+dispatch key**.
+
+**Codegen re-dispatch** — `resolve_dispatch_with`
+(`crates/vilan-core/src/transformer.rs` 6014–6059) prefers
+`resolve_member_on_trait_impl` (6113–6137), which filters
+`implementation.trait_ids.contains(&trait_id)` and
+`nominal_matches(subject, type_)` and takes the first hit. Two
+consequences, both measured:
+
+- `nominal_matches` (transformer.rs 1347–1353) compares struct/enum ids
+  and otherwise falls to `a == b`, so a `Type::Generic` subject never
+  matches a `Type::Struct` receiver. **The std blanket is invisible
+  here.** That is why row 4 and rows 21/22 pick the user's impl on the
+  bound path while the analyzer picks the blanket on the direct path.
+- The filter ignores `trait_args` entirely, so a bound written
+  `T: Conv<Baz>` re-dispatches to whichever impl of `Conv` was declared
+  first — row 20's type confusion. `resolve_member_on_type`
+  (transformer.rs 7109–7130) has the same first-hit-wins shape for the
+  unpreferred path.
+
+**What already gets arguments right**, and is the proof the key is
+available: B98's duplicate-impl check keys on `(trait, effective
+arguments, subject)` with SAMENESS rather than compatibility, padding a
+`with` clause with the trait's declared defaults and resolving `= Self`
+to the subject (`trait-objects.md` §15.8); and bound satisfaction refuses
+`Into<Bar>` for a type carrying only the blanket's `Into<Foo>` (row 24).
+The machinery exists in two places and is simply not consulted by the
+third.
+
+**So the root cause decomposes:**
+
+- **D1 — argument blindness.** Resolution keys on the trait id where the
+  duplicate check and the bound checker key on `(trait, arguments)`.
+  Causes rows 2, 5, 18, 19, 20.
+- **D2 — overlap by declaration order.** When two impls genuinely apply
+  for the *same* trait and arguments, nothing ranks them and
+  `candidates.first()` takes registration order. Causes rows 6, 7, 9–14,
+  17, 21.
+- **D3 — two matchers.** `compare_type` in the analyzer, `nominal_matches`
+  in the transformer. Causes rows 21/22's disagreement and, in the
+  opposite direction, the accident that makes row 4 correct today.
+
+### 13.4 The design space
+
+#### (a) A specificity ordering
+
+A partial order over the applicable impls; the unique maximum wins; two
+incomparable maxima are an ambiguity error at the call site. "More
+specific", precisely, for vilan's type language:
+
+1. **Subject shape.** Impl A's subject is more specific than B's when B's
+   subject *pattern-matches* A's subject and not conversely. That makes
+   `Foo` ≻ `type T`, `Box<i32>` ≻ `Box<type T>`, and `Box<List<i32>>` ≻
+   `Box<type T>` (rows 9–14) fall out of one rule rather than three
+   cases — it is directional `compare_type`, which the analyzer already
+   computes in both directions elsewhere.
+2. **Bounds.** When the subject patterns are equal up to binder renaming,
+   the impl whose binders carry a strictly stronger bound set wins:
+   `Box<type T: Display>` ≻ `Box<type T>` (rows 11/12). B98 already
+   compares bound sets for its sameness key ("Bounds, not identity, is
+   what makes (3) work in both directions", §15.8), so this reuses a
+   measured comparison rather than inventing one.
+3. **Incomparable.** `Box<type T: Display>` against `Box<type U: Ord>`
+   for a `Box<i32>` that satisfies both: neither subsumes the other, so
+   neither wins and the call site reports an ambiguity naming both impl
+   sites. This is the residue (a) does not rank, deliberately.
+
+**Composition with §3:** specificity ranks *inside* the trait tier only.
+Tier 1 (inherent) is untouched — row 23 keeps working, and B57's
+"inherent beats trait, unconditionally" is not weakened. The
+`AmbiguousTraits` error stays exactly what it is for two *different*
+traits; specificity never rescues that case.
+
+**What it does to std:** `impl type T with Into<T>` is the only blanket
+impl in the whole tree (swept: `grep "impl type " vilan` returns one hit,
+`std/src/into.vl:5`). Under (a) it loses to any user `Into` impl for that
+subject and keeps applying to every type that has none. No std impl pair
+becomes ambiguous — std's own bound-tiered `List` impls (`list.vl` 12,
+135, 151) use distinct method names per tier, which §3(b) already
+measured.
+
+**Corpus, docs, examples:** nothing in the tree calls `.into()` and
+nothing writes a `T: Into<…>` bound (the only `Into` mentions outside
+`into.vl` are the `docs/std/strings.md` §Into prose, `docs/spec/types.md`
+271–282's rule and its tracked note, and `docs/appendix/errors.md`
+120–121's B98 wording). Zero corpus goldens can move for want of a call
+site to move them. Two proposals have recorded wanting this fixed:
+`variadic-generics.md` 175–196 chose a bespoke `Readable<T>` over the
+more elegant `Into<Source<U>>` **because** blanket dispatch is broken, and
+`trait-objects.md` §10's P18 is row 1 verbatim.
+
+**Diagnostics** (diagnostics-standard.md): the incomparable case gets a
+call-site ambiguity anchored at the member-name span (A1/A4, matching
+§4's existing ambiguity and `BareTraitValue`), naming both candidates by
+their *impl subject* as the user wrote it (B1) with C3 notes at the two
+impl sites. There is no `Trait::member` steer available here — both
+candidates are the same trait — so, per B83's "an impossible steer is
+worse than no steer", the message says what ranks and what does not
+rather than offering a spelling that does not exist.
+
+**Cost:** a subsumption routine over impl subjects and bound sets, run
+per call site over an already-collected candidate list (the list is
+almost always length 1). It is additive to `rank_member_candidates`; no
+tier moves.
+
+#### (b) Overlap rejection (Rust's coherence)
+
+Two impls of the same trait, at the same effective arguments, whose
+subjects could both match some type are an error at the second
+definition site.
+
+**Is `impl type T with Into<T>` then legal alongside ANY user `Into`
+impl?** The brief's question, and the answer is *yes for the case that
+matters and no for one that exists*:
+
+- Against `impl Foo with Into<Bar>` — **legal.** With D1 fixed the
+  arguments differ (`Into<Foo>` vs `Into<Bar>`), so they are not the same
+  implementation and cannot overlap. This is the same reasoning B98
+  already shipped for its pair key.
+- Against a *reflexive* user impl `impl Foo with Into<Foo>` — **an
+  error**, and one the tree contains today:
+  `b98_the_std_into_blanket_is_not_a_duplicate_of_a_user_impl`
+  (`crates/vilan-core/tests/inference.rs` 47946) writes exactly
+  `impl Fahrenheit with Into<Fahrenheit> { fun into(self): Fahrenheit { self } }`
+  and asserts it compiles. Under (b) that pin's program stops compiling.
+  That is (b)'s only measured in-tree casualty, and it is a pin written
+  on purpose to hold this door open.
+
+**The deeper objection:** the overlap that fires is between a *user's*
+impl and a file in `std` the user cannot edit. The diagnostic's steer
+would have to be "delete std's blanket" or "do not implement `Into`
+reflexively" — a dead end at the user's own definition site, which is
+precisely the failure mode B65 and B83 named. (b) also forbids outright
+the "generic impl plus a specialized one" pattern (rows 9–14) with no
+replacement, since vilan has no `default fn`. It is simpler to specify
+and strictly stricter, and it does close D2 by construction — but it
+closes it by removing the expressiveness rather than ranking it.
+
+#### (c) The hybrid — overlap is an error unless one impl is strictly more specific
+
+(a)'s subsumption order plus (b)'s definition-site check, with the check
+suppressed whenever the order ranks the pair. Rust's specialization-lite,
+and what a reader coming from Rust expects.
+
+Arithmetically, (c) = (a) + (b), and its *only* behavioral addition over
+(a) is moving (a)'s incomparable residue from a call-site error to a
+definition-site error. It costs a whole-program pairwise check (cheap —
+it is per member-name row, the same scan B98 already runs) and it
+inherits (b)'s std-blanket problem in full: `impl Foo with Into<Foo>`
+beside the std blanket is *not* ranked by specificity (the blanket is
+strictly more general, so it IS ranked — the specific one wins), so
+actually (c) admits the row-8 pin's program where (b) refuses it. (c)'s
+residual refusals are only the genuinely incomparable pairs, of which the
+tree contains zero.
+
+### 13.5 Recommendation
+
+**Take (a), implemented as three rules in this order, and do not take (b).
+Leave (c) available as a later, purely additive layer.**
+
+- **R1 — put the trait's effective arguments in the resolution key.**
+  `rank_member_candidates`'s home (analyzer.rs 11352–11359) and the
+  transformer's `resolve_member_on_trait_impl` filter (transformer.rs
+  6123–6136) key on `(trait_id, effective arguments as instantiated for
+  this receiver)`, computed the way B98 already computes it (arguments
+  in, declared defaults padded, `= Self` resolved to the subject). This
+  alone fixes rows 18, 19 and 20 — the type confusion — and turns rows 2
+  and 5 from a silent wrong answer into two distinct homes. It is not a
+  new idea in this codebase; it is the key two other checks already use.
+- **R2 — the expected type selects among argument-distinct homes.** When
+  the surviving candidates differ only by their trait arguments and
+  exactly one's return type reconciles with the call site's expected
+  type, that one wins; zero or two or more is an ambiguity error naming
+  the homes as the receiver instantiates them (`Into<Foo>` and
+  `Into<str>`). This is what makes rows 1 and 3 compile and row 2 a
+  *reported* ambiguity rather than a printed struct, and it is exactly
+  the missing capability `variadic-generics.md` 182–187 recorded as its
+  blocker ("the annotation doesn't steer impl selection").
+- **R3 — specificity ranks a genuine overlap.** For candidates sharing
+  one `(trait, arguments)` home, §13.4(a)'s subsumption order picks the
+  maximum; incomparable maxima are a call-site ambiguity. Fixes rows 6,
+  7, 9–14, 17 and 21 — and closes D3 by making the analyzer agree with
+  the preference the transformer already has (row 22).
+
+**Three sentences of reasoning.** B73's beta-critical damage is caused by
+resolution keying on a trait id where the rest of the compiler keys on
+`(trait, arguments)`, so R1 is a consistency repair with two shipped
+precedents rather than a new semantics, and it alone removes the type
+confusion that would still exist if the std blanket were simply deleted.
+Overlap rejection (b) buys strictness the tree has no demand for while
+costing a shipped pin, forbidding a pattern with no replacement, and
+producing a diagnostic whose only fix lives in a file the user cannot
+edit. Specificity is the smaller and more honest change because half the
+compiler already implements it — the transformer's `nominal_matches`
+prefers a concrete impl over a blanket today (rows 21/22) — so R3 makes
+one program stop having two answers instead of inventing a preference
+nobody has expressed.
+
+**What this does not do.** It does not make `impl type T with Into<T>`
+unremovable — deleting it is still available as an independent
+simplification (§13.6 Q3) — and it does not touch §3's tiers, §3.1's
+`Trait::member` disambiguator, B98's pair key, or B84's same-block rule.
+
+### 13.6 Questions only the owner can answer — all RULED 2026-08-18, each as recommended
+
+**Q1 — the shape.** (a) with R1–R3, (b), or (c)? *Recommendation: (a) with
+R1–R3.* (b) costs a shipped pin and a user-unreachable fix site; (c) is
+(a) plus a check whose only new refusals are pairs the tree does not
+contain.
+
+**Q2 — may the expected type steer impl selection (R2)?** This is the one
+genuinely new capability in the recommendation: method resolution runs
+receiver-first today, and R2 lets the annotation on the left of the `=`
+choose among trait instantiations on the right. It is how Rust's `.into()`
+works and it is what two proposals have asked for. If the ruling is **no**,
+B73's headline case becomes an unconditional *ambiguity error* at every
+`.into()` on a type that has its own `Into` impl — correct, never silently
+wrong, and close to unusable without a bound, because there is no
+disambiguating spelling (row 5: `Into::into(foo)` reaches the blanket, and
+vilan has no `<Foo as Into<Bar>>::into` form and §3.1 declined to add one).
+A "no" therefore probably implies deleting the blanket as well.
+
+**Q3 — should `impl type T with Into<T>` exist at all?** Deleting
+`std/src/into.vl` 5–9 is a one-line change with no in-tree dependent —
+nothing calls `.into()`, nothing writes an `Into` bound, and
+`variadic-generics.md` 190–196 already recommends *against* the design
+that would have depended on it. It would make rows 1–5 correct
+immediately. **It would not close beta trigger (c)**: row 20's type
+confusion and rows 9–14/21's order dependence involve no blanket at all,
+so the miscompile stays open. If the owner wants beta unblocked sooner,
+the honest sequence is R1 (which closes row 20) plus the deletion, with
+R2/R3 following at ordinary priority — but that is a scheduling ruling,
+not a design one, and this section does not assume it.
+
+**Q4 — where is an unrankable overlap reported, call site or definition
+site?** (a) says call site (report only what a program actually asks
+for, as §3 does for trait-vs-trait); (b)/(c) say definition site (refuse
+early, as §3 does for duplicate-inherent). B57 shipped both anchoring
+philosophies for different rules, so precedent does not settle it.
+
+**Q5 — row 17: what should a specific impl that takes the trait's default
+outrank?** `impl type T with Tag { fun tag → 1 }` beside
+`impl Foo with Tag { }` prints `1` in both orders today: the blanket is
+the only candidate that *declares* the name, so the trait's default `9`
+is unreachable for `Foo`. §13.4(a) says the more specific impl wins and
+its member is the trait's default, giving `9`. The pin encodes `9`; it is
+the least obvious row in the table and the owner may prefer `1`.
+
+**Q6 — does R3's applicability check subsume the other tracked soundness
+note?** Row 15 is a false rejection with the same root: candidate
+selection ignores whether an impl's bounds actually hold, so an
+unsatisfiable bounded impl declared first wins the race and then fails its
+own bound check while an applicable unbounded impl sits below it.
+`spec/types.md` §5.4's second implementation note ("a conditional impl's
+bounds are not yet re-checked when the impl is selected through a GENERIC
+bound") is the same gap seen from the other side. Making bounds part of
+*applicability* would fix both; keeping them out of it leaves row 15 open.
+In scope of B73, or its own item?
+
+### 13.7 The pins
+
+Thirteen `#[ignore]`d pins in `crates/vilan-core/tests/inference.rs`, one
+per case, each encoding the §13.5 recommendation and each named for its
+row. They are un-ignored by the fix, not by this section.
+
+| Pin | Row(s) | Asserts |
+|---|---|---|
+| `b73_a_user_into_impl_beats_the_std_blanket` | 1 | compiles; `101` |
+| `b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity` | 2 | fails with an ambiguity naming `Into<str>` |
+| `b73_an_into_call_in_return_position_reaches_the_user_impl` | 3 | compiles; `101` |
+| `b73_a_trait_qualified_into_call_reaches_the_user_impl` | 5 | annotated `let b: Bar = Into::into(foo)` compiles; `101` |
+| `b73_a_user_blanket_loses_to_a_specific_impl_whatever_the_order` | 6, 7 | `101` in both orders |
+| `b73_a_concrete_impl_subject_outranks_a_generic_one` | 9, 10 | `2` in both orders |
+| `b73_a_bounded_impl_subject_outranks_an_unbounded_one` | 11, 12 | `2` in both orders |
+| `b73_a_nested_concrete_impl_subject_outranks_a_generic_one` | 13, 14 | `2` in both orders |
+| `b73_an_applicable_unbounded_impl_survives_an_inapplicable_bounded_one` | 15 | compiles; `1` |
+| `b73_a_specific_impl_taking_the_trait_default_outranks_a_blanket_declaration` | 17 | `9` in both orders (Q5) |
+| `b73_two_impls_of_one_trait_at_different_arguments_are_both_reachable` | 18, 19 | `3` and `2` |
+| `b73_a_bound_selects_the_impl_matching_its_trait_arguments` | 20 | `baz`, not `2` — the type confusion |
+| `b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins` | 21, 22 | `7` on both paths |
+
+Rows 4, 8, 16, 23 and 24 are correct today and take no new pin: they are
+already held by `b84_two_impls_of_one_trait_are_still_not_a_duplicate`,
+`b98_the_std_into_blanket_is_not_a_duplicate_of_a_user_impl`, and §3's
+inherent-tier pins. Every pin's program was run through this worktree's
+`target/debug/vilan` first, so each records a measured "today" in its
+comment rather than an assumed one — and each is non-vacuous by
+construction, since today's answer differs from the asserted one.
+
+### 13.8 The ship record (2026-08-18)
+
+Shipped as ruled: (a) with R1 → R2 → R3, three commits, each green on
+`cargo build` + `cargo test -p vilan-core --test inference` + `cargo test
+-p vilan-cli --test corpus` + `cargo test -p vilan-core --test docs`. No
+corpus golden moved at any of the three — the transformer change is a
+filter, and every program whose trait arguments already agreed emits the
+bytes it always did. All 13 pins are un-ignored; 10 more were added for
+shapes the 13 do not cover.
+
+**R1 — the trait's arguments join the key.**
+
+- `ImplMemberCandidate::home_arguments` (analyzer.rs 1472) with
+  `instantiated_home_arguments` (11567): B98's padding
+  (`effective_trait_arguments_of`, 4947 — the `TraitImplSite` version now
+  delegates to it) plus the impl's binders bound from the receiver, so
+  std's blanket reads as `Into<Foo>` on a `Foo`.
+- `rank_member_candidates` (11611) groups candidates into homes by
+  `(trait, arguments)` with `same_impl_types`, keeps §3/§4's
+  `AmbiguousTraits` for two DIFFERENT traits, and reports
+  `AmbiguousTraitArguments` (1496) for two instantiations of one.
+- `bound_dispatch_traits` widened to `(trait, arguments)` (2562, 31277);
+  `resolve_member_on_trait_impl` (transformer.rs 6172) filters through
+  `trait_instantiation_conflicts` (6018) / `nominally_different` (6047).
+- Pins un-ignored: rows 2 and 20 — both silent miscompiles, so no clean
+  compile in this family produces a wrong answer after R1 alone.
+- New pins: `b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them`,
+  `b73_two_bounds_at_different_arguments_each_reach_their_own_impl`,
+  `b73_an_impl_whose_trait_argument_is_its_own_binder_survives_the_filter`.
+- Diagnostics-ledger row 213.
+
+**R2 — the expected type selects among argument-distinct homes.**
+
+- `select_home_by_expected_type` (11901) with `member_return_type_for`
+  (11942), consulted at `resolve_method_call` (25234) before the
+  ambiguity is reported. The expectation is read from `expected_types`,
+  which an annotated `let`, a declared return type and a `ret` already
+  seed.
+- `bind_trait_qualified_call` (24474) collects every provider of the
+  named trait instead of taking the first, and asks the same selector.
+- `static_path_candidates` (11327) drops `self`-method candidates when
+  the path head IS a trait: a blanket impl's generic subject
+  `compare_type`s the bare trait type, so `Into::into` was answered as
+  though it were an attached static and never reached §3.1's re-point.
+  Attached statics (`Iterator::from_fn`) are untouched.
+- Pins un-ignored: rows 1, 3, 5, 6/7, 18/19.
+- New pin: `b73_an_expectation_matching_no_home_leaves_the_call_ambiguous`.
+
+**R3 — specificity ranks a genuine overlap.**
+
+- Applicability (Q6): `applicable_candidates` (11517) / `impl_bounds_hold`
+  (11538) drop an impl whose binder bounds the receiver does not satisfy.
+  The filter narrows and never empties — when nothing applies the
+  unfiltered list stands, so a program with only an inapplicable impl
+  keeps the bound diagnostic it has always had.
+- Subsumption: `impl_subject_matches` (11715), the directional match
+  `compare_type` cannot be; `subject_bounds_are_stronger` (11783) for
+  equal shapes; `impl_outranks` (11810); `impls_rank_equally` (11833)
+  keeps §2's platform-twin shape out of the ambiguity;
+  `most_specific_in_home` (11863) takes the maxima and reports the
+  residue as `AmbiguousImpls` (1501) at the call site (Q4).
+- Row 17 (Q5, ruled `9`): `inheriting_impls_of_declared_homes` (11459)
+  adds an impl that takes its trait's DEFAULT as a candidate — but only
+  into a home a declaring impl already occupies, so §3's
+  declaration-over-default tier and Gap E's fallback are untouched. The
+  winner is returned as `FoundInheritedDefault` (1506) and rides Gap E's
+  re-dispatch channel (25287).
+- Pins un-ignored: rows 9/10, 11/12, 13/14, 15, 17, 21/22.
+- New pins: `b73_two_impls_bounded_by_unrelated_traits_are_an_unrankable_overlap`,
+  `b73_an_inapplicable_impl_that_is_the_only_one_still_reports_its_bound`,
+  `b73_an_applicable_impl_wins_whichever_side_of_the_inapplicable_one_it_sits`,
+  `b73_an_inherent_member_still_outranks_the_most_specific_trait_impl`,
+  `b73_a_blanket_declaring_nothing_leaves_the_specific_impl_alone`,
+  `b73_a_conditional_impl_does_not_satisfy_a_bound_its_binder_refuses`.
+- Diagnostics-ledger row 214.
+
+#### Where the table's prediction and the measurement differ
+
+- **Rows 18/19 need R1 AND R2**, not R1 alone as §13.5's R1 bullet says.
+  Splitting `Conv<Bar>` and `Conv<Baz>` into two homes is what makes both
+  reachable; *choosing* between two reachable homes on one receiver is
+  precisely what an expected type is for, and R1 has no other instrument.
+  R1 alone turns rows 18/19 from "the first-declared, silently" into a
+  report — better, not fixed.
+- **Rows 6/7 close under R2, not R3** as §13.4(a) implies. A user's
+  `impl type T with Conv<T>` instantiates as `Conv<Foo>` against the
+  specific impl's `Conv<Bar>`, so the two are argument-distinct HOMES and
+  the annotation settles them before specificity is consulted. Rows
+  21/22, whose `Tag` takes no arguments, are the shape that genuinely
+  exercises R3's subsumption order.
+- **Row 5's mechanism is not the one §13.3 describes.** `Into::into(foo)`
+  never reached §3.1's re-point: the static path head resolved it
+  directly to the blanket's `into`, because an impl with a GENERIC
+  subject `compare_type`s `Type::Trait(Into, [])` itself. Two repairs
+  were needed, not one.
+- **`spec/types.md` §5.4's second implementation note (Q6's other side)
+  was already stale, for reasons unrelated to this arc.** Its own
+  example — `List<B>` satisfying a `Marker` bound via
+  `impl List<type T: Marker>` when `B` lacks `Marker` — measures as
+  REJECTED with R3's applicability step planted out, because bound
+  satisfaction goes through `type_implements_trait`, which asks
+  `compare_type`, which resolves a bounded binder to its constraint. The
+  note is rewritten and the claim is now pinned
+  (`b73_a_conditional_impl_does_not_satisfy_a_bound_its_binder_refuses`);
+  the derive-checks sentence it carried stands unchanged.
+
+#### Deferred
+
+- **An unranked home inside a multi-home call is represented by its first
+  maximum rather than reported.** `rank_member_candidates` (11671) hands
+  R2 one representative per home; if R2 then selects a home whose impls
+  R3 could not rank, the first maximum answers instead of the ambiguity
+  R3 would raise for that home alone. It takes a program with BOTH an
+  argument-distinct split AND an unrankable overlap inside one of the
+  halves; the tree contains none, and none of the 24 rows is that shape.
+- **B127 (delete the std `Into<T>` blanket) stays deferred**, per the Q3
+  ruling. Nothing here depends on the blanket existing or not.
+- **(c), the definition-site hybrid, remains available** as the purely
+  additive layer §13.5 describes: R3's residue is exactly the pair set
+  (c) would refuse early instead.
+
+## 14. B127 — is the blanket still earning its keep? (2026-08-20)
+
+> Status: **PAPER — recommendation DELETE, owner ruling pending** (the
+> question §13.6 Q3 deferred until R2's behavior was seen; it has now
+> been seen). Every claim below is measured: probes ran through this
+> worktree's `target/debug/vilan` (`cargo build` exit 0, branched from
+> `next` with R1–R3 in), and the deletion itself was run as a scratch
+> build with full gates, then reverted — the tree this section ships in
+> contains no code change (`git diff --stat`: this file and the README
+> index row only). Adjacent rulings: beta.md §5's Tier 3 row
+> (`std::into`, the table's only Tier 3 entry) and §5.1 Q3;
+> deprecation.md §5 ("Tier 3 owes no window — exercising the machinery
+> on a surface exempt from it proves nothing").
+
+### The census: where the blanket actually serves
+
+**Method — three legs that cross-check each other.** (1) An *import
+census*: `std::into` is not in the prelude (`std/src/lib.vl` re-exports
+`Default`, `assert`/`panic`/`print`, the numeric types, and `str` —
+`into` is absent), and a probe measured that without
+`import std::into::Into` the blanket does not even register:
+`foo.into()` in an import-free program is `Foo has no method 'into'`,
+exit 1. Registration therefore requires the import, so the candidate
+universe is *exactly the set of importers*, and grep enumerates it with
+certainty rather than heuristically. (2) A *probe pass* over every shape
+the module can serve, §13.2's harness method — scratch package with a
+`vilan.toml`, worktree binary, exit codes recorded. (3) The *deletion
+experiment* itself (next subsection) as ground truth: a serving site the
+first two legs missed cannot survive the deletion silently — it either
+loses its candidate or changes a diagnostic, and a gate goes red. Legs
+1–2 predicted leg 3's results exactly, which is what makes the census
+trustworthy.
+
+**The importers.** Zero `.vl` files anywhere — std itself, the corpus
+(`vilan/test/`), `examples/`, `benchmarks/`, `macro_std/` — import
+`std::into` or mention `Into<`/`.into()` (every `into` hit is the
+English word in a comment). Zero docs *fences* import it —
+`docs/std/strings.md` §Into's fence declares its own `trait Into<T>`
+fragment and never the impl. Zero hits in the website repo
+(`vilan-website`, swept read-only). The tree's importers are **eight
+embedded test programs, all in `crates/vilan-core/tests/inference.rs`**:
+the B98 carve-out pin (49340), the B84 legality pin (53320), and six B73
+pins (58224, 58254, 58280, 58310, 58641, 58674).
+
+**The probe pass** (worktree binary; "→" is printed output, exit 0
+unless said):
+
+| # | Shape | With the blanket (today) |
+|---|---|---|
+| A | `foo.into()`, no `import std::into` | `Foo has no method 'into'`, exit 1 — the blanket is not registered |
+| B | `let f: Foo = foo.into()`, import, no user impl | → `1` — the identity conversion; the blanket selected |
+| D | `let f = foo.into()`, only home | → `1` — selected unannotated |
+| F | `let f: Foo = foo.into()` beside a user `impl Foo with Into<str>` | → `5` — R2 picks the blanket's home `Into<Foo>` over the user's |
+| C | `fun accept<T: Into<Foo>>(x: T)` fed a `Foo` | **internal error, exit 1**: `internal: a call resolved to 'Into''s requirement 'into', which has no body — emitting it would produce an empty function and a runtime TypeError … please report this program`, anchored at the *import line* |
+| E | the row-4 shape — a bound reaching a *user* impl | → `101` — correct, blanket not involved |
+| G | a hand-written reflexive `impl Foo with Into<Foo>` beside the blanket, bound path | → `7` — the per-type impl works where the blanket internal-errors |
+
+**Finding 1 — resolution selects the blanket at zero sites in the
+tree, the test suite included.** In the eight importer programs the
+blanket never wins: three pins select the *user's* impl over it (rows
+1/3/5), three end in the ambiguity the blanket causes (rows 2 and the
+two diagnostic pins), two never call `into` at all (B98/B84). Its whole
+working surface, anywhere, is the direct-call identity conversion
+(probes B/D/F) — a no-op nothing in the tree writes.
+
+**Finding 2 — the blanket's flagship affordance is broken, with an
+internal compiler error.** The one thing a reflexive blanket is *for* is
+letting a `T: Into<Target>` bound accept a `Target` itself. Probe C
+measures that shape dying with "please report this program": the
+analyzer's bound satisfaction accepts via the blanket, but the
+transformer's `nominal_matches` cannot see a generic subject on the
+bound re-dispatch — §13.3's D3 ("The std blanket is invisible here"),
+whose remaining half R1–R3 deliberately left — and the no-body guard
+turns the invisibility into an internal refusal. Reproduced identically
+on the released binary (`vilan 0.34.0 (107d74671)`), so it is live for
+users, not a worktree artifact. **This wants filing as its own item**
+(this lane does not edit the backlog): today, the only program shape the
+blanket uniquely enables is a program that cannot compile.
+
+### What breaks if deleted — the scratch experiment
+
+Run honestly: `std/src/into.vl` lines 5–9 deleted (the trait kept),
+`cargo build` exit 0, gates by their own exit codes, then reverted and
+re-verified (`b73_*`: 23 passed after restore; `git status` clean).
+
+| Gate | Result |
+|---|---|
+| `cargo build` | exit 0 |
+| `cargo test -p vilan-core --test inference` | **exit 101 — 2363 passed, 3 FAILED**, 3 ignored (the pre-existing non-B73 ignores) |
+| `cargo test -p vilan-cli --test corpus` | exit 0 — **goldens byte-identical**, 7/7 |
+| `cargo test -p vilan-core --test docs` | exit 0 — every fence compiles, 8/8 |
+| `cargo test -p vilan-embedded-std` | exit 0 |
+
+The three failures, each a pin whose *premise* is the blanket rather
+than live behavior breaking:
+
+- `b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity`
+  (row 2) — "expected a compile error, but it compiled cleanly." Without
+  the blanket the user's `Into<str>` is the only home, and the program
+  prints `converted`, exit 0 (measured standalone) — which is §13.2's
+  own "Correct" column for row 2, its *first-choice* answer ("prints
+  `converted`, or an ambiguity error"). Today's blanket forces the
+  second-choice answer at every such call.
+- `b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them`
+  — no ambiguity remains, so the ledger-row-213 message never fires
+  (got: no diagnostic).
+- `b73_an_expectation_matching_no_home_leaves_the_call_ambiguous` — the
+  wrong-annotation shape becomes a plain
+  `Expected i32, but got str instead.` — arguably the better report,
+  since with one home there is nothing to be ambiguous *about*.
+
+And the deleted-world probes: B becomes `Foo has no method 'into'`
+(the identity spelling is gone); F becomes
+`Expected Foo, but got str instead.`; **C becomes a clean, steered
+refusal** — `'Foo' does not implement trait 'Into<Foo>', required by a
+generic bound of this call`, with a note at the bound's declaration,
+exit 1 — the internal error retired; G still prints `7` (the per-type
+reflexive impl carries the bound path with nothing else present).
+
+**The full breakage list, named:**
+
+- **std** — `into.vl` 5–9 gone; the `Into` trait stays; no other std
+  module references it (swept).
+- **Suite** — the three pins above rewritten (each keeps its R1/R2
+  behavior pinned with *two user impls* instead of user-plus-blanket,
+  e.g. `Into<str>` beside `Into<Bar>`); the B98 carve-out pin (49340)
+  loses its subject — keep it as the reflexive-impl-legality pin its
+  program already is, or retire it; stale *names and comments* on the
+  rows-1/3/5 pins and B84's "the live instance" comment (53320).
+- **Corpus** — nothing; byte-identical, measured.
+- **Docs fences** — nothing; gate green, measured. `strings.md` §Into
+  (72–83) teaches impl-plus-bound and never mentions the blanket;
+  `docs/README.md` 88's index row names the trait, which stays.
+- **Docs prose** — one real edit: `spec/types.md` 277–280 names
+  "`std::into`'s `impl type T with Into<T>` beside a type's own `Into`
+  impl" as the living overlap example; the example would move to a
+  user-written blanket or the conditional-impl pair the same sentence
+  already lists. `errors.md` 120–121 is the *arguments* rule
+  (`Into<Cup>`/`Into<Mug>`) — untouched.
+- **Records** — diagnostics-ledger row 213's B1 note reads "`Into<Foo>`
+  for std's blanket" (history; records don't retro-edit, but the
+  message's live exemplar changes); the Unreleased CHANGELOG entry
+  (119–123) narrates R1–R3 *in terms of* std's blanket — if deletion
+  landed in the same train, that entry would describe a surface the
+  release no longer has, so same-train landing wants a coordinating
+  edit.
+- **beta.md** — the Tier 3 row (318) and §5.1 Q3 (352) exist *because*
+  B127 is open; the ruling either way collapses them (delete → the row
+  vanishes with the module's impl question resolved; keep → §5.1 Q3's
+  "Tier 2 is the alternative"). Owner's file, owner's edit.
+- **Website** — nothing; zero mentions, swept.
+
+### What R2 makes better without it — and what rank keeps regardless
+
+**Deleting retires no machinery.** R1's argument key, R2's
+expected-type selection, and R3's subsumption order are all load-bearing
+for shapes users write with no std blanket anywhere: rows 6/7 (a *user*
+blanket), rows 9–14/17/21–22 (generic-vs-concrete and bound-strength
+overlaps), rows 18/19/20 (argument-distinct user impls — the
+type-confusion family R1 closed). `impl type T` is a language feature;
+std's blanket is merely its one in-tree *instance*. B128's deferred
+residue (backlog §B 128 — R2 selecting an unrankable home takes its
+first maximum instead of the ambiguity) is likewise constructible
+entirely from user impls: deletion neither closes nor shrinks it.
+
+**What deletion does buy** is user-facing, not mechanical: (i) the
+common case — one type, one conversion — stops paying an annotation tax.
+Today the blanket makes *every* `.into()` receiver a two-home call, so
+the natural `let s = foo.into()` with a single user impl is an ambiguity
+(row 2); without it, that program just runs and prints the §13.2-correct
+answer. (ii) std stops manufacturing the only overlap most programs will
+ever contain — R2/R3's ambiguity ceremony fires only where a *user*
+wrote an overlap. (iii) Probe C's internal error becomes a clean bound
+refusal — measured. (iv) Keeping the blanket carries an implied debt
+deletion cancels: making it *actually work* on the bound path means
+teaching the transformer to emit a generic-subject impl body
+per-instantiation (D3's remaining half) — real compiler work, currently
+serving zero users.
+
+**What keeping buys:** the reflexive-bound affordance (`T: Into<Target>`
+accepts a `Target`) — which does not work (probe C) and only pays after
+the D3 work above — and the identity `.into()` no-op (probes B/D/F),
+which nothing calls. variadic-generics.md 186–196 already measured the
+one design that wanted the affordance and chose a bespoke trait
+*because* "the identity `Into<Signal<A>>` competes and wins" — the
+blanket was that design's reason to flee, not its foundation.
+
+### Migration cost if deleted
+
+- **std:** the five-line impl; the trait, the module, and the import
+  path all stay.
+- **Call sites:** zero in the tree; corpus/docs/examples/website all
+  measured unaffected. For users: Tier 3 — "may be reworked wholesale
+  with a CHANGELOG note" (beta.md §5), and deprecation.md §5 records it
+  owes no window.
+- **Per-type impls:** a user wanting identity conversion writes the
+  three-line reflexive impl (`impl Foo with Into<Foo> { fun into(self):
+  Foo { self } }`) — already legal (the B98 pin's own program) and
+  *strictly more functional* than the blanket it replaces: it works on
+  the bound path today (probe G, both worlds), where the blanket
+  internal-errors.
+- **Docs teaching:** the `spec/types.md` 277–280 example swap;
+  `strings.md` untouched; a `breaking`-family CHANGELOG entry with the
+  migration line ("write the reflexive impl if you called identity
+  `.into()`").
+- **Tests:** the three pin rewrites plus the B98 pin's repurposing —
+  mechanical, shapes given above.
+
+**Recommendation: DELETE — in its own lane, after the ruling.** The
+census found zero selecting sites in every shipped surface *and* zero in
+the suite; the only working behavior is an identity no-op nothing calls;
+the flagship affordance is an internal compiler error in the released
+binary; deleting lands row 2 on §13.2's first-choice correct answer and
+un-taxes the single-impl `.into()` that `strings.md` actually teaches;
+keeping obligates D3 transformer work for zero users. This lane ships
+the paper only — under the work order's own letter the census is not
+"zero breakage" (three pins, one prose example, one contract row), so
+the deletion is a small scheduled change, not a drive-by: pin rewrites,
+the docs example, the CHANGELOG family entry, and the beta.md row in one
+commit, full gates.
+
+### 14.1 Owner question
+
+**Delete `std/src/into.vl` 5–9, or keep it and fund the fix?** Evidence
+for delete: resolution selects it *nowhere* in the tree, suite included
+(census above, three-legged and cross-checked); its one unique
+affordance — `T: Into<Foo>` fed a `Foo` — dies with `internal: … please
+report this program` on both this tree and released 0.34.0 (probe C);
+deleting turns that into a clean bound refusal, makes the unannotated
+single-impl `.into()` print the §13.2-correct `converted` instead of an
+ambiguity, costs three pin rewrites plus one docs-example swap
+(measured: corpus byte-identical, docs gate green), and closes beta.md
+§5.1 Q3 by removing the table's only Tier 3 row. Evidence for keep:
+Rust-shaped reflexive ergonomics — but they require paying D3's
+transformer debt before they exist at all, and the per-type reflexive
+impl already delivers them today (probe G: `7`, both worlds). If the
+ruling is delete, the bycatch stands regardless of timing: probe C's
+internal error is live in 0.34.0 and should be filed even if the blanket
+outlives it.

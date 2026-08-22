@@ -113,6 +113,23 @@ exempt (it cannot run uncovered); a function called from top level, or
 taken as a value, is entered without the value and is never covered,
 whatever its other callers.
 
+The error anchors at **your code**. A strict read you wrote reports at
+that read. A strict read that sits inside a standard-library helper —
+`effect`, `map`, and `or` all reach the ambient owner through one read
+in `std::reactive` — reports at each of your calls that enters
+the library on an uncovered path, one error per call (a call inside a
+covering `run` is never blamed), with a secondary note pointing at the
+library-internal read it reaches.
+
+The error also shows the **whole uncovered path**, not just its
+endpoint: every call of yours between the program's entry and the
+anchor carries its own label ("the context requirement flows through
+this call"; at a call dispatched on a generic bound, "may flow through"
+— the site might select an implementation that never reads). The labels
+run from the outermost frame down toward the read, and a deep chain
+elides its tail behind an explicit "… N more uncovered calls on this
+path". A covered call is clean: providing the context stops the trace.
+
 A function that reads a context **cannot be used as a value**
 ("`…` reads context `…`, so it can't be used as a value"): an indirect
 call would bypass the hidden parameter. Wrap it in a closure literal at

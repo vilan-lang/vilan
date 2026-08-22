@@ -2,8 +2,9 @@
 
 > Status: RATIFIED 2026-08-07 (owner review) — as drafted, with two
 > deliberate DEFERRALS: §2's branch protection (the ruleset amendment
-> stays unapplied) and §4's scaffolding slice (CONTRIBUTING.md,
-> SECURITY.md, templates — deferred, not refused; revisit with D5).
+> stayed unapplied — **APPLIED 2026-08-19**, §9.2) and §4's scaffolding
+> slice (CONTRIBUTING.md, SECURITY.md, templates — deferred, not refused;
+> revisit with D5).
 > Everything else stands: §1's cadence (Saturday train, U1–U3 urgent
 > triggers, lazy release/0.MINOR patch branches), §7.2's gate
 > unification (the highest-priority item), §3's merge policy, §5's
@@ -1005,14 +1006,27 @@ re-derive the boundary.
 
 ### 9.2 Deferred, and exactly where each one stopped
 
-- **§2 in whole — branch protection.** Ruleset 18887216 (`Protect default`)
+- **§2 in whole — branch protection.** ~~Ruleset 18887216 (`Protect default`)
   was **not** touched and still reads `enforcement: "disabled"` with
   `bypass_actors: []` and `required_signatures`. No second ruleset was
-  created for `next`. **8.3 is therefore open**, and so is the second half
-  of **8.1**: the `check` job exists and always reports, but nothing
-  requires it yet. That ordering is the right way round — §2.5's whole
-  argument is that the workflow must be reworked *before* the check becomes
-  required, and it now has been.
+  created for `next`.~~ **APPLIED 2026-08-19 (owner: "L6 approved"; backlog
+  L6).** Ruleset 18887216 amended by `PUT` exactly per §2.3 and read back:
+  `enforcement: "active"`, rules `deletion` + `non_fast_forward` +
+  `pull_request` (`required_approving_review_count: 0`,
+  `allowed_merge_methods: ["merge", "squash"]`) + `required_status_checks`
+  (`context: "check"`, non-strict), `bypass_actors` = RepositoryRole 5
+  (Admin), `bypass_mode: "always"`, **no** `required_signatures`. A second
+  ruleset, **`Protect next` (id 21052052)**, created by `POST` per §2.4:
+  `deletion` + `non_fast_forward` on `refs/heads/next`, no PR rule, no
+  required checks, no bypass list. **8.3 and the second half of 8.1 are
+  therefore closed** — `check` is required on `main`. The one operational
+  consequence, stated to the owner before applying: the Saturday fold
+  (`fold-release.sh`) pushes the `Merge next` commit to `main` directly,
+  which the Admin bypass admits and reports as a bypass in the push
+  output; if the fold should instead go through a PR so `check` gates it
+  for real, that is a `fold-release.sh` change, not a ruleset change.
+  The §2.5 ordering held: the workflow rework (§9.1) landed twelve days
+  before the check became required.
 - **§2.6's three security settings.** `secret_scanning`,
   `secret_scanning_push_protection` and `dependabot_security_updates` were
   verified still `disabled` and left that way: push protection arrived in

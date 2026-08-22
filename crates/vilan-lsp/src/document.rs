@@ -10,13 +10,14 @@ use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Implementation, Parameter, SourceId};
 use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
+use vilan_core::leak_tally::{LeakSite, Leaked};
 use vilan_core::lexing::tokenize;
 use vilan_core::node::Convention;
 use vilan_core::token::Token;
-use vilan_core::type_::Type;
+use vilan_core::type_::{Type, TypeId};
 use vilan_core::{
-    Error, Manifest, PackageSpec, Platform as BuildPlatform, Program, Span,
-    Workspace as BuildWorkspace, analyze_source,
+    Error, LeakedEntryAst, Manifest, PackageSpec, Platform as BuildPlatform, Program, Span,
+    Workspace as BuildWorkspace, analyze_source_reclaimable,
 };
 
 use crate::line_index::LineIndex;
@@ -453,15 +454,26 @@ pub enum CompletionKind {
     Snippet,
 }
 
+/// How far [`Document::expression_type_id`] follows a value through nesting
+/// shapes (a block's trailing expression, a closure-typed callee) before giving
+/// up. Real receivers nest a step or two; the bound is what keeps a malformed
+/// mid-edit tree from spinning.
+const EXPRESSION_TYPE_DEPTH_LIMIT: usize = 8;
+
 /// The vilan book's published base URL — keyword hovers deep-link into it.
-const BOOK_BASE: &str = "https://vilan-lang.org/docs/";
+/// (`crates/vilan-cli/tests/vscode_extension.rs` and `brew_formula.rs` pin the
+/// same URL as the marketplace listing's and the tap's homepage.)
+pub(crate) const BOOK_BASE: &str = "https://vilan-lang.org/docs/";
 
 /// Every keyword the lexer classifies (`token.rs`), each with a one-line
 /// meaning and a deep link into the book: `(keyword, sentence, page#anchor)`.
 /// Semantics-bearing keywords point at the specification; the rest point where
 /// the book teaches them best. The set is kept in lockstep with the lexer by
-/// [`keyword_lexeme`], whose every keyword arm has an entry here.
-const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
+/// [`keyword_lexeme`], whose every keyword arm has an entry here. Every
+/// `page#anchor` is held to the book's own headings by `book_sync.rs` — the
+/// anchor is mdBook's slug of a heading in `vilan/docs/<page>.md`, so a
+/// heading edit there has to land here too.
+pub(crate) const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     (
         "fun",
         "Declares a function.",
@@ -485,7 +497,7 @@ const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     (
         "impl",
         "Implements methods for a type (and, with a trait, that trait).",
-        "tour/data-and-traits.html#impl--methods-and-statics",
+        "tour/data-and-traits.html#impl-methods-and-statics",
     ),
     (
         "with",
@@ -910,7 +922,11 @@ pub struct Document {
     /// A `LineIndex` owns its text, so this IS the analyzed-text record — there
     /// is no second `String` to keep in step.
     analyzed_index: Arc<LineIndex>,
-    pub program: Option<Program<'static>>,
+    /// The analyzed program, paired with the entry text and tree it borrows
+    /// for `'static` — one value, so a superseded analysis's program and its
+    /// allocations are replaced (and reclaimed) together. See
+    /// [`AnalyzedProgram`].
+    pub program: AnalyzedProgram,
     pub diagnostics: Vec<Error>,
     /// The source file each diagnostic belongs to, parallel to `diagnostics`
     /// (`SourceId(0)` = this document; imported modules publish to their own
@@ -955,6 +971,91 @@ pub struct Document {
     /// can enumerate modules the `Program` never loaded. `None` on the degraded
     /// internal-error document, which resolved nothing.
     import_roots: Option<ImportRoots>,
+}
+
+/// The analyzed `Program` together with the two allocations it borrows for
+/// `'static`: the copy of the entry text `analyze_on_this_thread` leaks and the
+/// entry tree `analyze_source_reclaimable` leaks. The program's lifetime
+/// parameter says `'static`; this pairing is what makes that true for exactly
+/// as long as the program lives, and gives the bytes back afterwards — the M7
+/// fix (`leak-soak.md` §7): before it, every keystroke's analysis leaked both
+/// for the rest of the session (3.12 MiB of RSS per keystroke on a 735-line
+/// file, 6.1 GiB after two thousand).
+///
+/// **The invariant** (promised at [`AnalyzedProgram::new`], relied on in
+/// `Drop`): the program borrows only `text`, `ast`, and allocations that are
+/// immortal (std and module texts in `parse_clean_cached`, interned names,
+/// cached macro worlds); and nothing outside this value borrows `text` or
+/// `ast` — no process-global cache, no thread-local, nothing the server
+/// retains. `leak-soak.md` §7.2 is the audit that establishes the second half,
+/// global by global; the first half is what `analyze_source_reclaimable`
+/// returns. Every `Document` query returns owned values, so nothing borrowed
+/// from the program outlives the borrow of `self` that produced it.
+///
+/// `Drop` does the ordering in one visible place — program first, then the
+/// two reclaims — rather than leaning on field declaration order.
+pub struct AnalyzedProgram {
+    program: Option<Program<'static>>,
+    /// The leaked entry text the program borrows (`None` on a document that
+    /// analyzed nothing — the degraded internal-error document).
+    text: Option<Leaked<str>>,
+    /// The leaked entry tree the program borrows (`None` when parsing produced
+    /// no tree, or nothing was analyzed).
+    ast: Option<LeakedEntryAst>,
+}
+
+impl AnalyzedProgram {
+    /// Pairs a program with the allocations it borrows.
+    ///
+    /// # Safety
+    ///
+    /// `program` must borrow nothing with a non-`'static` life other than
+    /// `*text` and `*ast` — it is the program `analyze_source_reclaimable`
+    /// built over exactly that text and returned with exactly that `ast`
+    /// handle — and nothing else may hold a reference derived from either
+    /// leak: when this value drops, both are freed.
+    unsafe fn new(
+        program: Option<Program<'static>>,
+        text: Option<Leaked<str>>,
+        ast: Option<LeakedEntryAst>,
+    ) -> AnalyzedProgram {
+        AnalyzedProgram { program, text, ast }
+    }
+
+    /// No program, nothing leaked — the internal-error document's analysis.
+    pub fn none() -> AnalyzedProgram {
+        AnalyzedProgram {
+            program: None,
+            text: None,
+            ast: None,
+        }
+    }
+
+    pub fn as_ref(&self) -> Option<&Program<'static>> {
+        self.program.as_ref()
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.program.is_some()
+    }
+}
+
+impl Drop for AnalyzedProgram {
+    fn drop(&mut self) {
+        // The program borrows the two allocations: it goes FIRST, and only
+        // then are they given back. Nothing else borrows them (the `new`
+        // contract, established by leak-soak.md §7.2's audit), so after this
+        // line no reference into either allocation exists anywhere.
+        self.program = None;
+        if let Some(text) = self.text.take() {
+            // SAFETY: the program — the only borrower — was just dropped.
+            unsafe { text.reclaim() };
+        }
+        if let Some(ast) = self.ast.take() {
+            // SAFETY: as above; the tree's only borrower is gone.
+            unsafe { ast.reclaim() };
+        }
+    }
 }
 
 /// A semantic-token classification (E2): precision highlighting from the
@@ -1015,11 +1116,48 @@ pub struct PublishedDiagnostic {
     /// message, and the note's own file when it lives elsewhere (`None` =
     /// the diagnostic's file) — published as LSP related information.
     pub note: Option<(Span, String, Option<PathBuf>)>,
+    /// The diagnostic's requirement trace (backlog E78), in the same
+    /// per-location shape as `note`: one entry per uncovered upstream call,
+    /// ordered entry → read — published as LSP related information ahead of
+    /// the note, preserving this order, and each CALL hop additionally as
+    /// its own diagnostic at the call (E81).
+    pub trace: Vec<PublishedHop>,
+}
+
+/// One requirement-trace entry as the publisher wants it (backlog E78):
+/// located like the C3 note, plus whether it marks an uncovered CALL — a
+/// call hop additionally publishes as its own diagnostic at that location
+/// (E81), while the elision tail only ever rides as related information
+/// (its span is the last kept hop's, already underlined by that hop's own
+/// diagnostic).
+pub struct PublishedHop {
+    pub span: Span,
+    pub message: String,
+    pub path: Option<PathBuf>,
+    pub call: bool,
 }
 
 /// The span of an entity, flattened from the `&Span` stored in `span_map`.
 fn span_of(program: &Program, id: Id) -> Option<Span> {
     program.span_map.get(&id).map(|span| **span)
+}
+
+/// The subject to resolve a call through: the SOURCE subject. Where the
+/// context lowering rewired the call record's subject — a covered
+/// `get_safe`'s `Some`-wrap, `Context::run`'s body-closure call — the
+/// erased original is read back from the pass's record (editing-dx.md
+/// §19.3); every other call answers its wired subject. The erased subject
+/// entity survives in `entity_map`, so a chain walk continues through it
+/// normally and lands on the declaration the source names.
+fn source_call_subject(program: &Program, call_id: Id) -> Option<Id> {
+    let call = program.function_calls.get(&call_id)?;
+    Some(
+        program
+            .context_erased_subjects
+            .get(&call_id)
+            .copied()
+            .unwrap_or(call.subject_id),
+    )
 }
 
 /// The markup spans of a raw parse (element-syntax S5): tag names (open and
@@ -1076,6 +1214,61 @@ fn find_linked_tags(
     }
     node.0
         .for_each_child(&mut |child| find_linked_tags(child, offset, out));
+}
+
+/// The end of the TAG NAME of the innermost element whose opening tag could
+/// contain `offset` — the start of its head (E67).
+///
+/// Two shapes count, because element syntax is desugared before analysis
+/// (`elements.rs`) and so is only ever seen through a RAW parse, mid-edit:
+///
+/// - a parsed [`Node::Element`], which is what a complete tag gives; and
+/// - a [`Node::Error`] spanning `<…>`, which is what `parse_atom`'s element
+///   recovery leaves behind whenever a head item does not parse — `<div .>`
+///   (no method name after the dot) and `<div >` (no `</div>` yet) both land
+///   here, and they are exactly the buffers completion fires in.
+///
+/// Only the tag NAME bounds the answer; where the head ends, and whether the
+/// cursor is still at the head's own bracket depth, is
+/// [`Document::in_element_head`]'s token walk.
+fn innermost_open_tag_end(
+    node: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    offset: usize,
+    source: &str,
+    best: &mut Option<(usize, usize)>,
+) {
+    use vilan_core::node::Node;
+    let span = node.1.into_range();
+    if span.start <= offset && offset <= span.end {
+        let tag_end = match &node.0 {
+            Node::Element(body) => Some(body.tag.end),
+            Node::Error => error_tag_name_end(source, span.start, span.end),
+            _ => None,
+        };
+        if let Some(tag_end) = tag_end {
+            if tag_end <= offset && best.is_none_or(|(width, _)| span.end - span.start <= width) {
+                *best = Some((span.end - span.start, tag_end));
+            }
+        }
+    }
+    node.0
+        .for_each_child(&mut |child| innermost_open_tag_end(child, offset, source, best));
+}
+
+/// The end of the tag name in an error node the element recovery produced —
+/// `<` immediately followed by a name, the whole run closed by `>`. `None`
+/// for any other error node, so a failed expression is never mistaken for
+/// markup.
+fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
+    let slice = source.get(start..end)?;
+    if !slice.starts_with('<') || !slice.ends_with('>') {
+        return None;
+    }
+    let name: usize = slice[1..]
+        .bytes()
+        .take_while(|byte| is_identifier_byte(*byte) || *byte == b'-')
+        .count();
+    (name > 0).then_some(start + 1 + name)
 }
 
 /// Whether an expression is a value-position use of the definition `def_id` — the
@@ -1137,8 +1330,8 @@ impl Document {
             live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
             line_index,
-            program: None,
-            diagnostics: vec![Error {
+            program: AnalyzedProgram::none(),
+            diagnostics: vec![Error { trace: Vec::new(),
                 note: None,
                 span: vilan_core::span::Span::new((), 0..0),
                 msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
@@ -1164,12 +1357,13 @@ impl Document {
         // only when an edit lands (`set_text`).
         let line_index = Arc::new(LineIndex::new(text));
         let text_hash = hash_text(text);
-        // The program borrows its source for `'static`, so leak a copy (the
-        // editor re-analyzes on change; see the known leak tradeoff).
-        let leaked: &'static str = Box::leak(text.to_string().into_boxed_str());
-        vilan_core::leak_tally::record(
-            vilan_core::leak_tally::LeakSite::LspEntryText,
-            leaked.len(),
+        // The program borrows its source for `'static`, so leak a copy — with
+        // the handle kept: the `AnalyzedProgram` built below owns it and gives
+        // it back when the analysis is superseded or the document closes.
+        let (leaked_text, leaked) = Leaked::leak(
+            text.to_string().into_boxed_str(),
+            LeakSite::LspEntryText,
+            text.len(),
         );
         // Prefer the project's declared platform and source root (the file's role in
         // its `vilan.toml`); fall back to inferring the platform from imports and
@@ -1198,7 +1392,11 @@ impl Document {
                 })
                 .collect(),
         };
-        let (program, diagnostics) = analyze_source(
+        let vilan_core::AnalyzedEntry {
+            program,
+            diagnostics,
+            ast,
+        } = analyze_source_reclaimable(
             leaked,
             &std,
             &pkg_root,
@@ -1255,6 +1453,13 @@ impl Document {
             .as_ref()
             .map(vilan_core::platform_color::requirements)
             .unwrap_or_default();
+        // SAFETY: `program` was built by `analyze_source_reclaimable` over
+        // `leaked` (the text `leaked_text` owns) and returned with `ast`, the
+        // handle to the very tree it borrows; everything read from it above
+        // was copied into owned values (`entity_spans`, the diagnostics, the
+        // requirements). Nothing else borrows either allocation — leak-soak.md
+        // §7.2 audits every process-global and every thread-local for that.
+        let program = unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast) };
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
@@ -1285,14 +1490,29 @@ impl Document {
         // The C3 note as the publisher wants it: its span, its message, and the
         // file it lives in when it has one of its own (`None` = the
         // diagnostic's own file, whichever that is — backlog E17).
-        let note_of = |error: &Error| {
-            error.note.as_ref().map(|note| {
-                let note_path = note
-                    .source
-                    .and_then(|source| self.program.as_ref()?.source_path(source))
-                    .map(Path::to_path_buf);
-                (note.span, note.msg.clone(), note_path)
-            })
+        let locate = |note: &vilan_core::error::Note| {
+            let note_path = note
+                .source
+                .and_then(|source| self.program.as_ref()?.source_path(source))
+                .map(Path::to_path_buf);
+            (note.span, note.msg.clone(), note_path)
+        };
+        let note_of = |error: &Error| error.note.as_ref().map(locate);
+        // The E78 requirement trace, each hop located exactly like the note.
+        let trace_of = |error: &Error| {
+            error
+                .trace
+                .iter()
+                .map(|hop| {
+                    let (span, message, path) = locate(&hop.note);
+                    PublishedHop {
+                        span,
+                        message,
+                        path,
+                        call: hop.call,
+                    }
+                })
+                .collect::<Vec<_>>()
         };
         for (index, error) in self.diagnostics.iter().enumerate() {
             let source = self
@@ -1307,6 +1527,7 @@ impl Document {
                     message: error.msg.clone(),
                     warning: false,
                     note: note_of(error),
+                    trace: trace_of(error),
                 });
             } else if source == DERIVED_SOURCE {
                 published.push(PublishedDiagnostic {
@@ -1315,6 +1536,7 @@ impl Document {
                     message: format!("(in generated code) {}", error.msg),
                     warning: false,
                     note: None,
+                    trace: Vec::new(),
                 });
             } else {
                 let path = self
@@ -1334,6 +1556,7 @@ impl Document {
                         message: error.msg.clone(),
                         warning: false,
                         note: note_of(error),
+                        trace: trace_of(error),
                     }),
                     // An unknown source (shouldn't happen): keep the error
                     // visible on the entry rather than dropping it.
@@ -1343,6 +1566,7 @@ impl Document {
                         message: error.msg.clone(),
                         warning: false,
                         note: None,
+                        trace: Vec::new(),
                     }),
                 }
             }
@@ -1369,6 +1593,7 @@ impl Document {
                     message: warning.msg.clone(),
                     warning: true,
                     note: note_of(warning),
+                    trace: trace_of(warning),
                 }),
                 Some(Some(path)) => published.push(PublishedDiagnostic {
                     path: Some(path),
@@ -1376,6 +1601,7 @@ impl Document {
                     message: warning.msg.clone(),
                     warning: true,
                     note: note_of(warning),
+                    trace: trace_of(warning),
                 }),
                 // A source with no file (generated code): keep it visible on
                 // the entry rather than at that offset in the wrong text.
@@ -1385,6 +1611,7 @@ impl Document {
                     message: warning.msg.clone(),
                     warning: true,
                     note: None,
+                    trace: Vec::new(),
                 }),
             }
         }
@@ -1403,6 +1630,7 @@ impl Document {
                 message: problem.message.clone(),
                 warning: problem.warning,
                 note: None,
+                trace: Vec::new(),
             });
         }
         published
@@ -1536,7 +1764,7 @@ impl Document {
     /// conservative direction — the old always-sweep behavior, kept exactly
     /// where its reason still holds.
     pub fn depends_on(&self, path: &Path) -> bool {
-        let Some(program) = &self.program else {
+        let Some(program) = self.program.as_ref() else {
             return true;
         };
         program
@@ -1580,7 +1808,11 @@ impl Document {
             manifest_problem,
             import_roots,
         } = analysis;
-        // The analysis side, in full.
+        // The analysis side, in full. `program` is the pair of the new
+        // program and the allocations it borrows; assigning it drops the
+        // OUTGOING pair — its program first, then its entry text and tree are
+        // reclaimed (`AnalyzedProgram`'s `Drop`). This is the line the
+        // session leak M7 measured (leak-soak.md §4.1) stops at.
         self.analyzed_index = analyzed_index;
         self.program = program;
         self.diagnostics = diagnostics;
@@ -1744,16 +1976,22 @@ impl Document {
             }
         }
         // A variable (`let`/`mut`, local or module-level, or a destructured
-        // binder) or a parameter: its typed declaration, else the bare type.
-        let type_label = self.binding_hover(program, id).or_else(|| {
-            self.hover_label(program, id).map(|label| {
-                // A constant shows its VALUE beside its type (E9).
-                match self.const_value_label(program, id) {
-                    Some(value) => format!("{label} = {value}"),
-                    None => label,
-                }
-            })
-        });
+        // binder) or a parameter: its typed declaration; a member read: the
+        // fenced `name: T` (E72); else the bare type — fenced too, so every
+        // hover reads as code.
+        let type_label = self
+            .binding_hover(program, id)
+            .or_else(|| self.member_hover(program, id))
+            .or_else(|| {
+                self.hover_label(program, id).map(|label| {
+                    // A constant shows its VALUE beside its type (E9).
+                    let label = match self.const_value_label(program, id) {
+                        Some(value) => format!("{label} = {value}"),
+                        None => label,
+                    };
+                    format!("```vilan\n{label}\n```")
+                })
+            });
         let requirement = self
             .function_target(program, id)
             .and_then(|function| self.platform_requirements.get(&function))
@@ -1859,6 +2097,24 @@ impl Document {
         None
     }
 
+    /// The hover for a MEMBER read — `foo.bar` with the cursor on the member
+    /// expression — in the house style (E72): the fenced `bar: T`, the
+    /// member's name from the expression itself, the type the analyzer
+    /// rendered for it. A member *call* resolves through
+    /// [`Self::function_target`] to its declaration before this runs; the
+    /// call shape is skipped here rather than dressed in a field's clothes.
+    /// `None` for anything that is not a member read, leaving the bare-type
+    /// path.
+    fn member_hover(&self, program: &Program, id: Id) -> Option<String> {
+        let member_span = program.member_name_spans.get(&id)?;
+        if program.function_calls.contains_key(&id) {
+            return None;
+        }
+        let name = self.analyzed_text().get(member_span.into_range())?;
+        let type_label = self.hover_label(program, id)?;
+        Some(format!("```vilan\n{name}: {type_label}\n```"))
+    }
+
     /// The struct/enum definition an entity names in VALUE position — a
     /// constructor, a bare type reference, or an enum variant.
     fn type_declaration_target(&self, program: &Program, id: Id) -> Option<Id> {
@@ -1953,19 +2209,50 @@ impl Document {
                 || program.external_functions.contains_key(id)
                 || self.platform_requirements.contains_key(id)
         };
-        if carries_requirement(&id) {
-            return Some(id);
-        }
-        match program.entity_map.get(&id)? {
-            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
-                carries_requirement(binding).then_some(*binding)
+        // Iterative through the call → subject chain, with a seen-list: the
+        // chain is `entity_map`/`function_calls` data, which a lowering can
+        // (and E73 showed does) rewire into shapes the analyzer never emits —
+        // a cycle here must answer `None`, not recurse off the stack.
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = id;
+        loop {
+            if carries_requirement(&current) {
+                return Some(current);
             }
-            Expr::Function(function_id) | Expr::ExternalFunction(function_id) => Some(*function_id),
-            Expr::Call(call_id) => {
-                let subject = program.function_calls.get(call_id)?.subject_id;
-                self.function_target(program, subject)
+            if seen.contains(&current) {
+                return None;
             }
-            _ => None,
+            seen.push(current);
+            match program.entity_map.get(&current) {
+                Some(Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding)) => {
+                    if carries_requirement(binding) {
+                        return Some(*binding);
+                    }
+                }
+                Some(Expr::Function(function_id) | Expr::ExternalFunction(function_id)) => {
+                    return Some(*function_id);
+                }
+                Some(Expr::Call(call_id)) => {
+                    // Through the SOURCE subject: where the context pass
+                    // rewired the call record itself (a covered `get_safe`,
+                    // `Context::run`), the erased original is recorded and
+                    // still names the source callee (E75).
+                    current = source_call_subject(program, *call_id)?;
+                    continue;
+                }
+                _ => {}
+            }
+            // A call a lowering rewrote (E72): the context pass replaces an
+            // unprovided `get_safe()`'s entity record with the lowered form —
+            // a read of its hidden parameter, a `None` literal, an opaque
+            // `Null` for `Context::new()` — but the call record and its wired
+            // subject survive. Resolving through them is what lets the method
+            // name hover as the declaration the source names.
+            if let Some(subject) = source_call_subject(program, current) {
+                current = subject;
+                continue;
+            }
+            return None;
         }
     }
 
@@ -2049,28 +2336,52 @@ impl Document {
     }
 
     fn hover_label(&self, program: &Program, id: Id) -> Option<String> {
-        if let Some(label) = program.expr_types.get(&id) {
-            return Some(label.clone());
-        }
-        // A bare use carries no type on its own id; resolve through its binding
-        // (and through that binding's own kind, e.g. an imported enum variant).
-        match program.entity_map.get(&id)? {
-            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => program
-                .expr_types
-                .get(binding)
-                .cloned()
-                .or_else(|| self.hover_label(program, *binding)),
-            Expr::EnumVariant(enum_id, _) => program
-                .enums
-                .get(enum_id)
-                .map(|e| format!("enum {}", e.name)),
-            // A constructor / call: hover the thing being called (e.g. `Ok(x)`
-            // shows the enum) when the call's own result type isn't recorded.
-            Expr::Call(call_id) => {
-                let subject = program.function_calls.get(call_id)?.subject_id;
-                self.hover_label(program, subject)
+        // The id → binding chain is data (`entity_map`), and a binding that
+        // never got a type can sit on a self-loop — the context-threading
+        // pass's hidden parameters self-describe as `Expr::Parameter(itself)`
+        // with no `expr_types` entry — or, in principle, a longer cycle. The
+        // walk carries a seen-list and answers an honest `None` when the
+        // chain closes on itself, instead of recursing off the stack (E73:
+        // the recursive form crashed the whole server on such a hover).
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = id;
+        loop {
+            // A hidden context parameter is compiler-minted and deliberately
+            // record-less — not source, so no label is the honest answer.
+            // Checked explicitly against the pass's marker (E75) rather than
+            // left to the self-loop happening to meet the cycle guard.
+            if program.context_hidden_parameters.contains_key(&current) {
+                return None;
             }
-            _ => None,
+            if let Some(label) = program.expr_types.get(&current) {
+                return Some(label.clone());
+            }
+            if seen.contains(&current) {
+                return None;
+            }
+            seen.push(current);
+            // A bare use carries no type on its own id; resolve through its
+            // binding (and through that binding's own kind, e.g. an imported
+            // enum variant).
+            match program.entity_map.get(&current)? {
+                Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
+                    current = *binding;
+                }
+                Expr::EnumVariant(enum_id, _) => {
+                    return program
+                        .enums
+                        .get(enum_id)
+                        .map(|e| format!("enum {}", e.name));
+                }
+                // A constructor / call: hover the thing being called (e.g.
+                // `Ok(x)` shows the enum) when the call's own result type
+                // isn't recorded — through the SOURCE subject where the
+                // context pass rewired the call record (E75).
+                Expr::Call(call_id) => {
+                    current = source_call_subject(program, *call_id)?;
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -2121,7 +2432,7 @@ impl Document {
     /// resolved — inference made a decision the source doesn't show, so the
     /// editor shows it in place. Sorted by position.
     pub fn inlay_hints(&self) -> Vec<(usize, String)> {
-        let Some(program) = &self.program else {
+        let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
         let mut hints: Vec<(usize, String)> = Vec::new();
@@ -2152,7 +2463,7 @@ impl Document {
     /// definitions also cover macro names — they share trait names by design,
     /// and only semantics can tell them apart).
     pub fn semantic_tokens(&self) -> Vec<(Span, TokenKind, u32)> {
-        let Some(program) = &self.program else {
+        let Some(program) = self.program.as_ref() else {
             return Vec::new();
         };
         let entry = |id: Id| program.source_of(id) == Some(SourceId(0));
@@ -2365,61 +2676,91 @@ impl Document {
     }
 
     fn definition_of(&self, program: &Program, id: Id) -> Option<(SourceId, Span)> {
-        match program.entity_map.get(&id)? {
-            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
-                // Resolve to the name span of the thing the binding actually is —
-                // a function, a `let`/`mut` variable, or (parameters/generics,
-                // whose `span_map` entry is already the name) the span itself.
-                if let Some(function) = program.functions.get(binding) {
-                    return Some((program.source_of(*binding)?, function.name_span));
+        // The call → subject chain is walked iteratively with a seen-list —
+        // the same guard as `hover_label` and `function_target` (E73): the
+        // chain is data a lowering can rewire, and a cycle must answer `None`
+        // rather than recurse off the stack.
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = id;
+        loop {
+            if seen.contains(&current) {
+                return None;
+            }
+            seen.push(current);
+            // A hidden context parameter has no source declaration to land
+            // on — it is compiler-minted (E75). The explicit honest `None`.
+            if program.context_hidden_parameters.contains_key(&current) {
+                return None;
+            }
+            // A call whose ENTITY record the context pass overwrote (a plain
+            // `get` becomes a parameter read, a none-rooted safe read a
+            // `None` literal, `Context::new()` an opaque `Null`) still
+            // carries its call record, whose subject names the source
+            // callee — resolve through it, as `function_target` does (E75).
+            if program.function_calls.contains_key(&current)
+                && !matches!(program.entity_map.get(&current), Some(Expr::Call(_)))
+            {
+                current = source_call_subject(program, current)?;
+                continue;
+            }
+            return match program.entity_map.get(&current)? {
+                Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
+                    // Resolve to the name span of the thing the binding actually is —
+                    // a function, a `let`/`mut` variable, or (parameters/generics,
+                    // whose `span_map` entry is already the name) the span itself.
+                    if let Some(function) = program.functions.get(binding) {
+                        return Some((program.source_of(*binding)?, function.name_span));
+                    }
+                    if let Some(function) = program.external_functions.get(binding) {
+                        return Some((program.source_of(*binding)?, function.name_span));
+                    }
+                    if let Some(variable) = program.variables.get(binding) {
+                        return Some((program.source_of(*binding)?, variable.name_span));
+                    }
+                    Some((program.source_of(*binding)?, span_of(program, *binding)?))
                 }
-                if let Some(function) = program.external_functions.get(binding) {
-                    return Some((program.source_of(*binding)?, function.name_span));
+                Expr::Field(_, struct_id, index) => {
+                    let field = program.structs.get(struct_id)?.fields.get(*index)?;
+                    Some((program.source_of(*struct_id)?, field.name_span))
                 }
-                if let Some(variable) = program.variables.get(binding) {
-                    return Some((program.source_of(*binding)?, variable.name_span));
+                Expr::EnumVariant(enum_id, _) => {
+                    Some((program.source_of(*enum_id)?, span_of(program, *enum_id)?))
                 }
-                Some((program.source_of(*binding)?, span_of(program, *binding)?))
-            }
-            Expr::Field(_, struct_id, index) => {
-                let field = program.structs.get(struct_id)?.fields.get(*index)?;
-                Some((program.source_of(*struct_id)?, field.name_span))
-            }
-            Expr::EnumVariant(enum_id, _) => {
-                Some((program.source_of(*enum_id)?, span_of(program, *enum_id)?))
-            }
-            Expr::Call(call_id) => {
-                let subject = program.function_calls.get(call_id)?.subject_id;
-                self.definition_of(program, subject)
-            }
-            Expr::Function(function_id) => Some((
-                program.source_of(*function_id)?,
-                program.functions.get(function_id)?.name_span,
-            )),
-            Expr::ExternalFunction(function_id) => Some((
-                program.source_of(*function_id)?,
-                program.external_functions.get(function_id)?.name_span,
-            )),
-            Expr::Struct(struct_id) => Some((
-                program.source_of(*struct_id)?,
-                program.structs.get(struct_id)?.name_span,
-            )),
-            Expr::StructInitializer(initializer_id, _) => {
-                let struct_id = program.struct_initializer_to_def.get(initializer_id)?;
-                Some((
+                Expr::Call(call_id) => {
+                    // The SOURCE subject: the erased original where the
+                    // context pass rewired the call record (E75).
+                    current = source_call_subject(program, *call_id)?;
+                    continue;
+                }
+                Expr::Function(function_id) => Some((
+                    program.source_of(*function_id)?,
+                    program.functions.get(function_id)?.name_span,
+                )),
+                Expr::ExternalFunction(function_id) => Some((
+                    program.source_of(*function_id)?,
+                    program.external_functions.get(function_id)?.name_span,
+                )),
+                Expr::Struct(struct_id) => Some((
                     program.source_of(*struct_id)?,
                     program.structs.get(struct_id)?.name_span,
-                ))
-            }
-            Expr::Enum(enum_id) => Some((
-                program.source_of(*enum_id)?,
-                program.enums.get(enum_id)?.name_span,
-            )),
-            Expr::Trait(trait_id) => Some((
-                program.source_of(*trait_id)?,
-                program.traits.get(trait_id)?.name_span,
-            )),
-            _ => None,
+                )),
+                Expr::StructInitializer(initializer_id, _) => {
+                    let struct_id = program.struct_initializer_to_def.get(initializer_id)?;
+                    Some((
+                        program.source_of(*struct_id)?,
+                        program.structs.get(struct_id)?.name_span,
+                    ))
+                }
+                Expr::Enum(enum_id) => Some((
+                    program.source_of(*enum_id)?,
+                    program.enums.get(enum_id)?.name_span,
+                )),
+                Expr::Trait(trait_id) => Some((
+                    program.source_of(*trait_id)?,
+                    program.traits.get(trait_id)?.name_span,
+                )),
+                _ => None,
+            };
         }
     }
 
@@ -3057,6 +3398,14 @@ impl Document {
         if start >= 1 && bytes[start - 1] == b'(' && text[..start - 1].ends_with("[derive") {
             return self.macro_name_completions(program);
         }
+        // An element's opening tag is its own world too (E67): between `<div`
+        // and `>` the desugar takes an attribute, an `on:event(…)` or a
+        // `.method(…)` chain link — and nothing that is merely in scope. The
+        // check runs from `start` (the head item being typed), and the `.`
+        // just before it is the same disambiguator the grammar uses.
+        if self.in_element_head(start) {
+            return self.element_head_completions(program, start >= 1 && bytes[start - 1] == b'.');
+        }
         // An import path is its own world (E57): a name there is being reached
         // FOR THE FIRST TIME, so none of the in-scope machinery below applies —
         // candidates come from the package tree, and the head of the path names
@@ -3114,6 +3463,121 @@ impl Document {
             }
         }
         candidates
+    }
+
+    /// Whether `offset` (LIVE space — see [`Self::completion`]) sits in an
+    /// element's OPENING TAG, where the desugar takes an attribute, an
+    /// `on:event(…)`, or a `.method(…)` chain link (element-syntax.md §2–4).
+    ///
+    /// "In the head" is *after the tag name, before the head's `>`, and at the
+    /// head's own bracket depth*. The depth clause is what keeps this honest:
+    /// a head item's ARGUMENT is ordinary expression ground — the cursor in
+    /// `<form on:submit(|event| { print(client.add(x).| ) })>` is inside a
+    /// closure, three brackets deep, and belongs to E66's answer, not to this
+    /// one. It is also what makes the recovered shape safe to use, since a
+    /// flattened `<…>` error node spans the arguments too.
+    ///
+    /// The token walk reads the LIVE buffer, like the rest of completion's
+    /// dispatch: the character being typed is live by nature.
+    fn in_element_head(&self, offset: usize) -> bool {
+        let text = self.line_index.text();
+        let Some(tag_end) = self.open_tag_end(text, offset) else {
+            return false;
+        };
+        let (tokens, _errors) = tokenize(text);
+        let mut depth = 0usize;
+        for (token, span) in &tokens {
+            let range = span.into_range();
+            if range.start < tag_end {
+                continue;
+            }
+            if range.start >= offset {
+                break;
+            }
+            match token {
+                Token::Ctrl('(' | '[' | '{') => depth += 1,
+                Token::Ctrl(')' | ']' | '}') => depth = depth.saturating_sub(1),
+                // The head is already closed: the cursor is among the children.
+                Token::Ctrl('>') if depth == 0 => return false,
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// The head start of the innermost element containing `offset` — a raw
+    /// parse of the live text, since no element survives into `program`.
+    fn open_tag_end(&self, text: &str, offset: usize) -> Option<usize> {
+        let (tree, _errors) = vilan_core::parsing::parse(text);
+        let root = tree?;
+        let mut best: Option<(usize, usize)> = None;
+        for item in &root.0 {
+            innermost_open_tag_end(item, offset, text, &mut best);
+        }
+        best.map(|(_, tag_end)| tag_end)
+    }
+
+    /// The candidates for an element's head (E67). `chain` says the cursor
+    /// follows a `.`, so the head item under construction is a chain link.
+    ///
+    /// Both halves come from the compiler's own knowledge, so neither can
+    /// drift: the chain form's vocabulary is the `View` type's method set,
+    /// read from the std declaration the program compiles against, and the
+    /// event form is a *grammar* form, not a name list. The undotted
+    /// ATTRIBUTE vocabulary is deliberately absent — element-syntax.md §2 and
+    /// §9 item 3 make the desugar name-blind (`name(x)` lowers to
+    /// `.attr("name", x)` whatever `name` is), so there is no list to offer
+    /// and inventing one here would be a second source of truth with nothing
+    /// to gate it. What the head position stops offering is the enclosing
+    /// scope: not one binding, type, keyword or construct snippet may appear
+    /// between `<div` and `>`.
+    fn element_head_completions(&self, program: &Program, chain: bool) -> Vec<Completion> {
+        let Some(view_id) = self.element_view_nominal_id(program) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        self.push_methods(program, view_id, true, &mut items);
+        if !chain {
+            // Undotted: the chain form is offered in its own spelling, dot
+            // included, because an undotted `text(…)` is an ATTRIBUTE named
+            // "text" — a different construct, and the one §4's warning exists
+            // to catch.
+            for item in &mut items {
+                item.label = format!(".{}", item.label);
+            }
+            items.push(Completion::snippet(
+                "on:",
+                "an event handler",
+                "on:${1:click}(|${2:event}| { $0 })",
+                "on:",
+            ));
+        }
+        items
+    }
+
+    /// The `View` the element desugar builds on: the nominal `view("tag")`
+    /// returns (element-syntax.md §4 — a head lowers to a `view(…)` chain),
+    /// read from the declaration rather than matched by name, so the browser
+    /// and process twins each answer for their own platform.
+    fn element_view_nominal_id(&self, program: &Program) -> Option<Id> {
+        let mut fallback = None;
+        for (id, function) in &program.functions {
+            if function.name != "view" {
+                continue;
+            }
+            let Some(nominal) = function
+                .return_type_id
+                .and_then(|type_id| nominal_type_id(program, type_id))
+            else {
+                continue;
+            };
+            // std's `view`, not a same-named entry-file function.
+            if program.source_of(*id) != Some(SourceId(0)) {
+                return Some(nominal);
+            }
+            fallback = fallback.or(Some(nominal));
+        }
+        fallback
     }
 
     /// Every registered macro name, for attribute-position completion. The
@@ -3204,16 +3668,25 @@ impl Document {
                 return self.nominal_member_completions(program, element);
             }
         }
-        // A complex receiver (`find(x)?.`): its rendered type's first generic
-        // argument names the element — another `program` lookup, so `entity_at`
-        // also takes the ANALYZED offset (E52).
+        // A complex receiver (`find(x)?.`): the first type argument of its own
+        // value type names the element — another `program` lookup, so
+        // `entity_at` also takes the ANALYZED offset (E52). A CALL receiver is
+        // resolved structurally (E66); the rendered label is the fallback for
+        // whatever that cannot type.
         question_offset
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
-            .and_then(|receiver| self.hover_label(program, receiver))
-            .and_then(|label| first_generic_argument(&label).map(str::to_string))
-            .and_then(|element| self.nominal_id_by_name(program, base_type_name(&element)))
+            .and_then(|receiver| {
+                self.expression_element_nominal_id(program, receiver)
+                    .or_else(|| {
+                        self.hover_label(program, receiver)
+                            .and_then(|label| first_generic_argument(&label).map(str::to_string))
+                            .and_then(|element| {
+                                self.nominal_id_by_name(program, base_type_name(&element))
+                            })
+                    })
+            })
             .map(|type_id| self.nominal_member_completions(program, type_id))
             .unwrap_or_default()
     }
@@ -3237,33 +3710,105 @@ impl Document {
                 return Some(nominal);
             }
         }
-        // A complex receiver (`foo().`, `a.b.`): the parsed entity's rendered
+        // A complex receiver (`foo().`, `a.b.`): the parsed entity's own value
         // type — another `program` lookup, so `entity_at` also takes the
-        // ANALYZED offset (E52).
+        // ANALYZED offset (E52). The rendered label is the FALLBACK, not the
+        // answer: it is hover's phrasing, and hover answers a constructor call
+        // with the thing being constructed (`Some(1)` -> `enum Option`), which
+        // is right here, but a plain call with the CALLEE's signature
+        // (`make()` -> `fn make(): Point`), which never names a type at all.
         dot_offset
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
-            .and_then(|receiver| self.hover_label(program, receiver))
-            .and_then(|label| self.nominal_id_by_name(program, base_type_name(&label)))
+            .and_then(|receiver| {
+                self.expression_nominal_id(program, receiver).or_else(|| {
+                    self.hover_label(program, receiver)
+                        .and_then(|label| self.nominal_id_by_name(program, base_type_name(&label)))
+                })
+            })
+    }
+
+    /// The nominal struct/enum id of the VALUE an expression produces — the
+    /// question member completion asks of a receiver, and a different one from
+    /// [`Self::hover_label`], which describes the expression *as written*.
+    ///
+    /// The analyzer records a type on an expression's own id only where one is
+    /// *produced*; a call, and a block whose value is one, are typed on demand
+    /// and store nothing (the same silence B85 hit on `for … in` iterables and
+    /// B70 on tuple elements). So `expr_types`/`expr_type_ids` answer a field, an
+    /// index, a literal and a struct initializer directly, and the shapes below
+    /// are resolved by structure instead (E66).
+    fn expression_nominal_id(&self, program: &Program, id: Id) -> Option<Id> {
+        nominal_type_id(program, self.expression_type_id(program, id, 0)?)
+    }
+
+    /// [`Self::expression_nominal_id`]'s LIFTED twin: the nominal of the
+    /// container's ELEMENT — `find(x)?.` on an `Option<Profile>` offers
+    /// Profile's members (proposal/try-and-lift.md §5).
+    fn expression_element_nominal_id(&self, program: &Program, id: Id) -> Option<Id> {
+        let type_id = self.expression_type_id(program, id, 0)?;
+        let element = match program.type_id_to_type_map.get(&type_id)? {
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) => *arguments.first()?,
+            _ => return None,
+        };
+        nominal_type_id(program, element)
+    }
+
+    /// The resolved type of the value `id` produces. `depth` bounds the walk
+    /// through the nesting shapes (a block's trailing expression is itself an
+    /// expression), so a malformed mid-edit tree cannot spin here.
+    fn expression_type_id(&self, program: &Program, id: Id, depth: usize) -> Option<TypeId> {
+        if depth > EXPRESSION_TYPE_DEPTH_LIMIT {
+            return None;
+        }
+        if let Some(type_id) = program.expr_type_ids.get(&id) {
+            return Some(*type_id);
+        }
+        match program.entity_map.get(&id)? {
+            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
+                binding_type_id(program, *binding)
+            }
+            Expr::Call(call_id) => self.call_result_type_id(program, *call_id, depth),
+            Expr::Block((_, tail)) => self.expression_type_id(program, *tail, depth + 1),
+            _ => None,
+        }
+    }
+
+    /// A call's result type, read off the callee's declaration: the return type
+    /// of the function it names, or the result of the closure type it holds.
+    ///
+    /// The type ARGUMENTS of a generic return (`Result<Note, RpcError>`) do not
+    /// have to be solved for this to be useful — member completion resolves
+    /// members on the nominal head, and that head is written in the declaration.
+    fn call_result_type_id(&self, program: &Program, call_id: Id, depth: usize) -> Option<TypeId> {
+        let subject_id = program.function_calls.get(&call_id)?.subject_id;
+        // The callee is reached as a bare reference to its declaration.
+        let callee_id = match program.entity_map.get(&subject_id) {
+            Some(Expr::Local(binding))
+            | Some(Expr::Variable(binding))
+            | Some(Expr::Parameter(binding)) => *binding,
+            _ => subject_id,
+        };
+        if let Some(function) = program.functions.get(&callee_id) {
+            if let Some(return_type_id) = function.return_type_id {
+                return Some(return_type_id);
+            }
+        }
+        if let Some(external) = program.external_functions.get(&callee_id) {
+            return Some(external.return_type_id);
+        }
+        // A closure-typed callee (`let render = || …; render().`).
+        let subject_type_id = self.expression_type_id(program, subject_id, depth + 1)?;
+        match program.type_id_to_type_map.get(&subject_type_id)? {
+            Type::Closure(_, return_type_id) => Some(*return_type_id),
+            _ => None,
+        }
     }
 
     /// The nominal struct/enum id a `let`/parameter binding's declared type names.
     fn binding_nominal_id(&self, program: &Program, binding: Id) -> Option<Id> {
-        let type_id = program
-            .variables
-            .get(&binding)
-            .map(|variable| variable.type_id)
-            .or_else(|| {
-                program
-                    .parameters
-                    .get(&binding)
-                    .map(|parameter| parameter.type_id)
-            })?;
-        match program.type_id_to_type_map.get(&type_id)? {
-            Type::Struct(id, _) | Type::Enum(id, _) => Some(*id),
-            _ => None,
-        }
+        nominal_type_id(program, binding_type_id(program, binding)?)
     }
 
     /// The nearest same-file `let`/`mut` binding named `name` declared before
@@ -3685,10 +4230,7 @@ impl Document {
 
     /// The nominal struct/enum id an impl's subject names, ignoring type arguments.
     fn impl_subject_id(&self, program: &Program, implementation: &Implementation) -> Option<Id> {
-        match program.type_id_to_type_map.get(&implementation.subject)? {
-            Type::Struct(id, _) | Type::Enum(id, _) => Some(*id),
-            _ => None,
-        }
+        nominal_type_id(program, implementation.subject)
     }
 
     /// The struct or enum named `name` (type arguments already stripped).
@@ -4058,6 +4600,29 @@ fn first_generic_argument(label: &str) -> Option<&str> {
     None
 }
 
+/// The nominal struct/enum id a resolved type names, ignoring its type
+/// arguments — the id member resolution is keyed by.
+fn nominal_type_id(program: &Program, type_id: TypeId) -> Option<Id> {
+    match program.type_id_to_type_map.get(&type_id)? {
+        Type::Struct(id, _) | Type::Enum(id, _) => Some(*id),
+        _ => None,
+    }
+}
+
+/// The declared type of a `let`/`mut` binding or a parameter.
+fn binding_type_id(program: &Program, binding: Id) -> Option<TypeId> {
+    program
+        .variables
+        .get(&binding)
+        .map(|variable| variable.type_id)
+        .or_else(|| {
+            program
+                .parameters
+                .get(&binding)
+                .map(|parameter| parameter.type_id)
+        })
+}
+
 fn base_type_name(label: &str) -> &str {
     let label = label.trim();
     let label = ["struct ", "enum ", "trait "]
@@ -4089,6 +4654,19 @@ pub(crate) mod tests {
         std::env::var_os("VILAN_STD")
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"))
+    }
+
+    /// Runs `work` on a 256 MiB-stack thread and joins it — the stack
+    /// `Document::analyze` gives the pipeline, for tests that drive
+    /// `analyze_on_this_thread` directly (to read the thread-local leak tally
+    /// on the thread that analyzed).
+    pub(crate) fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(work)
+            .expect("spawn measurement thread")
+            .join()
+            .expect("measurement thread panicked")
     }
 
     // `same_file` / `is_within` decide a document's package and platform, so a
@@ -6294,6 +6872,379 @@ pub(crate) mod tests {
         assert!(hover.contains('…'), "the preview is clamped: {hover}");
     }
 
+    // --- E73: the hover chain guard (editing-dx.md §19) ---------------------
+    //
+    // The context-threading pass (vilan-core `context.rs`, `apply`) lowers an
+    // unprovided `get_safe()` read to a plain read of a pass-minted hidden
+    // parameter: `entity_map[call] = Local(hidden)`, where `hidden`'s own
+    // entry is the self-describing `Parameter(hidden)` — a SELF-LOOP — with
+    // no `expr_types` entry and no `parameters` record. `hover_label`
+    // resolved id → binding recursively with no cycle guard, so hovering
+    // `get_safe` overflowed the server's stack: SIGABRT, five restarts, and
+    // the client stops restarting it (the owner's live crash, 2026-08-19).
+
+    /// The owner's crash shape, distilled: a module-level `Context<T>`
+    /// binding with no provider, `get_safe()` on it in a function nothing
+    /// calls.
+    const LOWERED_GET_SAFE_SOURCE: &str = "import std::context::Context;\n\nlet app_context = Context<i32>::new();\n\nfun probe() {\n\tapp_context.get_safe();\n}\n";
+
+    #[test]
+    fn hover_on_a_lowered_context_read_returns() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        // The enabling shape, asserted so this pin says so if the lowering
+        // ever stops minting it: the read resolves to a binding whose own
+        // entity record is a self-loop with no type.
+        let Some(Expr::Local(binding)) = program.entity_map.get(&id) else {
+            panic!(
+                "the lowered read should wire as a Local: {:?}",
+                program.entity_map.get(&id)
+            );
+        };
+        assert!(
+            matches!(program.entity_map.get(binding), Some(Expr::Parameter(parameter)) if parameter == binding),
+            "the hidden parameter should self-loop: {:?}",
+            program.entity_map.get(binding)
+        );
+        assert!(
+            program.expr_types.get(binding).is_none(),
+            "and carry no type"
+        );
+        // The pin is the RETURN: this call used to recurse to a stack
+        // overflow and abort the whole server.
+        let _ = document.hover(offset);
+    }
+
+    /// A guard on the general shape, not just the self-loop the lowering
+    /// mints today: a two-node `entity_map` cycle (constructed directly — no
+    /// analyzed program is known to wire one) answers the honest `None`.
+    #[test]
+    fn hover_label_answers_none_on_an_entity_cycle() {
+        let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
+        let program = document
+            .program
+            .program
+            .as_mut()
+            .expect("the program analyzes");
+        let first = Id(program.next_entity_id);
+        let second = Id(program.next_entity_id + 1);
+        program.entity_map.insert(first, Expr::Local(second));
+        program.entity_map.insert(second, Expr::Local(first));
+        let program = document.program.as_ref().unwrap();
+        assert_eq!(document.hover_label(program, first), None);
+        assert_eq!(document.hover_label(program, second), None);
+    }
+
+    /// The same through the call → subject arm: a call whose subject chains
+    /// back to the call itself (again constructed — the shape a rewiring
+    /// lowering could produce) answers `None` from every resolver that walks
+    /// it.
+    #[test]
+    fn resolvers_answer_none_on_a_call_cycle() {
+        let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
+        let program = document
+            .program
+            .program
+            .as_mut()
+            .expect("the program analyzes");
+        let call = Id(program.next_entity_id);
+        program.entity_map.insert(call, Expr::Call(call));
+        program.function_calls.insert(
+            call,
+            vilan_core::analyzer::FunctionCall {
+                id: call,
+                subject_id: call,
+                generic_argument_ids: Vec::new(),
+                argument_ids: Vec::new(),
+                arguments_span: vilan_core::span::Span::new((), 0..0),
+            },
+        );
+        let program = document.program.as_ref().unwrap();
+        assert_eq!(document.hover_label(program, call), None);
+        assert_eq!(document.function_target(program, call), None);
+        assert_eq!(document.definition_of(program, call), None);
+    }
+
+    /// A chain that ends on a record-less id (no type, no entity entry)
+    /// answers `None` — not a panic, not a made-up label.
+    #[test]
+    fn hover_label_answers_none_when_the_chain_yields_no_type() {
+        let mut document = Document::analyze("fun main() {}\n", &std_root(), Path::new("test.vl"));
+        let program = document
+            .program
+            .program
+            .as_mut()
+            .expect("the program analyzes");
+        let first = Id(program.next_entity_id);
+        let second = Id(program.next_entity_id + 1);
+        program.entity_map.insert(first, Expr::Local(second));
+        let program = document.program.as_ref().unwrap();
+        assert_eq!(document.hover_label(program, first), None);
+    }
+
+    /// The guard must not cut the legitimate chain: a use site still resolves
+    /// through its binding to the binding's type.
+    #[test]
+    fn hover_label_still_resolves_a_use_through_its_binding() {
+        let text = "fun main() {\n\tlet width = 3;\n\tlet doubled = width * 2;\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = text.rfind("width").unwrap() + 1;
+        let id = document.entity_at(offset).expect("the use entity");
+        assert!(
+            program.expr_types.get(&id).is_none(),
+            "the use must carry no type of its own, or this pins nothing"
+        );
+        assert_eq!(document.hover_label(program, id).as_deref(), Some("i32"));
+    }
+
+    // --- E72: member hovers wear the house style (editing-dx.md §19) --------
+
+    // A FIELD hovers as the fenced `name: T` — not the bare pre-house-style
+    // type string the fallback used to hand back.
+    #[test]
+    fn hover_on_a_field_shows_the_fenced_name_and_type() {
+        let hover = hover_at_cursor(
+            "struct Point { x: i32 }\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet n = p.|x;\n}\n",
+        )
+        .expect("hovering the field should produce a label");
+        assert_eq!(hover, "```vilan\nx: i32\n```");
+    }
+
+    // A std METHOD name answers the method's declaration, fenced — through
+    // `function_target`'s wired subject, like a user method.
+    #[test]
+    fn hover_on_a_std_method_name_shows_its_signature() {
+        let hover =
+            hover_at_cursor("fun main() {\n\tlet name = \"vilan\";\n\tlet n = name.l|en();\n}\n")
+                .expect("hovering the method should produce a label");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(hover.contains("fun len(self): i32"), "{hover}");
+    }
+
+    // The E73 crash shape, now answering: the context pass lowers the
+    // unprovided `get_safe()` to a hidden-parameter read and rewrites the
+    // call's entity record, but the call record's wired subject survives —
+    // `function_target` resolves through it to the declaration the source
+    // names, instead of the lowered view (`enum Option`, or nothing).
+    #[test]
+    fn hover_on_an_unprovided_get_safe_shows_its_declaration() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let hover = document
+            .hover(offset)
+            .expect("hovering `get_safe` should answer");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(hover.contains("fun get_safe(self): Option<T>"), "{hover}");
+    }
+
+    // "Anything else" keeps the bare rendered type but gains the fence: an
+    // index expression's hover is its element type, as code.
+    #[test]
+    fn a_bare_expression_type_hover_wears_the_fence() {
+        let hover = hover_at_cursor("fun main() {\n\tlet xs = [ 1 ];\n\tlet n = xs|[0];\n}\n")
+            .expect("the index expression hovers");
+        assert_eq!(hover, "```vilan\ni32\n```");
+    }
+
+    // --- E75: the context lowering records what it erases (editing-dx.md
+    // §19.3). The two lowerings that rewire `function_calls[call].subject_id`
+    // itself — a covered `get_safe` (the `Some`-wrap) and `Context::run` (the
+    // body closure becomes the subject) — record the erased original, and the
+    // resolvers answer the SOURCE view through it. --------------------------
+
+    /// A COVERED safe read: the `get_safe` sits in a `run` body, so its
+    /// holder carries the bare value and the pass rewires the call into
+    /// `Some(hidden)`.
+    const COVERED_CONTEXT_SOURCE: &str = "import std::context::Context;\n\nlet app_context = Context<i32>::new();\n\nfun main() {\n\tapp_context.run(7, || {\n\t\tapp_context.get_safe();\n\t});\n}\n";
+
+    #[test]
+    fn hover_on_a_covered_get_safe_shows_its_declaration() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        // The enabling shape, asserted so this pin announces itself if the
+        // lowering changes: the pass rewired the call record's subject away
+        // from the wired callee and recorded the erased original.
+        let call = program.function_calls.get(&id).expect("the call record");
+        let erased = program
+            .context_erased_subjects
+            .get(&id)
+            .expect("the pass records the subject it erases");
+        assert_ne!(
+            call.subject_id, *erased,
+            "the `Some`-wrap should have rewired the subject"
+        );
+        let hover = document
+            .hover(offset)
+            .expect("hovering the covered `get_safe` should answer");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(
+            hover.contains("fun get_safe(self): Option<T>"),
+            "the SOURCE callee's signature, not the lowered `Some`: {hover}"
+        );
+    }
+
+    #[test]
+    fn definition_on_a_covered_get_safe_lands_on_the_callee() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find("get_safe").unwrap() + 2;
+        let (source, span) = document
+            .definition(offset)
+            .expect("go-to-definition on the covered `get_safe` should answer");
+        let get_safe_fn = program
+            .context_get_safe_fn_id
+            .expect("std's context module loaded");
+        assert_eq!(
+            source,
+            program.source_of(get_safe_fn).expect("get_safe has a file"),
+            "the definition lives in std's context.vl"
+        );
+        let name_span = program
+            .external_functions
+            .get(&get_safe_fn)
+            .expect("`get_safe` is an external fn")
+            .name_span;
+        assert_eq!(span.into_range(), name_span.into_range());
+    }
+
+    #[test]
+    fn hover_on_context_run_shows_its_declaration() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find(".run(").unwrap() + 2;
+        let id = document.entity_at(offset).expect("an entity under `run`");
+        // The enabling shape: the body closure became the subject, the
+        // erased original is recorded.
+        let call = program.function_calls.get(&id).expect("the call record");
+        let erased = program
+            .context_erased_subjects
+            .get(&id)
+            .expect("the pass records the subject it erases");
+        assert_ne!(
+            call.subject_id, *erased,
+            "the `run` lowering should have rewired the subject"
+        );
+        let hover = document
+            .hover(offset)
+            .expect("hovering `run` should answer");
+        assert!(hover.starts_with("```vilan\n"), "{hover}");
+        assert!(
+            hover.contains("fun run(self, value: T, body: || U): U"),
+            "the SOURCE callee's signature, not the closure's type: {hover}"
+        );
+        assert!(
+            hover.contains("yields its body's value"),
+            "the declaration's doc rides along: {hover}"
+        );
+    }
+
+    #[test]
+    fn definition_on_context_run_lands_on_the_callee() {
+        let document = Document::analyze(COVERED_CONTEXT_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = COVERED_CONTEXT_SOURCE.find(".run(").unwrap() + 2;
+        let (source, span) = document
+            .definition(offset)
+            .expect("go-to-definition on `run` should answer");
+        let run_fn = program
+            .context_run_fn_id
+            .expect("std's context module loaded");
+        assert_eq!(
+            source,
+            program.source_of(run_fn).expect("run has a file"),
+            "the definition lives in std's context.vl"
+        );
+        let name_span = program
+            .external_functions
+            .get(&run_fn)
+            .expect("`run` is an external fn")
+            .name_span;
+        assert_eq!(span.into_range(), name_span.into_range());
+    }
+
+    // The ENTITY-record overwrite (an unprovided `get_safe` lowers to a read
+    // of the hidden parameter): the call record survives with its wired
+    // subject, and `definition_of` now resolves through it — go-to-definition
+    // lands on the callee where it used to answer nothing.
+    #[test]
+    fn definition_on_an_unprovided_get_safe_lands_on_the_callee() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        // The enabling shape: the entity record is the lowered parameter
+        // read, not a call — the surviving call record is the only way back.
+        assert!(
+            matches!(program.entity_map.get(&id), Some(Expr::Local(_))),
+            "the lowering should have overwritten the entity record: {:?}",
+            program.entity_map.get(&id)
+        );
+        let (source, span) = document
+            .definition(offset)
+            .expect("go-to-definition on the lowered `get_safe` should answer");
+        let get_safe_fn = program
+            .context_get_safe_fn_id
+            .expect("std's context module loaded");
+        assert_eq!(
+            source,
+            program.source_of(get_safe_fn).expect("get_safe has a file")
+        );
+        let name_span = program
+            .external_functions
+            .get(&get_safe_fn)
+            .expect("`get_safe` is an external fn")
+            .name_span;
+        assert_eq!(span.into_range(), name_span.into_range());
+    }
+
+    // The minted hidden parameter carries the pass's marker — parameter id →
+    // the context binding it threads — and the chain walkers answer the
+    // explicit honest `None` on it (no label, no definition), by design
+    // rather than by the self-loop meeting the cycle guard.
+    #[test]
+    fn the_hidden_parameter_is_marked_and_answers_nothing() {
+        let document =
+            Document::analyze(LOWERED_GET_SAFE_SOURCE, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        let offset = LOWERED_GET_SAFE_SOURCE.find("get_safe").unwrap() + 2;
+        let id = document
+            .entity_at(offset)
+            .expect("an entity under `get_safe`");
+        let Some(Expr::Local(hidden)) = program.entity_map.get(&id) else {
+            panic!(
+                "the lowered read should wire as a Local: {:?}",
+                program.entity_map.get(&id)
+            );
+        };
+        let app_context = program
+            .variables
+            .iter()
+            .find(|(_, variable)| variable.name == "app_context")
+            .map(|(id, _)| *id)
+            .expect("the context binding");
+        assert_eq!(
+            program.context_hidden_parameters.get(hidden),
+            Some(&app_context),
+            "the marker names the context the parameter threads"
+        );
+        assert_eq!(document.hover_label(program, *hidden), None);
+        assert_eq!(document.definition_of(program, *hidden), None);
+    }
+
     // --- clamp_preview: the hover budget cuts at char boundaries ------------
 
     // Byte 160 inside a 3-byte character: back up to the boundary below.
@@ -6434,6 +7385,21 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// [`completions_at_cursor`] with an explicit cursor marker — the element
+    /// pins carry closure literals, whose `|` the default marker would claim.
+    fn completions_at_marker(src: &str, marker: char) -> Vec<String> {
+        let offset = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("test source needs a `{marker}` cursor marker"));
+        let text = src.replace(marker, "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
     /// The full completion candidates offered at the `|` cursor in `src` —
     /// carrying `detail`, `documentation`, and `call_parameters` (WO-3).
     fn completion_items_at_cursor(src: &str) -> Vec<Completion> {
@@ -6518,6 +7484,262 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"x".to_string()),
             "incomplete member: {labels:?}"
+        );
+    }
+
+    // --- E66: a call receiver (editing-dx.md §18) ---------------------------
+    //
+    // The shapes below all end in a value the analyzer types on DEMAND and
+    // records nothing for, so none of them could resolve through `expr_types`
+    // the way a field or an index does. The name-receiver case they contrast
+    // with is pinned by `member_completion_lists_fields_and_methods` and
+    // `member_completion_on_incomplete_receiver` above.
+
+    /// The prelude the call-receiver pins share: a nominal with a field and a
+    /// method, a free function returning it, a method returning it, and an
+    /// `Option` producer for the lifted shape.
+    const CALL_RECEIVER_PRELUDE: &str = "import std::option::Option::{ self, Some, None };\n\
+         struct Point { x: i32, y: i32 }\n\
+         impl Point { fun twin(self): Point { self } }\n\
+         fun make(): Point { Point { x = 1, y = 2 } }\n\
+         fun find(): Option<Point> { None }\n\
+         fun echo(p: Point): Point { p }\n";
+
+    fn call_receiver_completions(body: &str) -> Vec<String> {
+        completions_at_cursor(&format!("{CALL_RECEIVER_PRELUDE}fun main() {{\n{body}}}\n"))
+    }
+
+    // E66: the owner's shape — a `.` typed straight after a call's closing
+    // paren. The receiver is the call's RESULT, never the callee.
+    #[test]
+    fn member_completion_on_a_call_receiver() {
+        let labels = call_receiver_completions("\tmake().|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+        assert!(
+            !labels.contains(&"make".to_string()),
+            "the RESULT's members, not the callee: {labels:?}"
+        );
+    }
+
+    // E66: a chained call — the receiver is itself a call on a call.
+    #[test]
+    fn member_completion_on_a_chained_call_receiver() {
+        let labels = call_receiver_completions("\tmake().twin().|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+    }
+
+    // E66: a method call on a bound name — the receiver resolves through the
+    // METHOD's return type, not the binding's.
+    #[test]
+    fn member_completion_on_a_method_call_receiver() {
+        let labels = call_receiver_completions("\tlet p = make();\n\tp.twin().|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+    }
+
+    // E66: a call in ARGUMENT position, the trailing `)` and `;` still to come
+    // — the shape the playground was actually being typed in.
+    #[test]
+    fn member_completion_on_a_call_in_argument_position() {
+        let labels = call_receiver_completions("\tlet _q = echo(make().|);\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+    }
+
+    // E66: a `?.`-lifted call offers the ELEMENT's members, exactly as the
+    // lifted NAME receiver does (`lifted_member_completion_offers_the_element`).
+    #[test]
+    fn lifted_member_completion_on_a_call_receiver() {
+        let labels = call_receiver_completions("\tfind()?.|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+        assert!(
+            !labels.contains(&"unwrap_or".to_string()),
+            "the ELEMENT's members, not Option's: {labels:?}"
+        );
+    }
+
+    // E66: a block's value is a call — the walk through the trailing
+    // expression, which `expr_types` records nothing for either.
+    #[test]
+    fn member_completion_on_a_block_receiver() {
+        let labels = call_receiver_completions("\t{ make() }.|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+    }
+
+    // E66: a constructor call still answers with the constructed type — the
+    // shape `hover_label` already covered, kept green by the fallback.
+    #[test]
+    fn member_completion_on_a_constructor_call_receiver() {
+        let labels = call_receiver_completions("\tSome(1).|\n");
+        assert!(
+            labels.contains(&"unwrap_or".to_string()),
+            "Option's members: {labels:?}"
+        );
+    }
+
+    // E66, the field case verbatim (vilan-playground/todo/src/client.vl:42):
+    // a generated client method's `Result<…>` result, reached inside a closure
+    // inside an element's `on:submit(…)` attribute.
+    #[test]
+    fn member_completion_on_a_call_inside_an_element_attribute_closure() {
+        let labels = completions_at_marker(
+            "import std::print;\n\
+             import std::reactive::Signal;\n\
+             import std::result::Result;\n\
+             import std::ui::view;\n\
+             struct Note { id: i32, text: str }\n\
+             struct NotesClient { }\n\
+             impl NotesClient {\n\
+             \tfun add(self, name: str): Result<Note, str> { Result::Ok(Note { id = 1, text = name }) }\n\
+             }\n\
+             fun app(client: NotesClient, note_name: Signal<str>) {\n\
+             \t<form on:submit(|event| { print(client.add(note_name.get()).~); })></form>\n\
+             }\n",
+            '~',
+        );
+        assert!(
+            labels.contains(&"is_ok".to_string()) && labels.contains(&"unwrap".to_string()),
+            "the client method's `Result` members: {labels:?}"
+        );
+    }
+
+    // --- E67: an element's opening tag (editing-dx.md §18) ------------------
+
+    /// The prelude the element-head pins share.
+    const ELEMENT_HEAD_PRELUDE: &str =
+        "import std::ui::view;\nimport std::reactive::Signal;\nimport std::print;\n";
+
+    fn element_head_completions(body: &str) -> Vec<String> {
+        completions_at_marker(
+            &format!("{ELEMENT_HEAD_PRELUDE}fun main() {{\n{body}}}\n"),
+            '~',
+        )
+    }
+
+    // E67: `<div .|>` is the chain's method-completion site — the head lowers
+    // to a `view("div")` chain (element-syntax.md §4), so the candidates are
+    // the `View` type's own methods.
+    #[test]
+    fn element_head_dot_offers_the_view_methods() {
+        let labels = element_head_completions("\t<div .~></div>\n");
+        for method in ["bind_each", "on", "text", "child", "styled"] {
+            assert!(
+                labels.contains(&method.to_string()),
+                "`{method}` is a View method: {labels:?}"
+            );
+        }
+        assert!(
+            !labels.iter().any(|label| label.starts_with('.')),
+            "the dot is already typed: {labels:?}"
+        );
+        // A head item is a CHAIN LINK, so the candidates are the View's
+        // methods and not its members: a `View` field is not something the
+        // desugar can splice into the chain, and offering one here is what an
+        // ordinary member completion on the desugared `view("div")` would do.
+        for field in ["tag", "attributes"] {
+            assert!(
+                !labels.contains(&field.to_string()),
+                "`{field}` is a View FIELD, not a chain link: {labels:?}"
+            );
+        }
+    }
+
+    // E67: `<div |>` — the undotted head position. The chain form is offered
+    // in its own spelling (dot included: undotted `text(…)` is an ATTRIBUTE),
+    // the event form as the grammar's `on:`, and nothing that is merely in
+    // scope: no bindings, no type names, no keywords, no construct snippets.
+    #[test]
+    fn element_head_offers_the_head_forms_and_nothing_in_scope() {
+        let labels = element_head_completions("\tlet caption = \"hi\";\n\t<div ~></div>\n");
+        assert!(
+            labels.contains(&".bind_each".to_string()) && labels.contains(&".on".to_string()),
+            "the chain form, dot included: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"on:".to_string()),
+            "the event form: {labels:?}"
+        );
+        for wrong in ["caption", "str", "view", "fun", "for … in { }"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` may not appear in a head: {labels:?}"
+            );
+        }
+    }
+
+    // E67: a NESTED tag under construction. The unfinished chain link used to
+    // flatten its own tag to an error atom and, nested, took the whole
+    // statement with it; the head-item recovery keeps both elements alive.
+    #[test]
+    fn element_head_dot_completes_in_a_nested_element() {
+        let labels = element_head_completions("\t<div><span .~></span></div>\n");
+        assert!(
+            labels.contains(&"bind_value".to_string())
+                && !labels.contains(&"attributes".to_string()),
+            "the inner tag's View methods: {labels:?}"
+        );
+        let self_closing = element_head_completions("\t<div><span .~ /></div>\n");
+        assert!(
+            self_closing.contains(&"bind_value".to_string()),
+            "a self-closing inner tag: {self_closing:?}"
+        );
+    }
+
+    // E67: mid-word (`<div .bi|>`) offers the same list — the editor filters
+    // it by the prefix, as everywhere else in completion.
+    #[test]
+    fn element_head_dot_mid_word_offers_the_view_methods() {
+        let labels = element_head_completions("\t<div .bi~></div>\n");
+        assert!(
+            labels.contains(&"bind_each".to_string())
+                && labels.contains(&"bind_value".to_string())
+                && !labels.contains(&"attributes".to_string()),
+            "{labels:?}"
+        );
+    }
+
+    // E67, the boundary: a head item's ARGUMENT is ordinary expression ground.
+    // The cursor sits inside a closure inside `on:click(…)` — brackets deep,
+    // so the head vocabulary does not apply and the receiver's members do.
+    #[test]
+    fn an_element_head_argument_is_not_head_position() {
+        let labels = element_head_completions(
+            "\t<div on:click(|| { let s = Signal::new(\"\"); s.~; })></div>\n",
+        );
+        assert!(
+            labels.contains(&"get".to_string()) && labels.contains(&"set".to_string()),
+            "the Signal's members: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"bind_each".to_string()),
+            "not the View's: {labels:?}"
+        );
+    }
+
+    // E67, the negative: a `.` outside any markup is untouched.
+    #[test]
+    fn a_dot_outside_an_element_still_completes_normally() {
+        let labels = element_head_completions("\tlet s = Signal::new(\"\");\n\ts.~\n");
+        assert!(
+            labels.contains(&"get".to_string()),
+            "the Signal's members: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"bind_each".to_string()),
+            "not the View's: {labels:?}"
+        );
+    }
+
+    // E67, the other negative: an element's CHILD position is expression
+    // ground too — `{expr}` holes complete from scope, not from the head.
+    #[test]
+    fn an_element_child_is_not_head_position() {
+        let labels = element_head_completions("\tlet caption = \"hi\";\n\t<div>{capt~}</div>\n");
+        assert!(
+            labels.contains(&"caption".to_string()),
+            "the binding in scope: {labels:?}"
         );
     }
 
@@ -8465,7 +9687,7 @@ pub(crate) mod tests {
     #[test]
     fn a_document_without_a_program_is_conservatively_a_dependent() {
         let (dir, mut document) = analyze_workspace(&[("main.vl", "fun main() {}\n")]);
-        document.program = None;
+        document.program = AnalyzedProgram::none();
         assert!(
             document.depends_on(&dir.join("anything.vl")),
             "with no recorded source set, re-analysis is the conservative direction"
@@ -8658,6 +9880,161 @@ pub(crate) mod tests {
     }
 }
 
+/// M7 (`leak-soak.md` §7): the entry text and tree an analysis leaks are given
+/// back when the `Document` drops or replaces the analysis. Platform-
+/// independent — the counters need no `/proc` — so unlike `leak_measurement`
+/// below this is not Linux-gated. Each pin runs its analyses on ONE big-stack
+/// thread and reads that thread's counters, because the tally is thread-local
+/// (`leak_tally`'s module doc); the last pin is the exception on purpose.
+#[cfg(test)]
+mod entry_reclaim {
+    use super::*;
+    use crate::document::tests::{on_big_stack, std_root};
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    const FIRST: &str = "import std::print;\n\nfun main() {\n\tprint(\"one\");\n}\n";
+    const SECOND: &str =
+        "import std::print;\n\nfun main() {\n\tlet greeting = \"two\";\n\tprint(greeting);\n}\n";
+
+    fn analyze_here(text: &str) -> Document {
+        Document::analyze_on_this_thread(text, &std_root(), Path::new("reclaim.vl"))
+    }
+
+    /// Closing a document (dropping it) gives back exactly the text and tree
+    /// its analysis recorded — the gross record stands, the outstanding
+    /// balance at both sites is zero.
+    #[test]
+    fn dropping_a_document_reclaims_its_entry_text_and_tree() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let document = analyze_here(FIRST);
+            assert!(document.program.is_some(), "the fixture analyzes");
+            assert_eq!(leak_tally::bytes(LeakSite::LspEntryText), FIRST.len());
+            let tree = leak_tally::bytes(LeakSite::EntryAst);
+            assert!(tree > 0, "no entry tree was recorded — the pin is vacuous");
+            assert_eq!(leak_tally::released(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::released(LeakSite::EntryAst), 0);
+            drop(document);
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                FIRST.len(),
+                "the entry text was not given back to the byte"
+            );
+            assert_eq!(
+                leak_tally::released(LeakSite::EntryAst),
+                tree,
+                "the entry tree was not given back at the bytes it recorded"
+            );
+            assert_eq!(leak_tally::outstanding(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::EntryAst), 0);
+            // The gross record is unchanged by the reclaim: `bytes` still says
+            // what the analysis leaked, which is what the plateau pins read.
+            assert_eq!(leak_tally::bytes(LeakSite::LspEntryText), FIRST.len());
+        });
+    }
+
+    /// The server's path: a document analyzes, the buffer changes, a second
+    /// analysis lands through `adopt_analysis`. Exactly the FIRST analysis's
+    /// allocations are given back, exactly the SECOND's stay out, and the
+    /// adopted program still answers — its own allocations were not the ones
+    /// reclaimed. Then the document drops and both sites net to zero.
+    #[test]
+    fn a_document_that_analyzes_twice_reclaims_the_first_analysis_and_keeps_the_second() {
+        on_big_stack(|| {
+            leak_tally::reset();
+            let mut document = analyze_here(FIRST);
+            let first_tree = leak_tally::bytes(LeakSite::EntryAst);
+            let second = analyze_here(SECOND);
+            let second_tree = leak_tally::bytes(LeakSite::EntryAst) - first_tree;
+            assert!(
+                first_tree > 0 && second_tree > 0,
+                "both analyses record a tree"
+            );
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                0,
+                "nothing is reclaimed before the adoption"
+            );
+            document.adopt_analysis(second);
+            assert_eq!(
+                leak_tally::released(LeakSite::LspEntryText),
+                FIRST.len(),
+                "adoption must reclaim the superseded analysis's text, and only that"
+            );
+            assert_eq!(
+                leak_tally::released(LeakSite::EntryAst),
+                first_tree,
+                "adoption must reclaim the superseded analysis's tree, and only that"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::LspEntryText),
+                SECOND.len() as isize,
+                "the adopted analysis's text is the one still out"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::EntryAst),
+                second_tree as isize,
+                "the adopted analysis's tree is the one still out"
+            );
+            // The adopted program answers from its own, live allocations.
+            assert_eq!(document.analyzed_text(), SECOND);
+            let offset = SECOND
+                .find("greeting")
+                .expect("the binding is in the fixture")
+                + 1;
+            assert!(
+                document.hover(offset).is_some(),
+                "the adopted analysis no longer answers hover"
+            );
+            assert!(
+                !document.semantic_tokens().is_empty(),
+                "the adopted analysis no longer produces semantic tokens"
+            );
+            drop(document);
+            assert_eq!(leak_tally::outstanding(LeakSite::LspEntryText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::EntryAst), 0);
+        });
+    }
+
+    /// The shipped server's allocation lifetime: `Document::analyze` records on
+    /// a thread that then dies, and the `Document` is dropped on the caller's
+    /// thread. The reclaim happens where the drop happens — this thread sees a
+    /// release it never recorded, a negative outstanding balance that a cross-
+    /// thread sum (the soak's) nets to zero.
+    #[test]
+    fn an_analysis_from_its_own_thread_is_reclaimed_on_the_thread_that_drops_it() {
+        leak_tally::reset();
+        let document = Document::analyze(FIRST, &std_root(), Path::new("reclaim.vl"));
+        assert!(document.program.is_some(), "the fixture analyzes");
+        assert_eq!(
+            leak_tally::bytes(LeakSite::LspEntryText),
+            0,
+            "the record belongs to the analysis thread, not this one"
+        );
+        drop(document);
+        assert_eq!(leak_tally::released(LeakSite::LspEntryText), FIRST.len());
+        assert!(
+            leak_tally::released(LeakSite::EntryAst) > 0,
+            "the tree was not given back on the dropping thread"
+        );
+        assert_eq!(
+            leak_tally::outstanding(LeakSite::LspEntryText),
+            -(FIRST.len() as isize)
+        );
+    }
+
+    /// The degraded document (a panicked analysis) owns nothing: dropping it
+    /// releases nothing and cannot double-free.
+    #[test]
+    fn the_internal_error_document_owns_nothing_to_reclaim() {
+        leak_tally::reset();
+        let document = Document::internal_error(FIRST);
+        assert!(!document.program.is_some());
+        drop(document);
+        assert_eq!(leak_tally::released_total(), 0);
+    }
+}
+
 // Linux-only, and specifically Linux rather than unix: the harness reads
 // resident-set size from `/proc/self/statm`, which Windows does not have (the
 // CI run failed with `NotFound`) and macOS does not have either. The E3 Phase-1
@@ -8667,7 +10044,7 @@ pub(crate) mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod leak_measurement {
     use super::*;
-    use crate::document::tests::std_root;
+    use crate::document::tests::{on_big_stack, std_root};
     use vilan_core::leak_tally::{self, LeakSite};
 
     /// Resident set size in KiB, from /proc/self/statm (Linux pages × 4).
@@ -8682,6 +10059,43 @@ mod leak_measurement {
         pages * 4
     }
 
+    /// The allocator's own split of the heap, from glibc's `mallinfo2`:
+    /// `(uordblks, fordblks)` — bytes IN USE (allocated, never freed) and
+    /// bytes free but retained. The instrument leak-soak.md §7.7 attributed
+    /// the const evaluator's cycles with: in-use bytes growing flat to the
+    /// kilobyte across windows are a genuine leak, where RSS confounds it
+    /// with allocator retention. `None` off glibc — like `/proc` above, the
+    /// gate is about the instrument, not the claim.
+    #[cfg(target_env = "gnu")]
+    fn heap_split_bytes() -> Option<(isize, isize)> {
+        /// glibc's `struct mallinfo2` (malloc.h): ten `size_t` counters.
+        #[repr(C)]
+        struct MallInfo2 {
+            arena: usize,
+            ordblks: usize,
+            smblks: usize,
+            hblks: usize,
+            hblkhd: usize,
+            usmblks: usize,
+            fsmblks: usize,
+            uordblks: usize,
+            fordblks: usize,
+            keepcost: usize,
+        }
+        unsafe extern "C" {
+            fn mallinfo2() -> MallInfo2;
+        }
+        // SAFETY: mallinfo2 reads allocator statistics and touches nothing
+        // else; glibc ≥ 2.33 exports it with exactly this shape.
+        let info = unsafe { mallinfo2() };
+        Some((info.uordblks as isize, info.fordblks as isize))
+    }
+
+    #[cfg(not(target_env = "gnu"))]
+    fn heap_split_bytes() -> Option<(isize, isize)> {
+        None
+    }
+
     /// The macro-expansion leak sites. analysis-reuse.md §2's fix routes the
     /// stamped `parse_generated` calls through the content cache, so after an
     /// unchanged program's expansions are cached these must PLATEAU — leak zero
@@ -8693,6 +10107,7 @@ mod leak_measurement {
         LeakSite::MacroExpansion,
         LeakSite::MacroWorldText,
         LeakSite::MacroWorldProgram,
+        LeakSite::MacroWorldAst,
         LeakSite::MacroPreludeText,
         LeakSite::MacroBlockEntryName,
     ];
@@ -8701,15 +10116,89 @@ mod leak_measurement {
         MACRO_SITES.iter().copied().map(leak_tally::bytes).sum()
     }
 
+    /// The subset of the per-site tally a [`LeakReport`] is built from, read on
+    /// whichever thread ran the analyses.
+    ///
+    /// Its own type, rather than fields read inline where the report is built,
+    /// because the tally is **thread-local** and one of the two drivers below
+    /// gives every analysis its own thread: those counters have to be read
+    /// *inside* that thread, before it exits, and summed here. Read after the
+    /// join they are zero — which is not "nothing leaked", it is no measurement
+    /// at all.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Counts {
+        /// GROSS bytes recorded at the entry-text site: one copy of the
+        /// analysed source per analysis, whether or not it was later given
+        /// back — the file-proportional figure the plateau claims read.
+        entry_text: usize,
+        /// GROSS bytes recorded at the entry-tree site, likewise.
+        entry_ast: usize,
+        /// The NET balance at the entry-text site once every `Document` the
+        /// window produced has dropped: recorded minus reclaimed. Zero is the
+        /// M7 claim (`leak-soak.md` §7); signed because a reclaim may happen
+        /// on another thread than the record.
+        entry_text_outstanding: isize,
+        /// The net balance at the entry-tree site, likewise.
+        entry_ast_outstanding: isize,
+        display: usize,
+        /// The two sites analysis-reuse.md §2 fixes: `parse_generated`'s leaked
+        /// source and AST, reached from the stamped expansion paths.
+        stamped_parse: usize,
+        macro_bytes: usize,
+        total: usize,
+    }
+
+    impl Counts {
+        /// This thread's counters, as they stand.
+        fn read() -> Counts {
+            Counts {
+                entry_text: leak_tally::bytes(LeakSite::LspEntryText),
+                entry_ast: leak_tally::bytes(LeakSite::EntryAst),
+                entry_text_outstanding: leak_tally::outstanding(LeakSite::LspEntryText),
+                entry_ast_outstanding: leak_tally::outstanding(LeakSite::EntryAst),
+                display: leak_tally::bytes(LeakSite::DisplayName),
+                stamped_parse: leak_tally::bytes(LeakSite::MacroParseText)
+                    + leak_tally::bytes(LeakSite::MacroParseAst),
+                macro_bytes: macro_bytes(),
+                total: leak_tally::total(),
+            }
+        }
+
+        fn add(&mut self, other: &Counts) {
+            self.entry_text += other.entry_text;
+            self.entry_ast += other.entry_ast;
+            self.entry_text_outstanding += other.entry_text_outstanding;
+            self.entry_ast_outstanding += other.entry_ast_outstanding;
+            self.display += other.display;
+            self.stamped_parse += other.stamped_parse;
+            self.macro_bytes += other.macro_bytes;
+            self.total += other.total;
+        }
+
+        /// The named, by-design per-analysis leaks: the entry source the
+        /// `Program` borrows for `'static`, its AST, and a dependency package's
+        /// display name. Everything else at every other site is expected to be
+        /// zero over a warm window.
+        fn named(&self) -> usize {
+            self.entry_text + self.entry_ast + self.display
+        }
+    }
+
     /// The per-analysis leak counted over the `measured` window, plus the RSS
-    /// growth (a noisy report, never asserted on). Built on the analysis thread
-    /// — the counters are thread-local, so a snapshot read after the loop on the
-    /// same thread tallies exactly these analyses and nothing a parallel test
-    /// leaked (the E12 flaky-global-counter lesson).
+    /// growth (a noisy report, never asserted on).
     struct LeakReport {
         rss_grown: usize,
+        /// `uordblks` growth over the window — bytes allocated during it and
+        /// never freed (`None` off glibc). The M8 signal (leak-soak.md
+        /// §7.7/§7.8): flat once the const evaluator's cycles are broken.
+        in_use_grown: Option<isize>,
+        /// `fordblks` growth over the window — freed bytes the allocator kept.
+        /// Noise around zero; reported so the RSS number can be read.
+        free_retained_grown: Option<isize>,
         entry_text: usize,
         entry_ast: usize,
+        entry_text_outstanding: isize,
+        entry_ast_outstanding: isize,
         display: usize,
         /// The two sites analysis-reuse.md §2 fixes: `parse_generated`'s leaked
         /// source and AST, reached from the stamped expansion paths.
@@ -8720,6 +10209,41 @@ mod leak_measurement {
     }
 
     impl LeakReport {
+        fn from_counts(
+            counts: Counts,
+            rss_grown: usize,
+            heap_grown: Option<(isize, isize)>,
+            measured: usize,
+        ) -> LeakReport {
+            LeakReport {
+                rss_grown,
+                in_use_grown: heap_grown.map(|(in_use, _)| in_use),
+                free_retained_grown: heap_grown.map(|(_, free_retained)| free_retained),
+                entry_text: counts.entry_text,
+                entry_ast: counts.entry_ast,
+                entry_text_outstanding: counts.entry_text_outstanding,
+                entry_ast_outstanding: counts.entry_ast_outstanding,
+                display: counts.display,
+                stamped_parse: counts.stamped_parse,
+                macro_bytes: counts.macro_bytes,
+                total: counts.total,
+                measured,
+            }
+        }
+
+        fn counts(&self) -> Counts {
+            Counts {
+                entry_text: self.entry_text,
+                entry_ast: self.entry_ast,
+                entry_text_outstanding: self.entry_text_outstanding,
+                entry_ast_outstanding: self.entry_ast_outstanding,
+                display: self.display,
+                stamped_parse: self.stamped_parse,
+                macro_bytes: self.macro_bytes,
+                total: self.total,
+            }
+        }
+
         fn print(&self, label: &str) {
             println!(
                 "[{label}] RSS +{} KiB ≈ {:.1} KiB/analysis over {} analyses (report only)",
@@ -8727,9 +10251,19 @@ mod leak_measurement {
                 self.rss_grown as f64 / self.measured as f64,
                 self.measured,
             );
+            if let (Some(in_use), Some(free_retained)) =
+                (self.in_use_grown, self.free_retained_grown)
+            {
+                println!(
+                    "[{label}] heap in use {in_use:+} B ≈ {:+.1} KiB/analysis; \
+                     free-retained {free_retained:+} B over the window (mallinfo2)",
+                    in_use as f64 / 1024.0 / self.measured as f64,
+                );
+            }
             println!(
                 "[{label}] counted leak over {} analyses: entry-text {} B, entry-AST {} B, \
-                 display {} B, macro {} B, total {} B ≈ {:.0} B/analysis",
+                 display {} B, macro {} B, total {} B ≈ {:.0} B/analysis; outstanding after \
+                 the documents dropped: entry-text {} B, entry-AST {} B",
                 self.measured,
                 self.entry_text,
                 self.entry_ast,
@@ -8737,54 +10271,159 @@ mod leak_measurement {
                 self.macro_bytes,
                 self.total,
                 self.total as f64 / self.measured as f64,
+                self.entry_text_outstanding,
+                self.entry_ast_outstanding,
             );
         }
     }
 
-    /// Runs `warmup` then `measured` analyses of `text_at(i)` **on the current
-    /// thread** (via `analyze_on_this_thread`, so the leaks land in this
-    /// thread's `leak_tally`), zeroing the counters after warmup. Callers must
-    /// invoke this on a big-stack thread — the pipeline nests a full analysis
-    /// inside macro-world compiles.
-    fn measure(text_at: impl Fn(usize) -> String, warmup: usize, measured: usize) -> LeakReport {
+    /// How the harness runs one analysis — the two allocation lifetimes the
+    /// language server actually has.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Driver {
+        /// Inline on the measuring thread, through `analyze_on_this_thread`.
+        /// Every fixture that predates the soak uses this: one long-lived
+        /// thread, one tally, read once at the end of a window.
+        Inline,
+        /// One fresh big-stack thread per analysis — the exact shape
+        /// [`Document::analyze`] gives the real server, which spawns, runs and
+        /// joins a thread per call so the deeply recursive pipeline gets its own
+        /// stack (the LSP then wraps *that* in `spawn_blocking`).
+        ///
+        /// Nothing the compiler caches is thread-local — `BASE_CACHE`, the macro
+        /// `WORLDS`/`FAILURES`/`EXPANSIONS`/`PARSES` and `parse_clean_cached` are
+        /// process-global `OnceLock<Mutex<…>>`, and the `thread_local!`s in
+        /// `analyzer`, `macros`, `call_graph`, `util` and `transformer` are
+        /// per-analysis scratch or test counters — so both drivers see the same
+        /// warm caches. What differs is that every allocation the analysis makes
+        /// belongs to a thread that then *dies*, which returns its arenas to the
+        /// allocator on a different schedule. That is the lifetime worth
+        /// measuring separately, and it is the one the shipped server has.
+        PerAnalysisThread,
+    }
+
+    impl Driver {
+        fn label(self) -> &'static str {
+            match self {
+                Driver::Inline => "inline",
+                Driver::PerAnalysisThread => "per-thread",
+            }
+        }
+    }
+
+    /// One measured window: `count` analyses of `text_at(i)` over
+    /// `start..start + count`, and the bytes they leaked.
+    ///
+    /// The two drivers accumulate differently and have to: the inline driver
+    /// zeroes this thread's counters and reads them once at the end, while the
+    /// per-analysis-thread driver reads each thread's own counters before that
+    /// thread exits and sums them here. Same total, two mechanisms, because a
+    /// thread-local does not outlive its thread.
+    fn run_window(
+        driver: Driver,
+        text_at: &impl Fn(usize) -> String,
+        entry: &Path,
+        std_dir: &Path,
+        start: usize,
+        count: usize,
+    ) -> Counts {
+        match driver {
+            Driver::Inline => {
+                leak_tally::reset();
+                for i in start..start + count {
+                    let _ = Document::analyze_on_this_thread(&text_at(i), std_dir, entry);
+                }
+                Counts::read()
+            }
+            Driver::PerAnalysisThread => {
+                let mut window = Counts::default();
+                for i in start..start + count {
+                    let text = text_at(i);
+                    let std_dir = std_dir.to_path_buf();
+                    let entry = entry.to_path_buf();
+                    window.add(&on_big_stack(move || {
+                        let _ = Document::analyze_on_this_thread(&text, &std_dir, &entry);
+                        Counts::read()
+                    }));
+                }
+                window
+            }
+        }
+    }
+
+    /// Runs `warmup` unmeasured analyses, then `windows` disjoint measured
+    /// windows of `window` analyses each, reporting every window on its own.
+    ///
+    /// More than one window is the whole point of the soak, and it is what turns
+    /// "the leak is small" into "the leak **plateaus**": two equal-length windows
+    /// over an equal-length document must leak the same bytes at every site.
+    /// Anything that accumulates — a cache keyed on something that changes per
+    /// keystroke, a registry nobody prunes, a per-round retention — makes the
+    /// second window larger than the first, and exact integer counters say so
+    /// with no threshold, no tolerance and no curve fit. RSS cannot do this job
+    /// and is only printed: it is dominated by allocator retention from
+    /// rebuilding and dropping the reachable `Program` every call (`leak_tally`'s
+    /// own module doc).
+    fn measure_windows(
+        text_at: impl Fn(usize) -> String,
+        entry: &Path,
+        driver: Driver,
+        warmup: usize,
+        window: usize,
+        windows: usize,
+    ) -> Vec<LeakReport> {
+        let std_dir = std_root();
+        // Warmup fills every content-addressed cache (the reachable std, the
+        // module parses, the macro worlds and their stamped expansions) so the
+        // measured windows see only the genuinely per-analysis leaks. It runs
+        // inline whichever driver is measuring: the caches it fills are
+        // process-global, so which thread fills them is not a distinction.
+        for i in 0..warmup {
+            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, entry);
+        }
+        let mut reports = Vec::with_capacity(windows);
+        for index in 0..windows {
+            let before_rss = rss_kib();
+            let before_heap = heap_split_bytes();
+            let start = warmup + index * window;
+            let counts = run_window(driver, &text_at, entry, &std_dir, start, window);
+            let heap_grown = before_heap.and_then(|(in_use, free_retained)| {
+                heap_split_bytes()
+                    .map(|(in_use_now, free_now)| (in_use_now - in_use, free_now - free_retained))
+            });
+            reports.push(LeakReport::from_counts(
+                counts,
+                rss_kib().saturating_sub(before_rss),
+                heap_grown,
+                window,
+            ));
+        }
+        reports
+    }
+
+    /// [`measure_windows`] against a synthetic entry in a temp directory, on
+    /// the inline driver. Callers must invoke this on a big-stack thread — the
+    /// pipeline nests a full analysis inside macro-world compiles.
+    fn measure_windows_in_temp(
+        text_at: impl Fn(usize) -> String,
+        warmup: usize,
+        window: usize,
+        windows: usize,
+    ) -> Vec<LeakReport> {
         let dir = std::env::temp_dir().join(format!("vilan_leak_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let entry = dir.join("main.vl");
-        let std_dir = std_root();
-        // Warmup fills every content-addressed cache (the reachable std, the
-        // module parses, the macro worlds and their stamped expansions) so the
-        // measured window sees only the genuinely per-analysis leaks.
-        for i in 0..warmup {
-            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, &entry);
-        }
-        leak_tally::reset();
-        let before_rss = rss_kib();
-        for i in warmup..warmup + measured {
-            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, &entry);
-        }
-        let report = LeakReport {
-            rss_grown: rss_kib().saturating_sub(before_rss),
-            entry_text: leak_tally::bytes(LeakSite::LspEntryText),
-            entry_ast: leak_tally::bytes(LeakSite::EntryAst),
-            display: leak_tally::bytes(LeakSite::DisplayName),
-            stamped_parse: leak_tally::bytes(LeakSite::MacroParseText)
-                + leak_tally::bytes(LeakSite::MacroParseAst),
-            macro_bytes: macro_bytes(),
-            total: leak_tally::total(),
-            measured,
-        };
+        let reports = measure_windows(text_at, &entry, Driver::Inline, warmup, window, windows);
         let _ = std::fs::remove_dir_all(&dir);
-        report
+        reports
     }
 
-    fn on_big_stack(work: impl FnOnce() -> LeakReport + Send + 'static) -> LeakReport {
-        std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(work)
-            .expect("spawn measurement thread")
-            .join()
-            .expect("measurement thread panicked")
+    /// Runs `warmup` then `measured` analyses of `text_at(i)` **on the current
+    /// thread** (via `analyze_on_this_thread`, so the leaks land in this
+    /// thread's `leak_tally`), zeroing the counters after warmup.
+    fn measure(text_at: impl Fn(usize) -> String, warmup: usize, measured: usize) -> LeakReport {
+        measure_windows_in_temp(text_at, warmup, measured, 1).remove(0)
     }
 
     // A changing, std-using document with no macros. Each `i` differs (a
@@ -8805,12 +10444,34 @@ mod leak_measurement {
     // dependency packages, so no display names) — and nothing on the macro path
     // or any other site. RSS is far noisier (allocator retention from rebuilding
     // the reachable `Program`); it is printed, never asserted.
+    //
+    // And since M7 (leak-soak.md §7) the two named sites are RECLAIMED: every
+    // `Document` the window produced was dropped, so the outstanding balance at
+    // both is exactly zero — the gross record is still one source copy and one
+    // tree per analysis (the window genuinely re-analysed), and none of it is
+    // still out.
     #[test]
-    fn per_analysis_leak_is_bounded_by_named_sites() {
+    fn per_analysis_leak_is_bounded_by_named_sites_and_the_entry_is_reclaimed() {
         let warmup = 20;
         let measured = 200;
         let report = on_big_stack(move || measure(no_macro_text, warmup, measured));
         report.print("no-macro");
+
+        // M7: the entry text and tree of every dropped document were given
+        // back — to the byte, because the reclaim releases exactly what the
+        // leak recorded.
+        assert_eq!(
+            report.entry_text_outstanding, 0,
+            "{} B of entry text is still out after every document in the window dropped — \
+             the superseded analysis's text is not being reclaimed (leak-soak.md §7)",
+            report.entry_text_outstanding,
+        );
+        assert_eq!(
+            report.entry_ast_outstanding, 0,
+            "{} B of entry tree is still out after every document in the window dropped — \
+             the superseded analysis's AST is not being reclaimed (leak-soak.md §7)",
+            report.entry_ast_outstanding,
+        );
 
         // The counted per-analysis leak is EXACTLY the named sites — every other
         // leak site (macro path, the content-keyed module parses, the loader's
@@ -8827,9 +10488,9 @@ mod leak_measurement {
             "a non-macro document leaked {} macro bytes over {} analyses",
             report.macro_bytes, report.measured,
         );
-        // The entry source is the dominant named leak and is file-proportional:
-        // it is exactly the bytes of every analyzed text (each keystroke leaks
-        // its own source copy — the recorded, still-open refinement).
+        // The entry source is the dominant named record and is file-
+        // proportional: it is exactly the bytes of every analyzed text (each
+        // keystroke leaks its own source copy, and — above — gives it back).
         let expected_entry_text: usize = (warmup..warmup + measured)
             .map(|i| no_macro_text(i).len())
             .sum();
@@ -8998,5 +10659,595 @@ mod leak_measurement {
             report.entry_text > 0,
             "the broken-world fixture leaked no entry text — it may not be re-analyzing",
         );
+    }
+
+    // A const-heavy document: every cycle shape leak-soak.md §7.7 names —
+    // hoisted world functions (a root-scope cycle per `const` site), a closure
+    // declared inside a called function's body (a call-scope cycle, the shape
+    // the root-only experiment could not reach), and loop iterations between
+    // them — with list results fat enough that a stranded root scope holds
+    // real bytes. Written for `moving_edit`, so every analysis is a distinct
+    // content of identical length.
+    const CONST_HEAVY_BASE: &str = "import std::print;\n\n\
+         fun labels(count: i32): List<str> {\n\
+         \tlet describe = |index: i32| { \"a labelled entry in the fixture\" };\n\
+         \tmut result: List<str> = List::new();\n\
+         \tmut index = 0;\n\
+         \tfor index < count {\n\t\tresult.push(describe(index));\n\t\tindex = index + 1;\n\t}\n\
+         \tresult\n\
+         }\n\n\
+         fun total(count: i32): i32 {\n\
+         \tmut sum = 0;\n\
+         \tmut index = 0;\n\
+         \tfor index < count {\n\t\tsum = sum + index;\n\t\tindex = index + 1;\n\t}\n\
+         \tsum\n\
+         }\n\n\
+         let NAMES: List<str> = const labels(12);\n\
+         let MORE: List<str> = const labels(18);\n\
+         let SUM: i32 = const total(15);\n\
+         let AGAIN: i32 = const total(24);\n\
+         let LAST: List<str> = const labels(9);\n\n\
+         fun main() {\n\
+         \tprint(NAMES.len());\n\tprint(MORE.len());\n\tprint(SUM);\n\tprint(AGAIN);\n\tprint(LAST.len());\n\
+         }\n";
+
+    // The M8 pin (leak-soak.md §7.8), in §7.7's mallinfo2 harness shape: a
+    // const-heavy document's IN-USE bytes — allocated and never freed, the
+    // counter that cannot confuse a leak with allocator retention — must be
+    // flat window over window. Before the per-run scope registry, every
+    // `const` site of every analysis stranded its root scope behind a
+    // closure–scope `Rc` cycle — measured with the teardown planted out:
+    // +8.4 KiB of in-use heap per analysis on this fixture, flat across both
+    // windows, exactly a leak's signature (+1,523.9 KiB per analysis on
+    // `vilan-website/src/page.vl`) — so in-use bytes grew linearly in
+    // keystrokes. The exact half of the pin
+    // is the scope counter: interpreter scopes created minus dropped on the
+    // measuring thread is zero once its runs are done, on any platform and
+    // under any test runner. The byte half is asserted only where the
+    // instrument exists (glibc), with a cap far under the broken rate and far
+    // over warm-window noise.
+    #[test]
+    fn const_evaluations_in_use_bytes_plateau() {
+        let warmup = 8;
+        let window = 75;
+        let (reports, scopes_alive) = on_big_stack(move || {
+            let reports =
+                measure_windows_in_temp(|i| moving_edit(CONST_HEAVY_BASE, i), warmup, window, 2);
+            (reports, vilan_core::interpreter::live_scope_count())
+        });
+        for (index, report) in reports.iter().enumerate() {
+            report.print(&format!("const-heavy w{}", index + 1));
+        }
+        assert!(
+            reports[0].entry_text > 0,
+            "the const-heavy fixture leaked no entry text — it may not be re-analyzing",
+        );
+        assert_eq!(
+            scopes_alive, 0,
+            "{scopes_alive} interpreter scope(s) outlived their runs on the measuring thread — \
+             the const evaluator's cycles are stranding scopes again (leak-soak.md §7.8)",
+        );
+        // `uordblks` is process-global, so the byte half asserts only under
+        // nextest's process-per-test isolation — under `cargo test`'s
+        // in-process threads a neighbouring test's live allocations would land
+        // in the window, which is exactly why RSS has always been report-only
+        // here. The scope counter above is thread-local and gates everywhere.
+        let isolated = std::env::var_os("NEXTEST").is_some();
+        match reports[1].in_use_grown {
+            Some(in_use) if isolated => {
+                let per_analysis = in_use / window as isize;
+                assert!(
+                    per_analysis < 2048,
+                    "the warm window grew {per_analysis} B of in-use heap per analysis over \
+                     {window} analyses ({in_use} B) — allocated-and-never-freed bytes should be \
+                     flat with the const evaluator's scopes torn down (leak-soak.md §7.8)",
+                );
+            }
+            Some(in_use) => println!(
+                "[const-heavy] shared-process run — in-use growth {in_use} B reported, not \
+                 asserted (the scope counter above still gates)"
+            ),
+            None => println!(
+                "[const-heavy] mallinfo2 unavailable — the in-use cap was not asserted \
+                 (the scope counter above still gates)"
+            ),
+        }
+    }
+
+    // --- The soak: real corpora, thousands of analyses (proposal/leak-soak.md) --
+
+    /// The sibling-repository corpora, addressed by environment variable and
+    /// **skipped, never failed**, when absent — the same two variables the
+    /// `perf_baseline` module beside this one reads, so one export serves both
+    /// harnesses and both speak about the same two files. They live in checkouts
+    /// a fresh clone of this repository does not have.
+    const SOAK_CORPORA: &[(&str, &str, &str)] = &[
+        ("kolt_views", "VILAN_PERF_KOLT", "src/views.vl"),
+        ("website_page", "VILAN_PERF_WEBSITE", "src/page.vl"),
+    ];
+
+    /// Unmeasured analyses before the first measured window. Larger than the
+    /// synthetic fixtures' 8–20 because a real package drags in real modules:
+    /// every one of them has to be parsed, resolved and (for the derives) macro-
+    /// expanded into its content-addressed cache before "warm" is true.
+    const SOAK_WARMUP: usize = 10;
+
+    /// How many analyses one measured window runs. Two windows per driver, so
+    /// the default soak is 2,000 analyses of each corpus on the inline driver —
+    /// "thousands", where the shipped fixtures do tens and hundreds.
+    ///
+    /// Overridable with `VILAN_LEAK_SOAK_WINDOW` because the honest answer to
+    /// "how long should a soak run" is "longer than you think, but you are the
+    /// one waiting": a 735-line file costs ~320 ms an analysis in release
+    /// (`perf-baseline.md` §2.3), so 2,000 of them is ~11 minutes and the same
+    /// run in debug is most of an hour.
+    fn soak_window() -> usize {
+        std::env::var("VILAN_LEAK_SOAK_WINDOW")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|window| *window > 0)
+            .unwrap_or(1000)
+    }
+
+    /// A real file under a **moving single-character edit**: a fixed-width
+    /// trailing comment carrying one `x` that walks one column per iteration and
+    /// wraps.
+    ///
+    /// Three properties, each load-bearing:
+    ///
+    /// - **Every iteration is a distinct content**, so nothing is served from
+    ///   `parse_clean_cached` and every analysis is a genuine re-analysis rather
+    ///   than a cache hit wearing one.
+    /// - **Every iteration is the same LENGTH**, which is what makes the plateau
+    ///   assertion exact instead of statistical: the entry-text leak over a
+    ///   window of N analyses is exactly N × the file's bytes, and two windows of
+    ///   N must then match to the byte.
+    /// - **A trailing comment is valid in every file**, so one mutation works on
+    ///   any corpus without knowing anything about it — the same argument the
+    ///   `perf_baseline` module makes for its own trailing-comment keystroke.
+    ///
+    /// It deliberately edits nothing the analyzer resolves. The question a soak
+    /// asks is what a keystroke costs the *process* over thousands of rounds,
+    /// not what one particular edit costs the type solver; a `perf_baseline`
+    /// row already answers the second.
+    fn moving_edit(base: &str, i: usize) -> String {
+        const TRACK: usize = 64;
+        let column = i % TRACK;
+        format!(
+            "{base}\n// {}x{}\n",
+            " ".repeat(column),
+            " ".repeat(TRACK - 1 - column),
+        )
+    }
+
+    /// One window as a machine-readable row, the shape `perf_baseline`'s `PERF`
+    /// lines have, so a soak run greps into a file that diffs against the next
+    /// one.
+    fn soak_row(
+        corpus: &str,
+        lines: usize,
+        source_bytes: usize,
+        driver: Driver,
+        window_index: usize,
+        report: &LeakReport,
+    ) {
+        let json_or_null = |value: Option<isize>| {
+            value.map_or_else(|| "null".to_string(), |value| value.to_string())
+        };
+        println!(
+            "LEAK {{\"corpus\":\"{corpus}\",\"lines\":{lines},\"source_bytes\":{source_bytes},\
+             \"driver\":\"{}\",\"window\":{window_index},\"analyses\":{},\"entry_text_b\":{},\
+             \"entry_ast_b\":{},\"display_b\":{},\"macro_b\":{},\"total_b\":{},\
+             \"bytes_per_analysis\":{},\"entry_text_outstanding_b\":{},\
+             \"entry_ast_outstanding_b\":{},\"rss_grown_kib\":{},\"in_use_grown_b\":{},\
+             \"free_retained_grown_b\":{}}}",
+            driver.label(),
+            report.measured,
+            report.entry_text,
+            report.entry_ast,
+            report.display,
+            report.macro_bytes,
+            report.total,
+            report.total / report.measured,
+            report.entry_text_outstanding,
+            report.entry_ast_outstanding,
+            report.rss_grown,
+            json_or_null(report.in_use_grown),
+            json_or_null(report.free_retained_grown),
+        );
+    }
+
+    /// The soak's tier 1 (`leak-soak.md` §2): the shipped plateau assertion, run
+    /// against real application files instead of synthetic ones, for thousands
+    /// of keystrokes instead of tens, through both of the server's allocation
+    /// lifetimes.
+    ///
+    /// `#[ignore]`d because it is minutes to hours of measurement; the cheap
+    /// fixtures above stay in the gate and keep asserting the same invariant on
+    /// the shapes that can be asserted in seconds.
+    ///
+    /// Each corpus is measured in two disjoint equal windows and the windows are
+    /// compared **to the byte**. That comparison is the finding, not a
+    /// threshold: a per-analysis leak that is by design (the entry source the
+    /// `Program` borrows for `'static`, its AST) contributes the same bytes to
+    /// both windows, while anything that *accumulates* contributes more to the
+    /// second. RSS is printed beside it and asserted on nowhere, for the reason
+    /// `leak_tally`'s module doc gives.
+    #[test]
+    #[ignore = "the leak soak: thousands of analyses per corpus, run deliberately (proposal/leak-soak.md §5)"]
+    fn leak_soak_corpus_plateaus() {
+        for &(corpus, variable, relative) in SOAK_CORPORA {
+            let Some(root) = std::env::var_os(variable).map(PathBuf::from) else {
+                println!("LEAK-SKIP {corpus}: {variable} is not set");
+                continue;
+            };
+            let entry = root.join(relative);
+            let Ok(base) = std::fs::read_to_string(&entry) else {
+                println!("LEAK-SKIP {corpus}: {} is not readable", entry.display());
+                continue;
+            };
+            let lines = base.lines().count();
+            let source_bytes = moving_edit(&base, 0).len();
+
+            for driver in [Driver::Inline, Driver::PerAnalysisThread] {
+                let window = match driver {
+                    Driver::Inline => soak_window(),
+                    // A quarter of the window on the per-thread driver, stated
+                    // rather than tuned by feel: what it has to support is the
+                    // same plateau claim, and a plateau is proven by two windows
+                    // being EQUAL, not by their length. Its extra cost over the
+                    // inline driver is one 256 MiB-stack thread spawn and join
+                    // per analysis — small beside a real file's analysis, but
+                    // paid thousands of times.
+                    Driver::PerAnalysisThread => (soak_window() / 4).max(25),
+                };
+                let text = base.clone();
+                let subject = entry.clone();
+                let reports = on_big_stack(move || {
+                    measure_windows(
+                        move |i| moving_edit(&text, i),
+                        &subject,
+                        driver,
+                        SOAK_WARMUP,
+                        window,
+                        2,
+                    )
+                });
+                for (index, report) in reports.iter().enumerate() {
+                    report.print(&format!("{corpus} {} w{}", driver.label(), index + 1));
+                    soak_row(corpus, lines, source_bytes, driver, index + 1, report);
+                }
+
+                for (index, report) in reports.iter().enumerate() {
+                    assert_eq!(
+                        report.total,
+                        report.counts().named(),
+                        "{corpus} ({}) window {}: an unnamed leak site grew over {} analyses \
+                         — total {} B, named sites {} B (macro path {} B)",
+                        driver.label(),
+                        index + 1,
+                        report.measured,
+                        report.total,
+                        report.counts().named(),
+                        report.macro_bytes,
+                    );
+                }
+                assert_eq!(
+                    reports[0].entry_text,
+                    window * source_bytes,
+                    "{corpus} ({}): the entry-text leak is not one copy of the {source_bytes}-byte \
+                     source per analysis over {window} analyses",
+                    driver.label(),
+                );
+                // M7 (leak-soak.md §7): every one of those copies, and every
+                // tree, was given back when its document dropped — on both
+                // drivers, the per-thread one included (each analysis thread
+                // drops its own document before it reads its counters).
+                for (index, report) in reports.iter().enumerate() {
+                    assert_eq!(
+                        (report.entry_text_outstanding, report.entry_ast_outstanding),
+                        (0, 0),
+                        "{corpus} ({}) window {}: {} B of entry text and {} B of entry tree are \
+                         still out after {} analyses whose documents all dropped — the session \
+                         leak M7 fixed is back",
+                        driver.label(),
+                        index + 1,
+                        report.entry_text_outstanding,
+                        report.entry_ast_outstanding,
+                        report.measured,
+                    );
+                }
+                assert_eq!(
+                    reports[1].counts(),
+                    reports[0].counts(),
+                    "{corpus} ({}): the second window of {window} analyses did not leak what the \
+                     first did — something is accumulating across keystrokes, which is the leak \
+                     this soak exists to find",
+                    driver.label(),
+                );
+            }
+        }
+    }
+
+    /// The gate's pin on the soak harness: a handful of analyses through BOTH
+    /// drivers, asserting they agree to the byte and that two equal windows
+    /// plateau. Seconds, not minutes.
+    ///
+    /// Not a small copy of the heavy soak — it is the pin that the heavy soak's
+    /// *instrument* works, and specifically the one the per-analysis-thread
+    /// driver cannot do without. Read that driver's tally after the join instead
+    /// of inside the thread and every count comes back zero, which reads exactly
+    /// like a perfect plateau; the equality against the inline driver is what
+    /// makes shipping that impossible.
+    #[test]
+    fn leak_soak_harness_smoke() {
+        let base = no_macro_text(0);
+        let source_bytes = moving_edit(&base, 0).len();
+        let mut per_driver = Vec::new();
+        for driver in [Driver::Inline, Driver::PerAnalysisThread] {
+            let text = base.clone();
+            let reports = on_big_stack(move || {
+                let dir = std::env::temp_dir().join(format!(
+                    "vilan_leak_soak_smoke_{}_{}",
+                    std::process::id(),
+                    driver.label()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let entry = dir.join("main.vl");
+                let reports =
+                    measure_windows(move |i| moving_edit(&text, i), &entry, driver, 2, 2, 2);
+                let _ = std::fs::remove_dir_all(&dir);
+                reports
+            });
+            for (index, report) in reports.iter().enumerate() {
+                report.print(&format!("soak-smoke {} w{}", driver.label(), index + 1));
+            }
+            assert_eq!(
+                reports[0].entry_text,
+                2 * source_bytes,
+                "the {} driver did not tally one copy of the {source_bytes}-byte source per \
+                 analysis — a driver that reports nothing reports a clean plateau",
+                driver.label(),
+            );
+            assert_eq!(
+                (
+                    reports[0].entry_text_outstanding,
+                    reports[0].entry_ast_outstanding
+                ),
+                (0, 0),
+                "the {} driver left entry text or tree outstanding after its documents dropped \
+                 — the reclaim (leak-soak.md §7) is not reaching this driver's lifetime",
+                driver.label(),
+            );
+            assert_eq!(
+                reports[1].counts(),
+                reports[0].counts(),
+                "the {} driver's two equal windows did not leak equally",
+                driver.label(),
+            );
+            per_driver.push(reports[0].counts());
+        }
+        assert_eq!(
+            per_driver[1], per_driver[0],
+            "the per-analysis-thread driver must tally exactly what the inline driver tallies — \
+             the same analyses ran, only the thread they ran on differs",
+        );
+    }
+}
+
+/// The edit-latency half of the performance baseline (`proposal/perf-baseline.md`).
+///
+/// `leak_measurement` above answers "does a keystroke leak"; this answers "what
+/// does a keystroke *cost*", over the same loop and through the same entry
+/// point (`Document::analyze_on_this_thread`, which is why the section lives
+/// here rather than in the CLI's harness — it is private to this crate, and a
+/// benchmark is not a reason to widen it). A tail latency, not a mean: an
+/// editor is judged by the keystroke that stalls, so the row is p50/p95/p99.
+///
+/// Not `target_os = "linux"`-gated, unlike its neighbor — that gate is about
+/// `/proc/self/statm`, and a clock is everywhere.
+///
+/// Run it (with the CLI half, one command, `perf-baseline.md` §3):
+///
+/// ```text
+/// cargo nextest run --release --workspace --run-ignored ignored-only \
+///     -E 'test(perf_baseline)' --no-capture > perf.log 2>&1
+/// ```
+#[cfg(test)]
+mod perf_baseline {
+    use super::*;
+    use crate::document::tests::std_root;
+    use std::time::{Duration, Instant};
+
+    /// Which build measured the row. A debug-profile number is a fact about
+    /// `-O0`, not about the compiler a user installs, and a baseline that does
+    /// not say which it is invites exactly that confusion.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    }
+
+    /// Nearest-rank percentile over sorted samples.
+    fn percentile(sorted: &[Duration], fraction: f64) -> f64 {
+        let rank = (fraction * sorted.len() as f64).ceil().max(1.0) as usize;
+        sorted[rank.min(sorted.len()) - 1].as_secs_f64() * 1000.0
+    }
+
+    /// The same `PERF {…}` line shape the CLI harness emits, so a run's rows
+    /// from both binaries concatenate into one diffable summary.
+    fn report(corpus: &str, note: &str, samples: &mut Vec<Duration>) {
+        samples.sort_unstable();
+        let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        println!(
+            "PERF {{\"section\":\"lsp_edit\",\"corpus\":\"{}\",\"mode\":\"warm\",\
+             \"metric\":\"analyze\",\"profile\":\"{}\",\"runs\":{},\"min_ms\":{:.2},\
+             \"median_ms\":{:.2},\"p95_ms\":{:.2},\"p99_ms\":{:.2},\"max_ms\":{:.2},\
+             \"note\":\"{}\"}}",
+            corpus,
+            profile(),
+            samples.len(),
+            milliseconds(samples[0]),
+            percentile(samples, 0.50),
+            percentile(samples, 0.95),
+            percentile(samples, 0.99),
+            milliseconds(*samples.last().expect("at least one sample")),
+            note,
+        );
+    }
+
+    /// Runs `warmup` unmeasured then `measured` timed analyses of `text_at(i)`,
+    /// each a distinct document (a keystroke), and returns the per-analysis
+    /// wall times.
+    ///
+    /// The mode is **warm** and could not honestly be anything else: this is
+    /// the editor's steady state, where the resolved base world is already in
+    /// the process and only the entry is new. The cold shape — a first analysis
+    /// after the server starts — is what the CLI harness's `cold` rows measure.
+    /// The warmup is what makes the distinction real rather than assumed
+    /// (`suite-speed.md` §2.1/E26): without it the first samples carry the whole
+    /// std resolve and the percentile is a mixture of two populations.
+    fn measure(
+        text_at: impl Fn(usize) -> String,
+        entry: &Path,
+        warmup: usize,
+        measured: usize,
+    ) -> Vec<Duration> {
+        let std_dir = std_root();
+        for i in 0..warmup {
+            let _ = Document::analyze_on_this_thread(&text_at(i), &std_dir, entry);
+        }
+        let mut samples = Vec::with_capacity(measured);
+        for i in warmup..warmup + measured {
+            let text = text_at(i);
+            let started = Instant::now();
+            let _ = Document::analyze_on_this_thread(&text, &std_dir, entry);
+            samples.push(started.elapsed());
+        }
+        samples
+    }
+
+    fn on_big_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(work)
+            .expect("spawn the latency measurement thread")
+            .join()
+            .expect("the latency measurement thread panicked")
+    }
+
+    /// The synthetic subject: a std-using document with no macros, one
+    /// character different per iteration. Deliberately the same fixture
+    /// `leak_measurement` uses, so the leak plateau and the latency curve are
+    /// statements about one document.
+    fn synthetic_text(i: usize) -> String {
+        format!(
+            "import std::print;\nimport std::option::Option::{{ self, Some, None }};\n\n\
+             fun describe(value: Option<i32>): str {{\n\
+             \tmatch value {{\n\t\tSome(let n) => int_to_string(n),\n\t\tNone => \"empty {i}\",\n\t}}\n}}\n\n\
+             fun int_to_string(n: i32): str {{\n\t\"n\"\n}}\n\n\
+             fun main() {{\n\tlet value = Some({i});\n\tprint(describe(value));\n\tprint(describe(None));\n}}\n"
+        )
+    }
+
+    /// A real package file, edited the way the broken-world fixture above edits
+    /// its own: a trailing comment that changes every iteration. It is a whole
+    /// re-analysis either way — the entry is never served from a content cache
+    /// once its bytes move — and a trailing comment is the one edit that is
+    /// valid in every file, so the same mutation works on any corpus.
+    fn corpus_text(base: &str, i: usize) -> String {
+        format!("{base}\n// keystroke {i}\n")
+    }
+
+    /// The sibling-repository corpora, addressed by environment variable and
+    /// skipped when absent (`perf-baseline.md` §1): `VILAN_PERF_KOLT`,
+    /// `VILAN_PERF_WEBSITE`.
+    const CORPORA: &[(&str, &str, &str)] = &[
+        ("kolt_views", "VILAN_PERF_KOLT", "src/views.vl"),
+        ("website_page", "VILAN_PERF_WEBSITE", "src/page.vl"),
+    ];
+
+    #[test]
+    #[ignore = "the performance baseline: minutes of measurement, run deliberately (proposal/perf-baseline.md §3)"]
+    fn perf_baseline_lsp_edit_latency() {
+        let samples = on_big_stack(|| {
+            let directory =
+                std::env::temp_dir().join(format!("vilan_perf_latency_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("create the fixture directory");
+            let entry = directory.join("main.vl");
+            let samples = measure(synthetic_text, &entry, 50, 2000);
+            let _ = std::fs::remove_dir_all(&directory);
+            samples
+        });
+        let mut samples = samples;
+        report("synthetic", "15 lines, no macros", &mut samples);
+
+        for (name, variable, relative) in CORPORA {
+            let Some(root) = std::env::var_os(variable).map(PathBuf::from) else {
+                println!("PERF-SKIP {name}: {variable} is not set");
+                continue;
+            };
+            let entry = root.join(relative);
+            let Ok(base) = std::fs::read_to_string(&entry) else {
+                println!("PERF-SKIP {name}: {} is not readable", entry.display());
+                continue;
+            };
+            let lines = base.lines().count();
+            // Fewer iterations than the synthetic subject, and the reason is
+            // recorded rather than tuned by feel: each analysis leaks its entry
+            // text and AST (the known, named leak `leak_measurement` bounds), so
+            // a 25 KB file at 2000 keystrokes is hundreds of megabytes of
+            // deliberate garbage — and at a real file's per-keystroke cost that
+            // many iterations is most of an hour. 100 is enough for p50/p95 and
+            // is reported with its `runs` so a reader can judge the p99 for
+            // themselves.
+            let mut samples =
+                on_big_stack(move || measure(move |i| corpus_text(&base, i), &entry, 10, 100));
+            report(name, &format!("{lines} lines"), &mut samples);
+        }
+    }
+
+    /// The gate's pin on this half of the harness: it runs and produces an
+    /// ordered, non-empty sample set. A handful of analyses, seconds.
+    #[test]
+    fn perf_baseline_lsp_harness_smoke() {
+        let mut samples = on_big_stack(|| {
+            let directory = std::env::temp_dir()
+                .join(format!("vilan_perf_latency_smoke_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("create the fixture directory");
+            let entry = directory.join("main.vl");
+            let samples = measure(synthetic_text, &entry, 1, 3);
+            let _ = std::fs::remove_dir_all(&directory);
+            samples
+        });
+        assert_eq!(samples.len(), 3, "the harness measured the wrong count");
+        report("synthetic", "smoke", &mut samples);
+        assert!(
+            samples.windows(2).all(|pair| pair[0] <= pair[1]),
+            "reporting did not leave the samples sorted, so the percentiles are not percentiles",
+        );
+        assert!(
+            samples[0] > Duration::ZERO,
+            "an analysis measured zero time — the clock is not measuring the work",
+        );
+    }
+
+    /// The pin on the statistic itself, over known samples. Three measured
+    /// analyses cannot tell a p95 from a p5 — every rank of a three-sample set
+    /// is within one of every other — so the tail numbers this section exists
+    /// to report need a fixture that can distinguish them.
+    #[test]
+    fn perf_baseline_lsp_percentiles_are_nearest_rank() {
+        let sorted: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+        assert_eq!(percentile(&sorted, 0.50), 50.0);
+        assert_eq!(percentile(&sorted, 0.95), 95.0);
+        assert_eq!(percentile(&sorted, 0.99), 99.0);
+        // A single sample answers every question with itself.
+        assert_eq!(percentile(&sorted[..1], 0.99), 1.0);
     }
 }

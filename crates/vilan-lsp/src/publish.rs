@@ -170,35 +170,150 @@ impl PublishState {
     }
 }
 
-/// Attaches a diagnostic's C3 note as LSP related information (backlog E17) —
-/// a location plus a message, which is exactly what a declaration note is.
-/// `home` is the file the diagnostic itself was published to, with its index:
-/// a note with no file of its own lives there (the entry, or the module the
-/// diagnostic was attributed to). A note in another file is read fresh, like
-/// the diagnostic's own file is. An unreadable note file drops the related
-/// information only — never the diagnostic.
-fn attach_note(
+/// A secondary location resolved to the wire: the file's URI and the span's
+/// range in THAT file's text. `home` is the file the diagnostic itself was
+/// published to, with its index: a location with no file of its own lives
+/// there (the entry, or the module the diagnostic was attributed to). A
+/// location in another file is read fresh, like the diagnostic's own file
+/// is. An unreadable file answers `None` — the caller drops that entry
+/// only, never the diagnostic.
+fn locate_secondary(
+    span: &vilan_core::Span,
+    path: &Option<std::path::PathBuf>,
+    home: &Url,
+    home_index: &LineIndex,
+) -> Option<Location> {
+    match path {
+        None => Some(Location {
+            uri: home.clone(),
+            range: home_index.range(span),
+        }),
+        Some(path) => vilan_core::util::read_source(path)
+            .ok()
+            .map(|text| LineIndex::new(&text).range(span))
+            .and_then(|range| {
+                Url::from_file_path(path)
+                    .ok()
+                    .map(|uri| Location { uri, range })
+            }),
+    }
+}
+
+/// Attaches a diagnostic's secondary locations as LSP related information
+/// (backlog E17): the E78 requirement trace first — one entry per uncovered
+/// upstream call, preserving the analyzer's entry → read order — then the C3
+/// note, each a location plus a message, which is exactly what a chain hop
+/// or a declaration note is.
+fn attach_related(
     converted: &mut Diagnostic,
     item: &PublishedDiagnostic,
     home: &Url,
     home_index: &LineIndex,
 ) {
-    let Some((note_span, note_msg, note_path)) = &item.note else {
-        return;
-    };
-    let located = match note_path {
-        None => Some((home.clone(), home_index.range(note_span))),
-        Some(path) => vilan_core::util::read_source(path)
-            .ok()
-            .map(|text| LineIndex::new(&text).range(note_span))
-            .and_then(|range| Url::from_file_path(path).ok().map(|target| (target, range))),
-    };
-    if let Some((target, range)) = located {
-        converted.related_information = Some(vec![DiagnosticRelatedInformation {
-            location: Location { uri: target, range },
-            message: note_msg.clone(),
-        }]);
+    let related: Vec<DiagnosticRelatedInformation> = item
+        .trace
+        .iter()
+        .map(|hop| (&hop.span, &hop.message, &hop.path))
+        .chain(
+            item.note
+                .iter()
+                .map(|(span, message, path)| (span, message, path)),
+        )
+        .filter_map(|(span, message, path)| {
+            locate_secondary(span, path, home, home_index).map(|location| {
+                DiagnosticRelatedInformation {
+                    location,
+                    message: message.clone(),
+                }
+            })
+        })
+        .collect();
+    if !related.is_empty() {
+        converted.related_information = Some(related);
     }
+}
+
+/// The E81 hop diagnostics of one published item: each CALL hop of the item's
+/// requirement trace, as a diagnostic AT THE CALL. Related information draws
+/// no marker at its locations, so the trace alone (E78) squiggled the read
+/// and left every call on the uncovered path bare — exactly the sites the
+/// trace exists to point at. Each hop diagnostic carries the hop's own label
+/// as its message (the primary's text would say "is read here" at a span that
+/// is not the read) and the rest of the story as related information: the
+/// other trace entries in entry → read order, then the read itself (the
+/// primary), then the C3 note. The elision tail publishes no diagnostic of
+/// its own — its span is the last kept hop's, already underlined by that
+/// hop's — and a hop whose file cannot be read drops out entirely, exactly
+/// as it drops out of the primary's related information.
+fn trace_call_diagnostics(
+    item: &PublishedDiagnostic,
+    severity: DiagnosticSeverity,
+    primary: Location,
+    home: &Url,
+    home_index: &LineIndex,
+) -> Vec<(Url, Diagnostic)> {
+    if !item.trace.iter().any(|hop| hop.call) {
+        return Vec::new();
+    }
+    // The whole story, located once: every trace entry, then the read, then
+    // the note.
+    let located: Vec<(Option<Location>, &str, bool)> = item
+        .trace
+        .iter()
+        .map(|hop| {
+            (
+                locate_secondary(&hop.span, &hop.path, home, home_index),
+                hop.message.as_str(),
+                hop.call,
+            )
+        })
+        .chain(std::iter::once((
+            Some(primary),
+            item.message.as_str(),
+            false,
+        )))
+        .chain(item.note.iter().map(|(span, message, path)| {
+            (
+                locate_secondary(span, path, home, home_index),
+                message.as_str(),
+                false,
+            )
+        }))
+        .collect();
+    located
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (location, message, call))| {
+            if !call {
+                return None;
+            }
+            let location = location.as_ref()?;
+            let related: Vec<DiagnosticRelatedInformation> = located
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != position)
+                .filter_map(|(_, (location, message, _))| {
+                    location
+                        .as_ref()
+                        .map(|location| DiagnosticRelatedInformation {
+                            location: location.clone(),
+                            message: (*message).to_string(),
+                        })
+                })
+                .collect();
+            Some((
+                location.uri.clone(),
+                Diagnostic {
+                    range: location.range,
+                    severity: Some(severity),
+                    source: Some("vilan".to_string()),
+                    message: (*message).to_string(),
+                    related_information: (!related.is_empty()).then_some(related),
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect()
 }
 
 /// One analyzed document's diagnostics as per-target groups: the entry's own
@@ -218,6 +333,10 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
     let mut entry_group: Vec<Diagnostic> = Vec::new();
     let mut extra_groups: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
     let mut extra_indices: HashMap<PathBuf, Option<Arc<LineIndex>>> = HashMap::new();
+    // The E81 hop diagnostics, collected across items and routed to their
+    // groups after the loop: a hop lives wherever its call does, which is
+    // routinely not the file its primary published to.
+    let mut hop_diagnostics: Vec<(Url, Diagnostic)> = Vec::new();
     for item in document.published_diagnostics() {
         let severity = if item.warning {
             DiagnosticSeverity::WARNING
@@ -240,7 +359,17 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
                 let mut converted = diagnostic(document.analyzed_range(&item.span));
                 // A secondary note becomes related information — "first
                 // call here"-style anchors.
-                attach_note(&mut converted, &item, owner, document.analyzed_index());
+                attach_related(&mut converted, &item, owner, document.analyzed_index());
+                hop_diagnostics.extend(trace_call_diagnostics(
+                    &item,
+                    severity,
+                    Location {
+                        uri: owner.clone(),
+                        range: converted.range,
+                    },
+                    owner,
+                    document.analyzed_index(),
+                ));
                 entry_group.push(converted);
             }
             Some(path) => {
@@ -264,7 +393,17 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
                         // (backlog E17): this branch used to publish
                         // module-attributed diagnostics stripped of their
                         // second location.
-                        attach_note(&mut converted, &item, &target, &index);
+                        attach_related(&mut converted, &item, &target, &index);
+                        hop_diagnostics.extend(trace_call_diagnostics(
+                            &item,
+                            severity,
+                            Location {
+                                uri: target.clone(),
+                                range: converted.range,
+                            },
+                            &target,
+                            &index,
+                        ));
                         match extra_groups
                             .iter_mut()
                             .find(|(existing, _)| *existing == target)
@@ -282,6 +421,41 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
                         ..Default::default()
                     }),
                 }
+            }
+        }
+    }
+    // Two chains through one call — two reads sharing an upstream frame —
+    // merge into ONE hop diagnostic there, their stories concatenated: an
+    // identical squiggle stacked per read would report one call N times.
+    let mut merged_hops: Vec<(Url, Diagnostic)> = Vec::new();
+    for (target, diagnostic) in hop_diagnostics {
+        match merged_hops.iter_mut().find(|(existing_target, existing)| {
+            *existing_target == target
+                && existing.range == diagnostic.range
+                && existing.message == diagnostic.message
+                && existing.severity == diagnostic.severity
+        }) {
+            Some((_, existing)) => {
+                let combined = existing.related_information.get_or_insert_with(Vec::new);
+                for entry in diagnostic.related_information.into_iter().flatten() {
+                    if !combined.contains(&entry) {
+                        combined.push(entry);
+                    }
+                }
+            }
+            None => merged_hops.push((target, diagnostic)),
+        }
+    }
+    for (target, diagnostic) in merged_hops {
+        if target == *owner {
+            entry_group.push(diagnostic);
+        } else {
+            match extra_groups
+                .iter_mut()
+                .find(|(existing, _)| *existing == target)
+            {
+                Some((_, group)) => group.push(diagnostic),
+                None => extra_groups.push((target, vec![diagnostic])),
             }
         }
     }
@@ -328,6 +502,38 @@ mod tests {
         let mut visible = editor.clone();
         visible.retain(|_, group| !group.is_empty());
         visible
+    }
+
+    /// The (line, start, end) of the `occurrence`th `snippet` in `text`,
+    /// 0-based, so span expectations are computed from the fixture rather
+    /// than hand-counted.
+    fn position_of(text: &str, snippet: &str, occurrence: usize) -> (u32, u32, u32) {
+        let mut from = 0;
+        let mut at = None;
+        for _ in 0..=occurrence {
+            at = text[from..].find(snippet).map(|found| from + found);
+            from = at.expect("the snippet occurs in the fixture") + 1;
+        }
+        let at = at.unwrap();
+        let line = text[..at].matches('\n').count() as u32;
+        let column = (at - text[..at].rfind('\n').map(|nl| nl + 1).unwrap_or(0)) as u32;
+        (line, column, column + snippet.len() as u32)
+    }
+
+    /// The Range of the `occurrence`th `snippet` in `text`, from
+    /// [`position_of`].
+    fn range_of(text: &str, snippet: &str, occurrence: usize) -> Range {
+        let (line, start, end) = position_of(text, snippet, occurrence);
+        Range {
+            start: Position {
+                line,
+                character: start,
+            },
+            end: Position {
+                line,
+                character: end,
+            },
+        }
     }
 
     /// One analysis of `text` as the open entry, published through the planner —
@@ -480,6 +686,261 @@ mod tests {
             ),
             (1, 0),
             "`let Z` starts line 2 of zeta.vl"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E78 at the wire: a cross-file requirement chain publishes as related
+    // information — one entry per uncovered hop, the analyzer's entry → read
+    // order preserved, each located in ITS file (URI + range). The read is
+    // user-written, so there is no C3 note: the related information is
+    // exactly the chain.
+    #[test]
+    fn a_cross_file_requirement_chain_publishes_each_hop_as_related_information() {
+        let main_text = "import std::print;\nimport pkg::lib::read_it;\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
+        let lib_text = "import std::context::Context;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\n";
+        let (dir, _) = analyze_workspace(&[("main.vl", main_text), ("lib.vl", lib_text)]);
+        let mut state = PublishState::new();
+        let (main_uri, main_document) = open(&dir, "main.vl");
+        let published = state.plan_publish(&main_uri, &main_document);
+        let group = published
+            .iter()
+            .find(|(target, _)| target.path().ends_with("lib.vl"))
+            .map(|(_, group)| group)
+            .expect("the read is in lib.vl, so the diagnostic publishes there");
+        let diagnostic = group
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("can be reached without an enclosing `run`")
+            })
+            .expect("the coverage diagnostic is published");
+        let related = diagnostic
+            .related_information
+            .as_ref()
+            .expect("the chain travels with the diagnostic");
+        // Entry → read: the top-level call, main's `relay()`, relay's
+        // `read_it()` — the occurrence skips a declaration where the
+        // snippet also matches it.
+        let expected = [
+            position_of(main_text, "main()", 1),
+            position_of(main_text, "relay()", 1),
+            position_of(main_text, "read_it()", 0),
+        ];
+        assert_eq!(related.len(), 3, "{related:#?}");
+        for (entry, (line, start, end)) in related.iter().zip(expected) {
+            assert!(
+                entry
+                    .message
+                    .contains("the context requirement flows through this call"),
+                "{}",
+                entry.message
+            );
+            assert!(
+                entry.location.uri.path().ends_with("main.vl"),
+                "each hop locates in ITS file: {}",
+                entry.location.uri
+            );
+            assert_eq!(
+                entry.location.range.start,
+                Position {
+                    line,
+                    character: start
+                }
+            );
+            assert_eq!(
+                entry.location.range.end,
+                Position {
+                    line,
+                    character: end
+                }
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E81: related information draws no marker in the editor, so the E78
+    // chain alone squiggled the read and left every uncovered call bare —
+    // exactly the sites the trace exists to point at (the owner's report,
+    // 2026-08-20). Each CALL hop publishes as its own diagnostic at the
+    // call: the hop's own label as the message (rows 241/242), the rest of
+    // the story — the other hops in entry → read order, then the read — as
+    // its related information.
+    #[test]
+    fn a_trace_call_hop_publishes_its_own_diagnostic_at_the_call() {
+        let text = "import std::context::Context;\nimport std::print;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
+        let group = published(text);
+        let hops: Vec<&Diagnostic> = group
+            .iter()
+            .filter(|item| item.message == "the context requirement flows through this call")
+            .collect();
+        // The chain: the top-level `main();`, main's `relay()`, relay's
+        // `read_it()` — each snippet's occurrence 1, past its declaration.
+        let expected = [
+            range_of(text, "main()", 1),
+            range_of(text, "relay()", 1),
+            range_of(text, "read_it()", 1),
+        ];
+        assert_eq!(hops.len(), 3, "{group:#?}");
+        for expected_range in expected {
+            let hop = hops
+                .iter()
+                .find(|hop| hop.range == expected_range)
+                .expect("every uncovered call carries its own diagnostic");
+            assert_eq!(hop.severity, Some(DiagnosticSeverity::ERROR));
+            let related = hop
+                .related_information
+                .as_ref()
+                .expect("the rest of the story travels with the hop");
+            assert_eq!(
+                related.len(),
+                3,
+                "the other two hops and the read: {related:#?}"
+            );
+            assert!(
+                related
+                    .last()
+                    .unwrap()
+                    .message
+                    .contains("can be reached without an enclosing `run`"),
+                "the story ends at the read: {related:#?}"
+            );
+        }
+        // The primary keeps its own related chain unchanged (E78's law).
+        let primary = group
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("can be reached without an enclosing `run`")
+            })
+            .expect("the coverage diagnostic is published");
+        assert_eq!(
+            primary.related_information.as_ref().map(Vec::len),
+            Some(3),
+            "{primary:#?}"
+        );
+    }
+
+    // E81's merge law: two reads sharing an upstream frame — the owner's
+    // todo client, where one `mount_root` closure feeds two `get()`s — put
+    // ONE diagnostic on the shared call, its related information the union
+    // of both stories, not a stacked pair of identical squiggles.
+    #[test]
+    fn two_reads_sharing_an_upstream_call_merge_into_one_hop_diagnostic() {
+        let text = "import std::context::Context;\nimport std::print;\nlet current: Context<i32> = Context::new();\nfun first(): i32 {\n\tcurrent.get()\n}\nfun second(): i32 {\n\tcurrent.get() + first()\n}\nfun main() {\n\tprint(second());\n}\nmain();\n";
+        let group = published(text);
+        let hops: Vec<&Diagnostic> = group
+            .iter()
+            .filter(|item| item.message == "the context requirement flows through this call")
+            .collect();
+        // Three DISTINCT uncovered calls — `main();`, `second()`, `first()`
+        // — though two chains traverse the first two.
+        assert_eq!(hops.len(), 3, "{group:#?}");
+        let shared: Vec<&&Diagnostic> = hops
+            .iter()
+            .filter(|hop| hop.range == range_of(text, "second()", 1))
+            .collect();
+        assert_eq!(shared.len(), 1, "one diagnostic on the shared call");
+        let reads: Vec<_> = shared[0]
+            .related_information
+            .as_ref()
+            .expect("the merged story travels with the hop")
+            .iter()
+            .filter(|entry| {
+                entry
+                    .message
+                    .contains("can be reached without an enclosing `run`")
+            })
+            .collect();
+        assert_eq!(
+            reads.len(),
+            2,
+            "both reads in the merged story: {shared:#?}"
+        );
+    }
+
+    // The elision tail (row 243) labels but never underlines: its span is
+    // the last kept hop's, already underlined by that hop's own diagnostic,
+    // so a diagnostic of its own would report one call twice. It still
+    // rides every related-information chain.
+    #[test]
+    fn the_elision_tail_labels_but_never_underlines() {
+        // Eight uncovered calls — two past TRACE_CAP.
+        let text = "import std::context::Context;\nlet current: Context<i32> = Context::new();\nfun f8(): i32 {\n\tcurrent.get()\n}\nfun f7(): i32 {\n\tf8()\n}\nfun f6(): i32 {\n\tf7()\n}\nfun f5(): i32 {\n\tf6()\n}\nfun f4(): i32 {\n\tf5()\n}\nfun f3(): i32 {\n\tf4()\n}\nfun f2(): i32 {\n\tf3()\n}\nfun f1(): i32 {\n\tf2()\n}\nf1();\n";
+        let group = published(text);
+        assert!(
+            !group
+                .iter()
+                .any(|item| item.message.contains("more uncovered call")),
+            "the tail publishes no diagnostic of its own: {group:#?}"
+        );
+        let hops: Vec<&Diagnostic> = group
+            .iter()
+            .filter(|item| item.message == "the context requirement flows through this call")
+            .collect();
+        assert_eq!(hops.len(), 6, "the kept entry side underlines: {group:#?}");
+        let primary = group
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("can be reached without an enclosing `run`")
+            })
+            .expect("the coverage diagnostic is published");
+        let related = primary
+            .related_information
+            .as_ref()
+            .expect("the chain travels with the diagnostic");
+        assert_eq!(related.len(), 7, "six hops and the tail: {related:#?}");
+        assert!(
+            related
+                .last()
+                .unwrap()
+                .message
+                .contains("… 2 more uncovered calls on this path"),
+            "{related:#?}"
+        );
+    }
+
+    // E81 across files: a hop publishes in the file its CALL is in, not the
+    // file its primary published to — the same fixture as the
+    // related-information pin above, now asserting main.vl's own group.
+    #[test]
+    fn a_cross_file_chains_hop_diagnostics_publish_in_the_hops_file() {
+        let main_text = "import std::print;\nimport pkg::lib::read_it;\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
+        let lib_text = "import std::context::Context;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\n";
+        let (dir, _) = analyze_workspace(&[("main.vl", main_text), ("lib.vl", lib_text)]);
+        let mut state = PublishState::new();
+        let (main_uri, main_document) = open(&dir, "main.vl");
+        let published = state.plan_publish(&main_uri, &main_document);
+        let group_of = |suffix: &str| {
+            published
+                .iter()
+                .find(|(target, _)| target.path().ends_with(suffix))
+                .map(|(_, group)| group)
+                .expect("both files publish")
+        };
+        let hops: Vec<&Diagnostic> = group_of("main.vl")
+            .iter()
+            .filter(|item| item.message == "the context requirement flows through this call")
+            .collect();
+        assert_eq!(hops.len(), 3, "every hop lives in main.vl: {published:#?}");
+        for hop in &hops {
+            let read = hop
+                .related_information
+                .as_ref()
+                .expect("the story travels with the hop")
+                .last()
+                .unwrap();
+            assert!(
+                read.location.uri.path().ends_with("lib.vl"),
+                "the story ends at the read, in ITS file: {read:#?}"
+            );
+        }
+        assert!(
+            !group_of("lib.vl")
+                .iter()
+                .any(|item| item.message == "the context requirement flows through this call"),
+            "no hop publishes beside the primary: {published:#?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

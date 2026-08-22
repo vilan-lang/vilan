@@ -57,11 +57,15 @@ impl Option<type T> {
 	fun ok_or<E>(own self, err: E): Result<T, E>
 	fun ok_or_else<E>(own self, err: || E): Result<T, E>
 }
+impl Option<Option<type T>> { fun flatten(own self): Option<T> }
+impl Option<Result<type T, type E>> { fun transpose(own self): Result<Option<T>, E> }
 impl Option<type T: Default> { fun unwrap_or_default(own self): T }
 impl Option<(type T, type U)> { fun unzip(own self): (Option<T>, Option<U>) }
 ```
 
-`str.parse_i32(): Option<i32>` (declared here) is the string→number path.
+`str.parse_i32(): Option<i32>` and `str.parse_f64(): Option<f64>` (both
+declared here) are the string→number path, and `bool.then_some(value)` is the
+condition→`Option` one.
 
 The combinators that hand the payload onward take **`own self`**: they move
 the value out of the `Option`, so they must own it (`docs/spec/memory.md` R3).

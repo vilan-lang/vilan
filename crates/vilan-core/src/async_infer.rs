@@ -199,6 +199,17 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id) else {
             continue;
         };
+        // `Context::run` is `external` only as a type-checking fiction: the
+        // context threading pass erases every `run` call it accepts (the body
+        // becomes a direct call), so `run` is never a host boundary at
+        // runtime. A `run` call survives to this pass only when
+        // `thread_contexts` refused the rewrite and already said why (a
+        // coverage or `run`-shape error); re-judging its body here as a
+        // host-await misuse cascades a false secondary — anchored in std —
+        // on top of that primary (E68).
+        if Some(*target) == program.context_run_fn_id {
+            continue;
+        }
         let Some(external) = program.external_functions.get(target) else {
             continue;
         };
@@ -1381,6 +1392,7 @@ fn anchored(
 ) -> (crate::error::Error, SourceId) {
     program.anchored(
         crate::error::Error {
+            trace: Vec::new(),
             note,
             span: span_of(program, id),
             msg,
@@ -1482,6 +1494,12 @@ fn extern_violations_at(
     reported: &mut HashSet<(Id, Id)>,
     diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
 ) {
+    // The `Context::run` intrinsic is not a host boundary — see the direct
+    // host-boundary check in `infer` (E68): a surviving `run` call means
+    // `thread_contexts` already refused and reported it.
+    if Some(callee) == program.context_run_fn_id {
+        return;
+    }
     let Some(external) = program.external_functions.get(&callee) else {
         return;
     };

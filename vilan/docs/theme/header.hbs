@@ -1,0 +1,24 @@
+{{!-- The masthead slot (mdBook's `theme/header.hbs` partial — lands as the
+     first child of `.page`, above the menu bar; docs-port.md §3.1 S4, §4 Q2
+     mechanism (i)).
+
+     THIS IS A FALLBACK FOR LOCAL BUILDS. At deploy, docs.yml replaces this
+     file with `chrome/header.html`, the masthead fragment the website's
+     deploy exports from its own `top_bar()` code into the Pages repo — one
+     nav, generated once by the site, never hand-copied. The site's markup is
+     build-hashed atomic classes and its styles live in `/chrome/header.css`
+     (linked by head.hbs), so copying either here would be wrong the day
+     after. Keep this to a home link and the book's title, so nothing tempts
+     a copy.
+
+     The contract the exported fragment honours: ONE root element, no
+     <html>/<head>/<body>, no handlebars braces, absolute asset paths, and
+     every colour a `var(--role)` that `css/variables.css` declares on
+     html.light / html.navy — so the masthead follows the book's theme
+     picker, not the OS. This fallback keeps the same shape (one root, role
+     tokens only — see `.vilan-masthead-fallback` in css/vilan.css); being a
+     partial, it may read `book_title`, which the fragment cannot. --}}
+<div class="vilan-masthead-fallback">
+    <a href="/">vilan</a>
+    <span>{{ book_title }}</span>
+</div>

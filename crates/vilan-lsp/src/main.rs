@@ -2,6 +2,8 @@
 //! Analyzes each open document on change and answers diagnostics, hover,
 //! go-to-definition, find-references, and rename — across files into `std`.
 
+#[cfg(test)]
+mod book_sync;
 mod document;
 mod line_index;
 mod manifest_completion;
@@ -1618,6 +1620,71 @@ impl Backend {
     }
 }
 
+/// What the server advertises at `initialize` — every provider it answers
+/// for, and by omission every one it does not. A pure value, so the book's
+/// editor page can be held to it (`book_sync.rs`): the page's "what it gives
+/// you" and "what it does not have" are claims about exactly this struct.
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                // B39c: the client sends ranged edits, not the
+                // whole buffer per keystroke.
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
+        )),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        // Element syntax S5: editing one tag name renames its pair.
+        linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            // `.` and `:` (the second `:` of `::`) re-trigger completion so
+            // member/path candidates appear without a manual invoke.
+            trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+            ..Default::default()
+        }),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        // E2: precision highlighting from the analyzed program. The
+        // legend is index-aligned with `document::TokenKind`.
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: crate::document::TOKEN_TYPES
+                        .iter()
+                        .map(|name| SemanticTokenType::new(name))
+                        .collect(),
+                    token_modifiers: crate::document::TOKEN_MODIFIERS
+                        .iter()
+                        .map(|name| SemanticTokenModifier::new(name))
+                        .collect(),
+                },
+                full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
+                range: Some(true),
+                ..Default::default()
+            },
+        )),
+        // WO-2: the "Organize Imports" source action (sort + prune).
+        // E54: QUICKFIX (add-import, and E58's field-name rename) and
+        // the "add all missing imports" source action.
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![
+                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                CodeActionKind::QUICKFIX,
+                fix_all_imports_kind(),
+            ]),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -1646,70 +1713,7 @@ impl LanguageServer for Backend {
             self.snippet_support
                 .store(snippet_support, Ordering::Relaxed);
             Ok(InitializeResult {
-                capabilities: ServerCapabilities {
-                    text_document_sync: Some(TextDocumentSyncCapability::Options(
-                        TextDocumentSyncOptions {
-                            open_close: Some(true),
-                            // B39c: the client sends ranged edits, not the
-                            // whole buffer per keystroke.
-                            change: Some(TextDocumentSyncKind::INCREMENTAL),
-                            save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-                            ..Default::default()
-                        },
-                    )),
-                    hover_provider: Some(HoverProviderCapability::Simple(true)),
-                    // Element syntax S5: editing one tag name renames its pair.
-                    linked_editing_range_provider: Some(
-                        LinkedEditingRangeServerCapabilities::Simple(true),
-                    ),
-                    definition_provider: Some(OneOf::Left(true)),
-                    references_provider: Some(OneOf::Left(true)),
-                    rename_provider: Some(OneOf::Left(true)),
-                    document_symbol_provider: Some(OneOf::Left(true)),
-                    document_formatting_provider: Some(OneOf::Left(true)),
-                    completion_provider: Some(CompletionOptions {
-                        // `.` and `:` (the second `:` of `::`) re-trigger completion so
-                        // member/path candidates appear without a manual invoke.
-                        trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
-                        ..Default::default()
-                    }),
-                    inlay_hint_provider: Some(OneOf::Left(true)),
-                    // E2: precision highlighting from the analyzed program. The
-                    // legend is index-aligned with `document::TokenKind`.
-                    semantic_tokens_provider: Some(
-                        SemanticTokensServerCapabilities::SemanticTokensOptions(
-                            SemanticTokensOptions {
-                                legend: SemanticTokensLegend {
-                                    token_types: crate::document::TOKEN_TYPES
-                                        .iter()
-                                        .map(|name| SemanticTokenType::new(name))
-                                        .collect(),
-                                    token_modifiers: crate::document::TOKEN_MODIFIERS
-                                        .iter()
-                                        .map(|name| SemanticTokenModifier::new(name))
-                                        .collect(),
-                                },
-                                full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
-                                range: Some(true),
-                                ..Default::default()
-                            },
-                        ),
-                    ),
-                    // WO-2: the "Organize Imports" source action (sort + prune).
-                    // E54: QUICKFIX (add-import, and E58's field-name rename) and
-                    // the "add all missing imports" source action.
-                    code_action_provider: Some(CodeActionProviderCapability::Options(
-                        CodeActionOptions {
-                            code_action_kinds: Some(vec![
-                                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-                                CodeActionKind::QUICKFIX,
-                                fix_all_imports_kind(),
-                            ]),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                },
+                capabilities: server_capabilities(),
                 server_info: Some(ServerInfo {
                     name: "vilan-lsp".to_string(),
                     version: None,
@@ -3097,6 +3101,54 @@ mod snapshot_consistency_tests {
         assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
     }
 
+    // The member path (E72): a FIELD hover through the handler answers the
+    // house-styled `name: T`, and keeps answering the analyzed snapshot while
+    // an un-analyzed edit is pending — the same wiring pin as above, on the
+    // member fallback the format change routed differently.
+    #[tokio::test]
+    async fn member_hover_answers_the_house_style_while_typing() {
+        const MEMBER_SOURCE: &str = "struct Point {\n\tx: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet n = p.x;\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(MEMBER_SOURCE));
+        let field = position_at(MEMBER_SOURCE, "p.x", 2);
+        let params = |uri: &Url| HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: field,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let baseline = backend.hover(params(&uri)).await.expect("hover");
+        let rendered = format!("{baseline:?}");
+        assert!(
+            rendered.contains("x: i32"),
+            "the field hovers in the house shape: {rendered}"
+        );
+        // The un-analyzed edit: a prepended comment line skews every
+        // conversion below it.
+        let mut edited = String::from("// a new first line\n");
+        edited.push_str(MEMBER_SOURCE);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&edited);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert_ne!(
+                document.analyzed_offset(field),
+                document.line_index.offset(field),
+                "the fixture must skew the inbound conversion",
+            );
+        }
+        let mid_edit = backend.hover(params(&uri)).await.expect("hover mid-edit");
+        assert_eq!(rendered, format!("{mid_edit:?}"));
+    }
+
     #[tokio::test]
     async fn goto_definition_answers_the_analyzed_snapshot_while_typing() {
         let (service, _socket) = backend();
@@ -3470,6 +3522,115 @@ mod snapshot_consistency_tests {
             !labels.contains(&"fun".to_string()),
             "a keyword candidate would mean the dispatch fell through to \
              scope completions instead of the member path: {labels:?}",
+        );
+    }
+
+    // E66 (editing-dx.md §18), at the protocol layer: the `.` after a CALL's
+    // closing paren, typed on a line the analysis has not seen. The trigger
+    // scan finds the dot in the live text; the receiver — the call's result,
+    // which no `expr_types` entry names — is resolved against the ANALYZED
+    // snapshot through `to_analyzed_offset`, so the answer is the result
+    // type's members and not the callee's signature.
+    #[tokio::test]
+    async fn completion_after_a_dot_typed_on_a_call_result_offers_its_members() {
+        const BASE: &str = "struct Widget {\n\tsize: i32,\n}\n\n\
+             fun build(): Widget { Widget { size = 1 } }\n\n\
+             fun main() {\n\tlet _w = build();\n}\n";
+        let live = BASE.replacen("\tlet _w = build();\n", "\tlet _w = build().\n", 1);
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(BASE));
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let position = position_at(&live, "build().\n", 8);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert!(document.is_stale(), "the buffer is ahead of the analysis");
+        }
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion after a call");
+        let labels: Vec<String> = match &response {
+            Some(CompletionResponse::Array(items)) => {
+                items.iter().map(|item| item.label.clone()).collect()
+            }
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels.contains(&"size".to_string()),
+            "the CALL's result type carries the members: {labels:?}",
+        );
+        assert!(
+            !labels.contains(&"build".to_string()),
+            "the callee is not the receiver: {labels:?}",
+        );
+    }
+
+    // E67 (editing-dx.md §18), at the protocol layer: a `.` typed inside an
+    // element's opening tag. The head context is read from a raw parse of the
+    // LIVE buffer — element syntax is desugared before analysis, so no element
+    // ever reaches `program` and the analyzed snapshot cannot answer this —
+    // while the `View` methods themselves come from the analyzed program.
+    #[tokio::test]
+    async fn completion_after_a_dot_in_an_element_head_offers_the_view_methods() {
+        const BASE: &str = "import std::ui::view;\n\nfun main() {\n\t<div></div>\n}\n";
+        let live = BASE.replacen("\t<div></div>\n", "\t<div .></div>\n", 1);
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(BASE));
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let position = position_at(&live, "<div .>", 6);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert!(document.is_stale(), "the buffer is ahead of the analysis");
+        }
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion in an element head");
+        let labels: Vec<String> = match &response {
+            Some(CompletionResponse::Array(items)) => {
+                items.iter().map(|item| item.label.clone()).collect()
+            }
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels.contains(&"bind_each".to_string()) && labels.contains(&"text".to_string()),
+            "the View chain's methods: {labels:?}",
+        );
+        assert!(
+            !labels.contains(&"attributes".to_string()),
+            "a View FIELD is not a chain link: {labels:?}",
+        );
+        assert!(
+            !labels.contains(&"fun".to_string()),
+            "a keyword candidate would mean the head context was missed: {labels:?}",
         );
     }
 

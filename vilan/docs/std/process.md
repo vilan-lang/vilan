@@ -56,9 +56,6 @@ impl ServerBuilder {
 	fun serve_build(own self, build: LegBuild): ServerBuilder   // one route per artifact
 	fun build(self): Server
 }
-// The same routing for a boot function that hands you only a fallback
-// (`serve_service`, `serve_connected`):
-fun build_handler(build: LegBuild, fallback: |Request| Response): |Request| Response
 impl Server {
 	fun start(self)        // begin listening; holds the event loop
 	fun stop(self)         // stop listening; fires on_stop once the listener has closed
@@ -115,7 +112,10 @@ content-type table a full-stack server used to write by hand. It takes a
 every route chunk — in front of `on_request`, whatever order the chain was
 written in. So the app's catch-all still answers every path the build does
 not claim, and a leg that gains `split = true` gains its chunk routes with
-no server edit.
+no server edit. It is the one way a server serves its build: an rpc app
+that wants it puts its service on the same chain with `with_service`
+([below](#stdrpc_server)) rather than reaching for a `serve_*` boot
+function, which hands you only a fallback and no builder to install on.
 
 Three details are decisions, not defaults. The route shape is
 `/<file name>`, which is what every shell already asks for, so adopting it
@@ -135,8 +135,8 @@ headers are written, `on_open` receives the live `ResponseStream` and
 writes chunks over time (SSE's shape; a suspending `on_open` runs as
 spawned work). `on_upgrade` mounts a WebSocket-style handshake handler
 over the raw bindings (`NodeRequest`/`NodeSocket`). For an rpc-serving
-app you won't touch any of this directly: `serve_service` wraps it
-(below), and `serve_connected` itself now rides this surface.
+app you won't touch any of this directly: the service layer
+(`with_service`, below) rides this surface.
 
 `Server::stop()` closes the listener and fires `on_stop` once it has
 actually closed — call it from `on_start` (stash the `Server` value
@@ -147,18 +147,9 @@ route) or from inside a request handler. Stopping a `Server` value
 ## std::rpc_server
 
 ```vilan,fragment
-fun serve_service(
-	port: i32,
-	protocol: RpcProtocol,             // service.dispatcher().into_protocol(codec)
-	fallback: |Request| Response,      // plain-http requests
-	on_ready: |Server| void,           // `server.port()` is the port actually bound
-)
-
-fun serve_connected(port, protocol, on_connection, fallback, on_ready)
-	// the same server with the per-connection hook exposed (custom attach/auth)
-
 impl Service {
-	fun new(protocol: RpcProtocol): Service   // mounted at "/"; the session-registry lifecycle
+	fun new(protocol: RpcProtocol): Service   // service.dispatcher().into_protocol(codec);
+	                                          // mounted at "/"; the session-registry lifecycle
 	fun at(own self, prefix: str): Service    // mount elsewhere instead, e.g. "/admin/"
 	fun on_connect(own self, handler: |i32, DuplexEnd| void): Service
 	fun on_disconnect(own self, handler: |i32| void): Service
@@ -169,11 +160,11 @@ impl ServerBuilder {
 ```
 
 Websocket upgrade + session registry (mirror attach/detach) + rpc dispatch;
-each handler runs in a turn (`AtEnd`). `serve_rpc`/`serve_service`/
-`serve_connected` are sugar over `Server::builder().with_service(…)` —
-the underlying layer a server can grow into: install a second service on
-its own mount, or a plain page alongside one, by adding a call rather
-than swapping to a different `serve_*` function. Details and the client
+each handler runs in a turn (`AtEnd`). `Server::builder().with_service(…)`
+is the one spelling, and the server grows by adding a call rather than
+swapping boot functions: a second service on its own mount, a plain page
+alongside one, the build's artifacts via `serve_build` — all on the same
+chain. Details and the client
 side: [Services & RPC](../guide/services.md) and the
 [rpc reference](rpc.md).
 
@@ -183,6 +174,7 @@ side: [Services & RPC](../guide/services.md) and the
 fun exists(path: str): bool                     // sync
 fun read_file_to_str(path: str): str            // async, UTF-8
 fun read_file_to_str_sync(path: str): str       // sync, UTF-8 — blocks the event loop
+fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
 fun write_file(path: str, contents: str)        // async
 fun read_dir(path: str): List<str>              // async, entry NAMES, flat (v1)
@@ -202,6 +194,17 @@ missing path is `None`, not a thrown exception. Prefer the async read; the
 sync one exists for a read that must complete inside a callback that cannot
 suspend — `serve_build`'s dev-mode revalidation is the case it was added
 for.
+
+Three reads, three different questions. `read_bytes` is the true binary
+read: the host hands back a `Buffer`, which binds straight to `Bytes` with
+no decode in between, and it is what serves an image, a font or a favicon.
+`read_file_to_str` is that read decoded as UTF-8 — the one almost every
+caller wants. `read_file_encoded(path, encoding)` is the same decode with
+the encoding named (`"utf8"`, `"latin1"`, …), for a file that is text but
+not UTF-8; `read_file_to_str` is a one-line call to it. (It was called
+`read_file_bytes` until v0.34.0, which is the name that made the rename
+worth doing: it promised bytes and returned a decoded string. No alias was
+kept.)
 
 ## std::build
 
@@ -262,7 +265,7 @@ impl Document {
 	fun lang(own self, lang: str): Document
 	fun mount(own self, id: str): Document                // the other end of mount_root
 	fun head(own self, markup: str): Document             // raw, appended inside <head>
-	fun body(own self, markup: str): Document             // raw, before the script tag
+	fun body(own self, markup: str): Document             // raw, appended inside <body>
 	fun render(self, view: View): Document                // SSR markup, inside the mount element
 
 	fun html(self): str
@@ -358,10 +361,17 @@ async fun main() {
 
 `head`/`body` take raw markup and append (a favicon, an `og:` tag, a CSP,
 a `<noscript>`), which is what keeps the generated document small enough
-to be worth having: everything else is derived. They are an escape hatch,
-not an exemption — markup you add there is checked like any other, so a
-`<link>` to a stylesheet the build did not emit is caught wherever it came
-from.
+to be worth having: everything else is derived. They work on a supplied
+shell too (`require_shell`, `from_shell`): `head()` markup splices in
+immediately before the shell's own `</head>`, `body()`'s immediately
+before its `</body>` — and a shell that lacks the closing tag a used
+hatch needs stops at `html()` rather than having the markup guessed into
+it. They are an escape hatch, not an exemption — when `html()` writes the
+page, markup you added there is checked like any other, so a `<link>` to
+a stylesheet the build did not emit stops the boot exactly as it would in
+a hand-written shell. A document with no hatch markup runs no check at
+all: a generated one is derived from the build alone, and a supplied one
+serves the shell's own bytes, exactly as `require_shell` checked them.
 
 `render(view)` is the server-rendering splice ([SSR](../guide/ssr.md)):
 the markup goes *inside the mount element*, because the document already

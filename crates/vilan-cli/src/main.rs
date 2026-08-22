@@ -2752,26 +2752,44 @@ fn compile_to_js(
                 error.msg.clone(),
                 error.note.as_ref().map(|note| note.msg.clone()),
             ));
-            // A note-carrying diagnostic renders directly (two labels — the
-            // shared ariadne path has nowhere to put the secondary location);
-            // plain ones keep the shared path.
-            match &error.note {
-                Some(note) => {
-                    // A cross-source note reads its file so the sub-label can
-                    // render in it (the trait's declaration in std, say). `None`,
-                    // or the primary's own source, means the same file — which
-                    // needs no second source.
-                    let note_source = note.source.filter(|note_source| *note_source != source);
-                    if let Some(note_source) = note_source {
-                        load_diagnostic_file(&mut diagnostic_files, &program, note_source);
+            // A diagnostic carrying secondary locations — an E78 requirement
+            // trace and/or a C3 note — renders directly (multi-label; the
+            // shared ariadne path has nowhere to put them); plain ones keep
+            // the shared path.
+            if error.note.is_some() || !error.trace.is_empty() {
+                // A cross-source label reads its file so the sub-label can
+                // render in it (the trait's declaration in std, a chain hop
+                // in an importing module). `None`, or the primary's own
+                // source, means the same file — which needs no second source.
+                let secondaries = || {
+                    error
+                        .trace
+                        .iter()
+                        .map(|hop| &hop.note)
+                        .chain(error.note.as_ref())
+                };
+                for secondary in secondaries() {
+                    if let Some(label_source) = secondary
+                        .source
+                        .filter(|label_source| *label_source != source)
+                    {
+                        load_diagnostic_file(&mut diagnostic_files, &program, label_source);
                     }
-                    let (name, text) = diagnostic_file(&diagnostic_files, source);
-                    let note_file = note_source
-                        .map(|note_source| diagnostic_file(&diagnostic_files, note_source));
-                    report_error_with_note(name, text, error, note_file);
-                    noted_errors += 1;
                 }
-                None => analyzer_errors.push((source, error.span.into_range(), error.msg.clone())),
+                let (name, text) = diagnostic_file(&diagnostic_files, source);
+                let located: Vec<(&vilan_core::error::Note, Option<(&str, &str)>)> = secondaries()
+                    .map(|secondary| {
+                        let file = secondary
+                            .source
+                            .filter(|label_source| *label_source != source)
+                            .map(|label_source| diagnostic_file(&diagnostic_files, label_source));
+                        (secondary, file)
+                    })
+                    .collect();
+                report_error_with_labels(name, text, error, &located);
+                noted_errors += 1;
+            } else {
+                analyzer_errors.push((source, error.span.into_range(), error.msg.clone()));
             }
         }
         // Warnings are non-fatal: render them, but they do not enter `errs`,
@@ -3040,8 +3058,19 @@ fn write_debug(file: &Path, extension: &str, contents: &str) {
 }
 
 /// The shared ariadne configuration for every diagnostic the CLI renders
-/// (`windows-support.md` §6). Two things beyond the byte indexing:
+/// (`windows-support.md` §6). Three decisions:
 ///
+/// * **char indexing, converted at this boundary.** Compiler spans are byte
+///   offsets; every one is re-expressed in char offsets by [`char_range`]
+///   before ariadne sees it. `IndexType::Byte` looked like the fit, but its
+///   0.6.0 renderer derives a cross-source group's `file:line:col` sub-header
+///   from the label's already-converted CHAR offset and then converts it *as
+///   if it were still bytes* (`write.rs`: `labels[0].char_span.start` fed to
+///   `get_byte_line`), so any multibyte character earlier in the file dragged
+///   the sub-header lines above the label it heads (backlog E76 — a
+///   `reactive.vl:363:26` header over a line-365 label). Handing ariadne one
+///   index space end to end leaves it nothing to misconvert: the header and
+///   the label are derived from the same number and cannot disagree.
 /// * **color follows `paint.rs`'s gate.** ariadne colors unconditionally by
 ///   default — it leaves the terminal check to its caller — so before this,
 ///   `NO_COLOR=1 vilan build broken.vl 2> file` still wrote ANSI escapes into
@@ -3054,7 +3083,7 @@ fn write_debug(file: &Path, extension: &str, contents: &str) {
 ///   well; they join the warnings (ratified call (f)).
 fn diagnostic_config() -> ariadne::Config {
     ariadne::Config::new()
-        .with_index_type(ariadne::IndexType::Byte)
+        .with_index_type(ariadne::IndexType::Char)
         .with_color(paint::stderr_enabled())
 }
 
@@ -3093,21 +3122,46 @@ fn diagnostic_file(files: &HashMap<SourceId, (String, String)>, source: SourceId
         .unwrap_or(("<unknown>", ""))
 }
 
+/// Whether a byte range validly indexes `text` at character boundaries — the
+/// one predicate behind both halves of the E16 net, [`snippet`] and
+/// [`char_range`].
+fn indexes_text(text: &str, span: &std::ops::Range<usize>) -> bool {
+    span.start <= span.end
+        && span.end <= text.len()
+        && text.is_char_boundary(span.start)
+        && text.is_char_boundary(span.end)
+}
+
 /// The text a label may be drawn from: the file's own text when the span
 /// actually indexes it at character boundaries, otherwise nothing.
 ///
-/// ariadne slices the source by the label's byte range and **panics** on a
-/// mid-codepoint index ("byte index N is not a char boundary"), which takes the
-/// compiler thread down with it (backlog E16). Attribution is what makes spans
-/// fit — this is the net under it: a span that does not index this text is a
-/// bug, and the honest degrade is the message without a snippet, never a
-/// clamped label pointing at innocent code.
+/// Slicing text by a span that does not index it **panics** on a mid-codepoint
+/// offset ("byte index N is not a char boundary"), which takes the compiler
+/// thread down with it (backlog E16) — under `IndexType::Byte` the slice was
+/// ariadne's, today it is [`char_range`]'s conversion. Attribution is what
+/// makes spans fit — this is the net under it: a span that does not index this
+/// text is a bug, and the honest degrade is the message without a snippet,
+/// never a clamped label pointing at innocent code.
 fn snippet<'a>(text: &'a str, span: &std::ops::Range<usize>) -> &'a str {
-    let indexes_this_text = span.start <= span.end
-        && span.end <= text.len()
-        && text.is_char_boundary(span.start)
-        && text.is_char_boundary(span.end);
-    if indexes_this_text { text } else { "" }
+    if indexes_text(text, span) { text } else { "" }
+}
+
+/// A compiler byte range re-expressed in CHAR offsets against the text it
+/// indexes — the one index space every span handed to ariadne uses (see
+/// [`diagnostic_config`]). Each render site converts a span exactly once and
+/// reuses the result for both the report's own location and its label, so the
+/// `file:line:col` header and the underline are derived from the same number.
+///
+/// A span that does not index `text` comes back unchanged: [`snippet`] has
+/// already degraded that label's source to empty text, against which the raw
+/// offsets fail ariadne's line lookup just as they always did — the message
+/// still renders, without a snippet.
+fn char_range(text: &str, span: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+    if !indexes_text(text, span) {
+        return span.clone();
+    }
+    let start = text[..span.start].chars().count();
+    start..start + text[span.start..span.end].chars().count()
 }
 
 /// Renders parser diagnostics (via the handwritten frontend's `render`) and
@@ -3132,11 +3186,12 @@ fn report(
         }));
     for (source, span, message) in diagnostics {
         let (filename, text) = diagnostic_file(files, source);
-        Report::build(ReportKind::Error, (filename.to_string(), span.clone()))
+        let char_span = char_range(text, &span);
+        Report::build(ReportKind::Error, (filename.to_string(), char_span.clone()))
             .with_config(diagnostic_config())
             .with_message(&message)
             .with_label(
-                Label::new((filename.to_string(), span.clone()))
+                Label::new((filename.to_string(), char_span))
                     .with_message(&message)
                     .with_color(Color::Red),
             )
@@ -3151,83 +3206,134 @@ fn report(
     }
 }
 
-/// Renders one analyzer diagnostic that carries a secondary note
-/// (diagnostics-standard.md C3): the primary label at the error's span, the
-/// note as a second label at its own location ("first call here", "generated
-/// by this attribute").
-fn report_error_with_note(
+/// Renders one analyzer diagnostic that carries secondary locations: the
+/// primary label at the error's span, then one label per secondary — the E78
+/// requirement trace's hops (in trace order, entry → read) and/or the C3
+/// note ("first call here", "generated by this attribute";
+/// diagnostics-standard.md §3) — each at its own location, in its own file
+/// when it lives elsewhere. Every span is converted to ariadne's char index
+/// space exactly once, against its own file's text (E76's one-index-space
+/// rule — the sub-header and its label derive from the same number and
+/// cannot disagree); the byte span rides along for the snippet validity
+/// test.
+fn report_error_with_labels(
     // The primary span's own file (name, contents) — a module's error renders
     // in the module (backlog E16).
     filename: &str,
     src: &str,
     error: &vilan_core::Error,
-    // The note's own file when it lives elsewhere (name, contents) —
-    // cross-source notes point into std or an imported module.
-    note_file: Option<(&str, &str)>,
+    // Each secondary label, paired with its own file when it lives elsewhere
+    // (name, contents) — cross-source labels point into std or an imported
+    // module.
+    located: &[(&vilan_core::error::Note, Option<(&str, &str)>)],
 ) {
-    let Some(note) = &error.note else {
-        return;
-    };
     let primary_span = error.span.into_range();
-    let note_span = note.span.into_range();
-    let note_filename = note_file
-        .map(|(name, _)| name.to_string())
-        .unwrap_or_else(|| filename.to_string());
-    let mut files = vec![(
-        filename.to_string(),
-        snippet(src, &primary_span).to_string(),
+    // Every label, addressed to the file it renders in: the primary in red,
+    // every secondary — trace hop or C3 note — in the note's yellow.
+    type LabelRow<'a> = (
+        &'a str,
+        std::ops::Range<usize>,
+        std::ops::Range<usize>,
+        &'a str,
+        Color,
+    );
+    let mut labels: Vec<LabelRow> = vec![(
+        filename,
+        primary_span.clone(),
+        char_range(src, &primary_span),
+        error.msg.as_str(),
+        Color::Red,
     )];
-    match note_file {
-        Some((name, text)) => files.push((name.to_string(), snippet(text, &note_span).to_string())),
-        // Same file as the primary: the note's span must index the text the
-        // primary already brought.
-        None => {
-            if snippet(src, &note_span).is_empty() {
-                files[0].1 = String::new();
+    for (secondary, file) in located {
+        let byte_span = secondary.span.into_range();
+        let (label_filename, char_span) = match file {
+            Some((name, text)) => (*name, char_range(text, &byte_span)),
+            // Same file as the primary: the span indexes the text the
+            // primary already brought.
+            None => (filename, char_range(src, &byte_span)),
+        };
+        labels.push((
+            label_filename,
+            byte_span,
+            char_span,
+            secondary.msg.as_str(),
+            Color::Yellow,
+        ));
+    }
+    // The file table ariadne slices from: each named file once, its text
+    // blanked when ANY of its labels' spans fails to index it — the honest
+    // degrade is the messages without snippets, never a clamped label over
+    // innocent code (see [`snippet`]).
+    let mut files: Vec<(String, String)> = vec![(filename.to_string(), src.to_string())];
+    for (_, file) in located {
+        if let Some((name, text)) = file {
+            if !files.iter().any(|(existing, _)| existing == name) {
+                files.push((name.to_string(), text.to_string()));
             }
         }
     }
-    Report::build(
-        ReportKind::Error,
-        (filename.to_string(), primary_span.clone()),
-    )
-    .with_config(diagnostic_config())
-    .with_message(error.msg.clone())
-    .with_label(
-        Label::new((filename.to_string(), primary_span))
-            .with_message(error.msg.clone())
-            .with_color(Color::Red),
-    )
-    .with_label(
-        Label::new((note_filename, note_span))
-            .with_message(note.msg.clone())
-            .with_color(Color::Yellow),
-    )
-    .finish()
-    // stderr, like the warnings (ratified call (f)).
-    .eprint(sources(files))
-    .unwrap();
+    for (name, text) in &mut files {
+        let blank = labels
+            .iter()
+            .filter(|(label_file, _, _, _, _)| label_file == name)
+            .any(|(_, byte_span, _, _, _)| snippet(text, byte_span).is_empty() && !text.is_empty());
+        if blank {
+            text.clear();
+        }
+    }
+    // ariadne renders labels in the order handed over, opening a NEW
+    // windowed section (with a repeated sub-header) whenever a label lands
+    // above an already-rendered line — so labels go over in source order,
+    // grouped per file (the primary's file first), one section per file.
+    // The chain's own entry → read order is the trace vector's, which the
+    // language server publishes verbatim; the terminal is a spatial renderer
+    // and reads best in source order. The sort is stable, so the primary
+    // stays ahead of a secondary sharing its exact span.
+    let file_rank = |name: &str| files.iter().position(|(existing, _)| existing == name);
+    labels.sort_by_key(|(label_file, byte_span, _, _, _)| {
+        (file_rank(label_file), byte_span.start, byte_span.end)
+    });
+    let primary_char_span = char_range(src, &primary_span);
+    let mut report = Report::build(ReportKind::Error, (filename.to_string(), primary_char_span))
+        .with_config(diagnostic_config())
+        .with_message(error.msg.clone());
+    for (label_filename, _byte_span, char_span, message, color) in labels {
+        report = report.with_label(
+            Label::new((label_filename.to_string(), char_span))
+                .with_message(message)
+                .with_color(color),
+        );
+    }
+    report
+        .finish()
+        // stderr, like the warnings (ratified call (f)).
+        .eprint(sources(files))
+        .unwrap();
 }
 
 /// Renders a single analyzer warning (e.g. an unused `[must_use]` result) — like
 /// `report`, but `ReportKind::Warning` and non-fatal. Carries its own file too.
 fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, message: &str) {
-    Report::build(ReportKind::Warning, (filename.to_string(), span.clone()))
-        .with_config(diagnostic_config())
-        .with_message(message)
-        .with_label(
-            Label::new((filename.to_string(), span.clone()))
-                .with_message(message)
-                .with_color(Color::Yellow),
-        )
-        .finish()
-        // stderr, so it doesn't corrupt `build --stdout` JS — the call the
-        // errors now match too.
-        .eprint(sources([(
-            filename.to_string(),
-            snippet(src, &span).to_string(),
-        )]))
-        .unwrap();
+    let char_span = char_range(src, &span);
+    Report::build(
+        ReportKind::Warning,
+        (filename.to_string(), char_span.clone()),
+    )
+    .with_config(diagnostic_config())
+    .with_message(message)
+    .with_label(
+        Label::new((filename.to_string(), char_span))
+            .with_message(message)
+            .with_color(Color::Yellow),
+    )
+    .finish()
+    // stderr, so it doesn't corrupt `build --stdout` JS — the call the
+    // errors now match too.
+    .eprint(sources([(
+        filename.to_string(),
+        snippet(src, &span).to_string(),
+    )]))
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -3548,5 +3654,50 @@ mod tests {
         {
             assert_eq!(snippet(multibyte, &(6..4)), "");
         }
+    }
+
+    // --- The one index space handed to ariadne (backlog E76) ----------------
+    //
+    // `char_range` re-expresses a compiler byte span in char offsets against
+    // the text it indexes; both the report location and every label are built
+    // from the converted range, so a header and the label under it cannot
+    // name different positions. The end-to-end agreement is pinned in
+    // `tests/diagnostics.rs`; these pin the conversion itself.
+
+    #[test]
+    fn an_ascii_span_converts_to_identical_char_offsets() {
+        // ASCII: byte and char offsets coincide, so nothing may move.
+        assert_eq!(char_range("let x = 1;\n", &(4..5)), 4..5);
+    }
+
+    #[test]
+    fn multibyte_text_before_a_span_shrinks_its_char_offsets() {
+        // `é` (2 bytes) and `—` (3 bytes) precede `x`: byte 5..6 is char 2..3.
+        // This is the divergence that dragged a cross-source sub-header lines
+        // above its label when the byte offset was read as an index ariadne
+        // could convert a second time.
+        let text = "é—x = 1;\n";
+        assert_eq!(&text[5..6], "x");
+        assert_eq!(char_range(text, &(5..6)), 2..3);
+        // A span STRADDLING multibyte text shrinks in length too.
+        assert_eq!(char_range(text, &(0..6)), 0..3);
+    }
+
+    #[test]
+    fn an_empty_span_at_the_end_of_text_converts_to_the_char_end() {
+        // The EOF parse-error shape: empty, at the very end.
+        let text = "é\n";
+        assert_eq!(char_range(text, &(3..3)), 2..2);
+    }
+
+    #[test]
+    fn a_span_that_does_not_index_the_text_converts_unchanged() {
+        // The degrade contract shared with `snippet`: the raw offsets come
+        // back untouched and fail ariadne's line lookup against the empty
+        // snippet text — message without a snippet, never a shifted label.
+        let multibyte = "let é = 1;\n";
+        assert_eq!(char_range(multibyte, &(5..7)), 5..7); // mid-codepoint
+        assert_eq!(char_range(multibyte, &(400..420)), 400..420); // past the end
+        assert_eq!(char_range("", &(5..7)), 5..7); // and against empty text
     }
 }

@@ -20,7 +20,7 @@ Four sections:
   (`crates/vilan-cli/tests/benchmarks.rs`).
 - **RPC round-trip throughput**: sequential (each call awaited: honest
   latency, no pipelining) over `LocalTransport` and over real HTTP on
-  localhost via `serve_rpc`.
+  localhost via a mounted service's `/rpc` route.
 - **Realtime fan-out**: three live SplitDuplex sessions (real SSE + POST)
   subscribed to one signal through the generated `[service(Client)]` stub; 50
   mutations from a driver; reports per-session update-frame counts

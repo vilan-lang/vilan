@@ -3,13 +3,15 @@
 //!
 //! The formula lives in another repository — `vilan-lang/homebrew-vilan` —
 //! and is generated: `scripts/brew-formula.sh <version> sha256sums.txt`
-//! renders it, the release workflow's `publish-brew` job runs that against the
-//! tag's own checksums and pushes the result, and the copy staged under
-//! `homebrew/` here is the same command's output for the current release. That
-//! copy is what seeded the tap and what a reviewer reads, so the first pin is
-//! that it is exactly what the job would write — a hand-edit there, or a
-//! change to the script that nobody re-ran, fails here rather than at the next
-//! `brew install`.
+//! renders it, and the release workflow's `publish-brew` job runs that
+//! against the tag's own checksums and pushes the result there on every
+//! release, so the live tap is always current. The copy staged under
+//! `homebrew/` here is a different thing: a pinned seed fixture, deliberately
+//! held at `SEED_VERSION` rather than tracking releases, that a reviewer
+//! reads as a stand-in for the tap's shape. The first pin is that it is
+//! exactly what the generator would write for that pinned version — a
+//! hand-edit there, or a change to the script that nobody re-ran, fails here
+//! rather than at the next `brew install`.
 //!
 //! Nothing else in this repository exercises any of it. A wrong checksum, a
 //! target that lost its block, or a `url` pointing at `releases/latest` would

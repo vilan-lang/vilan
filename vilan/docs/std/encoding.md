@@ -226,8 +226,8 @@ impl Bytes {
 }
 
 // UTF-8 text ↔ bytes
-fun encode_utf(text: str): Bytes
-fun decode_utf(bytes: Bytes): str
+fun encode_utf8(text: str): Bytes
+fun decode_utf8(bytes: Bytes): str
 ```
 
 Lower still: `ByteBuffer`/`DataView` (host ArrayBuffer access,
@@ -238,7 +238,7 @@ Lower still: `ByteBuffer`/`DataView` (host ArrayBuffer access,
 ```vilan,fragment
 fun binary_codec(): Codec
 fun encode_binary<T: Wire>(value: T): Bytes
-fun decode_binary<T: Wire>(bytes: Bytes): T
+fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str>
 struct BinaryWriter { … }   // write_byte / write_i32 / write_str / finish(): Bytes
 ```
 

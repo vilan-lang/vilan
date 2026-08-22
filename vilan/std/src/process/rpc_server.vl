@@ -5,14 +5,14 @@
 // wire format (the SSE `data:` framing, the `__conn:<id>` handshake, and the
 // `/send?c=<id>` addressing that `SplitDuplex` speaks).
 //
-// `serve_connected` rides `Server`'s public surface: the SSE stream is a
+// A connected service rides `Server`'s public surface: the SSE stream is a
 // STREAMING response (`ResponseBuilder::streaming` — partial writes over a
 // held-open response), the binary RPC reply is a bytes body, and the
 // WebSocket handshake mounts through `ServerBuilder::on_upgrade`.
 
 import pkg::bytes::Bytes;
 import pkg::compare::Ordering;
-import pkg::http::{ NodeRequest, NodeSocket, Request, Response, Server, ServerBuilder };
+import pkg::http::{ NodeRequest, NodeSocket, Request, Response, ServerBuilder };
 import pkg::json::{ FromJson, JsonValue, has_json_field };
 import pkg::option::Option::{ None, Some, self };
 import pkg::reactive::{ FlushPolicy, batch, turn };
@@ -49,34 +49,6 @@ fun ws_accept_key(key: str): str {
 	create_hash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64")
 }
 
-// --- Request/response mount ----------------------------------------------------
-
-/// Answer one RPC-over-HTTP request: the POST body is the request frame, and the
-/// protocol's reply frame is the response body. The frame is handled in a `batch`
-/// — the wire turn (proposal/reactive-batching.md) — so signal writes made while
-/// dispatching coalesce. Compose this into a `Server`'s `on_request` alongside
-/// other routes, or mount it alone with `serve_rpc`. This mount rides the text
-/// `Server` API, so it serves TEXT codecs (JSON); a binary protocol belongs on
-/// `serve_connected`'s raw `/rpc` route.
-fun rpc_response(protocol: RpcProtocol, request: Request): Response {
-	let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Text(request.body())));
-	match reply {
-		Frame::Text(let frame) => Response::builder().set_header("Content-Type", "application/json").body(frame).build(),
-		Frame::Binary(let frame) => Response::builder().code(500).body("binary reply over a text mount").build(),
-	}
-}
-
-/// Serve one RPC protocol on `port`: every request is dispatched through it. The
-/// client side is `std::rpc`'s `HttpTransport { url = "http://host:port/" }`.
-fun serve_rpc(port: i32, protocol: RpcProtocol, on_ready: |Server| void) {
-	Server::builder()
-		.port(port)
-		.on_request(|request| rpc_response(protocol, request))
-		.on_start(on_ready)
-		.build()
-		.start()
-}
-
 // --- Service: an rpc mount installed on a `ServerBuilder` (fullstack-dx.md §4) -
 
 /// One rpc service mounted on a `Server`: the protocol, where its routes
@@ -85,6 +57,11 @@ fun serve_rpc(port: i32, protocol: RpcProtocol, on_ready: |Server| void) {
 /// are installed together, because a duplex service is both —
 /// `ServerBuilder::with_service` folds both in at `build()`, in front of
 /// `on_request`/`on_upgrade` (§4.3).
+///
+/// A connection ends when its stream closes (tab closed, network gone): the
+/// wire is forgotten here, and `on_disconnect(id)` tells the app to drop its
+/// own per-connection state (dispose a `ReactiveServer` session, say) —
+/// otherwise a long-running server leaks a session per ever-connected client.
 struct Service {
 	protocol: RpcProtocol,
 	mount: str,
@@ -94,8 +71,10 @@ struct Service {
 
 impl Service {
 	/// The `Client::connect` service (`transport-rpc.md` §4.2): the runtime
-	/// session registry as the connection lifecycle — what `serve_service`
-	/// installs today. Mounted at `/` until `.at(prefix)` says otherwise.
+	/// session registry as the connection lifecycle — every connection gets a
+	/// reactive session the generated `__attach` route can answer from,
+	/// disposed on disconnect. Mounted at `/` until `.at(prefix)` says
+	/// otherwise.
 	fun new(protocol: RpcProtocol): Service {
 		Service {
 			protocol = protocol,
@@ -114,8 +93,8 @@ impl Service {
 		self
 	}
 
-	/// Replace the connection lifecycle — the pair `serve_connected` takes
-	/// today, for apps holding custom per-connection state.
+	/// Replace the connection lifecycle, for apps holding custom
+	/// per-connection state (an auth identity, an app-written attach).
 	fun on_connect(own self, handler: |i32, DuplexEnd| void): Service {
 		self.on_connect = handler;
 		self
@@ -137,27 +116,7 @@ impl ServerBuilder {
 	}
 }
 
-/// The `Client::connect` server (§4.2): `serve_connected` with the runtime's
-/// session registry as its connection lifecycle — every connection gets a
-/// reactive session the generated `__attach` route can answer from, disposed
-/// on disconnect. Apps needing custom per-connection state (auth identity, an
-/// app-written attach) use `serve_connected` directly.
-fun serve_service(
-	port: i32,
-	protocol: RpcProtocol,
-	fallback: |Request| Response,
-	on_ready: |Server| void,
-) {
-	Server::builder()
-		.port(port)
-		.with_service(Service::new(protocol))
-		.on_request(fallback)
-		.on_start(on_ready)
-		.build()
-		.start()
-}
-
-// --- Connected server: RPC + a duplex wire per client ---------------------------
+// --- The connection registry: a duplex wire per client --------------------------
 
 /// Live SplitDuplex connections: each client's wire-side `DuplexEnd`, keyed by the
 /// connection id announced on its SSE stream.
@@ -170,37 +129,6 @@ fun fresh_connection(): i32 {
 	let id = next_connection.read();
 	next_connection.write() = id + 1;
 	id
-}
-
-/// The full-stack server (the `SplitDuplex` counterpart — proposal §5): one
-/// `node:http` server routing
-///   `GET  /events`     → a long-lived SSE stream; announces `__conn:<id>`, then
-///                        carries server→client frames. Each connection hands the
-///                        app a fresh `DuplexEnd` via `on_connect(id, end)` — give
-///                        it to a `ReactiveServer` to serve signals over the wire.
-///   `POST /send?c=<id>` → one client→server frame for that connection (a turn).
-///   `POST /rpc`         → an RPC request frame (a turn).
-///   everything else     → `fallback` (static files, 404s).
-///
-/// A connection ends when its SSE stream closes (tab closed, network gone): the
-/// wire is forgotten here, and `on_disconnect(id)` tells the app to drop its own
-/// per-connection state (dispose a `ReactiveServer` session, say) — otherwise a
-/// long-running server leaks a session per ever-connected client.
-fun serve_connected(
-	port: i32,
-	protocol: RpcProtocol,
-	on_connect: |i32, DuplexEnd| void,
-	on_disconnect: |i32| void,
-	fallback: |Request| Response,
-	on_ready: |Server| void,
-) {
-	Server::builder()
-		.port(port)
-		.with_service(Service::new(protocol).on_connect(on_connect).on_disconnect(on_disconnect))
-		.on_request(fallback)
-		.on_start(on_ready)
-		.build()
-		.start()
 }
 
 // --- The fold: `Service`s answer before `on_request`/`on_upgrade` (§4.3) -------

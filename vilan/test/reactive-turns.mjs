@@ -116,7 +116,7 @@ function $b(self, observer) {
 		return;
 	} ]);
 	observer($c(self));
-	return [ self[1], id ];
+	return [ self[1], id, __shared_new([ 1 ]) ];
 }
 function $k(self) {
 	return self.length === 0;

@@ -1,0 +1,253 @@
+/* The book's palette — mdBook's variables mapped onto the vilan role tokens.
+ *
+ * This file REPLACES mdBook's stock `css/variables.css` (the theme-override
+ * mechanism: a file of the same name under `theme/` wins). It is the ONE
+ * place in the book that names a color. Everything else — `vilan.css`, the
+ * hljs mapping, the masthead fallback — says `var(--role)` and nothing more.
+ *
+ * Where the hexes live: the one source is the website's `src/theme.vl`
+ * (its `themed_values` table — the dark column is the brand as shipped,
+ * the light column design-language.md §2.5, which derives every value
+ * from the dark ladder and states the contrast). This file stays a local
+ * copy ON PURPOSE — a plain `mdbook build` must stand alone, fetching
+ * nothing — but since K10's generation (design-language.md §2.6) the
+ * copy is GATED, not trusted: the website's chrome leg renders the table
+ * into `tokens-fixture.css` beside this file, and the suite
+ * (crates/vilan-cli/tests/book_mirrors.rs) holds every role declared
+ * here — both themes, the no-script fallback block included — byte-equal
+ * to that fixture. When theme.vl moves: regenerate the fixture (the
+ * command in its header), and the red test walks this file forward in
+ * the same change-set.
+ *
+ * Shape: the role tokens are declared per theme on the <html> element —
+ * `html.light` (mdBook's `.light` class) and `html.navy` — and mdBook's own
+ * variables are mapped onto them ONCE, on `:root`. `:root` is the <html>
+ * element, so each `var(--role)` in the mapping resolves against whichever
+ * theme class is on <html>, and the masthead fragment the website exports
+ * (styled with the same roles) follows the book's theme picker rather than
+ * the OS. The three stock mdBook themes the picker no longer offers (rust,
+ * coal, ayu — hidden by `vilan.css`) are aliased onto the two vilan themes,
+ * so a `localStorage` preference left over from before this file still
+ * renders a vilan theme instead of an unstyled page.
+ */
+
+/* --- mdBook's layout globals (unchanged except the faces) --- */
+
+:root {
+    --sidebar-target-width: 300px;
+    --sidebar-width: min(var(--sidebar-target-width), 80vw);
+    --sidebar-resize-indicator-width: 8px;
+    --sidebar-resize-indicator-space: 2px;
+    --page-padding: 15px;
+    --content-max-width: 750px;
+    --menu-bar-height: 50px;
+    /* CommitMono V143 is the code face of every vilan surface
+       (design-language.md §2.3); the stack below it is theme.vl's
+       `code_face`. `fonts/fonts.css` declares the face. */
+    --mono-font: "CommitMonoV143", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    /* 13px at the body's 15px — the tool register's own code size
+       (theme.vl `code_size`, design-language.md §2.2). */
+    --code-font-size: 0.8667em;
+    --searchbar-margin-block-start: 5px;
+}
+
+/* --- the role tokens, per theme --- */
+
+/* Dark: the brand as shipped — blush on ink. Values are theme.vl's. */
+.navy,
+.coal,
+.ayu {
+    /* the `down` ladder — surfaces, the ground first */
+    --down-dim: #120004;
+    --down-normal: #1B060D;
+    --down-bright: #28101A;
+    /* the `up` ladder — text, the brightest first */
+    --up-bright: #F9DFE7;
+    --up-normal: #D8BEC8;
+    --up-dim: #9A7F8B;
+    /* the state overlays */
+    --down-hover: rgba(255, 255, 255, 0.06);
+    --down-active: rgba(255, 255, 255, 0.10);
+    /* the hairlines */
+    --stroke-hard: #402C32;
+    --stroke-soft: rgba(64, 44, 50, 0.5);
+    /* the one accent, what sits on it, and the secondary accent */
+    --primary: #EB682E;
+    --primary-on: #120004;
+    --accent: #E5AFD9;
+    /* the fixed semantic hues (Tailwind's, as kolt pins them) */
+    --up-info: #F4F4F5;
+    --up-caution: #FBBF24;
+    --up-error: #FB7185;
+    --down-info: #10B981;
+    --down-caution: #FBBF24;
+    --down-danger: #FB7185;
+    /* the code palette's one non-role value */
+    --tint-callable: #F0A886;
+    /* the one alpha pull that differs between the themes (§2.5) */
+    --code-comment-alpha: 50%;
+    /* not a role: the book's one shadow, for its two floating surfaces
+       (the theme picker, the help popup) — black over ink, ink over blush */
+    --shadow-float: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+    --color-scheme: dark;
+}
+
+/* Light: the brand inverted — ink on blush. Values are §2.5's. `html:not(.js)`
+   is mdBook's no-script fallback (the default theme with no picker). */
+.light,
+.rust,
+html:not(.js) {
+    --down-dim: #F9DFE7;
+    --down-normal: #FBE7ED;
+    --down-bright: #FDF3F6;
+    --up-bright: #120004;
+    --up-normal: #3B262D;
+    --up-dim: #6A535B;
+    --down-hover: rgba(18, 0, 4, 0.06);
+    --down-active: rgba(18, 0, 4, 0.10);
+    --stroke-hard: #CFAFBA;
+    --stroke-soft: rgba(207, 175, 186, 0.5);
+    --primary: #AE3611;
+    --primary-on: #F9DFE7;
+    --accent: #922A7C;
+    --up-info: #3F3F46;
+    --up-caution: #92400E;
+    --up-error: #BE123C;
+    --down-info: #10B981;
+    --down-caution: #FBBF24;
+    --down-danger: #FB7185;
+    --tint-callable: #7F260D;
+    --code-comment-alpha: 60%;
+    --shadow-float: 0 8px 24px rgba(18, 0, 4, 0.16);
+
+    --color-scheme: light;
+}
+
+/* No script, dark OS: the dark block again (mdBook's own fallback shape —
+   without JS there is no theme class, so the OS decides). */
+@media (prefers-color-scheme: dark) {
+    html:not(.js) {
+        --down-dim: #120004;
+        --down-normal: #1B060D;
+        --down-bright: #28101A;
+        --up-bright: #F9DFE7;
+        --up-normal: #D8BEC8;
+        --up-dim: #9A7F8B;
+        --down-hover: rgba(255, 255, 255, 0.06);
+        --down-active: rgba(255, 255, 255, 0.10);
+        --stroke-hard: #402C32;
+        --stroke-soft: rgba(64, 44, 50, 0.5);
+        --primary: #EB682E;
+        --primary-on: #120004;
+        --accent: #E5AFD9;
+        --up-info: #F4F4F5;
+        --up-caution: #FBBF24;
+        --up-error: #FB7185;
+        --down-info: #10B981;
+        --down-caution: #FBBF24;
+        --down-danger: #FB7185;
+        --tint-callable: #F0A886;
+        --code-comment-alpha: 50%;
+        --shadow-float: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+        --color-scheme: dark;
+    }
+}
+
+/* --- the code surface: theme.vl's `code_palette`, slot for slot --- */
+
+/* The same `--code-*` slots the playground's CodeMirror theme reads (K10),
+   minted from the roles exactly as `code_palette` mints them, so which role
+   plays "keyword" is one edit here and one in theme.vl — never a hex. The
+   alpha pulls use color-mix so the role's value is written once. */
+:root {
+    --code-bg: var(--down-normal);
+    --code-fg: var(--up-bright);
+    --code-dim: var(--up-dim);
+    --code-gutter-edge: var(--stroke-soft);
+    --code-active-line: color-mix(in srgb, var(--up-bright) 4%, transparent);
+    --code-active-gutter: color-mix(in srgb, var(--up-bright) 7%, transparent);
+    --code-selection: color-mix(in srgb, var(--up-bright) 18%, transparent);
+    --code-keyword: var(--primary);
+    --code-string: var(--accent);
+    --code-plain: var(--up-normal);
+    --code-callable: var(--tint-callable);
+    --code-type: var(--up-bright);
+    --code-comment: color-mix(in srgb, var(--up-bright) var(--code-comment-alpha), transparent);
+    --code-attr: color-mix(in srgb, var(--primary) 65%, transparent);
+    --code-path: color-mix(in srgb, var(--up-bright) 60%, transparent);
+    --code-operator: color-mix(in srgb, var(--up-bright) 72%, transparent);
+    --code-error: var(--up-error);
+    --code-caution: var(--up-caution);
+}
+
+/* --- mdBook's variables, mapped onto the roles --- */
+
+:root {
+    /* the page */
+    --bg: var(--down-dim);
+    --fg: var(--up-normal);
+
+    /* the sidebar is a panel on the ground */
+    --sidebar-bg: var(--down-normal);
+    --sidebar-fg: var(--up-normal);
+    --sidebar-non-existant: var(--up-dim);
+    --sidebar-active: var(--primary);
+    --sidebar-spacer: var(--stroke-soft);
+
+    --scrollbar: var(--stroke-hard);
+
+    --icons: var(--up-dim);
+    --icons-hover: var(--up-bright);
+
+    --links: var(--primary);
+
+    --inline-code-color: var(--up-bright);
+
+    /* the theme picker is a floating surface */
+    --theme-popup-bg: var(--down-bright);
+    --theme-popup-border: var(--stroke-hard);
+    --theme-hover: var(--down-hover);
+
+    --quote-bg: var(--down-normal);
+    --quote-border: var(--stroke-hard);
+
+    /* the legacy `.warning` box: its border AND its glyph, so the text tier */
+    --warning-border: var(--up-caution);
+
+    --table-border-color: var(--stroke-soft);
+    --table-header-bg: var(--down-bright);
+    --table-alternate-bg: var(--down-normal);
+
+    --searchbar-border-color: var(--stroke-hard);
+    --searchbar-bg: var(--down-normal);
+    --searchbar-fg: var(--up-bright);
+    --searchbar-shadow-color: var(--primary);
+    --searchresults-header-fg: var(--up-dim);
+    --searchresults-border-color: var(--stroke-hard);
+    --searchresults-li-bg: var(--down-normal);
+    --search-mark-bg: color-mix(in srgb, var(--primary) 28%, transparent);
+
+    /* the copy icon is drawn as a mask in currentColor (vilan.css), so
+       mdBook's colorizing filter has nothing to do */
+    --copy-button-filter: none;
+    --copy-button-filter-hover: none;
+
+    --footnote-highlight: var(--accent);
+
+    --overlay-bg: color-mix(in srgb, var(--down-dim) 55%, transparent);
+
+    /* mdBook's five alert kinds onto the roles — each colors a 4px border
+       AND the title text, so every one must read as text in both themes:
+       note = the accent voice, tip = emerald pulled 40% toward the up
+       ladder (4.9:1 on blush; the 500 weight alone is 2.0:1), important =
+       the secondary accent, warning/caution = the two semantic text tiers */
+    --blockquote-note-color: var(--primary);
+    --blockquote-tip-color: color-mix(in srgb, var(--down-info) 60%, var(--up-bright));
+    --blockquote-important-color: var(--accent);
+    --blockquote-warning-color: var(--up-caution);
+    --blockquote-caution-color: var(--up-error);
+
+    --sidebar-header-border-color: var(--stroke-hard);
+}

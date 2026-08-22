@@ -172,8 +172,8 @@ representation, in which a bare backing value has nowhere to put a
 payload.
 
 The leading `resource` modifier marks a type declaration as a *resource*:
-the owned-resource class, whose semantics are specified in the resources
-chapter (forthcoming; the modifier currently reserves the surface). It
+the owned-resource class, whose semantics are specified in
+[§6.8](memory.md). It
 precedes `external`, so the full modifier order is `resource external
 struct`, and it is accepted only on `struct` and `enum` declarations;
 `resource` before any other item is a parse error.

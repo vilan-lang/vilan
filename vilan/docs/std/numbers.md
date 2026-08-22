@@ -39,6 +39,8 @@ impl i32 {
 	fun max(self, other: i32): i32
 	fun rem(self, m: i32): i32     // the % operator's method
 	fun diff(self, other: i32): i32
+	fun is_even(self): bool
+	fun is_odd(self): bool
 }
 ```
 
@@ -55,7 +57,18 @@ impl f64 {
 	fun min(self, other: f64): f64
 	fun max(self, other: f64): f64
 	fun clamp(self, min: f64, max: f64): f64
-	fun sin(self): f64      // cos, tan, asin, acos, atan …
+	fun trunc(self): f64
+	fun fract(self): f64
+	fun sign(self): f64
+	fun lerp(self, to: f64, t: f64): f64
+	fun sin(self): f64      // cos, tan, asin, acos, atan, atan2, hypot
+	fun exp(self): f64      // ln, log2, log10, cbrt
+	fun to_radians(self): f64  // to_degrees
+
+	// the three a reader actually comes looking for
+	fun is_nan(self): bool
+	fun is_finite(self): bool
+	fun is_infinite(self): bool
 }
 ```
 

@@ -2207,3 +2207,552 @@ assertion moved, including `!page.contains("<!--ssr-->")`, which now pins that n
 marker convention returns, and `<div id="app"><main class="app">`, which is the
 splice landing exactly where the marker used to. Only its module comment was
 updated, to stop describing a marker that no longer exists.
+
+## 16. The consumer sweep, completed (2026-08-18)
+
+§13.3 moved `examples/fullstack`, `examples/ssr` and the init template and left
+`examples/todo` and `examples/walkthrough` behind, with a reason and a
+condition: *"the remaining gap closes when S1 lets them move to the builder"*.
+S1 shipped the same day and the follow-up did not happen (backlog E63). Both
+files now carry the shipped idiom — `Server::builder()`, the service installed
+with `.with_service(Service::new(…))`, the artifacts with `.serve_build(build)`,
+and the shell read through `require_shell` — which is §6.3's rung 1 + rung 0+,
+the same rung the scaffold and `examples/ssr` ship at.
+
+### 16.1 The numbers, and the one that goes the wrong way
+
+Counted by §1.2's rule (non-blank, non-comment lines), before → after:
+
+| File | lines | ceremony |
+|---|---|---|
+| `examples/todo/src/server.vl` | 13 → **20** | 5 → **7** |
+| `examples/walkthrough/src/server.vl` | 13 → **20** | 5 → **7** |
+| *(draft)* `vilan-playground/todo/src/server.vl` | 19 → **20** | 10 → **6** |
+| *(draft)* kolt's `src/server.vl` | 248 → **249** | 10 → **7** |
+
+**The two in-repo counts rise, and that is a fact about §1.2, not about the
+code.** The formatter puts each builder-chain call on its own line where a
+plain call stays on one, so the four things `serve_service(port, protocol,
+build_handler(build, |request| …), on_ready)` said in a single 258-character
+line now occupy seven readable ones. Longest line, todo: 258 → 103;
+walkthrough: 246 → 103. The after-ceremony of **7** is not new ceremony either
+— it is exactly the 7 `templates/fullstack/src/server.vl` and
+`examples/ssr/src/server.vl` already carry, i.e. the true cost of the rung-1 +
+rung-0+ shape, itemized. §13.3's "10 → 5" for these two files was flattered by
+the mega-line, which hid the build serving and the shell answer inside a line
+classified whole.
+
+**The rule should be counted per call, not per line**, or should say that a
+line takes the classification of its longest constituent. As written, §1.2
+rewards a formatter that packs and penalizes one that unpacks, which is the
+opposite of what the paper is arguing for. Recorded as feedback on the
+instrument; no number already published is restated.
+
+### 16.2 What the ladder could not express
+
+**Rung 2 is closed to these examples, and by two shipped gates rather than by
+taste.** §6.3 already ruled the scaffold stays at rung 1 and noted "the blessed
+examples keep their `app.html`"; §15.4 kept `examples/ssr`'s for
+`tests/init.rs:335`'s blessed-layout gate, which asserts `src/client.vl`,
+`src/server.vl` and `src/app.html` on disk across the scaffold and all three
+examples. The second gate is new and is the sharper one:
+`tests/examples.rs::every_example_builds` refuses any example whose build emits
+a stylesheet that **no `.html` file in the staged tree links**. A rung-2 example
+fails that by construction — its page is written by `Document::of` at boot and
+never touches disk, so the check finds a `client.css` and no page at all. Both
+would have to change, which is a stop condition, so neither did.
+
+That is worth stating as design feedback rather than as an obstacle worked
+around: **the repository currently cannot demonstrate rung 2 in an example.**
+`docs/guide/ssr.md` and `docs/std/process.md` teach it and
+`tests/document.rs`'s third pin proves it end to end over a real build, so the
+rung is covered — but if an example is ever meant to show it,
+`unlinked_stylesheets` needs a second source of truth for "linked": the served
+page, or the `Document` the server builds. Filed here, not fixed.
+
+**Nothing else forced a hand-kept line, and no std change was wanted.** The two
+shells passed `check_shell` unmodified — the first time either had been held
+against its build — and the served page is byte-identical to `src/app.html` in
+both examples, which is what makes "behavior identical" a measurement rather
+than a claim.
+
+### 16.3 `build_handler` has no consumer left
+
+§13.1 called it "the slice's one unplanned name", a direct consequence of S1
+not being in that slice, and said that when S1 landed and these two examples
+moved, it "has nothing left to do; it is not load-bearing for the design and
+should be reviewed for removal then". That day is today: the only remaining
+references in the tree are teaching ones — `docs/guide/routing.md`,
+`persistence.md`, `services.md`, and its signature in `docs/std/process.md`.
+
+Not removed here. It is shipped std surface, the `serve_service` shape it
+exists for is still a supported spelling (§4.6), and deleting a public name is
+its own decision with its own changelog entry. The review §13.1 asked for is
+owed, and this is the note that opens it. (Closed: §16.8.)
+
+### 16.4 The drafts
+
+Two consumers outside this repository are on the pre-ladder idiom. Neither was
+touched: each is a unified diff under `proposal/e63-drafts/`, with a header
+saying what moves and what to verify, for the owner to apply or not.
+
+- **`proposal/e63-drafts/todo-app.patch`** — `vilan-playground/todo`, the app
+  §2.1 measured as the charter's own evidence, at **rung 2**: its shell is
+  exactly what `Document::of(build).title("Todo")` writes, so `src/app.html`
+  is deleted and 32 lines across two files become 20 in one. The four
+  differences between the generated document and the hand-written file are
+  cosmetic (`<!DOCTYPE>` case, `charset=UTF-8`, `initial-scale=1.0`, and a
+  stray indent on `<html>`) and are listed in the header. Verified on a
+  scratch copy: builds, boots, serves the document, `/client.js` and
+  `/client.css` answer with their content types.
+- **`proposal/e63-drafts/kolt-server.patch`** — kolt's 289-line
+  `src/server.vl` at **rung 1 + rung 0+**, deliberately narrow: the schema,
+  the pbkdf2 externs, the module-level `Database`, all seven store closures
+  and the four helpers are untouched byte for byte. Rung 2 is available there
+  too and is declined in the draft for a stated reason — `Document::of` would
+  add `lang="en"` and a viewport meta the current shell does not carry, a
+  served-bytes change under `e2e/run.sh`. Verified on a scratch copy of
+  `src/` + `vilan.toml`: `vilan check` exits 0 before and after under the
+  shipped v0.34.0 CLI, `vilan build` emits all three legs, and the booted
+  server answers `/` byte-identically to `src/app.html`, plus `/client.js`,
+  `/client.css`, the `/w/1` deep link and `POST /rpc`.
+
+### 16.5 The gates
+
+`cargo test -p vilan-cli --test examples --test init --test workspace
+--test print_chunks` passes with **not one assertion moved** — including
+`every_example_builds`'s artifact and unlinked-stylesheet checks over both
+rewritten examples, `the_walkthrough_example_builds`, and the blessed-layout
+gate that pins both `src/app.html` files. `docs/guide/walkthrough.md`'s server
+fence carries the new idiom in the same commit, with prose for `require_shell`
+and `with_service`; `examples/todo/README.md`'s one `serve_service` sentence
+followed it. Corpus: zero movement — no std, no compiler, no emitted
+JavaScript was touched by this slice.
+
+Behavior was measured, not assumed. Each example was built and booted, and
+`/`, `/client.js`, `/client.css`, a deep link and `POST /rpc` were fetched:
+same status, same content types, and a served page diffed byte-identical
+against `src/app.html`.
+
+### 16.6 The todo-app draft, applied — 2026-08-18
+
+The owner asked for it the same day ("update `vilan-playground/todo` with
+the new full-stack system, if it's ready"), and it was applied by the
+orchestrator with `patch -p1` (the tree is not under git; `src/` backed up
+first). Applied clean. Then the field test the header asked for, on the
+shipped v0.34.0 CLI:
+
+- `vilan build .` — exit 0; `dist/` gains `client.chunks.json` beside the
+  three artifacts (the leg manifest S2 introduced).
+- Boot: `notes server listening on http://localhost:4600/`.
+- `GET /` — 200 `text/html`, the `Document::of(build).title("Todo")` page:
+  `<!doctype html>`, `charset="utf-8"`, `initial-scale=1`, no stray indent
+  — exactly the four cosmetic deltas §16.4's header predicted, nothing
+  else. `<link rel="stylesheet" href="/client.css" />`,
+  `<div id="app">`, `<script type="module" src="/client.js">` — all
+  derived from the build.
+- `/client.js` 200 `text/javascript` 40,568 B; `/client.css` 200
+  `text/css` 57 B; `POST /rpc` 200 `application/json`.
+- Stopped clean; port released.
+
+So the app §2.1 measured as the charter's own evidence — 19 lines, 10 of
+them ceremony, three boot-time reads and a hand-written shell — now runs
+at rung 2 with no path, file name, or MIME type in its server. The one
+behavioral change is the one the arc exists for: the page cannot disagree
+with the artifacts it names, because it is written from them.
+
+### 16.7 E65 shipped (2026-08-19)
+
+§16.2 filed it: the repository could not demonstrate rung 2 in an example,
+because two shipped gates refused one by construction. Both gates now tell
+the truth about a rung-2 server, and `examples/todo` stands on it.
+
+**`unlinked_stylesheets` has a second source of truth for "linked".** The
+first stays what it was — an `.html` in the staged tree with a
+`<link rel="stylesheet">` to the sheet. The second is the served page's
+other possible origin: a server that writes the page itself from the build.
+`tests/support/ladder.rs::documented_legs` reads a `.vl` source through the
+real lexer (`vilan_core::lexing::tokenize`) and matches the call shape
+`Document` `::` `of` `(` — a mention in a comment or a string literal is
+trivia or one `String` token and cannot satisfy it — then resolves the
+argument to the leg it describes: `require_build("leg")` / `build_of("leg")`
+inline, or a `let`/`mut` binding (type annotation allowed) to one. A build
+that arrives any other way (a parameter, a field) names no leg, and the
+gate says so rather than guessing. `examples.rs::documented_stylesheets`
+then joins those legs against the build's own statement — `styles` in
+`dist/<leg>.chunks.json`, the same manifest `Document::of` reads — so the
+claim is precisely "this server writes leg L's document, and L's build
+emitted this sheet". Two browser legs and one `Document::of` credit one
+sheet, not two. Four pins in `examples.rs`, each planted red: the
+recognized shapes (bound, inline, `build_of`+`!`, annotated, `mut`, two
+legs); a comment and a string that are not calls and a parameter that
+names no leg; a staged rung-2 tree that passes and the same tree with the
+call commented out that fails with `client.css` named; and the two-leg
+tree where `admin.css` is still unlinked. With the second truth removed,
+`every_example_builds` fails on `examples/todo` exactly as §16.2 predicted
+(`emitted stylesheets that no page links: ["client.css"]`); with it, the
+gate is green over all ten examples with no assertion moved.
+
+**`examples/todo` is at rung 2.** `src/app.html` is deleted; the server
+writes `Document::of(build).title("Vilan todos").body("<p …>…</p>").html()`
+— the one line of markup that was this app's own (the two-tabs hint) rides
+`body`, which is the escape hatch's first in-repo customer. Mirrors the
+shape §16.6 applied to the owner's playground app; `src/client.vl` is
+untouched (`mount_root("app", …)` is the generated document's default
+mount). Measured on a staged copy of the tracked files, built and booted:
+`GET /` 200 `text/html`; `/client.js` 200 `text/javascript`; `/client.css`
+200 `text/css`; `POST /rpc` 200 `application/json`; stopped clean. The
+served page against the deleted shell, indentation-blind: `<html lang="en">`
+(was bare `<html>`), the viewport `<meta>` added, `<meta charset>` and the
+`<link>` self-closing, a trailing newline — and nothing else: same title,
+same `<link>`, same `<div id="app">`, same `<p>`, same module `<script>`.
+By §1.2's line rule: `src/server.vl` 20 → 23 lines (the formatter gives the
+`Document::of` chain four lines; per call it is the one `require_shell`
+call it replaces) and `src/app.html` 13 → 0 — 33 lines across two files
+become 23 in one. The README's layout block loses `app.html` and says why.
+
+**The scaffold does not climb; the blessed-layout gate distinguishes.**
+`tests/init.rs::the_fullstack_template_matches_the_blessed_example_layout`
+asserted `src/app.html` on disk in the scaffold and all three examples as
+"the layout the manifest implies". The manifest implies the two entries'
+files, and only those are asserted in both now. The shell is a rung, not a
+layout: the scaffold keeps `src/app.html` and is asserted to — §6.3 and
+§10.6 RULED rung 1 + the validator for the scaffold ("a web developer
+opening a new project expects to find the HTML") and the owner ratified the
+§10 set, so the template moving would reverse a ruling, which is not a
+lane's call — while each example must stand on one rung: the shell on disk,
+or `src/server.vl` writing the `client` leg's document (`documented_legs`,
+the same recognizer). Planted red: commenting out todo's `Document::of`
+fails the gate with "todo stands on no rung". Consequently the init
+template is byte-identical, there is no CHANGELOG entry, and the
+`docs/guide/` touch is one paragraph: `walkthrough.md`'s "the shell is
+still an unchecked `fs::read_file_to_str`" had been stale since §16 moved
+that example to `require_shell`; it now says which rung the walkthrough
+stands on and points at `examples/todo` for the last one.
+
+**The gates.** `cargo test -p vilan-cli --test examples` (6 passed),
+`--test init` (12 passed), `cargo test -p vilan-cli --test corpus` (7
+passed, byte-identical — no compiler, std, or emitted JavaScript touched),
+`cargo test -p vilan-core --test docs` (8 passed), and the full suite by
+exit code (see the lane's report). Not verified: the browser client running
+against the rung-2 server (no browser here); the page's bytes are the
+measurement above.
+
+**Found in passing, not fixed here.** `Document::head()`/`body()`'s doc
+comment ("the markup goes through the same `check_shell` rules as anything
+else … is caught here too") and `docs/std/process.md` ("markup you add
+there is checked like any other") promise a check that `Document::html()`
+does not run for a generated document: probed on the rung-2 todo,
+`.head("<script type=\"module\" src=\"/client.Nope.js\"></script>")` — a
+script inside the leg's namespace the build never emitted, F3's
+`ScriptNotEmitted` — builds, boots, and is served. `tests/document.rs`
+proves the check CATCHES it when an app calls `check_shell` on the result,
+which is a different sentence. Either `of`'s `html()` runs `check_shell`
+over the generated markup when `head`/`body` were supplied (and §5.5's
+"every document `of` can produce passes `check_shell`" is then stated
+without the hatches), or the two comments stop promising it — a std
+semantic, the owner's to rule; filed in the lane's report.
+
+### 16.8 E64 — `build_handler` retired (2026-08-19)
+
+The owner RULED the review §13.1 asked for and §16.3 opened: retire it.
+`fun build_handler(build: LegBuild, fallback: |Request| Response):
+|Request| Response` is deleted from `std/src/process/http.vl`, and nothing
+else went with it — `load_build`, `asset_for`, `asset_response` and
+`asset_body` are `serve_build`'s and `respond_from_build`'s, and stay; the
+`pkg::build` import line is unchanged. It was exported from no list (std's
+modules are root-scoped), so the deletion is the one std edit. Corpus
+byte-identical with the std change in (no program compiled it), docs gate
+green, full suite green by exit code — the lane's report has the numbers.
+The one behavior that existed only in it, a sync `|Request| Response` over
+the build's routes for a boot function that owns its own `Server`, has no
+replacement by design: that boot-function shape is §3.7's complaint and
+§4.6's sugar, and the builder it is sugar over carries `serve_build`.
+
+Where the guides now point. `docs/guide/routing.md`'s deep-link section
+compiles the builder chain (`serve_build` + the `on_request` catch-all, a
+`norun` fence where it had a `serve_service(…, build_handler(…))`
+fragment) and says in prose that an rpc app adds `.with_service(…)` to the
+same chain under the same rule; `docs/guide/services.md`'s "The server
+side" shows the full chain — `.with_service(Service::new(…))`,
+`.serve_build(require_build("client"))`, `.on_request`, `.on_start` — and
+its "Growing past one service" opens from that chain rather than from
+`serve_service`; `docs/guide/persistence.md` lost its `build_handler`
+fragment and points at the services page for the chain with a service on
+it; `docs/std/process.md` lost the signature and says `serve_build` on the
+builder is the one way a server serves its build, with `with_service` for
+the rpc app; `docs/std/rpc.md` stopped naming it as what "usually fills"
+a `serve_*` fallback. No `vilan,fragment` fence names it any more.
+Outside the repo: `vilan-playground` and kolt's `vilan-migration` branch
+were grepped read-only — neither calls it (kolt is on `serve_service` with
+a hand-written fallback, §16.4's draft unapplied).
+
+Next: the owner has said the `serve_rpc` / `serve_service` /
+`serve_connected` trio is to be retired too — E71 in the tracker, a
+separate slice; this one touched none of them, and the guides' remaining
+`serve_service` mentions are that slice's to sweep.
+
+### 16.9 E71 — the `serve_*` trio retired (2026-08-20)
+
+The owner RULED it with E64 ("I'd like the others retired soon as
+well"); the tracker carried it as E71. `serve_rpc`, `serve_service` and
+`serve_connected` are deleted from `std/src/process/rpc_server.vl`, and
+the audit found exactly one thing that died with them: `rpc_response`,
+the text-only rpc mount whose sole caller was `serve_rpc` (documented as
+composable into `on_request`, but no code, docs fence or example ever
+did). Everything else in the module is the builder path's and stays —
+`Service`, `with_service`, the request/upgrade folds, the connection
+registry, `accept_socket`, `ws_accept_key`, and `std::rpc`'s
+`register_session`/`drop_session` (which `Service::new`'s default
+lifecycle installs). The `Server` import fell out of the module as
+unused, and the lifecycle/leak prose that lived on `serve_connected`'s
+doc comment (a connection ends when its stream closes; `on_disconnect`
+is where the app drops its session) moved to the `Service` struct's.
+
+§4.6's migration story ("there isn't one") is superseded by the trio's
+own bodies, which ARE the migration: `serve_service(port, protocol,
+fallback, on_ready)` is `Server::builder().port(port).with_service(
+Service::new(protocol)).on_request(fallback).on_start(on_ready)
+.build().start()`; `serve_connected` puts its two hooks on the service
+(`.on_connect(…).on_disconnect(…)`); `serve_rpc` is the chain with no
+fallback — and one real wire change, the only one in the slice: the
+text mount answered rpc on EVERY path, the service answers on
+`{mount}rpc`, so an `HttpTransport` that dialed the bare origin dials
+`http://host:port/rpc` now. The changelog's breaking entry and
+`std/rpc.md` both say so.
+
+Where the consumers went. The four e2e suites spell the chain
+(`rpc_http.rs`'s six servers, `transport_robustness.rs`'s restartable
+server, `streaming.rs`'s comment); `inference.rs`'s
+`client_connect_enforces_the_contract_and_wires_mirrors` spells its two
+servers on it; the benchmarks moved with their no-op lifecycles kept
+no-op (`.on_connect(|id, end| {})` — no session registered per
+benchmark connection, where `Service::new`'s default would have
+registered one), and the throughput json-http leg dials `/rpc` where it
+dialed `/` — it now rides the same byte-reading route as its binary
+sibling, worth knowing when comparing against pre-E71 numbers.
+`guide/services.md`'s opening example teaches the chain and its
+"growing" section describes the layer without a sugar to contrast;
+`guide/walkthrough.md` lost the parenthetical; `std/rpc.md` and
+`std/process.md` lost the signatures; `persistence.md`, `ssr.md` and
+`routing.md` had nothing left to sweep (§16.8 got there first). The
+benchmarks README and `examples/todo`'s README each traded their one
+mention for the layer's name. `formatter.rs`'s two motivating-shape
+comments are marked historical (the test inputs keep the old
+signatures as data, which is what they always were).
+
+The wire pin survives its subject. `service_layer.rs`'s byte-identity
+test proved the layer against a `serve_service` program; with the trio
+gone that spelling is unbuildable, so the pin now states the contract
+directly: the RECORDED bytes — the same literals captured against the
+pre-layer implementation (2026-08-11) — asserted against the builder
+chain (`the_builders_wire_matches_the_bytes_recorded_from_serve_service`),
+with the capture's provenance in the test's comment. The wire contract
+outlives every respelling of the boot code, which was the §4.6 claim
+all along.
+
+Outside the repo: kolt's `vilan-migration` branch still calls
+`serve_service` (§16.4's and §16.8's read-only greps). With the trio
+gone that branch does not compile against v0.35.0, so
+`proposal/e63-drafts/kolt-server.patch` — together with the A25
+remote-sources migrations for the same branch (`kolt/src/client.vl`,
+`probe.vl`, `views.vl`; `remote-sources.md` §9) — is REQUIRED for kolt
+on v0.35.0, not optional modernization. The playground todo app was
+already moved (§16.6) and is unaffected.
+
+The gates. Corpus 7 passed, byte-identical (no golden moved — no corpus
+program named the trio); docs 8 passed; the migrated inference pin
+green; `rpc_http` 6, `service_layer` 5, `transport_robustness` 1,
+`streaming` 3, `benchmarks` 1 — all passed with no assertion moved
+except the byte-identity pin's reframing above; full suite green by
+exit code (the lane's report has the line). Not verified: a browser
+client against a migrated server (no browser here — the e2e wires are
+the measurement), and kolt itself (read-only by standing rule). E70
+(`Document::html()` over the head/body hatches) was NOT ruled and is
+untouched by this slice.
+
+### 16.10 E70 — the escape hatches meet the rules at `html()` (2026-08-20)
+
+The owner RULED §16.7's found-in-passing question ("Yes" — `html()` runs
+the `check_shell` rules when a hatch was used; tracker E70). The std doc
+comments on `head()`/`body()` promised "the markup goes through the same
+`check_shell` rules as anything else … is caught here too" and
+`docs/std/process.md` promised "markup you add there is checked like any
+other" — and neither was true: §16.7's probe
+(`.head("<script type=\"module\" src=\"/client.Nope.js\"></script>")`,
+in-namespace, F3) built, booted, and served that page.
+
+**The change is one site, and it is where the page is assembled.**
+`Document::html()`'s generated arm now runs `check_shell` over the
+assembled page — the same faults, the same message heads (the ledger keys
+them; nothing reworded) — exactly when `self.head != "" || self.body !=
+""`, and a fault panics with `fault_report`'s envelope, its slot filled
+with `this generated document's `head`/`body` markup` (the parameter
+renamed `path` → `source`; rows 234–239 note the second reachable site
+and the moved pin). The emptiness test is the whole cost of the
+hatch-less path: no check, no re-reading of the page's own output, and
+byte-identical output — pinned against the pre-change bytes, recorded
+2026-08-20. §5.5's property now holds in two ways: by construction for
+everything `of` derives (unchanged), and by the check for the raw markup
+the hatches admit — a hatched page that would fail is never handed back.
+A supplied shell is untouched: `from_shell` checked it before the value
+existed, and its arm of `html()` did not move.
+
+**The pins** (`tests/document.rs`, every refusal planted red against the
+pre-change std — all four booted or handed the page back — then green):
+§16.7's probe as a boot refusal over a REAL build
+(`a_hatch_loading_a_script_the_build_did_not_emit_refuses_the_boot`,
+naming `/client.Nope.js`); one per remaining fault family the hatches can
+trip — stylesheet (F2, `a_hatch_linking_a_stylesheet…`), mount (F4, an
+unclosed `<!--` in `head()` that hides the mount element from the scanner
+and from a real browser alike, tripping F4 + the bundle's F3), and the
+bundle tag's form (F6, a module-script copy of the bundle over a
+splitting leg). A valid hatch passes and rides the page; the hatch-less
+pin proves both halves of the flag (bytes identical to the recorded
+pre-E70 output, and a page `check_shell` WOULD refuse — an empty mount id
+— still handed back, the absence of the check observed). F1
+(`StylesNotLinked`) is not reachable through `html()`: the generated
+`<link>` precedes any hatch markup, and a comment can only swallow
+forward. The property test's trailing hand-called demonstration (build a
+faulty page, call `check_shell` on it yourself) is superseded by the
+refusal pins — the page it demonstrated on can no longer be produced —
+and its 1152-document count now doubles as 1056 hatched documents
+passing through the internal check. The boot harness (`Boot`/`boot`/
+`assert_refused`) moved from `shell_check.rs` to `tests/support/boot.rs`,
+shared by both suites, no assertion moved.
+
+**In-tree hatch users hold.** `examples/todo`'s server (`.body()`, §16.7)
+now runs the check at boot and passes; the walkthrough's `Document::of`
+fences carry no hatch and run none. `docs/std/process.md`'s hatch
+paragraph states the now-true rule and its other half (no hatch markup →
+no check); the CHANGELOG carries one `feature` entry saying plainly that
+a boot which served a wrong page yesterday refuses today.
+
+**The gates.** `cargo test -p vilan-cli --test document` (9 passed),
+`--test shell_check` (8 passed, on the shared harness), `--test corpus`
+(7 passed, byte-identical), `--test examples`, `cargo test -p vilan-core
+--test docs` (8 passed), and the full suite by exit code — the lane's
+report has the lines. Not verified: a browser against a refused boot (no
+browser here; the refusal's stderr and exit code are the measurement).
+
+**Found in passing, not fixed here.** `head()`/`body()` on a SUPPLIED
+shell are silently inert: `html()`'s supplied arm serves the shell's own
+bytes plus the render splice, and the hatch fields never reach it — so
+`require_shell(…).head("<meta …>")` compiles, boots, and appends nothing.
+Either the hatches splice into a supplied shell (they have a located
+`<head>`/mount to aim at) and face the same check, or they refuse/warn on
+a supplied document; today they do neither. A std semantic, the owner's
+to rule; left for the tracker.
+
+### 16.11 K13 step 3 — the site takes rung 2 whole (2026-08-20)
+
+The first consumer outside this repository's examples took rung 2 whole
+(vilan-website, lane site-rung2, website@6036e21): both pages are written
+by `Document::of` over their legs' builds (`client`, `playground`), served
+over two `serve_build` calls on one builder, the two HTML shells deleted
+and the `<!--ssr-->` marker gone from the deploy gate — which now fails on
+an empty mount div, the one failure mode rung 2 leaves. Mount markup
+byte-identical, both pages pixel-identical before/after in both schemes;
+the wrapper deltas were the precedent's (self-closing generated tags, the
+head reordered to generated-prefix + hatch-suffix, one indent level, the
+shells' comments moving into `.vl`). What the hatches carried, and the
+ladder could not derive: the UA theme metas (`color-scheme`, two
+per-scheme `theme-color`s — palette values theme.vl knows, restated by
+hand), the description, the og:/twitter: card (whose og:title is not the
+document title), the icon set, and the `<style>` page-frame block §5.5
+predicted — three `@font-face`, ground and `::selection`, per-page frame
+rules, the reduced-motion kill; `body()` carried the landing page's
+out-of-mount SVG filter and the playground's two vendored plain scripts,
+whose load-before-the-bundle order the generated tag's position
+guarantees. All three of §15.2's declined helpers had a real customer on
+the first real site — §10.1's review clause has its requests (filed E79).
+One thing no hatch could say: the deployed site served the playground
+leg's pair under `/playground/`, and a generated document addresses
+`/{bundle}` — §5.4's declined route prefix is exactly what that page
+needed, so the deployment moved to the ladder's root namespace instead
+(the pair staged at the pages-repo root, stale copies retired), a live
+site's URL space following the ladder rather than a knob. `split = true`
+was not taken: no router, zero chunks — it belongs with K13's router
+step. Bycatch: docs-port.md §5 item 7's node externs replaced by
+`std::fs::read_bytes`/`read_dir`.
+
+### 16.12 E77 — the hatches compose into a supplied shell (2026-08-20)
+
+The owner RULED §16.10's found-in-passing item (COMPOSE, as recommended;
+tracker E77): the hatches splice into the supplied shell, and the
+composed page runs the `check_shell` rules, uniform with E70's generated
+arm.
+
+**The splice points, defined against what the shell contract
+guarantees.** `head()` markup goes immediately before the shell's own
+`</head>`, `body()`'s immediately before its `</body>`, the render (as
+before) at the mount element's content start — all indices into the
+original shell, applied in ascending order. The closing tags are read
+the way the check reads markup: the scanner (`tags_of`) now records
+closing tags too (`Tag` gains `start` and `closing`; a closing tag
+carries no attributes, which is what keeps every attribute-keyed check
+reading opening tags only), so a `</head>` inside a comment or a script
+body is no splice point, for the same reason it is no closing tag to a
+browser. And the contract argument: `require_shell`'s check guarantees
+the mount element and the bundle's script tag — NOT the closing tags,
+which a browser tolerates missing — so a shell `from_shell` accepted can
+lack the tag a used hatch aims at. That is a compose-time refusal at
+`html()` (ledger row 240): one line per missing tag, not the first
+(§5.6's doctrine), naming both fixes — add the tag, or write the markup
+into the shell itself. A missing tag no used hatch aims at refuses
+nothing.
+
+**The check, uniform with E70.** Exactly when `self.head != "" ||
+self.body != ""`, the COMPOSED page runs `check_shell` — same faults,
+same heads, nothing reworded — against the mount `from_shell` located
+(`default_mount`, not `self.mount`: `mount()` documents that it does not
+move a supplied shell's mount, so the check must not read it either, or
+a documented no-op call would refuse a working page). The
+`fault_report` envelope's slot names both provenances the way E70's
+names the generated document: `{source} composed with this document's
+`head`/`body` markup`, where `source` is `require_shell`'s file path
+(`Document` gains the field; `require_shell` fills it) or `from_shell`'s
+generic `this supplied shell` (row 239's third filling). The hatch-less
+supplied path is untouched: the shell's own bytes (plus the render
+splice), no check beyond the one `from_shell` ran — E70's emptiness flag,
+same arm shape.
+
+**The pins** (`tests/document.rs`, six of seven planted red against the
+pre-change std — each red for the ruling's own reason, the inert hatch):
+the inert case dies over a REAL build, observed in the SERVED bytes
+(`a_head_hatch_on_a_supplied_shell_now_rides_the_served_page`: the meta
+rides immediately before `</head>`); a bad hatch refuses the boot
+(`a_bad_hatch_on_a_supplied_shell_refuses_the_boot`, F3's
+`/client.Nope.js` with the envelope naming `src/app.html`, on the shared
+boot harness); a second family through bare `from_shell`
+(`a_bad_hatch_through_from_shell_names_the_supplied_shell`, F2, the
+generic source name); the three-way composition
+(`a_valid_hatch_composes_at_every_splice_point_and_passes`: head, body
+and render in one page, each at its defined position); the no-closing-tag
+refusal (`a_used_hatch_with_no_closing_tag_to_splice_before_refuses`,
+both lines) and its complement
+(`a_closing_tag_only_an_unused_hatch_would_need_is_not_required`); and
+the hatch-less half
+(`a_hatchless_supplied_shell_is_byte_identical_and_runs_no_check`, green
+before and after by design — byte-identity, plus the absence of the
+check observed through rendered markup that WOULD trip it, a
+`view("script").attr("src", "/client.Nope.js")` still riding the page:
+the check keys on the hatches alone at both arms, E70's own condition).
+
+**In-tree supplied-shell users hold.** `examples/walkthrough` and
+`examples/ssr` (`require_shell`, no hatches) ride the hatch-less path,
+byte-identical; `examples/todo`'s `.body()` is on a generated document
+(E70's arm). `docs/std/process.md`'s hatch paragraph now states both
+rungs and the closing-tag refusal; the std doc comments align
+(`head`/`body`, `html`, `from_shell`, the module header). The CHANGELOG
+carries one `feature` entry saying plainly that previously-inert calls
+start doing something — a served page can change, a boot that silently
+ignored its hatches can refuse.
+
+**The gates.** `cargo test -p vilan-cli --test document` (16 passed),
+`--test shell_check` (9 passed), `--test corpus` (7 passed,
+byte-identical), `--test examples` (6 passed), `cargo test -p vilan-core
+--test docs` (8 passed), and the full suite by exit code — the lane's
+report has the lines. Not verified: a browser against a composed page
+(no browser here; the served bytes and the refusal's stderr are the
+measurement).

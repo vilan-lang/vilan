@@ -4694,7 +4694,8 @@ mod chain_splitting {
     }
 
     /// A block's tail expression is a statement position too — this is the shape
-    /// `std::process::rpc_server`'s `serve_rpc` reflowed into.
+    /// `std::process::rpc_server`'s `serve_rpc` (since retired, E71) reflowed
+    /// into.
     #[test]
     fn a_block_tail_expression_splits() {
         let tail = "Server::builder().port(port).on_request(|request| handle(protocol, request))\
@@ -6277,12 +6278,13 @@ mod signature_layout {
     //! and why it is intended rather than an oversight.
     //!
     //! Each pin runs the whole formatter contract through `assert_construct`.
+    use super::LINE_BUDGET;
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::{assert_over_budget, columns};
-    use super::{LINE_BUDGET, format};
 
-    /// The motivating signature, from `std/src/process/rpc_server.vl`: 172
-    /// columns of closure-typed parameters, wide by construction.
+    /// The motivating signature — `serve_connected` as it stood in
+    /// `std/src/process/rpc_server.vl` (since retired, E71): 172 columns of
+    /// closure-typed parameters, wide by construction.
     #[test]
     fn an_over_budget_signature_splits_one_parameter_per_line() {
         let source = "fun serve_connected(port: i32, protocol: RpcProtocol, \

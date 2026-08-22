@@ -200,7 +200,8 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::Json;
 import std::json::json_codec;
 import std::rpc::HttpTransport;
-import std::rpc_server::serve_rpc;
+import std::http::Server;
+import std::rpc_server::Service;
 
 [service(Client)]
 struct Counter {
@@ -218,10 +219,14 @@ impl Counter {
 fun main() {
 	let counter = Counter { count = Shared::new(0) };
 	// Port 0: the OS picks a free port and `server.url()` is the one it
-	// bound — no probe, no TOCTOU window, nothing to substitute.
-	serve_rpc(0, counter.dispatcher().into_protocol(json_codec()), |server| {
-		run_client(server.url());
-	});
+	// bound — no probe, no TOCTOU window, nothing to substitute. The
+	// service's rpc route is `{mount}rpc`, so the client dials `{url}rpc`.
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))
+		.on_start(|server| run_client(i"{server.url()}rpc"))
+		.build()
+		.start();
 }
 
 fun run_client(url: str) {
@@ -281,8 +286,8 @@ import std::rpc::{
 	HttpTransport, connect_split, bridge,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
-import std::http::Response;
-import std::rpc_server::serve_connected;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
 
 // Per-connection reactive servers, so `attach` can expose the board's signal on
 // the caller's own wire.
@@ -317,20 +322,23 @@ impl Board {
 
 fun main() {
 	let board = Board { count = Signal::new(0) };
-	// Port 0: the OS picks a free port, and the ready callback's server
+	// Port 0: the OS picks a free port, and the on_start callback's server
 	// reports the one it bound.
-	serve_connected(
-		0,
-		board.dispatcher().into_protocol(json_codec()),
-		|id, end| {
-			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
-		},
-		|id| {},
-		|request| Response::builder().code(404).body("nope").build(),
-		|server| {
+	Server::builder()
+		.port(0)
+		.with_service(
+			Service::new(board.dispatcher().into_protocol(json_codec()))
+				.on_connect(|id, end| {
+					sessions.write().push((id, ReactiveServer::new(end, json_codec())));
+				})
+				.on_disconnect(|id| {}),
+		)
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| {
 			run_clients(i"http://localhost:{server.port()}");
-		},
-	);
+		})
+		.build()
+		.start();
 }
 
 fun watch(name: str, base: str): Client<HttpTransport> {
@@ -381,7 +389,7 @@ fun run_clients(base: str) {
 #[test]
 fn a_closed_connection_tears_its_session_down_and_spares_the_rest() {
     // Connection lifecycle over SplitDuplex: a subscribed client PROCESS dies
-    // (its SSE socket closes), which must fire `serve_connected`'s
+    // (its SSE socket closes), which must fire the service's
     // `on_disconnect` so the app can dispose that session's `ReactiveServer` —
     // and disposing it must not disturb another session subscribed to the SAME
     // signal, which still sees a later mutation.
@@ -401,8 +409,8 @@ import std::result::Result::{ self, Ok, Err };
 import std::json::{ Json, FromJson, json_codec };
 import std::reactive::Signal;
 import std::rpc::{ ReactiveServer, DuplexEnd };
-import std::http::Response;
-import std::rpc_server::serve_connected;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
@@ -448,19 +456,22 @@ fun main() {
 	let board = Board { count = Signal::new(0) };
 	// Port 0, announced: the client processes are written once this line
 	// arrives, so they dial the port the OS actually handed out.
-	serve_connected(
-		0,
-		board.dispatcher().into_protocol(json_codec()),
-		|id, end| {
-			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
-		},
-		|id| {
-			drop_session(id);
-			print(i"closed {id}");
-		},
-		|request| Response::builder().code(404).body("nope").build(),
-		|server| print(i"ready {server.port()}"),
-	);
+	Server::builder()
+		.port(0)
+		.with_service(
+			Service::new(board.dispatcher().into_protocol(json_codec()))
+				.on_connect(|id, end| {
+					sessions.write().push((id, ReactiveServer::new(end, json_codec())));
+				})
+				.on_disconnect(|id| {
+					drop_session(id);
+					print(i"closed {id}");
+				}),
+		)
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
 }
 "#,
     );
@@ -561,8 +572,8 @@ fun main() {{
 #[test]
 fn realtime_sync_over_a_true_websocket() {
     // The WebSocket transport end to end (transport-rpc.md §5): the RFC 6455
-    // handshake vector, the in-language server half (upgrade + frame layer on
-    // serve_connected's port), the host-WebSocket client, and the drop-in
+    // handshake vector, the in-language server half (the upgrade + frame layer
+    // `with_service` installs), the host-WebSocket client, and the drop-in
     // promise — this is the SSE realtime test with `connect_split` swapped for
     // `connect_socket`, nothing else.
     let dir = temp_project("websocket");
@@ -588,8 +599,8 @@ import std::rpc::{
 	HttpTransport, connect_socket, bridge, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
-import std::rpc_server::{ serve_connected, ws_accept_key };
-import std::http::Response;
+import std::rpc_server::{ Service, ws_accept_key };
+import std::http::{ Response, Server };
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
@@ -625,18 +636,21 @@ fun main() {
 
 	let board = Board { count = Signal::new(0) };
 	// Port 0: both the http and the ws URL are built from the bound port.
-	serve_connected(
-		0,
-		board.dispatcher().into_protocol(json_codec()),
-		|id, end| {
-			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
-		},
-		|id| print(i"closed {id}"),
-		|request| Response::builder().code(404).body("nope").build(),
-		|server| {
+	Server::builder()
+		.port(0)
+		.with_service(
+			Service::new(board.dispatcher().into_protocol(json_codec()))
+				.on_connect(|id, end| {
+					sessions.write().push((id, ReactiveServer::new(end, json_codec())));
+				})
+				.on_disconnect(|id| print(i"closed {id}")),
+		)
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| {
 			run_clients(server.port());
-		},
-	);
+		})
+		.build()
+		.start();
 }
 
 fun watch(name: str, port: i32): Client<HttpTransport> {
@@ -715,8 +729,8 @@ import std::rpc::{
 	connect_socket, bridge, SocketTransport, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
-import std::rpc_server::serve_connected;
-import std::http::Response;
+import std::rpc_server::Service;
+import std::http::{ Response, Server };
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
@@ -747,18 +761,21 @@ impl Board {
 
 fun main() {
 	let board = Board { count = Signal::new(0) };
-	serve_connected(
-		0,
-		board.dispatcher().into_protocol(json_codec()),
-		|id, end| {
-			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
-		},
-		|id| {},
-		|request| Response::builder().code(404).body("nope").build(),
-		|server| {
+	Server::builder()
+		.port(0)
+		.with_service(
+			Service::new(board.dispatcher().into_protocol(json_codec()))
+				.on_connect(|id, end| {
+					sessions.write().push((id, ReactiveServer::new(end, json_codec())));
+				})
+				.on_disconnect(|id| {}),
+		)
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| {
 			run_clients(server.port());
-		},
-	);
+		})
+		.build()
+		.start();
 }
 
 // EVERYTHING rides the one socket: RPC via the transport() view, updates via
@@ -856,8 +873,8 @@ import std::rpc::{
 	connect_socket, bridge, SocketTransport, SocketDuplex,
 	ReactiveServer, ReactiveClient, RemoteSource, DuplexEnd,
 };
-import std::rpc_server::serve_connected;
-import std::http::Response;
+import std::rpc_server::Service;
+import std::http::{ Response, Server };
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
@@ -888,18 +905,21 @@ impl Board {
 
 fun main() {
 	let board = Board { count = Signal::new(0) };
-	serve_connected(
-		0,
-		board.dispatcher().into_protocol(binary_codec()),
-		|id, end| {
-			sessions.write().push((id, ReactiveServer::new(end, binary_codec())));
-		},
-		|id| {},
-		|request| Response::builder().code(404).body("nope").build(),
-		|server| {
+	Server::builder()
+		.port(0)
+		.with_service(
+			Service::new(board.dispatcher().into_protocol(binary_codec()))
+				.on_connect(|id, end| {
+					sessions.write().push((id, ReactiveServer::new(end, binary_codec())));
+				})
+				.on_disconnect(|id| {}),
+		)
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| {
 			run_clients(server.port());
-		},
-	);
+		})
+		.build()
+		.start();
 }
 
 fun watch(name: str, port: i32): Client<SocketTransport> {

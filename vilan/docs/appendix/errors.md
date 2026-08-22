@@ -197,8 +197,37 @@ there would say nothing the `_` does not.
 **"struct '…' has no field '…'"** · **"variant '…' does not belong to the matched enum"**
 A field or variant name is off. For the variant case inside `match`,
 patterns bind with `let`: a bare misspelled variant is an error here,
-never a silent catch-all.
+never a silent catch-all. When a real field is a close-enough edit away
+the field case adds a note — *"did you mean `entries`?"* — and the editor
+turns it into a "Change to `entries`" quickfix that rewrites the name.
+Close enough is a real threshold: `"entires"` suggests `"entries"`, and
+`"x"` suggests nothing at all.
 → [Control flow](../tour/control-flow.md)
+
+**"`…` expects N arguments, but got M instead: `…` is missing."** ·
+**"`…` expects N fields, but got M instead: `…` is not a field of `…`."**
+A call or a struct literal is short of, or over, its declared list. The
+message names the **callee or struct**, not just the counts — two calls
+on one line no longer leave you working out which — and, when it is
+short, the specific parameter or field that is missing (arguments bind
+positionally, so which one is absent is unambiguous; too *many* gets no
+such guess, since which extra to drop is not). A secondary note points at
+the subject's own declaration: *"`distance` is declared here"*.
+→ [Functions & closures](../tour/functions-and-closures.md), [Data and traits](../tour/data-and-traits.md)
+
+**"Expected …, but got void instead: an `if` with no `else` produces void."** ·
+**"…: the `;` discards this body's last value."** ·
+**"…: this body ends without producing a value."**
+Three shapes of "nothing came back", each naming its own cause instead of
+reporting a bare void. The first is an `if`/`else if` chain in tail
+position with no final `else` — add the branch. The second and third
+anchor on the callable's **closing brace**, one character wide: the fix
+is almost always the trailing `;` that discarded the value, and the
+editor offers "Remove `;`" on it. A closure's own `: T` return annotation
+is checked against its body directly, so these reach a closure literal as
+readily as a `fun`. Passing a wrong-*typed* value is a different error and
+still points at the value.
+→ [Functions & closures](../tour/functions-and-closures.md)
 
 **"`…` compares two values of the same type, but the operands are `…` and `…`"**
 Comparisons follow the trait model (`==` is `PartialEq`, `<` is
@@ -264,8 +293,12 @@ which). Do the mutation before taking the view, or after its block ends.
 
 **"cannot hold a view across 'await': '…' is still live here. …"**
 Your function suspends while a view is live, and whatever it points into
-could change during the pause. Re-derive the view after the await
-(`rows[i].field` again) instead of keeping it.
+could change during the pause. Re-derive the view after the suspension
+(`rows[i].field` again) instead of keeping it. The message names `await`,
+but the question is whether the call **can suspend**: calling an async
+function without the keyword is the sanctioned spelling and suspends
+identically, so this fires on a line with no `await` on it — including
+through a sync-looking function that reaches something async.
 → [The memory model](../tour/memory-model.md), [Async](../tour/async.md)
 
 **"view binding '…' cannot be `mut`: a view cannot be rebound. …"**
@@ -375,10 +408,12 @@ can't see inside host storage. `Option` is the sanctioned resource
 container; or keep the resource in a struct field.
 → [Resources](../tour/resources.md)
 
-**"field `…` of `[derive(Wire)]` / `[derive(Hashable)]` / `[derive(PartialEq)]` type `…` is the resource `…`: …"**
-A resource is not plain data: it cannot be sent over the wire, hashed by
+**"field `…` of `[derive(Wire)]` / `[derive(Json)]` / `[derive(Hashable)]` / `[derive(PartialEq)]` type `…` is the resource `…`: …"**
+A resource is not plain data: it cannot be serialized, hashed by
 value, or compared by copy. Drop it from the derived type, or carry a
-plain-data handle (an id, a key) in its place.
+plain-data handle (an id, a key) in its place. The check reaches a field
+nested two structs deep and an enum variant's payload, not just a direct
+field.
 → [Resources](../tour/resources.md)
 
 **"`Wire` / `Json` cannot be derived for the resource struct / enum `…`: …"**
@@ -514,7 +549,13 @@ closure or a UI handler, `match` instead.
 **"context `owner_scope` is read here, but this code can be reached without an enclosing `run`"**
 The most common first UI error: you built reactive state (an `effect`, a
 binding) outside every ownership boundary. Wrap the entry point in
-`mount_root`, or `run_with_owner` in a test.
+`mount_root`, or `run_with_owner` in a test. The error points at your
+`effect`/`map`/`or` call; the note under it shows the read inside the
+standard library that your call reaches, and every call of yours on the
+uncovered path above it is underlined too ("the context requirement
+flows through this call") — follow the chain up to where the ownership
+boundary belongs. Calls inside a covering `run` are clean and never
+appear in the chain.
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
 
 **"`…` reads context `…`, so it can't be used as a value"**
@@ -601,6 +642,31 @@ hangs. Fix the termination condition, or move the work to runtime.
 
 ## Syntax
 
+A syntax error no longer blanks out the rest of the file. The parser
+recovers at statement and item boundaries — a statement it cannot read is
+reported and skipped to the next `;`, `}`, or declaration keyword — so
+the statements around it, the functions below it and the whole file tail
+still reach the type checker, and the diagnostics they already had stay
+where they were. `vilan check` type-checks that salvaged file too;
+`vilan build` still stops, because a recovered file is not something to
+emit from.
+
+**"expected `;` to end this statement"**
+A statement ran into the next one. The message is anchored at the gap
+where the `;` goes — the last character before it, not the head of the
+statement below — and the editor offers an "Insert `;`" quickfix there.
+It answers a missing `;` after an `import` or a `use` as well.
+→ [spec §3.2](../spec/grammar.md)
+
+**"unclosed `(`: expected a matching `)`"**
+A delimiter you opened and have not closed yet — the defining shape of
+code mid-edit. It reports on the delimiter *you typed*, not on whatever
+the parser tripped over several lines down. A closing delimiter that is
+wrong *inside* a finished list keeps its own, more precise message
+(`found ';' expected ',' or ')'`, on the exact character where the list
+broke).
+→ [spec §3](../spec/grammar.md)
+
 **A struct literal in a condition parses as the block**
 Struct literals are ordinary operator operands (`Point { … } == q`
 compares), but condition positions exclude them: after `if Foo` or a
@@ -627,3 +693,30 @@ expected (`let q = Point;`). A type names a kind, not a runtime value:
 construct it (`Point { … }`), name a variant (`Color::Red`), or call a
 static (`Point::new(…)`).
 → [spec §4.2](../spec/names.md)
+
+## Panics
+
+These are not compile errors — they are what the program prints when it
+stops at run time. Both exist because the alternative was a host-level
+message naming nothing you wrote.
+
+**"… : … is not one of its values"** (e.g. `Align: "middle" is not one of its values`)
+An **exhaustive** `match` over a backed enum met a value outside its
+variant set. A backed enum lowers to a bare host string or number, so its
+runtime domain is the host's, and exhaustiveness is a proof about the
+*variant set* rather than about the value: an `external fun` return, a
+host callback's argument, or a decoded payload can carry anything. The
+last arm is tested like every other one and the `else` traps rather than
+answering with whichever variant happened to be last. A `match` with a
+`_` arm is unaffected — the out-of-set value takes the arm you wrote — and
+`Enum::parse(text)` is the shape to reach for where an unrecognized value
+is one of the answers you expect: it returns `Option`.
+→ [Data and traits](../tour/data-and-traits.md), [spec §5.2](../spec/types.md)
+
+**"mount: no element with id '…'"**
+`mount` or `mount_root` was given an id nothing on the page carries. The
+host's `get_element_by_id` hands back `null` typed as an `Element`, so the
+shared lookup checks for that first and names the id, instead of leaving a
+`Cannot read properties of null` to speak for itself. On a server-served
+page, `check_shell` catches the same mismatch at boot.
+→ [Browser modules](../std/browser.md), [Building UI](../guide/ui.md)

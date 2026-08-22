@@ -48,6 +48,7 @@ pub use transformer::{
     EmittedChunk, JsProgram, SplitProgram, transform, transform_split, transform_to_ast,
 };
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use node::{Func, ImportBranch, Node, NodeList};
@@ -199,6 +200,46 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     }
 }
 
+/// [`parse_clean_cached`]'s store: clean parses by content hash. At module
+/// scope (rather than local to the function, as it began) only so
+/// [`parse_clean_cache_clear`] can reach it.
+static PARSE_CLEAN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<u64, (&'static Spanned<node::NodeList<'static>>, &'static str)>>,
+> = std::sync::OnceLock::new();
+/// Content hashes known NOT to parse clean — so a broken file (an entry
+/// mid-edit under `--watch`, say) is leaked and re-parsed once per distinct
+/// content, not once per round.
+static PARSE_CLEAN_BROKEN: std::sync::OnceLock<std::sync::Mutex<HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+/// Drops every entry in [`parse_clean_cached`]'s two process-global maps — the
+/// clean-parse store and its known-broken set — so the next compile re-lexes
+/// and re-parses every module it loads (backlog M6: without this, the perf
+/// harness's in-process "cold" was world-cold but parse-warm, and the true
+/// first-compile shape was unmeasurable in-process).
+///
+/// **The memory stays leaked.** The cache's values are `Box::leak`ed `'static`
+/// sources and ASTs, and clearing the maps drops the *pointers*, never the
+/// allocations — analyzed programs that borrowed them may still be alive, and
+/// the leak tally's records stand. So this is a measurement/test surface, not
+/// a memory reclaim; it sits beside [`analyzer::base_cache_clear`] and
+/// [`macro_world_cache_clear`], the harness's other two cold switches.
+#[doc(hidden)]
+pub fn parse_clean_cache_clear() {
+    if let Some(cache) = PARSE_CLEAN_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+    if let Some(broken) = PARSE_CLEAN_BROKEN.get() {
+        broken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
 /// A process-global, content-addressed cache of clean parses, shared by every
 /// compile in the process — the CLI's long-lived `--watch` loop, the language
 /// server, the test harness. The key is a hash of the source; the value is the
@@ -218,18 +259,8 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
 pub fn parse_clean_cached(
     source: &str,
 ) -> Option<(&'static Spanned<node::NodeList<'static>>, &'static str)> {
-    use std::collections::{HashMap, HashSet};
-    use std::sync::{Mutex, OnceLock};
-
-    static CACHE: OnceLock<
-        Mutex<HashMap<u64, (&'static Spanned<node::NodeList<'static>>, &'static str)>>,
-    > = OnceLock::new();
-    // Content hashes known NOT to parse clean — so a broken file (an entry
-    // mid-edit under `--watch`, say) is leaked and re-parsed once per distinct
-    // content, not once per round.
-    static BROKEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let broken = BROKEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let cache = PARSE_CLEAN_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let broken = PARSE_CLEAN_BROKEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
 
     let key = content_hash(source);
     if let Some(cached) = cache.lock().unwrap().get(&key) {
@@ -274,6 +305,23 @@ pub fn content_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// The handle to an entry tree `analyze_source_reclaimable` leaked: the
+/// `Program` it returned borrows this tree for `'static`, and the owner that
+/// drops that program may give the tree back (`Leaked::reclaim`, `unsafe`,
+/// its contract there). Dropping the handle keeps the leak.
+pub type LeakedEntryAst = leak_tally::Leaked<span::Spanned<node::NodeList<'static>>>;
+
+/// What one entry analysis produced, with the tree it leaked attached — the
+/// return of [`analyze_source_reclaimable`]. `program` and `diagnostics` are
+/// exactly [`analyze_source`]'s pair; `ast` is the handle to the parsed entry
+/// tree the program borrows (`None` when parsing produced no tree, in which
+/// case there is no program either).
+pub struct AnalyzedEntry {
+    pub program: Option<Program<'static>>,
+    pub diagnostics: Vec<Error>,
+    pub ast: Option<LeakedEntryAst>,
+}
+
 /// Lex, parse, and fully analyze a source string. The source must already be
 /// leaked to `'static` so the returned `Program` (which borrows it) can outlive
 /// this call — the front-end that owns the document lifecycle does the leak.
@@ -286,6 +334,12 @@ pub fn content_hash(text: &str) -> u64 {
 /// `platform` is the build platform to analyze against — pass `Some` when the
 /// front-end knows it (e.g. the language server resolved it from the project's
 /// `vilan.toml`), or `None` to infer it from the file's imports.
+///
+/// The entry tree this parses is leaked for the program to borrow and stays
+/// leaked — the shape every caller but the language server wants (the macro
+/// world's nested compile keeps its tree in the cached world; the tests and
+/// the wasm front end never drop a program mid-process). A front-end that DOES
+/// drop programs calls [`analyze_source_reclaimable`] and owns the tree.
 pub fn analyze_source(
     source: &'static str,
     std: &PackageSpec,
@@ -294,25 +348,47 @@ pub fn analyze_source(
     platform: Option<Platform>,
     workspace: &Workspace,
 ) -> (Option<Program<'static>>, Vec<Error>) {
+    let analyzed =
+        analyze_source_reclaimable(source, std, pkg_root, entry_path, platform, workspace);
+    // `analyzed.ast` drops here without a reclaim: the tree stays leaked.
+    (analyzed.program, analyzed.diagnostics)
+}
+
+/// [`analyze_source`], handing back the handle to the entry tree it leaked so
+/// the caller can reclaim it once the program is dropped (`leak-soak.md` §7 —
+/// the language server's per-keystroke session leak). Same pipeline, same
+/// fences, same program and diagnostics; only the ownership of the tree
+/// differs. The source text is still the caller's leak, as before, so a
+/// caller that wants the text back keeps its own `Leaked<str>` handle.
+pub fn analyze_source_reclaimable(
+    source: &'static str,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    platform: Option<Platform>,
+    workspace: &Workspace,
+) -> AnalyzedEntry {
     // One outer fence covers the stages the analysis fence below does not —
     // lexing/parsing and the lift rewrite. A panic there used to unwind into
     // the caller: in the editor that meant through `Document::analyze`'s
     // thread join and out of a request handler, aborting the whole language
     // server (B40). It degrades to "no program" plus an honest diagnostic
     // instead; the panic hook (or default hook) has already written the
-    // payload and location to stderr.
+    // payload and location to stderr. A tree leaked before such a panic is
+    // lost with the unwound frame (once per panic, not a session rate) —
+    // the inner fence around `analyze` below is the one that matters for
+    // reclaim, and it returns the handle.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         analyze_source_unfenced(source, std, pkg_root, entry_path, platform, workspace)
     }))
-    .unwrap_or_else(|_| {
-        (
-            None,
-            vec![Error {
-                note: None,
-                span: crate::span::Span::new((), 0..0),
-                msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
-            }],
-        )
+    .unwrap_or_else(|_| AnalyzedEntry {
+        program: None,
+        diagnostics: vec![Error { trace: Vec::new(),
+            note: None,
+            span: crate::span::Span::new((), 0..0),
+            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
+        }],
+        ast: None,
     })
 }
 
@@ -323,7 +399,7 @@ fn analyze_source_unfenced(
     entry_path: &Path,
     platform: Option<Platform>,
     workspace: &Workspace,
-) -> (Option<Program<'static>>, Vec<Error>) {
+) -> AnalyzedEntry {
     // The handwritten frontend lexes and parses in a single fast-and-rich pass,
     // always returning a tree — clean, or recovered from syntax errors — together
     // with every diagnostic (lexer and parser, span-ordered). Analysis below runs
@@ -333,13 +409,18 @@ fn analyze_source_unfenced(
     let mut diagnostics: Vec<Error> = parse_errors
         .iter()
         .map(|error| Error {
+            trace: Vec::new(),
             note: None,
             span: error.span,
             msg: parsing::render(error),
         })
         .collect();
     let Some(mut root) = tree else {
-        return (None, diagnostics);
+        return AnalyzedEntry {
+            program: None,
+            diagnostics,
+            ast: None,
+        };
     };
 
     // A macro WORLD's entry gets the ambient meta prelude (macro-engine.md
@@ -408,7 +489,6 @@ fn analyze_source_unfenced(
     // raw trees, so source text prints back verbatim.
     elements::rewrite_items(&mut root.0, source);
     lift::rewrite_items(&mut root.0);
-    let root = Box::leak(Box::new(root));
     // The tally is a tree-proportional estimate — one `Spanned<Node>` of
     // storage per node — so growth in the tree is visible to the counters;
     // the root box alone would record a constant ~40 B whatever the file
@@ -425,7 +505,20 @@ fn analyze_source_unfenced(
         }
         total * std::mem::size_of::<span::Spanned<Node>>()
     }
-    leak_tally::record(leak_tally::LeakSite::EntryAst, tree_estimate(&root.0));
+    // A macro WORLD's entry is analysed through this same function, and its
+    // tree is kept by the cached world — bounded by `WORLDS`, not a per-
+    // analysis leak — so it records at its own site, and `EntryAst` means
+    // exactly the top-level entry's tree: the one a front-end may reclaim.
+    let tree_site = if macros::in_macro_world() {
+        leak_tally::LeakSite::MacroWorldAst
+    } else {
+        leak_tally::LeakSite::EntryAst
+    };
+    let estimate = tree_estimate(&root.0);
+    // Leaked with the handle kept: the `Program` below borrows `root` for
+    // `'static`; whoever drops that program may reclaim the tree through the
+    // handle (`analyze_source` drops the handle and keeps the leak).
+    let (ast, root) = leak_tally::Leaked::leak(Box::new(root), tree_site, estimate);
     // Use the front-end's resolved platform (e.g. from `vilan.toml`), else infer
     // one from the file's own imports: a file importing the browser DOM layer is a
     // browser file, otherwise Node. This keeps the platform gate from
@@ -435,26 +528,29 @@ fn analyze_source_unfenced(
     let platform = platform.unwrap_or_else(|| infer_platform(&root.0, std));
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut program = analyze(root, source, std, pkg_root, entry_path, platform, workspace);
-        let phase_post_start = crate::PhaseClock::now();
+        // The post-pass half of the `VILAN_PHASE_TIMING` split prints inside
+        // `post_analysis_passes` itself (backlog M5), so BOTH pipelines —
+        // this one (LSP, wasm, the test harnesses) and the CLI's — show it.
         post_analysis_passes(&mut program, platform, &options::BuildOptions::default());
-        // The post-pass half of the `VILAN_PHASE_TIMING` split. This line
-        // prints only on the `analyze_source` path (LSP, wasm, the test
-        // harnesses) — the CLI calls `analyze` directly and runs the same
-        // post-passes itself, so a CLI build shows the in-analyze line alone.
-        if phase_timing_enabled() {
-            eprintln!(
-                "[vilan phase] post-passes {:.1}ms",
-                phase_post_start.elapsed().as_secs_f64() * 1000.0,
-            );
-        }
         program
     }));
     match analyzed {
         Ok(program) => {
             diagnostics.extend(program.diagnostics.iter().cloned());
-            (Some(program), diagnostics)
+            AnalyzedEntry {
+                program: Some(program),
+                diagnostics,
+                ast: Some(ast),
+            }
         }
-        Err(_) => (None, diagnostics),
+        // The analysis unwound inside its fence: every analyzer local went
+        // with it and nothing global borrowed the tree (leak-soak.md §7.2),
+        // so the handle is still the caller's to reclaim.
+        Err(_) => AnalyzedEntry {
+            program: None,
+            diagnostics,
+            ast: Some(ast),
+        },
     }
 }
 
@@ -494,30 +590,53 @@ pub fn post_analysis_passes(
     platform: Platform,
     options: &options::BuildOptions,
 ) {
+    // The post-pass half of the `VILAN_PHASE_TIMING` split, per pass (backlog
+    // M5): the aggregate `post-passes` wall could not say WHICH pass moved,
+    // and attributing M4 meant hand-patching `Instant` marks into this
+    // function three separate times (`perf-baseline.md` §4.3, `const-eval.md`
+    // §10.1/§10.6). The marks are unconditional, on the analyzer's argument —
+    // a handful of clock reads is noise next to a pass — and the line prints
+    // here rather than in `analyze_source` so both pipelines (the LSP/test
+    // path AND the CLI's) show it.
+    let phase_post_start = PhaseClock::now();
+    let phase_graph_start = PhaseClock::now();
     let call_graph =
         context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
+    let phase_graph = phase_graph_start.elapsed();
+    let phase_async_start = PhaseClock::now();
     async_infer::infer(program, &call_graph);
+    let phase_async = phase_async_start.elapsed();
     // E3's implicit half (B119, view-invalidation.md §7): a view may not live
     // across a call that CAN SUSPEND, which is the call graph's answer, not the
     // `await` token's. `check_invalidation` recorded the candidate sites inside
     // `analyze()` (it owns view liveness); this decides them against the
     // suspension set `async_infer` just settled.
+    let phase_views_start = PhaseClock::now();
     analyzer::check_view_suspensions(program, &call_graph);
+    let phase_views = phase_views_start.elapsed();
     // `drop` must be synchronous (destruction.md §5): reject an async drop
     // body now that `async_functions` is settled — an awaiting body is async
     // only by inference, so this cannot run inside `analyze`.
+    let phase_async_drops_start = PhaseClock::now();
     analyzer::check_async_drops(program);
+    let phase_async_drops = phase_async_drops_start.elapsed();
     // And teardown must be context-free (destruction.md §8): a `drop` body
     // whose call sites (scope exits) can thread no context is rejected. Runs
     // after `thread_contexts` fills `context_dependent_functions`.
+    let phase_context_drops_start = PhaseClock::now();
     analyzer::check_context_drops(program);
+    let phase_context_drops = phase_context_drops_start.elapsed();
+    let phase_platform_start = PhaseClock::now();
     platform_color::check(program, platform, &call_graph);
+    let phase_platform = phase_platform_start.elapsed();
     // The const pass (proposal/const-eval.md): evaluate `const`-marked
     // expressions in dependency order; results serialize in place at
     // transform time, failures are ordinary diagnostics. Runs here so
     // `check`, the LSP, and every build path agree.
+    let phase_const_start = PhaseClock::now();
     let (const_results, const_assets, const_errors) =
         const_eval::evaluate(program, options, &call_graph);
+    let phase_const = phase_const_start.elapsed();
     program.const_results = const_results;
     program.const_assets = const_assets;
     for (error, source) in const_errors {
@@ -531,13 +650,45 @@ pub fn post_analysis_passes(
     // declaration order (b33-emission-order.md §3), so it is an error
     // rather than a load-time `ReferenceError`. Runs last: the relation is
     // only meaningful for a program that analyzed cleanly.
+    let phase_init_start = PhaseClock::now();
     init_order::check_cycles(program);
+    let phase_init = phase_init_start.elapsed();
     // THE seam for diagnostic order (E38, diagnostics-standard.md C1). Nothing
     // after this point adds to either list, and both pipelines run this
     // function, so normalizing here is what every consumer reads — including
     // the HMR overlay, which shows only the first `OVERLAY_DIAGNOSTIC_CAP` of
     // them and so needs the order to be an answer, not an artifact.
     program.normalize_diagnostic_order();
+
+    // One line, whitespace-separated `name value` pairs like the in-analyze
+    // line, stderr for the same reason. The named buckets do not sum to the
+    // `post-passes` total — the residual is the seam glue (the graph install,
+    // diagnostic-order normalization) — and `const-lower`/`const-interp` are a
+    // SUB-split of `const-eval`: the shared world's lowering + per-site
+    // assembly against the interpreter's evaluation, the two thirds/one third
+    // `const-eval.md` §10.2 had to hand-measure. Printed for macro worlds too,
+    // exactly as the aggregate line this extends was.
+    if phase_timing_enabled() {
+        let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+        let (const_lower, const_interp) = const_eval::phase_split();
+        eprintln!(
+            "[vilan phase] post-passes {:.1}ms call-graph {:.1}ms async-infer {:.1}ms \
+             view-suspensions {:.1}ms async-drops {:.1}ms context-drops {:.1}ms \
+             platform-color {:.1}ms const-eval {:.1}ms const-lower {:.1}ms \
+             const-interp {:.1}ms init-order {:.1}ms",
+            milliseconds(phase_post_start.elapsed()),
+            milliseconds(phase_graph),
+            milliseconds(phase_async),
+            milliseconds(phase_views),
+            milliseconds(phase_async_drops),
+            milliseconds(phase_context_drops),
+            milliseconds(phase_platform),
+            milliseconds(phase_const),
+            milliseconds(const_lower),
+            milliseconds(const_interp),
+            milliseconds(phase_init),
+        );
+    }
 }
 
 /// Whether `VILAN_LEAK_REPORT` asks for the per-analysis leak line (any value

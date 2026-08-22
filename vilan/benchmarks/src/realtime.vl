@@ -3,21 +3,28 @@
 // per-session update-frame counts (deterministic) and the settle time from
 // first mutation to every session having observed the final value.
 
+import std::http::{ Response, Server };
+import std::json::{ FromJson, Json, json_codec };
+import std::option::Option::{ None, Some, self };
 import std::print;
+import std::reactive::{ Signal, Subscription };
+import std::result::Result::{ Err, Ok, self };
+import std::rpc::{
+	DuplexEnd,
+	DuplexTransport,
+	HttpTransport,
+	ReactiveClient,
+	ReactiveServer,
+	RemoteSource,
+	SplitDuplex,
+	bridge,
+	connect_split,
+};
+import std::rpc_server::Service;
 import std::shared::Shared;
 import std::time::{ now_millis, sleep };
-import std::option::Option::{ self, Some, None };
-import std::result::Result::{ self, Ok, Err };
-import std::json::{ Json, FromJson, json_codec };
-import std::reactive::Signal;
-import std::rpc::{
-	HttpTransport, SplitDuplex, DuplexTransport, DuplexEnd, connect_split, bridge,
-	ReactiveServer, ReactiveClient, RemoteSource,
-};
 import std::wire::Frame;
-import std::rpc_server::serve_connected;
-import std::http::Response;
-import pkg::report::{ section, round };
+import pkg::report::{ round, section };
 
 let sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
@@ -68,6 +75,10 @@ impl CountingDuplex with DuplexTransport {
 struct Session {
 	frames: Shared<i32>,
 	last_seen: Shared<i32>,
+	// The mirror's lease — disposed when the measurement is done, which
+	// closes the channel (`Unsubscribe`) instead of leaving the server
+	// forwarding to a session nobody reads.
+	watching: Shared<Option<Subscription>>,
 }
 
 fun watch(base: str): Session {
@@ -76,17 +87,18 @@ fun watch(base: str): Session {
 	let counting = CountingDuplex { inner = split, inbound = frames };
 	let reactive = ReactiveClient::new(bridge(counting), json_codec());
 	let last_seen: Shared<i32> = Shared::new(0 - 1);
+	let watching: Shared<Option<Subscription>> = Shared::new(None);
 	let client = Client { transport = HttpTransport { url = i"{base}/rpc" }, codec = json_codec() };
 	match client.attach(split.connection) {
 		Ok(let channel) => {
 			let mirror: RemoteSource<i32> = reactive.source(channel);
-			let _watching = mirror.sub(|n| {
+			watching.write() = Some(mirror.sub(|n| {
 				last_seen.write() = n;
-			});
+			}));
 		},
 		Err(let error) => print("attach failed"),
 	}
-	Session { frames = frames, last_seen = last_seen }
+	Session { frames = frames, last_seen = last_seen, watching = watching }
 }
 
 fun run(finished: || void) {
@@ -95,20 +107,21 @@ fun run(finished: || void) {
 	// Port 0 (E33 — a fixed port collides with concurrent e2e legs under
 	// nextest): the OS picks a free one, and `on_start` reads it back for
 	// the same-process client sessions below to dial.
-	serve_connected(
-		0,
-		board.dispatcher().into_protocol(json_codec()),
-		|id, end| {
-			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
-		},
-		|id| {},
-		|request| Response::builder().code(404).body("benchmark").build(),
-		|server| {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(board.dispatcher().into_protocol(json_codec()))
+			.on_connect(|id, end| {
+				sessions.write().push((id, ReactiveServer::new(end, json_codec())));
+			})
+			.on_disconnect(|id| {}))
+		.on_request(|request| Response::builder().code(404).body("benchmark").build())
+		.on_start(|server| {
 			let port = server.port();
 			print(i"[port] {port}");
 			drive(port, finished);
-		},
-	);
+		})
+		.build()
+		.start();
 }
 
 fun drive(port: i32, finished: || void) {
@@ -132,15 +145,16 @@ fun drive(port: i32, finished: || void) {
 	}
 	// Poll until every session has observed the final value (or 5s).
 	mut waited = 0;
-	for (alice.last_seen.read() != mutations
-		|| bob.last_seen.read() != mutations
-		|| carol.last_seen.read() != mutations)
-		&& waited < 5000 {
+	for (alice.last_seen.read() != mutations || bob.last_seen.read() != mutations || carol.last_seen.read() != mutations) && waited < 5000 {
 		sleep(20);
 		waited += 20;
 	}
 	let settled = now_millis() - started;
 	print(i"per-session update frames: {alice.frames.read()} {bob.frames.read()} {carol.frames.read()} (subscribe + 1 per mutation)");
 	print(i"all sessions settled at {mutations} after {round(settled)} ms ({round(settled * 1000.0 / mutations)} us per mutation fan-out)");
+	// Done watching: release the three leases, which closes the channels.
+	alice.watching.read()?.dispose();
+	bob.watching.read()?.dispose();
+	carol.watching.read()?.dispose();
 	finished();
 }

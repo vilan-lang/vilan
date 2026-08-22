@@ -2,7 +2,7 @@
   "name": "vilan",
   "displayName": "Vilan",
   "description": "Language support for Vilan: live diagnostics, completion with signatures, hover, inlay hints, semantic highlighting, go to definition, find references, rename, formatting, and Organize Imports.",
-  "version": "0.34.0",
+  "version": "0.35.0",
   "publisher": "vilan-lang",
   "license": "MIT OR Apache-2.0",
   "icon": "icon.png",
@@ -96,7 +96,7 @@
         "vilan.inlayHints.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Show inlay type hints (inferred let-binding and parameter types). Applies live."
+          "description": "Show inlay type hints (the inferred type of an unannotated binding). Applies live."
         },
         "vilan.semanticTokens.enabled": {
           "type": "boolean",

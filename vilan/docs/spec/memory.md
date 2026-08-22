@@ -575,7 +575,7 @@ changes no ownership and is policed by rule 4.
   inferred container is a container. Deleting the annotation changes
   nothing, and neither does never writing one —
 
-  ```vilan,ignore
+  ```vilan,fragment
   mut arr: List<Guard> = [Guard { .. }];   // rejected
   mut arr = [Guard { .. }];                // rejected, identically
   let cell = Shared::new(Guard { .. });    // and so is this
@@ -609,7 +609,7 @@ changes no ownership and is policed by rule 4.
   through a `&mut T`, or over a `T`-typed component, is rejected at a resource
   instantiation:
 
-  ```vilan,ignore
+  ```vilan,fragment
   fun set<T>(slot: &mut T, own value: T) { slot = value; }   // rejected at T := a resource
   fun clear<T>(slot: &mut Option<T>) { slot = None; }        // and so is this
   ```

@@ -1118,7 +1118,7 @@ pub(crate) fn read_enum_backing<'a>(
             match enum_backing {
                 Some((established, owner, owner_span)) if established != kind => {
                     backing_disagrees = true;
-                    diagnostics.push(Error {
+                    diagnostics.push(Error { trace: Vec::new(),
                         note: Some(Note {
                             span: owner_span,
                             msg: format!("'{owner}' backs '{enum_name}' with {}", established.label()),
@@ -1138,34 +1138,35 @@ pub(crate) fn read_enum_backing<'a>(
                 None => enum_backing = Some((kind, variant_name, written.span())),
             }
         }
-        let value = match explicit_backing {
-            Some(_) if backing_disagrees => None,
-            Some(written) => match backing_literal_value(written) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    diagnostics.push(error);
-                    None
-                }
-            },
-            None => {
-                // §3.1(a): C-style auto-increment is meaningful for integers and
-                // there is no successor of `"start"`, so a string backing must
-                // be written on EVERY variant. Deriving it from the variant name
-                // is rejected on §2.1's evidence: five of std's eleven CSS enums
-                // have names no case convention produces (`AlignItems::Start` is
-                // `"flex-start"`, `Display::Hidden` is `"none"`), and a rule that
-                // is right for six and silently wrong for five is worse than no
-                // rule.
-                // A payload anywhere in the enum already broke the placement
-                // rule and was reported there; the missing-string rule has
-                // nothing to add on top of it (one mistake, one message).
-                if enum_backing.map(|(kind, _, _)| kind) == Some(Backing::Str)
-                    && first_payload_variant.is_none()
-                {
-                    let (owner, owner_span) = enum_backing
-                        .map(|(_, owner, span)| (owner, span))
-                        .expect("a string backing was established");
-                    diagnostics.push(Error {
+        let value =
+            match explicit_backing {
+                Some(_) if backing_disagrees => None,
+                Some(written) => match backing_literal_value(written) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        diagnostics.push(error);
+                        None
+                    }
+                },
+                None => {
+                    // §3.1(a): C-style auto-increment is meaningful for integers and
+                    // there is no successor of `"start"`, so a string backing must
+                    // be written on EVERY variant. Deriving it from the variant name
+                    // is rejected on §2.1's evidence: five of std's eleven CSS enums
+                    // have names no case convention produces (`AlignItems::Start` is
+                    // `"flex-start"`, `Display::Hidden` is `"none"`), and a rule that
+                    // is right for six and silently wrong for five is worse than no
+                    // rule.
+                    // A payload anywhere in the enum already broke the placement
+                    // rule and was reported there; the missing-string rule has
+                    // nothing to add on top of it (one mistake, one message).
+                    if enum_backing.map(|(kind, _, _)| kind) == Some(Backing::Str)
+                        && first_payload_variant.is_none()
+                    {
+                        let (owner, owner_span) = enum_backing
+                            .map(|(_, owner, span)| (owner, span))
+                            .expect("a string backing was established");
+                        diagnostics.push(Error { trace: Vec::new(),
                         note: Some(Note {
                             span: owner_span,
                             msg: format!("'{owner}' backs '{enum_name}' with a string here"),
@@ -1178,10 +1179,10 @@ pub(crate) fn read_enum_backing<'a>(
                              '{enum_name}' its own string"
                         ),
                     });
-                    None
-                } else {
-                    if next_discriminant.is_none() {
-                        diagnostics.push(Error {
+                        None
+                    } else {
+                        if next_discriminant.is_none() {
+                            diagnostics.push(Error { trace: Vec::new(),
                             note: None,
                             span: variant.1,
                             msg: format!(
@@ -1190,11 +1191,11 @@ pub(crate) fn read_enum_backing<'a>(
                                  an explicit discriminant"
                             ),
                         });
+                        }
+                        next_discriminant.map(BackingValue::Int)
                     }
-                    next_discriminant.map(BackingValue::Int)
                 }
-            }
-        };
+            };
         if let Some(value) = &value {
             if let BackingValue::Int(discriminant) = value {
                 // The continuation stops at the same edge an explicit
@@ -1210,6 +1211,7 @@ pub(crate) fn read_enum_backing<'a>(
             };
             match backing_owners.get(&key) {
                 Some((owner, owner_span)) => diagnostics.push(Error {
+                    trace: Vec::new(),
                     // Both variants are in the one declaration, so the note
                     // needs no source of its own.
                     note: Some(Note {
@@ -1284,6 +1286,7 @@ fn backing_literal_value(written: &BackingLiteral<'_>) -> Result<BackingValue, E
     };
     let reject = |msg: String| {
         Err(Error {
+            trace: Vec::new(),
             note: None,
             span: written.span(),
             msg,
@@ -1340,6 +1343,7 @@ fn backing_placement_error(
 ) -> Option<Error> {
     if has_payload {
         return Some(Error {
+            trace: Vec::new(),
             note: None,
             span: written.span(),
             msg: format!(
@@ -1350,6 +1354,7 @@ fn backing_placement_error(
     }
     let (payload_variant, payload_span) = first_payload_variant?;
     Some(Error {
+        trace: Vec::new(),
         note: Some(Note {
             span: payload_span,
             msg: format!("'{payload_variant}' carries a payload here"),
@@ -1451,7 +1456,7 @@ pub struct Implementation<'src> {
 /// One impl-declared candidate for `receiver.member` — a member some impl of
 /// the receiver's type declares, before precedence picks between them
 /// (`proposal/method-resolution.md` §3).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ImplMemberCandidate {
     member_id: Id,
     /// The declaring impl's subject, to reconcile against the receiver so the
@@ -1460,6 +1465,22 @@ struct ImplMemberCandidate {
     /// The trait the name comes from, or `None` when the member is INHERENT —
     /// the type's own, outranking every trait-provided candidate.
     home_trait: Option<Id>,
+    /// The home trait's arguments AS THIS RECEIVER INSTANTIATES THEM — std's
+    /// `impl type T with Into<T>` reached through a `Foo` is `Into<Foo>`, a
+    /// user's `impl Foo with Into<str>` is `Into<str>`. Empty for an inherent
+    /// member and for a trait with no parameters.
+    ///
+    /// Half of B73's R1 resolution key: the trait id alone made those two one
+    /// home, so `homes.len()` was 1, no ambiguity was raised, and declaration
+    /// order decided which body a call reached (`method-resolution.md` §13.3,
+    /// defect D1).
+    home_arguments: Vec<TypeId>,
+    /// Whether the providing impl takes the home trait's DEFAULT body rather
+    /// than declaring the member itself. Such an impl contributes a candidate
+    /// only where a declaring impl already occupies its home, so R3 can rank
+    /// the two (§13.2 row 17): the more specific impl wins and brings its
+    /// inherited default with it.
+    inherits_the_default: bool,
 }
 
 /// How `receiver.member` resolves against the impls whose subject matches
@@ -1472,6 +1493,22 @@ enum ImplMemberResolution {
     /// them: the call has to name one (`Trait::member(receiver)`). Carries the
     /// competing traits, in declaration order.
     AmbiguousTraits(Vec<Id>),
+    /// ONE trait provides the name at two or more distinct instantiations —
+    /// `Into<Foo>` and `Into<str>` for this receiver (B73's R1 key). §3.1's
+    /// `Trait::member` disambiguator has no argument slot, so naming the trait
+    /// settles nothing; the call is reported. Carries one candidate per home,
+    /// in declaration order.
+    AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
+    /// Two or more impls of ONE home that the specificity order does not rank
+    /// — `Box<type T: Display>` against `Box<type U: Ord>` for a `Box<i32>`
+    /// that satisfies both (§13.4(a)(3), reported at the call site per §13.6
+    /// Q4). Carries the unranked maxima, in declaration order.
+    AmbiguousImpls(Vec<ImplMemberCandidate>),
+    /// The winner takes the home trait's DEFAULT body (§13.2 row 17): the
+    /// member is the trait's own declaration, so the call re-dispatches through
+    /// the same channel Gap E's inherited defaults use. Carries the member, the
+    /// winning impl's subject, and the home as this receiver instantiates it.
+    FoundInheritedDefault(Id, TypeId, Id, Vec<TypeId>),
     Missing,
 }
 
@@ -2518,11 +2555,16 @@ pub struct Analyzer<'src> {
     // the operand's own span covers `e` alone.
     spread_spans: HashMap<Id, Span>,
     // The trait a bound call resolved through (`value.tag()` where `T: Marker`
-    // found `tag` in `Marker`), keyed by call id. The OnConstraint emission
+    // found `tag` in `Marker`), keyed by call id, WITH the arguments the bound
+    // wrote (`T: Conv<Baz>` -> `[Baz]`; empty for an unparameterized trait or
+    // where the site knows only the trait). The OnConstraint emission
     // dispatches on THAT trait's surface — override, else default — so an
     // inherent method sharing the name can't shadow the trait member the
-    // analyzer typed against.
-    bound_dispatch_traits: HashMap<Id, Id>,
+    // analyzer typed against, and on THAT instantiation, so a bound written
+    // `Conv<Baz>` cannot re-dispatch into an `impl .. with Conv<Bar>` that
+    // merely registered first (B73's R1; `method-resolution.md` §13.2 row 20 —
+    // the type confusion).
+    bound_dispatch_traits: HashMap<Id, (Id, Vec<TypeId>)>,
     prepped_trait_impls: Vec<TraitImplCheck<'src>>,
     // Every `impl Subject with Trait` clause whose trait resolved, recorded as
     // the (trait, subject) pair the coherence rule is keyed on (B98). Consumed
@@ -3498,6 +3540,7 @@ impl<'src> Analyzer<'src> {
         for (id, span, msg) in errors {
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg,
@@ -3918,7 +3961,15 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (anchor, span, msg, note) in bound_declarations {
-            self.push_anchored(Error { note, span, msg }, anchor);
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note,
+                    span,
+                    msg,
+                },
+                anchor,
+            );
         }
     }
 
@@ -4242,6 +4293,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(type_node);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -4258,6 +4310,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(type_node);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -4357,7 +4410,7 @@ impl<'src> Analyzer<'src> {
                 // cannot be hashed by value (destruction.md §8).
                 if self.type_is_resource(*field_type_id) {
                     let rendered = render_type(type_node);
-                    self.push_anchored(Error {
+                    self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
                         msg: format!(
@@ -4370,7 +4423,7 @@ impl<'src> Analyzer<'src> {
                 }
                 if !self.is_hashable_type(type_node) {
                     let rendered = render_type(type_node);
-                    self.push_anchored(Error {
+                    self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
                         msg: format!(
@@ -4395,7 +4448,7 @@ impl<'src> Analyzer<'src> {
             for (label, type_node, field_type_id, span) in members {
                 if self.type_is_resource(*field_type_id) {
                     let rendered = render_type(type_node);
-                    self.push_anchored(Error {
+                    self.push_anchored(Error { trace: Vec::new(),
                         note: None,
                         span: *span,
                         msg: format!(
@@ -4425,6 +4478,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(type_node);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -4458,6 +4512,7 @@ impl<'src> Analyzer<'src> {
             if !self.type_is_resource(subject_type_id) {
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!(
@@ -4865,6 +4920,7 @@ impl<'src> Analyzer<'src> {
             let elsewhere = self.other_module_clause(first.impl_id, second.impl_id);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span: second.span,
                     msg: format!(
@@ -4900,25 +4956,40 @@ impl<'src> Analyzer<'src> {
     /// `impl Bag with Combine` and `impl Bag with Combine<Bag>` would compare as
     /// different instantiations of the one they both are.
     fn effective_trait_arguments(&self, site: &TraitImplSite) -> Vec<TypeId> {
-        let Some(trait_) = self.traits.get(&site.trait_id) else {
-            return site.arguments.clone();
+        self.effective_trait_arguments_of(site.trait_id, &site.arguments, site.subject)
+    }
+
+    /// [`effective_trait_arguments`] over the parts rather than a
+    /// [`TraitImplSite`] — the same padding rule, reached from the resolution
+    /// path (B73's R1), which holds an [`Implementation`] and not a check's
+    /// recorded site.
+    fn effective_trait_arguments_of(
+        &self,
+        trait_id: Id,
+        written_arguments: &[TypeId],
+        subject: TypeId,
+    ) -> Vec<TypeId> {
+        let Some(trait_) = self.traits.get(&trait_id) else {
+            return written_arguments.to_vec();
         };
         trait_
             .generic_parameter_constraint_ids
             .iter()
             .enumerate()
-            .map(|(position, declared_id)| match site.arguments.get(position) {
-                Some(written_id) => *written_id,
-                None if matches!(declared_id.get_type(self), Type::Trait(id, _) if id == site.trait_id) => {
-                    site.subject
-                }
-                None => *declared_id,
-            })
+            .map(
+                |(position, declared_id)| match written_arguments.get(position) {
+                    Some(written_id) => *written_id,
+                    None if matches!(declared_id.get_type(self), Type::Trait(id, _) if id == trait_id) => {
+                        subject
+                    }
+                    None => *declared_id,
+                },
+            )
             .chain(
                 // A clause that wrote MORE arguments than the trait declares is
                 // already an arity error elsewhere; keep them so two such
                 // clauses still compare by what they wrote.
-                site.arguments
+                written_arguments
                     .iter()
                     .skip(trait_.generic_parameter_constraint_ids.len())
                     .copied(),
@@ -5107,6 +5178,7 @@ impl<'src> Analyzer<'src> {
             let span = self.declaration_name_span(second_id);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span,
                     msg: format!(
@@ -5207,6 +5279,7 @@ impl<'src> Analyzer<'src> {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span: impl_shape.name_span,
                     msg: format!(
@@ -5270,6 +5343,7 @@ impl<'src> Analyzer<'src> {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note,
                     span: impl_shape.name_span,
                     msg: format!(
@@ -5300,6 +5374,7 @@ impl<'src> Analyzer<'src> {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note,
                         span: anchor,
                         msg: if trait_shape.is_self[0] {
@@ -5353,6 +5428,7 @@ impl<'src> Analyzer<'src> {
                 };
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note,
                         span: anchor,
                         msg,
@@ -5393,6 +5469,7 @@ impl<'src> Analyzer<'src> {
                 let actual_label = self.pretty_print_type(&actual_type, &HashMap::default());
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note,
                         span: anchor,
                         msg: format!(
@@ -5455,7 +5532,7 @@ impl<'src> Analyzer<'src> {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             let expected_label = self.pretty_print_type(&expected_return, &HashMap::default());
             let actual_label = self.pretty_print_type(&actual_return, &HashMap::default());
-            self.push_anchored(Error {
+            self.push_anchored(Error { trace: Vec::new(),
 
                 note,
                 span: impl_shape.name_span,
@@ -6560,6 +6637,7 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         self.push_in_source(
             Error {
+                trace: Vec::new(),
                 note,
                 span,
                 msg: format!(
@@ -6883,7 +6961,7 @@ impl<'src> Analyzer<'src> {
             if self.type_is_resource(type_id) {
                 let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
                 let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
-                self.push_anchored(Error {
+                self.push_anchored(Error { trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!(
@@ -7013,6 +7091,7 @@ impl<'src> Analyzer<'src> {
         };
         self.push_anchored(
             Error {
+                trace: Vec::new(),
                 note: Some(crate::error::Note::here(
                     span,
                     "only plain data transfers: scalars, `str`, lists, options, and \
@@ -9865,7 +9944,7 @@ impl<'src> Analyzer<'src> {
                     move_span,
                 } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "use of `{name}` after it was moved: a resource has a single owner"
@@ -9879,7 +9958,7 @@ impl<'src> Analyzer<'src> {
                         )),
                     }
                 }
-                ResourceMoveViolation::PartialMove { at } => Error {
+                ResourceMoveViolation::PartialMove { at } => Error { trace: Vec::new(),
                     span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot move a resource field out of a live aggregate: a resource has \
                           one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make \
@@ -9889,7 +9968,7 @@ impl<'src> Analyzer<'src> {
                 },
                 ResourceMoveViolation::ConditionalMove { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is moved on one path through this branch but not another: a \
@@ -9901,7 +9980,7 @@ impl<'src> Analyzer<'src> {
                 }
                 ResourceMoveViolation::LoopMove { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is declared outside this loop and moved inside it: the move \
@@ -9928,7 +10007,7 @@ impl<'src> Analyzer<'src> {
                         }
                     };
                     let owned = format!("own {name}");
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "cannot move the resource `{name}` out of this function: it is declared \
@@ -9951,7 +10030,7 @@ impl<'src> Analyzer<'src> {
                         Some(subject_name) => format!("`{subject_name}`"),
                         None => "the subject".to_string(),
                     };
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "cannot move the resource `{name}` out of this pattern: it captures \
@@ -9968,7 +10047,7 @@ impl<'src> Analyzer<'src> {
                     binding,
                 } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "a closure cannot capture the resource `{name}`; pass a loan into the \
@@ -9980,7 +10059,7 @@ impl<'src> Analyzer<'src> {
                 }
                 ResourceMoveViolation::ModuleLevelMove { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is a module-level resource: it has process lifetime and \
@@ -9992,7 +10071,7 @@ impl<'src> Analyzer<'src> {
                 }
                 ResourceMoveViolation::ModuleLevelOverwrite { at, binding } => {
                     let name = self.binding_name(binding);
-                    Error {
+                    Error { trace: Vec::new(),
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "`{name}` is a module-level resource: it has process lifetime and \
@@ -10321,6 +10400,7 @@ impl<'src> Analyzer<'src> {
         };
         self.push_anchored(
             Error {
+                trace: Vec::new(),
                 span: site,
                 msg: format!(
                     "`{name}` is not move-clean when instantiated with a resource: {summary}, \
@@ -10492,6 +10572,7 @@ impl<'src> Analyzer<'src> {
         };
         self.push_anchored(
             Error {
+                trace: Vec::new(),
                 span: site,
                 msg: format!(
                     "`{name}` is not move-clean when instantiated with a resource: this \
@@ -11064,6 +11145,7 @@ impl<'src> Analyzer<'src> {
             };
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     span: site,
                     msg: format!(
                         "`{name}` is not move-clean when instantiated with a resource: \
@@ -11131,6 +11213,7 @@ impl<'src> Analyzer<'src> {
                         let rendered = render_type(type_node);
                         self.push_anchored(
                             Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!(
@@ -11146,6 +11229,7 @@ impl<'src> Analyzer<'src> {
                     None => {
                         self.push_anchored(
                             Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!(
@@ -11181,6 +11265,7 @@ impl<'src> Analyzer<'src> {
                     let rendered = render_type(element);
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -11199,6 +11284,7 @@ impl<'src> Analyzer<'src> {
                         .unwrap_or_else(|| "_".to_string());
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -11216,7 +11302,7 @@ impl<'src> Analyzer<'src> {
 
     /// Resolves a method `member_name` callable on a concrete `subject_type`
     /// (a struct or enum) by searching its implementations.
-    fn method_member_in_impls(&self, subject_type: &Type, member_name: &str) -> Option<Id> {
+    fn method_member_in_impls(&mut self, subject_type: &Type, member_name: &str) -> Option<Id> {
         self.method_member_impl_subject(subject_type, member_name)
             .map(|(member_id, _)| member_id)
     }
@@ -11230,13 +11316,19 @@ impl<'src> Analyzer<'src> {
     /// a caller that wants to tell them apart — and to say so — asks
     /// [`resolve_impl_member`] directly.
     fn method_member_impl_subject(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Option<(Id, TypeId)> {
         match self.resolve_impl_member(subject_type, member_name) {
-            ImplMemberResolution::Found(member_id, impl_subject) => Some((member_id, impl_subject)),
-            ImplMemberResolution::AmbiguousTraits(_) | ImplMemberResolution::Missing => None,
+            ImplMemberResolution::Found(member_id, impl_subject)
+            | ImplMemberResolution::FoundInheritedDefault(member_id, impl_subject, ..) => {
+                Some((member_id, impl_subject))
+            }
+            ImplMemberResolution::AmbiguousTraits(_)
+            | ImplMemberResolution::AmbiguousTraitArguments(_)
+            | ImplMemberResolution::AmbiguousImpls(_)
+            | ImplMemberResolution::Missing => None,
         }
     }
 
@@ -11249,7 +11341,7 @@ impl<'src> Analyzer<'src> {
     /// ([`declaration_order`]), so which candidate a tie names is a property of
     /// the program, not of the order its imports happen to be written in.
     fn method_member_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<ImplMemberCandidate> {
@@ -11267,16 +11359,32 @@ impl<'src> Analyzer<'src> {
     /// `[trait_only]` member is reachable when the path head IS the trait
     /// (access on the trait itself stays allowed, §3.2).
     fn static_path_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
         subject_is_trait: bool,
     ) -> Vec<ImplMemberCandidate> {
-        self.impl_member_candidates(subject_type, member_name, false, subject_is_trait)
+        let candidates =
+            self.impl_member_candidates(subject_type, member_name, false, subject_is_trait);
+        if !subject_is_trait {
+            return candidates;
+        }
+        // `Trait::member(receiver)` for a `self`-method is §3.1's disambiguator,
+        // not a static: which implementation runs is the RECEIVER's to decide,
+        // and the path head falls through to `trait_qualified_calls` to let it.
+        // An impl with a GENERIC subject compare_types the bare trait type,
+        // though, so std's `impl type T with Into<T>` answered the path itself
+        // and `Into::into(foo)` reached the blanket whatever `foo` implements
+        // (`method-resolution.md` §13.2 row 5). A trait's attached statics —
+        // `Iterator::from_fn`, which take no `self` — are untouched.
+        candidates
+            .into_iter()
+            .filter(|candidate| !self.is_self_method(candidate.member_id))
+            .collect()
     }
 
     fn impl_member_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
         methods_only: bool,
@@ -11292,7 +11400,11 @@ impl<'src> Analyzer<'src> {
         let Some(declaring) = self.implementations_by_member.get(member_name) else {
             return Vec::new();
         };
-        let mut candidates: Vec<ImplMemberCandidate> = declaring
+        // `(member, impl subject, home trait, the home's arguments AS WRITTEN)`.
+        // The written arguments are read here, where the declaring impl is in
+        // hand; padding and instantiation happen below, once the immutable
+        // borrow of `implementations_by_member` is released.
+        let mut found: Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> = declaring
             .iter()
             .map(|index| &self.implementations[*index])
             .filter(|implementation| {
@@ -11311,16 +11423,206 @@ impl<'src> Analyzer<'src> {
                     .get(member_name)
                     .copied()
                     .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
-                Some(ImplMemberCandidate {
+                let home_trait = self.member_home_trait(implementation, member_name);
+                let written_arguments = home_trait
+                    .and_then(|trait_id| {
+                        implementation
+                            .trait_args
+                            .iter()
+                            .find(|(id, _)| *id == trait_id)
+                            .map(|(_, arguments)| arguments.clone())
+                    })
+                    .unwrap_or_default();
+                Some((
                     member_id,
-                    impl_subject: implementation.subject,
-                    home_trait: self.member_home_trait(implementation, member_name),
-                })
+                    implementation.subject,
+                    home_trait,
+                    written_arguments,
+                ))
             })
             .collect();
-        candidates.sort_by_key(|candidate| self.declaration_order(candidate.member_id));
-        candidates.dedup_by_key(|candidate| candidate.member_id);
-        candidates
+        found.extend(self.inheriting_impls_of_declared_homes(subject_type, member_name, &found));
+        found.sort_by_key(|(member_id, ..)| self.declaration_order(*member_id));
+        found.dedup_by_key(|(member_id, ..)| *member_id);
+        let candidates: Vec<ImplMemberCandidate> = found
+            .into_iter()
+            .map(
+                |(member_id, impl_subject, home_trait, written_arguments)| ImplMemberCandidate {
+                    member_id,
+                    impl_subject,
+                    home_trait,
+                    home_arguments: match home_trait {
+                        Some(trait_id) => self.instantiated_home_arguments(
+                            subject_type,
+                            trait_id,
+                            &written_arguments,
+                            impl_subject,
+                        ),
+                        None => Vec::new(),
+                    },
+                    inherits_the_default: !self.declares_member(impl_subject, member_id),
+                },
+            )
+            .collect();
+        self.applicable_candidates(subject_type, candidates)
+    }
+
+    /// Whether the impl with this subject DECLARES `member_id` itself, as
+    /// opposed to inheriting it as a trait default (B73 R3, row 17).
+    fn declares_member(&self, impl_subject: TypeId, member_id: Id) -> bool {
+        self.implementations.iter().any(|implementation| {
+            implementation.subject == impl_subject
+                && implementation
+                    .declarations
+                    .values()
+                    .any(|declared| *declared == member_id)
+        })
+    }
+
+    /// The impls that provide `member_name` by taking their trait's DEFAULT body
+    /// — collected only for a home some declaring impl already occupies, so
+    /// R3 can rank them side by side (§13.2 row 17, ruled `9` at §13.6 Q5).
+    ///
+    /// Deliberately NOT every impl that inherits a default: §3's tiers stand, so
+    /// a declaration still beats an unrelated trait's default outright, and Gap
+    /// E's fallback still owns the case where no impl declares the name at all.
+    /// Specificity ranks *inside* one home, and this is the candidate set that
+    /// makes that ranking complete — without it, `impl Foo with Tag { }` beside
+    /// a blanket that declares `tag` contributes nothing and the trait's default
+    /// is unreachable for `Foo` in either declaration order.
+    fn inheriting_impls_of_declared_homes(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        declared: &[(Id, TypeId, Option<Id>, Vec<TypeId>)],
+    ) -> Vec<(Id, TypeId, Option<Id>, Vec<TypeId>)> {
+        let homes: Vec<Id> = declared
+            .iter()
+            .filter_map(|(_, _, home_trait, _)| *home_trait)
+            .collect();
+        if homes.is_empty() {
+            return Vec::new();
+        }
+        self.implementations
+            .iter()
+            .filter(|implementation| !implementation.declarations.contains_key(member_name))
+            .filter(|implementation| {
+                self.compare_type(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
+            .filter_map(|implementation| {
+                let trait_id = *implementation
+                    .trait_ids
+                    .iter()
+                    .find(|trait_id| homes.contains(trait_id))?;
+                let member_id = self.method_member_in_trait(trait_id, member_name)?;
+                if !self.member_has_default_body(member_id) {
+                    return None;
+                }
+                let written_arguments = implementation
+                    .trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)
+                    .map(|(_, arguments)| arguments.clone())
+                    .unwrap_or_default();
+                Some((
+                    member_id,
+                    implementation.subject,
+                    Some(trait_id),
+                    written_arguments,
+                ))
+            })
+            .collect()
+    }
+
+    /// B73's R3 applicability step (§13.6 Q6, ruled in scope): an impl whose
+    /// binders carry bounds the receiver does not satisfy does not compete.
+    /// `compare_type` treats a bounded parameter as a hole like any other, so
+    /// `impl Box<type T: Display>` used to win the race on a `Box<Opaque>` and
+    /// then fail its own bound check while an applicable `impl Box<type T>` sat
+    /// below it — §13.2 row 15's false rejection.
+    ///
+    /// The filter narrows the field and never empties it: when nothing applies,
+    /// the unfiltered list stands so the program keeps the bound diagnostic it
+    /// has always had, which is the right message when no impl fits.
+    fn applicable_candidates(
+        &mut self,
+        subject_type: &Type,
+        candidates: Vec<ImplMemberCandidate>,
+    ) -> Vec<ImplMemberCandidate> {
+        let mut applicable: Vec<ImplMemberCandidate> = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            if self.impl_bounds_hold(candidate.impl_subject, subject_type) {
+                applicable.push(candidate.clone());
+            }
+        }
+        match applicable.is_empty() {
+            true => candidates,
+            false => applicable,
+        }
+    }
+
+    /// Whether every bound on the impl subject's binders holds for what this
+    /// receiver binds them to. Only a NOMINAL binding can fail: anything still
+    /// abstract or unresolved is undecided here, and an undecided bound is not
+    /// evidence for dropping a candidate.
+    fn impl_bounds_hold(&mut self, impl_subject: TypeId, subject_type: &Type) -> bool {
+        let impl_subject_type = impl_subject.get_type(self);
+        let Some((_, bindings)) =
+            self.reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+        else {
+            return true;
+        };
+        bindings.iter().all(|(constraint_id, bound_id)| {
+            let bound = bound_id.get_type(self);
+            if !matches!(bound, Type::Struct(..) | Type::Enum(..)) {
+                return true;
+            }
+            self.generic_bound_trait_ids(*constraint_id)
+                .into_iter()
+                .all(|trait_id| self.type_implements_trait(&bound, trait_id))
+        })
+    }
+
+    /// The home trait's arguments as THIS receiver instantiates them — B73's R1
+    /// key. Two steps, both already shipped elsewhere: pad the `with` clause to
+    /// the trait's arity with its declared defaults, resolving `= Self` to the
+    /// subject (B98's pair key, [`effective_trait_arguments`]); then bind the
+    /// impl's own generic parameters from the receiver and substitute, so std's
+    /// `impl type T with Into<T>` reads as `Into<Foo>` on a `Foo` rather than as
+    /// the abstract `Into<T>` it is written as.
+    ///
+    /// Without the second step every blanket impl in the program would share one
+    /// home with every specific impl of the same trait, which is exactly the
+    /// collapse `method-resolution.md` §13.3 measured.
+    fn instantiated_home_arguments(
+        &mut self,
+        subject_type: &Type,
+        trait_id: Id,
+        written_arguments: &[TypeId],
+        impl_subject: TypeId,
+    ) -> Vec<TypeId> {
+        let effective =
+            self.effective_trait_arguments_of(trait_id, written_arguments, impl_subject);
+        if effective.is_empty() {
+            return effective;
+        }
+        let impl_subject_type = impl_subject.get_type(self);
+        let bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        effective
+            .into_iter()
+            .map(|argument_id| {
+                let argument = argument_id.get_type(self);
+                let resolved = self.substitute_type(&argument, &bindings);
+                resolved.get_type_id(self)
+            })
+            .collect()
     }
 
     /// The precedence rule of `proposal/method-resolution.md` §3, for a
@@ -11328,8 +11630,13 @@ impl<'src> Analyzer<'src> {
     /// unconditionally; two traits providing the same name with no inherent
     /// member above them is an ambiguity the call has to resolve by naming one
     /// (`Trait::member(receiver)`).
-    fn resolve_impl_member(&self, subject_type: &Type, member_name: &str) -> ImplMemberResolution {
-        self.rank_member_candidates(self.method_member_candidates(subject_type, member_name))
+    fn resolve_impl_member(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> ImplMemberResolution {
+        let candidates = self.method_member_candidates(subject_type, member_name);
+        self.rank_member_candidates(candidates)
     }
 
     /// The tiering itself, over an already-collected candidate list — shared by
@@ -11346,26 +11653,346 @@ impl<'src> Analyzer<'src> {
         {
             return ImplMemberResolution::Found(inherent.member_id, inherent.impl_subject);
         }
-        // Tier 2: trait-provided. Two impls of the SAME trait are not an
-        // ambiguity — the name has one home, and only one of them can be live
-        // in a given build (the platform-twin shape, §2).
-        let mut homes: Vec<Id> = Vec::new();
+        // Tier 2: trait-provided. A home is `(trait, the arguments THIS receiver
+        // instantiates)` — B73's R1. Keying on the trait id alone made std's
+        // `impl type T with Into<T>` and a user's `impl Foo with Into<str>` one
+        // home for a `Foo`, so there was one home, no ambiguity was raised, and
+        // `candidates.first()` handed the call to whichever impl registered
+        // first (std, always).
+        let mut homes: Vec<Vec<&ImplMemberCandidate>> = Vec::new();
         for candidate in &candidates {
-            if let Some(trait_id) = candidate.home_trait
-                && !homes.contains(&trait_id)
+            let Some(trait_id) = candidate.home_trait else {
+                continue;
+            };
+            let existing = homes.iter_mut().find(|home| {
+                home[0].home_trait == Some(trait_id)
+                    && self.same_impl_types(
+                        &home[0].home_arguments,
+                        &candidate.home_arguments,
+                        &mut Vec::new(),
+                    )
+            });
+            match existing {
+                Some(home) => home.push(candidate),
+                None => homes.push(vec![candidate]),
+            }
+        }
+        // Two DIFFERENT traits keep §3/§4's verdict and its `Trait::member`
+        // steer. Two instantiations of ONE trait have no such spelling, so they
+        // are reported apart (R2 gives the expected type a chance first).
+        let mut distinct_traits: Vec<Id> = Vec::new();
+        for home in &homes {
+            if let Some(trait_id) = home[0].home_trait
+                && !distinct_traits.contains(&trait_id)
             {
-                homes.push(trait_id);
+                distinct_traits.push(trait_id);
             }
         }
-        if homes.len() > 1 {
-            return ImplMemberResolution::AmbiguousTraits(homes);
+        if distinct_traits.len() > 1 {
+            return ImplMemberResolution::AmbiguousTraits(distinct_traits);
         }
-        match candidates.first() {
-            Some(candidate) => {
-                ImplMemberResolution::Found(candidate.member_id, candidate.impl_subject)
+        // R3: rank the impls WITHIN each home by specificity (§13.4(a)).
+        let ranked: Vec<Result<&ImplMemberCandidate, Vec<ImplMemberCandidate>>> = homes
+            .iter()
+            .map(|home| self.most_specific_in_home(home))
+            .collect();
+        // Two homes of ONE trait have no `Trait::member` spelling to pick
+        // between them. Reporting is what makes row 2 stop being a silent wrong
+        // answer; R2 gives the call's expected type the first chance to choose.
+        // Each home is represented by its most specific impl — an unranked home
+        // by its first maximum, the residue §13.8 records as deferred.
+        if ranked.len() > 1 {
+            return ImplMemberResolution::AmbiguousTraitArguments(
+                ranked
+                    .into_iter()
+                    .filter_map(|home| match home {
+                        Ok(winner) => Some(winner.clone()),
+                        Err(unranked) => unranked.into_iter().next(),
+                    })
+                    .collect(),
+            );
+        }
+        match ranked.into_iter().next() {
+            Some(Ok(winner)) => self.resolution_for_candidate(winner),
+            Some(Err(unranked)) => ImplMemberResolution::AmbiguousImpls(unranked),
+            None => match candidates.first() {
+                Some(candidate) => self.resolution_for_candidate(candidate),
+                None => ImplMemberResolution::Missing,
+            },
+        }
+    }
+
+    /// A won candidate's verdict: an ordinary `Found`, or — when the winning
+    /// impl takes its trait's default body — the inherited-default form, whose
+    /// member id belongs to the trait and needs Gap E's re-dispatch.
+    fn resolution_for_candidate(&self, candidate: &ImplMemberCandidate) -> ImplMemberResolution {
+        match (candidate.inherits_the_default, candidate.home_trait) {
+            (true, Some(trait_id)) => ImplMemberResolution::FoundInheritedDefault(
+                candidate.member_id,
+                candidate.impl_subject,
+                trait_id,
+                candidate.home_arguments.clone(),
+            ),
+            _ => ImplMemberResolution::Found(candidate.member_id, candidate.impl_subject),
+        }
+    }
+
+    /// Whether `pattern` — an impl subject, in its own generic terms — MATCHES
+    /// `target`, another impl subject, with the pattern's binders read as holes
+    /// and the target's read as RIGID. `Box<type T>` matches `Box<i32>` and
+    /// `Box<List<i32>>`; neither of those matches `Box<type T>`.
+    ///
+    /// That asymmetry is the whole of §13.4(a)(1): where `compare_type` is
+    /// compatibility and answers yes in both directions, this answers yes in
+    /// exactly one, and the direction it refuses is which impl is more
+    /// specific.
+    fn impl_subject_matches(&self, pattern: TypeId, target: TypeId) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match (pattern.get_type(self), target.get_type(self)) {
+            // A hole matches anything, including another hole; a concrete
+            // pattern does not match a hole.
+            (Type::Generic(_), _) => true,
+            (_, Type::Generic(_)) => false,
+            (Type::Struct(left_id, left_arguments), Type::Struct(right_id, right_arguments))
+            | (Type::Enum(left_id, left_arguments), Type::Enum(right_id, right_arguments))
+            | (Type::Trait(left_id, left_arguments), Type::Trait(right_id, right_arguments)) => {
+                left_id == right_id
+                    && self.impl_subject_arguments_match(&left_arguments, &right_arguments)
             }
-            None => ImplMemberResolution::Missing,
+            (Type::Tuple(left_items), Type::Tuple(right_items)) => {
+                self.impl_subject_arguments_match(&left_items, &right_items)
+            }
+            (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
+                left_length == right_length && self.impl_subject_matches(left_item, right_item)
+            }
+            (left, right) => left == right,
         }
+    }
+
+    /// Argument lists for [`impl_subject_matches`]. An ERASED side — a subject
+    /// written `List` with no arguments — carries no shape to compare, so the
+    /// heads alone decide, exactly as `compare_argument_types` treats it.
+    fn impl_subject_arguments_match(&self, pattern: &[TypeId], target: &[TypeId]) -> bool {
+        if pattern.is_empty() || target.is_empty() {
+            return true;
+        }
+        pattern.len() == target.len()
+            && pattern
+                .iter()
+                .zip(target.iter())
+                .all(|(pattern_id, target_id)| self.impl_subject_matches(*pattern_id, *target_id))
+    }
+
+    /// The binders a subject writes, in walk order — the positions
+    /// [`subject_bounds_are_stronger`] aligns.
+    fn collect_subject_binders(&self, subject: TypeId, binders: &mut Vec<TypeId>) {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return;
+        };
+        match subject.get_type(self) {
+            Type::Generic(constraint_id) => binders.push(constraint_id),
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                for argument in arguments {
+                    self.collect_subject_binders(argument, binders);
+                }
+            }
+            Type::Tuple(items) => {
+                for item in items {
+                    self.collect_subject_binders(item, binders);
+                }
+            }
+            Type::Array(item, _) => self.collect_subject_binders(item, binders),
+            _ => {}
+        }
+    }
+
+    /// §13.4(a)(2): with the subject shapes equal up to binder renaming, the
+    /// impl whose binders carry a strictly stronger bound set is more specific —
+    /// `Box<type T: Display>` ≻ `Box<type T>`. "Stronger" is superset per
+    /// aligned binder, with at least one position strictly larger; two binders
+    /// bounded by unrelated traits are neither, which is the residue R3 reports
+    /// rather than ranks.
+    fn subject_bounds_are_stronger(&self, stronger: TypeId, weaker: TypeId) -> bool {
+        let mut stronger_binders = Vec::new();
+        let mut weaker_binders = Vec::new();
+        self.collect_subject_binders(stronger, &mut stronger_binders);
+        self.collect_subject_binders(weaker, &mut weaker_binders);
+        if stronger_binders.is_empty() || stronger_binders.len() != weaker_binders.len() {
+            return false;
+        }
+        let mut strictly = false;
+        for (stronger_id, weaker_id) in stronger_binders.iter().zip(weaker_binders.iter()) {
+            let stronger_bounds = self.generic_bound_trait_ids(*stronger_id);
+            let weaker_bounds = self.generic_bound_trait_ids(*weaker_id);
+            if !weaker_bounds
+                .iter()
+                .all(|trait_id| stronger_bounds.contains(trait_id))
+            {
+                return false;
+            }
+            if stronger_bounds.len() > weaker_bounds.len() {
+                strictly = true;
+            }
+        }
+        strictly
+    }
+
+    /// The specificity order over two impls of ONE home (§13.4(a)): subject
+    /// shape first, then the binders' bounds when the shapes are equal.
+    fn impl_outranks(&self, candidate: &ImplMemberCandidate, other: &ImplMemberCandidate) -> bool {
+        let (subject, other_subject) = (candidate.impl_subject, other.impl_subject);
+        if subject == other_subject {
+            return false;
+        }
+        let matches_forward = self.impl_subject_matches(subject, other_subject);
+        let matches_backward = self.impl_subject_matches(other_subject, subject);
+        if matches_backward && !matches_forward {
+            return true;
+        }
+        if matches_forward && !matches_backward {
+            return false;
+        }
+        // Equal shapes: the stronger bound set wins.
+        matches_forward && self.subject_bounds_are_stronger(subject, other_subject)
+    }
+
+    /// Whether two impls of one home sit at the SAME point in the specificity
+    /// order — mutually matching shapes and binder-for-binder identical bounds.
+    /// That is the platform-twin shape §2 measured: one program, two impls, only
+    /// one live per build, and *not* an ambiguity. Two impls that merely fail to
+    /// rank — `Box<type T: Display>` against `Box<type U: Ord>` — are not the
+    /// same point, and R3 reports them.
+    fn impls_rank_equally(
+        &self,
+        candidate: &ImplMemberCandidate,
+        other: &ImplMemberCandidate,
+    ) -> bool {
+        let (subject, other_subject) = (candidate.impl_subject, other.impl_subject);
+        if subject == other_subject {
+            return true;
+        }
+        if !self.impl_subject_matches(subject, other_subject)
+            || !self.impl_subject_matches(other_subject, subject)
+        {
+            return false;
+        }
+        let mut binders = Vec::new();
+        let mut other_binders = Vec::new();
+        self.collect_subject_binders(subject, &mut binders);
+        self.collect_subject_binders(other_subject, &mut other_binders);
+        binders.len() == other_binders.len()
+            && binders
+                .iter()
+                .zip(other_binders.iter())
+                .all(|(left, right)| self.same_generic_bounds(*left, *right, &mut Vec::new()))
+    }
+
+    /// R3 over one home's candidates: the maxima of the specificity order.
+    /// A single maximum is the winner; several that rank equally keep
+    /// declaration order (the platform-twin shape); several that do not rank
+    /// are the residue §13.4(a)(3) leaves deliberately unranked, reported at the
+    /// call site (§13.6 Q4).
+    fn most_specific_in_home<'a>(
+        &self,
+        home: &[&'a ImplMemberCandidate],
+    ) -> Result<&'a ImplMemberCandidate, Vec<ImplMemberCandidate>> {
+        let maxima: Vec<&ImplMemberCandidate> = home
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !home
+                    .iter()
+                    .any(|other| self.impl_outranks(other, candidate))
+            })
+            .collect();
+        let Some(first) = maxima.first().copied() else {
+            // Cannot happen for a non-empty home — the order is irreflexive —
+            // but resolution never depends on that being true.
+            return home.first().copied().ok_or_else(Vec::new);
+        };
+        match maxima
+            .iter()
+            .all(|candidate| self.impls_rank_equally(first, candidate))
+        {
+            true => Ok(first),
+            false => Err(maxima.into_iter().cloned().collect()),
+        }
+    }
+
+    /// B73's R2: the type the call site expects picks among argument-distinct
+    /// homes. Exactly one candidate whose return type — as THIS receiver
+    /// instantiates it — reconciles with the expectation wins; zero, or two or
+    /// more, is `None` and the caller reports the ambiguity.
+    ///
+    /// Method resolution runs receiver-first everywhere else, so this is the one
+    /// place the annotation on the left of the `=` reaches across and chooses
+    /// among the implementations on the right. It is what makes
+    /// `let b: Bar = foo.into()` mean the user's `impl Foo with Into<Bar>`
+    /// rather than std's blanket, and what `variadic-generics.md` 182–187
+    /// recorded as its blocker.
+    fn select_home_by_expected_type(
+        &mut self,
+        call_id: Id,
+        subject_type: &Type,
+        homes: &[(Id, TypeId)],
+    ) -> Option<(Id, TypeId)> {
+        let expected_id = self.expected_types.get(&call_id).copied()?;
+        let expected = expected_id.get_type(self);
+        // An expectation that is itself open constrains nothing — the call is
+        // as ambiguous as it was without one.
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+            return None;
+        }
+        let mut selected: Option<(Id, TypeId)> = None;
+        for (member_id, impl_subject) in homes {
+            let Some(return_type) =
+                self.member_return_type_for(*member_id, *impl_subject, subject_type)
+            else {
+                continue;
+            };
+            // A return type that never resolved reconciles with everything, so
+            // it must not be allowed to *win* the selection.
+            if matches!(return_type, Type::Unknown | Type::Unresolved | Type::Any) {
+                continue;
+            }
+            if !self.compare_type(&return_type, &expected, &HashMap::default()) {
+                continue;
+            }
+            if selected.is_some() {
+                // Two homes fit the expectation: it does not disambiguate.
+                return None;
+            }
+            selected = Some((*member_id, *impl_subject));
+        }
+        selected
+    }
+
+    /// A candidate member's declared return type, with the declaring impl's own
+    /// binders bound from the receiver — so the blanket's `fun into(self): T`
+    /// reads as `Foo` on a `Foo` and the user's `fun into(self): Bar` as `Bar`.
+    /// `None` when the member declares no return type.
+    fn member_return_type_for(
+        &mut self,
+        member_id: Id,
+        impl_subject: TypeId,
+        subject_type: &Type,
+    ) -> Option<Type> {
+        let return_type_id = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => self.functions.get(function_id)?.return_type_id?,
+            Some(Expr::ExternalFunction(function_id)) => {
+                self.external_functions.get(function_id)?.return_type_id
+            }
+            _ => return None,
+        };
+        let impl_subject_type = impl_subject.get_type(self);
+        let bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject_type, subject_type, &HashMap::default())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        let declared = return_type_id.get_type(self);
+        Some(self.substitute_type(&declared, &bindings))
     }
 
     /// The trait that is `member_name`'s home when `implementation` provides it
@@ -11386,6 +12013,55 @@ impl<'src> Analyzer<'src> {
                         .is_some_and(|trait_| trait_.declarations.contains_key(member_name))
                 })
         })
+    }
+
+    /// An impl's subject as the program writes it — `Box<T: Display>`, not the
+    /// receiver it is being matched against — so an unranked overlap names the
+    /// two definitions the reader has to go and edit (B1). The binders' bounds
+    /// are part of the spelling: without them the two subjects of §13.4(a)(3)'s
+    /// residue render identically.
+    fn impl_subject_label(&self, impl_subject: TypeId) -> String {
+        let mut binders = Vec::new();
+        self.collect_subject_binders(impl_subject, &mut binders);
+        let rendered = self.pretty_print_type(&impl_subject.get_type(self), &HashMap::default());
+        let bounds: Vec<String> = binders
+            .iter()
+            .filter_map(|constraint_id| {
+                let name = self.generic_constraint_names.get(constraint_id)?;
+                let traits: Vec<String> = self
+                    .generic_bound_traits(*constraint_id)
+                    .into_iter()
+                    .map(|(trait_id, arguments)| {
+                        self.pretty_print_type(
+                            &Type::Trait(trait_id, arguments),
+                            &HashMap::default(),
+                        )
+                    })
+                    .collect();
+                match traits.is_empty() {
+                    true => None,
+                    false => Some(format!("{name}: {}", traits.join(" + "))),
+                }
+            })
+            .collect();
+        match bounds.is_empty() {
+            true => rendered,
+            false => format!("{rendered} where {}", bounds.join(", ")),
+        }
+    }
+
+    /// One candidate's home, spelled as THIS receiver instantiates it —
+    /// `Into<Foo>` for std's blanket reached through a `Foo`, `Into<str>` for
+    /// the user's own impl (B1: the reader has to be able to tell the two
+    /// apart, and `Into` twice does not).
+    fn home_label(&self, candidate: &ImplMemberCandidate) -> String {
+        let Some(trait_id) = candidate.home_trait else {
+            return String::new();
+        };
+        self.pretty_print_type(
+            &Type::Trait(trait_id, candidate.home_arguments.clone()),
+            &HashMap::default(),
+        )
     }
 
     /// A trait's user-facing spelling for one subject — with the arguments the
@@ -13868,7 +14544,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for expr_id in escapes {
-            self.push_anchored(Error { note: None,
+            self.push_anchored(Error { trace: Vec::new(), note: None,
                 span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                 msg: "a view cannot escape its scope: it may not be returned, stored in a field, placed in a collection, or carried in an enum payload. Return an owned value or a handle instead.".to_string(),
             }, expr_id);
@@ -14769,6 +15445,7 @@ impl<'src> Analyzer<'src> {
                 for (parameter_id, form) in view_parameters {
                     self.push_anchored(
                         Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
                             msg: async_view_parameter_message(form),
@@ -14846,6 +15523,7 @@ impl<'src> Analyzer<'src> {
             };
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&anchor).unwrap_or(&&EMPTY_SPAN),
                     msg,
@@ -14932,6 +15610,7 @@ impl<'src> Analyzer<'src> {
         for (reference_id, name) in errors {
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                     msg: async_view_capture_message(name),
@@ -15358,7 +16037,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (reseat_id, name) in violations {
-            self.push_anchored(Error { note: None,
+            self.push_anchored(Error { trace: Vec::new(), note: None,
                 span: **self.span_map.get(&reseat_id).unwrap_or(&&EMPTY_SPAN),
                 msg: format!(
                     "cannot reseat a view to '{name}', which goes out of scope before the view; the view would dangle. Reseat to a place that outlives the view, or use a handle."
@@ -15673,6 +16352,7 @@ impl<'src> Analyzer<'src> {
                 let advice = Self::immutability_advice(name, fix);
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!("cannot mutate immutable '{name}'; {advice}."),
@@ -15733,6 +16413,7 @@ impl<'src> Analyzer<'src> {
                         let advice = Self::immutability_advice(name, fix);
                         self.push_anchored(
                             Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!("cannot mutate immutable '{name}'; {advice}."),
@@ -15844,7 +16525,7 @@ impl<'src> Analyzer<'src> {
         }
         for leak in leaks {
             let span = **self.span_map.get(&leak).unwrap_or(&&EMPTY_SPAN);
-            self.push_anchored(Error { note: None,
+            self.push_anchored(Error { trace: Vec::new(), note: None,
                 span,
                 msg: "a view can't be read as a value here; write `*` to copy the value out \
                       (a view's value is explicit: `*v` is the only way to cross from view to value)"
@@ -15874,6 +16555,7 @@ impl<'src> Analyzer<'src> {
                 let advice = Self::immutability_advice(name, fix);
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -15923,7 +16605,7 @@ impl<'src> Analyzer<'src> {
                 initial.is_some_and(|initial_id| self.assignment_target_is_view(initial_id));
             // R7: a view binding may not be `mut`.
             if mutable && holds_view {
-                self.push_anchored(Error { note: None,
+                self.push_anchored(Error { trace: Vec::new(), note: None,
                     span: name_span,
                     msg: format!(
                         "view binding '{name}' cannot be `mut`: a view cannot be rebound. Declare it `let`, and mutate the referent by assigning through it (`{name} = …`)."
@@ -15945,6 +16627,7 @@ impl<'src> Analyzer<'src> {
                 };
                 self.push_anchored(
                     Error {
+                        trace: Vec::new(),
                         note: None,
                         span: name_span,
                         msg,
@@ -16010,7 +16693,7 @@ impl<'src> Analyzer<'src> {
                     None => continue,
                 };
                 if !self.assignment_target_is_view(*argument_id) {
-                    self.push_anchored(Error { note: None,
+                    self.push_anchored(Error { trace: Vec::new(), note: None,
                         span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
@@ -16096,6 +16779,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             self.warnings.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: concat!(
@@ -16141,7 +16825,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             if self.call_is_must_use(*call_id) {
-                self.warnings.push(Error { note: None,
+                self.warnings.push(Error { trace: Vec::new(), note: None,
                     span: **self.span_map.get(&statement_id).unwrap_or(&&EMPTY_SPAN),
                     msg: "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string(),
                 });
@@ -16729,6 +17413,7 @@ impl<'src> Analyzer<'src> {
         for (parameter_id, name) in resource_rejections {
             self.push_anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -17432,6 +18117,7 @@ impl<'src> Analyzer<'src> {
             return length;
         }
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span: node.1,
             msg: "an array length must be a non-negative integer literal \
@@ -17455,6 +18141,7 @@ impl<'src> Analyzer<'src> {
     fn reject_lift_region_condition(&mut self, condition: &Spanned<Node<'src>>) {
         if matches!(condition.0, Node::LiftRegion(..)) {
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span: condition.1,
                 msg: "the `?` lifts this condition to an `Option`/`Result`, which a \
@@ -17475,6 +18162,7 @@ impl<'src> Analyzer<'src> {
             // caught here, with the idiom.
             if matches!(&inner.0, Node::Assign(..)) {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "Vilan has no const declarations; write `let x = const ..`".to_string(),
@@ -17539,6 +18227,7 @@ impl<'src> Analyzer<'src> {
                     // `i"""` whose malformed shape degraded to this node.
                     let base = node.1.end.saturating_sub(3 + x.len());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: (base + range.start..base + range.end).into(),
                         msg: message,
@@ -17594,6 +18283,7 @@ impl<'src> Analyzer<'src> {
                     Node::Number(name, fraction, suffix) => {
                         if suffix.is_some() {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: member.1,
                                 msg: "a tuple position is a bare number (`.0`, `.1`); drop the \
@@ -17652,6 +18342,7 @@ impl<'src> Analyzer<'src> {
                             }
                             _ => {
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: call_subject.1,
                                     msg: "expected a method name after `.`".to_string(),
@@ -17662,6 +18353,7 @@ impl<'src> Analyzer<'src> {
                     }
                     _ => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: member.1,
                             msg: "expected a field or method name after `.`".to_string(),
@@ -17731,6 +18423,7 @@ impl<'src> Analyzer<'src> {
                 // `[T; n]` is a TYPE — the type parser produces it in type
                 // position only; in value position it's a stray type annotation.
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a `[T; n]` array type isn't a value; write an array \
@@ -17855,6 +18548,7 @@ impl<'src> Analyzer<'src> {
             Node::MacroFun(function) => {
                 if !self.module_scope_ids.contains(&scope_id) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "a `macro fun` must be a top-level item".to_string(),
@@ -17929,6 +18623,7 @@ impl<'src> Analyzer<'src> {
                     // Reached only where expansion never runs — a macro body
                     // (the world walks the definition's original text).
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: format!(
@@ -17958,6 +18653,7 @@ impl<'src> Analyzer<'src> {
                 } else {
                     // Reached only where expansion never runs — a macro body.
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "this `macro { .. }` block was not expanded: a block cannot \
@@ -17975,6 +18671,7 @@ impl<'src> Analyzer<'src> {
                 // in a body has nothing to attach to.
                 if !self.module_scope_ids.contains(&scope_id) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "`export` is a module-level item and cannot appear inside a body"
@@ -18128,6 +18825,7 @@ impl<'src> Analyzer<'src> {
                     // function with a callable type so calls infer their return.
                     if function.body.is_some() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: function.name.1,
                             msg: "an `external` function cannot have a body".to_string(),
@@ -18192,6 +18890,7 @@ impl<'src> Analyzer<'src> {
                             // declared `external`.
                             if !self.walking_trait_body {
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: function.name.1,
                                     msg: format!(
@@ -18217,36 +18916,21 @@ impl<'src> Analyzer<'src> {
                     {
                         self.expected_types.insert(expr_id, return_type_id);
                         self.return_sites.push((id, expr_id));
-                        // P28 dedup (editing-dx.md §17.2; deferred at §16 as
-                        // needing "the tail-construction site to know a
-                        // preceding `ret` already diverged"): when the
-                        // block's own last STATEMENT is itself a `ret`,
-                        // that `ret`'s own return-position check (pushed at
-                        // its construction site, below) already reports
-                        // whatever is wrong with this function's return
-                        // value — the synthesized void tail after it is
-                        // unreachable, and checking IT too is B5's "second
-                        // diagnostic that adds no information", not a
-                        // second mistake. Narrow on purpose: a `ret` is the
-                        // one statement shape that already owns an
-                        // independent `Constraint::ReturnType` of its own: a
-                        // last statement that diverges some OTHER way (a
-                        // `jump`, an exhaustive `if`/`match`) raises a
-                        // different, unfiled question about the TAIL's own
-                        // inferred type and is left alone.
-                        let tail_is_reachable = !last_statement_id.is_some_and(|statement_id| {
-                            matches!(
-                                self.expr_id_to_expr_map.get(&statement_id),
-                                Some(Expr::FunctionReturn(_))
-                            )
+                        // The synthesized void tail after a last statement that
+                        // LEAVES is unreachable, and checking it draws a second
+                        // diagnostic that adds no information (P28's duplicate,
+                        // editing-dx.md §17.2) or — for an exhaustive
+                        // `if`/`match` of `ret`s — a false one (B124, §17.7).
+                        // The constraint is pushed unconditionally and
+                        // `check_return_position` asks `expr_diverges` instead:
+                        // at walk time a `match` is not yet in
+                        // `expr_id_to_expr_map` (`resolve_match` inserts it), so
+                        // only the resolve-time question can see every way out.
+                        self.constraints.push(Constraint::ReturnType {
+                            body_id: expr_id,
+                            return_type_id,
+                            last_statement_id,
                         });
-                        if tail_is_reachable {
-                            self.constraints.push(Constraint::ReturnType {
-                                body_id: expr_id,
-                                return_type_id,
-                                last_statement_id,
-                            });
-                        }
                     }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(
@@ -18389,6 +19073,7 @@ impl<'src> Analyzer<'src> {
                 // mark is never silently dropped, it errors here.
                 self.walk_expr_node(inner, scope_id);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a bare `?` (expression lifting) is not supported in this position"
@@ -18405,6 +19090,7 @@ impl<'src> Analyzer<'src> {
                     && steps.get(index).is_some_and(|(_, is_split)| *is_split)
                 {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: "`?` lifts nothing here: the region is the whole expression; \
@@ -18423,6 +19109,7 @@ impl<'src> Analyzer<'src> {
                         || contains_try_assert(&body.0);
                     if after_split_try_assert {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: node.1,
                             msg: "`!` cannot run after a `?` inside a lifted expression: it \
@@ -18492,7 +19179,7 @@ impl<'src> Analyzer<'src> {
                         });
                     }
                     _ => {
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: node.1,
                             msg: "`!` requires the nearest enclosing function to declare an `Option`/`Result`-compatible return type (closures and `async` blocks are not yet supported)"
                                 .to_string(),
@@ -18556,6 +19243,7 @@ impl<'src> Analyzer<'src> {
                     };
                     if !matches!(grouped, Node::ClosureType(..)) {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: clause_span,
                             msg: "a `context` clause is only supported on a closure type"
@@ -18652,6 +19340,7 @@ impl<'src> Analyzer<'src> {
                     }
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: node.1,
                             msg: "a destructuring `let` requires a value".to_string(),
@@ -18665,7 +19354,7 @@ impl<'src> Analyzer<'src> {
                 // rvalue — and may not be an assignment target. A view is written
                 // *through* directly (`x = v`), so `*x = v` is rejected.
                 if matches!(&target.0, Node::Dereference(_)) {
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span: target.1,
                         msg: "cannot assign through `*`: a view is written through directly; write `x = …`, not `*x = …`".to_string(),
                     });
@@ -18680,6 +19369,7 @@ impl<'src> Analyzer<'src> {
                 // assign into a lowering temp (proposal/try-and-lift.md §3).
                 if lift_target_of(target) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: target.1,
                         msg: "a lifted chain (`?.`) is not an assignment target".to_string(),
@@ -18725,6 +19415,7 @@ impl<'src> Analyzer<'src> {
                 // empty).
                 if !external && body.is_none() {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: node.1,
                         msg: format!(
@@ -19259,6 +19950,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::ClosureType(_, _) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a closure type is not valid here (expected an expression)".to_string(),
@@ -19267,6 +19959,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::TypeWithContexts(_, _) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg:
@@ -19277,6 +19970,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::AsyncType(_) | Node::SyncType(_) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a closure-type marker is not valid here (expected an expression)"
@@ -19286,6 +19980,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::MappedType { .. } => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a mapped tuple type is not valid here (expected an expression)"
@@ -19385,6 +20080,7 @@ impl<'src> Analyzer<'src> {
                 Node::ClosureType(..) | Node::AsyncType(..) | Node::SyncType(..)
             ) {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: clause_span,
                     msg: "a `context` clause is only supported on a closure type".to_string(),
@@ -19696,6 +20392,7 @@ impl<'src> Analyzer<'src> {
                         Some(entity) => entity,
                         None => {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!("cannot find '{}' in this scope", name),
@@ -19707,6 +20404,7 @@ impl<'src> Analyzer<'src> {
                     Some(Expr::EnumVariant(enum_id, variant_index)) => (*enum_id, *variant_index),
                     _ => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!("'{}' is not an enum variant", name),
@@ -19781,6 +20479,7 @@ impl<'src> Analyzer<'src> {
                             &HashMap::default(),
                         );
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -19797,6 +20496,7 @@ impl<'src> Analyzer<'src> {
                     Type::Generic(_) => {}
                     Type::Enum(_, _) => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!("variant '{}' does not belong to the matched enum", name),
@@ -19806,6 +20506,7 @@ impl<'src> Analyzer<'src> {
                     other => {
                         let subject_str = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -19840,6 +20541,7 @@ impl<'src> Analyzer<'src> {
                 let payload_patterns: &[WalkPattern] = payload.as_deref().unwrap_or(&[]);
                 if payload_patterns.len() != data_type_ids.len() {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!(
@@ -19900,6 +20602,7 @@ impl<'src> Analyzer<'src> {
                     Type::Array(element_id, length) => {
                         if length != patterns.len() {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: *span,
                                 msg: format!(
@@ -19917,6 +20620,7 @@ impl<'src> Analyzer<'src> {
                     other => {
                         let rendered = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: *span,
                             msg: format!(
@@ -19948,6 +20652,7 @@ impl<'src> Analyzer<'src> {
                     let expected = self.pretty_print_type(&subject_type, &HashMap::default());
                     let got = self.pretty_print_type(&literal_type, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&literal_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -20102,7 +20807,7 @@ impl<'src> Analyzer<'src> {
             // is the inner closure type; the marker is peeled (and recorded)
             // only at parameters and `let` annotations (J2 v1).
             Node::AsyncType(inner) => {
-                self.diagnostics.push(Error {
+                self.diagnostics.push(Error { trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "an `async` closure type is only supported on parameters, `let` annotations, struct fields, and function return types"
@@ -20116,6 +20821,7 @@ impl<'src> Analyzer<'src> {
             // already refuses async stores.
             Node::SyncType(inner) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a `sync` closure contract is only supported on parameters".to_string(),
@@ -20124,6 +20830,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::TypeWithContexts(inner, _) => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: node.1,
                     msg: "a `context` clause is only supported on a parameter's closure type"
@@ -20481,6 +21188,7 @@ impl<'src> Analyzer<'src> {
             .or_else(|| self.span_map.get(&for_each_id))
             .unwrap_or(&&EMPTY_SPAN);
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span,
             msg,
@@ -20579,6 +21287,37 @@ impl<'src> Analyzer<'src> {
                 self.collect_residual_generics(&element.get_type(self), out);
             }
             _ => {}
+        }
+    }
+
+    /// Whether a type is fully determined — no `Unknown`/`Unresolved` hole and
+    /// no residual `Generic` anywhere inside it. The empty-list grounding in
+    /// `infer_type_path` writes a type into a literal's element slot, and a
+    /// slot write is permanent (the slot is only filled while `Unknown`), so
+    /// only a type that can no longer change may commit: a mid-inference
+    /// (`Unresolved`), still-open (`Unknown`), or abstract (`Generic`) element
+    /// must keep deferring instead.
+    fn type_is_fully_determined(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Unknown | Type::Unresolved | Type::Generic(_) => false,
+            // Symbolic until its source tuple lands, so not determined yet.
+            Type::Mapped(..) => false,
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                arguments
+                    .iter()
+                    .all(|argument| self.type_is_fully_determined(&argument.get_type(self)))
+            }
+            Type::Tuple(items) => items
+                .iter()
+                .all(|item| self.type_is_fully_determined(&item.get_type(self))),
+            Type::Array(element_id, _) => self.type_is_fully_determined(&element_id.get_type(self)),
+            Type::Closure(parameter_ids, return_id) => {
+                parameter_ids
+                    .iter()
+                    .all(|parameter| self.type_is_fully_determined(&parameter.get_type(self)))
+                    && self.type_is_fully_determined(&return_id.get_type(self))
+            }
+            Type::Any | Type::Never | Type::Function(_) | Type::Module(_) | Type::Void => true,
         }
     }
 
@@ -21236,7 +21975,7 @@ impl<'src> Analyzer<'src> {
                 if let Type::Array(element_type_id, length) = constraint {
                     let element_type = element_type_id.get_type(self);
                     if item_ids.len() != length && self.reported_literal_errors.insert(expr_id) {
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
                                 "this array literal has {} element{}, but its type is `[_; {length}]`",
@@ -21267,7 +22006,7 @@ impl<'src> Analyzer<'src> {
                             let expected =
                                 self.pretty_print_type(&element_type, &HashMap::default());
                             let got = self.pretty_print_type(&item_type, &HashMap::default());
-                            self.diagnostics.push(Error { note: None,
+                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                 span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
                                     "Expected {expected} (this literal's element type), but got {got} instead."
@@ -21288,6 +22027,41 @@ impl<'src> Analyzer<'src> {
                                     slot
                                 }
                             };
+                            // B129: an empty `[]` takes its element type from
+                            // where it lands. When the expectation is `List<E>`
+                            // — a call argument checked against a substituted
+                            // `T`-typed parameter (`remote.or([])` on a
+                            // `RemoteSource<List<Note>>` arrives here with the
+                            // receiver-bound `List<Note>`), an annotated
+                            // binding, a match leg under an expectation — the
+                            // slot grounds to `E` instead of waiting for a
+                            // `push` that never comes. Without this the slot
+                            // stays `Unknown`, and the generic argument
+                            // binding then REBINDS the receiver-known `T` to
+                            // `List<unknown>` (reconcile's generic arm pushes
+                            // the raw argument side), which is the reported
+                            // `Signal<List<unknown>>` hover. Only an unfilled
+                            // slot takes the expectation, and only a fully
+                            // determined `E` commits — a slot write is
+                            // permanent, so a mid-inference or abstract
+                            // element keeps deferring. Empty literals only:
+                            // directing a NON-empty literal's elements by the
+                            // expectation is deliberately avoided (see the
+                            // `expected_element` comment below).
+                            if matches!(slot.get_type(self), Type::Unknown)
+                                && let Type::Struct(expected_struct_id, expected_arguments) =
+                                    &constraint
+                                && *expected_struct_id == list_id
+                                && let Some(expected_element_id) = expected_arguments.first()
+                            {
+                                let expected_element = self.substitute_type(
+                                    &expected_element_id.get_type(self),
+                                    substitution_context,
+                                );
+                                if self.type_is_fully_determined(&expected_element) {
+                                    self.write_type_slot(slot, expected_element);
+                                }
+                            }
                             Type::Struct(list_id, vec![slot])
                         }
                         None => Type::Unknown,
@@ -21344,7 +22118,7 @@ impl<'src> Analyzer<'src> {
                                 let expected =
                                     self.pretty_print_type(&element_type, &HashMap::default());
                                 let got = self.pretty_print_type(&item_type, &HashMap::default());
-                                self.diagnostics.push(Error { note: None,
+                                self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                     span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
                                         "Expected {expected} (this literal's element type), but got {got} instead."
@@ -21833,39 +22607,62 @@ impl<'src> Analyzer<'src> {
             // miscompiled the call to its trait's abstract body (B17). Without
             // a final `else` the `if` is a statement, so it is void.
             Expr::If(branch) => {
-                // Every branch's trailing expression id, in source order.
-                fn trailing_ids(branch: &ExprIfBranch, out: &mut Vec<Id>) {
+                // Every branch's BODY — statement list and trailing expression
+                // — in source order. The statements come along because they
+                // decide whether the trailing expression is reached at all
+                // (B124, below).
+                fn branch_bodies(branch: &ExprIfBranch, out: &mut Vec<(Vec<Id>, Id)>) {
                     match branch {
-                        ExprIfBranch::If(_, (_, trailing), next) => {
-                            out.push(*trailing);
+                        ExprIfBranch::If(_, (statements, trailing), next) => {
+                            out.push((statements.clone(), *trailing));
                             if let Some(next) = next {
-                                trailing_ids(next, out);
+                                branch_bodies(next, out);
                             }
                         }
-                        ExprIfBranch::Else((_, trailing)) => out.push(*trailing),
+                        ExprIfBranch::Else((statements, trailing)) => {
+                            out.push((statements.clone(), *trailing))
+                        }
                     }
                 }
                 if if_branch_has_final_else(branch) {
-                    let mut trailings = Vec::new();
-                    trailing_ids(branch, &mut trailings);
+                    let mut bodies = Vec::new();
+                    branch_bodies(branch, &mut bodies);
                     // The `if`'s type is the unification of its branches; infer
                     // each against the constraint so each branch's tail directs
                     // its own inference (the branches must agree, checked
                     // elsewhere). An unresolved branch defers the whole `if`.
-                    let mut result = Type::Unknown;
-                    for trailing in trailings {
-                        // Seed each branch tail's expectation (the `match`/call
-                        // binding channel), then infer it against the constraint.
-                        self.seed_expectation(trailing, &constraint);
-                        let branch_type = self.infer_type_inner(
-                            trailing,
-                            &constraint,
-                            substitution_context,
-                            exprs_seen,
-                        );
-                        if matches!(branch_type, Type::Unresolved) {
-                            return Type::Unresolved;
-                        }
+                    // `Never` is the merge's identity — it YIELDS to the other
+                    // side in `reconcile_type` — so an `if` every branch of
+                    // which leaves types as `never`, not as the `Unknown` seed.
+                    let mut result = Type::Never;
+                    for (statements, trailing) in bodies {
+                        // A branch that definitely LEAVES contributes no value
+                        // to the merge (B124): control never reaches its
+                        // trailing expression, which for a branch ending in a
+                        // bare `ret` is the parser's synthesized void. Unifying
+                        // on that void is what typed an exhaustive `if`/`else`
+                        // of bare `ret`s as `void` and drew a false
+                        // `Expected T, but got void` over complete code; the
+                        // branch's real contribution is the `Type::Never` the
+                        // `ret` itself already infers as.
+                        let branch_type = if self.block_diverges(&statements, trailing) {
+                            Type::Never
+                        } else {
+                            // Seed each branch tail's expectation (the
+                            // `match`/call binding channel), then infer it
+                            // against the constraint.
+                            self.seed_expectation(trailing, &constraint);
+                            let inferred = self.infer_type_inner(
+                                trailing,
+                                &constraint,
+                                substitution_context,
+                                exprs_seen,
+                            );
+                            if matches!(inferred, Type::Unresolved) {
+                                return Type::Unresolved;
+                            }
+                            inferred
+                        };
                         result = match self.reconcile_type(
                             &result,
                             &branch_type,
@@ -21877,7 +22674,7 @@ impl<'src> Analyzer<'src> {
                             // type — diagnosis is the checker's job, not this
                             // inference's.
                             None => {
-                                if matches!(result, Type::Unknown) {
+                                if matches!(result, Type::Unknown | Type::Never) {
                                     branch_type
                                 } else {
                                     result
@@ -22058,6 +22855,7 @@ impl<'src> Analyzer<'src> {
                                 .any(|d| d.span == brace_span && d.msg == msg)
                             {
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: brace_span,
                                     msg,
@@ -23017,6 +23815,7 @@ impl<'src> Analyzer<'src> {
                 None => {
                     if report {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: "`self` import has no enclosing namespace".to_string(),
@@ -23037,6 +23836,7 @@ impl<'src> Analyzer<'src> {
             None => {
                 if report {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: root_span,
                         msg: format!("cannot find module '{}' to import", root),
@@ -23073,6 +23873,7 @@ impl<'src> Analyzer<'src> {
                 None => {
                     if report {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: part_span,
                             msg: format!("cannot find '{}' in the imported path", part),
@@ -23437,6 +24238,7 @@ impl<'src> Analyzer<'src> {
         let fixed = parameters.len() - 1;
         if argument_ids.len() < fixed {
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span: arguments_span,
                 msg: format!(
@@ -23847,7 +24649,10 @@ impl<'src> Analyzer<'src> {
                 call_id,
                 GenericDispatch::OnConstraint(constraint_id, member_name),
             );
-            self.bound_dispatch_traits.insert(call_id, trait_id);
+            // The qualified spelling names a trait and no arguments, so the
+            // instantiation is left unconstrained (B73 R1's empty-list case).
+            self.bound_dispatch_traits
+                .insert(call_id, (trait_id, Vec::new()));
             return None;
         }
         if !matches!(receiver_type, Type::Struct(..) | Type::Enum(..)) {
@@ -23855,7 +24660,11 @@ impl<'src> Analyzer<'src> {
             return None;
         }
         self.trait_qualified_calls.remove(&subject_id);
-        let provider = self
+        // Every impl of the named trait whose subject matches, not just the
+        // first: one subject may implement the trait at two instantiations
+        // (`Into<Bar>` beside std's `Into<Foo>`), and naming the trait says
+        // nothing about which — §3.1's spelling has no argument slot (B73 R2).
+        let providers: Vec<(Option<Id>, TypeId)> = self
             .implementations
             .iter()
             .filter(|implementation| {
@@ -23878,7 +24687,25 @@ impl<'src> Analyzer<'src> {
                     implementation.subject,
                 )
             })
-            .next();
+            .collect();
+        let declaring: Vec<(Id, TypeId)> = providers
+            .iter()
+            .filter_map(|(member_id, impl_subject)| {
+                member_id.map(|member_id| (member_id, *impl_subject))
+            })
+            .collect();
+        // With more than one implementation declaring the name, the call's
+        // expected type is the only thing that can choose (R2). When it cannot,
+        // the first-declared still wins, as it always has — the reported
+        // ambiguity belongs to `receiver.member()`, which is where a reader can
+        // act on it; there is no *further* spelling to steer a qualified call to.
+        let provider = match declaring.len() > 1 {
+            true => self
+                .select_home_by_expected_type(call_id, &receiver_type, &declaring)
+                .map(|(member_id, impl_subject)| (Some(member_id), impl_subject))
+                .or_else(|| providers.first().copied()),
+            false => providers.first().copied(),
+        };
         match provider {
             Some((Some(member_id), impl_subject)) => {
                 let count = self.reference_count.entry(member_id).or_insert(0);
@@ -23912,7 +24739,8 @@ impl<'src> Analyzer<'src> {
                 // Dispatch on THIS trait's surface: two traits whose defaults
                 // share a name are exactly the case the call named one to
                 // resolve, so a by-name lookup would undo the disambiguation.
-                self.bound_dispatch_traits.insert(call_id, trait_id);
+                self.bound_dispatch_traits
+                    .insert(call_id, (trait_id, Vec::new()));
                 let rest: Vec<Id> = argument_ids[1..].to_vec();
                 self.constraints.push(Constraint::MethodArgCheck {
                     call_id,
@@ -23934,6 +24762,7 @@ impl<'src> Analyzer<'src> {
                 let type_label = self.pretty_print_type(&receiver_type, &HashMap::default());
                 let trait_label = self.trait_label_for(&receiver_type, trait_id);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&receiver_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -23990,6 +24819,7 @@ impl<'src> Analyzer<'src> {
         if let Type::Closure(parameter_type_ids, _) = &subject_type {
             if argument_ids.len() != parameter_type_ids.len() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: arguments_span,
                     msg: format!(
@@ -24055,6 +24885,7 @@ impl<'src> Analyzer<'src> {
                             None => (String::new(), None),
                         };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&argument_id).unwrap(),
                         msg: format!("Expected {}, but got {} instead.{}", expected, got, origin),
@@ -24083,6 +24914,7 @@ impl<'src> Analyzer<'src> {
                         .clone();
                     if argument_ids.len() != data_type_ids.len() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: arguments_span,
                             msg: format!(
@@ -24111,6 +24943,7 @@ impl<'src> Analyzer<'src> {
                                 self.pretty_print_type(&data_type, &substitution_context);
                             let got = self.pretty_print_type(&argument_type, &substitution_context);
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&argument_id).unwrap(),
                                 msg: format!("Expected {}, but got {} instead.", expected, got),
@@ -24185,6 +25018,7 @@ impl<'src> Analyzer<'src> {
                     };
                     if argument_ids.len() != parameters.len() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: self.declared_here_note(function_id),
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
                             msg: self.argument_count_message(
@@ -24319,6 +25153,7 @@ impl<'src> Analyzer<'src> {
                                     &substitution_context,
                                 );
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note,
                                     span: **self.span_map.get(&argument_id).unwrap(),
                                     msg,
@@ -24393,7 +25228,7 @@ impl<'src> Analyzer<'src> {
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                         self.not_callable_message(&subject_type)
                     };
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         // The SUBJECT is what isn't callable (A1).
                         span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
                         msg: match struct_name {
@@ -24424,6 +25259,7 @@ impl<'src> Analyzer<'src> {
                 let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                 let msg = self.not_callable_message(&subject_type);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     // The SUBJECT is what isn't callable (A1) — anchor there.
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
@@ -24479,6 +25315,11 @@ impl<'src> Analyzer<'src> {
             // Two or more traits provide the name and no inherent member
             // outranks them (B57) — the call has to name one.
             AmbiguousTraits(Vec<Id>),
+            // ONE trait provides the name at two or more instantiations (B73's
+            // R1) — `Trait::member` cannot name which, so the call is reported.
+            AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
+            // Two impls of ONE home that specificity does not rank (B73's R3).
+            AmbiguousImpls(Vec<ImplMemberCandidate>),
             // The receiver is a value typed as a bare trait (not `self` in a trait
             // default) — there is no concrete type to dispatch to.
             BareTraitValue(Id),
@@ -24511,6 +25352,7 @@ impl<'src> Analyzer<'src> {
             if member_name != "len" {
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     // The method NAME identifies the problem (A1/A4), not
                     // the argument list.
@@ -24526,6 +25368,7 @@ impl<'src> Analyzer<'src> {
             }
             if !argument_ids.is_empty() || !generic_argument_ids.is_empty() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: arguments_span,
                     msg: "`len` takes no arguments".to_string(),
@@ -24547,7 +25390,21 @@ impl<'src> Analyzer<'src> {
         let mut return_ambiguous: Option<Vec<Id>> = None;
         let lookup = match &subject_type {
             Type::Struct(_, _) | Type::Enum(_, _) => {
-                match self.resolve_impl_member(&subject_type, member_name) {
+                let mut resolution = self.resolve_impl_member(&subject_type, member_name);
+                // R2: before reporting two argument-distinct homes, let the type
+                // the call site expects choose between them.
+                if let ImplMemberResolution::AmbiguousTraitArguments(homes) = &resolution {
+                    let reachable: Vec<(Id, TypeId)> = homes
+                        .iter()
+                        .map(|home| (home.member_id, home.impl_subject))
+                        .collect();
+                    if let Some((member_id, impl_subject)) =
+                        self.select_home_by_expected_type(id, &subject_type, &reachable)
+                    {
+                        resolution = ImplMemberResolution::Found(member_id, impl_subject);
+                    }
+                }
+                match resolution {
                     ImplMemberResolution::Found(member_id, impl_subject_id) => {
                         // Bind the impl's generic parameters from the receiver
                         // (`List<i32>` against the impl's `List<T>` binds `T = i32`)
@@ -24577,6 +25434,39 @@ impl<'src> Analyzer<'src> {
                     }
                     ImplMemberResolution::AmbiguousTraits(trait_ids) => {
                         MethodLookup::AmbiguousTraits(trait_ids)
+                    }
+                    ImplMemberResolution::AmbiguousTraitArguments(homes) => {
+                        MethodLookup::AmbiguousTraitArguments(homes)
+                    }
+                    ImplMemberResolution::AmbiguousImpls(unranked) => {
+                        MethodLookup::AmbiguousImpls(unranked)
+                    }
+                    // R3, §13.2 row 17: the most specific impl of the home takes
+                    // the trait's DEFAULT body. The member id belongs to the
+                    // trait, whose declared receiver no concrete argument
+                    // reconciles against, so the call rides the same Gap E
+                    // channel an uncontested inherited default already does.
+                    ImplMemberResolution::FoundInheritedDefault(
+                        member_id,
+                        impl_subject_id,
+                        trait_id,
+                        trait_arguments,
+                    ) => {
+                        let receiver_type_id = subject_type.clone().get_type_id(self);
+                        self.generic_dispatch.insert(
+                            id,
+                            GenericDispatch::OnType(Some(receiver_type_id), member_name),
+                        );
+                        let bindings = self.inherited_default_bindings(
+                            &subject_type,
+                            impl_subject_id,
+                            trait_id,
+                            &trait_arguments,
+                        );
+                        if !bindings.is_empty() {
+                            self.method_call_substitution.insert(id, bindings);
+                        }
+                        MethodLookup::Found(member_id)
                     }
                     // Gap E: fall back to an inherited trait default, re-dispatched
                     // to this concrete type at codegen.
@@ -24694,7 +25584,7 @@ impl<'src> Analyzer<'src> {
                             continue;
                         };
                         member = Some(found_member);
-                        member_trait = Some(*trait_id);
+                        member_trait = Some((*trait_id, trait_arguments.clone()));
                         // A parameterized bound (`F: Feed<T>`) substitutes the trait's
                         // parameters with the bound's arguments, so a method parameter
                         // typed in the trait's terms (`each(observer: |T| ..)`) is typed
@@ -24726,8 +25616,12 @@ impl<'src> Analyzer<'src> {
                             id,
                             GenericDispatch::OnConstraint(*constraint_id, member_name),
                         );
-                        if let Some(trait_id) = member_trait {
-                            self.bound_dispatch_traits.insert(id, trait_id);
+                        if let Some((trait_id, trait_arguments)) = member_trait {
+                            // The bound's own arguments (`T: Conv<Baz>` -> `[Baz]`)
+                            // travel with the trait, so codegen re-dispatches into
+                            // the impl of THAT instantiation (B73 R1, row 20).
+                            self.bound_dispatch_traits
+                                .insert(id, (trait_id, trait_arguments));
                         }
                     }
                     found(member)
@@ -24873,6 +25767,7 @@ impl<'src> Analyzer<'src> {
                     .unimported_trait_method_steer(&subject_type, member_name)
                     .unwrap_or_default();
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self
                         .member_name_spans
@@ -24911,6 +25806,7 @@ impl<'src> Analyzer<'src> {
                     })
                     .collect();
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     // The member NAME is what is ambiguous (A1/A4) — the same
                     // anchor "has no method" uses.
@@ -24930,10 +25826,82 @@ impl<'src> Analyzer<'src> {
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
                 Resolution::Failed
             }
+            // B73 R1: one trait, two instantiations. §3.1's disambiguator names
+            // a trait and has no argument slot, so — per B83's "an impossible
+            // steer is worse than no steer" — the message says what does select
+            // (the expected type, R2) rather than offering a spelling that does
+            // not exist.
+            MethodLookup::AmbiguousTraitArguments(homes) => {
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                let trait_name = homes
+                    .first()
+                    .and_then(|home| home.home_trait)
+                    .and_then(|trait_id| self.traits.get(&trait_id))
+                    .map(|trait_| trait_.name)
+                    .unwrap_or("Trait");
+                let providers: Vec<String> = homes
+                    .iter()
+                    .map(|home| format!("'{}'", self.home_label(home)))
+                    .collect();
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    // The member NAME is what is ambiguous (A1/A4) — the same
+                    // anchor the two-trait ambiguity uses.
+                    span: self
+                        .member_name_spans
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(arguments_span),
+                    msg: format!(
+                        "'{member_name}' is ambiguous on '{type_str}': {}{} provide it, and \
+                         '{trait_name}::{member_name}' names only the trait, not which of its \
+                         instantiations; annotate the type this call must produce to pick one",
+                        if providers.len() == 2 { "both " } else { "" },
+                        join_with(&providers, "and"),
+                    ),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Resolution::Failed
+            }
+            // B73 R3's residue (§13.4(a)(3)): two impls of one home, neither
+            // more specific. There is no call-site spelling that picks between
+            // them — both are the same trait at the same instantiation — so the
+            // message states the rule that failed to apply and sends the reader
+            // to the definitions, which is where the fix lives (B6/B4).
+            MethodLookup::AmbiguousImpls(unranked) => {
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                let subjects: Vec<String> = unranked
+                    .iter()
+                    .map(|candidate| {
+                        format!("'{}'", self.impl_subject_label(candidate.impl_subject))
+                    })
+                    .collect();
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: self
+                        .member_name_spans
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(arguments_span),
+                    msg: format!(
+                        "'{member_name}' is ambiguous on '{type_str}': {}{} provide it and \
+                         neither impl subject is more specific than the other; vilan picks the \
+                         more specific of two overlapping impls, so narrow one subject until it \
+                         is",
+                        if subjects.len() == 2 { "both " } else { "" },
+                        join_with(&subjects, "and"),
+                    ),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Resolution::Failed
+            }
             MethodLookup::Defer => Resolution::Deferred,
             MethodLookup::NotCallable => {
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: self
                         .member_name_spans
@@ -24951,6 +25919,7 @@ impl<'src> Analyzer<'src> {
                     .map(|trait_| trait_.name)
                     .unwrap_or("trait");
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -24986,6 +25955,7 @@ impl<'src> Analyzer<'src> {
                 let expected = self.pretty_print_type(&slot_type, &HashMap::default());
                 let got = self.pretty_print_type(&argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!("Expected {}, but got {} instead.", expected, got),
@@ -25029,6 +25999,7 @@ impl<'src> Analyzer<'src> {
             // with parameters 1.. only.
             let argument_parameter_ids = parameter_ids.get(1..).unwrap_or(&[]);
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: self.declared_here_note(member_id),
                 span: self.clamp_span_to_first_line(arguments_span, call_id),
                 msg: self.argument_count_message(
@@ -25076,6 +26047,7 @@ impl<'src> Analyzer<'src> {
                 let expected = self.pretty_print_type(&parameter_type, &HashMap::default());
                 let got = self.pretty_print_type(&argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!("Expected {}, but got {} instead.", expected, got),
@@ -25116,6 +26088,7 @@ impl<'src> Analyzer<'src> {
             other => {
                 let got = self.pretty_print_type(&other, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -25202,6 +26175,7 @@ impl<'src> Analyzer<'src> {
                         self.pretty_print_type(&variable_type, &substitution_context);
                     let got_str = self.pretty_print_type(&value_type, &substitution_context);
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&first_value_id).unwrap(),
                         msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
@@ -25248,6 +26222,7 @@ impl<'src> Analyzer<'src> {
                         )
                     });
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&value_id).unwrap(),
                         msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
@@ -25315,6 +26290,7 @@ impl<'src> Analyzer<'src> {
             ReturnPositionCheck::Mismatched(msg) => {
                 let span = **self.span_map.get(&body_id).unwrap_or(&&EMPTY_SPAN);
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg,
@@ -25388,6 +26364,26 @@ impl<'src> Analyzer<'src> {
         if self
             .reconcile_type(&body_type, target_return_type, substitution_context)
             .is_some()
+        {
+            return ReturnPositionCheck::Matched;
+        }
+        // B124 (editing-dx.md §17.7): a body that definitely LEAVES has no
+        // value in this position to check. Every path out of it is a `ret`,
+        // each of which already carries its own `Constraint::ReturnType`, so
+        // the value that actually leaves is checked where it is written — and
+        // the tail after it is unreachable. Two shapes reach here: the body
+        // ITSELF diverges (a `{ ret ..; }` block in tail position — an
+        // exhaustive `if`/`match` of `ret`s already infers as `Type::Never`
+        // and reconciled above), or the block's last STATEMENT diverges and
+        // the parser's synthesized void tail after it is dead code. The second
+        // subsumes §17.2's `ret`-only dedup at the tail-construction site: a
+        // `jump`, or an exhaustive `if`/`match` of `ret`s, leaves exactly the
+        // same way and left the same false "ends without producing a value"
+        // behind. Nothing is weakened — `expr_diverges` needs EVERY path to
+        // leave, so a body with any fall-through still reaches the diagnostics
+        // below.
+        if self.expr_diverges(body_id)
+            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id))
         {
             return ReturnPositionCheck::Matched;
         }
@@ -25569,7 +26565,7 @@ impl<'src> Analyzer<'src> {
                         self.pretty_print_type(&subject_error_type, &HashMap::default());
                     let continuation_rendered =
                         self.pretty_print_type(&continuation_error_type, &HashMap::default());
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span,
                         msg: format!(
                             "`?.` flattens into the chain's own `Result`, so the error types must match: the subject's is {subject_rendered}, the chain yields {continuation_rendered}. Convert the error first with `.map_err(…)`."
@@ -25653,6 +26649,7 @@ impl<'src> Analyzer<'src> {
                     let Some((nominal_id, arguments)) = self.lift_element_of(&other) else {
                         let rendered = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: step_span,
                             msg: format!(
@@ -25681,6 +26678,7 @@ impl<'src> Analyzer<'src> {
                             ""
                         };
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -25712,6 +26710,7 @@ impl<'src> Analyzer<'src> {
                             let second =
                                 self.pretty_print_type(&step_error_type, &HashMap::default());
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: step_span,
                                 msg: format!(
@@ -25767,6 +26766,7 @@ impl<'src> Analyzer<'src> {
                     let first = self.pretty_print_type(&region_error_type, &HashMap::default());
                     let second = self.pretty_print_type(&body_error_type, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!(
@@ -26069,6 +27069,7 @@ impl<'src> Analyzer<'src> {
     fn lift_opt_in_error(&mut self, operator: &str, subject_type: &Type, span: Span) {
         let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span,
             msg: format!(
@@ -26095,6 +27096,7 @@ impl<'src> Analyzer<'src> {
         }
         let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         self.diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span,
             msg: format!(
@@ -26133,6 +27135,7 @@ impl<'src> Analyzer<'src> {
         let Some((nominal_id, arguments)) = self.lift_element_of(&subject_type) else {
             let rendered = self.pretty_print_type(&subject_type, &HashMap::default());
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: format!("`?.` needs a container with an element type; this is {rendered}"),
@@ -26224,13 +27227,21 @@ impl<'src> Analyzer<'src> {
         if matches!(tail_type, Type::Unresolved | Type::Unknown) {
             return Resolution::Deferred;
         }
-        let tail_is_void = matches!(tail_type, Type::Void);
+        // A tail that DIVERGES yields no value either (B124 made an `if`/`match`
+        // of `ret`s in tail position type as `never` rather than `void`), so
+        // rule 4's void-tail rules apply to it unchanged: the conservative
+        // "make the ret'd value the body's tail" guidance is what
+        // ret-checking.md §4 settled to avoid the diverging-tail swamp, and
+        // B124 does not reopen it. Reading `never` as a produced value would
+        // instead have rejected a bare `ret` for "exiting a closure whose body
+        // yields never".
+        let tail_yields_no_value = matches!(tail_type, Type::Void | Type::Never);
         for (span, value_id) in rets {
             match value_id {
                 None => {
-                    if !tail_is_void {
+                    if !tail_yields_no_value {
                         let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: *span,
                             msg: format!(
                                 "a bare `ret` exits a closure whose body yields {tail_rendered}; return a value"
@@ -26243,8 +27254,8 @@ impl<'src> Analyzer<'src> {
                     if matches!(value_type, Type::Unresolved) {
                         return Resolution::Deferred;
                     }
-                    if tail_is_void && !matches!(value_type, Type::Void) {
-                        self.diagnostics.push(Error { note: None,
+                    if tail_yields_no_value && !matches!(value_type, Type::Void) {
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: *span,
                             msg: "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail"
                                 .to_string(),
@@ -26256,7 +27267,7 @@ impl<'src> Analyzer<'src> {
                         let value_rendered =
                             self.pretty_print_type(&value_type, &HashMap::default());
                         let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: *span,
                             msg: format!(
                                 "this `ret` returns {value_rendered}, but the closure's body yields {tail_rendered}"
@@ -26334,7 +27345,7 @@ impl<'src> Analyzer<'src> {
                 Type::Enum(return_enum, _) if Some(*return_enum) == self.option_enum_id => {}
                 other => {
                     let rendered = self.pretty_print_type(other, &HashMap::default());
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span,
                         msg: format!(
                             "`!` on an `Option` returns `None` early, so the enclosing function must return `Option`; it returns {rendered}. If it returns `Result`, convert first: `.ok_or(err)` turns `None` into an `Err`."
@@ -26371,7 +27382,7 @@ impl<'src> Analyzer<'src> {
                         let receiver_rendered = self.pretty_print_type(&bad, &HashMap::default());
                         let return_rendered =
                             self.pretty_print_type(&return_bad, &HashMap::default());
-                        self.diagnostics.push(Error { note: None,
+                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span,
                             msg: format!(
                                 "`!` returns this `Result`'s error as-is, so the error types must match: the value's is {receiver_rendered}, the function returns {return_rendered}. Convert the error first: `.map_err(…)` before `!`."
@@ -26381,7 +27392,7 @@ impl<'src> Analyzer<'src> {
                 }
                 other => {
                     let rendered = self.pretty_print_type(other, &HashMap::default());
-                    self.diagnostics.push(Error { note: None,
+                    self.diagnostics.push(Error { trace: Vec::new(), note: None,
                         span,
                         msg: format!(
                             "`!` on a `Result` returns the error early, so the enclosing function must return `Result`; it returns {rendered}"
@@ -26420,7 +27431,7 @@ impl<'src> Analyzer<'src> {
         }
         let Some(impl_index) = try_impl else {
             let rendered = self.pretty_print_type(&receiver_type, &HashMap::default());
-            self.diagnostics.push(Error { note: None,
+            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                 span,
                 msg: format!(
                     "`!` needs a value implementing `Try` (an `Option`, a `Result`, or a type with an `impl .. with Try<..>`); this is {rendered}"
@@ -26444,6 +27455,7 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         let (Some(verdict_id), Some(from_bad_id)) = (verdict_id, from_bad_id) else {
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: "the `Try` impl is missing `verdict`/`from_bad`".to_string(),
@@ -26479,7 +27491,7 @@ impl<'src> Analyzer<'src> {
         {
             let receiver_rendered = self.pretty_print_type(&receiver_type, &HashMap::default());
             let return_rendered = self.pretty_print_type(&return_type, &HashMap::default());
-            self.diagnostics.push(Error { note: None,
+            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                 span,
                 msg: format!(
                     "`!` on a `Try` type returns `from_bad(..)`, which rebuilds {receiver_rendered}; the enclosing function returns {return_rendered} (for user `Try` types the two must match exactly, v1)"
@@ -26787,6 +27799,7 @@ impl<'src> Analyzer<'src> {
                 } else if !self.compare_type(&guard_type, &self.bool_type(), &HashMap::default()) {
                     let got = self.pretty_print_type(&guard_type, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&guard_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!("match guard must be a bool, but got {}", got),
@@ -26915,6 +27928,7 @@ impl<'src> Analyzer<'src> {
                     )
                 };
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: guarded_leg_note(self, &guards),
                     span: prepped.span,
                     msg,
@@ -26938,10 +27952,22 @@ impl<'src> Analyzer<'src> {
             let leg_constraint = expected
                 .map(|type_id| type_id.get_type(self))
                 .unwrap_or(Type::Unknown);
-            let body_type = self.infer_type(*body_id, &leg_constraint, &HashMap::default());
-            if matches!(body_type, Type::Unresolved) {
-                return Resolution::Deferred;
-            }
+            // A leg that definitely LEAVES contributes no value to the merge
+            // (B124), the same way an `if` branch that leaves does: its body's
+            // tail is the synthesized void control never reaches, so unifying
+            // on it made an all-`ret` match `void` — and made a `ret` leg
+            // beside a value leg report `match legs have mismatched types`.
+            // `Type::Never` yields in `reconcile_type`, so the live legs decide
+            // the match's type and an all-diverging match is `never`.
+            let body_type = if self.expr_diverges(*body_id) {
+                Type::Never
+            } else {
+                let inferred = self.infer_type(*body_id, &leg_constraint, &HashMap::default());
+                if matches!(inferred, Type::Unresolved) {
+                    return Resolution::Deferred;
+                }
+                inferred
+            };
             unified = Some(match unified {
                 None => body_type,
                 Some(current) => {
@@ -26957,7 +27983,7 @@ impl<'src> Analyzer<'src> {
                                 .get(body_id)
                                 .map(|span| **span)
                                 .unwrap_or(prepped.span);
-                            self.diagnostics.push(Error { note: None,
+                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                             span: leg_span,
                             msg: format!(
                                 "match legs have mismatched types: expected {}, but got {} instead.",
@@ -27060,6 +28086,7 @@ impl<'src> Analyzer<'src> {
                         .import_steer(constraint.struct_name)
                         .unwrap_or_default();
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!("unknown struct: {}{}", constraint.struct_name, steer),
@@ -27076,6 +28103,7 @@ impl<'src> Analyzer<'src> {
                 .map(|span| **span)
                 .unwrap_or(constraint.fields_span);
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: format!("cannot initialize a non-struct: {}", constraint.struct_name),
@@ -27113,7 +28141,12 @@ impl<'src> Analyzer<'src> {
                 msg: format!("`{}` is declared here", constraint.struct_name),
                 source: self.source_of_id(struct_id),
             });
-            self.diagnostics.push(Error { note, span, msg });
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note,
+                span,
+                msg,
+            });
             return Resolution::Failed;
         }
         let initializer_id = constraint.initializer_id;
@@ -27146,6 +28179,7 @@ impl<'src> Analyzer<'src> {
                         Note::here(*field_name_span, format!("did you mean `{suggestion}`?"))
                     });
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         // The NAME's span, not the value's (E58 — see
                         // `StructInitializerConstraint::fields`'s doc): the
@@ -27178,6 +28212,7 @@ impl<'src> Analyzer<'src> {
                 // value, not the whole `{ .. }` block — E7) but still record
                 // the type for downstream consumers.
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: *field_value_span,
                     msg: format!(
@@ -27319,6 +28354,7 @@ impl<'src> Analyzer<'src> {
                             &HashMap::default(),
                         );
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: tuple_access_error(&label, member_name, problem),
@@ -27333,6 +28369,7 @@ impl<'src> Analyzer<'src> {
                     Some(struct_) => struct_,
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap(),
                             msg: format!("subject is not a struct: {}", struct_id.0),
@@ -27385,6 +28422,7 @@ impl<'src> Analyzer<'src> {
                     }
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!("struct '{}' has no field '{}'", struct_name, member_name),
@@ -27403,6 +28441,7 @@ impl<'src> Analyzer<'src> {
                 }
                 let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -27468,6 +28507,7 @@ impl<'src> Analyzer<'src> {
             // (only a `List` is indexable)" — say what is actually missing.
             Type::Struct(struct_id, _) if Some(struct_id) == list_id => {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot index this List: its element type is never determined \
@@ -27489,6 +28529,7 @@ impl<'src> Analyzer<'src> {
                     && literal_index >= length
                 {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -27509,6 +28550,7 @@ impl<'src> Analyzer<'src> {
             subject_type => {
                 let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
@@ -27622,6 +28664,7 @@ impl<'src> Analyzer<'src> {
                 Some(entity) => entity,
                 None => {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: root_span,
                         msg: format!("cannot find '{}' in this scope", root),
@@ -27644,6 +28687,7 @@ impl<'src> Analyzer<'src> {
                 };
                 let Some(namespace_scope_id) = namespace_scope_id else {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: segment_span,
                         msg: "`use` requires a namespace (a module or an enum)".to_string(),
@@ -27660,6 +28704,7 @@ impl<'src> Analyzer<'src> {
                     Some(entity) => entity,
                     None => {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: segment_span,
                             msg: format!("cannot find '{}' in the `use` path", segment),
@@ -27720,6 +28765,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                         let diagnostics_before = self.diagnostics.len();
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: message,
@@ -27773,6 +28819,7 @@ impl<'src> Analyzer<'src> {
                     );
                     let note = note.or_else(|| self.element_view_import_note(id, name));
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!("cannot find '{}' in this scope{}", name, steer),
@@ -27812,6 +28859,7 @@ impl<'src> Analyzer<'src> {
             // `check_readonly_mutation`.
             if self.variables.get(&variable_id).is_none() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot assign to this expression".to_string(),
@@ -27923,6 +28971,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(trait_id) = bare_trait_id {
                         let (message, note) = self.bare_trait_in_value_position(trait_id, scope_id);
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note,
                             span,
                             msg: message,
@@ -27955,6 +29004,7 @@ impl<'src> Analyzer<'src> {
                         format!("cannot find type '{}'{}", name, steer)
                     };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: message,
@@ -27980,6 +29030,7 @@ impl<'src> Analyzer<'src> {
                         }
                         None => {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span,
                                 msg: format!(
@@ -28002,6 +29053,7 @@ impl<'src> Analyzer<'src> {
                         let subject_str =
                             self.pretty_print_type(&subject_type, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span,
                             msg: format!(
@@ -28113,11 +29165,14 @@ impl<'src> Analyzer<'src> {
                         // Only a trait provides it as a METHOD: refuse, and say
                         // which path does reach it (handled below).
                         false => ImplMemberResolution::Missing,
-                        true => self.rank_member_candidates(self.static_path_candidates(
-                            &subject_type,
-                            member_name,
-                            subject_is_trait,
-                        )),
+                        true => {
+                            let static_candidates = self.static_path_candidates(
+                                &subject_type,
+                                member_name,
+                                subject_is_trait,
+                            );
+                            self.rank_member_candidates(static_candidates)
+                        }
                     };
                     let static_member = match &static_resolution {
                         ImplMemberResolution::Found(member_id, impl_subject) => {
@@ -28201,6 +29256,7 @@ impl<'src> Analyzer<'src> {
                                 })
                                 .collect();
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -28246,6 +29302,7 @@ impl<'src> Analyzer<'src> {
                                 })
                                 .collect();
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -28273,6 +29330,7 @@ impl<'src> Analyzer<'src> {
                             })
                             .unwrap_or_default();
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -28295,6 +29353,7 @@ impl<'src> Analyzer<'src> {
                         }
                         None => {
                             self.diagnostics.push(Error {
+                                trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -28312,6 +29371,7 @@ impl<'src> Analyzer<'src> {
                     let bound_trait_ids = self.generic_bound_trait_ids(constraint_id);
                     if bound_trait_ids.is_empty() {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -28345,7 +29405,8 @@ impl<'src> Analyzer<'src> {
                                 // an inherent static sharing the name can't
                                 // shadow it (keyed by the accessor: the call id
                                 // isn't known here).
-                                self.bound_dispatch_traits.insert(id, matched_trait);
+                                self.bound_dispatch_traits
+                                    .insert(id, (matched_trait, Vec::new()));
                             }
                             None => {
                                 let bounds = bound_trait_ids
@@ -28356,6 +29417,7 @@ impl<'src> Analyzer<'src> {
                                     .collect::<Vec<_>>()
                                     .join(" + ");
                                 self.diagnostics.push(Error {
+                                    trace: Vec::new(),
                                     note: None,
                                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
@@ -28378,6 +29440,7 @@ impl<'src> Analyzer<'src> {
                 None => {
                     let steer = self.import_steer(check.trait_name).unwrap_or_default();
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: check.span,
                         msg: format!("cannot find trait '{}'{}", check.trait_name, steer),
@@ -28390,6 +29453,7 @@ impl<'src> Analyzer<'src> {
             // provide it.
             if !self.traits.contains_key(&trait_id) {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: check.span,
                     msg: format!("'{}' is not a trait", check.trait_name),
@@ -28562,6 +29626,7 @@ impl<'src> Analyzer<'src> {
                     })
                     .unwrap_or((String::new(), None));
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note,
                     span: check.span,
                     msg: format!(
@@ -28891,18 +29956,19 @@ impl<'src> Analyzer<'src> {
                     let resolved = self
                         .generic_bound_traits(constraint_id)
                         .into_iter()
-                        .find_map(|(trait_id, _)| {
+                        .find_map(|(trait_id, trait_arguments)| {
                             self.method_member_in_trait(trait_id, next_method)
-                                .map(|next_id| (trait_id, next_id))
+                                .map(|next_id| (trait_id, trait_arguments, next_id))
                         });
                     match resolved {
-                        Some((trait_id, next_id)) => {
+                        Some((trait_id, trait_arguments, next_id)) => {
                             self.for_each_next.insert(for_each_id, next_id);
                             self.generic_dispatch.insert(
                                 for_each_id,
                                 GenericDispatch::OnConstraint(constraint_id, next_method),
                             );
-                            self.bound_dispatch_traits.insert(for_each_id, trait_id);
+                            self.bound_dispatch_traits
+                                .insert(for_each_id, (trait_id, trait_arguments));
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
@@ -28972,6 +30038,7 @@ impl<'src> Analyzer<'src> {
                 {
                     let label = self.pretty_print_type(&condition, &HashMap::default());
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&condition_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -29050,7 +30117,7 @@ impl<'src> Analyzer<'src> {
                             && !self.compare_type(&bool_type, &operand, &HashMap::default())
                         {
                             let label = self.pretty_print_type(&operand, &HashMap::default());
-                            self.diagnostics.push(Error { note: None,
+                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
                                 span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
                                     "`{symbol}` takes `bool` operands; the {side} operand is `{label}`"
@@ -29067,6 +30134,7 @@ impl<'src> Analyzer<'src> {
                 if is_ordering_operator(op) && grounded(&lhs_type) {
                     if is_bool(&lhs_type) {
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -29086,6 +30154,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(enum_) = self.string_backed_enum(&lhs_type) {
                         let enum_name = enum_.name;
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -29112,6 +30181,7 @@ impl<'src> Analyzer<'src> {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
                         self.diagnostics.push(Error {
+                            trace: Vec::new(),
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
@@ -29230,6 +30300,7 @@ impl<'src> Analyzer<'src> {
                         method_name
                     };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
@@ -29255,6 +30326,7 @@ impl<'src> Analyzer<'src> {
             for (name, name_span) in names {
                 let Some(target) = self.try_get_expr_id_by_name(name, scope_id) else {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: name_span,
                         msg: format!("cannot find context `{name}` in this scope"),
@@ -29270,6 +30342,7 @@ impl<'src> Analyzer<'src> {
                 };
                 if context_ids.contains(&target) {
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: name_span,
                         msg: format!("duplicate context `{name}` in this clause"),
@@ -29300,20 +30373,7 @@ impl<'src> Analyzer<'src> {
             // An unknown suffix is an ERROR, not silently unsuffixed (`5q`
             // once typed as `i32`). The renamed wide types get a hint.
             if let Some(suffix) = suffix
-                && !matches!(
-                    suffix,
-                    "i8" | "u8"
-                        | "i16"
-                        | "u16"
-                        | "i32"
-                        | "u32"
-                        | "i53"
-                        | "u53"
-                        | "f"
-                        | "f32"
-                        | "f64"
-                        | "n"
-                )
+                && !crate::type_::NUMERIC_SUFFIXES.contains(&suffix)
             {
                 if let Some(span) = self.span_map.get(&literal_id) {
                     let span = **span;
@@ -29327,6 +30387,7 @@ impl<'src> Analyzer<'src> {
                         _ => "",
                     };
                     self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span,
                         msg: format!("unknown numeric suffix `{suffix}`{hint}"),
@@ -29394,6 +30455,7 @@ impl<'src> Analyzer<'src> {
             if let Some(span) = self.span_map.get(&literal_id) {
                 let span = **span;
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!("the literal `{whole}` is out of range for `{name}` ({range})"),
@@ -29417,16 +30479,19 @@ impl<'src> Analyzer<'src> {
             for constraint in &self.constraints {
                 match constraint {
                     Constraint::StructInitializer(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: constraint.fields_span,
                         msg: "type of struct initializer could not be resolved".to_string(),
                     }),
                     Constraint::FieldAccessor(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **(self.span_map.get(&constraint.id).unwrap_or(&&EMPTY_SPAN)),
                         msg: "type of accessor subject could not be resolved".to_string(),
                     }),
                     Constraint::Variable(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: **(self
                             .span_map
@@ -29441,6 +30506,7 @@ impl<'src> Analyzer<'src> {
                         ),
                     }),
                     Constraint::CallSubject(constraint) => self.diagnostics.push(Error {
+                        trace: Vec::new(),
                         note: None,
                         span: constraint.arguments_span,
                         msg: "type of function call arguments could not be resolved".to_string(),
@@ -29465,6 +30531,7 @@ impl<'src> Analyzer<'src> {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             if self.list_element_slot(&subject_type).is_some() {
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&subscript_id).unwrap_or(&&EMPTY_SPAN),
                     msg: "cannot index this List: its element type is never determined \
@@ -29488,6 +30555,7 @@ impl<'src> Analyzer<'src> {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
             self.diagnostics.push(Error {
+                trace: Vec::new(),
                 note: None,
                 span,
                 msg: format!(
@@ -29583,6 +30651,7 @@ impl<'src> Analyzer<'src> {
                     .unwrap_or("unknown");
                 let rendered = self.pretty_print_type(&variable_type, &HashMap::default());
                 self.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!(
@@ -30425,7 +31494,10 @@ pub struct Program<'src> {
     pub for_each_views: HashMap<Id, bool>,
     pub binary_op_dispatch: HashMap<Id, Id>,
     pub own_generic_call_bindings: HashMap<Id, Vec<TypeId>>,
-    pub bound_dispatch_traits: HashMap<Id, Id>,
+    /// Call id -> `(trait, the arguments the bound wrote)`. The arguments are
+    /// empty where the site knows only the trait; an empty list constrains
+    /// nothing, so re-dispatch behaves exactly as it did before B73's R1.
+    pub bound_dispatch_traits: HashMap<Id, (Id, Vec<TypeId>)>,
     /// Per `expr!` site: how the transformer lowers it (std fast path or a
     /// user `Try` impl's members) — proposal/try-and-lift.md §4.
     pub try_dispatch: HashMap<Id, TryDispatch>,
@@ -30507,6 +31579,24 @@ pub struct Program<'src> {
     // ambient nursery in the spawn's scope, whether it is `Option`-wrapped).
     // The transformer passes the value as `__task`'s third argument.
     pub spawn_nursery_sources: HashMap<Id, (Id, bool)>,
+    /// What the context pass ERASED when it rewired a call record's subject
+    /// (editing-dx.md §19.3, backlog E75): rewired call id → the subject
+    /// entity the analyzer wired (`Local(get_safe_fn)` / `Local(run_fn)`).
+    /// Exactly two lowerings rewire the subject — a covered `get_safe`
+    /// becomes a `Some`-wrap of the hidden parameter, and `Context::run`
+    /// becomes a call of its body closure — destroying the only record that
+    /// names the SOURCE callee. The erased entity survives in `entity_map`,
+    /// so tooling resolves hover and go-to-definition through this map to
+    /// answer the source view.
+    pub context_erased_subjects: HashMap<Id, Id>,
+    /// The hidden context parameters the context pass minted (editing-dx.md
+    /// §19.3): parameter id → the context binding whose value it threads.
+    /// Deliberately a MARKER, not real records — a fabricated `parameters`
+    /// entry would surface the parameter in completion tab stops and every
+    /// other consumer keyed on `parameters`, dressing compiler plumbing as
+    /// source. Tooling checks membership here to answer an explicit, honest
+    /// "nothing" instead of relying on the self-loop cycle guard (E73).
+    pub context_hidden_parameters: HashMap<Id, Id>,
     // `external` std functions the transformer lowers to native JS or a runtime
     // helper (`str.trim()`, `scan()`, `random::range_i32(..)`, ...), keyed by fn id.
     // (The per-type `range_*` are forwarded to by the `Random` trait impls.)
@@ -30839,7 +31929,9 @@ impl<'src> Program<'src> {
                 error.span = origin_span;
                 // A note points into generated text too, and its own file is
                 // then meaningless; the attribute says everything there is.
+                // The same goes for a requirement trace's labels.
                 error.note = None;
+                error.trace = Vec::new();
                 (error, origin_source)
             }
             None => {
@@ -30941,20 +32033,25 @@ impl<'src> Program<'src> {
             usize,
             &'a str,
             Option<(u32, usize, usize, &'a str)>,
+            Vec<(u32, usize, usize, &'a str)>,
         ) {
+            let locate = |note: &'a Note| {
+                (
+                    note.source.unwrap_or(source).0,
+                    note.span.start,
+                    note.span.end,
+                    note.msg.as_str(),
+                )
+            };
             (
                 source.0,
                 error.span.start,
                 error.span.end,
                 error.msg.as_str(),
-                error.note.as_ref().map(|note| {
-                    (
-                        note.source.unwrap_or(source).0,
-                        note.span.start,
-                        note.span.end,
-                        note.msg.as_str(),
-                    )
-                }),
+                error.note.as_ref().map(locate),
+                // The E78 requirement trace is part of what the reader sees,
+                // so it joins the content tail (empty for most diagnostics).
+                error.trace.iter().map(|hop| locate(&hop.note)).collect(),
             )
         }
         fn sort_in_step(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>) {
@@ -31311,6 +32408,7 @@ fn report_module_parse_errors(diagnostics: &mut Vec<Error>, path: &Path, loaded:
             continue;
         }
         diagnostics.push(Error {
+            trace: Vec::new(),
             note: None,
             span: EMPTY_SPAN,
             msg,
@@ -32688,6 +33786,7 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
                     continue;
                 }
                 diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span,
                     msg: format!(
@@ -33656,6 +34755,7 @@ fn analyze_inner<'src>(
             let lib_path = std_module_path(&spec.base_root, "lib.vl");
             let Some(lib_loaded) = load_package_module(&lib_path) else {
                 analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: EMPTY_SPAN,
                     msg: format!("library at `{}` has no `lib.vl`", spec.base_root.display()),
@@ -33694,7 +34794,7 @@ fn analyze_inner<'src>(
                 if resolve_module_file(&spec.base_root, module).is_some() {
                     to_load.push((Origin::Dep(index), module));
                 } else if resolve_module_in_roots(&spec.search_roots(platform), module).is_some() {
-                    analyzer.diagnostics.push(Error {
+                    analyzer.diagnostics.push(Error { trace: Vec::new(),
                         note: None,
                         span: EMPTY_SPAN,
                         msg: format!(
@@ -33824,6 +34924,7 @@ fn analyze_inner<'src>(
             let module_path = resolution.path;
             if resolution.ambiguous {
                 analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: EMPTY_SPAN,
                     msg: format!(
@@ -33842,6 +34943,7 @@ fn analyze_inner<'src>(
                 crate::util::case_exact_mismatch(&resolution.root, &resolution.relative)
             {
                 analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
                     note: None,
                     span: EMPTY_SPAN,
                     msg: format!(
@@ -35358,6 +36460,8 @@ fn analyze_over_world<'src>(
         nursery_fn_id,
         owned_nursery_enter_fn_id,
         spawn_nursery_sources: HashMap::default(),
+        context_erased_subjects: HashMap::default(),
+        context_hidden_parameters: HashMap::default(),
         bool_enum_id: analyzer.bool_enum_id,
         module_id_by_name: analyzer.module_id_by_name,
         modules: analyzer.modules,
@@ -35492,6 +36596,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
             });
         violations.push(program.anchored(
             Error {
+                trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(anchor).unwrap_or(&&EMPTY_SPAN),
                 msg: view_crossing_message(view_name, root_name, callee),
@@ -35505,6 +36610,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
         }
         violations.push(program.anchored(
             Error {
+                trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(parameter_id).unwrap_or(&&EMPTY_SPAN),
                 msg: async_view_parameter_message(form),
@@ -35518,6 +36624,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
         }
         violations.push(program.anchored(
             Error {
+                trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(reference_id).unwrap_or(&&EMPTY_SPAN),
                 msg: async_view_capture_message(name),
@@ -35547,6 +36654,7 @@ pub fn check_async_drops(program: &mut Program) {
         .map(|(function_id, span, subject)| {
             program.anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: *span,
                     msg: format!(
@@ -35578,6 +36686,7 @@ pub fn check_context_drops(program: &mut Program) {
         .map(|(function_id, span, subject)| {
             program.anchored(
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: *span,
                     msg: format!(

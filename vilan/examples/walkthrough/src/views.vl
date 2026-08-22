@@ -58,12 +58,12 @@ let muted = const style().color(Color::gray(500));
 
 // The app shell: a connection banner, the sign-in gate, and the routed
 // app. The gate and the app toggle on whether a token exists.
-fun screen(
-	client: NotesClient<SocketTransport>,
-	notes: Signal<List<Note>>,
-	token: Signal<str>,
-	route: Signal<Route>,
-): View {
+fun screen(client: NotesClient<SocketTransport>, token: Signal<str>, route: Signal<Route>): View {
+	// The mirror, as a plain signal: `[]` until the first sync lands. Counted
+	// and released when this view is unmounted — the channel is open while,
+	// and only while, the screen is showing. The empty `[]` takes its element
+	// type from the mirror.
+	let notes = client.notes.or([]);
 	view("div")
 		.styled(shell)
 		.child(connection_banner(client))

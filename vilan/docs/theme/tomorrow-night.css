@@ -1,0 +1,9 @@
+/* Intentionally empty. This REPLACES mdBook's stock `tomorrow-night.css`, one of the
+ * three highlight.js colour sheets mdBook's book.js switches between by
+ * theme name (highlight.css for light themes, tomorrow-night.css for
+ * navy/coal, ayu-highlight.css for ayu). The book's code colours are not
+ * per-sheet literals any more: they are the `--code-*` role slots in
+ * `css/variables.css`, applied by the hljs mapping in `css/vilan.css`, which
+ * loads in every theme. Leaving the stock file in place would ship a sheet
+ * of hard-coded hexes that wins whenever its theme is active; an empty
+ * override ships nothing. */

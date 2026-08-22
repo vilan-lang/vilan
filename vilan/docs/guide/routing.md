@@ -146,18 +146,38 @@ and the page change land together as one update.
 
 When someone loads `/w/3/task/7` fresh, the request goes to your
 *server*, which has to answer with the app shell no matter the path.
-That's the standard history-API fallback, and the catch-all in your http
-handler does it:
+That's the standard history-API fallback, and the `on_request` handler
+on your server's builder chain does it:
 
-```vilan,fragment
-serve_service(4000, protocol, build_handler(build, |request| {
-	…app shell html…   // every path the build does not claim serves the shell
-}))
+```vilan,norun
+import std::build::require_build;
+import std::document::require_shell;
+import std::http::{ Response, Server };
+import std::print;
+
+async fun main() {
+	let build = require_build("client");
+	let page = require_shell("src/app.html", build).html();
+
+	Server::builder()
+		.port(4000)
+		.serve_build(build)
+		// Every path the build does not claim serves the shell.
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page).build())
+		.on_start(|server| print(i"listening on {server.url()}"))
+		.build()
+		.start();
+}
 ```
 
-`build_handler(build, …)` answers the build's own artifacts (`/client.js`,
-`/client.css`, and any route chunks) and hands everything else to your
-fallback, which is the catch-all deep links need.
+`serve_build(build)` answers the build's own artifacts (`/client.js`,
+`/client.css`, and any route chunks) *before* `on_request`, whatever order
+the chain was written in, so the `on_request` handler is the catch-all
+deep links need: it gets every path the build does not claim. An rpc app
+adds `.with_service(Service::new(protocol))` to the same chain and the
+rule holds — the service and the build answer first, your handler answers
+the rest ([Persistence](persistence.md#serving-http-stdhttp),
+[Services & RPC](services.md#the-server-side)).
 
 On the client side, a deep-linked page usually needs data that hasn't
 synced yet. Mount it under `when(present)` so it appears when the data

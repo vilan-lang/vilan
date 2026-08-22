@@ -551,3 +551,74 @@ applied `<style>` carries the fresh bytes — not the stale ones the server's ow
 route still serves. Reverting the shim change alone turns the pin red (no
 `<style>` is ever produced, no request ever reaches the dev channel), so the
 fix, not the harness, is what the test is anchored to.
+
+## Appendix: implementation record — the client registry reaps its own dead (2026-08-18)
+
+**Backlog M3**, found by the 2026-08-18 perf/leak survey. The registry
+(`DevChannel.clients`) took every `/events` connection unconditionally and shed
+one only as a side effect of a later broadcast failing to write to it. Between
+rounds nothing on the server ever *looked* at a client, so every disconnect —
+a tab refresh, a closed second tab, `EventSource`'s own native reconnect (§2's
+reconnect-heals path makes those routine) — banked its socket. A dev session
+that reconnects often and rebuilds rarely leaked one fd per disconnect,
+unbounded.
+
+**Measured before the fix** (`vilan run --watch` on a two-leg fixture, fds and
+threads read from `/proc/<pid>`): baseline 4 fds / 4 threads; after 50
+connect-disconnect cycles with no rebuild, 54 fds; after 100, 104 — one fd per
+cycle, exactly. Two facts the survey's write-up did not have:
+
+- **Threads never leaked.** The handler pushed the socket into the registry and
+  *returned*, so the per-connection thread ended there. Thread count stayed 4
+  across all 100 cycles. The backlog entry's parenthetical about accumulating
+  per-connection threads was wrong; only fds accumulated.
+- **A rebuild did not reap them.** After the first rebuild the count was still
+  104. A write to a socket whose peer closed cleanly *succeeds* — the bytes
+  reach the kernel and the RST answers them afterwards — so a dead client
+  survives its first broadcast and leaves only on the second (measured: back to
+  4 after the second rebuild). The prune was not merely late, it was a round
+  behind.
+
+**Fix**: the classic SSE idiom — the connection's own thread stays on it.
+`serve_events` writes the head and the `connected` hello, registers the socket,
+then blocks in `wait_for_disconnect` reading that socket until end-of-stream,
+and unregisters on the way out. A browser never writes on an SSE stream, so a
+read there is pure liveness: it blocks for as long as the tab lives and returns
+the moment it does not. The socket is an `Arc<TcpStream>` shared between that
+reader and the broadcaster (`&TcpStream` implements both `Read` and `Write`, so
+no `try_clone` — which would have spent a second fd per browser to fix an fd
+leak), and clients are keyed by an id rather than by their socket, because two
+threads can now decide a client is finished: its reader and a failing
+broadcast. Removal by id through the one mutex is idempotent, so the second
+arrival is a no-op rather than a race. The broadcast-time prune stays as a
+backstop and additionally `shutdown`s a socket it gives up on, so that
+connection's reader returns at once instead of holding the fd.
+
+**Cost**: one parked thread per *live* browser, where before there were none.
+Measured at 10 open connections: 14 fds / 14 threads, both back to 4 / 4 the
+moment they close. The accept loop already spends a thread per connection
+(§2's "fine for a localhost dev tool"); this extends that thread's life to its
+connection's rather than spawning anything new.
+
+**Measured after**: 100 connect-disconnect cycles, no rebuild — 4 fds / 4
+threads, unchanged from baseline, at every checkpoint.
+
+**Pinned** in `crates/vilan-cli/src/hmr.rs`'s unit tests rather than in
+`tests/hmr.rs`: the invariant is the registry's *size*, which nothing on the
+wire exposes, and `vilan-cli` is a bin-only crate — an integration test cannot
+reach a `DevChannel` accessor, and inventing a debug route to expose the count
+would have added dev-channel surface to test the dev channel.
+`a_disconnected_client_leaves_the_registry_without_a_broadcast` binds a real
+ephemeral channel, opens four real SSE connections, asserts the registry holds
+four (so "zero afterwards" cannot pass by never registering), drops them, and
+waits for zero — three generations, and **no event is ever pushed**, which is
+the whole claim. `a_live_client_stays_registered_and_receives_pushes` is the
+other half: the new reader must not unregister a healthy connection, and the
+id-keyed registry must still fan out. Planting the old behavior (register, then
+return) turns the first pin red — `expected 0 registered client(s), found 4` —
+so the fix, not the harness, is what it is anchored to.
+
+Unchanged: the wire. Framing, the `connected` hello, `/refresh`
+(`dev-refresh.md` §5–§6), the artifact routes, and every event the shim handles
+are byte-for-byte what they were; all eleven `tests/hmr.rs` e2e legs pass
+untouched.

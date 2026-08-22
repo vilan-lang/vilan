@@ -27,12 +27,24 @@
 //! The pass is a no-op for programs that never create a `Context`, so it can't
 //! change the output of any existing program.
 
+use std::collections::VecDeque;
+
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
-use crate::error::Error;
+use crate::error::{Error, Note, TraceHop};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::Type;
+
+/// How many upstream calls a coverage refusal's requirement trace labels
+/// (backlog E78) before it elides the rest behind an honest "… N more" tail.
+/// Six keeps a full report about a screen tall: chains deeper than that are
+/// recursion- or framework-shaped noise past the point where the reader has
+/// seen where the requirement enters, and the ENTRY side is what the cap
+/// keeps — the outermost uncovered frames, where the missing `run` belongs —
+/// while the read end is always visible anyway as the primary (or its C3
+/// note, when the read sits in std).
+const TRACE_CAP: usize = 6;
 
 /// Entry point: thread every context in `program`, or record diagnostics if any
 /// context is read where its value can't be supplied.
@@ -194,12 +206,70 @@ fn local_target(program: &Program, entity_id: Id) -> Option<Id> {
 fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
     program.anchored(
         Error {
+            trace: Vec::new(),
             note: None,
             span: span_of(program, anchor),
             msg,
         },
         anchor,
     )
+}
+
+/// [`anchored`], carrying the E78 requirement trace (one label per uncovered
+/// user-written call, ordered entry → site) and, when the offending site sits
+/// in std, the C3 note that demotes the std frame.
+fn anchored_tracing(
+    program: &Program,
+    anchor: Id,
+    msg: String,
+    trace: Vec<TraceHop>,
+    note: Option<Note>,
+) -> (Error, SourceId) {
+    program.anchored(
+        Error {
+            note,
+            trace,
+            span: span_of(program, anchor),
+            msg,
+        },
+        anchor,
+    )
+}
+
+/// The C3 note that demotes a std-internal site under a user-anchored primary
+/// (diagnostics-standard.md A2): the site's own span, labeled with the std
+/// function whose body holds it (`the read is inside `get_owner` here`), in
+/// its own file. `what` names the site's role — "read" for a strict `get`,
+/// "injected call" for a call through a `context`-clause closure.
+fn std_frame_note(
+    program: &Program,
+    graph: &CallGraph,
+    site: Id,
+    site_owner: Id,
+    what: &str,
+    anchor: Id,
+) -> Note {
+    // The nearest enclosing FUNCTION of the site's owner node (a closure hops
+    // its lexical parents), for the label.
+    let mut current = site_owner;
+    let holder = loop {
+        if let Some(function) = program.functions.get(&current) {
+            break function.name;
+        }
+        match graph.closure_parent_of(current) {
+            Some(parent) => current = parent,
+            None => break "std",
+        }
+    };
+    Note {
+        span: span_of(program, site),
+        msg: format!("the {what} is inside `{holder}` here"),
+        // The `Note::source` contract: name the file only when it differs
+        // from the primary span's.
+        source: program
+            .note_source_of(site)
+            .filter(|source| Some(*source) != program.note_source_of(anchor)),
+    }
 }
 
 fn span_of(program: &Program, id: Id) -> crate::span::Span {
@@ -765,6 +835,57 @@ fn analyze(
         }
     }
 
+    // --- The A2 walk-back's inputs (E74, diagnostics-standard.md §1). ---
+    // A coverage refusal whose offending site sits in STD was caused by user
+    // code calling a std helper (`effect`/`map`/`or` all funnel to
+    // `get_owner`'s strict read), so the diagnostic must lead with the user's
+    // call, not std's body. The reporting loops below walk from the site's
+    // owner back along the same edges the strictness climbed, and these are
+    // those edges at call-site grain.
+    let mut dispatch_incoming: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
+    for (owner, call_id, candidates) in &dispatch_sites {
+        for &candidate in candidates {
+            dispatch_incoming
+                .entry(candidate)
+                .or_default()
+                .push((*owner, *call_id));
+        }
+    }
+    let std_spanned = |id: Id| -> bool {
+        program
+            .source_of(id)
+            .is_some_and(|source| program.std_sources.contains(&source))
+    };
+    // Whether a dispatch site can actually select `candidate` — the
+    // concrete-receiver narrowing the coverage refinement uses, applied at
+    // one site: a recorded receiver's HEAD selects among candidates, so a
+    // site whose receiver picks a different member never takes the blame for
+    // this one. `OnConstraint` sites resolve per ENTRY, not per site, so they
+    // stay admitted (the union), exactly as conservative as the union edges.
+    let dispatch_admits = |call_id: Id, candidate: Id| -> bool {
+        match crate::async_infer::dispatch_at(program, call_id) {
+            Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
+                match program.type_id_to_type_map.get(&receiver) {
+                    Some(resolved)
+                        if !matches!(
+                            resolved,
+                            Type::Generic(_)
+                                | Type::Any
+                                | Type::Unknown
+                                | Type::Unresolved
+                                | Type::Trait(..)
+                        ) =>
+                    {
+                        let selected = impl_members_for(resolved, member);
+                        selected.is_empty() || selected.contains(&candidate)
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    };
+
     // --- Injected (`context`-typed) closures — proposal/ambient-owner.md §5. ---
     // A clause on a parameter's closure type defers that closure's context
     // binding to its CALL sites: the literal passed in takes its own hidden
@@ -1154,27 +1275,283 @@ fn analyze(
             }
         }
 
+        // The A2 walk-back (E74): a refused site whose own span sits in std
+        // anchors at the user-written calls that enter std on an uncovered
+        // path — the async-polymorphism origin discipline (`record_origin`:
+        // ids are minted in walk order, so call-id order is program order),
+        // with the std site demoted to the C3 note. E74 kept only the
+        // least-id entry; E78 keeps them all — each uncovered entry becomes
+        // its own diagnostic (fixing the first must not merely reveal the
+        // next), returned in id order so the least-id one still leads,
+        // exactly where E74 anchored. A site in user code anchors at itself
+        // and returns no entries here. The walk descends the same edges the
+        // strictness climbed — direct calls, admitted dispatch calls, the
+        // capture hop — and only through UNBOUND callers: a covered caller
+        // is not on the uncovered path and must not take the blame. No user
+        // entry found (an uncovered read reachable only from std's own load
+        // would be std's bug, not the user's) falls back to the std anchor.
+        let user_entries_of = |site: Id, start: Id| -> Vec<Id> {
+            if !std_spanned(site) {
+                return Vec::new();
+            }
+            let mut entries: Vec<Id> = Vec::new();
+            let mut visited: HashSet<Id> = HashSet::default();
+            let mut walk: Vec<Id> = vec![start];
+            while let Some(node) = walk.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                for &(caller, call_id) in incoming_calls.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) {
+                        continue;
+                    }
+                    if std_spanned(call_id) {
+                        walk.push(caller);
+                    } else {
+                        entries.push(call_id);
+                    }
+                }
+                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                        continue;
+                    }
+                    if std_spanned(call_id) {
+                        walk.push(caller);
+                    } else {
+                        entries.push(call_id);
+                    }
+                }
+                // A top-level call is an uncovered entry by construction; it
+                // has no node to walk onward to.
+                for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
+                    if !std_spanned(call_id) {
+                        entries.push(call_id);
+                    }
+                }
+                // The capture hop: an unbound closure's uncovered-ness came
+                // through its defining scope.
+                if let Some(parent) = graph.closure_parent_of(node) {
+                    if !bound.contains(&parent) {
+                        walk.push(parent);
+                    }
+                }
+            }
+            // One dispatch site reaches the walk once per visited candidate;
+            // a diagnostic per site, not per candidate.
+            entries.sort_by_key(|entry| entry.0);
+            entries.dedup();
+            entries
+        };
+
+        // The requirement trace (backlog E78): the refusal keeps the PATH
+        // the walk traverses, not just its endpoint. One hop per uncovered
+        // user-written call upstream of `start` (the frame holding the
+        // primary), breadth-first so a hop's depth is its least distance
+        // from that frame. A covered caller's edge is skipped exactly as in
+        // the walk above — a providing call is never labeled and stops the
+        // trace — and std-internal calls are traversed but never labeled
+        // (A2 demotes std frames; the C3 note already names the std site).
+        // The capture hop crosses no call site, so it adds no label and no
+        // depth: the closure blames its defining scope's callers directly.
+        struct Hop {
+            call: Id,
+            /// A dispatch edge is union-admitted (row 222's residual): the
+            /// site MAY select the needy candidate, so its label must not
+            /// overclaim.
+            dispatch: bool,
+            depth: usize,
+        }
+        let uncovered_hops_from = |start: Id| -> Vec<Hop> {
+            let mut hops: Vec<Hop> = Vec::new();
+            let mut visited: HashSet<Id> = HashSet::default();
+            let mut frontier: VecDeque<(Id, usize)> = VecDeque::from([(start, 0)]);
+            while let Some((node, depth)) = frontier.pop_front() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                for &(caller, call_id) in incoming_calls.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) {
+                        continue;
+                    }
+                    if !std_spanned(call_id) {
+                        hops.push(Hop {
+                            call: call_id,
+                            dispatch: false,
+                            depth,
+                        });
+                    }
+                    frontier.push_back((caller, depth + 1));
+                }
+                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
+                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                        continue;
+                    }
+                    if !std_spanned(call_id) {
+                        hops.push(Hop {
+                            call: call_id,
+                            dispatch: true,
+                            depth,
+                        });
+                    }
+                    frontier.push_back((caller, depth + 1));
+                }
+                for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
+                    if !std_spanned(call_id) {
+                        hops.push(Hop {
+                            call: call_id,
+                            dispatch: false,
+                            depth,
+                        });
+                    }
+                }
+                if let Some(parent) = graph.closure_parent_of(node) {
+                    if !bound.contains(&parent) {
+                        frontier.push_back((parent, depth));
+                    }
+                }
+            }
+            hops
+        };
+
+        // Hops as trace labels, ordered entry → read: decreasing depth reads
+        // from the outermost uncovered frame down toward the primary (a
+        // level order — on a many-chains DAG every hop's own upstream hop
+        // precedes it), ties in id (program) order; one label per call site.
+        // Past TRACE_CAP the entry side is kept and the rest elides behind
+        // the honest tail. Each label follows the `Note::source` contract:
+        // the file is named only when it differs from the anchor's.
+        let trace_of = |start: Id, anchor: Id| -> Vec<TraceHop> {
+            let mut hops = uncovered_hops_from(start);
+            hops.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.call.0.cmp(&b.call.0)));
+            let mut seen: HashSet<Id> = HashSet::default();
+            hops.retain(|hop| seen.insert(hop.call));
+            let anchor_source = program.note_source_of(anchor);
+            let locate = |call: Id| {
+                program
+                    .note_source_of(call)
+                    .filter(|source| Some(*source) != anchor_source)
+            };
+            let elided = hops.len().saturating_sub(TRACE_CAP);
+            let mut entries: Vec<TraceHop> = hops
+                .iter()
+                .take(TRACE_CAP)
+                .map(|hop| TraceHop {
+                    note: Note {
+                        span: span_of(program, hop.call),
+                        msg: if hop.dispatch {
+                            "the context requirement may flow through this call (dispatch may select a reader)"
+                                .to_string()
+                        } else {
+                            "the context requirement flows through this call".to_string()
+                        },
+                        source: locate(hop.call),
+                    },
+                    call: true,
+                })
+                .collect();
+            if elided > 0 {
+                let last = &hops[TRACE_CAP - 1];
+                let plural = if elided == 1 { "call" } else { "calls" };
+                entries.push(TraceHop {
+                    note: Note {
+                        span: span_of(program, last.call),
+                        msg: format!("… {elided} more uncovered {plural} on this path"),
+                        source: locate(last.call),
+                    },
+                    call: false,
+                });
+            }
+            entries
+        };
+
         // Any STRICT get whose owner stayed unbound is read outside every
         // `run`; a safe read never fences.
         for get in gets
             .iter()
             .filter(|get| get.context == context && !get.safe)
         {
-            if !bound.contains(&get.owner.id()) {
-                errors.push(anchored(program, get.call_id, format!(
-                        "context `{}` is read here, but this code can be reached without an enclosing `run`",
-                        context_name(program, context)
-                    )));
+            if bound.contains(&get.owner.id()) {
+                continue;
+            }
+            let message = format!(
+                "context `{}` is read here, but this code can be reached without an enclosing `run`",
+                context_name(program, context)
+            );
+            let entries = user_entries_of(get.call_id, get.owner.id());
+            if entries.is_empty() {
+                // A user-written read anchors at itself (E74), now carrying
+                // its upstream chain; a std-spanned read no user entry
+                // reaches keeps the bare std anchor, trace-free.
+                let trace = if std_spanned(get.call_id) {
+                    Vec::new()
+                } else {
+                    trace_of(get.owner.id(), get.call_id)
+                };
+                errors.push(anchored_tracing(program, get.call_id, message, trace, None));
+            } else {
+                for entry in entries {
+                    // The chain climbs from the frame holding the entry call;
+                    // a top-level entry has no frame and nothing above it.
+                    let trace = owner_of
+                        .get(&entry)
+                        .map(|frame| trace_of(frame.id(), entry))
+                        .unwrap_or_default();
+                    errors.push(anchored_tracing(
+                        program,
+                        entry,
+                        message.clone(),
+                        trace,
+                        Some(std_frame_note(
+                            program,
+                            graph,
+                            get.call_id,
+                            get.owner.id(),
+                            "read",
+                            entry,
+                        )),
+                    ));
+                }
             }
         }
         // Calling an injected closure IS a read: its deferred argument comes
         // from the caller, so an unbound caller has nothing to supply.
         for (owner, call_id) in injected_calls.get(&context).into_iter().flatten() {
-            if !bound.contains(&owner.id()) {
-                errors.push(anchored(program, *call_id, format!(
-                        "an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`",
-                        context_name(program, context)
-                    )));
+            if bound.contains(&owner.id()) {
+                continue;
+            }
+            let message = format!(
+                "an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`",
+                context_name(program, context)
+            );
+            let entries = user_entries_of(*call_id, owner.id());
+            if entries.is_empty() {
+                let trace = if std_spanned(*call_id) {
+                    Vec::new()
+                } else {
+                    trace_of(owner.id(), *call_id)
+                };
+                errors.push(anchored_tracing(program, *call_id, message, trace, None));
+            } else {
+                for entry in entries {
+                    let trace = owner_of
+                        .get(&entry)
+                        .map(|frame| trace_of(frame.id(), entry))
+                        .unwrap_or_default();
+                    errors.push(anchored_tracing(
+                        program,
+                        entry,
+                        message.clone(),
+                        trace,
+                        Some(std_frame_note(
+                            program,
+                            graph,
+                            *call_id,
+                            owner.id(),
+                            "injected call",
+                            entry,
+                        )),
+                    ));
+                }
             }
         }
 
@@ -1435,6 +1812,7 @@ fn analyze(
             // problem, reported against the entry.
             _ => errors.push((
                 Error {
+                    trace: Vec::new(),
                     note: None,
                     span: crate::span::Span { start: 0, end: 0 },
                     msg: "`get_safe` needs `std::option::Option` loaded".to_string(),
@@ -1463,12 +1841,17 @@ fn apply(program: &mut Program, plan: Plan) {
     // (context, node) -> the parameter id that holds the value inside that node.
     let mut source: HashMap<(Id, Id), Id> = HashMap::default();
 
-    // Give each function and `run` closure its own hidden parameter.
+    // Give each function and `run` closure its own hidden parameter. The
+    // parameter is deliberately record-less (no `parameters` entry, no span,
+    // no `expr_types` label — it is not source), so it is marked in
+    // `context_hidden_parameters` for tooling to recognize and answer
+    // honestly (editing-dx.md §19.3).
     for &(context, node) in &plan.param_nodes {
         let parameter = fresh();
         program
             .entity_map
             .insert(parameter, Expr::Parameter(parameter));
+        program.context_hidden_parameters.insert(parameter, context);
         if let Some(function) = program.functions.get_mut(&node) {
             function.parameters.push(parameter);
         } else if let Some(closure) = program.closures.get_mut(&node) {
@@ -1546,9 +1929,16 @@ fn apply(program: &mut Program, plan: Plan) {
                     .entity_map
                     .insert(value_reference, Expr::Local(parameter));
                 if let Some(call) = program.function_calls.get_mut(&call_id) {
+                    // Record the subject this rewire erases — the wired
+                    // `Local(get_safe_fn)` naming the SOURCE callee — so
+                    // tooling can still answer it (editing-dx.md §19.3).
+                    let erased_subject = call.subject_id;
                     call.subject_id = subject;
                     call.generic_argument_ids = Vec::new();
                     call.argument_ids = vec![value_reference];
+                    program
+                        .context_erased_subjects
+                        .insert(call_id, erased_subject);
                 }
                 program.method_call_substitution.remove(&call_id);
                 program.generic_dispatch.remove(&call_id);
@@ -1608,8 +1998,14 @@ fn apply(program: &mut Program, plan: Plan) {
     // parameter).
     for site in &plan.runs {
         if let Some(call) = program.function_calls.get_mut(&site.call_id) {
+            // As with the covered `get_safe`: the erased subject is the
+            // wired `Local(run_fn)`, recorded for tooling (§19.3).
+            let erased_subject = call.subject_id;
             call.subject_id = site.closure_entity;
             call.argument_ids = vec![site.value_id];
+            program
+                .context_erased_subjects
+                .insert(site.call_id, erased_subject);
         }
         // The call entity keeps its id, so purge the METHOD-call records the
         // analyzer attached to `Context::run` — a stale substitution would

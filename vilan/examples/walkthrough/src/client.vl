@@ -1,5 +1,7 @@
-// The client entry: connect, feed the mirror into a local signal, restore
-// the stored token, derive the route, and mount the screen.
+// The client entry: connect, restore the stored token, derive the route,
+// and mount the screen. The mirror is read INSIDE the screen
+// (`client.notes.or([])`): the subscription opens when the view mounts and
+// closes when it unmounts, instead of living as long as the tab.
 
 import std::json::json_codec;
 import std::print;
@@ -8,20 +10,17 @@ import std::result::Result::{ Err, Ok, self };
 import std::router::current_path;
 import std::storage;
 import std::ui::mount_root;
-import pkg::notes::Note;
 import pkg::routes::{ Route, parse };
 import pkg::store::NotesClient;
 import pkg::views::screen;
 
 async fun main() {
-	let notes: Signal<List<Note>> = Signal::new([]);
 	let token = Signal::new(storage::get("notes-token"));
 	let route = current_path().map(parse);
 
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			let _sync = client.notes.sub(|list| notes.set(list));
-			let _root = mount_root("app", || screen(client, notes, token, route));
+			let _root = mount_root("app", || screen(client, token, route));
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}

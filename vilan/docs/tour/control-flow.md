@@ -60,6 +60,34 @@ Drop the middle arm and the compiler says *"match is not exhaustive:
 missing `Option::Some(_)`"* — it names a value that has nowhere to go,
 spelled as the arm that would take it.
 
+An arm can carry a **guard**, an `if` that has to hold for the arm to
+run:
+
+```vilan,fragment
+match state {
+	Status::Ready if budget > 0 => start(),
+	Status::Ready => wait(),
+	Status::Done => finish(),
+}
+```
+
+A guarded arm proves nothing about completeness, and the compiler says
+so: a guard tests the *value* where the check reasons about the *type*,
+so writing `Status::Ready` only on a guarded arm still leaves `Ready`
+missing — reported with a note pointing at the guard. The rule that falls
+out is worth remembering: **the last arm may not be guarded.** Give it a
+`_ => …` afterwards, so the value the guard rejects has somewhere to go.
+
+One more edge belongs to [backed enums](data-and-traits.md), whose
+variants carry a host string or number. An exhaustive `match` over one is
+complete over the variant *set*, which is a proof about your side of the
+boundary and not about the value: a host that answers outside the set
+reaches a trap arm and panics naming it
+(`Align: "middle" is not one of its values`) rather than being filed
+under whichever variant came last. Add a `_` arm, or take the value
+through `Align::parse`, wherever an unrecognized value is an answer you
+expect.
+
 When you only need a yes/no answer instead of a full match, `is` tests a
 pattern as a boolean:
 

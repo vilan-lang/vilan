@@ -461,26 +461,6 @@ impl ServerBuilder {
 	}
 }
 
-/// `serve_build`'s fold as a plain handler, for a boot function that builds its
-/// own `Server` and hands the app only a fallback — `std::rpc_server`'s
-/// `serve_service` and `serve_connected`. The same reads, the same routes and
-/// the same dev-mode freshness; the only difference is where it is installed.
-///
-/// Composable in the way `std::rpc_server::rpc_response` is. Reach for
-/// `ServerBuilder::serve_build` whenever the app owns its builder — this exists
-/// because the `serve_*` boot functions do not hand one over.
-fun build_handler(build: LegBuild, fallback: |Request| Response): |Request| Response {
-	let assets = load_build(build);
-	// The one thing this cannot share with `respond_from_build` is the
-	// fallback's COLOR: `ServerBuilder`'s handler is `async` and
-	// `serve_service`'s is not, and a closure calling an async one is async.
-	// Both answer from `asset_response`, which is where the policy lives.
-	|request| match asset_for(assets, request.path()) {
-		Some(let asset) => asset_response(asset),
-		None => fallback(request),
-	}
-}
-
 /// The build's routes, then the app's own handler — `serve_build`'s half of
 /// `build()`'s fold.
 fun respond_from_build(

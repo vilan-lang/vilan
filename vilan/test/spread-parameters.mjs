@@ -136,7 +136,7 @@ function $u(self, observer) {
 		return;
 	} ]);
 	observer($i(self));
-	return [ self[1], id ];
+	return [ self[1], id, __shared_new([ 1 ]) ];
 }
 function $g(sources, $h) {
 	const snapshot = () => {

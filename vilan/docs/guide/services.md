@@ -21,8 +21,8 @@ Here's a complete little server:
 import std::print;
 import std::reactive::Signal;
 import std::json::json_codec;
-import std::http::Response;
-import std::rpc_server::serve_service;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
 import std::shared::Shared;
 
 [derive(Wire, PartialEq, Debug)]
@@ -56,15 +56,19 @@ fun main() {
 		entries = Signal::new([]),
 		next_id = Shared::new(1),
 	};
-	serve_service(4000, notes.dispatcher().into_protocol(json_codec()), |request| {
-		Response::builder().body("app shell here").build()
-	}, |server| print(i"listening on {server.url()}"));
+	Server::builder()
+		.port(4000)
+		.with_service(Service::new(notes.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().body("app shell here").build())
+		.on_start(|server| print(i"listening on {server.url()}"))
+		.build()
+		.start();
 }
 ```
 
 And a client. `NotesClient::connect` gives you an object whose exposed
-fields are live local signals and whose rpc methods are ordinary calls
-that return `Result`:
+fields are typed **mirrors** (`RemoteSource<T>`, one per `[expose]`) and
+whose rpc methods are ordinary calls that return `Result`:
 
 ```vilan,browser
 import std::print;
@@ -97,13 +101,16 @@ impl Notes {
 async fun main() {
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			// The mirror: fires on every server-side change, on every client.
-			let _sync = client.entries.sub(|list: List<Note>| print(list.len()));
+			// The mirror, watched by hand: the first `sub` opens the channel,
+			// and the observer fires on every server-side change, on every
+			// client. Disposing the last watcher closes the channel again.
+			let watching = client.entries.sub(|list: List<Note>| print(list.len()));
 			// An rpc call: implicitly awaited, Result-typed.
 			match client.add("hello") {
 				Ok(let id) => print(id),
 				Err(let error) => print(i"rpc failed: {error.debug()}"),
 			}
+			watching.dispose();
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}
@@ -197,12 +204,15 @@ check is still what decides who may act.
 
 - On the client they return `Result<T, RpcError>` and are implicitly
   awaited, like any async call.
-- `RpcError` tells you what went wrong: `Transport` (couldn't reach the
-  server), `Decode`, or `Remote` (the handler failed). Errors are
+- `RpcError` tells you what went wrong, in five variants:
+  `Transport(str)` (couldn't reach the server), `Decode(str)`,
+  `Remote(str)` (the handler failed), `Contract(str)` (the connect-time
+  check below refused a drifted server), and `Unauthorized`. Errors are
   values. Look at them and decide.
 - At connect time, both sides compare a hash of the service's shape. If
-  a stale client meets a redeployed server, the connect fails cleanly
-  instead of calls corrupting halfway. This is the **contract check**.
+  a stale client meets a redeployed server, the connect fails cleanly —
+  as `Contract(reason)` — instead of calls corrupting halfway. This is
+  the **contract check**.
 - On the server, each handler runs inside a turn, so all the signal
   writes one rpc makes are broadcast as a single consistent update.
 - Handler bodies can await: call another service, `sleep_for`, wait on
@@ -229,6 +239,81 @@ Three patterns follow from it:
   [drafts](reactive.md#optimistic-writes-and-local-first-drafts) whose
   commit is the rpc, and `adopt` mirror updates into them. Typing stays
   instant, remote edits fold in, and your own echoes are no-ops.
+
+### Reading a mirror
+
+A mirror is a `RemoteSource<T>`, not a `Signal<T>`, for one honest
+reason: before the first update lands it has **no value**, and nothing
+about the type pretends otherwise. You read it one of four ways:
+
+- `mirror.or(initial): Signal<T>` — the common one, for a view. A plain
+  signal you hand to `bind_each`, `bind_text`, or a `{…}` hole: `initial`
+  until the first sync, the mirrored value after. Write it inside the
+  view (not in `main`), because it is a **subscription**: it opens the
+  channel, and it is released when the view that created it is unmounted.
+- `mirror.map(|value| …): Signal<U>` — the same, with the `Option<T>`
+  in your hands once, which is where a fallback of a *different* type
+  belongs (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for
+  the same-type case.
+- `mirror.sub(|value| …): Subscription` — the manual form: an observer
+  of present values, and a handle you dispose yourself. For code with no
+  view and no owner (a probe, a script).
+- `mirror.get(): Option<T>` and `mirror.status(): Signal<Status>`
+  (`Waiting` / `Ready`) — passive reads. They open nothing.
+
+```vilan,browser
+import std::print;
+import std::json::json_codec;
+import std::reactive::Signal;
+import std::result::Result::{ self, Ok, Err };
+import std::rpc::SocketTransport;
+import std::shared::Shared;
+import std::ui::{ View, mount_root, view };
+
+[derive(Wire, PartialEq, Debug)]
+struct Note {
+	id: i32,
+	text: str,
+}
+
+[service(NotesClient)]
+struct Notes {
+	[expose] entries: Signal<List<Note>>,
+	next_id: Shared<i32>,
+}
+
+fun notes_panel(client: NotesClient<SocketTransport>): View {
+	// Counted, and released when this view is unmounted: the channel is
+	// open while — and only while — the panel is showing. `[]` until the
+	// first sync; the empty list takes its element type from the mirror.
+	let entries = client.entries.or([]);
+	view("ul").bind_each(entries, |note| note.id, |note| view("li").text(note.text))
+}
+
+async fun main() {
+	match NotesClient::connect("/", json_codec()) {
+		Ok(let client) => {
+			let _root = mount_root("app", || notes_panel(client));
+		},
+		Err(let error) => print(i"connect failed: {error.debug()}"),
+	}
+}
+```
+
+**Subscription follows demand.** Every `or`, `map`, and `sub` takes a
+counted lease on the channel: the first one sends `Subscribe`, the last
+release sends `Unsubscribe` (deferred to the end of the turn, so a view
+that re-renders in place churns nothing). Ten bindings on one mirror
+cost one channel; unmounting the page closes it. Which is also why
+`or`/`map` must be called where an owner is ambient (inside a view, or
+under `run_with_owner`): a network subscription with nobody to release
+it is a compile error, not a slow leak.
+
+One sentence to keep in mind: **`status` reports; it does not ask.** A
+`status()` observer alone never sees `Waiting → Ready`, because nothing
+opened the channel — the mirror stays `Waiting` until something that
+renders the value (`or`, `map`, `sub`) subscribes. That is the passive
+read being honest, and the count is what makes the active ones cheap.
 
 ## Connection state and reconnection
 
@@ -319,29 +404,35 @@ longer the only legal home for anything.
 ## The server side
 
 ```vilan,fragment
-serve_service(
-	port,
-	service.dispatcher().into_protocol(json_codec()),
-	|request| …,       // http fallback: serve assets + the app shell
-	|server| …,        // on_ready — `server.port()` is the bound port
-)
+Server::builder()
+	.port(port)
+	.with_service(Service::new(service.dispatcher().into_protocol(json_codec())))
+	.serve_build(require_build("client"))
+	.on_request(|request| …)   // every path neither claims: the app shell
+	.on_start(|server| …)      // `server.port()` is the bound port
+	.build()
+	.start();
 ```
 
-`dispatcher()` is generated by `[service]`. The fallback answers every
-plain http request; wrap it in `build_handler(require_build("client"), …)`
-so the client leg's own artifacts are served from the build's description
-rather than from paths you typed, and your closure returns the app shell
-for anything else so deep links work (see [Routing](routing.md)). For
-custom per-connection state, drop down to `serve_connected` (see the
-[rpc reference](../std/rpc.md)).
+`dispatcher()` is generated by `[service]`, `into_protocol` pairs it with
+a codec, and `Service::new` mounts the result at `/` — `with_service`
+installs its routes and its WebSocket handshake on the builder.
+`serve_build` serves the client leg's own artifacts from the build's
+description rather than from paths you typed, and `on_request` answers
+every plain http request neither of them claims — return the app shell
+there, so deep links work (see [Routing](routing.md); the shell, read
+and checked against the build, is in
+[Persistence](persistence.md#serving-http-stdhttp)). For custom
+per-connection state, `Service::on_connect`/`on_disconnect` replace the
+default session lifecycle (see the [rpc reference](../std/rpc.md)).
 
 ## Growing past one service
 
-`serve_service` is sugar over a `ServerBuilder` layer you can reach
-directly: `Service::new(protocol)`, installed with
-`ServerBuilder::with_service`. Its routes answer before `on_request`,
-which is what lets a page and a service sit on the same builder chain
-instead of one replacing the other:
+That chain is the whole layer — `Service::new(protocol)`, installed with
+`ServerBuilder::with_service`. A
+service's routes answer before `on_request`, which is what lets a page
+and a service sit on the same builder chain instead of one replacing the
+other:
 
 ```vilan,norun
 import std::print;
@@ -376,15 +467,16 @@ fun main() {
 ```
 
 Delete the `.with_service(…)` line and the program still compiles and
-still serves the page — the property a boot function built around
-`serve_service` can't have. `with_service` is repeatable: a second
+still serves the page — the property a boot function that owns the
+whole port can't have. `with_service` is repeatable: a second
 service goes on its own mount, `.at("/admin/")`, so
 `Client::connect("/admin/", codec)` reaches it and the first service's
 routes are untouched. Two constants either way: services always answer
 before `on_request` (so an app route can't accidentally shadow a
-service route), and `serve_rpc`/`serve_service`/`serve_connected` keep
-working unchanged — they're this same layer with the registry lifecycle
-(or a custom one) already wired in.
+service route), and the connection lifecycle is the service's own knob —
+`Service::on_connect`/`on_disconnect` swap the default session registry
+for the app's per-connection state (an auth identity, an app-written
+attach) without changing anything else about the chain.
 
 ## Traps
 
@@ -392,8 +484,9 @@ working unchanged — they're this same layer with the registry lifecycle
   *old server process* is still holding the port. Check with
   `ss -tlnp | grep <port>` and kill it by pid.
 - The wire is value-semantic. A mirrored list is a fresh copy per
-  update. Mutate through rpcs, never by writing the client's mirror
-  signal.
+  update. Mutate through rpcs, never by writing the signal `or`/`map`
+  handed you — that writes the local derivative only, and the next sync
+  overwrites it.
 - An rpc handler's reply is its return value, so the handler runs to
   completion before the client hears back. Long work belongs in spawned
   tasks that write signals when done.

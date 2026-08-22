@@ -13,6 +13,7 @@ use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
 use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options).transform_entry()
@@ -1502,7 +1503,95 @@ struct Transformer<'src> {
     // at emission, so these are PRE-rename names — which is what the planting
     // pass, which runs before the rename, matches against.
     gate_call_names: BTreeMap<String, String>,
+    // The const pass's per-emission attribution (`const-eval.md` §10.6). `None`
+    // for every other transform — an entry build records nothing, and the field
+    // is what keeps the emission path it shares with the const pass unchanged.
+    recorder: Option<EmissionRecorder>,
 }
+
+/// One thing the shared const world declares: a concrete function, or a KEYED
+/// emission — a generic instance, a specialized trait default, or a per-type
+/// drop helper, all of which land in [`Transformer::monomorphized`]. A keyed
+/// emission's identity is reserved BEFORE its body is walked (its
+/// `monomorphized` slot is not known until after), so a self- or mutually
+/// recursive requirement inside that body still resolves to it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum EmissionId {
+    Function(Id),
+    Keyed(usize),
+}
+
+/// What one emission contributed DIRECTLY, recorded the first — and, in the
+/// shared world, only — time it is lowered (`const-eval.md` §10.6).
+///
+/// A per-site mini-program used to re-walk every function its expression
+/// reached, and that walk was where the site learned three things besides the
+/// code: which module-level bindings it reads (its prelude, and the
+/// `unresolved` diagnostics), which runtime helpers it needs, and which host
+/// imports it reaches (what `check_capabilities` refuses on). Lowering each
+/// function once would lose all three for every site after the first — so each
+/// emission records them, together with what it directly required, and a site
+/// recovers its exact set by closing over `requires` from its own walk.
+#[derive(Default)]
+struct EmissionRecord {
+    globals: HashSet<Id>,
+    helpers: BTreeSet<&'static str>,
+    imports: BTreeMap<String, BTreeSet<String>>,
+    /// Everything this body required directly, whether or not the requirement
+    /// was already emitted — a memo hit contributes to the reaching site's set
+    /// exactly as a fresh emission does.
+    requires: Vec<EmissionId>,
+}
+
+/// The per-emission records, plus the open frames they are captured in. Present
+/// only on the const pass's transformer.
+#[derive(Default)]
+struct EmissionRecorder {
+    frames: Vec<EmissionRecord>,
+    records: HashMap<EmissionId, EmissionRecord>,
+    /// Where each keyed emission's node landed in `monomorphized`, by reserved
+    /// index. `None` until the body is walked and pushed.
+    keyed_slots: Vec<Option<usize>>,
+    /// The reserved identity of each keyed emission, by the memo key its own
+    /// emitter uses — consulted on a memo hit, the one place the identity is
+    /// not already in hand.
+    instances: HashMap<(Id, Vec<String>, Vec<Id>), EmissionId>,
+    defaults: HashMap<(Id, String), EmissionId>,
+    drops: HashMap<String, EmissionId>,
+}
+
+thread_local! {
+    /// How many function bodies the const pass has LOWERED on this thread since
+    /// [`reset_const_lowering_count`]. The instrument behind M4-A's pin
+    /// (`const-eval.md` §10.6), on the same argument as the call-graph and
+    /// name-seed counters beside it: a world lowered once per pass and a world
+    /// lowered once per site produce IDENTICAL results — the sharing is
+    /// behaviour-neutral by construction — so only a counter can tell them
+    /// apart, and only a counter can catch the per-site rebuild creeping back.
+    ///
+    /// Bumped only under a recorder, so it counts the const pass and nothing
+    /// else; one `Cell` bump against a whole function-body walk is
+    /// unmeasurable.
+    static CONST_LOWERING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many function bodies the const pass has lowered on this thread since the
+/// last [`reset_const_lowering_count`]. See [`CONST_LOWERING_COUNT`].
+pub fn const_lowering_count() -> usize {
+    CONST_LOWERING_COUNT.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`const_lowering_count`].
+pub fn reset_const_lowering_count() {
+    CONST_LOWERING_COUNT.with(|count| count.set(0));
+}
+
+/// The three accumulating sets a frame borrows while it is open.
+type FrameSets = (
+    HashSet<Id>,
+    BTreeSet<&'static str>,
+    BTreeMap<String, BTreeSet<String>>,
+);
 
 /// What a split build's route gate rewires: `View.swap` becomes
 /// `View.swap_split` at the recognized calls, and `std::ui::chunk_preload` is
@@ -1561,42 +1650,18 @@ enum ScopeTeardown {
 
 impl<'src> Transformer<'src> {
     fn new(program: &'src Program<'src>, options: &BuildOptions) -> Self {
-        let style = if options.readable_names {
-            NameStyle::Readable
-        } else if options.debug_names {
-            NameStyle::Annotated
-        } else {
-            NameStyle::Plain
-        };
-        // Source names for functions, variables, and parameters — what `Readable`
-        // names identifiers after and `Annotated` annotates them with. `Plain`
-        // needs none.
-        let source_names = if matches!(style, NameStyle::Plain) {
-            HashMap::default()
-        } else {
-            program
-                .variables
-                .iter()
-                .map(|(id, variable)| (*id, variable.name.to_string()))
-                .chain(
-                    program
-                        .functions
-                        .iter()
-                        .map(|(id, function)| (*id, function.name.to_string())),
-                )
-                .chain(
-                    program
-                        .parameters
-                        .iter()
-                        .map(|(id, parameter)| (*id, parameter.name.to_string())),
-                )
-                .collect::<HashMap<Id, String>>()
-        };
-        // Seeded in EVERY style, not just the readable one: the obfuscated
-        // sequence walks `a, b, …, aa, ab, …` and so eventually spells `if`,
-        // `in`, `do` — names no style may hand a binding.
-        let reserved = collect_reserved_names(program);
+        Self::with_name_seed(program, options, Rc::new(NameSeed::build(program, options)))
+    }
 
+    /// [`Transformer::new`] over an ALREADY-BUILT name seed — the entry a caller
+    /// that transforms the same program many times uses, so the seed is built
+    /// once instead of once per transform. See [`NameSeed`] and
+    /// [`ConstProgramSeed`].
+    fn with_name_seed(
+        program: &'src Program<'src>,
+        options: &BuildOptions,
+        names: Rc<NameSeed>,
+    ) -> Self {
         let print_fn_id = {
             let std_module_id = *program
                 .module_id_by_name
@@ -1614,7 +1679,7 @@ impl<'src> Transformer<'src> {
 
         Self {
             formatter: Formatter::from_options(options.indent, options.spaces),
-            ng: NameGenerator::new(style, source_names, reserved),
+            ng: NameGenerator::new(names),
             print_fn_id,
             list_new_fn_id: program.list_new_fn_id,
             list_push_fn_id: program.list_push_fn_id,
@@ -1645,6 +1710,7 @@ impl<'src> Transformer<'src> {
             chunk_count: 0,
             chunk_gate: None,
             gate_call_names: BTreeMap::new(),
+            recorder: None,
         }
     }
 
@@ -1698,6 +1764,7 @@ impl<'src> Transformer<'src> {
             .get("main")
             .and_then(|id| self.program.functions.get(id))
             .ok_or_else(|| Error {
+                trace: Vec::new(),
                 note: None,
                 msg: "Cannot execute program without a main function".to_string(),
                 span: Span::new((), 0..0),
@@ -1971,6 +2038,7 @@ impl<'src> Transformer<'src> {
                 None => format!("`{name}`"),
             };
             return Err(Error {
+                trace: Vec::new(),
                 note: None,
                 span: function
                     .map(|function| function.name_span)
@@ -1993,6 +2061,7 @@ impl<'src> Transformer<'src> {
         // is the class `drop(f(x))` belonged to; it must not leave here quietly.
         if let Some(&call_id) = self.unresolved_drop_sinks.first() {
             return Err(Error {
+                trace: Vec::new(),
                 note: None,
                 span: self
                     .program
@@ -2851,10 +2920,9 @@ impl<'src> Transformer<'src> {
         block: &mut Vec<js::Node<'src>>,
     ) -> Option<js::Node<'src>> {
         // A `const` expression's computed value replaces the whole subtree —
-        // in-place serialization (const-eval.md §1). The const mini-programs
-        // themselves are built by `transform_const_program` with the results
-        // map still empty for the expression being evaluated, so this arm
-        // never short-circuits an evaluation.
+        // in-place serialization (const-eval.md §1). The const world itself is
+        // lowered with the results map still empty for the expression being
+        // evaluated, so this arm never short-circuits an evaluation.
         if let Some(value) = self.program.const_results.get(&id) {
             return Some(const_value_to_js(value));
         }
@@ -3067,7 +3135,7 @@ impl<'src> Transformer<'src> {
                                     .bound_dispatch_traits
                                     .get(&function_call.subject_id)
                             })
-                            .copied();
+                            .cloned();
                         if let Some(dispatch) = self.resolve_dispatch_with(
                             concrete_type_id,
                             member_name,
@@ -3094,7 +3162,7 @@ impl<'src> Transformer<'src> {
                             .get(id)
                             .cloned()
                             .unwrap_or_default();
-                        let preferred = self.program.bound_dispatch_traits.get(id).copied();
+                        let preferred = self.program.bound_dispatch_traits.get(id).cloned();
                         if let Some(dispatch) = self.resolve_dispatch_with(
                             concrete_type_id,
                             member_name,
@@ -3118,7 +3186,7 @@ impl<'src> Transformer<'src> {
                         // dispatch on (B57 §3.1) — without it, two traits whose
                         // DEFAULTS share a name both resolve to whichever the
                         // by-name lookup reaches first.
-                        let preferred = self.program.bound_dispatch_traits.get(id).copied();
+                        let preferred = self.program.bound_dispatch_traits.get(id).cloned();
                         if let Some(dispatch) =
                             self.resolve_dispatch_with(type_id, member_name, &[], preferred)
                         {
@@ -5916,7 +5984,7 @@ impl<'src> Transformer<'src> {
                 .program
                 .bound_dispatch_traits
                 .get(&for_each_id)
-                .copied();
+                .cloned();
             if let Some(dispatch) = self.resolve_dispatch_with(type_id, member_name, &[], preferred)
             {
                 return dispatch;
@@ -5964,11 +6032,113 @@ impl<'src> Transformer<'src> {
             .collect()
     }
 
+    /// Notes a requirement in the frame currently being recorded — called at
+    /// every requirement, memo hit or fresh emission alike (`const-eval.md`
+    /// §10.6). A no-op outside the const pass.
+    fn record_require(&mut self, key: Option<EmissionId>) {
+        if let (Some(recorder), Some(key)) = (&mut self.recorder, key) {
+            if let Some(frame) = recorder.frames.last_mut() {
+                frame.requires.push(key);
+            }
+        }
+    }
+
+    /// Registers a keyed emission whose body is about to be walked: reserves its
+    /// identity, files it under the memo key its emitter looks it up by, and
+    /// notes it as a requirement of the frame that asked for it.
+    fn record_keyed(
+        &mut self,
+        remember: impl FnOnce(&mut EmissionRecorder, EmissionId),
+    ) -> Option<EmissionId> {
+        let key = {
+            let recorder = self.recorder.as_mut()?;
+            let key = EmissionId::Keyed(recorder.keyed_slots.len());
+            recorder.keyed_slots.push(None);
+            remember(recorder, key);
+            key
+        };
+        CONST_LOWERING_COUNT.with(|count| count.set(count.get() + 1));
+        self.record_require(Some(key));
+        Some(key)
+    }
+
+    /// Notes a keyed emission the memo already held as a requirement of the
+    /// asking frame — the path that makes a memo hit contribute exactly what a
+    /// fresh emission would.
+    fn record_hit(&mut self, lookup: impl FnOnce(&EmissionRecorder) -> Option<EmissionId>) {
+        let key = self.recorder.as_ref().and_then(lookup);
+        self.record_require(key);
+    }
+
+    /// Records where a keyed emission's node landed, once it is pushed.
+    fn record_landed(&mut self, key: Option<EmissionId>) {
+        let slot = self.monomorphized.len().checked_sub(1);
+        if let (Some(recorder), Some(EmissionId::Keyed(index)), Some(slot)) =
+            (self.recorder.as_mut(), key, slot)
+        {
+            recorder.keyed_slots[index] = Some(slot);
+        }
+    }
+
+    /// Opens a recording frame: the three accumulating sets are lent to it, so
+    /// what the body about to be walked adds is exactly what the frame holds.
+    /// Returns `None` (and does nothing) outside the const pass.
+    fn record_enter(&mut self) -> Option<FrameSets> {
+        self.recorder.as_ref()?;
+        let saved = (
+            std::mem::take(&mut self.referenced_globals),
+            std::mem::take(&mut self.used_helpers),
+            std::mem::take(&mut self.used_imports),
+        );
+        if let Some(recorder) = &mut self.recorder {
+            recorder.frames.push(EmissionRecord::default());
+        }
+        Some(saved)
+    }
+
+    /// Closes a frame, files it under `key`, and merges what it captured back
+    /// into the enclosing accumulation — so an enclosing frame, and the
+    /// assembly of a whole-program transform, see exactly what they saw before.
+    /// Returns the closed frame when it is not filed under a key — the const
+    /// world's site walk and prelude build both read their own frame back.
+    fn record_leave(
+        &mut self,
+        saved: Option<FrameSets>,
+        key: Option<EmissionId>,
+    ) -> Option<EmissionRecord> {
+        let (globals, helpers, imports) = saved?;
+        let mut frame = self
+            .recorder
+            .as_mut()
+            .and_then(|recorder| recorder.frames.pop())
+            .unwrap_or_default();
+        frame.globals = std::mem::replace(&mut self.referenced_globals, globals);
+        frame.helpers = std::mem::replace(&mut self.used_helpers, helpers);
+        frame.imports = std::mem::replace(&mut self.used_imports, imports);
+        self.referenced_globals
+            .extend(frame.globals.iter().copied());
+        self.used_helpers.extend(frame.helpers.iter().copied());
+        for (module, symbols) in &frame.imports {
+            self.used_imports
+                .entry(module.clone())
+                .or_default()
+                .extend(symbols.iter().cloned());
+        }
+        match (self.recorder.as_mut(), key) {
+            (Some(recorder), Some(key)) => {
+                recorder.records.insert(key, frame);
+                None
+            }
+            _ => Some(frame),
+        }
+    }
+
     /// Emits a concrete (non-generic) function once, keyed by its id. Any active
     /// substitution and self-type are cleared while walking it, since its body
     /// has no generic parameters of its own and is not a default being
     /// specialized.
     fn ensure_function_emitted(&mut self, function_id: Id) {
+        self.record_require(Some(EmissionId::Function(function_id)));
         if self.required_functions.contains_key(&function_id) {
             return;
         }
@@ -5979,10 +6149,15 @@ impl<'src> Transformer<'src> {
             return;
         }
         if let Some(function) = self.program.functions.get(&function_id) {
+            if self.recorder.is_some() {
+                CONST_LOWERING_COUNT.with(|count| count.set(count.get() + 1));
+            }
             let saved = std::mem::take(&mut self.current_substitution);
             let saved_self = self.current_self_type.take();
             let saved_instance = self.enter_instance(function_id, Vec::new());
+            let frame = self.record_enter();
             let js_function = self.function(function);
+            self.record_leave(frame, Some(EmissionId::Function(function_id)));
             self.restore_instance(saved_instance);
             self.current_substitution = saved;
             self.current_self_type = saved_self;
@@ -6004,6 +6179,64 @@ impl<'src> Transformer<'src> {
         self.resolve_dispatch_with(type_id, member, &[], None)
     }
 
+    /// Whether `implementation` provides `trait_id` at an instantiation the
+    /// re-dispatch demonstrably does NOT want — B73's R1 on the emission side.
+    ///
+    /// The filter is deliberately one-sided: it excludes an impl only when a
+    /// wanted argument and the impl's written one resolve to two *different
+    /// nominal types* (`Conv<Bar>` against a bound written `Conv<Baz>`). A
+    /// position still abstract on either side after `resolve_type_id` — the
+    /// impl's own binder (`impl Signal<type T> with Readable<T>`), or a bound
+    /// argument the current monomorphization has not fixed — proves nothing
+    /// here and keeps the impl, so every program whose arguments already agreed
+    /// emits exactly the bytes it emitted before.
+    fn trait_instantiation_conflicts(
+        &self,
+        implementation: &crate::analyzer::Implementation<'src>,
+        trait_id: Id,
+        wanted_arguments: &[TypeId],
+    ) -> bool {
+        if wanted_arguments.is_empty() {
+            return false;
+        }
+        let Some((_, written_arguments)) = implementation
+            .trait_args
+            .iter()
+            .find(|(id, _)| *id == trait_id)
+        else {
+            return false;
+        };
+        if written_arguments.len() != wanted_arguments.len() {
+            return false;
+        }
+        written_arguments
+            .iter()
+            .zip(wanted_arguments)
+            .any(|(written, wanted)| self.nominally_different(*written, *wanted))
+    }
+
+    /// Whether two types are provably distinct nominal types — the only
+    /// judgement [`trait_instantiation_conflicts`] is willing to act on. Type
+    /// ids are minted, not interned, so identity is compared through the types
+    /// they name and never through the ids themselves.
+    fn nominally_different(&self, left: TypeId, right: TypeId) -> bool {
+        let left = self.resolve_type_id(left);
+        let right = self.resolve_type_id(right);
+        if left == right {
+            return false;
+        }
+        match (
+            self.program.type_id_to_type_map.get(&left),
+            self.program.type_id_to_type_map.get(&right),
+        ) {
+            (Some(Type::Struct(left_id, _)), Some(Type::Struct(right_id, _)))
+            | (Some(Type::Enum(left_id, _)), Some(Type::Enum(right_id, _))) => left_id != right_id,
+            (Some(Type::Struct(..)), Some(Type::Enum(..)))
+            | (Some(Type::Enum(..)), Some(Type::Struct(..))) => true,
+            _ => false,
+        }
+    }
+
     /// `resolve_dispatch`, additionally binding the target method's OWN generics
     /// from `own_generic_values` (the call's bindings in declaration order —
     /// recorded against the trait member the analyzer saw, whose ids differ from
@@ -6016,13 +6249,14 @@ impl<'src> Transformer<'src> {
         type_id: TypeId,
         member: &str,
         own_generic_values: &[TypeId],
-        preferred_trait: Option<Id>,
+        preferred_trait: Option<(Id, Vec<TypeId>)>,
     ) -> Option<Dispatch<'src>> {
         let type_id = self.resolve_type_id(type_id);
-        if let Some(trait_id) = preferred_trait {
-            // Resolve strictly within the trait: the impl's override first...
+        if let Some((trait_id, trait_arguments)) = preferred_trait {
+            // Resolve strictly within the trait AND its instantiation (B73 R1).
+            // The impl's override first...
             if let Some((member_id, impl_subject)) =
-                self.resolve_member_on_trait_impl(type_id, trait_id, member)
+                self.resolve_member_on_trait_impl(type_id, trait_id, &trait_arguments, member)
             {
                 return Some(self.dispatch_to_member(
                     member_id,
@@ -6114,6 +6348,7 @@ impl<'src> Transformer<'src> {
         &self,
         type_id: TypeId,
         trait_id: Id,
+        trait_arguments: &[TypeId],
         member: &str,
     ) -> Option<(Id, TypeId)> {
         let type_ = self.program.type_id_to_type_map.get(&type_id)?;
@@ -6122,6 +6357,11 @@ impl<'src> Transformer<'src> {
             .iter()
             .filter(|implementation| {
                 implementation.trait_ids.contains(&trait_id)
+                    && !self.trait_instantiation_conflicts(
+                        implementation,
+                        trait_id,
+                        trait_arguments,
+                    )
                     && self
                         .program
                         .type_id_to_type_map
@@ -6171,19 +6411,27 @@ impl<'src> Transformer<'src> {
     fn emit_default_instance(&mut self, default_id: Id, type_id: TypeId) -> String {
         let key = (default_id, self.type_key(type_id));
         if let Some(name) = self.default_instances.get(&key) {
-            return name.clone();
+            let name = name.clone();
+            self.record_hit(|recorder| recorder.defaults.get(&key).copied());
+            return name;
         }
         let name = self.ng.next_name();
-        self.default_instances.insert(key, name.clone());
+        self.default_instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&default_id) {
+            let emission = self.record_keyed(|recorder, id| {
+                recorder.defaults.insert(key, id);
+            });
             let substitution = self.trait_parameter_substitution(default_id, type_id);
             let saved_self = std::mem::replace(&mut self.current_self_type, Some(type_id));
             let saved_substitution =
                 std::mem::replace(&mut self.current_substitution, substitution);
+            let frame = self.record_enter();
             let js_function = self.function_with_name(function, name.clone());
             self.current_self_type = saved_self;
             self.current_substitution = saved_substitution;
             self.monomorphized.push(js_function);
+            self.record_landed(emission);
+            self.record_leave(frame, emission);
         }
         name
     }
@@ -6510,7 +6758,9 @@ impl<'src> Transformer<'src> {
     fn ensure_drop_helper(&mut self, type_id: TypeId) -> Option<String> {
         let key = self.type_key(type_id);
         if let Some(existing) = self.drop_helpers.get(&key) {
-            return existing.clone();
+            let existing = existing.clone();
+            self.record_hit(|recorder| recorder.drops.get(&key).copied());
+            return existing;
         }
         let Some(glue) = self.program.drop_glue.get(&type_id).cloned() else {
             self.drop_helpers.insert(key, None);
@@ -6523,7 +6773,11 @@ impl<'src> Transformer<'src> {
         // Register the name BEFORE building the body, so a self-referential
         // resource (`struct Node { next: Option<Node> }`) terminates.
         let name = self.ng.next_name();
-        self.drop_helpers.insert(key, Some(name.clone()));
+        self.drop_helpers.insert(key.clone(), Some(name.clone()));
+        let emission = self.record_keyed(|recorder, id| {
+            recorder.drops.insert(key, id);
+        });
+        let frame = self.record_enter();
         let value_name = self.ng.next_name();
         let value = || js::Node::Local(value_name.clone());
         let mut body: Vec<js::Node<'src>> = Vec::new();
@@ -6586,6 +6840,8 @@ impl<'src> Transformer<'src> {
             body,
             is_async: false,
         }));
+        self.record_landed(emission);
+        self.record_leave(frame, emission);
         Some(name)
     }
 
@@ -6729,18 +6985,26 @@ impl<'src> Transformer<'src> {
             bits.to_vec(),
         );
         if let Some(name) = self.instances.get(&key) {
-            return name.clone();
+            let name = name.clone();
+            self.record_hit(|recorder| recorder.instances.get(&key).copied());
+            return name;
         }
         let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
         let name = self.ng.next_name();
-        self.instances.insert(key, name.clone());
+        self.instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&function_id) {
+            let emission = self.record_keyed(|recorder, id| {
+                recorder.instances.insert(key, id);
+            });
             let saved = std::mem::replace(&mut self.current_substitution, substitution);
             let saved_instance = self.enter_instance(function_id, bits.to_vec());
+            let frame = self.record_enter();
             let js_function = self.function_with_name(function, name.clone());
             self.restore_instance(saved_instance);
             self.current_substitution = saved;
             self.monomorphized.push(js_function);
+            self.record_landed(emission);
+            self.record_leave(frame, emission);
         }
         name
     }
@@ -7620,141 +7884,372 @@ fn const_value_to_js<'src>(value: &ConstValue) -> js::Node<'src> {
     }
 }
 
-/// Builds the mini-program that evaluates one `const` expression: the
-/// functions it (transitively) requires, declarations for the bindings it
-/// reads — already-computed const values as literals, literal initializers
-/// walked — and a final `const __const_result = <expr>;`. Returns the program
-/// plus any referenced bindings that are NOT compile-time-known; the caller
-/// turns those into diagnostics (free variables inside the expression itself
-/// are pre-checked with precise spans — this net catches what called
-/// functions reach). Skips `rename_for_scopes`: names stay as minted, and
-/// `__const_result` must survive for the evaluator to read.
-pub fn transform_const_program<'src>(
-    program: &'src Program<'src>,
-    options: &BuildOptions,
-    expr_id: Id,
-    external_bindings: &HashSet<Id>,
-    const_values: &HashMap<Id, crate::interpreter::ConstValue>,
-) -> (JsProgram<'src>, Vec<Id>) {
-    let mut transformer = Transformer::new(program, options);
+/// Everything a const site's assembly needs that does NOT vary with the
+/// expression being assembled: the [`NameSeed`] the world's transformer starts
+/// from, and the module-level bindings each site's prelude is filtered against.
+/// Both are functions of `(program, options)` alone — and both were rebuilt per
+/// const site, which on the website's server entry meant 210 rebuilds of a
+/// 4,184-entry source-name map and 210 walks of the module tree
+/// (`const-eval.md` §10). The [`ConstWorld`] builds one of these per analysis.
+struct ConstProgramSeed {
+    names: Rc<NameSeed>,
+    /// Module-level bindings as a set: the ids a site's prelude may have to
+    /// declare. `module_level_bindings()` returns them in emission order, which
+    /// this build does not need — the prelude sorts its own batches by entity
+    /// id (`b33-emission-order.md` §4).
+    module_level_bindings: HashSet<Id>,
+}
 
-    // The bindings that may need a prelude declaration: the expression's own
-    // free locals (checked by the caller) and module-level bindings reached
-    // through called functions. Everything else referenced is declared inside
-    // the emitted code itself (function-body and block locals).
-    let external: HashSet<Id> = program
-        .module_level_bindings()
-        .into_iter()
-        .chain(external_bindings.iter().copied())
-        .collect();
-
-    let mut body = Vec::new();
-    let result = transformer
-        .walk_entity(expr_id, &mut body)
-        .unwrap_or(js::Node::Void);
-
-    // Emitting a binding's initializer can reference more bindings (and
-    // require more functions) — iterate to a fixpoint.
-    let mut declared: HashSet<Id> = HashSet::default();
-    let mut unresolved: Vec<Id> = Vec::new();
-    let mut prelude: Vec<js::Node<'src>> = Vec::new();
-    loop {
-        // `referenced_globals` is a `HashSet`, so sort each round's batch by
-        // entity id — the canonical key — or the prelude's declaration order
-        // (and any diagnostic order derived from it) would vary run to run
-        // (`b33-emission-order.md` §4).
-        let mut pending: Vec<Id> = transformer
-            .referenced_globals
-            .iter()
-            .copied()
-            .filter(|id| external.contains(id) && !declared.contains(id))
-            .collect();
-        if pending.is_empty() {
-            break;
+impl ConstProgramSeed {
+    fn build(program: &Program, options: &BuildOptions) -> Self {
+        Self {
+            names: Rc::new(NameSeed::build(program, options)),
+            module_level_bindings: program.module_level_bindings().into_iter().collect(),
         }
-        pending.sort_by_key(|id| id.0);
-        for binding in pending {
-            declared.insert(binding);
-            // Non-variable references (functions, struct names) emit through
-            // their own channels; only value bindings need declarations.
-            let Some(variable) = program.variables.get(&binding) else {
-                continue;
-            };
-            let name = transformer.ng.name_for(binding);
-            // A const-initialized binding's computed value, keyed by its
-            // INITIAL expression id (how `const_eval` stores results).
-            if let Some(value) = variable
-                .initial
-                .and_then(|initial| const_values.get(&initial))
-            {
-                prelude.push(js::Node::ConstVariable(js::Variable {
-                    name,
-                    value: Box::new(const_value_to_js(value)),
-                }));
-                continue;
-            }
-            let initial = variable.initial;
-            let literal_initial = initial
-                .and_then(|initial| program.entity_map.get(&initial))
-                .map(|entity| {
-                    matches!(
-                        entity,
-                        Expr::String(_)
-                            | Expr::MultilineString(_)
-                            | Expr::Number(..)
-                            | Expr::Bool(_)
-                            | Expr::Null
-                    )
-                })
-                .unwrap_or(false);
-            if literal_initial && !variable.mutable {
-                let value = transformer
-                    .walk_entity(initial.unwrap(), &mut prelude)
-                    .unwrap_or(js::Node::Void);
-                prelude.push(js::Node::ConstVariable(js::Variable {
-                    name,
-                    value: Box::new(value),
-                }));
-            } else {
-                unresolved.push(binding);
-            }
+    }
+}
+
+/// The shared const world (`const-eval.md` §10.6): ONE lowering per const pass
+/// that every site is evaluated against, in place of the whole-closure
+/// mini-program each site used to build for itself.
+///
+/// A site's expression is walked the first time the pass reaches it, and the
+/// functions that walk requires are lowered into this world's single
+/// [`Transformer`] — so a function every style chain enters through is emitted
+/// once for the pass instead of once per site. (The website's client entry:
+/// 3,873 function emissions across 188 sites, **106** of them distinct.)
+///
+/// **What is shared is the LOWERING, never the evaluation.** Each site still
+/// gets its own prelude — the module-level bindings it reads, declared afresh —
+/// and its own interpreter scope, so no site can observe another site's state.
+/// And each site still carries its OWN reached set (functions, module-level
+/// bindings, runtime helpers, host imports), reconstructed from the
+/// [`EmissionRecord`]s the lowering left behind rather than from a re-walk, so
+/// its prelude, its `unresolved` diagnostics and what `check_capabilities`
+/// refuses on are exactly what a per-site mini-program produced.
+pub struct ConstWorld<'src> {
+    transformer: Transformer<'src>,
+    seed: ConstProgramSeed,
+    sites: HashMap<Id, SiteWalk<'src>>,
+}
+
+/// One site's own lowering, cached: the statements its expression emitted (the
+/// last of them `const __const_result = …`), and what that walk required — the
+/// seed of the site's reached set. Cached because the dependency-order retry
+/// loop re-derives only the PRELUDE; the expression and the world it reaches do
+/// not change when a dependency folds.
+struct SiteWalk<'src> {
+    body: Vec<js::Node<'src>>,
+    record: EmissionRecord,
+}
+
+/// What one site reaches in the world — the per-site half of what used to be a
+/// per-site mini-program.
+pub struct SiteReach {
+    /// The concrete functions it reaches, in entity-id order (the order a
+    /// mini-program declared them in).
+    functions: Vec<Id>,
+    /// The `monomorphized` slots it reaches, in emission order.
+    slots: Vec<usize>,
+    /// Every module-level binding its code reads — the prelude's input, and
+    /// what anything not compile-time-known is reported from.
+    globals: HashSet<Id>,
+    helpers: Vec<&'static str>,
+    imports: Vec<String>,
+}
+
+/// One const site's program, evaluated against the pass's shared world.
+pub struct ConstSite<'a> {
+    /// The world declarations this site reaches, borrowed from the one lowering
+    /// the pass made — hoisted into the site's own fresh scope.
+    pub world: Vec<&'a js::Node<'a>>,
+    /// The host imports and runtime helpers THIS site reaches, never the
+    /// world's union: what the interpreter refuses on is a per-site fact.
+    pub imports: Vec<String>,
+    pub helpers: Vec<&'static str>,
+    /// The module-level bindings this site reads, declared for this site alone.
+    pub prelude: Vec<js::Node<'a>>,
+    /// The site's expression, lowered once, ending in `const __const_result`.
+    pub body: &'a [js::Node<'a>],
+}
+
+impl<'src> ConstWorld<'src> {
+    pub fn new(program: &'src Program<'src>, options: &BuildOptions) -> Self {
+        let seed = ConstProgramSeed::build(program, options);
+        let mut transformer = Transformer::with_name_seed(program, options, seed.names.clone());
+        transformer.recorder = Some(EmissionRecorder::default());
+        Self {
+            transformer,
+            seed,
+            sites: HashMap::default(),
         }
     }
 
-    let mut t_functions: Vec<_> = transformer.required_functions.into_iter().collect();
-    t_functions.sort_by(|a, b| (a.0.0).cmp(&b.0.0));
-    let t_instances = transformer.monomorphized.into_iter();
+    /// Lowers `expr_id`'s expression into the world if it is not there yet, then
+    /// builds this site's prelude: declarations for the module-level bindings it
+    /// reads — already-computed `const` values as literals, literal initializers
+    /// walked. Returns the site's reach, its prelude, and the bindings that are
+    /// NOT compile-time-known, which the caller turns into diagnostics or
+    /// resolves and asks again.
+    pub fn prepare(
+        &mut self,
+        expr_id: Id,
+        external_bindings: &HashSet<Id>,
+        const_values: &HashMap<Id, crate::interpreter::ConstValue>,
+    ) -> (SiteReach, Vec<js::Node<'src>>, Vec<Id>) {
+        self.walk_site(expr_id);
+        let mut reach = self.reach_of(expr_id);
 
-    let imports = transformer
-        .used_imports
-        .iter()
-        .map(|(module, symbols)| {
-            let names = symbols.iter().cloned().collect::<Vec<_>>().join(", ");
-            format!("import {{ {} }} from \"{}\";", names, module)
-        })
-        .collect::<Vec<_>>();
-    let helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
+        let ConstWorld {
+            transformer, seed, ..
+        } = self;
+        let program = transformer.program;
+        // The bindings that may need a prelude declaration: the expression's own
+        // free locals (checked by the caller) and module-level bindings reached
+        // through called functions. Everything else referenced is declared inside
+        // the emitted code itself (function-body and block locals). Asked as a
+        // predicate over the two sets rather than built as their union, so the
+        // module-level half stays the seed's one copy.
+        let is_external =
+            |id: &Id| seed.module_level_bindings.contains(id) || external_bindings.contains(id);
 
-    body.push(js::Node::ConstVariable(js::Variable {
-        name: "__const_result".to_string(),
-        value: Box::new(result),
-    }));
-    let nodes = t_functions
-        .into_iter()
-        .map(|x| x.1)
-        .chain(t_instances)
-        .chain(prelude)
-        .chain(body)
-        .collect::<Vec<_>>();
+        // The fixpoint runs against the SITE's reached bindings, in a frame of
+        // its own — emitting a binding's initializer can reference more bindings
+        // (and, in principle, require more code), and both belong to this site.
+        let frame = transformer.record_enter();
+        transformer.referenced_globals = reach.globals.clone();
+        let mut declared: HashSet<Id> = HashSet::default();
+        let mut unresolved: Vec<Id> = Vec::new();
+        let mut prelude: Vec<js::Node<'src>> = Vec::new();
+        loop {
+            // `referenced_globals` is a `HashSet`, so sort each round's batch by
+            // entity id — the canonical key — or the prelude's declaration order
+            // (and any diagnostic order derived from it) would vary run to run
+            // (`b33-emission-order.md` §4).
+            let mut pending: Vec<Id> = transformer
+                .referenced_globals
+                .iter()
+                .copied()
+                .filter(|id| is_external(id) && !declared.contains(id))
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            pending.sort_by_key(|id| id.0);
+            for binding in pending {
+                declared.insert(binding);
+                // Non-variable references (functions, struct names) emit through
+                // their own channels; only value bindings need declarations.
+                let Some(variable) = program.variables.get(&binding) else {
+                    continue;
+                };
+                let name = transformer.ng.name_for(binding);
+                // A const-initialized binding's computed value, keyed by its
+                // INITIAL expression id (how `const_eval` stores results).
+                if let Some(value) = variable
+                    .initial
+                    .and_then(|initial| const_values.get(&initial))
+                {
+                    prelude.push(js::Node::ConstVariable(js::Variable {
+                        name,
+                        value: Box::new(const_value_to_js(value)),
+                    }));
+                    continue;
+                }
+                let initial = variable.initial;
+                let literal_initial = initial
+                    .and_then(|initial| program.entity_map.get(&initial))
+                    .map(|entity| {
+                        matches!(
+                            entity,
+                            Expr::String(_)
+                                | Expr::MultilineString(_)
+                                | Expr::Number(..)
+                                | Expr::Bool(_)
+                                | Expr::Null
+                        )
+                    })
+                    .unwrap_or(false);
+                if literal_initial && !variable.mutable {
+                    let value = transformer
+                        .walk_entity(initial.unwrap(), &mut prelude)
+                        .unwrap_or(js::Node::Void);
+                    prelude.push(js::Node::ConstVariable(js::Variable {
+                        name,
+                        value: Box::new(value),
+                    }));
+                } else {
+                    unresolved.push(binding);
+                }
+            }
+        }
+        let closed = transformer.record_leave(frame, None).unwrap_or_default();
+        // Whatever the prelude's own walks added belongs to this site too.
+        if closed.requires.is_empty() {
+            reach.globals = closed.globals;
+        } else {
+            reach = self.reach_from(&closed);
+        }
+        (reach, prelude, unresolved)
+    }
 
-    (
-        JsProgram {
-            imports,
-            helpers,
-            nodes,
-        },
-        unresolved,
-    )
+    /// The site's program: the world declarations it reaches (borrowed), its own
+    /// imports and helpers, its prelude, and its cached body.
+    pub fn site<'world>(
+        &'world self,
+        expr_id: Id,
+        reach: &SiteReach,
+        prelude: Vec<js::Node<'src>>,
+    ) -> ConstSite<'world> {
+        let mut world: Vec<&'world js::Node<'world>> =
+            Vec::with_capacity(reach.functions.len() + reach.slots.len());
+        for function_id in &reach.functions {
+            if let Some(node) = self.transformer.required_functions.get(function_id) {
+                world.push(node);
+            }
+        }
+        for slot in &reach.slots {
+            if let Some(node) = self.transformer.monomorphized.get(*slot) {
+                world.push(node);
+            }
+        }
+        ConstSite {
+            world,
+            imports: reach.imports.clone(),
+            helpers: reach.helpers.clone(),
+            prelude,
+            body: self
+                .sites
+                .get(&expr_id)
+                .map(|site| site.body.as_slice())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Lowers one site's expression into the world, once per pass. The three
+    /// per-walk scratch maps are cleared first, so the shared transformer starts
+    /// each site's walk from exactly the state a fresh one gave it.
+    fn walk_site(&mut self, expr_id: Id) {
+        if self.sites.contains_key(&expr_id) {
+            return;
+        }
+        self.transformer.is_bindings.clear();
+        self.transformer.hoisted_values.clear();
+        self.transformer.is_binding_reads = None;
+        let frame = self.transformer.record_enter();
+        let mut body = Vec::new();
+        let result = self
+            .transformer
+            .walk_entity(expr_id, &mut body)
+            .unwrap_or(js::Node::Void);
+        body.push(js::Node::ConstVariable(js::Variable {
+            name: "__const_result".to_string(),
+            value: Box::new(result),
+        }));
+        let record = self
+            .transformer
+            .record_leave(frame, None)
+            .unwrap_or_default();
+        self.sites.insert(expr_id, SiteWalk { body, record });
+    }
+
+    /// Resolves an interpreter frame trace back to the FUNCTIONS whose emission
+    /// minted those names (`const-eval.md` §10.6).
+    ///
+    /// The trace carries emitted names, and an emitted name is a generated
+    /// artifact: one generator serves the whole pass, so two reached functions
+    /// that share a source name cannot both be called by it — the second is
+    /// `helper2`. Matching a frame by IDENTITY, which the generator's own map
+    /// answers, is what keeps §8.2's attribution reading the source rather than
+    /// the mint. It also drops the frames §8.2 never wanted at a user: an
+    /// instance or a drop helper is named from the anonymous sequence and was
+    /// never minted for an entity at all, so it resolves to `None`.
+    pub fn resolve_trace(&self, trace: &[String]) -> Vec<Option<Id>> {
+        let functions = &self.transformer.program.functions;
+        let by_name: HashMap<&str, Id> = self
+            .transformer
+            .ng
+            .names
+            .iter()
+            .filter(|(id, _)| functions.contains_key(*id))
+            .map(|(id, name)| (name.as_str(), *id))
+            .collect();
+        trace
+            .iter()
+            .map(|frame| by_name.get(frame.as_str()).copied())
+            .collect()
+    }
+
+    fn reach_of(&self, expr_id: Id) -> SiteReach {
+        match self.sites.get(&expr_id) {
+            Some(site) => self.reach_from(&site.record),
+            None => self.reach_from(&EmissionRecord::default()),
+        }
+    }
+
+    /// Closes over `requires` from one walk's record: the set a per-site
+    /// re-walk of the whole closure would have produced, read off the records
+    /// the single lowering left instead. The walk is a plain worklist, so a
+    /// recursive or mutually recursive requirement terminates on `visited`.
+    fn reach_from(&self, seed: &EmissionRecord) -> SiteReach {
+        let mut functions: Vec<Id> = Vec::new();
+        let mut slots: Vec<usize> = Vec::new();
+        let mut globals = seed.globals.clone();
+        let mut helpers = seed.helpers.clone();
+        let mut imports = seed.imports.clone();
+        if let Some(recorder) = self.transformer.recorder.as_ref() {
+            let mut visited: HashSet<EmissionId> = HashSet::default();
+            let mut worklist: Vec<EmissionId> = seed.requires.clone();
+            while let Some(key) = worklist.pop() {
+                if !visited.insert(key) {
+                    continue;
+                }
+                match key {
+                    EmissionId::Function(function_id) => {
+                        if self
+                            .transformer
+                            .required_functions
+                            .contains_key(&function_id)
+                        {
+                            functions.push(function_id);
+                        }
+                    }
+                    EmissionId::Keyed(index) => {
+                        if let Some(Some(slot)) = recorder.keyed_slots.get(index) {
+                            slots.push(*slot);
+                        }
+                    }
+                }
+                let Some(record) = recorder.records.get(&key) else {
+                    continue;
+                };
+                globals.extend(record.globals.iter().copied());
+                helpers.extend(record.helpers.iter().copied());
+                for (module, symbols) in &record.imports {
+                    imports
+                        .entry(module.clone())
+                        .or_default()
+                        .extend(symbols.iter().cloned());
+                }
+                worklist.extend(record.requires.iter().copied());
+            }
+        }
+        functions.sort_by_key(|function_id| function_id.0);
+        slots.sort_unstable();
+        SiteReach {
+            functions,
+            slots,
+            globals,
+            helpers: helpers.into_iter().collect(),
+            imports: imports
+                .iter()
+                .map(|(module, symbols)| {
+                    let names = symbols.iter().cloned().collect::<Vec<_>>().join(", ");
+                    format!("import {{ {} }} from \"{}\";", names, module)
+                })
+                .collect(),
+        }
+    }
 }
 
 pub mod js {
@@ -7785,7 +8280,7 @@ pub mod js {
         // `_` for a discarded element.
         ForOf(String, Box<Self>, Vec<Self>),
         LetVariable(Variable<'src>),
-        Local(String), // TODO: Consider extracting identifiers into a separate lookup table for late identifier substitution.
+        Local(String),
         Null,
         Number(String, Option<String>),
         // Object(Vec<(&'src str, Self)>),
@@ -8006,54 +8501,143 @@ enum NameStyle {
     Plain,
 }
 
+/// What a [`NameGenerator`] starts from, and the only part of it that is a fact
+/// about the PROGRAM rather than about one transform: the source names the
+/// readable styles name identifiers after, the reserved set no style may hand
+/// out, and which style is in force. All three are functions of
+/// `(program, options)` alone, so a caller that transforms one program many
+/// times — the `const` pass, which used to lower a world per site — builds this
+/// once and shares it (`const-eval.md` §10). Behind an `Rc` because sharing it
+/// is the point.
+struct NameSeed {
+    style: NameStyle,
+    /// Source names by id (functions, variables, parameters) — empty for `Plain`.
+    source_names: HashMap<Id, String>,
+    /// Keywords, referenced globals, `__`-helpers and `[extern]` symbols: names
+    /// no generated identifier may collide with. Seeded in EVERY style, not just
+    /// the readable one — the obfuscated sequence walks `a, b, …, aa, ab, …` and
+    /// so eventually spells `if`, `in`, `do`.
+    reserved: HashSet<String>,
+}
+
+thread_local! {
+    /// How many [`NameSeed`]s this thread has built since
+    /// [`reset_name_seed_build_count`]. A test instrument for the
+    /// one-seed-per-const-pass invariant (`const-eval.md` §10), on the same
+    /// argument as `call_graph`'s build counter: a seed rebuilt per const site
+    /// and a seed built once produce IDENTICAL output — the sharing is
+    /// behaviour-neutral by construction — so only a counter can tell them
+    /// apart, and only a counter can catch the rebuild creeping back.
+    ///
+    /// Thread-local for the same reason as that one: the suite runs analyses
+    /// concurrently under plain `cargo test`, and an analysis is
+    /// single-threaded. One `Cell` bump against a build that walks every
+    /// variable, function and parameter in the program — unmeasurable.
+    static NAME_SEED_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`NameSeed`] builds on this thread since the last
+/// [`reset_name_seed_build_count`]. See [`NAME_SEED_BUILD_COUNT`].
+pub fn name_seed_build_count() -> usize {
+    NAME_SEED_BUILD_COUNT.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`name_seed_build_count`].
+pub fn reset_name_seed_build_count() {
+    NAME_SEED_BUILD_COUNT.with(|count| count.set(0));
+}
+
+impl NameSeed {
+    fn build(program: &Program, options: &BuildOptions) -> Self {
+        NAME_SEED_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+        let style = if options.readable_names {
+            NameStyle::Readable
+        } else if options.debug_names {
+            NameStyle::Annotated
+        } else {
+            NameStyle::Plain
+        };
+        // `Plain` names after nothing, so it needs no source names.
+        let source_names = if matches!(style, NameStyle::Plain) {
+            HashMap::default()
+        } else {
+            program
+                .variables
+                .iter()
+                .map(|(id, variable)| (*id, variable.name.to_string()))
+                .chain(
+                    program
+                        .functions
+                        .iter()
+                        .map(|(id, function)| (*id, function.name.to_string())),
+                )
+                .chain(
+                    program
+                        .parameters
+                        .iter()
+                        .map(|(id, parameter)| (*id, parameter.name.to_string())),
+                )
+                .collect::<HashMap<Id, String>>()
+        };
+        Self {
+            style,
+            source_names,
+            reserved: collect_reserved_names(program),
+        }
+    }
+}
+
 struct NameGenerator {
     chars: Vec<char>,
     counter: u64,
     names: HashMap<Id, String>,
-    /// Source names by id (functions, variables, parameters) — empty for `Plain`.
-    source_names: HashMap<Id, String>,
-    style: NameStyle,
-    /// Names already in use: the reserved set (keywords, referenced globals,
-    /// `__`-helpers, `[extern]` symbols) plus every name minted so far. Every
-    /// mint consults it, so a generated name is never a reserved word and never
-    /// repeats — the generator's own uniqueness invariant.
-    taken: HashSet<String>,
+    /// The program-wide seed — see [`NameSeed`].
+    seed: Rc<NameSeed>,
     /// Every name this generator has MINTED — the ones handed to an `Id` by
     /// `name_for` and the ones handed to an anonymous temp by `next_name` alike.
     /// `names` covers only the former, which is what made B69 possible: the
     /// scope re-allocator needs the CLOSED set, because a minted name it does
     /// not know about is one it will happily mint again out of its own
     /// identical alphabet. See `rename_for_scopes`.
+    ///
+    /// With the seed's reserved set it is also the generator's uniqueness
+    /// invariant: [`NameGenerator::is_taken`] is the union of the two, and every
+    /// mint consults it, so a generated name is never a reserved word and never
+    /// repeats.
     minted: HashSet<String>,
 }
 
 impl NameGenerator {
-    fn new(style: NameStyle, source_names: HashMap<Id, String>, reserved: HashSet<String>) -> Self {
+    fn new(seed: Rc<NameSeed>) -> Self {
         Self {
             chars: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
                 .chars()
                 .collect(),
             counter: 0,
             names: HashMap::default(),
-            source_names,
-            style,
-            taken: reserved,
+            seed,
             minted: HashSet::default(),
         }
+    }
+
+    /// Reserved, or already handed out by this generator — the two halves of
+    /// "unavailable".
+    fn is_taken(&self, name: &str) -> bool {
+        self.seed.reserved.contains(name) || self.minted.contains(name)
     }
 
     fn name_for(&mut self, id: Id) -> String {
         if let Some(name) = self.names.get(&id) {
             return name.clone();
         }
-        let name = match self.style {
+        let name = match self.seed.style {
             // Name after the source; an entity with no source name (an anonymous
             // temp) gets a `$`-prefixed fresh name, which no source name can be.
-            NameStyle::Readable => match self.source_names.get(&id).cloned() {
+            NameStyle::Readable => match self.seed.source_names.get(&id).cloned() {
                 Some(source) => self.unique_readable(&source),
                 None => self.next_name(),
             },
-            NameStyle::Annotated => match self.source_names.get(&id).cloned() {
+            NameStyle::Annotated => match self.seed.source_names.get(&id).cloned() {
                 Some(source) => format!("{}/*{}*/", self.next_name(), source),
                 None => self.next_name(),
             },
@@ -8069,7 +8653,7 @@ impl NameGenerator {
         let base = sanitize_identifier(source);
         let mut candidate = base.clone();
         let mut suffix = 2;
-        while self.taken.contains(&candidate) {
+        while self.is_taken(&candidate) {
             candidate = format!("{base}{suffix}");
             suffix += 1;
         }
@@ -8084,19 +8668,19 @@ impl NameGenerator {
 
     /// The next unused generated name. The obfuscated sequence walks the same
     /// `[a-zA-Z]` alphabet the scope re-allocator draws from, so it eventually
-    /// spells reserved words (`if`, `in`, `do`, …) — `taken` is consulted so it
-    /// never hands one out.
+    /// spells reserved words (`if`, `in`, `do`, …) — [`NameGenerator::is_taken`]
+    /// is consulted so it never hands one out.
     fn next_name(&mut self) -> String {
         loop {
             let index = self.next_idx();
             let short = self.name_from_idx(index);
             // In readable mode, temps are `$`-prefixed so they can't collide with a
             // readable (source-derived) name, which never contains `$`.
-            let candidate = match self.style {
+            let candidate = match self.seed.style {
                 NameStyle::Readable => format!("${short}"),
                 _ => short,
             };
-            if !self.taken.contains(&candidate) {
+            if !self.is_taken(&candidate) {
                 return self.mint(candidate);
             }
         }
@@ -8105,7 +8689,6 @@ impl NameGenerator {
     /// Records a name as handed out: unavailable for a later mint, and a member
     /// of the closed set `rename_for_scopes` re-allocates over.
     fn mint(&mut self, name: String) -> String {
-        self.taken.insert(name.clone());
         self.minted.insert(name.clone());
         name
     }
@@ -8491,7 +9074,7 @@ fn rename_if(branch: &mut js::IfBranch, rename: &HashMap<String, String>) {
 /// either re-allocated against a scope's `used` set or reserved in every scope,
 /// and a binding the walk misses can only come out over-long, never colliding.
 fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::Node>) {
-    let release = match ng.style {
+    let release = match ng.seed.style {
         NameStyle::Annotated => return,
         NameStyle::Readable => false,
         NameStyle::Plain => true,
@@ -8499,7 +9082,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
     // Each renameable binding's current (unique) name -> its source name.
     let mut source_of: HashMap<String, String> = HashMap::default();
     for (id, name) in &ng.names {
-        if let Some(source) = ng.source_names.get(id) {
+        if let Some(source) = ng.seed.source_names.get(id) {
             source_of.insert(name.clone(), source.clone());
         }
     }
