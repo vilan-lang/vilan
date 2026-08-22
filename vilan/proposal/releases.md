@@ -361,6 +361,21 @@ and 5 are the human's, and `cut-release.sh` finishes by printing them verbatim.
    neighbours, none leading or trailing. (At the v0.40.0 switch `### Breaking`
    becomes a structural heading — beta.md §2 — and this marker is what will
    generate it.)
+
+   **A marker that opens no entry is refused the same way** (2026-08-22,
+   backlog L11). A marker sits *directly* above its bold head — the
+   changelog's own writing note says so, and every marker in the tree does
+   so — and a `family:` or `commit:` line that reaches a blank line, a `---`
+   rule, a second marker of its kind, prose, or the section's end before a
+   head is printed with its line (``marker `<!-- family: tooling -->` at line
+   215 opens no entry``) and the cut stops. That shape is what a CHANGELOG
+   merge-union leaves behind (found 2026-08-20: a marker, two blank lines, a
+   rule — the parser let the rule clear it and the dry-run stayed green), and
+   a dangling marker would ride into the release section as a comment nobody
+   wrote. The manual cross-check after any CHANGELOG union is the anchored
+   parity count, markers against heads under `## Unreleased`, which must be
+   equal:
+   `awk '/^## Unreleased/{p=1;next} /^## /{p=0} p&&/^<!-- family:/{m++} p&&/^\*\*/{h++} END{print m+0, h+0}' CHANGELOG.md`
 4. **Commit, tag, push.** A `release: v<version>` commit on `next`, tagged
    `v<version>`; push `next` and the tag.
 5. **Watch `release.yml`.** The tag push is the trigger. Ten assets, five

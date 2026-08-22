@@ -15,6 +15,11 @@ the cut and REFUSES an entry that carries none, rather than guessing.
 proposal/releases.md §7.2 step 3 defines the four.
 -->
 
+## Unreleased
+
+<!-- family: tooling -->
+**`scripts/cut-release.sh` refuses a marker that opens no entry.** A `<!-- family: ... -->` line with nothing under it — blank lines and then the next `---`, which is what a CHANGELOG merge-union leaves behind — used to parse as nothing: the rule cleared it, no entry claimed it, and the dry-run stayed green over a comment that would have ridden into the release section. The parser now strands a `family:` or `commit:` marker that reaches a blank line, a rule, a second marker of its kind, prose, or the section's end before a bold head, and refuses the cut naming the marker and its line (``marker `<!-- family: tooling -->` at line 215 opens no entry``), beside the existing refusals and changing nothing. The rule it enforces is the one the changelog's own writing note already states: a marker sits directly above its head — every marker in the tree does, so a blank between the two is refused rather than tolerated. `proposal/releases.md` §7.2 step 3 names the shape and the anchored parity count that is the manual cross-check.
+
 ## v0.35.0 — 2026-08-21
 
 <!-- family: breaking -->
