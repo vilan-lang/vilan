@@ -879,7 +879,12 @@ the same way ("cannot index this List: its element type is never
 determined"), so does a `map` with a `None => []` arm, and all three
 reproduce on the v0.30.0 binary — an empty `[]` through a `T`-typed
 parameter does not take `T` from the receiver's already-bound type
-argument. The examples and docs write the annotated form
+argument. *(Corrected 2026-08-22, B125's lane: the `None => []` arm was
+never the todo example's reason — match-arm legs unify fine, as the
+backlog's B125 entry recorded on 2026-08-20 after probing. The `[]` half
+closed as B129 (§9); the annotation `todos.vl` kept afterwards was for a
+different defect again, mis-filed as B125/P21's and closed with it —
+type-solver.md "What B129's second gap actually was".)* The examples and docs write the annotated form
 (`let notes: Signal<List<Note>> = client.notes.or([]);`), the docs say
 why in one sentence, and the gap is pinned `#[ignore]` as
 `a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation`

@@ -60,11 +60,7 @@ let remove_button = const button + style().margin_left(Length::auto());
 let empty_note = const style().opacity(0.6);
 
 fun todos(client: TodoClient<SocketTransport>): View {
-	// Annotated for `items.map(..)` below, not for the `[]` — an empty list
-	// takes its element type from the mirror since B129, but a `.map` on a
-	// let-bound signal still types its closure parameter before the binding
-	// lands (the B125/P21 solver-ordering family).
-	let items: Signal<List<Todo>> = client.todos.or([]);
+	let items = client.todos.or([]);
 	let draft = Signal::new("");
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 

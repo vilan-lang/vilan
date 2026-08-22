@@ -11770,22 +11770,17 @@ fn missing_return_value_regime_3_parameter_mismatch_keeps_the_whole_value_anchor
     );
 }
 
-// P21 — KNOWN, NOT FIXED by this slice: the closure's void return
-// propagates through a GENERIC binding (`map<U>`'s `U`) before the mismatch
-// surfaces, one level out, on the initializer — a different, harder
-// mechanism (tracing the root cause back through generic instantiation)
-// than the direct context-return-type case P23/P24 cover. `type_is_ground`
-// deliberately declines to route a still-abstract target through the new
-// check (I5/B19's family — see its own doc comment), which is what leaves
-// this one on today's path.
+// P21 — the generic-binding case, closed by B125 (type-solver.md "The
+// expectation is an input of generic call resolution"): `map<U>`'s `U` is
+// bound from the call site's EXPECTATION (`let widths: List<i32>`) before the
+// closure argument is typed, so the closure arm's return-position check has
+// a ground target on the first attempt and reports at the closure's own
+// brace — not one level out as `List<void>` against the annotation. The
+// `type_is_ground` gate is unchanged: it still declines a target nobody has
+// bound; the expectation is what binds it now.
 #[test]
-#[ignore = "S3 residue (editing-dx.md P21): the closure's void return reaches List<void> \
-            through a generic binding before it mismatches, one level out — the new \
-            return-position check only fires when the expected return type is fully \
-            ground, so this stays on the whole-call anchor. Un-ignore once generic-return \
-            provenance tracing ships."]
-fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
-    assert_fails_spanning(
+fn missing_return_value_regime_3_through_a_generic_binding() {
+    assert_fails_spanning_nth(
         r#"
         import std::print;
 
@@ -11801,7 +11796,400 @@ fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
         }
         "#,
         "}",
+        2,
         "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// The same binding through a declared return type's TAIL — the expectation
+// the function walk seeds for its body tail reaches the call at priority 6
+// exactly as the `let` annotation does.
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_tail_position() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun widths(points: List<Point>): List<i32> {
+        	points.map(|point| {
+        		point.x * 2;
+        	})
+        }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	print(widths(points).len());
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// And through a `ret` — the third walk-time expectation seed.
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_ret_position() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun widths(points: List<Point>): List<i32> {
+        	ret points.map(|point| {
+        		point.x * 2;
+        	});
+        }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	print(widths(points).len());
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// The free-function path rides the same binding source (B90 aligned the two
+// call paths; B125 keeps them aligned): `apply<U>`'s `U` from the `let`.
+#[test]
+fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+
+        fun apply<U>(xs: List<i32>, f: |i32| U): List<U> {
+        	xs.map(f)
+        }
+
+        fun main() {
+        	let xs = [1, 2];
+        	let ys: List<i32> = apply(xs, |x| {
+        		x * 2;
+        	});
+        	print(ys.len());
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// `Signal::map<U>` — the shape the todo example annotates around; `sync |T|
+// U` binds the same way as `List::map`'s `|T| U`.
+#[test]
+fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        fun main() {
+        	let scope = Owner::new();
+        	let n = owner_scope.run(scope, || {
+        		let count = Signal::new(1);
+        		let doubled: Signal<i32> = count.map(|n| {
+        			n * 2;
+        		});
+        		doubled.get()
+        	});
+        	print(n);
+        	scope.dispose();
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// The nested shapes: the expectation reaches a call standing in a block
+// tail, a value-`if`'s branch tail, or a match leg — seeded at WALK time
+// through the syntactic tails (`seed_tail_expectations`), and by
+// `resolve_match` before its subject can defer the attempt.
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_a_block_tail() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = {
+        		points.map(|point| {
+        			point.x * 2;
+        		})
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_an_if_branch() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = if points.len() > 0 {
+        		points.map(|point| {
+        			point.x * 2;
+        		})
+        	} else {
+        		[]
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+// A match whose SUBJECT is itself a call: the legs used to be seeded only
+// once the subject landed (a pass after the leg's call had committed).
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_a_match_leg() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = match points.len() {
+        		0 => [],
+        		_ => points.map(|point| {
+        			point.x * 2;
+        		}),
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+// --- B125's B5 set: when the closure's tail, the annotation and the receiver
+// disagree in different combinations, exactly ONE diagnostic fires, and the
+// value-position reconcile at the `let` never doubles it — the closure's
+// reported type is the target it was held to (S3's rule), so the call types
+// as the annotation says and the `let` has nothing to add.
+
+// The void tail under an annotation: one report, at the brace, and the old
+// whole-call `List<void>` message is gone rather than joined.
+#[test]
+fn b125_a_void_closure_tail_under_an_annotation_reports_once_at_the_brace() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| {
+        		point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_without(source, "List<void>");
+}
+
+// A block tail that produces the WRONG value (i32 where the annotation's `U`
+// is str): one report, at the brace, in the annotation's terms.
+#[test]
+fn b125_a_closure_tail_disagreeing_with_the_annotation_reports_once_at_the_brace() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point| {
+        		point.x * 2
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning_nth(source, "}", 2, "Expected str, but got i32 instead.");
+    assert_fails_without(source, "List<str>");
+}
+
+// The bare-expression spelling has no brace to anchor at (S3 scoped the
+// return-position route to block bodies), so the argument check reports the
+// closure as a whole value — still once, still narrower than the whole call
+// the annotation used to be compared against.
+#[test]
+fn b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closure() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point| point.x * 2);
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "|point| point.x * 2",
+        "Expected |Point| str, but got |Point| i32 instead.",
+    );
+    assert_fails_without(source, "List<str>");
+}
+
+// A PARAMETER that disagrees with the receiver keeps P27's whole-value anchor
+// — the expectation binding adds nothing beside it.
+#[test]
+fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point: str| point.len());
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "|point: str| point.len()",
+        "Expected |Point| i32, but got |str| i32 instead.",
+    );
+}
+
+// All three disagree (parameter vs receiver, tail vs annotation): one
+// report, the whole closure, in the receiver's and the annotation's terms.
+#[test]
+fn b125_a_closure_disagreeing_with_receiver_and_annotation_reports_once() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point: i32| {
+        		point;
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_with(source, "Expected |Point| str, but got |i32| void instead.");
+}
+
+// Precedence: a generic a NON-closure argument binds is never overridden by
+// the expectation — `fold<B>`'s `B` is `i32` from the literal, and the `let`
+// reports the mismatch where it always did.
+#[test]
+fn b125_an_argument_bound_generic_outranks_the_expectation() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let xs = [1, 2];
+        	let s: str = xs.fold(0, |acc, x| acc + x);
+        	print(s);
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "xs.fold(0, |acc, x| acc + x)",
+        "Expected str, but got i32 instead.",
+    );
+}
+
+// No expectation, no change: an unannotated `let` still takes the closure's
+// bottom-up binding (`List<void>` here, and the program is legal).
+#[test]
+fn b125_an_unannotated_let_keeps_the_bottom_up_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths = points.map(|point| {
+        		point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// An expectation naming the ENCLOSING function's generic binds `U = T`; the
+// closure's target is then abstract, `type_is_ground` declines it (exactly
+// the "don't freeze unbound" case the gate exists for), and the body types
+// bottom-up as before.
+#[test]
+fn b125_an_expectation_naming_the_enclosing_generic_binds_through() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun ident<T>(xs: List<T>): List<T> {
+        	xs.map(|x| x)
+        }
+
+        fun main() {
+        	let ys = ident([1, 2, 3]);
+        	print(ys.len());
+        }
+        "#,
+        "3\n",
     );
 }
 
@@ -60389,18 +60777,20 @@ fn b129_an_empty_list_argument_binding_a_free_generic_still_errors() {
     );
 }
 
-/// The OTHER gap the original A25 pin's body carried, isolated: a `.map` on a
-/// `let`-bound signal freezes its closure parameter before the receiver's
-/// binding lands, so the parameter types as `any` and a field access on the
-/// element fails — with a NON-empty initial and no `[]` anywhere, so it is
-/// not B129's. Inlining the chain (`Signal::new(..).map(..)` in one
-/// expression) works; only the intermediate unannotated `let` trips it. This
-/// is B125/P21's solver-ordering family (the binding is read one level out,
-/// after the closure is already inferred — analyzer.rs's own P21 comment in
-/// the closure arm); it stays ignored until that design lands. Annotating the
-/// `let` sidesteps it, which is what the examples and docs do.
+/// The OTHER gap the original A25 pin's body carried, isolated — and, closed,
+/// re-diagnosed (B125's lane, type-solver.md "What B129's second gap actually
+/// was"): it was never P21's family and never about the `let`. The closure
+/// parameter `list` is filled fine once `.map` resolves; what went wrong is
+/// that `for todo in list` resolved FIRST — `ForEachItem` sits at priority 8,
+/// the `.map` call deferred to the next pass because its receiver had not
+/// grounded yet, and the for-each resolver committed the item to `any` on
+/// sight of an `Unknown` iterable instead of deferring on an unknown closure
+/// parameter the way the field-accessor, method-call, call-subject and match
+/// resolvers already do. Annotating `items` only worked because it let the
+/// call resolve at priority 6 of the first pass, ahead of the loop; the
+/// inline chain failed the same way (its receiver is a call). The resolver
+/// now defers; `resolve_subscript` got the same rule.
 #[test]
-#[ignore = "analyzer: a `.map` on a let-bound signal freezes its closure parameter before the receiver's binding lands — B125/P21 solver-ordering family, editing-dx.md §16; found isolating B129"]
 fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
     assert_compiles_and_runs(
         r#"
@@ -60430,5 +60820,125 @@ fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
         }
         "#,
         "1\n",
+    );
+}
+
+/// The same defect on `List` with no signal and no `let` in the way beyond the
+/// receiver's own: indexing the parameter (`resolve_subscript` reported
+/// "cannot index unknown" on the first pass, before the call filled it).
+#[test]
+fn b129_indexing_an_unannotated_closure_parameter_waits_for_its_owning_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let items = [[Todo { id = 1, done = false }]];
+        	let ids: List<i32> = items.map(|list| list[0].id);
+        	print(ids[0]);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// Iterating it — the for-each shape of the todo example, on a plain nested
+/// list whose receiver grounds only at priority 10 of the first pass.
+#[test]
+fn b129_iterating_an_unannotated_closure_parameter_waits_for_its_owning_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let items = [[Todo { id = 1, done = false }, Todo { id = 2, done = true }]];
+        	let remaining: List<i32> = items.map(|list| {
+        		mut open = 0;
+        		for todo in list {
+        			if !todo.done {
+        				open += 1;
+        			}
+        		}
+        		open
+        	});
+        	print(remaining[0]);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The inline chain the old pin's comment said worked — it did not (the
+/// receiver is a call, resolved at priority 11, so the loop ran first just
+/// the same), and it is pinned here so the claim is checked rather than
+/// remembered.
+#[test]
+fn b129_the_inline_chain_types_its_closure_parameter_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let scope = Owner::new();
+        	let n = owner_scope.run(scope, || {
+        		let remaining = Signal::new([Todo { id = 1, done = false }]).map(|list| {
+        			mut open = 0;
+        			for todo in list {
+        				if !todo.done {
+        					open += 1;
+        				}
+        			}
+        			open
+        		});
+        		remaining.get()
+        	});
+        	print(n);
+        	scope.dispose();
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The bound on the defer: a parameter NO call ever fills stays open to the
+/// end of the fixpoint and reports through the leftover sweep — it is not
+/// silently accepted. Indexing it used to report "cannot index unknown" on
+/// the first pass; iterating it used to type the item `any` and compile
+/// clean (the `any` leaking out of an untyped parameter). Both now report
+/// the way a never-pushed `List::new()` always has.
+#[test]
+fn b129_a_never_called_closures_parameter_still_reports() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let first = |xs| xs[0];
+        	print(1);
+        }
+        "#,
+        "could not be resolved",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let walk = |xs| {
+        		for x in xs {
+        			print(x);
+        		}
+        	};
+        	print(1);
+        }
+        "#,
+        "could not be resolved",
     );
 }

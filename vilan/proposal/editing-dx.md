@@ -2195,6 +2195,26 @@ added (§16). The standing `#[ignore]`d pin
 is left exactly as §16 shipped it — untouched, not re-verdicted, not
 touched by any commit in this lane.
 
+**Closed 2026-08-22 (B125, lane `b125-solver-ordering`).** Neither (a) nor
+(b) as written above: the expectation was never late. `expected_types` is
+seeded at walk time for the annotated `let`, the declared return type's
+tail and the `ret`, so it was in the map when the call resolved — the call
+resolver simply never read it for its own generic binding, only for B73
+R2's home selection. A third binding source, placed after the receiver and
+the non-closure arguments and before the closure arguments are typed,
+binds `U = i32` from the annotation; the closure arm's target is then
+ground on the first attempt, `type_is_ground` (unchanged) admits it, and
+the body reports at its own brace with the `;` wording — once. (b) was
+refuted by the mechanism: by the time the `let`'s reconcile runs, `U` is
+committed to `void` and that reconcile binds nothing, so there is no bound
+`U` for a second check to re-target. The pin is un-ignored as
+`missing_return_value_regime_3_through_a_generic_binding`, joined by the
+tail, `ret`, free-function, `Signal::map`, block-tail, if-branch and
+match-leg shapes and an eight-program B5 set. Design, probe tables, and the
+re-diagnosis of B129's companion pin (never this family — the for-each
+resolver committed `any` on an unknown closure parameter):
+`type-solver.md`, "The expectation is an input of generic call resolution".
+
 ### 17.7 B124 — a branch that leaves contributes no tail value — SHIPPED
 
 The live bug §17.2 recorded rather than fixed in passing, root-caused: the

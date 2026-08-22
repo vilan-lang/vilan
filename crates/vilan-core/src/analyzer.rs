@@ -18915,6 +18915,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(return_type_id) = return_type_id
                     {
                         self.expected_types.insert(expr_id, return_type_id);
+                        self.seed_tail_expectations(expr_id, return_type_id);
                         self.return_sites.push((id, expr_id));
                         // The synthesized void tail after a last statement that
                         // LEAVES is unreachable, and checking it draws a second
@@ -19022,6 +19023,7 @@ impl<'src> Analyzer<'src> {
                             void_id
                         });
                         self.expected_types.insert(checked_id, return_type_id);
+                        self.seed_tail_expectations(checked_id, return_type_id);
                         self.constraints.push(Constraint::ReturnType {
                             body_id: checked_id,
                             return_type_id,
@@ -19282,7 +19284,7 @@ impl<'src> Analyzer<'src> {
                 if type_.is_some()
                     && let Some(value_id) = initial
                 {
-                    self.expected_types.entry(value_id).or_insert(type_id);
+                    self.seed_tail_expectations(value_id, type_id);
                 }
                 self.variables.insert(
                     id,
@@ -21534,6 +21536,123 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// Binds the callee's own generics the call's EXPECTATION fixes — the
+    /// `U` of `let widths: List<i32> = points.map(|point| ..)` — for exactly
+    /// the generics the receiver and the non-closure arguments left open
+    /// (B125 / editing-dx.md P21, type-solver.md "The expectation is an
+    /// input"). Runs BEFORE the closure arguments are typed, which is the
+    /// whole point: with `U` known, the closure arm's return-position check
+    /// has a GROUND target and reports a void or mismatched body at the
+    /// closure's own brace; without it the closure's bottom-up type is what
+    /// binds `U` (`void`), the call commits `List<void>`, and the annotation
+    /// can only disagree with the whole call one level out. The expectation
+    /// is walk-time static for every shape that carries one (an annotated
+    /// `let`, a declared return type's tail, a `ret`), so it is already in
+    /// `expected_types` when the call resolves — this is not a reordering of
+    /// constraints, it is a binding source the call was not reading.
+    ///
+    /// Precedence, deliberately: receiver → non-closure arguments →
+    /// expectation → closure returns. An argument-bound generic is never
+    /// overridden (a `fold(0, ..)` under `let s: str` still binds `B = i32`
+    /// from the literal and reports at the `let`, as before); the expectation
+    /// fills only what is still open, and a closure's return then either
+    /// agrees or is reported where it is written. Only a binding with no
+    /// `Unknown`/`Unresolved` hole commits — a still-open expectation
+    /// (`List<unknown>` from an ungrounded slot) constrains nothing, and an
+    /// enclosing binder's generic is fixed, not free (B58); a generic
+    /// "inferred" to be itself has inferred nothing (B102) — the same filter
+    /// the call arm's return-type-only inference applies.
+    fn bind_callee_own_generics_from_expectation(
+        &mut self,
+        call_id: Id,
+        callee_id: Id,
+        substitution: &mut SubstitutionContext,
+    ) {
+        let Some(expected_id) = self.expected_types.get(&call_id).copied() else {
+            return;
+        };
+        let expected = expected_id.get_type(self);
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+            return;
+        }
+        let Some((_, own_generics)) = self.method_signature(callee_id) else {
+            return;
+        };
+        let open: Vec<TypeId> = own_generics
+            .into_iter()
+            .filter(|generic| !substitution.contains_key(generic))
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let declared_return_id = match self.expr_id_to_expr_map.get(&callee_id) {
+            Some(Expr::Function(function_id)) => self
+                .functions
+                .get(function_id)
+                .and_then(|function| function.return_type_id),
+            Some(Expr::ExternalFunction(function_id)) => self
+                .external_functions
+                .get(function_id)
+                .map(|function| function.return_type_id),
+            _ => None,
+        };
+        let Some(declared_return_id) = declared_return_id else {
+            return;
+        };
+        let declared_return = declared_return_id.get_type(self);
+        let mut return_generics = Vec::new();
+        self.collect_generics(&declared_return, 0, &mut return_generics);
+        if !open.iter().any(|generic| return_generics.contains(generic)) {
+            return;
+        }
+        let substituted_return = self.substitute_type(&declared_return, substitution);
+        let Some((_, bindings)) = self.reconcile_type(&substituted_return, &expected, substitution)
+        else {
+            return;
+        };
+        for (constraint_id, type_id) in bindings {
+            if open.contains(&constraint_id)
+                && !self.generic_is_enclosing_binder(constraint_id, call_id)
+                && type_id.get_type(self) != Type::Generic(constraint_id)
+                && !self.type_has_hole(type_id)
+            {
+                substitution.insert(constraint_id, type_id);
+            }
+        }
+    }
+
+    /// Whether `type_id` carries an `Unknown` or `Unresolved` anywhere in its
+    /// structure — a still-open slot, as opposed to an abstract but fixed
+    /// generic (`type_is_ground` refuses those too; `type_is_fully_determined`
+    /// refuses `Mapped` as well). A binding with a hole is not evidence.
+    fn type_has_hole(&self, type_id: TypeId) -> bool {
+        match type_id.get_type(self) {
+            Type::Unknown | Type::Unresolved => true,
+            Type::Generic(_)
+            | Type::Any
+            | Type::Never
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Void => false,
+            Type::Closure(parameter_type_ids, return_type_id) => {
+                parameter_type_ids
+                    .iter()
+                    .any(|parameter_type_id| self.type_has_hole(*parameter_type_id))
+                    || self.type_has_hole(return_type_id)
+            }
+            Type::Enum(_, argument_type_ids)
+            | Type::Struct(_, argument_type_ids)
+            | Type::Trait(_, argument_type_ids)
+            | Type::Tuple(argument_type_ids) => argument_type_ids
+                .iter()
+                .any(|argument_type_id| self.type_has_hole(*argument_type_id)),
+            Type::Array(element_type_id, _) => self.type_has_hole(element_type_id),
+            Type::Mapped(_, source_type_id, template_type_id) => {
+                self.type_has_hole(source_type_id) || self.type_has_hole(template_type_id)
+            }
+        }
+    }
+
     /// Whether some NON-closure argument's type has not landed on this attempt,
     /// so a generic that argument would bind cannot bind yet. Closure arguments
     /// are excluded: a closure's own type is `Unresolved` until its body types,
@@ -22844,6 +22963,45 @@ impl<'src> Analyzer<'src> {
                             return Type::Closure(parameter_type_ids, target_return_type_id);
                         }
                         ReturnPositionCheck::Mismatched(msg) => {
+                            // The regime-1/1' wording (editing-dx.md §3.7)
+                            // needs the block's last STATEMENT typed: "the
+                            // `;` discards this body's last value" is only
+                            // honest once that value is known to fit. A
+                            // closure is first inferred by the call that
+                            // just filled its parameters (B125's expectation
+                            // binding makes the target ground on that very
+                            // attempt), while the body's constraints on
+                            // those parameters (`point.x` — a field accessor
+                            // deferred on the unknown parameter) are still
+                            // pending, so the statement reads `Unresolved`
+                            // and the message would fall back to the general
+                            // wording for good. Say "not yet" instead — only
+                            // for the synthesized-void tail, where the
+                            // statement decides the wording: the owning
+                            // call's argument check (or the `let`) re-infers
+                            // the closure once the statement has typed, and
+                            // reports then. A statement that is itself an
+                            // error node never types and is not waited for
+                            // (its own diagnostic is the root cause).
+                            if matches!(self.expr_id_to_expr_map.get(&tail_id), Some(Expr::Void))
+                                && let Some(statement_id) = last_statement_id
+                                && !self.variables.contains_key(&statement_id)
+                                && !matches!(
+                                    self.expr_id_to_expr_map.get(&statement_id),
+                                    Some(Expr::Error)
+                                )
+                                && matches!(
+                                    self.infer_type_inner(
+                                        statement_id,
+                                        &Type::Unknown,
+                                        substitution_context,
+                                        exprs_seen,
+                                    ),
+                                    Type::Unresolved
+                                )
+                            {
+                                return Type::Unresolved;
+                            }
                             // `infer_type` has no memoization, so the same
                             // closure can be re-inferred while the
                             // enclosing constraint's OTHER inputs are still
@@ -25098,6 +25256,14 @@ impl<'src> Analyzer<'src> {
                         {
                             return Resolution::Deferred;
                         }
+                        // The method path's third binding source, shared (B125):
+                        // the call site's expectation fixes what the non-closure
+                        // arguments left open, before any closure is typed.
+                        self.bind_callee_own_generics_from_expectation(
+                            call_id,
+                            target_id,
+                            &mut substitution_context,
+                        );
                     }
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
@@ -25275,6 +25441,21 @@ impl<'src> Analyzer<'src> {
     /// later `push` may fill) is unresolved.
     fn resolve_for_each_item(&mut self, item_id: Id, iterable_id: Id) -> Resolution {
         let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
+        // Iterating an unannotated closure parameter (`items.map(|list| { for
+        // todo in list { .. } })`) waits for bidirectional inference to fill it
+        // — the rule the field-accessor, method-call, call-subject and match
+        // resolvers already apply to an unknown closure parameter (C′'s
+        // family). `Unknown` is not `Unresolved`, so without this the item
+        // committed to `any` on the first pass whenever the owning call had
+        // not yet resolved (an un-annotated receiver, a receiver that is itself
+        // a call), and every field access on the item failed "on type any" —
+        // B129's second gap, whose "let-bound signal" framing was the symptom,
+        // not the cause. A parameter never filled by the end of the fixpoint
+        // still takes `finalize_build`'s `any` default, as before.
+        if matches!(iterable_type, Type::Unknown) && self.is_unknown_closure_parameter(iterable_id)
+        {
+            return Resolution::Deferred;
+        }
         let next_method = self.for_each_next_method(Some(item_id));
         let element_type = self.iterable_element_type(&iterable_type, next_method);
         if matches!(iterable_type, Type::Unresolved)
@@ -25687,6 +25868,12 @@ impl<'src> Analyzer<'src> {
                 {
                     return Resolution::Deferred;
                 }
+                // The call site's expectation binds what is still open (`map<U>`'s
+                // `U` from `let widths: List<i32> = ..`) before the closures are
+                // typed, so a closure's return-position check has a ground target
+                // (B125/P21). After the defer above on purpose: the expectation
+                // fills generics, it does not decide readiness.
+                self.bind_callee_own_generics_from_expectation(id, member_id, &mut substitution);
                 self.infer_closure_args_against_params(member_id, argument_ids, &substitution);
                 // Then bind generics fixed by a closure's return (`derive<U>`'s `U`),
                 // now that the closures are typed.
@@ -26158,6 +26345,14 @@ impl<'src> Analyzer<'src> {
 
         if let Some(&first_value_id) = value_ids.first() {
             let value_type = self.infer_type(first_value_id, &variable_type, &substitution_context);
+            // Ready undirected (above) but not yet DIRECTED by the annotation:
+            // a closure held to `|| i32` whose void tail's wording waits on a
+            // pending last statement (the closure arm's "not yet", B125).
+            // Defer like the reassignments below do rather than report the
+            // non-type `unresolved` against the annotation.
+            if matches!(value_type, Type::Unresolved) {
+                return Resolution::Deferred;
+            }
             match self.reconcile_type(&value_type, &variable_type, &substitution_context) {
                 Some((unified, bindings)) => {
                     for (constraint_id, type_id) in bindings {
@@ -26256,6 +26451,47 @@ impl<'src> Analyzer<'src> {
     /// generic-call type-argument binding — see it. Used when the constraint
     /// flows into a branch or block tail during inference. Does not overwrite
     /// an expectation already present (a nearer annotation wins).
+    /// Seeds `type_id` as the expectation of `expr_id` AND of every syntactic
+    /// tail under it — a block's tail, a value-`if`'s branch tails, recursively
+    /// — at WALK time, where the three expectation sources (an annotated
+    /// `let`, a declared return type's tail, a `ret`) are seeded. The
+    /// inference-time seeds in the `Block`/`If` arms of `infer_type_path` only
+    /// run when the binding's own constraint infers the value (priority 10),
+    /// which is after a generic call standing in that tail has resolved at
+    /// its own priority (6) and committed its bindings — so `let widths:
+    /// List<i32> = if c { points.map(|p| { p.x; }) } else { [] }` never let
+    /// the call see `List<i32>` in time (B125's nested shapes). A `match`'s
+    /// legs are seeded by `resolve_match` from the match's own entry, which
+    /// this recursion writes when the match stands in a tail. `or_insert`
+    /// throughout: a nearer annotation wins, exactly as the inference-time
+    /// seeds behave.
+    fn seed_tail_expectations(&mut self, expr_id: Id, type_id: TypeId) {
+        self.expected_types.entry(expr_id).or_insert(type_id);
+        let tails: Vec<Id> = match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Block((_, tail_id))) => vec![*tail_id],
+            Some(Expr::If(branch)) if if_branch_has_final_else(branch) => {
+                fn branch_tails(branch: &ExprIfBranch, out: &mut Vec<Id>) {
+                    match branch {
+                        ExprIfBranch::If(_, (_, trailing), next) => {
+                            out.push(*trailing);
+                            if let Some(next) = next {
+                                branch_tails(next, out);
+                            }
+                        }
+                        ExprIfBranch::Else((_, trailing)) => out.push(*trailing),
+                    }
+                }
+                let mut out = Vec::new();
+                branch_tails(branch, &mut out);
+                out
+            }
+            _ => Vec::new(),
+        };
+        for tail_id in tails {
+            self.seed_tail_expectations(tail_id, type_id);
+        }
+    }
+
     fn seed_expectation(&mut self, expr: Id, constraint: &Type) {
         if matches!(constraint, Type::Unknown | Type::Unresolved) {
             return;
@@ -27761,6 +27997,23 @@ impl<'src> Analyzer<'src> {
     /// match as the unification of its leg bodies. Defers while the subject, a
     /// guard, or a leg body is unresolved.
     fn resolve_match(&mut self, prepped: &PreppedMatch<'src>) -> Resolution {
+        // The match's own expectation (a function's return tail, an annotated
+        // `let`, a tail `seed_tail_expectations` reached) is every leg body's
+        // too, so a return-position generic call inside a leg binds from it.
+        // Seeded FIRST, before the subject can defer this attempt: a subject
+        // that is itself a call resolves a pass later than the leg's call
+        // does (priority 5 here, 6 there), and a leg seeded only once the
+        // subject had landed reached its call after that call had already
+        // committed its bindings (B125's nested shapes). `or_insert`, so a
+        // nested match/leg inherits the expectation without overriding a
+        // nearer one.
+        if let Some(expected_type_id) = self.expected_types.get(&prepped.id).copied() {
+            for leg in &prepped.legs {
+                self.expected_types
+                    .entry(leg.body)
+                    .or_insert(expected_type_id);
+            }
+        }
         let subject_type = self.infer_type(prepped.subject_id, &Type::Unknown, &HashMap::default());
         if matches!(subject_type, Type::Unresolved) {
             return Resolution::Deferred;
@@ -27944,11 +28197,6 @@ impl<'src> Analyzer<'src> {
         let expected = self.expected_types.get(&prepped.id).copied();
         let mut unified: Option<Type> = None;
         for (_, _, body_id) in &resolved_legs {
-            if let Some(expected_type_id) = expected {
-                self.expected_types
-                    .entry(*body_id)
-                    .or_insert(expected_type_id);
-            }
             let leg_constraint = expected
                 .map(|type_id| type_id.get_type(self))
                 .unwrap_or(Type::Unknown);
@@ -28484,6 +28732,13 @@ impl<'src> Analyzer<'src> {
         let list_id = self.primitive_struct_ids.get("List").copied();
         match subject_type {
             Type::Unresolved => Resolution::Deferred,
+            // An unannotated closure parameter awaiting bidirectional inference
+            // (`items.map(|list| list[0])`) — typed when its owning call
+            // resolves; the same defer the field accessor applies (B129's
+            // second gap, see `resolve_for_each_item`). One still unknown at
+            // the end of the fixpoint reports through the leftover sweep's
+            // never-determined path, never silently.
+            Type::Unknown if self.is_unknown_closure_parameter(subject_id) => Resolution::Deferred,
             Type::Struct(struct_id, arguments)
                 if Some(struct_id) == list_id && arguments.len() == 1 =>
             {
