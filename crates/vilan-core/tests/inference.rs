@@ -12012,6 +12012,40 @@ fn b126_mutually_recursive_unannotated_functions_infer_together() {
     );
 }
 
+// B126 residue (2026-08-22), KNOWN, NOT FIXED: a self-call bound by a `let`
+// and read in the tail. The inference path does not read a `let` binding
+// through its initializer, so the tail `x + 1` is unresolved while `x`'s own
+// constraint is waiting on `g(n - 1)` — and the function's answer never
+// lands: "type of variable 'x' could not be resolved". Same on `next` before
+// the amendment. Asserts what SHOULD hold; goes green when the binding is
+// read through its initializer on the inference path.
+#[test]
+#[ignore = "B126 residue, 2026-08-22: a self-call bound by a `let` and read in the tail \
+            (`let x = g(n - 1); x + 1`) in an unannotated recursive body still fails \
+            \"could not be resolved\" — a `let` binding is not read through its \
+            initializer on the inference path"]
+fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = g(n - 1);
+        	x + 1
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
 // A function whose only return evidence is itself never returns: `never`,
 // which satisfies any expectation (as `panic(..)` does). It used to be
 // "could not be resolved".

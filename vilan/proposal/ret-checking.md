@@ -67,7 +67,8 @@ and argument checking; return position had none.
      `b126_a_function_that_only_calls_itself_is_never`). A self-call bound by a `let`
      and read in the tail (`let x = g(n - 1); x + 1`) still does not resolve — the
      binding's type is not read through its initializer on the inference path — exactly
-     as before the amendment; recorded, not a regression.
+     as before the amendment; recorded, not a regression (`#[ignore]` pin
+     `b126_a_let_bound_self_call_read_in_the_tail_resolves`, asserting what should hold).
    - The rule is the function's, not the shape's: an `async fun` without an annotation
      infers the same way and a call to it yields that type (pin
      `b126_an_async_function_without_annotation_infers_from_its_rets`); a nested closure's
@@ -220,7 +221,12 @@ for a function already on the stack answers `never` — the self-call's type is 
 answer under construction, so it can constrain nothing — and marks every frame nested
 inside that function's as inexact, so a function whose answer was built on an
 unfinished neighbour's is not recorded (its own constraint computes it top-level and
-records then). `exprs_seen` still guards expression-level cycles exactly as before.
+records then). `exprs_seen` still guards expression-level cycles exactly as before. Residue: a self-call
+bound by a `let` and read in the tail (`let x = g(n - 1); x + 1`) is not reached by this —
+the inference path does not read a `let` binding through its initializer, so the tail
+stays unresolved while the binding waits on the call — and fails "could not be resolved"
+as it did before the amendment; pinned `#[ignore]`d as
+`b126_a_let_bound_self_call_read_in_the_tail_resolves` (B126 residue, 2026-08-22).
 
 `Constraint::FunctionReturns { function_id }` is pushed for every bodied function
 without a declared return type (not only those with `ret`s — the record is how the
