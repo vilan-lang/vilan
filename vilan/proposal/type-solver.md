@@ -244,3 +244,294 @@ monomorphized instance via the one `emit_instance` path. Pinned by
 row of the bug table has a passing test.** (Lesson recorded: "closed" needs a pinned test
 per case, not suite-green plus one example — the earlier overstatement came from skipping
 that.)
+
+## The expectation is an input of generic call resolution — P21 closed (B125, 2026-08-22)
+
+The design lives here rather than in `editing-dx.md` because the question it
+answers is a solver one — **which binding source fixes a generic, and in what
+order** — and this is the paper that owns class (A), the re-queue, and the
+`expected_types` channel; `editing-dx.md` §17.6 records the diagnostics
+history and now points here. Lane `b125-solver-ordering`, Order 9 / cycle 27,
+off `next` @ 67cd3c57. Code commits `055183be`, `20bf10ed`, `76bbd9e6`.
+
+### The defect, in the solver's own terms
+
+`let widths: List<i32> = points.map(|point| { point.x * 2; })` with
+`List::map<U>(self, fn: |T| U): List<U>`:
+
+1. **Walk.** The annotated `let` seeds `expected_types[call] = List<i32>`
+   (analyzer.rs, the `Node::Let` arm — the same seed a declared return type's
+   tail and a `ret` get). `Constraint::MethodCall` for the call (priority 6);
+   `Constraint::Variable` for `widths` (priority 10).
+2. **Pass 1, priority 6 — `resolve_method_call`.** The receiver binds the
+   impl's `T = Point`. `bind_callee_own_generics(skip_closures)` binds
+   nothing: the only argument is the closure. No defer — no non-closure
+   argument is unresolved. `infer_closure_args_against_params` infers the
+   closure against `|Point| U`; `U` is unbound, so the closure arm's
+   substituted target is `Generic(U)`, `type_is_ground` declines it, and the
+   body infers bottom-up: `|Point| void`. `bind_callee_own_generics(all)`
+   reconciles `|T| U` against that and **commits `U := void`**; the call
+   records `{T: Point, U: void}`, wires, and returns `Resolved`.
+3. **Priority 9 — `MethodArgCheck`** re-infers the closure against
+   `|Point| void`: ground now, and true. Matched.
+4. **Priority 10 — `Variable`** infers the call against `List<i32>`; the call
+   arm's return-type-only inference reconciles `List<void>` against
+   `List<i32>`, fails, binds nothing; the `let`'s own reconcile fails and
+   reports `Expected List<i32>, but got List<void> instead.` on the whole
+   call. Confirmed live on the v0.35.0 binary (`8d7fe41b`), and for the
+   tail, `ret`, free-function (`apply<U>(xs, f: |i32| U): List<U>`) and
+   `Signal::map` spellings — same message, same whole-call anchor.
+
+**Why the re-queue cannot wake it.** Nothing deferred. The `MethodCall`
+RESOLVED (a committed binding is never revisited — resolution is monotone by
+construction, `build()`'s loop comment), and the `Variable` FAILED (reported).
+`current_waiting_on` is captured only for a constraint that returns
+`Deferred`; item 5 v2 re-runs work that waited, and this work never waited.
+P21 is not a re-queue shape at all.
+
+**The fact the papers missed.** The expectation was available the whole
+time. `expected_types[call]` is written AT WALK TIME for every shape that
+carries one — the annotated `let`, the declared return type's tail, the
+`ret` — so it is already in the map when the call resolves at priority 6 of
+the first pass. The call resolver read it for exactly one thing, B73 R2's
+home selection (`select_home_by_expected_type`), and never for its own
+generic binding. "The call's own generic-parameter binding is a downstream
+CONSEQUENCE of the argument inference that already ran" (§17.6) was true of
+the *closure's* contribution; it was never true of the *expectation's*.
+
+### (a) against (b), with the spike's answer
+
+- **(b) as framed** — a deferred constraint re-triggering the closure's
+  return-position check once its target becomes ground, woken by the call's
+  return reconcile — **cannot close P21.** By the time the `let`'s reconcile
+  runs, `U` is committed to `void`; the reconcile `List<void>` against
+  `List<i32>` fails outright and binds nothing, so there is no newly-bound
+  `U` for a second check to re-target. A constraint waiting on "`U` is
+  ground" fires on `U := void` — which IS ground — and finds a body that
+  matches it. The only way (b) works is if the call declined to commit `U`
+  from a closure's return while an expectation might still arrive, and there
+  is no signal that one never will: an unannotated `let widths = points.map(
+  |point| { point.x * 2; })` legitimately has none and legitimately types
+  `List<void>` (pinned: `b125_an_unannotated_let_keeps_the_bottom_up_binding`).
+  Such a defer would wait forever and the run-all backstop would commit it
+  anyway. The orchestrator's prior is refuted by the mechanism, not by
+  taste.
+- **(a) as framed** — reorder generic method-call resolution so a
+  context-known return binds before the closure arguments — assumed the
+  expectation arrives *later* and the call must wait for it. It does not.
+  What is needed is not a reordering of constraints but a **third binding
+  source inside the existing two-phase resolver**, in a fixed place in its
+  precedence:
+
+  > receiver → non-closure arguments → **expectation** → closure returns
+
+  `bind_callee_own_generics_from_expectation(call_id, callee_id,
+  &mut substitution)`: read `expected_types[call_id]` (skip
+  `Unknown`/`Unresolved`/`Any`); take the callee's own generics still open
+  after the receiver and the non-closure pass; substitute the callee's
+  DECLARED return type with what is bound so far; reconcile it against the
+  expectation; insert the bindings for the open generics that appear in the
+  declared return type — filtered exactly as the call arm's return-type-only
+  inference filters (not the enclosing binder's generic, B58; not a generic
+  "inferred" to be itself, B102) and additionally refusing a binding with an
+  `Unknown`/`Unresolved` hole anywhere inside it (`type_has_hole`: a
+  still-open expectation is not evidence). Called at both call paths — the
+  method path after its B90 defer and before `infer_closure_args_against_
+  params`, the free-function path after its hoisted non-closure pass and
+  before its positional loop — because B90 made the two paths one rule and a
+  fix on one side would have re-opened the split.
+
+  **Why argument-first, expectation-second.** An argument is a value the
+  user wrote; the expectation is where the result goes. `let s: str =
+  xs.fold(0, |acc, x| acc + x)` binds `B = i32` from the literal, the
+  closure types against it, and the `let` reports `Expected str, but got i32`
+  at the call — as before, one diagnostic, and the right one: the literal is
+  the nearest evidence (pinned:
+  `b125_an_argument_bound_generic_outranks_the_expectation`). Letting the
+  expectation win would type the literal through the annotation — a
+  different, wider change (literal typing by expectation) this lane does not
+  make.
+
+- **The S3 blast radius, re-read.** §16's four broken iterator tests came
+  from routing a NON-ground target through `check_return_position`, which
+  swallowed the binding the closure's own return would have produced
+  (`Iterator::from_fn`'s `Option<T>`). This change never routes a non-ground
+  target; it binds first and lets the gate decide. Measured rather than
+  argued: the inference suite (2396 passed, 0 failed, 1 ignored — every
+  iterator pin among them), the corpus byte-identical (7 passed), docs (8),
+  benchmarks (1), the full suite (§ below).
+
+### Who reports — the B5 question, answered and pinned
+
+Exactly one diagnostic, at the closure:
+
+| the disagreement | before (v0.35.0) | after |
+|---|---|---|
+| annotation `List<i32>`, block tail `{ point.x * 2; }` | whole call, `Expected List<i32>, but got List<void> instead.` | the closing `}`: `` Expected i32, but got void instead: the `;` discards this body's last value. `` |
+| annotation `List<str>`, block tail `{ point.x * 2 }` | whole call, `…got List<i32>` | the closing `}`: `Expected str, but got i32 instead.` |
+| annotation `List<str>`, bare `\|point\| point.x * 2` | whole call, `…got List<i32>` | the closure: `Expected \|Point\| str, but got \|Point\| i32 instead.` |
+| parameter `\|point: str\|` vs receiver, annotation `List<i32>` | the closure, `Expected \|Point\| i32, but got \|str\| i32 instead.` | unchanged (P27's whole-value anchor) |
+| all three disagree (`List<str>`, `\|point: i32\| { point; }`) | the closure, `Expected \|Point\| str, but got \|i32\| void instead.` | unchanged |
+| `fold(0, ..)` under `let s: str` | the call, `Expected str, but got i32 instead.` | unchanged |
+
+The `let`'s value-position reconcile never doubles the closure's report
+because S3's rule carries it: on a mismatch the closure's REPORTED type is
+the target it was held to (`|Point| i32`), so the call types as `List<i32>`,
+the annotation agrees, and the `let` has nothing to add. The `MethodArgCheck`
+at priority 9 re-infers the closure against the same ground target and hits
+the closure arm's span+message dedup. Eight programs pinned
+(`b125_*` in `tests/inference.rs`), each asserting the count with
+`assert_fails_once_with` and the absence of the old whole-call message with
+`assert_fails_without`.
+
+**One anchor residual, deliberately left.** The bare-expression closure
+(`|point| point.x * 2`) reports as a whole value at the argument check,
+because S3 scoped the return-position route to block bodies ("no closing
+brace to anchor at"). The narrower anchor — the expression itself, `Expected
+str, but got i32` — is a later slice's refinement of S3, not this lane's.
+
+### The role of `type_is_ground` after the change
+
+Unchanged, and still load-bearing. It is the "don't freeze unbound" guard:
+a target nobody has bound must not be routed through the return-position
+check, or the closure's own return could never bind it (I5/B19;
+`an_unannotated_next_that_yields_an_option_stays_legal` and its neighbours
+pin this). The expectation binding is what makes the target ground *when the
+program supplies an expectation*; when it does not — an unannotated `let`,
+or an expectation that names the enclosing function's generic (`fun
+ident<T>(xs: List<T>): List<T> { xs.map(|x| x) }` binds `U = T`, abstract)
+— the gate declines exactly as before and the body binds bottom-up. Both
+directions are pinned. There is no "second chance" constraint: the first
+chance now has the information.
+
+### Two supporting pieces the spike needed
+
+1. **The regime-1/1' wording is decided later, not guessed.** The closure
+   is first inferred by the very call that just filled its parameters, while
+   the body's constraints on those parameters — `point.x`, a field accessor
+   deferred on the unknown parameter with an empty wait set — are still
+   pending. `missing_return_value_message` read the last statement as
+   `Unresolved` and fell back to "this body ends without producing a value"
+   for good, because the dedup then refused the corrected wording. The
+   closure arm now says "not yet" (`Type::Unresolved`) in exactly that case:
+   a `Mismatched` verdict on the synthesized-void tail whose last statement
+   is pending and is not an error node. The owning call's argument check (or
+   the `let`) re-infers the closure after the backstop has resolved the
+   accessor, and reports the `;` wording. The first version of this fired
+   before the tail had even been checked and broke
+   `an_async_annotated_let_awaits_at_its_calls` (`{ tick(); 11 }` — the
+   statement is a call wired at priority 11); scoping it to the verdict
+   fixed that.
+2. **`resolve_variable` defers on a directed inference that is not ready.**
+   Its readiness probe infers the value UNDIRECTED; the directed inference
+   that follows can now say "not yet" where the undirected one did not, and
+   the constraint reported the non-type `unresolved` against the annotation.
+   It defers, as its reassignment loop already did.
+
+### The nested shapes — closed too (`76bbd9e6`)
+
+The expectation binding lands only if the call's entry is in
+`expected_types` when the call resolves. The three sources seeded only the
+VALUE's id; a call in a block tail or a value-`if`'s branch tail was seeded
+by the `Block`/`If` arms of `infer_type_path` — during inference, at priority
+10, a pass after the call had committed. A match leg was seeded by
+`resolve_match` at priority 5, early enough unless the match's SUBJECT was
+itself a call (`match points.len() { .. }`), in which case the match
+deferred past the leg's call. `seed_tail_expectations` walks the syntactic
+tails (block tail, value-`if` branch tails, recursively) at the three seed
+sites, and `resolve_match` seeds its legs before its subject can defer the
+attempt. The final contents of `expected_types` are unchanged — the same
+entries, a pass earlier — so the post-solve readers (the literal-range
+check) see what they saw. Three pins, plant-proven.
+
+### What B129's second gap actually was
+
+`b129_a_map_on_a_let_bound_signal_types_its_closure_parameter` was filed as
+this family — "a `.map` on a let-bound signal freezes its closure parameter
+before the receiver's binding lands". Probed on the v0.35.0 binary, it is
+neither P21's mechanism nor about the `let`:
+
+| program | v0.35.0 |
+|---|---|
+| the pin (`let items = Signal::new([Todo{..}])`, `.map(\|list\| { for todo in list { .. } })`) | `cannot access field 'done' on type any` |
+| the same, inlined (`Signal::new(..).map(..)`) — the pin's comment said this worked | fails identically |
+| the same on `List`: `let items = [[Todo{..}]]` | fails identically |
+| `let items: List<List<Todo>> = [[..]]` (annotated receiver) | compiles |
+| `[[1, 2], [3]]` with `total += n` | "compiles" — with `n: any` |
+| `.map(\|list\| list[0].id)` | `cannot index unknown` |
+
+The closure parameter is filled fine once `.map` resolves. What fails is the
+body's `for todo in list`: `ForEachItem` sits at priority 8; the `.map` call
+deferred to the NEXT pass because its receiver had not grounded (an
+un-annotated `let`, or a receiver that is itself a call); and
+`resolve_for_each_item` committed the item to `any` on sight of an `Unknown`
+iterable — `Unknown` is not `Unresolved`, so nothing deferred. The annotated
+receiver "worked" only because the call then resolved at priority 6 of the
+first pass, ahead of the loop. `resolve_subscript` had the same hole
+(`cannot index unknown` on the first pass). The field-accessor, method-call,
+call-subject and match resolvers all already defer on an unknown closure
+parameter (C′'s family, B23); the two that did not now do. The consequence
+at the bound: a closure NO call ever fills (`let walk = |xs| { for x in xs {
+print(x); } }`, never called) used to compile clean with `x: any` and now
+reports through the leftover sweep — `type of function call arguments could
+not be resolved` at `print(x)` — exactly as `for x in List::new()` on a
+never-pushed list always has. Pinned as the consistency claim; the sweep's
+wording is the sweep's (owner question below).
+
+### Gates and numbers
+
+- `cargo test -p vilan-core --test inference`: 2396 passed, 0 failed,
+  1 ignored (the one remaining ignore is unrelated to this family).
+  Iterator set included, all green.
+- `cargo test -p vilan-cli --test corpus`: 7 passed — every golden
+  byte-identical (diagnostics do not change emitted JS, and the expectation
+  binding records the same `method_call_substitution` a successful program
+  already recorded through the `let`'s reconcile).
+- docs 8 passed; benchmarks 1 passed.
+- Perf, `perf-baseline.md` §3's command (release, in-repo subjects), `next`
+  @ 67cd3c57 against the branch on the same machine, **alternating, two
+  rounds** (`next`, branch, `next`, branch), medians as ratios
+  branch/`next`: `std_wide` cold analyze 0.960 / 1.000, warm analyze
+  1.005 / 0.991, cold total 0.959 / 1.003; `tiny` cold analyze 0.952 /
+  0.995, warm analyze 1.007 / 1.021; `vilan check` of the reference
+  package (end to end) 1.054 in the first session; the LSP synthetic
+  keystroke p50 1.080 / 1.077 (8.47 → 9.15 ms), the one row with a
+  consistent sign. Within noise by the paper's own reading — and the
+  cautionary tale is the FIRST session, run once each, straight after a
+  release build: it read `std_wide` analyze at 1.39× cold and 1.43× warm
+  alongside `post_passes` at 1.85×, a phase this change does not touch,
+  with every absolute ~25 % above the settled rounds. One run each is not a
+  measurement on this machine. Deterministically (a temporary pass counter
+  in `build()`'s loop, not committed): on the `std_wide` subject every std
+  build has the SAME pass and backstop counts on both trees (18/7, 12/4,
+  12/4, 12/4, 27/9, 3/2) and the branch makes 1–3 FEWER constraint attempts
+  (3292 → 3291, 8546 → 8543); the todo example likewise (pass counts
+  identical across its nine builds; 8020 → 8019, 9155 → 9152 attempts).
+  The only increases are on the probe programs the fix targets, which now
+  resolve instead of erroring: the B129 pin's entry build 7 → 8 passes,
+  46 → 50 attempts; the nested-list form 5 → 6 passes, 14 → 16. The
+  expectation binding itself is a `HashMap` lookup on every call without an
+  expectation and a reconcile on the few with an open own generic.
+- Plant-proofs: expectation binding disabled → 8 of the 17 tests the
+  `missing_return_value_regime_3` / `b125` filter selects go red (every
+  P21-family pin among them); for-each/subscript defers disabled → 5 of 5
+  B129 pins red; tail seeding + match hoist disabled → 3 of 3 nested pins
+  red.
+- `examples/todo/src/todos.vl` drops its last annotation (the comment that
+  named B125/P21 as the reason goes with it); the example builds from its
+  tracked files.
+
+### Owner questions
+
+1. The never-called closure's untyped parameter now reports (where iterating
+   it used to compile with `any`) — but through the leftover sweep's
+   `type of function call arguments could not be resolved` at the USE, not
+   at the parameter. B13's rule ("inferred from the closure's first call")
+   has no call to point at here; a dedicated message at the parameter
+   ("`xs` is never typed: annotate it or call the closure") is a diagnostics
+   item, not made here. File it?
+2. The bare-expression closure's anchor (the whole closure at the argument
+   check, see the table) — refine S3's route to anchor at the expression?
+3. CHANGELOG family: filed as `diagnostics` per the lane brief; the
+   never-called-closure consequence is, strictly, a program that compiled
+   and now does not. If that reads as `breaking` to you, the entry moves.
