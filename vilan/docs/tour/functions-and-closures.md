@@ -29,6 +29,35 @@ Notice there is no `return` on the last line. A bare expression at the
 end of a block is the block's value. You'll see this everywhere in Vilan.
 `if`, `match`, and plain blocks all work the same way.
 
+The `: i32` is optional. Leave it off and the return type is inferred
+from the body — from the final expression and from every `ret`, which
+have to agree. A body that only ever leaves by `ret` is typed by those
+`ret`s:
+
+```vilan
+import std::print;
+
+fun sign(x: i32) {
+	if x < 0 {
+		ret -1;
+	}
+	if x > 0 {
+		ret 1;
+	}
+	ret 0;
+}
+
+fun main() {
+	print(sign(-7));
+}
+```
+
+If a `ret` disagrees with the rest of the body — a `ret "s"` next to a
+final `2`, a bare `ret` in a body that ends in a value, a `ret 1` beside
+an `if` with no `else` that can fall through with nothing — the compiler
+reports it at that `ret`. Declaring the return type is always an option,
+and turns inference into checking.
+
 Generic functions take type parameters. Bounds say what the body is
 allowed to do with them:
 

@@ -410,6 +410,16 @@ pub struct Function<'src> {
     /// the body's type, which matters for generic returns like `(): T`.
     pub return_type_id: Option<TypeId>,
     pub body: (Vec<Id>, Id, Id),
+    /// The block's own last statement (`body.0` also carries the parameter
+    /// destructures, which run first). An undeclared return asks whether it
+    /// LEAVES to know if the synthesized tail after it is reachable
+    /// (proposal/ret-checking.md rule 3).
+    pub last_statement_id: Option<Id>,
+    /// The body's `ret` sites (span + optional value), collected for a function
+    /// with no declared return type: its return type is inferred from these
+    /// together with its reachable tail (`inferred_return_type`). Empty for a
+    /// declared-return function, whose `ret`s are checked as they are walked.
+    pub rets: Vec<(Span, Option<Id>)>,
     /// Whether the source provided a body. A trait method without one is a
     /// signature-only requirement (impls must supply it); with one it is a
     /// default method (impls may inherit it). Always true outside a trait.
@@ -1662,9 +1672,6 @@ struct MemberSignatureShape {
     /// The impl-side per-position source span, for narrow diagnostics.
     parameter_spans: Vec<Span>,
     return_type_id: Option<TypeId>,
-    /// The body's tail expression, so an unannotated impl return can be compared
-    /// by its INFERRED type (std impls like `Iterator::next` omit the annotation).
-    body_tail_id: Id,
     name_span: Span,
     generic_count: usize,
     generic_constraint_ids: Vec<TypeId>,
@@ -1875,6 +1882,9 @@ enum Constraint<'src> {
         tail_id: Id,
         rets: Vec<(Span, Option<Id>)>,
     },
+    /// An unannotated function's return positions — its reachable tail and
+    /// every `ret` — must agree (proposal/ret-checking.md rule 3).
+    FunctionReturns { function_id: Id },
 }
 
 impl Constraint<'_> {
@@ -1904,6 +1914,7 @@ impl Constraint<'_> {
             Constraint::Lift { id, .. } => *id,
             Constraint::LiftRegion { id, .. } => *id,
             Constraint::ClosureReturns { closure_id, .. } => *closure_id,
+            Constraint::FunctionReturns { function_id } => *function_id,
         }
     }
 
@@ -1934,6 +1945,7 @@ impl Constraint<'_> {
             Constraint::Lift { .. } => 10,
             Constraint::LiftRegion { .. } => 10,
             Constraint::ClosureReturns { .. } => 10,
+            Constraint::FunctionReturns { .. } => 10,
             Constraint::CallSubject(_) => 11,
         }
     }
@@ -2188,11 +2200,20 @@ pub struct Analyzer<'src> {
     expose_fields_to_check: Vec<ExposeFieldCheck<'src>>,
     // The innermost enclosing callable's return frame: `ret` returns from the
     // nearest callable, so each body walk pushes one (proposal/ret-checking.md).
-    // Functions check rets against the declared type; undeclared-void
-    // functions check nothing (the consistency-with-tail rule); closures and
-    // `async` blocks COLLECT their rets, checked against the inferred tail
-    // type once it resolves (rule 4's follow-up).
+    // Functions check rets against the declared type; closures, `async`
+    // blocks and unannotated functions COLLECT their rets, which take part in
+    // the inferred return type once the body resolves (rules 3 and 4).
     return_type_stack: Vec<ReturnFrame>,
+    /// The functions whose return type `infer_function_returns` is computing
+    /// on the current path, innermost last, each with whether its answer is
+    /// still EXACT: a re-entrant ask (a self-call, direct or mutual) answers
+    /// `never` and marks every frame nested inside the re-entered one inexact
+    /// — built on an unfinished neighbour — so only exact answers are recorded.
+    return_inference_stack: Vec<(Id, bool)>,
+    /// `inferred_return_type`'s record: the last exact answer per unannotated
+    /// function, for the read-only coercion path (`compare_type`) that cannot
+    /// infer on the spot.
+    inferred_return_types: HashMap<Id, TypeId>,
     /// Non-fatal diagnostics (e.g. an unused `[must_use]` result). Rendered as
     /// warnings; they do not block codegen.
     warnings: Vec<Error>,
@@ -3081,6 +3102,8 @@ impl<'src> Analyzer<'src> {
             rpc_signatures_to_check: Vec::new(),
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
+            return_inference_stack: Vec::new(),
+            inferred_return_types: HashMap::default(),
             warnings: Vec::new(),
             warning_sources: Vec::new(),
             entity_id: 0,
@@ -4590,7 +4613,6 @@ impl<'src> Analyzer<'src> {
             is_self,
             parameter_spans,
             return_type_id: function.return_type_id,
-            body_tail_id: function.body.1,
             name_span: function.name_span,
             generic_count: function.generic_parameter_constraint_ids.len(),
             generic_constraint_ids: function.generic_parameter_constraint_ids.clone(),
@@ -5513,15 +5535,17 @@ impl<'src> Analyzer<'src> {
                 None => Type::Void,
             }
         };
-        // An unannotated impl return is compared by its body's INFERRED type, not
-        // treated as void — std impls (`Iterator::next`, `Into::into`) legitimately
-        // omit the annotation and rely on inference. An unmapped tail falls back to
+        // An unannotated impl return is compared by its INFERRED type — rule
+        // 3's, tail and `ret`s together — not treated as void: std impls
+        // (`Iterator::next`, `Into::into`) legitimately omit the annotation and
+        // rely on inference. A return that cannot resolve falls back to
         // `Unknown`, which matches leniently rather than false-rejecting.
         let actual_return = match impl_shape.return_type_id {
             Some(type_id) => type_id.get_type(self),
-            None => self
-                .type_of_expr(impl_shape.body_tail_id)
-                .unwrap_or(Type::Unknown),
+            None => match self.inferred_return_type_of(check.impl_function_id) {
+                Type::Unresolved => Type::Unknown,
+                inferred => inferred,
+            },
         };
         if !self.compare_type_rigid(
             &expected_return,
@@ -18862,11 +18886,12 @@ impl<'src> Analyzer<'src> {
                     Some(Expr::ExternalFunction(id))
                 } else {
                     // The body's `ret`s check against this function's declared
-                    // return type; an undeclared (void) return checks nothing —
-                    // consistent with the tail (proposal/ret-checking.md).
+                    // return type; without one they COLLECT, and the function's
+                    // return type is inferred from them together with its tail
+                    // (proposal/ret-checking.md rules 2 and 3).
                     self.return_type_stack.push(match return_type_id {
                         Some(declared) => ReturnFrame::Function(id, declared),
-                        None => ReturnFrame::VoidFunction,
+                        None => ReturnFrame::Inferred { rets: Vec::new() },
                     });
                     let (ids, expr_id, last_statement_id) = match &function.body {
                         Some(body) => {
@@ -18906,7 +18931,10 @@ impl<'src> Analyzer<'src> {
                             (Vec::new(), void_id, None)
                         }
                     };
-                    self.return_type_stack.pop();
+                    let rets = match self.return_type_stack.pop() {
+                        Some(ReturnFrame::Inferred { rets }) => rets,
+                        _ => Vec::new(),
+                    };
                     // Infer the body's tail against the declared return type (the
                     // way a `let v: R = ..` annotation drives its value), so a
                     // return-position generic call binds its type parameters from
@@ -18932,6 +18960,14 @@ impl<'src> Analyzer<'src> {
                             last_statement_id,
                         });
                     }
+                    // Rule 3: an undeclared return is inferred from the body's
+                    // return positions, which must agree. One constraint per
+                    // bodied function, `ret`s or not — its pass is what leaves
+                    // the record the read-only coercion path reads.
+                    if function.body.is_some() && return_type_id.is_none() {
+                        self.constraints
+                            .push(Constraint::FunctionReturns { function_id: id });
+                    }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(
                         id,
@@ -18943,6 +18979,8 @@ impl<'src> Analyzer<'src> {
                             parameters,
                             return_type_id,
                             body: (ids, expr_id, body_scope_id),
+                            last_statement_id,
+                            rets,
                             has_body: function.body.is_some(),
                             call_count: 0,
                             is_async: function.is_async,
@@ -19007,9 +19045,10 @@ impl<'src> Analyzer<'src> {
                 // checks (and binds return-position generics) against the
                 // innermost callable's DECLARED return type. A bare `ret` is
                 // `ret <void>` — a synthesized void value spanned at the `ret`,
-                // legal exactly when the declared type is void. In a closure,
-                // rets collect on the frame and check against the inferred
-                // tail type instead (proposal/ret-checking.md).
+                // legal exactly when the declared type is void. In a closure or
+                // an unannotated function, rets collect on the frame and take
+                // part in the inferred return type instead
+                // (proposal/ret-checking.md rules 3 and 4).
                 match self.return_type_stack.last_mut() {
                     Some(ReturnFrame::Function(function_id, declared)) => {
                         let function_id = *function_id;
@@ -19031,10 +19070,10 @@ impl<'src> Analyzer<'src> {
                         });
                         self.return_sites.push((function_id, checked_id));
                     }
-                    Some(ReturnFrame::Closure { rets }) => {
+                    Some(ReturnFrame::Inferred { rets }) => {
                         rets.push((node.1, value_id));
                     }
-                    Some(ReturnFrame::VoidFunction) | None => {}
+                    None => {}
                 }
                 Some(Expr::FunctionReturn(value_id))
             }
@@ -19870,9 +19909,9 @@ impl<'src> Analyzer<'src> {
                 // its rets collect here and check against the tail once it
                 // resolves (proposal/ret-checking.md rule 4's follow-up).
                 self.return_type_stack
-                    .push(ReturnFrame::Closure { rets: Vec::new() });
+                    .push(ReturnFrame::Inferred { rets: Vec::new() });
                 let expr_id = self.walk_expr_node(&closure.return_value, body_scope_id);
-                if let Some(ReturnFrame::Closure { rets }) = self.return_type_stack.pop()
+                if let Some(ReturnFrame::Inferred { rets }) = self.return_type_stack.pop()
                     && !rets.is_empty()
                 {
                     self.constraints.push(Constraint::ClosureReturns {
@@ -19910,9 +19949,9 @@ impl<'src> Analyzer<'src> {
                 let body_scope_id = self.push_scope(body_scope);
                 // Like a closure: a `ret` boundary with an inferred return type.
                 self.return_type_stack
-                    .push(ReturnFrame::Closure { rets: Vec::new() });
+                    .push(ReturnFrame::Inferred { rets: Vec::new() });
                 let return_id = self.walk_expr_node(body, body_scope_id);
-                if let Some(ReturnFrame::Closure { rets }) = self.return_type_stack.pop()
+                if let Some(ReturnFrame::Inferred { rets }) = self.return_type_stack.pop()
                     && !rets.is_empty()
                 {
                     self.constraints.push(Constraint::ClosureReturns {
@@ -21240,16 +21279,16 @@ impl<'src> Analyzer<'src> {
         let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
             return None;
         };
-        let function = self.functions.get(function_id)?;
-        let (declared, has_body, body_return_id) =
-            (function.return_type_id, function.has_body, function.body.1);
+        let function_id = *function_id;
+        let function = self.functions.get(&function_id)?;
+        let (declared, has_body) = (function.return_type_id, function.has_body);
         let return_type = match declared {
             Some(declared) => declared.get_type(self),
             // A bodyless trait REQUIREMENT has nothing to read and nothing to
             // contradict; conformance makes the impl declare it, and that
             // declaration is what the loop resolves to.
             None if !has_body => return None,
-            None => self.infer_type(body_return_id, &Type::Unknown, &HashMap::default()),
+            None => self.inferred_return_type_of(function_id),
         };
         match &return_type {
             Type::Enum(enum_id, _)
@@ -22320,9 +22359,10 @@ impl<'src> Analyzer<'src> {
                         }
                     }
                     // A call's type is the callee's return type: its declared
-                    // return type if annotated, otherwise the inferred type of
-                    // its body — with the call's generic arguments substituted
-                    // for the function's generic parameters.
+                    // return type if annotated, otherwise the type inferred
+                    // from its body's return positions (rule 3) — with the
+                    // call's generic arguments substituted for the function's
+                    // generic parameters.
                     Type::Function(function_id) => {
                         // `panic(..)` never returns, so its call types as `any`,
                         // which unifies with any expected type (e.g. it can be
@@ -22334,16 +22374,11 @@ impl<'src> Analyzer<'src> {
                             (
                                 f.generic_parameter_constraint_ids.clone(),
                                 f.return_type_id,
-                                f.body.1,
                                 f.parameters.first().copied(),
                             )
                         });
-                        let Some((
-                            generic_constraint_ids,
-                            return_type_id,
-                            body_return_id,
-                            self_parameter_id,
-                        )) = function
+                        let Some((generic_constraint_ids, return_type_id, self_parameter_id)) =
+                            function
                         else {
                             // An external function: use its declared return type
                             // (giving `List::new()` a fresh element slot).
@@ -22394,9 +22429,8 @@ impl<'src> Analyzer<'src> {
                         let declared_return_type = return_type_id.map(|id| id.get_type(self));
                         let return_type = match &declared_return_type {
                             Some(declared) => self.substitute_type(declared, &substitution_context),
-                            None => self.infer_type_inner(
-                                body_return_id,
-                                &Type::Unknown,
+                            None => self.inferred_return_type(
+                                function_id,
                                 &substitution_context,
                                 exprs_seen,
                             ),
@@ -23076,17 +23110,253 @@ impl<'src> Analyzer<'src> {
         Some((parameter_type_ids, function.return_type_id))
     }
 
+    /// "What does this unannotated function return?" — the ONE answer every
+    /// reader of an undeclared return goes through: the call site
+    /// (`infer_type_inner`'s `Type::Function` arm), a named function coerced
+    /// to a closure slot (`function_closure_type`), the `for` protocol's
+    /// `next` (`for_each_next_non_option_return`) and trait conformance
+    /// (`check_one_conformance`). See `infer_function_returns`.
+    fn inferred_return_type(
+        &mut self,
+        function_id: Id,
+        substitution_context: &SubstitutionContext,
+        exprs_seen: &mut HashSet<Id>,
+    ) -> Type {
+        self.infer_function_returns(function_id, substitution_context, exprs_seen)
+            .type_
+    }
+
+    /// `inferred_return_type` from a fresh inference path, for readers that
+    /// are not already inside one.
+    fn inferred_return_type_of(&mut self, function_id: Id) -> Type {
+        self.inferred_return_type(function_id, &HashMap::default(), &mut HashSet::default())
+    }
+
+    /// The return type of a function with no declared return type, inferred
+    /// from its return positions (proposal/ret-checking.md rule 3): the tail
+    /// when the body can reach it, and every `ret` — tail first, then in
+    /// source order, each read WITH the running type as its expectation so a
+    /// return-position generic in a `ret` binds from the tail. The tail is
+    /// dead code when the block's last statement leaves or the tail itself
+    /// diverges (B124's question, the one `check_return_position` asks of a
+    /// declared function), and dead code is no evidence; between a real tail
+    /// and the parser's synthesized void after a last statement that does not
+    /// leave, only the refusal's wording differs.
+    ///
+    /// A function already being inferred on this path — a self-call, direct
+    /// or mutual — answers `never`: its type IS the answer under construction,
+    /// so it can constrain nothing. Every frame nested inside the re-entered
+    /// one is then inexact (built on an unfinished neighbour) and is not
+    /// recorded; that function's own `FunctionReturns` constraint computes it
+    /// top-level and records then.
+    fn infer_function_returns(
+        &mut self,
+        function_id: Id,
+        substitution_context: &SubstitutionContext,
+        exprs_seen: &mut HashSet<Id>,
+    ) -> ReturnInference {
+        if let Some(position) = self
+            .return_inference_stack
+            .iter()
+            .position(|(inferring_id, _)| *inferring_id == function_id)
+        {
+            for (_, exact) in &mut self.return_inference_stack[position + 1..] {
+                *exact = false;
+            }
+            return ReturnInference {
+                type_: Type::Never,
+                disagreements: Vec::new(),
+            };
+        }
+        let Some(function) = self.functions.get(&function_id) else {
+            return ReturnInference {
+                type_: Type::Unresolved,
+                disagreements: Vec::new(),
+            };
+        };
+        let (tail_id, last_statement_id, rets) = (
+            function.body.1,
+            function.last_statement_id,
+            function.rets.clone(),
+        );
+        let mut evidence: Vec<(ReturnOrigin, Option<Id>)> = Vec::new();
+        let tail_reachable = !(self.expr_diverges(tail_id)
+            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id)));
+        if tail_reachable {
+            let tail_span = self
+                .span_map
+                .get(&tail_id)
+                .map(|span| **span)
+                .unwrap_or(EMPTY_SPAN);
+            let origin = match self.expr_id_to_expr_map.get(&tail_id) {
+                Some(Expr::Void) => ReturnOrigin::FallThrough(tail_span),
+                Some(Expr::If(branch)) if !if_branch_has_final_else(branch) => {
+                    ReturnOrigin::IfWithoutElse(tail_span)
+                }
+                _ => ReturnOrigin::Tail(tail_span),
+            };
+            let value_id = match origin {
+                ReturnOrigin::FallThrough(_) => None,
+                _ => Some(tail_id),
+            };
+            evidence.push((origin, value_id));
+        }
+        evidence.extend(
+            rets.into_iter()
+                .map(|(span, value_id)| (ReturnOrigin::Ret(span), value_id)),
+        );
+        self.return_inference_stack.push((function_id, true));
+        let inference = self.unify_return_evidence(&evidence, substitution_context, exprs_seen);
+        let exact = self
+            .return_inference_stack
+            .pop()
+            .is_some_and(|(_, exact)| exact);
+        if exact && !matches!(inference.type_, Type::Unresolved) {
+            let type_id = inference.type_.clone().get_type_id(self);
+            self.inferred_return_types.insert(function_id, type_id);
+        }
+        inference
+    }
+
+    /// The fold under `infer_function_returns`: each item reconciles with the
+    /// running type (the first item that constrains sets it). An item that
+    /// constrains nothing — `never` (a leaving branch, a self-call), `any`
+    /// (a `panic`), `unknown` — is skipped, kept only as the answer of last
+    /// resort when nothing else speaks; the first `Unresolved` item makes the
+    /// whole answer `Unresolved`. A disagreeing item is listed, and the
+    /// answer becomes `any` so the refusal at the `ret` is the only one (B5).
+    fn unify_return_evidence(
+        &mut self,
+        evidence: &[(ReturnOrigin, Option<Id>)],
+        substitution_context: &SubstitutionContext,
+        exprs_seen: &mut HashSet<Id>,
+    ) -> ReturnInference {
+        let mut running: Option<(Type, ReturnOrigin)> = None;
+        let mut last_resort: Option<Type> = None;
+        let mut disagreements = Vec::new();
+        for (origin, value_id) in evidence {
+            let expectation = running
+                .as_ref()
+                .map(|(type_, _)| type_.clone())
+                .unwrap_or(Type::Unknown);
+            let item_type = match value_id {
+                Some(value_id) => {
+                    self.infer_type_inner(*value_id, &expectation, substitution_context, exprs_seen)
+                }
+                // A bare `ret`, or the body falling through: `ret <void>`.
+                None => Type::Void,
+            };
+            match item_type {
+                Type::Unresolved => {
+                    return ReturnInference {
+                        type_: Type::Unresolved,
+                        disagreements,
+                    };
+                }
+                Type::Never | Type::Any | Type::Unknown => {
+                    last_resort.get_or_insert(item_type);
+                    continue;
+                }
+                _ => {}
+            }
+            let Some((running_type, running_origin)) = &running else {
+                running = Some((item_type, *origin));
+                continue;
+            };
+            match self.reconcile_type(&item_type, running_type, substitution_context) {
+                Some((unified, _)) => running = Some((unified, *running_origin)),
+                // The tail is read first, so a disagreeing item is always a `ret`.
+                None => {
+                    if let ReturnOrigin::Ret(span) = origin {
+                        disagreements.push(ReturnDisagreement {
+                            span: *span,
+                            value: value_id.map(|_| item_type),
+                            inferred: running_type.clone(),
+                            origin: *running_origin,
+                        });
+                    }
+                }
+            }
+        }
+        let type_ = if !disagreements.is_empty() {
+            Type::Any
+        } else if let Some((running_type, _)) = running {
+            running_type
+        } else {
+            last_resort.unwrap_or(Type::Void)
+        };
+        ReturnInference {
+            type_,
+            disagreements,
+        }
+    }
+
+    /// An unannotated function's `ret`s take part in its return typing
+    /// (proposal/ret-checking.md rule 3): each disagreement with the evidence
+    /// read before it — the tail, an earlier `ret`, or the body falling
+    /// through — is one refusal at the `ret`, naming both types and where the
+    /// inferred one came from, with a note at that origin. Deferred while any
+    /// evidence is unresolved; the run-all backstop retries.
+    fn resolve_function_returns(&mut self, function_id: Id) -> Resolution {
+        let inference =
+            self.infer_function_returns(function_id, &HashMap::default(), &mut HashSet::default());
+        if matches!(inference.type_, Type::Unresolved) {
+            return Resolution::Deferred;
+        }
+        for disagreement in inference.disagreements {
+            let inferred = self.pretty_print_type(&disagreement.inferred, &HashMap::default());
+            let (origin, origin_span, origin_note) = match disagreement.origin {
+                ReturnOrigin::Tail(span) => ("its tail", span, "the tail it is inferred from"),
+                ReturnOrigin::FallThrough(span) => (
+                    "its body ending without a value",
+                    span,
+                    "the body ends here without a value",
+                ),
+                ReturnOrigin::IfWithoutElse(span) => (
+                    "its tail, an `if` with no `else`",
+                    span,
+                    "an `if` with no `else` produces void",
+                ),
+                ReturnOrigin::Ret(span) => (
+                    "an earlier `ret`",
+                    span,
+                    "the earlier `ret` it is inferred from",
+                ),
+            };
+            let msg = match disagreement.value {
+                Some(value) => {
+                    let value = self.pretty_print_type(&value, &HashMap::default());
+                    format!(
+                        "this `ret` returns {value}, but the function's return type is inferred \
+                         as {inferred} from {origin}; make every return agree, or declare the \
+                         return type"
+                    )
+                }
+                None => format!(
+                    "a bare `ret` returns nothing, but the function's return type is inferred \
+                     as {inferred} from {origin}; return a value, or declare the return type"
+                ),
+            };
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: Some(Note::here(origin_span, origin_note.to_string())),
+                span: disagreement.span,
+                msg,
+            });
+        }
+        Resolution::Resolved
+    }
+
     /// The closure type an eligible named function coerces to, inferring the
-    /// body's type when the return isn't declared (a void handler). `None`
-    /// when ineligible, or the body's type hasn't resolved yet.
+    /// return type when it isn't declared (a void handler, or rule 3's
+    /// inference). `None` when ineligible, or the return hasn't resolved yet.
     fn function_closure_type(&mut self, function_id: Id) -> Option<Type> {
         let (parameter_type_ids, return_type_id) =
             self.coercible_function_signature(function_id)?;
         let return_type_id = match return_type_id {
             Some(declared) => declared,
             None => {
-                let body_return_id = self.functions.get(&function_id)?.body.1;
-                let inferred = self.infer_type(body_return_id, &Type::Unknown, &HashMap::default());
+                let inferred = self.inferred_return_type_of(function_id);
                 if matches!(inferred, Type::Unresolved) {
                     return None;
                 }
@@ -23097,15 +23367,13 @@ impl<'src> Analyzer<'src> {
     }
 
     /// `function_closure_type` for read-only paths (`compare_type`): an
-    /// undeclared return uses the body's RECORDED type, or fails the coercion
-    /// on this attempt.
+    /// undeclared return uses `inferred_return_type`'s RECORD, or fails the
+    /// coercion on this attempt.
     fn function_closure_type_recorded(&self, function_id: Id) -> Option<Type> {
         let (parameter_type_ids, return_type_id) =
             self.coercible_function_signature(function_id)?;
-        let return_type_id = return_type_id.or_else(|| {
-            let body_return_id = self.functions.get(&function_id)?.body.1;
-            self.expr_id_to_type_id_map.get(&body_return_id).copied()
-        })?;
+        let return_type_id =
+            return_type_id.or_else(|| self.inferred_return_types.get(&function_id).copied())?;
         Some(Type::Closure(parameter_type_ids, return_type_id))
     }
 
@@ -24193,6 +24461,9 @@ impl<'src> Analyzer<'src> {
                 tail_id,
                 rets,
             } => self.resolve_closure_returns(*closure_id, *tail_id, rets),
+            Constraint::FunctionReturns { function_id } => {
+                self.resolve_function_returns(*function_id)
+            }
         }
     }
 
@@ -31251,17 +31522,58 @@ pub const DERIVED_SOURCE: SourceId = SourceId(u32::MAX);
 /// impl's `verdict`/`from_bad` (the members recorded here), with the receiver's
 /// concrete type for monomorphization.
 /// The innermost callable a `ret`/`!` returns from (proposal/ret-checking.md).
+/// At a `ret` the only question is declared-or-inferred; what becomes of the
+/// collected rets is the popper's business.
 #[derive(Debug, Clone)]
 enum ReturnFrame {
     /// A function with a declared return type — rets check against it. Carries
     /// the function's id so a `ret` site can be attributed to its function
     /// (async return-divergence checking reads `return_sites`).
     Function(Id, TypeId),
-    /// A function with no declared return type: void, rets unchecked.
-    VoidFunction,
-    /// A closure or `async` block: rets collect here (span + optional value)
-    /// and check against the inferred tail type.
-    Closure { rets: Vec<(Span, Option<Id>)> },
+    /// A callable whose return type is INFERRED — a closure, an `async` block,
+    /// or a function with no declared return type: rets collect here (span +
+    /// optional value) and take part in that inference. A closure checks them
+    /// against its tail (`Constraint::ClosureReturns`, rule 4); a function
+    /// unifies them with its reachable tail (`Constraint::FunctionReturns`,
+    /// rule 3).
+    Inferred { rets: Vec<(Span, Option<Id>)> },
+}
+
+/// Where one piece of an unannotated function's return evidence sits
+/// (proposal/ret-checking.md rule 3) — named in a disagreement's message and
+/// pointed at by its note.
+#[derive(Debug, Clone, Copy)]
+enum ReturnOrigin {
+    /// The body's tail expression, which the body can reach.
+    Tail(Span),
+    /// The body can end without producing a value: the parser's synthesized
+    /// void tail after a last statement that does not leave (its span is the
+    /// closing brace).
+    FallThrough(Span),
+    /// The tail is an `if` with no `else`, which produces void on the path
+    /// that takes no branch (S3's regime 2, named the same way here).
+    IfWithoutElse(Span),
+    /// An earlier `ret`.
+    Ret(Span),
+}
+
+/// One `ret` that disagrees with the return evidence read before it.
+struct ReturnDisagreement {
+    /// The disagreeing `ret`'s span — the refusal's anchor.
+    span: Span,
+    /// The `ret`'s value type; `None` for a bare `ret`.
+    value: Option<Type>,
+    /// The type the evidence before it had settled on, and where that came from.
+    inferred: Type,
+    origin: ReturnOrigin,
+}
+
+/// `infer_function_returns`'s answer: the inferred return type — `Unresolved`
+/// while any evidence is, `Any` once evidence disagrees (so the refusal at the
+/// `ret` never cascades into a call site) — and the disagreements found.
+struct ReturnInference {
+    type_: Type,
+    disagreements: Vec<ReturnDisagreement>,
 }
 
 /// How one `?.` site lowers: the std pair inline — short-circuit the bad tag,

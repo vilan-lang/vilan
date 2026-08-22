@@ -38,9 +38,11 @@ and argument checking; return position had none.
      `b126_an_exhaustive_if_else_of_rets_infers_from_the_rets`). `fun f() { 5 }` is `i32`
      exactly as before (pin `b126_a_tail_only_body_still_infers_from_its_tail`).
    - A tail the body CAN reach is evidence like any `ret`: `{ if x { ret 1; } 2 }` is
-     `i32` (pin `b126_a_ret_and_a_tail_that_agree_infer_one_type`); `{ if x { ret 1; } }`
-     falls through without a value, and the `ret 1` disagrees with that (pin
-     `b126_a_value_ret_beside_a_fall_through_is_refused`).
+     `i32` (pin `b126_a_ret_and_a_tail_that_agree_infer_one_type`); a body that can end
+     without a value — a last statement that does not leave, or a tail that is an `if`
+     with no `else` — is void on that path, and a `ret 1` disagrees with it (pins
+     `b126_a_value_ret_beside_a_fall_through_is_refused`,
+     `b126_a_value_ret_beside_an_else_less_if_tail_is_refused`).
    - A **bare `ret`** is `ret <void>` (rule 2's reading, no special case): it agrees with
      a void body and disagrees with a value tail (pin
      `b126_a_bare_ret_in_a_value_tailed_function_is_refused`). A `ret` of a void call
@@ -48,8 +50,8 @@ and argument checking; return position had none.
      `b126_a_void_ret_beside_a_value_tail_is_refused`).
    - **Disagreement is one refusal per disagreeing `ret`**, anchored at that `ret`,
      naming the `ret`'s type, the inferred type, and where the inferred type came from —
-     the tail, an earlier `ret`, or the body falling through — with a note at that
-     origin (pins `b126_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret`,
+     the tail, an earlier `ret`, the body ending without a value, or an `if` with no
+     `else` — with a note at that origin (ledger rows 244–245; pins `b126_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret`,
      `b126_rets_that_disagree_are_refused_at_the_later_ret`). The evidence is read in
      one order: the tail first (when reachable), then the `ret`s in source order, each
      inferred WITH the running type as its expectation so a return-position generic in
@@ -60,12 +62,26 @@ and argument checking; return position had none.
    - A **self-call** inside the body contributes nothing — its type IS the answer being
      computed — so `fun count(n: i32) { if n == 0 { ret 0; } ret 1 + count(n - 1); }` is
      `i32` from `ret 0`, and a function whose only return evidence is self-calls is
-     `never` (pin `b126_a_recursive_unannotated_function_infers_from_its_other_returns`).
+     `never` (pins `b126_a_recursive_unannotated_function_infers_from_its_other_returns`,
+     `b126_mutually_recursive_unannotated_functions_infer_together`,
+     `b126_a_function_that_only_calls_itself_is_never`). A self-call bound by a `let`
+     and read in the tail (`let x = g(n - 1); x + 1`) still does not resolve — the
+     binding's type is not read through its initializer on the inference path — exactly
+     as before the amendment; recorded, not a regression.
    - The rule is the function's, not the shape's: an `async fun` without an annotation
      infers the same way and a call to it yields that type (pin
      `b126_an_async_function_without_annotation_infers_from_its_rets`); a nested closure's
      `ret`s stay on the closure's own frame under rule 4 (pin
-     `b126_a_nested_closures_rets_stay_on_the_closures_frame`).
+     `b126_a_nested_closures_rets_stay_on_the_closures_frame`); a generic function's
+     `ret` of its own parameter agrees with a tail of that type at every instantiation
+     (pin `b126_a_generic_function_infers_from_a_ret_of_its_parameter`). Every reader
+     sees the same answer: closure coercion on both its paths (pin
+     `b126_a_ret_only_function_coerces_to_a_closure_slot`), the `for` protocol's
+     unannotated `next` (pin `b126_an_unannotated_next_that_leaves_by_ret_drives_the_loop`),
+     and trait conformance (pin
+     `b126_an_unannotated_impl_method_conforms_by_its_unified_type`). The old rule-3 pin
+     `ret_with_a_value_in_an_undeclared_void_function_is_allowed` is re-pinned as
+     `b126_a_void_ret_agrees_with_a_void_body`: same program, the new reason.
 4. **In closures and `async` blocks (shipped as the follow-up):** their return types are
    *inferred*, so a closure's `ret`s collect on its frame and check against the inferred
    tail type once it resolves (`Constraint::ClosureReturns`): a value-`ret` must reconcile
@@ -186,9 +202,11 @@ alternative ships. The refusal anchors at the `ret`, like every other disagreeme
 
 One helper answers "what does this unannotated function return": `inferred_return_type`
 (over `infer_function_returns`, which also lists the disagreements). Its evidence is the
-reachable tail plus `Function.rets`, read tail-first then in source order; a `never`,
-`any` or `unknown` item constrains nothing (it is kept only as the answer of last resort
-when nothing else speaks); a disagreement makes the answer `any`. Every reader that
+reachable tail plus `Function.rets`, read tail-first then in source order, each item
+tagged with its origin (`ReturnOrigin`: the tail, the synthesized void after a
+non-leaving last statement, an else-less `if` tail, a `ret`) for the refusal's wording;
+a `never`, `any` or `unknown` item constrains nothing (it is kept only as the answer of
+last resort when nothing else speaks); a disagreement makes the answer `any`. Every reader that
 used to read `f.body.1` goes through it: `infer_type_inner`'s `Type::Function` arm (the
 call site), `function_closure_type` (a named function coerced to a closure slot),
 `for_each_next_non_option_return` (the `for` protocol's unannotated `next`, B92), and

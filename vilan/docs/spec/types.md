@@ -377,6 +377,48 @@ generic function/impl produces its own specialization; dispatch is
 static. A program that would require an unbounded set of specializations
 (polymorphic recursion) is not required to compile.
 
+**Return-type inference.** A function with no declared return type takes
+its type from its body's return positions — the tail, when the body can
+reach it, and every `ret` — and they must agree. A tail the body cannot
+reach (every path before it leaves by `ret`) is not a return position, so
+`fun f(x: bool) { ret 1; }` is `i32`; a tail it can reach is one, so a
+`ret 1` beside an `if` with no `else` disagrees with the void that path
+produces. A bare `ret` is a void return; it agrees only with a void body.
+A disagreeing `ret` is an error at that `ret`, naming both types and
+where the inferred one came from — the function then has no type, so
+the error is not repeated at its calls. A call the function makes to
+itself contributes nothing (its type is the one being inferred); a
+function whose only return positions are such calls is `Never`. Declaring
+the return type replaces inference with checking (every position against
+the declaration). A closure's `ret`s are checked against its tail
+instead; a closure whose body leaves only by `ret` must make the
+returned value its tail.
+
+```vilan
+import std::print;
+
+fun sign(x: i32) {
+	if x > 0 {
+		ret 1;
+	}
+	if x < 0 {
+		ret -1;
+	}
+	0
+}
+
+fun main() {
+	let s: i32 = sign(-4);
+	print(s);
+}
+```
+
+```vilan,fragment
+fun f(x: bool) { if x { ret "s"; } 2 }   // error at `ret "s"`: the tail is i32
+fun g(x: bool) { if x { ret; } 2 }       // error at `ret`: a bare ret is void
+fun h(x: bool) { if x { ret 1; } }       // error at `ret 1`: the if can produce void
+```
+
 ## 5.7 Operator and method dispatch
 
 The operators dispatch through lang-item traits (appendix §A.4):

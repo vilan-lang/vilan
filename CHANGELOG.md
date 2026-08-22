@@ -15,6 +15,15 @@ the cut and REFUSES an entry that carries none, rather than guessing.
 proposal/releases.md §7.2 step 3 defines the four.
 -->
 
+## Unreleased
+
+<!-- family: diagnostics -->
+**An unannotated function's `ret` now counts toward its inferred return type.** `fun f(x: bool) { ret 1; }` — no declared return type, a body that leaves only by `ret` — was `void` at every call site, so `let y: i32 = f(true)` reported `Expected i32, but got void instead.` at the call, the one line with nothing wrong on it. The return type was read from the body's final expression alone, and a `ret` was invisible to it. Invisible was worse than missing: `fun f(x: bool) { if x { ret "s"; } 2 }` compiled clean and handed a `str` to an `i32` binding at runtime, a bare `ret` beside a value tail handed back `undefined`, and an exhaustive `if`/`else` of `ret`s typed as `never` and let `let y: str = f(false)` through.
+
+The return type is now inferred from every return position — the final expression, when the body can reach it, and each `ret` — and they must agree. A `ret` that disagrees is reported at that `ret`, naming its type, the inferred type, and where that came from (the tail, an earlier `ret`, or the body ending without a value), with a note at the origin: `this `ret` returns str, but the function's return type is inferred as i32 from its tail; make every return agree, or declare the return type`. It is the only diagnostic — the function's calls stop reporting the mismatch a second time. A bare `ret` is a void return and is refused beside a value tail. A final expression the body cannot reach is not evidence, so `{ ret 1; }` is `i32`; one it can reach is, so `{ if x { ret 1; } }` is refused rather than typed `i32` and handed `undefined`. A call the function makes to itself contributes nothing, so `fun count(n: i32) { if n == 0 { ret 0; } ret 1 + count(n - 1); }` infers `i32` where a `ret` that was nothing but a self-call used to be "could not be resolved". The same answer now serves a named function passed where a closure is expected, an unannotated `next` driving a `for` loop, and an unannotated impl member checked against its trait — `fun area(self) { ret "wide"; }` against `: i32` used to pass conformance and print `wide`. Closures keep their existing rule (`ret`s are checked against the closure's tail). Spec §5.6, tour "Functions & closures", `proposal/ret-checking.md` rule 3 (amended).
+
+---
+
 ## v0.35.0 — 2026-08-21
 
 <!-- family: breaking -->
