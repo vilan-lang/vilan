@@ -2743,15 +2743,42 @@ fn compile_to_js(
             // Capture every diagnostic for the overlay (message + note verbatim),
             // located in the file its span indexes into (E16) — a module error
             // names the module, not the leg's entry; the terminal rendering
-            // below is unchanged.
+            // below is unchanged. Its E78 requirement trace rides along (E80),
+            // each hop located in ITS file: a hop's `Note::source` names the
+            // importing module the call sits in, `None` the anchor's own file.
+            for hop in &error.trace {
+                load_diagnostic_file(
+                    &mut diagnostic_files,
+                    &program,
+                    hop.note.source.unwrap_or(source),
+                );
+            }
             let (overlay_name, overlay_text) = diagnostic_file(&diagnostic_files, source);
-            overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
-                overlay_name,
-                overlay_text,
-                error.span.into_range(),
-                error.msg.clone(),
-                error.note.as_ref().map(|note| note.msg.clone()),
-            ));
+            let overlay_trace = error
+                .trace
+                .iter()
+                .map(|hop| {
+                    let (hop_name, hop_text) =
+                        diagnostic_file(&diagnostic_files, hop.note.source.unwrap_or(source));
+                    hmr::OverlayTraceEntry::located(
+                        hop_name,
+                        hop_text,
+                        hop.note.span.into_range(),
+                        hop.note.msg.clone(),
+                        hop.call,
+                    )
+                })
+                .collect();
+            overlay_diagnostics.push(
+                hmr::OverlayDiagnostic::located(
+                    overlay_name,
+                    overlay_text,
+                    error.span.into_range(),
+                    error.msg.clone(),
+                    error.note.as_ref().map(|note| note.msg.clone()),
+                )
+                .with_trace(overlay_trace),
+            );
             // A diagnostic carrying secondary locations — an E78 requirement
             // trace and/or a C3 note — renders directly (multi-label; the
             // shared ariadne path has nowhere to put them); plain ones keep

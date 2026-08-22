@@ -47,7 +47,12 @@ there is no server-side HMR to reason about.
 
 The error overlay carries the real diagnostics (the file, the `line:col`,
 the message, and any note): the same text your terminal shows, rendered over
-the page so the eyes already on the browser don't miss it. The terminal stays
+the page so the eyes already on the browser don't miss it. A context
+refusal brings its chain along — one `via src/client.vl:13:8 — the context
+requirement flows through this call` line per uncovered call between the
+entry and the read, each located in the file the call sits in — so the
+overlay answers *which* call left the read uncovered, as the terminal's
+labels and the editor's related information do. The terminal stays
 authoritative; the overlay is the copy, and the next successful save clears it.
 
 ## What carries across a swap, and what resets

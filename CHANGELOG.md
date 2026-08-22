@@ -17,8 +17,15 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**The dev overlay and the playground show a context refusal's chain.** `context `current` is read here, but this code can be reached without an enclosing `run`` has carried its requirement trace since E78 — one label per uncovered call between the entry and the read — but only the terminal (ariadne sub-labels) and the editor (related information, plus a diagnostic at each call) rendered it; the HMR error overlay and the playground's diagnostics pane showed the message and the note alone, so the one question the trace answers — *which* call left the read uncovered — had no answer on either surface. Both show it now, in the same trace-then-note order the terminal and the editor keep: the overlay renders one indented line per entry between the message and the note — `via src/client.vl:13:8 — the context requirement flows through this call` for a call hop, the elision tail (`… 3 more uncovered calls on this path`) as its own line — with each hop located in the file its call sits in (a hop in an importing module names the module, like the diagnostic itself has since E16), and the page's shim gives those lines their own class: coloured as the chain, a notch deeper than the message, and never counted toward the header badge — a diagnostic with three hops reads `1 error`, not `4`. The playground's wasm `Diagnostic` gains `trace`, a JS array of `{ file, line, column, message, call }` in the same units as the diagnostic's own position; the pane renders a dim `via …` line per hop under the row, and the editor's lint tooltip carries the same lines. The C3 note stays one location; the trace is the separate channel it always was (`Error::trace`), now on every surface.
+
+---
+
 <!-- family: tooling -->
 **`scripts/cut-release.sh` refuses a marker that opens no entry.** A `<!-- family: ... -->` line with nothing under it — blank lines and then the next `---`, which is what a CHANGELOG merge-union leaves behind — used to parse as nothing: the rule cleared it, no entry claimed it, and the dry-run stayed green over a comment that would have ridden into the release section. The parser now strands a `family:` or `commit:` marker that reaches a blank line, a rule, a second marker of its kind, prose, or the section's end before a bold head, and refuses the cut naming the marker and its line (``marker `<!-- family: tooling -->` at line 215 opens no entry``), beside the existing refusals and changing nothing. The rule it enforces is the one the changelog's own writing note already states: a marker sits directly above its head — every marker in the tree does, so a blank between the two is refused rather than tolerated. `proposal/releases.md` §7.2 step 3 names the shape and the anchored parity count that is the manual cross-check.
+
+---
 
 ## v0.35.0 — 2026-08-21
 

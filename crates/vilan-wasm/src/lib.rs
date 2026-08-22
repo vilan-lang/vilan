@@ -28,6 +28,7 @@ mod line_index;
 use std::path::{Path, PathBuf};
 
 use line_index::LineIndex;
+use vilan_core::analyzer::SourceId;
 use vilan_core::{
     BuildOptions, Layer, PackageSpec, Platform, PlatformPattern, Workspace, analyze_source,
     transform,
@@ -57,11 +58,36 @@ pub struct Diagnostic {
     pub message: String,
     /// The "declared here" style note, when the diagnostic carries one.
     pub note: Option<String>,
+    /// The requirement trace (backlog E78, surfaced here by E80): one entry
+    /// per uncovered call between the program's entry and the offending read,
+    /// in that order. A channel of its own beside `note` — the note stays one
+    /// location — and empty for every diagnostic but the context-coverage
+    /// refusals.
+    pub trace: Vec<TraceEntry>,
     /// `"error"` or `"warning"`.
     pub severity: &'static str,
     /// The file the span indexes, as the visitor would name it. `main.vl` for
     /// their own code; a toolchain path for a diagnostic inside std.
     pub file: String,
+}
+
+/// One entry of a diagnostic's requirement trace, located the way the
+/// diagnostic itself is: the file the hop's span indexes (its OWN file — a
+/// hop's `Note::source` names another when the call sits elsewhere), the
+/// zero-based line and UTF-16 column in it, and the hop's label.
+///
+/// `call` marks an uncovered CALL SITE; it is `false` only for the chain's
+/// elision tail, which is anchored at the last kept hop's span and carries
+/// its text (`… N more uncovered calls on this path`) — a surface that names
+/// each call's location renders the tail as text alone rather than naming
+/// that location twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEntry {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    pub message: String,
+    pub call: bool,
 }
 
 /// What a compile produced. `js` is `None` exactly when the program did not
@@ -203,36 +229,49 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
     );
 
     // The visitor's own file is the common case for a span, so index it once.
-    let entry_index = LineIndex::new(source);
-    let mut indices: Vec<(PathBuf, LineIndex)> = Vec::new();
+    let mut locator = Locator {
+        entry_path: &entry_path,
+        entry_index: LineIndex::new(source),
+        indices: Vec::new(),
+    };
     let mut diagnostics = Vec::new();
 
-    let mut convert = |error: &vilan_core::Error, severity: &'static str, path: Option<&Path>| {
+    // `path` is the file the diagnostic's own span indexes (`None` = the
+    // entry); `hop_path` answers the same for a trace hop that names another
+    // source — only a program can, so the pre-program paths pass a resolver
+    // that knows none (their diagnostics carry no trace).
+    let mut convert = |error: &vilan_core::Error,
+                       severity: &'static str,
+                       path: Option<&Path>,
+                       hop_path: &dyn Fn(SourceId) -> Option<PathBuf>| {
         let range = error.span.into_range();
-        let (index, file) = match path {
-            None => (&entry_index, ENTRY_NAME.to_string()),
-            Some(path) if path == entry_path => (&entry_index, ENTRY_NAME.to_string()),
-            Some(path) => {
-                if !indices.iter().any(|(known, _)| known == path) {
-                    let text = vilan_core::util::read_source(path).unwrap_or_default();
-                    indices.push((path.to_path_buf(), LineIndex::new(&text)));
+        let (line, column, file) = locator.locate(path, &error.span);
+        // Each hop in ITS file: `Note::source` when it names one, the
+        // diagnostic's own otherwise (the `None` contract of `Note`).
+        let trace = error
+            .trace
+            .iter()
+            .map(|hop| {
+                let hop_path = hop.note.source.and_then(hop_path);
+                let (line, column, file) =
+                    locator.locate(hop_path.as_deref().or(path), &hop.note.span);
+                TraceEntry {
+                    file,
+                    line,
+                    column,
+                    message: hop.note.msg.clone(),
+                    call: hop.call,
                 }
-                let index = indices
-                    .iter()
-                    .find(|(known, _)| known == path)
-                    .map(|(_, index)| index)
-                    .unwrap_or(&entry_index);
-                (index, display_path(path))
-            }
-        };
-        let (start, _) = index.range(&error.span);
+            })
+            .collect();
         diagnostics.push(Diagnostic {
             start: range.start,
             end: range.end,
-            line: start.line,
-            column: start.character,
+            line,
+            column,
             message: error.msg.clone(),
             note: error.note.as_ref().map(|note| note.msg.clone()),
+            trace,
             severity,
             file,
         });
@@ -240,7 +279,7 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
 
     let Some(program) = program else {
         for error in &errors {
-            convert(error, "error", None);
+            convert(error, "error", None, &|_| None);
         }
         return CompileOutput {
             js: None,
@@ -248,6 +287,7 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
             diagnostics,
         };
     };
+    let source_path = |source: SourceId| program.source_path(source).map(Path::to_path_buf);
 
     // `errors` is the ENTRY's own lex/parse errors followed by the program's
     // (`analyze_source`), while `diagnostic_sources` is parallel to the
@@ -263,7 +303,7 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
             .checked_sub(prefix)
             .and_then(|offset| program.source_path(program.diagnostic_source(offset)))
             .map(Path::to_path_buf);
-        convert(error, "error", path.as_deref());
+        convert(error, "error", path.as_deref(), &source_path);
     }
 
     if !errors.is_empty() {
@@ -285,13 +325,51 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
             diagnostics,
         },
         Err(error) => {
-            convert(&error, "error", None);
+            convert(&error, "error", None, &source_path);
             CompileOutput {
                 js: None,
                 css: None,
                 diagnostics,
             }
         }
+    }
+}
+
+/// Resolves spans to the page's positions, one `LineIndex` per file touched:
+/// the visitor's entry is indexed up front (the common case), every other
+/// file — std, for a diagnostic or a trace hop inside the toolchain — on
+/// first use.
+struct Locator<'a> {
+    entry_path: &'a Path,
+    entry_index: LineIndex,
+    indices: Vec<(PathBuf, LineIndex)>,
+}
+
+impl Locator<'_> {
+    /// The zero-based line, the UTF-16 column, and the visitor-facing file
+    /// name of `span` in `path` (`None`, or the entry's own path, is the
+    /// entry).
+    fn locate(&mut self, path: Option<&Path>, span: &vilan_core::span::Span) -> (u32, u32, String) {
+        let (index, file) = match path {
+            None => (&self.entry_index, ENTRY_NAME.to_string()),
+            Some(path) if path == self.entry_path => (&self.entry_index, ENTRY_NAME.to_string()),
+            Some(path) => {
+                if !self.indices.iter().any(|(known, _)| known == path) {
+                    let text = vilan_core::util::read_source(path).unwrap_or_default();
+                    self.indices
+                        .push((path.to_path_buf(), LineIndex::new(&text)));
+                }
+                let index = self
+                    .indices
+                    .iter()
+                    .find(|(known, _)| known == path)
+                    .map(|(_, index)| index)
+                    .unwrap_or(&self.entry_index);
+                (index, display_path(path))
+            }
+        };
+        let (start, _) = index.range(span);
+        (start.line, start.character, file)
     }
 }
 
@@ -329,6 +407,33 @@ mod bindings {
         pub note: Option<String>,
         pub severity: String,
         pub file: String,
+        trace: Vec<TraceEntry>,
+    }
+
+    /// One hop of a diagnostic's requirement trace (E80), as the page
+    /// consumes it: the same field names and units as `Diagnostic`'s own
+    /// position (zero-based line, UTF-16 column, the visitor-facing file).
+    #[wasm_bindgen(getter_with_clone)]
+    #[derive(Clone)]
+    pub struct TraceEntry {
+        pub file: String,
+        pub line: u32,
+        pub column: u32,
+        pub message: String,
+        pub call: bool,
+    }
+
+    #[wasm_bindgen]
+    impl Diagnostic {
+        /// The requirement trace, as a JS array of `TraceEntry` objects in
+        /// entry → read order — empty for every diagnostic but the
+        /// context-coverage refusals. A getter for the same reason
+        /// `CompileResult::diagnostics` is one: a `Vec` of exported structs
+        /// crosses as a return value, not as a field.
+        #[wasm_bindgen(getter)]
+        pub fn trace(&self) -> Vec<TraceEntry> {
+            self.trace.clone()
+        }
     }
 
     #[wasm_bindgen(getter_with_clone)]
@@ -355,6 +460,7 @@ mod bindings {
                     note: diagnostic.note.clone(),
                     severity: diagnostic.severity.clone(),
                     file: diagnostic.file.clone(),
+                    trace: diagnostic.trace.clone(),
                 })
                 .collect()
         }
@@ -376,6 +482,17 @@ mod bindings {
                     note: diagnostic.note,
                     severity: diagnostic.severity.to_string(),
                     file: diagnostic.file,
+                    trace: diagnostic
+                        .trace
+                        .into_iter()
+                        .map(|hop| TraceEntry {
+                            file: hop.file,
+                            line: hop.line,
+                            column: hop.column,
+                            message: hop.message,
+                            call: hop.call,
+                        })
+                        .collect(),
                 })
                 .collect(),
         }

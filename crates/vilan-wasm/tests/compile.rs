@@ -179,6 +179,107 @@ fn a_type_error_reports_a_position_in_the_visitors_file() {
     );
 }
 
+/// The zero-based line and column of the `occurrence`th (0-based) hit of
+/// `snippet` in an ASCII `source` — the page's units for a diagnostic's
+/// position, computed independently of the compiler's own index.
+fn position_of(source: &str, snippet: &str, occurrence: usize) -> (u32, u32) {
+    let mut start = 0;
+    let mut at = 0;
+    for _ in 0..=occurrence {
+        at = start + source[start..].find(snippet).expect("the snippet occurs");
+        start = at + 1;
+    }
+    let before = &source[..at];
+    let line = before.matches('\n').count() as u32;
+    let column = before.rsplit('\n').next().unwrap_or("").len() as u32;
+    (line, column)
+}
+
+/// E80: the requirement trace (E78) crosses the playground's wire. The
+/// owner's acceptance example — `c`'s `context.run` covers its `a()`, every
+/// other path to the read is bare — yields ONE error whose `trace` carries
+/// `main`'s `b()` and `b`'s `a()`, entry → read, each a call hop located in
+/// the visitor's file in the page's units; the covered call is absent. It
+/// carries no note: the trace is a channel beside the note, not inside it.
+#[test]
+fn e80_the_owners_example_carries_its_requirement_trace_on_the_wire() {
+    let source = "import std::context::Context;\n\n\
+        let context: Context<u32> = Context::new();\n\n\
+        fun a() {\n    context.get();\n}\n\n\
+        fun b() {\n    a();\n}\n\n\
+        fun c() {\n    context.run(0, || a());\n}\n\n\
+        fun main() {\n    b();\n    c();\n}\n";
+    let output = compile(source);
+    assert!(output.js.is_none(), "a failed compile emits no JavaScript");
+    let errors: Vec<_> = output
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "one refusal, at the read: {errors:#?}");
+    let refusal = errors[0];
+    assert!(
+        refusal
+            .message
+            .contains("can be reached without an enclosing `run`"),
+        "{refusal:#?}"
+    );
+    assert_eq!(refusal.file, "main.vl");
+    assert_eq!(
+        (refusal.line, refusal.column),
+        position_of(source, "context.get()", 0),
+        "the primary sits at the read"
+    );
+    assert_eq!(refusal.note, None, "the owner's example carries no C3 note");
+    // Occurrence 1 of each call skips the function's own declaration.
+    let expected: Vec<(u32, u32)> =
+        vec![position_of(source, "b()", 1), position_of(source, "a()", 1)];
+    let located: Vec<(u32, u32)> = refusal
+        .trace
+        .iter()
+        .map(|hop| (hop.line, hop.column))
+        .collect();
+    assert_eq!(located, expected, "entry → read: {:#?}", refusal.trace);
+    for hop in &refusal.trace {
+        assert_eq!(hop.file, "main.vl", "a hop in the visitor's file names it");
+        assert_eq!(
+            hop.message,
+            "the context requirement flows through this call"
+        );
+        assert!(
+            hop.call,
+            "both entries are call hops; no tail under the cap"
+        );
+    }
+}
+
+/// The C3 note crosses the wire beside the message: an arity mismatch notes
+/// the callee's declaration (`call_argument_count_notes_the_callees_declaration`
+/// in core's harness), and that note is what the page's `note:` line shows.
+/// A noted diagnostic carries no trace — the two channels are independent.
+#[test]
+fn a_declared_here_note_crosses_the_wire_beside_the_message() {
+    let output = compile(
+        "fun distance(x: i32, y: i32): i32 {\n    x + y\n}\n\n\
+         fun main() {\n    distance(3);\n}\n",
+    );
+    let arity = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`distance` expects 2 arguments")
+        })
+        .expect("the arity diagnostic is reported");
+    assert_eq!(
+        arity.note.as_deref(),
+        Some("`distance` is declared here"),
+        "{arity:#?}"
+    );
+    assert!(arity.trace.is_empty(), "a note is not a trace: {arity:#?}");
+}
+
 /// A parse error must degrade to a diagnostic, never a panic — in the browser a
 /// panic takes down the instance rather than one request.
 #[test]
