@@ -18915,6 +18915,7 @@ impl<'src> Analyzer<'src> {
                         && let Some(return_type_id) = return_type_id
                     {
                         self.expected_types.insert(expr_id, return_type_id);
+                        self.seed_tail_expectations(expr_id, return_type_id);
                         self.return_sites.push((id, expr_id));
                         // The synthesized void tail after a last statement that
                         // LEAVES is unreachable, and checking it draws a second
@@ -19022,6 +19023,7 @@ impl<'src> Analyzer<'src> {
                             void_id
                         });
                         self.expected_types.insert(checked_id, return_type_id);
+                        self.seed_tail_expectations(checked_id, return_type_id);
                         self.constraints.push(Constraint::ReturnType {
                             body_id: checked_id,
                             return_type_id,
@@ -19282,7 +19284,7 @@ impl<'src> Analyzer<'src> {
                 if type_.is_some()
                     && let Some(value_id) = initial
                 {
-                    self.expected_types.entry(value_id).or_insert(type_id);
+                    self.seed_tail_expectations(value_id, type_id);
                 }
                 self.variables.insert(
                     id,
@@ -26449,6 +26451,47 @@ impl<'src> Analyzer<'src> {
     /// generic-call type-argument binding — see it. Used when the constraint
     /// flows into a branch or block tail during inference. Does not overwrite
     /// an expectation already present (a nearer annotation wins).
+    /// Seeds `type_id` as the expectation of `expr_id` AND of every syntactic
+    /// tail under it — a block's tail, a value-`if`'s branch tails, recursively
+    /// — at WALK time, where the three expectation sources (an annotated
+    /// `let`, a declared return type's tail, a `ret`) are seeded. The
+    /// inference-time seeds in the `Block`/`If` arms of `infer_type_path` only
+    /// run when the binding's own constraint infers the value (priority 10),
+    /// which is after a generic call standing in that tail has resolved at
+    /// its own priority (6) and committed its bindings — so `let widths:
+    /// List<i32> = if c { points.map(|p| { p.x; }) } else { [] }` never let
+    /// the call see `List<i32>` in time (B125's nested shapes). A `match`'s
+    /// legs are seeded by `resolve_match` from the match's own entry, which
+    /// this recursion writes when the match stands in a tail. `or_insert`
+    /// throughout: a nearer annotation wins, exactly as the inference-time
+    /// seeds behave.
+    fn seed_tail_expectations(&mut self, expr_id: Id, type_id: TypeId) {
+        self.expected_types.entry(expr_id).or_insert(type_id);
+        let tails: Vec<Id> = match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Block((_, tail_id))) => vec![*tail_id],
+            Some(Expr::If(branch)) if if_branch_has_final_else(branch) => {
+                fn branch_tails(branch: &ExprIfBranch, out: &mut Vec<Id>) {
+                    match branch {
+                        ExprIfBranch::If(_, (_, trailing), next) => {
+                            out.push(*trailing);
+                            if let Some(next) = next {
+                                branch_tails(next, out);
+                            }
+                        }
+                        ExprIfBranch::Else((_, trailing)) => out.push(*trailing),
+                    }
+                }
+                let mut out = Vec::new();
+                branch_tails(branch, &mut out);
+                out
+            }
+            _ => Vec::new(),
+        };
+        for tail_id in tails {
+            self.seed_tail_expectations(tail_id, type_id);
+        }
+    }
+
     fn seed_expectation(&mut self, expr: Id, constraint: &Type) {
         if matches!(constraint, Type::Unknown | Type::Unresolved) {
             return;
@@ -27954,6 +27997,23 @@ impl<'src> Analyzer<'src> {
     /// match as the unification of its leg bodies. Defers while the subject, a
     /// guard, or a leg body is unresolved.
     fn resolve_match(&mut self, prepped: &PreppedMatch<'src>) -> Resolution {
+        // The match's own expectation (a function's return tail, an annotated
+        // `let`, a tail `seed_tail_expectations` reached) is every leg body's
+        // too, so a return-position generic call inside a leg binds from it.
+        // Seeded FIRST, before the subject can defer this attempt: a subject
+        // that is itself a call resolves a pass later than the leg's call
+        // does (priority 5 here, 6 there), and a leg seeded only once the
+        // subject had landed reached its call after that call had already
+        // committed its bindings (B125's nested shapes). `or_insert`, so a
+        // nested match/leg inherits the expectation without overriding a
+        // nearer one.
+        if let Some(expected_type_id) = self.expected_types.get(&prepped.id).copied() {
+            for leg in &prepped.legs {
+                self.expected_types
+                    .entry(leg.body)
+                    .or_insert(expected_type_id);
+            }
+        }
         let subject_type = self.infer_type(prepped.subject_id, &Type::Unknown, &HashMap::default());
         if matches!(subject_type, Type::Unresolved) {
             return Resolution::Deferred;
@@ -28137,11 +28197,6 @@ impl<'src> Analyzer<'src> {
         let expected = self.expected_types.get(&prepped.id).copied();
         let mut unified: Option<Type> = None;
         for (_, _, body_id) in &resolved_legs {
-            if let Some(expected_type_id) = expected {
-                self.expected_types
-                    .entry(*body_id)
-                    .or_insert(expected_type_id);
-            }
             let leg_constraint = expected
                 .map(|type_id| type_id.get_type(self))
                 .unwrap_or(Type::Unknown);

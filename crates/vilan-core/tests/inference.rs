@@ -11911,6 +11911,96 @@ fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
     );
 }
 
+// The nested shapes: the expectation reaches a call standing in a block
+// tail, a value-`if`'s branch tail, or a match leg — seeded at WALK time
+// through the syntactic tails (`seed_tail_expectations`), and by
+// `resolve_match` before its subject can defer the attempt.
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_a_block_tail() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = {
+        		points.map(|point| {
+        			point.x * 2;
+        		})
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_an_if_branch() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = if points.len() > 0 {
+        		points.map(|point| {
+        			point.x * 2;
+        		})
+        	} else {
+        		[]
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+// A match whose SUBJECT is itself a call: the legs used to be seeded only
+// once the subject landed (a pass after the leg's call had committed).
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_a_match_leg() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = match points.len() {
+        		0 => [],
+        		_ => points.map(|point| {
+        			point.x * 2;
+        		}),
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
 // --- B125's B5 set: when the closure's tail, the annotation and the receiver
 // disagree in different combinations, exactly ONE diagnostic fires, and the
 // value-position reconcile at the `let` never doubles it — the closure's
