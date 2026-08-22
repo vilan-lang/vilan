@@ -2756,3 +2756,294 @@ byte-identical), `--test examples` (6 passed), `cargo test -p vilan-core
 report has the lines. Not verified: a browser against a composed page
 (no browser here; the served bytes and the refusal's stderr are the
 measurement).
+
+### 16.13 E79 — the §10.1 review: the head helpers, with their customers (2026-08-21)
+
+§10.1 bounded rung 2 to "the intersection of the seven shells plus
+`head`/`body` escape hatches, and reviewed again if the first three
+feature requests are all in `head()`"; §15.2 applied the bound three
+times and declined the description, favicon/icon and generic-meta
+helpers (with CSP and `<base>` beside them) on the stated ground that
+"that review wants the requests, not a pre-emption". K13 step 3
+(§16.11) supplied the requests: the first site outside this repository
+put every one of them in `head()`. This is the review — paper only, the
+owner's to rule, the questions collected at the end. One adjacent item
+stays where §16.11 left it, recorded and not filed: §5.4's declined
+route prefix had its customer on the same site and was answered by the
+deployment following the ladder's URL space rather than by a knob.
+
+**The census, exact.** Three sources, read the way §2.2 read the shells.
+
+*The site* (`vilan-website` at `6036e21`, `src/*.vl`). `head()` is
+called twice — `src/server.vl:154` (the landing page) and `:181` (the
+playground) — both through one site-side function,
+`head_hatch(description, og_title, og_description, og_url, style)`
+(`src/server.vl:84`), which joins fourteen items at the hatch's indent.
+Grouped by the candidate each would be a customer of:
+
+| candidate | items / page | what it emits | who owns the value |
+|---|---:|---|---|
+| UA theme metas | 3 | `color-scheme`, `theme-color` ×2 (per scheme) | `theme.vl`'s `down-dim` row |
+| description | 1 | `<meta name="description">` | the page |
+| icons | 3 | `favicon.ico` 48, `icon-192.png`, `apple-touch-icon.png` — all absolute `https://vilan-lang.org/…` | the pages repo's hand-deployed `assets/` (not this package, not the build) |
+| social card | 6 | `og:title`, `og:description`, `og:image`, `og:url`, `og:type`, `twitter:card` | the page (2), the pages repo (image), the deployment (url), constants (2) |
+| the `<style>` frame | 1 block | three `@font-face`, ground + `::selection`, the page's rules, the reduced-motion kill | the site |
+
+The theme-meta lines, verbatim from `src/server.vl:85`:
+
+```html
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#120004" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F9DFE7" media="(prefers-color-scheme: light)">
+```
+
+and the row they restate, `src/theme.vl:120`:
+
+```vilan
+ThemedValue { name = "down-dim", dark = "#120004", light = "#F9DFE7" },
+```
+
+The same function restates three more rows, as the `var()` fallbacks
+in the frame block (`src/server.vl:131-132,186`): `var(--down-dim,
+#120004)`, `var(--up-bright, #F9DFE7)`, `var(--primary, #EB682E)` —
+each the dark column of a `themed_values` row. Five restatements of
+the table in one function, in the repository whose
+design paper says "a value stated anywhere else is a bug, not a
+convenience" (`src/theme.vl:46`). The social card against the identity
+lines the document does carry: the landing page's `og:title` equals
+its `<title>` but its `og:description` is not its description ("A
+language for…" against "Vilan is a language for…"); the playground's
+`og:description` equals its description but its `og:title` ("Vilan
+Playground") is not its title. Two of four pairings differ, on two
+pages. `body()` is called twice too — the landing page's out-of-mount
+SVG filter, the playground's two vendored plain scripts — and neither
+is a head matter.
+
+*This repository* (`vilan/examples`, `crates/vilan-cli/templates`,
+`docs/`). `head()` calls in code: **zero**. `body()`: one
+(`examples/todo/src/server.vl:33`, the two-tabs hint). One teaching
+`head()` in `docs/std/process.md:350`, carrying a `<style>`. Nine hand
+shells remain — `templates/fullstack/src/app.html`,
+`templates/browser/index.html`, `examples/walkthrough/src/app.html`,
+`examples/ssr/src/app.html`, `examples/fullstack`'s inline string, and
+the four browser-only `index.html`s (`reactive-ui`, `browser`,
+`router`, `canvas`) — and beyond what `Document::of` writes they carry
+a `<style>` frame in four (`reactive-ui`, `router`, both templates) and
+nothing else: no description, icon, card, theme meta, CSP or `<base>`
+in any of them. The two §16.4 drafts: the todo app is
+`Document::of(build).title("Todo")` with no hatch; kolt's server is
+`require_shell` with no hatch, and its header records that kolt's
+shell lacks even `lang` and a viewport.
+
+*Kolt* (the style reference, `visual-overhaul-2:client/src/index.html`
+— a Vite shell, not a vilan document, read through `git show` only).
+Charset, viewport, `<title>Kolt</title>`, six icon `<link>`s (32/16
+png, `shortcut icon`, `apple-touch-icon`, android-chrome 192/512) and a
+`<link rel="manifest">` — no description, no card, no `theme-color`
+meta. The manifest (`client/src/public/logo/site.webmanifest`) states
+`"theme_color": "#000000"` and `"background_color": "#000000"`; the
+same branch's `client/src/index.css:33` declares the ground
+`--color-down-dim: #282420`. The restated value has already drifted
+from the palette it restates, in the reference the site's own roles
+were adopted from.
+
+The counts. `head()` calls in vilan code: 2 (the site) + 0 (this
+repository) + 1 (a docs example). Customers per candidate: description
+— one project, two pages; icons — two projects (the site's three
+links, kolt's six plus a manifest); the social card — one project; the
+theme metas — one project, plus the same smell in kolt's manifest;
+generic meta, CSP, `<base>` — **none, anywhere**; the `<style>` frame
+— one project, four hand shells and the docs example, which is the
+customer §5.5 predicted. The population: the nine hand shells above,
+the site's two former shells (now hatches) and kolt's one — twelve
+documents, and the most common candidate, icons, is in two of them.
+**Under the rule as written nothing graduates, and §10.1's
+clause was never "measure again" — the bound was drawn over a
+population with no public page in it, and the clause asked whether it
+still fits once there is one.**
+
+**The three bounds, re-read against the census.** (a) *No knob the
+checker must learn.* `check_shell` reads exactly three things
+(`document.vl:118-128`): a `<link>` whose `rel` is a stylesheet, a
+`<script src>`, and the element carrying the mount id. A `<meta>` is
+invisible to it; an icon `<link>` has a non-stylesheet `rel` and is
+skipped. Of the five candidates only `<base>` touches the check — a
+`<base href>` changes what every `/client.js` in the page resolves to,
+so the checker would have to learn it or be wrong. (b) *No second
+string contract between the document and the build.* The census
+refines this: the question is who the other party is. `title`'s value
+has no other party — the document is its sole author, and the only
+thing that can go wrong is escaping, which `title()` does. An icon's
+`href` names a file; `og:image` names a file and `og:url` names the
+page's own address; a `theme-color` names a palette row. Those are
+contracts with a second party std cannot see, and a helper for one is
+a typed way to write an unchecked string — sugar over no rule, which
+is the one shape §5.6 rejects. (c) *The intersection.* Unchanged, and
+unchanged it keeps the five out; the question for the owner is whether
+it stays the whole rule.
+
+**Per candidate.**
+
+*Description* — **graduate**, as `title`'s twin. `fun description(own
+self, text: str): Document`, writing `<meta name="description"
+content="…">` through `escape_attribute` the way `title` goes through
+`escape_text`, beside the `<title>` in the generated prefix. Against
+the bounds: nothing for the checker to learn; no second party — the
+value is the document's own; outside the intersection, which is Q1.
+What it buys over the hatch is small and real: the site interpolates
+the text raw (`i"<meta name=\"description\" content=\"{description}\">"`,
+`src/server.vl:85`), so a `"` in a description ends the attribute and
+the remainder becomes junk attributes a browser tolerates — the page
+looks right and the search snippet is wrong, the F-family's signature
+one rung up; and the name cannot be misspelled, which the checker
+would never notice. What it does not open: `keywords`, `author`,
+`robots`, `canonical` — no customer in the census, and the last two
+are a policy and a URL, second parties both.
+
+*Icons* — **keep in `head()`.** `fun icon(own self, href: str):
+Document` (or `icons(favicon, touch)`). Against the bounds: nothing
+for the checker; a second party, the file; two of twelve. Its two
+customers agree on nothing: three links against six plus a manifest, absolute URLs
+against root-relative, and four attributes that vary (`rel`, `sizes`,
+`type`, `href`) — a helper fitting both is a knob set, a helper fitting
+one is the hatch with a name. The sharper reason is the ladder's own:
+the `href` names a file the build did not emit and `serve_build` will
+not serve (§5.10 — the build, not a directory), so on a rung-2 server
+with no hand route `icon("/favicon.ico")` writes a URL that answers
+404, and the checker's honest silence about anything outside the leg's
+namespace (§14.2) means nothing says so. The shape in which an icon
+helper becomes this paper's kind of helper is a `LegBuild` that knows
+a public-asset set the build copied — then the href is checkable, an
+F7 with a name. No customer has asked for build-copied assets;
+recorded, not proposed.
+
+*The social card* — **keep in `head()`; the site's `head_hatch` is the
+helper, at the altitude that knows the host.** `fun social_card(own
+self, title: str, description: str, image: str, url: str): Document`
+with `og:type`/`twitter:card` as constants is four strings — nothing
+for the checker, one of twelve, and two of the four second parties: the image a hand-deployed file, the `og:url` the
+page's own address — which the document does not know, as §16.11
+showed when the deployment followed the ladder's URL space and one
+page is served at `/playground/` by Pages and `/playground` by the
+local server. The derived form (`og:title` from `title`,
+`og:description` from `description`) is ruled out by the census
+itself: two of its four pairings differ on the first real site.
+
+*The theme metas* — **a site-side helper; std unchanged.** Its own
+paragraph below.
+
+*Generic meta, CSP, `<base>`* — **stay declined, with a stronger reason
+than §15.2 had.** `fun meta(own self, name: str, content: str):
+Document` would write none of the real site's metas but the
+description: the card uses `property=`, `theme-color` needs `media=`, a
+CSP uses `http-equiv=` — three knobs before the generic shape writes
+one real `<head>`, which is §10.1's "no obvious stopping point" in
+miniature. A CSP has zero customers and is the server's business: a
+header on the `Response` the app already builds, where
+`frame-ancestors` and reporting work and a meta CSP cannot carry them
+— §5.5's line that a document which knew HTTP would be a framework.
+`<base>` has zero customers and is the one candidate bound (a) bites.
+
+*The `<style>` frame* — not E79's, counted because it is the largest
+customer by lines: **stays in `head()`**. A `style(css)` helper is
+`head("<style>…</style>")` with a name, and the templates' own comment
+("the page frame is not the app's business, so it stays plain CSS") is
+the reason it should look like what it is.
+
+**The theme metas, specifically.** K10 is the bar: one home inside
+`theme.vl`, "generated outward", "no hex is stated twice"
+(`design-language.md` §2.6), and the chrome leg already renders the
+table into `chrome/tokens.css` on every deploy by that mechanism — one
+formatter, two consumers, zero drift. The hatch states `down-dim`'s
+pair again for the UA, and three dark columns again as fallbacks, and
+kolt's manifest shows what the hand-stated copy does given time. Three
+shapes were weighed.
+
+A std `theme_color(dark: str, light: str)` is the literals with a typed
+spelling; the sync is still by hand. Nothing gained.
+
+A token-aware std helper has to get the value from somewhere, and
+there is nowhere. `LegBuild` carries the leg, its dist, the bundle,
+the sidecar's name, the chunks and the script form — no palette. The
+compiled sidecar has the values, as text std would have to parse: a
+mirror through a parser, the thing §2.6 retired. And std's own `Color`
+as `token()` mints it is `css = "var(--down-dim)"` — a *reference*,
+while a `<meta>`'s `content` needs a *value*, which a browser does not
+resolve `var()` into: `theme_color(color: Color)` would write
+`content="var(--down-dim)"`, the frame would quietly not paint, and the
+page would look right. The only honest std shape is the compiler
+recording each leg's `:root` custom properties in the manifest and
+`theme_color(token: str)` resolving against that table and refusing
+the boot on a name it lacks — an F7 in the doctrine, a manifest field,
+a compiler change and a checker rule, for one customer whose site
+already owns a generator. Not now; the shape if a second site asks.
+
+The site-side shape is one function beside `themed_declaration`,
+reading the same row `token()` reads — `themed_value(name)` being that
+lookup factored out of `token()`, with its discipline kept (a name the
+table lacks fails at const eval):
+
+```vilan
+/// The UA's copy of the ground, written from the table: one row, both schemes.
+fun theme_metas(ground: str): str {
+	let value = themed_value(ground);
+	i"<meta name=\"color-scheme\" content=\"dark light\">\n\t\t<meta name=\"theme-color\" content=\"{value.dark}\" media=\"(prefers-color-scheme: dark)\">\n\t\t<meta name=\"theme-color\" content=\"{value.light}\" media=\"(prefers-color-scheme: light)\">"
+}
+```
+
+and the fallbacks the same way — `fallback("down-dim")` writing
+`var(--down-dim, #120004)` from the row — after which `head_hatch`
+states no hex and `theme.vl:31`'s "nothing past this block names a
+hex" is true of the served page, not only the stylesheet. The server
+leg already imports `pkg::page`, which imports `pkg::theme`, so the
+table is reachable today with no new edge. This is a website item, not
+a std one, and it is the whole of E79's theme-meta answer: **the
+document is built in std and the theme lives in the site, so the
+helper lives where the value does.**
+
+**Found in passing, not fixed here.** `head()` and `body()` are
+repeatable and concatenate with no separator (`self.head + markup`,
+`document.vl:313`), and `generated()` writes the result at one indent
+— so two calls put two items on one line, which is why the site wrote
+`joined(lines, "\n\t\t")` (`src/server.vl:57`) and calls `head()` once
+with everything. §15.1 promised a page a person can read in View
+Source; a newline at the hatch's indent between calls would keep that
+promise for a hatch used per item and retire the site's helper. A std
+change, S, the owner's.
+
+**The rule, restated as recommended.** Rung 2 is the intersection of
+the shells in the tree, plus the identity lines the document is the
+sole author of — `title` and `description` — plus the `head`/`body`
+hatches for everything that names a second party std cannot see: a
+file, a host, an address, a palette.
+
+**The owner's ruling questions.**
+
+1. *Does the bound move?* §15.2's "intersection of the seven shells"
+   was drawn over a population with no public page in it; the first
+   public page put five things in `head()` and none into the
+   intersection. — **Recommend: yes**, to the rule above — the
+   intersection, plus the identity lines the document is the sole
+   author of; everything naming a second party stays a hatch.
+2. *Does `description(text)` graduate?* — **Recommend: yes**, as
+   `title`'s twin, escaped, beside it in the generated prefix; S, std,
+   one pin. If Q1 is no, this is no.
+3. *Do the icons stay in `head()`?* — **Recommend: yes**; revisit only
+   if `LegBuild` ever carries build-copied public assets, which is
+   what makes an icon `href` checkable.
+4. *Does the social card stay in `head()`, with the site's
+   `head_hatch` as the helper?* — **Recommend: yes**; `og:url` and
+   `og:image` are deployment facts, and the derived form is wrong on
+   the first real site.
+5. *The theme metas: a site-side `theme_metas` reading
+   `themed_values` (and the fallbacks from the same rows), filed as a
+   website item, no std helper?* — **Recommend: yes**; the std shape
+   (manifest-recorded tokens, a checked `theme_color(token)`) declined
+   until a second site asks.
+6. *Do generic `meta`, CSP and `<base>` stay declined?* — **Recommend:
+   yes**, with the census's reason: the generic shape writes none of
+   the real metas, a CSP is a header, and `<base>` is the one the
+   checker would have to learn.
+7. *The found-in-passing — `head()`/`body()` calls separated by a
+   newline at the hatch's indent: file it?* — **Recommend: yes**, S,
+   std; it is what lets the hatch be used per item.
