@@ -275,8 +275,8 @@ A trait parameterized differently is a different implementation:
 `impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` both stand.
 
 The rule refuses exact repeats, not OVERLAP: a blanket impl and a specific
-one that both match a type — `std::into`'s `impl type T with Into<T>`
-beside a type's own `Into` impl, or two conditional impls with different
+one that both match a type — your own `impl type T with Show`
+beside `impl Bag with Show`, or two conditional impls with different
 bounds — both stand, and a call is answered by the **more specific** of
 them, never by whichever was declared first. More specific means, in
 order: the impl whose subject pattern the other's matches and not

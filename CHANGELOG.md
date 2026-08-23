@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: breaking -->
+**std no longer ships the reflexive `Into` blanket.** `std::into`'s `impl type T with Into<T>` — the identity conversion every imported `Into` gave every type — is deleted (B127, `proposal/method-resolution.md` §14; ruled 2026-08-22). The `Into` trait, the module, and the import path all stay, and every corpus program emits byte-identical JavaScript. The census that preceded the ruling measured the blanket selected by resolution at zero sites in the entire tree, and its one unique affordance — `fun accept<T: Into<Foo>>(x: T)` fed a `Foo` itself — dying in an internal compiler error ("a call resolved to `Into`'s requirement `into`, which has no body … please report this program", live in released 0.34.0), because the emitter cannot see a generic-subject impl on the bound path. If you called the identity `.into()`, write the reflexive impl yourself: `impl Foo with Into<Foo> { fun into(self): Foo { self } }` — three lines, already legal, and strictly more functional than the blanket it replaces: it satisfies the `T: Into<Foo>` bound *and* runs, where the blanket crashed the compiler.
+
+What deleting buys: the common case stops paying an annotation tax. One type, one conversion — `let s = foo.into()` beside a single `impl Foo with Into<str>` — used to be a two-home ambiguity demanding an annotation, because std's blanket made every `.into()` receiver an overlap; now it just runs and prints the conversion you wrote. An `Into` overlap is now something only your own impls can create, and the bound-fed-its-own-target shape is a clean refusal naming the missing impl, with a note at the bound's declaration, instead of an internal error.
+
+---
+
 <!-- family: diagnostics -->
 **An unannotated function's `ret` now counts toward its inferred return type.** `fun f(x: bool) { ret 1; }` — no declared return type, a body that leaves only by `ret` — was `void` at every call site, so `let y: i32 = f(true)` reported `Expected i32, but got void instead.` at the call, the one line with nothing wrong on it. The return type was read from the body's final expression alone, and a `ret` was invisible to it. Invisible was worse than missing: `fun f(x: bool) { if x { ret "s"; } 2 }` compiled clean and handed a `str` to an `i32` binding at runtime, a bare `ret` beside a value tail handed back `undefined`, and an exhaustive `if`/`else` of `ret`s typed as `never` and let `let y: str = f(false)` through.
 

@@ -1351,9 +1351,9 @@ shapes the 13 do not cover.
 
 ## 14. B127 — is the blanket still earning its keep? (2026-08-20)
 
-> Status: **PAPER — recommendation DELETE, owner ruling pending** (the
-> question §13.6 Q3 deferred until R2's behavior was seen; it has now
-> been seen). Every claim below is measured: probes ran through this
+> Status: **RULED DELETE 2026-08-22 (§14.1); SHIPPED 2026-08-23
+> (§14.2)** (the question §13.6 Q3 deferred until R2's behavior was
+> seen; it has now been seen). Every claim below is measured: probes ran through this
 > worktree's `target/debug/vilan` (`cargo build` exit 0, branched from
 > `next` with R1–R3 in), and the deletion itself was run as a scratch
 > build with full gates, then reverted — the tree this section ships in
@@ -1594,3 +1594,53 @@ impl already delivers them today (probe G: `7`, both worlds). If the
 ruling is delete, the bycatch stands regardless of timing: probe C's
 internal error is live in 0.34.0 and should be filed even if the blanket
 outlives it.
+
+### 14.2 The ship record (2026-08-23)
+
+Shipped as ruled. `std/src/into.vl` is the trait alone now (the five
+impl lines and their separator deleted); corpus goldens byte-identical
+(7/7) and the docs gate green (8/8), exactly as the scratch experiment
+measured. The one prose edit landed (`spec/types.md`'s overlap example
+is a user-written blanket now), the CHANGELOG carries the `breaking`
+entry with the migration line, and beta.md's Tier 3 row and §5.1 Q3
+are collapsed onto the ruling — `std::into`, now just the trait
+`strings.md` teaches, is tabled at Tier 2.
+
+- **B130 closed by the deletion, plant-proven in order.** The probe-C
+  pin (`b130_an_into_bound_fed_its_target_without_an_impl_is_refused_cleanly`)
+  was written FIRST and run against the pre-deletion tree, where it
+  failed on the internal error verbatim ("internal: a call resolved
+  to \`Into\`'s requirement \`into\`, which has no body — emitting it
+  would produce an empty function and a runtime \`TypeError\`. The
+  receiver's type could not be resolved to a concrete implementation
+  at this call; please report this program") — and after the deletion
+  it pins the clean refusal: `'Foo' does not implement trait
+  'Into<Foo>', required by a generic bound of this call`, with the C3
+  note ("the bound is declared here") at the bound's declaration.
+  Probe G is pinned beside it
+  (`b130_a_user_reflexive_impl_carries_the_bound_path`, prints `7`) —
+  green in both worlds, as the census measured, which is the
+  "strictly more functional" half of the migration line.
+- **The deleted world's own pins**, both red pre-deletion:
+  `b127_an_into_call_with_no_user_impl_is_a_missing_method` (probe B —
+  red as "compiled cleanly", the identity conversion) and
+  `b127_an_unannotated_into_call_with_one_user_impl_selects_it`
+  (§13.2 row 2's first-choice answer — red as the two-home ambiguity,
+  the annotation tax this section measured).
+- **The three §13.8 pins re-staged with user impls**, the shapes §14
+  gave: row 2's pin renamed
+  `b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_first_declared`
+  (two specific user impls); the C2 message pin and the zero-match leg
+  each stage a USER blanket beside `Into<str>`, so the reported homes
+  — `Into<Foo>` and `Into<str>` — and the message bytes are unchanged.
+  The rows-3/5 pins gained a second user impl, declared FIRST so
+  first-declared cannot masquerade as selection, keeping their R2 legs
+  (return position; the §3.1 re-point) genuinely two-homed; row 1's is
+  renamed `b73_an_annotated_into_call_reaches_the_user_impl` and keeps
+  the now-single-home annotated shape. All five plant-proven red: the
+  R1 home key collapsed to the bare trait id reds the four direct-call
+  pins, the re-point's selection disabled reds the trait-qualified
+  one. The B98 carve-out pin is repurposed as the migration path's
+  legality pin (`b98_a_user_reflexive_into_impl_is_legal_and_not_a_duplicate`,
+  program unchanged), and B84's pin stages two-impls-one-trait with
+  two user impls on one subject.

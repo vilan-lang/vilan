@@ -1475,9 +1475,9 @@ struct ImplMemberCandidate {
     /// The trait the name comes from, or `None` when the member is INHERENT —
     /// the type's own, outranking every trait-provided candidate.
     home_trait: Option<Id>,
-    /// The home trait's arguments AS THIS RECEIVER INSTANTIATES THEM — std's
-    /// `impl type T with Into<T>` reached through a `Foo` is `Into<Foo>`, a
-    /// user's `impl Foo with Into<str>` is `Into<str>`. Empty for an inherent
+    /// The home trait's arguments AS THIS RECEIVER INSTANTIATES THEM — a
+    /// blanket `impl type T with Into<T>` reached through a `Foo` is
+    /// `Into<Foo>`, a specific `impl Foo with Into<str>` is `Into<str>`. Empty for an inherent
     /// member and for a trait with no parameters.
     ///
     /// Half of B73's R1 resolution key: the trait id alone made those two one
@@ -4862,13 +4862,14 @@ impl<'src> Analyzer<'src> {
     ///   together (`method-resolution.md` §2). Nothing here special-cases them;
     ///   the pairs are compared within one platform leg because only one leg
     ///   exists. Pinned on both legs.
-    /// - **The std `Into` blanket.** `impl type T with Into<T>` has a GENERIC
+    /// - **A reflexive blanket.** `impl type T with Into<T>` (std shipped one
+    ///   until B127 deleted it — the shape stays legal for users) has a GENERIC
     ///   subject; a user's `impl Foo with Into<Bar>` has a concrete one, and a
     ///   generic position matches only another generic position, so the pair
     ///   never forms. This is deliberate and load-bearing: a blanket impl
-    ///   OVERLAPPING a specific one is B73's specificity question, which stays
-    ///   open and stays out of this rule — an overlap resolves exactly as it did
-    ///   before, and only an exact repeat is refused.
+    ///   OVERLAPPING a specific one is B73's specificity question, answered by
+    ///   ranking (§13.4(a)) and not by this rule — only an exact repeat is
+    ///   refused.
     /// - **Two conditional impls with different bounds.**
     ///   `impl Pair<type T: Show>` and `impl Pair<type U: Marker>` are two
     ///   overlapping impls, not one written twice, which is why two generic
@@ -5024,8 +5025,8 @@ impl<'src> Analyzer<'src> {
     ///
     /// Deliberately NOT [`Self::compare_type`], which is compatibility: it
     /// treats a generic as a hole to be filled, so an unbounded one matches
-    /// anything and std's `impl type T with Into<T>` would read as a duplicate
-    /// of every user `Into` impl in the program. What this rule needs is
+    /// anything and a reflexive blanket `impl type T with Into<T>` would read
+    /// as a duplicate of every user `Into` impl in the program. What this rule needs is
     /// sameness — a parameter matches only another parameter, and only one bound
     /// the same way, so a blanket impl OVERLAPPING a specific one (B73) is not a
     /// repeat of it.
@@ -11397,9 +11398,9 @@ impl<'src> Analyzer<'src> {
         // not a static: which implementation runs is the RECEIVER's to decide,
         // and the path head falls through to `trait_qualified_calls` to let it.
         // An impl with a GENERIC subject compare_types the bare trait type,
-        // though, so std's `impl type T with Into<T>` answered the path itself
-        // and `Into::into(foo)` reached the blanket whatever `foo` implements
-        // (`method-resolution.md` §13.2 row 5). A trait's attached statics —
+        // though, so std's since-deleted `impl type T with Into<T>` (B127)
+        // answered the path itself and `Into::into(foo)` reached the blanket
+        // whatever `foo` implements (`method-resolution.md` §13.2 row 5). A trait's attached statics —
         // `Iterator::from_fn`, which take no `self` — are untouched.
         candidates
             .into_iter()
@@ -11953,8 +11954,9 @@ impl<'src> Analyzer<'src> {
     /// Method resolution runs receiver-first everywhere else, so this is the one
     /// place the annotation on the left of the `=` reaches across and chooses
     /// among the implementations on the right. It is what makes
-    /// `let b: Bar = foo.into()` mean the user's `impl Foo with Into<Bar>`
-    /// rather than std's blanket, and what `variadic-generics.md` 182–187
+    /// `let b: Bar = foo.into()` mean the `impl Foo with Into<Bar>` home
+    /// rather than a competing `Into` home (std's blanket, until §14 deleted
+    /// it; a user-written one still), and what `variadic-generics.md` 182–187
     /// recorded as its blocker.
     fn select_home_by_expected_type(
         &mut self,
@@ -12075,9 +12077,9 @@ impl<'src> Analyzer<'src> {
     }
 
     /// One candidate's home, spelled as THIS receiver instantiates it —
-    /// `Into<Foo>` for std's blanket reached through a `Foo`, `Into<str>` for
-    /// the user's own impl (B1: the reader has to be able to tell the two
-    /// apart, and `Into` twice does not).
+    /// `Into<Foo>` for a blanket `impl type T with Into<T>` reached through a
+    /// `Foo`, `Into<str>` for a specific impl (B1: the reader has to be able
+    /// to tell the two apart, and `Into` twice does not).
     fn home_label(&self, candidate: &ImplMemberCandidate) -> String {
         let Some(trait_id) = candidate.home_trait else {
             return String::new();
@@ -25091,7 +25093,7 @@ impl<'src> Analyzer<'src> {
         self.trait_qualified_calls.remove(&subject_id);
         // Every impl of the named trait whose subject matches, not just the
         // first: one subject may implement the trait at two instantiations
-        // (`Into<Bar>` beside std's `Into<Foo>`), and naming the trait says
+        // (`Into<Bar>` beside `Into<str>`), and naming the trait says
         // nothing about which — §3.1's spelling has no argument slot (B73 R2).
         let providers: Vec<(Option<Id>, TypeId)> = self
             .implementations

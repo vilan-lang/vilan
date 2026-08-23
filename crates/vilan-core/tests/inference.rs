@@ -50955,12 +50955,15 @@ fn b98_the_same_trait_at_different_arguments_is_two_impls() {
 }
 
 #[test]
-fn b98_the_std_into_blanket_is_not_a_duplicate_of_a_user_impl() {
-    // The carve-out that would have taken std down: `impl type T with Into<T>`
-    // matches every subject under ordinary type COMPATIBILITY, so a rule built
-    // on `compare_type` would call it a duplicate of every user `Into` impl. It
-    // is an OVERLAP, which is B73's open specificity question — unchanged here,
-    // in both directions (`Into<Fahrenheit>` and the reflexive `Into<Celsius>`).
+fn b98_a_user_reflexive_into_impl_is_legal_and_not_a_duplicate() {
+    // Originally the carve-out that would have taken std down: a rule built on
+    // `compare_type` would have called std's `impl type T with Into<T>` a
+    // duplicate of every user `Into` impl. That blanket is deleted (B127,
+    // method-resolution.md §14), and this program — unchanged — is now the
+    // migration path's legality pin: a USER-written reflexive impl
+    // (`impl Fahrenheit with Into<Fahrenheit>`) is an ordinary impl, legal
+    // beside a converting `Into<Fahrenheit>` on another subject, because the
+    // pair key is `(trait, arguments, subject)` and the subjects differ.
     assert_compiles(
         r#"
         import std::into::Into;
@@ -54937,8 +54940,10 @@ fn b84_one_name_per_block_across_two_blocks_still_compiles() {
 #[test]
 fn b84_two_impls_of_one_trait_are_still_not_a_duplicate() {
     // §9(6), kept load-bearing: the trait tier dedups by trait, so the name
-    // still has one home. `Into`'s std blanket impl is the live instance, and
-    // a user's own `Into` impl beside it must stay legal.
+    // still has one home. Std's `Into<T>` blanket was the live instance until
+    // B127 deleted it (method-resolution.md §14); two user impls of `Into` at
+    // different arguments on one subject keep the shape — two blocks, one
+    // trait, both declaring `into`, and legal.
     assert_compiles(
         r#"
         import std::into::Into;
@@ -54948,6 +54953,10 @@ fn b84_two_impls_of_one_trait_are_still_not_a_duplicate() {
 
         impl Celsius with Into<Fahrenheit> {
             fun into(self): Fahrenheit { Fahrenheit { degrees = self.degrees * 2 } }
+        }
+
+        impl Celsius with Into<Celsius> {
+            fun into(self): Celsius { self }
         }
 
         fun main() { }
@@ -59831,15 +59840,22 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
 // LIVE and asserts the shipped semantics — R1 (the trait's effective
 // arguments join the resolution key), R2 (the expected type selects among
 // argument-distinct homes), R3 (specificity ranks a genuine overlap). The
-// residue no row exercises is B128, deferred.
+// residue no row exercises is B128, deferred. The `Into` pins originally staged their second
+// home with std's `Into<T>` blanket; §14 deleted it, so they stage the same
+// shapes with user impls (each rewrite plant-proven red: the R1 home key
+// collapsed to the bare trait id reds the direct-call pins, the re-point's
+// selection disabled reds the trait-qualified one).
 
-/// §13.2 row 1, closed by R2. Before it: `Expected Bar, but got Foo instead.`
-/// — std's `impl type T with Into<T>` (`std/src/into.vl` 5–9) is a candidate for
-/// every receiver and, being tier 0, sorted first, so the user's own impl was
-/// dead code. R1 makes the two separate homes (`Into<Foo>` and `Into<Bar>`) and
-/// R2 lets the `let`'s annotation say which was meant.
+/// §13.2 row 1, closed by R2, then simplified by §14: std's
+/// `impl type T with Into<T>` was a candidate for every receiver and, being
+/// tier 0, sorted first, so this program reported `Expected Bar, but got Foo
+/// instead.` and the user's own impl was dead code — R1 split the homes and R2
+/// let the `let`'s annotation say which was meant. The blanket is deleted now,
+/// so the user's impl is the only home and the annotated call reaches it with
+/// nothing to select against. (R2's let-annotation selection between two live
+/// homes stays pinned by the rows-6/7 and rows-18/19 pins.)
 #[test]
-fn b73_a_user_into_impl_beats_the_std_blanket() {
+fn b73_an_annotated_into_call_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -59861,15 +59877,17 @@ fn b73_a_user_into_impl_beats_the_std_blanket() {
     );
 }
 
-/// §13.2 row 2 — the beta-critical miscompile, closed by R1. Before it, this
-/// compiled clean, exited 0, and printed `[ 1 ]`: the blanket's
-/// `fun into(self): T { self }` was emitted (`function $a(self) { return
-/// __clone(self); }`) and the user's `into` never was. With the trait's
-/// arguments in the resolution key the two are separate homes (`Into<Foo>` and
-/// `Into<str>`), and with no expected type to steer R2's selection the call is
-/// reported rather than silently resolved.
+/// §13.2 row 2 — the beta-critical miscompile, closed by R1. As filed, the
+/// second home was std's `Into<T>` blanket: this program with only the
+/// `Into<str>` impl compiled clean, exited 0, and printed `[ 1 ]`, because the
+/// blanket's identity `into` was emitted and the user's never was. The blanket
+/// is deleted (§14), so the pin keeps R1's point with two USER impls — before
+/// R1, one home meant `candidates.first()` and the first-declared impl
+/// answered silently. With the trait's arguments in the key the two are
+/// separate homes (`Into<str>` and `Into<Bar>`), and with no expected type to
+/// steer R2's selection the call is reported rather than silently resolved.
 #[test]
-fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
+fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_first_declared() {
     assert_fails_with(
         r#"
         import std::print;
@@ -59877,9 +59895,14 @@ fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
         import std::string::str;
 
         struct Foo { n: i32 }
+        struct Bar { n: i32 }
 
         impl Foo with Into<str> {
             fun into(self): str { "converted" }
+        }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
         }
 
         fun main() {
@@ -59893,16 +59916,24 @@ fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
 
 /// §13.2 row 3, closed by R2 — the same defect in RETURN position, where the
 /// expectation comes from the declared return type rather than from a `let`.
-/// Before: `Expected Bar, but got Foo instead.` on the `x.into()` tail.
+/// As filed the competing home was std's blanket (before R2: `Expected Bar,
+/// but got Foo instead.` on the `x.into()` tail); the blanket is deleted
+/// (§14), so a second user impl — declared FIRST, so first-declared cannot
+/// masquerade as selection — keeps the two homes this leg selects between.
 #[test]
 fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
         import std::print;
         import std::into::Into;
+        import std::string::str;
 
         struct Foo { n: i32 }
         struct Bar { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
 
         impl Foo with Into<Bar> {
             fun into(self): Bar { Bar { n = self.n + 100 } }
@@ -59919,20 +59950,26 @@ fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
 /// §13.2 row 5, closed by R2. §3.1's disambiguator is no escape hatch here —
 /// both candidates have the same trait head, so naming it settles nothing; the
 /// annotation is what picks the home. Two defects stood between: the path head
-/// `Into::into` never reached §3.1's re-point at all, because the blanket's
-/// GENERIC subject compare_types the bare trait type and answered the static
-/// path itself (a `self`-method can no longer do that); and the re-point's own
-/// provider scan then took the first impl of the trait rather than the one the
-/// expectation names.
+/// `Into::into` never reached §3.1's re-point at all, because std's blanket's
+/// GENERIC subject compare_typed the bare trait type and answered the static
+/// path itself (a `self`-method can no longer do that, and the blanket is gone
+/// — §14); and the re-point's own provider scan took the first impl of the
+/// trait rather than the one the expectation names. The second user impl —
+/// declared FIRST — is what keeps that provider scan a real selection.
 #[test]
 fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
         import std::print;
         import std::into::Into;
+        import std::string::str;
 
         struct Foo { n: i32 }
         struct Bar { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
 
         impl Foo with Into<Bar> {
             fun into(self): Bar { Bar { n = self.n + 100 } }
@@ -60250,15 +60287,16 @@ fn b73_a_bound_selects_the_impl_matching_its_trait_arguments() {
 }
 
 /// R1's diagnostic (C2). The two homes are named as THIS receiver instantiates
-/// them — `Into<Foo>` for std's blanket, `Into<str>` for the user's impl —
-/// because `Into` twice tells the reader nothing, and the message says what
-/// does select rather than offering an `Into::into` spelling that cannot
-/// (B83's "an impossible steer is worse than no steer"). Anchored at the method
-/// name (A1/A4), the same span the two-trait ambiguity uses.
+/// them — `Into<Foo>` for the blanket (a USER-written one since §14 deleted
+/// std's), `Into<str>` for the specific impl — because `Into` twice tells the
+/// reader nothing, and the message says what does select rather than offering
+/// an `Into::into` spelling that cannot (B83's "an impossible steer is worse
+/// than no steer"). Anchored at the method name (A1/A4), the same span the
+/// two-trait ambiguity uses.
 #[test]
 fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them() {
-    // The third `into` in the source is the CALL — the first two are the import
-    // path and the impl's declaration.
+    // The fourth `into` in the source is the CALL — the first three are the
+    // import path and the two impls' declarations.
     assert_fails_spanning_nth(
         r#"
         import std::print;
@@ -60266,6 +60304,10 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
         import std::string::str;
 
         struct Foo { n: i32 }
+
+        impl type T with Into<T> {
+            fun into(self): T { self }
+        }
 
         impl Foo with Into<str> {
             fun into(self): str { "converted" }
@@ -60277,7 +60319,7 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
         }
         "#,
         "into",
-        2,
+        3,
         "'into' is ambiguous on 'Foo': both 'Into<Foo>' and 'Into<str>' provide it, and \
          'Into::into' names only the trait, not which of its instantiations; annotate the \
          type this call must produce to pick one",
@@ -60287,7 +60329,9 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
 /// R2's ZERO-match leg. An expectation that fits neither home does not get to
 /// pick one by being nearest: the call stays ambiguous and says so, rather than
 /// resolving to some impl and then reporting a type mismatch against it. That
-/// second message would name a home the program never chose.
+/// second message would name a home the program never chose. (The `Into<Foo>`
+/// home comes from a user-written blanket — the same shape std's deleted
+/// blanket gave this pin originally, §14.)
 #[test]
 fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
     assert_fails_with(
@@ -60297,6 +60341,10 @@ fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
         import std::string::str;
 
         struct Foo { n: i32 }
+
+        impl type T with Into<T> {
+            fun into(self): T { self }
+        }
 
         impl Foo with Into<str> {
             fun into(self): str { "converted" }
@@ -60571,6 +60619,130 @@ fn b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins() {
         "#;
     assert_compiles_and_runs(direct, "7\n");
     assert_compiles_and_runs(through_a_bound, "7\n");
+}
+
+// --- B127/B130: std ships no `Into<T>` blanket (method-resolution.md §14) ---
+//
+// RULED DELETE 2026-08-22 (§14.1). std's `impl type T with Into<T>` was
+// selected by resolution at zero sites in the whole tree, the suite included;
+// its one working surface was an identity `.into()` nothing called; and its
+// one unique affordance — a `T: Into<Foo>` bound fed a `Foo` itself — died in
+// an internal compiler error (B130, §14 probe C), because the transformer's
+// nominal re-dispatch cannot see a generic subject (§13.3 D3). The trait, the
+// module, and the import path all stay; a user who wants identity conversion
+// writes the three-line reflexive impl, which is strictly more functional
+// than the blanket it replaces (it carries the bound path — probe G). The
+// pins below are the deleted world's contract; each `b127_`/the probe-C pin
+// was run RED against the pre-deletion tree before the impl was removed.
+
+/// §14 probe B. With no blanket in std, an `into` call reaches only what the
+/// program itself implements — no impl, no method. Re-adding a std blanket
+/// impl would turn this refusal into a clean compile that prints the receiver.
+#[test]
+fn b127_an_into_call_with_no_user_impl_is_a_missing_method() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+
+        fun main() {
+            let f = Foo { n = 1 }.into();
+            print(f);
+        }
+        "#,
+        "Foo has no method 'into'",
+    );
+}
+
+/// §13.2 row 2's FIRST-choice correct answer, reachable at last: one user
+/// impl, no annotation, and the call selects it. Std's blanket made every
+/// `.into()` receiver a two-home call, so this exact program — the shape
+/// `docs/std/strings.md` teaches — was an ambiguity that demanded an
+/// annotation (the tax §14 repeals). Red before the deletion, green after.
+#[test]
+fn b127_an_unannotated_into_call_with_one_user_impl_selects_it() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "converted\n",
+    );
+}
+
+/// B130, closed by the deletion. A `T: Into<Foo>` bound fed a `Foo` was the
+/// blanket's one unique affordance, and it died with "internal: a call
+/// resolved to 'Into''s requirement 'into', which has no body … please report
+/// this program" anchored at the import line (live in released 0.34.0): the
+/// analyzer accepted the bound through the blanket, and the transformer's
+/// `nominal_matches` re-dispatch cannot see a generic subject (§13.3 D3), so
+/// the no-body guard fired. With no blanket the bound is refused cleanly at
+/// the call, with the note at the bound's declaration. This pin is the red
+/// half of the plant: against the pre-deletion tree it fails on the internal
+/// error where the refusal should be.
+#[test]
+fn b130_an_into_bound_fed_its_target_without_an_impl_is_refused_cleanly() {
+    let source = r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+
+        fun accept<T: Into<Foo>>(x: T): Foo { x.into() }
+
+        fun main() { print(accept(Foo { n = 7 }).n); }
+        "#;
+    assert_fails_with(
+        source,
+        "'Foo' does not implement trait 'Into<Foo>', required by a generic bound of this call",
+    );
+    assert_fails_noting(
+        source,
+        "'Foo' does not implement trait 'Into<Foo>'",
+        "T",
+        "the bound is declared here",
+    );
+}
+
+/// §14 probe G, the migration path: a user-written reflexive impl delivers
+/// what the blanket only promised. It satisfies the `T: Into<Foo>` bound AND
+/// carries the bound path's re-dispatch, because a nominal subject is visible
+/// where a generic one never was (§13.3 D3) — measured identical with the
+/// blanket still in std, which is what makes the three-line impl "strictly
+/// more functional" than the five lines it replaces (§14, migration).
+#[test]
+fn b130_a_user_reflexive_impl_carries_the_bound_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<Foo> {
+            fun into(self): Foo { self }
+        }
+
+        fun accept<T: Into<Foo>>(x: T): Foo { x.into() }
+
+        fun main() { print(accept(Foo { n = 7 }).n); }
+        "#,
+        "7\n",
+    );
 }
 
 // --- A25: remote sources — subscribe by demand, unsubscribe at zero ---------
