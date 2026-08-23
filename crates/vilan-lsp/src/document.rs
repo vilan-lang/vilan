@@ -3460,6 +3460,30 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A `[deprecated]` use surfaces as a WARNING diagnostic (deprecation.md
+    // §1's ledger note) — the third producer on the same non-fatal channel
+    // `[must_use]` rides, through the same publish path; nothing new at this
+    // layer, and this pin holds it to that.
+    #[test]
+    fn deprecated_uses_publish_as_warnings() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "[deprecated(\"use two()\")]\nfun one(): i32 { 7 }\nfun two(): i32 { 7 }\nfun main() {\n\tlet _ = one();\n}\n",
+        )]);
+        let published = document.published_diagnostics();
+        let warning = published
+            .iter()
+            .find(|item| item.warning)
+            .expect("the deprecated use should warn");
+        assert!(warning.path.is_none());
+        assert!(
+            warning.message.contains("`one` is deprecated; use two()"),
+            "{}",
+            warning.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── git dependencies in the editor (proposal/distribution.md §5) ──
 
     // The editor's half of the git-dependency policy: **it never fetches**.

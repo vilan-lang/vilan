@@ -58,8 +58,10 @@ exposes a declaration to importers of the module.
 ### Functions
 
 ```text
-function = [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
+function = [ "[" "deprecated" "(" STRING ")" "]" ]
+           [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
            [ "[" "trait_only" "]" ] [ "[" "doc" "(" "hidden" ")" "]" ]
+           [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "async" ] [ "external" ]
            "fun" IDENT [ generic-params ]
            "(" [ parameter { "," parameter } [ "," ] ] ")"
@@ -104,6 +106,22 @@ declaration or any `impl` member, and on an `external fun`. It never
 combines with a convention — the argument is a tuple the *call site*
 builds, so there is nothing to transfer or alias — but `mut` may precede
 it (`mut ...items: T`).
+
+The attribute prefix is **ordered** — each attribute is optional, but
+they appear in exactly the production's order. `[deprecated("use …")]`
+leads it: the function is **deprecated**, and every use in code outside
+the standard library — a call, a method call, the function passed as a
+value — still compiles but raises the non-fatal warning
+`` `{name}` is deprecated; {steer} ``, anchored at the using name, once
+per use site. The one required argument is the replacement steer,
+carried into the warning verbatim; by convention it reads `use …`
+(`[deprecated("use two()")]` warns `` `one` is deprecated; use two() ``).
+Uses *inside* the standard library are silent — std migrates its own
+callers in the release that deprecates. The attribute is honored
+wherever it appears, in std and user code alike, and dies with its item:
+when the function is removed, so is the mark. When the item goes away is
+the CHANGELOG's fact, not the source's — the removal comes no earlier
+than the minor release after the warning first shipped.
 
 ### Structs and enums
 
@@ -222,8 +240,8 @@ macro-block      = "macro" block ;
 A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
 attribute names (`derive`, `service`, `extern`, `must_use`, `rpc`,
-`trait_only`, `doc`, `expose`) are not available as user macro-attribute
-names.
+`trait_only`, `doc`, `expose`, `platform`, `deprecated`) are not
+available as user macro-attribute names.
 
 ## 3.4 Bindings and assignment
 

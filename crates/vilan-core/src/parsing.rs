@@ -500,6 +500,7 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "doc",
     "expose",
     "platform",
+    "deprecated",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -3346,12 +3347,14 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     // --- Functions -----------------------------------------------------------
 
-    /// A function declaration: the ORDERED attribute prefix (`[extern(..)]`,
-    /// `[must_use]`, `[rpc]`, `[trait_only]`, `[doc(hidden)]`, `[platform(..)]` —
-    /// each optional but IN THIS ORDER, a faithful quirk), then `async? external?
+    /// A function declaration: the ORDERED attribute prefix (`[deprecated(..)]`,
+    /// `[extern(..)]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[doc(hidden)]`,
+    /// `[platform(..)]` — each optional but IN THIS ORDER, a faithful quirk),
+    /// then `async? external?
     /// fun name generics? (params) (: return)? (borrows param)? (block | ;)`.
     fn parse_function(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let deprecated = self.parse_deprecated_attribute();
         let extern_binding = self.parse_extern_attribute();
         let must_use = self.eat_marker_attribute("must_use");
         let rpc = self.eat_marker_attribute("rpc");
@@ -3430,6 +3433,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 name,
                 is_async,
                 external,
+                deprecated,
                 extern_binding,
                 must_use,
                 rpc,
@@ -4168,6 +4172,30 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(patterns)
+        })
+    }
+
+    /// `[deprecated("use …")]` — the deprecation steer for the function that
+    /// follows (proposal/deprecation.md §2): exactly one quoted string, the
+    /// replacement clause the use-site warning carries verbatim after
+    /// `` `{name}` is deprecated; ``. `None` when no deprecated attribute
+    /// leads.
+    fn parse_deprecated_attribute(&mut self) -> Option<&'src str> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("deprecated")) {
+                return None;
+            }
+            parser.bump();
+            parser.expect_ctrl('(')?;
+            let Some(Token::String(steer)) = parser.peek() else {
+                return None;
+            };
+            let steer = *steer;
+            parser.bump();
+            parser.expect_ctrl(')')?;
+            parser.expect_ctrl(']')?;
+            Some(steer)
         })
     }
 
@@ -5320,10 +5348,10 @@ mod tests {
 
     #[test]
     fn function_attributes_are_recognized_in_fixed_order() {
-        // The full ordered attribute prefix (`extern`, `must_use`, `rpc`,
-        // `trait_only`, `doc(hidden)`, `platform`) on one external function.
+        // The full ordered attribute prefix (`deprecated`, `extern`, `must_use`,
+        // `rpc`, `trait_only`, `doc(hidden)`, `platform`) on one external function.
         match only_item(
-            "[extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [doc(hidden)] [platform(\"@process\")] external fun serve();",
+            "[deprecated(\"use serve_all()\")] [extern(\"node:http\", \"createServer\")] [must_use] [rpc] [trait_only] [doc(hidden)] [platform(\"@process\")] external fun serve();",
         ) {
             Node::Func(function) => {
                 assert!(matches!(
@@ -5336,6 +5364,7 @@ mod tests {
                 assert!(
                     function.must_use && function.rpc && function.trait_only && function.doc_hidden
                 );
+                assert_eq!(function.deprecated, Some("use serve_all()"));
                 assert_eq!(function.platform_fence.len(), 1);
                 assert!(function.external);
             }
@@ -5349,6 +5378,30 @@ mod tests {
         // `[rpc] [must_use] fun` is NOT a function, and no other alternative claims
         // it, so the whole program declines.
         assert!(declines("[rpc] [must_use] fun f() { }"));
+        // `[deprecated(..)]` leads the chain: after `[extern(..)]` it declines.
+        assert!(declines(
+            "[extern(\"fs\", \"read\")] [deprecated(\"use read_all()\")] external fun read();"
+        ));
+    }
+
+    #[test]
+    fn a_deprecated_attribute_carries_its_steer() {
+        // The ordinary shape: one quoted steer, flattened into the `Func` field
+        // (proposal/deprecation.md §2).
+        match only_item("[deprecated(\"use two()\")] fun one() { }") {
+            Node::Func(function) => assert_eq!(function.deprecated, Some("use two()")),
+            other => panic!("expected a deprecated Func, got {other:?}"),
+        }
+        // Without the attribute the field is empty.
+        match only_item("fun plain() { }") {
+            Node::Func(function) => assert_eq!(function.deprecated, None),
+            other => panic!("expected a Func, got {other:?}"),
+        }
+        // The steer is REQUIRED — a bare `[deprecated]` marker is not the
+        // attribute (the warning's head needs its replacement clause), and
+        // `deprecated` is a known marker, so no user-macro reading claims it
+        // either: the program declines.
+        assert!(declines("[deprecated] fun one() { }"));
     }
 
     #[test]

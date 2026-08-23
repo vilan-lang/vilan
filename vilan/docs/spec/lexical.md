@@ -46,9 +46,10 @@ ret    struct trait    type      use     with   true    false
 `context` (the clause after a closure type, §3.9), `sync` (the marker
 opening a closure type, §3.9), `void` (the unit value/type), `self` and
 `Self` (receiver and receiver type), `derive`, `service`, `extern`,
-`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform` (attribute
-names in `[...]` position), and jump targets (`break`, `continue`) after
-`jump`. All remain usable as ordinary identifiers elsewhere.
+`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
+`deprecated` (attribute names in `[...]` position), and jump targets
+(`break`, `continue`) after `jump`. All remain usable as ordinary
+identifiers elsewhere.
 
 ## 2.3 Literals
 

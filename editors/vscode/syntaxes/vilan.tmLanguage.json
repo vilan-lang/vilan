@@ -197,7 +197,7 @@
     {
      "comment": "Bracket attributes: the built-in markers anywhere, plus GENERIC macro attributes `[name]` / `[name(args)]` at the start of a line (an expression's list literal never opens an item line, which keeps `[1, 2]` and `[x]` out).",
      "name": "meta.attribute.vilan",
-     "begin": "(\\[)(?=\\s*(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
+     "begin": "(\\[)(?=\\s*(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform|deprecated)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
      "beginCaptures": {
       "1": {
        "name": "punctuation.definition.attribute.begin.vilan"
@@ -214,7 +214,7 @@
      },
      "patterns": [
       {
-       "match": "\\b(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform)\\b",
+       "match": "\\b(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform|deprecated)\\b",
        "name": "keyword.other.attribute.vilan"
       },
       {
