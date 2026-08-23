@@ -1470,6 +1470,59 @@ fn read_manifest(directory: &Path) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
+/// The use-site warning head for a renamed CLI spelling (deprecation.md §4;
+/// diagnostics ledger row 247): the family form the compiler's `[deprecated]`
+/// warning carries, with spellings substituted. Spanless — the caller prints
+/// it as a plain stderr line behind `paint::warning_prefix()`, no ariadne
+/// panel (there is no span).
+#[cfg_attr(not(test), allow(dead_code))]
+fn deprecated_spelling_warning(old_spelling: &str, new_spelling: &str) -> String {
+    format!("`{old_spelling}` is deprecated; use `{new_spelling}`")
+}
+
+/// A renamed flag under the one-minor window (deprecation.md §4). clap's
+/// `alias` cannot warn — it does not record which spelling matched — so a
+/// rename keeps the OLD spelling as its own hidden arg
+/// (`#[arg(long, hide = true)]`), reconciled here at dispatch: the old
+/// spelling present warns and folds its value into the new arg; both present
+/// with CONFLICTING values is an error. Returns the effective value plus the
+/// warning line to print, `Err` with the refusal otherwise.
+///
+/// No real rename exists today (`--target` is a documented courtesy alias
+/// with no removal intended — not a deprecation, deliberately silent), so
+/// nothing outside the tests calls this yet: the mechanism is exercised on a
+/// SYNTHETIC pair there, and the first real rename wires its own hidden arg
+/// through this function. A renamed SUBCOMMAND takes the same shape — a
+/// hidden variant that prints [`deprecated_spelling_warning`] and delegates.
+#[cfg_attr(not(test), allow(dead_code))]
+fn reconcile_renamed_flag<T: PartialEq>(
+    new: Option<T>,
+    old: Option<T>,
+    new_spelling: &str,
+    old_spelling: &str,
+) -> Result<(Option<T>, Option<String>), String> {
+    match (new, old) {
+        (new, None) => Ok((new, None)),
+        (None, Some(old_value)) => Ok((
+            Some(old_value),
+            Some(deprecated_spelling_warning(old_spelling, new_spelling)),
+        )),
+        (Some(new_value), Some(old_value)) => {
+            if new_value == old_value {
+                Ok((
+                    Some(new_value),
+                    Some(deprecated_spelling_warning(old_spelling, new_spelling)),
+                ))
+            } else {
+                Err(format!(
+                    "`{old_spelling}` is a deprecated spelling of `{new_spelling}`, and both \
+                     are given with different values; drop `{old_spelling}`"
+                ))
+            }
+        }
+    }
+}
+
 /// The same read without the warning report, for a caller that runs **per
 /// file** — `vilan test` reads its package's manifest once per test, and one
 /// unknown key should not print once per test.
@@ -3366,6 +3419,77 @@ fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Renamed CLI spellings (proposal/deprecation.md §4) -----------------
+
+    /// A SYNTHETIC rename pair — no real rename exists, and the pins must not
+    /// invent one on the real surface — in exactly the shape a real rename
+    /// declares: the new spelling as an ordinary arg, the old as a HIDDEN one.
+    #[derive(clap::Parser)]
+    struct RenameProbe {
+        #[arg(long)]
+        fresh_spelling: Option<String>,
+        /// The deprecated old spelling: still parsed, hidden from help,
+        /// folded into `fresh_spelling` at dispatch with the warning.
+        #[arg(long, hide = true)]
+        stale_spelling: Option<String>,
+    }
+
+    fn reconcile(probe: RenameProbe) -> Result<(Option<String>, Option<String>), String> {
+        reconcile_renamed_flag(
+            probe.fresh_spelling,
+            probe.stale_spelling,
+            "--fresh-spelling",
+            "--stale-spelling",
+        )
+    }
+
+    #[test]
+    fn an_old_spelling_still_parses_and_warns_into_the_new() {
+        let probe = RenameProbe::parse_from(["probe", "--stale-spelling", "value"]);
+        let (value, warning) = reconcile(probe).expect("the old spelling alone reconciles");
+        assert_eq!(value.as_deref(), Some("value"));
+        assert_eq!(
+            warning.as_deref(),
+            Some("`--stale-spelling` is deprecated; use `--fresh-spelling`"),
+            "the ledger row 247 head, verbatim"
+        );
+    }
+
+    #[test]
+    fn the_new_spelling_is_silent_and_the_old_is_hidden_from_help() {
+        let probe = RenameProbe::parse_from(["probe", "--fresh-spelling", "value"]);
+        let (value, warning) = reconcile(probe).expect("the new spelling reconciles");
+        assert_eq!(value.as_deref(), Some("value"));
+        assert!(warning.is_none(), "the new spelling never warns");
+        // `hide = true` holds: help offers only the new spelling, which is
+        // what makes the old one an alias in its window rather than surface.
+        use clap::CommandFactory as _;
+        let help = RenameProbe::command().render_long_help().to_string();
+        assert!(help.contains("--fresh-spelling"), "{help}");
+        assert!(!help.contains("--stale-spelling"), "{help}");
+    }
+
+    #[test]
+    fn both_spellings_conflicting_refuse_and_agreeing_fold() {
+        let probe =
+            RenameProbe::parse_from(["probe", "--fresh-spelling", "a", "--stale-spelling", "b"]);
+        let error = reconcile(probe).expect_err("conflicting values must refuse");
+        assert!(
+            error.contains(
+                "`--stale-spelling` is a deprecated spelling of `--fresh-spelling`, and both \
+                 are given with different values; drop `--stale-spelling`"
+            ),
+            "{error}"
+        );
+        // Both spellings AGREEING fold into one value — still warning, so the
+        // author is steered off the old spelling either way.
+        let probe =
+            RenameProbe::parse_from(["probe", "--fresh-spelling", "a", "--stale-spelling", "a"]);
+        let (value, warning) = reconcile(probe).expect("agreeing values fold");
+        assert_eq!(value.as_deref(), Some("a"));
+        assert!(warning.is_some(), "the old spelling warns even when folded");
+    }
 
     // --- The entry file's exact case (windows-support.md §5 / §12) ----------
     //

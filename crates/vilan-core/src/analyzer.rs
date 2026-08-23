@@ -461,6 +461,10 @@ pub struct Function<'src> {
     pub returns_view: bool,
     /// Declared `[must_use]`: dropping a call's result is a warning.
     pub must_use: bool,
+    /// Declared `[deprecated("use …")]`: every resolved use in code outside
+    /// std warns, non-fatally, carrying this replacement steer verbatim
+    /// (proposal/deprecation.md §1–§2; `check_deprecated`).
+    pub deprecated: Option<&'src str>,
     /// Declared `[rpc]`: callable over the wire as part of a service's surface
     /// (its signature is Wire-checked; `[service(Client)]` generation reads it).
     pub rpc: bool,
@@ -508,6 +512,10 @@ pub struct ExternalFunction<'src> {
     /// Declared `async` — a promise-returning host function. Calls to it are
     /// implicitly awaited.
     pub is_async: bool,
+    /// Declared `[deprecated("use …")]` — `Function`'s field of the same name:
+    /// std's retire-shaped items are often externals, and the use-site warning
+    /// must not depend on which kind the callee is.
+    pub deprecated: Option<&'src str>,
 }
 
 #[derive(Debug, Clone)]
@@ -16893,6 +16901,90 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// `[deprecated("use …")]` (a warning, proposal/deprecation.md §1–§2):
+    /// every resolved reference to a deprecated function — a call's callee, a
+    /// member call's method, the function passed as a value — warns at the
+    /// reference's own name span (A1/A4: the narrowest identifying span; a
+    /// member access anchors at the `.name` identifier). Per USE SITE, not
+    /// once per form: each site is an independent fix, including a use inside
+    /// another deprecated item (B5's root-cause reading — the wrapper's body
+    /// must migrate too). A2: the check keys on the use site's SOURCE — a use
+    /// inside std itself is silent, which keeps the std-warning-clean gate
+    /// green under full scan and is scan-scope-invariant (`std_sources` is
+    /// populated in both modes, unlike the S1 frozen ranges). Non-fatal —
+    /// pushed to `warnings`, like `[must_use]`.
+    fn check_deprecated(&mut self) {
+        let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+        // Pass 1 — calls: a call's resolved callee is an `Expr::Local` subject.
+        // A METHOD call's subject is a synthesized, spanless entity; the name
+        // span lives in `member_name_spans` under the access expr (the call's
+        // own id). A free call's subject carries the callee-name span itself.
+        let mut call_subjects: HashSet<Id> = HashSet::default();
+        for (call_id, call) in self.function_calls.iter() {
+            let Some(Expr::Local(target_id)) = self.expr_id_to_expr_map.get(&call.subject_id)
+            else {
+                continue;
+            };
+            call_subjects.insert(call.subject_id);
+            let Some((name, steer)) = self.deprecated_steer(target_id) else {
+                continue;
+            };
+            let source = self.source_of_id(*call_id).unwrap_or(SourceId(0));
+            if self.std_sources.contains(&source) {
+                continue;
+            }
+            let span = self
+                .member_name_spans
+                .get(call_id)
+                .copied()
+                .unwrap_or_else(|| **self.span_map.get(&call.subject_id).unwrap_or(&&EMPTY_SPAN));
+            sites.push((span, source, format!("`{name}` is deprecated; {steer}")));
+        }
+        // Pass 2 — the remaining references (the function passed as a value):
+        // every resolved `Expr::Local` to a deprecated function that is not
+        // some call's callee, anchored at its own (name) span.
+        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+            let Expr::Local(target_id) = expr else {
+                continue;
+            };
+            if call_subjects.contains(expr_id) {
+                continue;
+            }
+            let Some((name, steer)) = self.deprecated_steer(target_id) else {
+                continue;
+            };
+            let source = self.source_of_id(*expr_id).unwrap_or(SourceId(0));
+            if self.std_sources.contains(&source) {
+                continue;
+            }
+            let span = **self.span_map.get(expr_id).unwrap_or(&&EMPTY_SPAN);
+            sites.push((span, source, format!("`{name}` is deprecated; {steer}")));
+        }
+        for (span, source, msg) in sites {
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            // This sweep runs over the whole program, outside any per-file
+            // walk, so the warning's file comes from its anchor reference.
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// The `(name, steer)` of a deprecated function or external, else `None`.
+    fn deprecated_steer(&self, target_id: &Id) -> Option<(&'src str, &'src str)> {
+        self.functions
+            .get(target_id)
+            .and_then(|function| function.deprecated.map(|steer| (function.name, steer)))
+            .or_else(|| {
+                self.external_functions
+                    .get(target_id)
+                    .and_then(|external| external.deprecated.map(|steer| (external.name, steer)))
+            })
+    }
+
     /// Whether a call resolves to a `[must_use]` function.
     fn call_is_must_use(&self, call_id: Id) -> bool {
         let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -18909,6 +19001,7 @@ impl<'src> Analyzer<'src> {
                             bumps: BTreeSet::new(),
                             call_count: 0,
                             is_async: function.is_async,
+                            deprecated: function.deprecated,
                         },
                     );
                     let function_type_id = self.new_type_id();
@@ -19029,6 +19122,7 @@ impl<'src> Analyzer<'src> {
                                 Some(Node::Reference(_, _))
                             ),
                             must_use: function.must_use,
+                            deprecated: function.deprecated,
                             platform_fence: function
                                 .platform_fence
                                 .iter()
@@ -36516,6 +36610,7 @@ fn analyze_over_world<'src>(
     analyzer.check_view_arguments();
     analyzer.check_view_value_reads();
     analyzer.check_must_use();
+    analyzer.check_deprecated();
     analyzer.check_element_attribute_shadowing();
     analyzer.check_view_escape();
     analyzer.check_invalidation();

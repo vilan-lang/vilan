@@ -35,7 +35,7 @@ ret    struct trait    type      use     with   true    false
 Contextual (identifier everywhere else): `context`, `sync`, `void`,
 `self`, `Self`, `break`/`continue` (after `jump`), and the attribute names
 `derive` `service` `extern` `must_use` `rpc` `trait_only` `doc`
-`expose` `platform`.
+`expose` `platform` `deprecated`.
 
 ## A.3 Literal suffixes
 

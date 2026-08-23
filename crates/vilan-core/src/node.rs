@@ -77,6 +77,12 @@ pub struct Func<'src> {
     // Declared with the `external` keyword: an intrinsic with no Vilan body,
     // implemented by the runtime/compiler (e.g. `external fun print(..);`).
     pub external: bool,
+    // Declared `[deprecated("use …")]`: every use of this function in code
+    // outside std warns, non-fatally, carrying this replacement steer verbatim
+    // after `` `{name}` is deprecated; `` (proposal/deprecation.md §1–§2). By
+    // convention the steer reads `use …`. Honored wherever the attribute
+    // appears — std and user code alike.
+    pub deprecated: Option<&'src str>,
     // A `[extern(..)]` host binding, lowering this external to a JS import/call,
     // method, or property access. `None` for a plain `external` (compiler
     // intrinsic) or an ordinary function.

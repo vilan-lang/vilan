@@ -450,6 +450,7 @@ fn analyze_source_unfenced(
                     name: (name, head),
                     is_async: false,
                     external: false,
+                    deprecated: None,
                     extern_binding: None,
                     must_use: false,
                     platform_fence: Vec::new(),

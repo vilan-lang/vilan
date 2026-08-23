@@ -576,6 +576,15 @@ The call returns something that stops working if you drop it (a
 on purpose with `let _ = …`.
 → [Reactive state](../guide/reactive.md)
 
+**"`…` is deprecated; use …"** *(a warning)*
+The named function still works — this never fails a build — but it is
+marked `[deprecated]` and scheduled for removal, no earlier than the
+minor release *after* this warning first shipped. The message names the
+replacement; switch to it at each warned use site. The removal itself,
+when it comes, is announced under the CHANGELOG's Breaking entries with
+migration notes.
+→ [spec §3.3](../spec/grammar.md) for the attribute
+
 ## Wire and rpc
 
 **"field `…` of `[derive(Wire)]` type `…` is `…`, which is not Wire: …"**

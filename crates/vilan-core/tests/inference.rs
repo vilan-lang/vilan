@@ -957,6 +957,78 @@ fn warnings(source: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// [`warnings`] with each warning's span, through a CLEAN analysis against the
+/// given std: panics unless analysis produced a program with zero diagnostics
+/// (a warning that rides an error is not the non-fatal path), then returns
+/// `(message, span)` per warning in the analyzer's own (C1-sorted) order.
+fn warning_diagnostics_with_std(
+    source: &str,
+    std: PackageSpec,
+) -> Vec<(String, std::ops::Range<usize>)> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std,
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            program
+                .expect("analysis should produce a program")
+                .warnings
+                .into_iter()
+                .map(|warning| (warning.msg, warning.span.into_range()))
+                .collect::<Vec<_>>()
+        })
+        .expect("spawn worker")
+        .join()
+        .unwrap()
+}
+
+/// [`warning_diagnostics_with_std`] against the real std.
+fn warning_diagnostics(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    warning_diagnostics_with_std(source, std_spec())
+}
+
+/// The warning twin of [`assert_fails_spanning`] (deprecation.md §1's C2 pin):
+/// asserts a warning containing `message_part` spans the FIRST occurrence of
+/// `spanning`, and — through [`warning_diagnostics`] — that the analysis was
+/// clean and produced a program.
+#[track_caller]
+fn assert_warns_spanning(source: &str, spanning: &str, message_part: &str) {
+    let expected_start = source
+        .find(spanning)
+        .expect("the `spanning` snippet must occur in the source");
+    let expected = expected_start..expected_start + spanning.len();
+    let warnings = warning_diagnostics(source);
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains(message_part))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "no warning contains {message_part:?}; got: {warnings:#?}"
+    );
+    assert!(
+        matching.iter().any(|(_, range)| *range == expected),
+        "no {message_part:?} warning spans {expected:?} ({spanning:?}); spans: {:#?}",
+        matching
+            .iter()
+            .map(|(message, range)| (message.as_str(), range.clone(), &source[range.clone()]))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The rendered per-function requirement line (`platform_color::requirements`
 /// — the hover's data) for the named function, through the real pipeline on
 /// the default platform. `None` = the function is colorless. Panics on
@@ -7735,6 +7807,209 @@ fn must_use_consumed_result_no_warning() {
         messages.is_empty(),
         "expected no warnings, got {messages:?}"
     );
+}
+
+// --- [deprecated] (proposal/deprecation.md) ---------------------------------
+
+/// A copy of the real std with one extra module, `std::deprecated_probe`,
+/// whose `stale()` is `[deprecated("use fresh()")]` and whose `wrapper()`
+/// calls it std-internally — the §5 mechanism leg's std half, end to end
+/// through `resolve_std` and the module loader (the copy's modules register
+/// as `std_sources` exactly as the real std's do).
+fn deprecation_fixture_std(tag: &str) -> (PathBuf, PackageSpec) {
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the fixture std directory");
+        for entry in std::fs::read_dir(from).expect("read the std tree") {
+            let entry = entry.expect("read a std tree entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("stat a std tree entry").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy a std source");
+            }
+        }
+    }
+    let root =
+        std::env::temp_dir().join(format!("vilan-deprecated-std-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // `macro_std` rides along: the macro world resolves it BESIDE `std`.
+    let tree = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    let std_root = root.join("std");
+    copy_tree(&tree.join("std"), &std_root);
+    copy_tree(&tree.join("macro_std"), &root.join("macro_std"));
+    std::fs::write(
+        std_root.join("src").join("deprecated_probe.vl"),
+        r#"// Test-only module: a deprecated item beside its replacement, plus a
+// std-internal caller (deprecation.md §5's mechanism leg).
+fun fresh(): i32 { 1 }
+
+[deprecated("use fresh()")]
+fun stale(): i32 { 1 }
+
+fun wrapper(): i32 { stale() }
+"#,
+    )
+    .expect("write the fixture std module");
+    let spec = vilan_core::manifest::resolve_std(&std_root);
+    (root, spec)
+}
+
+#[test]
+fn a_deprecated_functions_call_warns_at_the_callee_name() {
+    // The family head, verbatim, anchored at the callee NAME (A1/A4 — names
+    // over argument lists). The use precedes the declaration so the first
+    // occurrence of `one` is the use site.
+    assert_warns_spanning(
+        r#"
+        fun main() { one(); }
+        [deprecated("use two()")]
+        fun one() { }
+        fun two() { }
+        "#,
+        "one",
+        "`one` is deprecated; use two()",
+    );
+}
+
+#[test]
+fn an_unmarked_function_does_not_warn() {
+    let messages = warnings(
+        r#"
+        fun one() { }
+        fun main() { one(); }
+        "#,
+    );
+    assert!(
+        messages.is_empty(),
+        "expected no warnings, got {messages:?}"
+    );
+}
+
+#[test]
+fn every_use_site_of_a_deprecated_function_warns_independently() {
+    // Per USE SITE, not once per form (§1, B5): two calls and a passed-as-value
+    // reference are three independent fixes, so three warnings.
+    let warnings = warning_diagnostics(
+        r#"
+        fun apply(action: sync || void) { action(); }
+        fun main() { old(); old(); apply(old); }
+        [deprecated("use fresh()")]
+        fun old() { }
+        fun fresh() { }
+        "#,
+    );
+    let deprecation_count = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("`old` is deprecated; use fresh()"))
+        .count();
+    assert_eq!(
+        deprecation_count, 3,
+        "each use site warns once; got {warnings:#?}"
+    );
+}
+
+#[test]
+fn a_use_inside_another_deprecated_item_still_warns() {
+    // DECIDED (recorded in deprecation.md's ship record): no Rust-style
+    // suppression inside deprecated items. Per §1 each use site is an
+    // independent fix — the deprecated wrapper's body must migrate too, and
+    // std's own hygiene rule (migrate your callers in the deprecating train)
+    // reads the same way for user code.
+    let warnings = warning_diagnostics(
+        r#"
+        fun main() { old_outer(); }
+        [deprecated("use fresh()")]
+        fun old_outer() { old_inner(); }
+        [deprecated("use fresh()")]
+        fun old_inner() { }
+        fun fresh() { }
+        "#,
+    );
+    let heads: Vec<&str> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("is deprecated"))
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert_eq!(
+        heads,
+        vec![
+            "`old_outer` is deprecated; use fresh()",
+            "`old_inner` is deprecated; use fresh()",
+        ],
+        "both use sites warn — the one in `main` and the one inside the deprecated wrapper"
+    );
+}
+
+#[test]
+fn a_deprecated_method_warns_at_the_member_name() {
+    // The attribute parses on a member `fun` (one `parse_function`), and the
+    // warning anchors at the MEMBER name (`.old_area`), not the whole access.
+    assert_warns_spanning(
+        r#"
+        fun main() {
+            let sq = Square { side = 3 };
+            let _ = sq.old_area();
+        }
+        struct Square { side: i32 }
+        impl Square {
+            [deprecated("use area()")]
+            fun old_area(self): i32 { self.side * self.side }
+            fun area(self): i32 { self.side * self.side }
+        }
+        "#,
+        "old_area",
+        "`old_area` is deprecated; use area()",
+    );
+}
+
+#[test]
+fn a_std_marked_item_warns_at_its_use() {
+    // The std half of §5's mechanism leg: an item marked in (fixture) std
+    // source warns at its user-code use, head and span, through the real
+    // module loader.
+    let (root, std) = deprecation_fixture_std("warns");
+    let source = r#"
+        import std::deprecated_probe::{ stale };
+        fun main() { let _ = stale(); }
+    "#;
+    let warnings = warning_diagnostics_with_std(source, std);
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("`stale` is deprecated; use fresh()"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly the call site warns (the import line is not a use); got {warnings:#?}"
+    );
+    let expected = source.rfind("stale").expect("the call site");
+    assert_eq!(
+        matching[0].1,
+        expected..expected + "stale".len(),
+        "the warning anchors at the callee name"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_deprecated_form_used_only_inside_std_stays_silent() {
+    // A2: the check keys on the use site's source. `wrapper()` calls the
+    // deprecated `stale()` INSIDE std — the user program that only calls
+    // `wrapper` sees no warning, which is also what keeps the
+    // std-must-be-warning-clean gate green.
+    let (root, std) = deprecation_fixture_std("silent");
+    let warnings = warning_diagnostics_with_std(
+        r#"
+        import std::deprecated_probe::{ wrapper };
+        fun main() { let _ = wrapper(); }
+        "#,
+        std,
+    );
+    assert!(
+        warnings.is_empty(),
+        "a std-internal use of a deprecated form is silent; got {warnings:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

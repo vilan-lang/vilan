@@ -484,6 +484,214 @@ fn the_cut_accepts_a_commit_marker_on_either_side_of_the_family_marker() {
     }
 }
 
+// --- The deprecation lifetime sweep (proposal/deprecation.md §3) ------------
+//
+// `<!-- deprecates: KEY -->` / `<!-- removes: KEY -->` above an entry's head:
+// a `removes:` under Unreleased cuts only when a RELEASED section carries the
+// matching `deprecates:` — one minor of warning, with no version arithmetic,
+// because every train is a minor. These pins ride the same fixture repos as
+// the family sweep's; note the cut VERSION matters here (9.9.0, not 9.9.9 —
+// a patch cut refuses the markers outright, which is itself pinned below).
+
+/// `refuse`, but cutting the MINOR 9.9.0 (the lifetime sweep's ordinary
+/// train; `refuse`'s 9.9.9 would trip the patch rule first).
+fn refuse_minor(name: &str, changelog: &str) -> String {
+    let fixture = Fixture::new(name, changelog);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.0",
+        ],
+    );
+    assert!(!ok, "the cut accepted a section it must refuse:\n{report}");
+    assert!(
+        report.contains("refusing to cut"),
+        "the refusal must say nothing was changed:\n{report}"
+    );
+    assert!(!out.exists(), "a refused cut must write nothing");
+    assert!(fixture.read("CHANGELOG.md").contains("## Unreleased"));
+    report
+}
+
+#[test]
+fn the_cut_refuses_a_removal_whose_deprecation_never_shipped() {
+    // The plant-proven case §3 exists for: a removal jumping the window. No
+    // released section carries `deprecates: std::old::thing`, so the cut is
+    // REFUSED and the key printed — never guessed.
+    let jumped = SCRAMBLED.replace(
+        "<!-- family: breaking -->",
+        "<!-- family: breaking -->\n<!-- removes: std::old::thing -->",
+    );
+    let report = refuse_minor("removal-unshipped", &jumped);
+    assert!(
+        report.contains(
+            "RED   removes: std::old::thing - no RELEASED section carries \
+             `deprecates: std::old::thing`, so its warning never shipped"
+        ),
+        "the refusal must name the key and the missing warning:\n{report}"
+    );
+    assert!(
+        report.contains("A breaking entry."),
+        "the refusal must name the entry carrying the marker:\n{report}"
+    );
+}
+
+#[test]
+fn a_deprecation_in_the_same_unreleased_section_does_not_license_its_removal() {
+    // Warning and removal riding ONE train is exactly the no-window shape the
+    // check refuses: the match must sit in a released section.
+    let same_train = SCRAMBLED
+        .replace(
+            "<!-- family: breaking -->",
+            "<!-- family: breaking -->\n<!-- removes: std::old::thing -->",
+        )
+        .replace(
+            "<!-- family: tooling -->",
+            "<!-- family: tooling -->\n<!-- deprecates: std::old::thing -->",
+        );
+    let report = refuse_minor("same-train", &same_train);
+    assert!(
+        report.contains("no RELEASED section carries `deprecates: std::old::thing`"),
+        "{report}"
+    );
+    assert!(
+        report.contains("a deprecation in this same Unreleased section does not count"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_cut_accepts_a_removal_whose_deprecation_shipped_and_keeps_the_markers() {
+    // The released `deprecates:` licenses the removal; the cut orders,
+    // names the shipping train, and the rewrite carries BOTH marker lines
+    // into the release section (the CHANGELOG stays the ledger).
+    let windowed = SCRAMBLED
+        .replace(
+            "<!-- family: breaking -->",
+            "<!-- family: breaking -->\n<!-- removes: std::old::thing -->",
+        )
+        .replace(
+            "<!-- family: feature -->",
+            "<!-- family: feature -->\n<!-- deprecates: std::next::form -->",
+        )
+        .replace(
+            "## v0.1.0 — 2026-01-01\n",
+            "## v0.1.0 — 2026-01-01\n\n<!-- deprecates: std::old::thing -->",
+        );
+    let fixture = Fixture::new("removal-windowed", &windowed);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.0",
+        ],
+    );
+    assert!(ok, "the cut refused a windowed removal:\n{report}");
+    assert!(
+        report.contains("ok    removes: std::old::thing  (deprecated in v0.1.0)"),
+        "the sweep must name the train that shipped the warning:\n{report}"
+    );
+    assert!(
+        report.contains("ok    deprecates: std::next::form  (the window opens with this cut)"),
+        "{report}"
+    );
+    let proposed = fs::read_to_string(&out).expect("read the proposed changelog");
+    assert!(
+        proposed.contains(
+            "<!-- family: breaking -->\n<!-- removes: std::old::thing -->\n**A breaking entry.**"
+        ),
+        "the rewrite must keep the removal marker above its head:\n{proposed}"
+    );
+    assert!(
+        proposed.contains(
+            "<!-- family: feature -->\n<!-- deprecates: std::next::form -->\n**A feature entry.**"
+        ),
+        "the rewrite must keep the deprecation marker above its head:\n{proposed}"
+    );
+}
+
+#[test]
+fn the_cut_reports_shipped_deprecations_still_pending_removal() {
+    // A `deprecates:` with no `removes:` yet is NOT an error (§5.2(1) is a
+    // floor) — the sweep reports it, key and shipping train, at every cut.
+    let pending = SCRAMBLED.replace(
+        "## v0.1.0 — 2026-01-01\n",
+        "## v0.1.0 — 2026-01-01\n\n<!-- deprecates: std::old::thing -->",
+    );
+    let fixture = Fixture::new("pending-report", &pending);
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &["--date", "2026-01-02", "--dry-run", "9.9.0"],
+    );
+    assert!(ok, "a pending deprecation must not red the cut:\n{report}");
+    assert!(
+        report.contains("deprecations still in their window (report only)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("pending  std::old::thing  (deprecated in v0.1.0, not yet removed"),
+        "the report names the key and the train that shipped it:\n{report}"
+    );
+}
+
+#[test]
+fn a_patch_cut_refuses_lifetime_markers_outright() {
+    // Deprecations and removals ride minors only (releases.md §4: patches are
+    // fixes) — `refuse`'s 9.9.9 cut is the patch here.
+    let on_a_patch = SCRAMBLED.replace(
+        "<!-- family: breaking -->",
+        "<!-- family: breaking -->\n<!-- deprecates: std::old::thing -->",
+    );
+    let report = refuse("patch-lifetime", &on_a_patch);
+    assert!(
+        report.contains(
+            "RED   `deprecates: std::old::thing` on a PATCH cut - deprecations and removals \
+             ride minors only (releases.md §4)"
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_stranded_lifetime_marker_is_refused_like_any_other() {
+    // The L11 discipline extends to the new markers: one parted from its head
+    // by a blank line opens no entry, and an empty KEY names nothing to track.
+    let stranded = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.**",
+        "<!-- deprecates: std::old::thing -->\n\n<!-- family: feature -->\n**A feature entry.**",
+    );
+    let line = line_of(&stranded, "<!-- deprecates: std::old::thing -->");
+    let report = refuse_minor("orphan-lifetime", &stranded);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- deprecates: std::old::thing -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+
+    let empty = SCRAMBLED.replace(
+        "<!-- family: feature -->",
+        "<!-- family: feature -->\n<!-- removes: -->",
+    );
+    let line = line_of(&empty, "<!-- removes: -->");
+    let report = refuse_minor("empty-key", &empty);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- removes: -->` at line {line} names no key"
+        )),
+        "{report}"
+    );
+}
+
 #[test]
 fn the_sweep_reds_an_entry_whose_commit_is_not_an_ancestor_of_the_tag() {
     // The drift §7.1 was written about: an entry filed under Unreleased whose
