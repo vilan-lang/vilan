@@ -59840,7 +59840,8 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
 // LIVE and asserts the shipped semantics — R1 (the trait's effective
 // arguments join the resolution key), R2 (the expected type selects among
 // argument-distinct homes), R3 (specificity ranks a genuine overlap). The
-// residue no row exercises is B128, deferred. The `Into` pins originally staged their second
+// residue §13.8 deferred, B128, is closed (2026-08-23) — its pins sit after
+// the §14 deletion block below. The `Into` pins originally staged their second
 // home with std's `Into<T>` blanket; §14 deleted it, so they stage the same
 // shapes with user impls (each rewrite plant-proven red: the R1 home key
 // collapsed to the bare trait id reds the direct-call pins, the re-point's
@@ -60742,6 +60743,87 @@ fn b130_a_user_reflexive_impl_carries_the_bound_path() {
         fun main() { print(accept(Foo { n = 7 }).n); }
         "#,
         "7\n",
+    );
+}
+
+// --- B128: R2 selecting an unrankable home reports it (§13.8's residue) -----
+//
+// `rank_member_candidates` used to hand R2 one REPRESENTATIVE per home — an
+// unranked home was stood in for by its first maximum — so when the expected
+// type selected a home R3's specificity order could not rank, the first
+// maximum answered silently where the home's own `AmbiguousImpls` report
+// should. The shape needs BOTH an argument-distinct split (so R2 runs at all)
+// AND an unrankable overlap inside the selected home; no §13.2 row and no
+// program in the tree had it, which is why §13.8 shipped with it deferred.
+
+/// The probe the tree lacked, and B128's close. `Conv<Bar>`'s home holds two
+/// impls bounded by unrelated traits (`Box<i32>` satisfies both, neither
+/// subsumes — the row-214 shape); `Conv<str>`'s home is the argument-distinct
+/// split that routes the call through R2. The `Bar` annotation selects the
+/// unrankable home, and the call must report that home's overlap — before the
+/// fix this compiled cleanly and printed `1`, the first maximum by
+/// declaration order, which is the exact order-dependence B73 was filed over.
+#[test]
+fn b128_an_expectation_selecting_an_unrankable_home_reports_its_overlap() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::display::Display;
+        import std::compare::Ord;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Box<T> { v: T }
+        struct Bar { n: i32 }
+
+        impl Box<type T: Display> with Conv<Bar> { fun conv(self): Bar { Bar { n = 1 } } }
+
+        impl Box<type U: Ord> with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Box<type T> with Conv<str> { fun conv(self): str { "s" } }
+
+        fun main() {
+            let b: Bar = Box { v = 5 }.conv();
+            print(b.n);
+        }
+        "#,
+        "'conv' is ambiguous on 'Box<i32>': both 'Box<T> where T: Display' and \
+         'Box<U> where U: Ord' provide it and neither impl subject is more specific than \
+         the other",
+    );
+}
+
+/// The complement that keeps the fix honest: the same program, with the
+/// expectation selecting the RANKED home instead. An unrankable overlap the
+/// call does not select must not contaminate it — the `str` annotation picks
+/// `Conv<str>`'s single impl and the program runs.
+#[test]
+fn b128_an_expectation_selecting_a_ranked_home_beside_an_unrankable_one_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::display::Display;
+        import std::compare::Ord;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Box<T> { v: T }
+        struct Bar { n: i32 }
+
+        impl Box<type T: Display> with Conv<Bar> { fun conv(self): Bar { Bar { n = 1 } } }
+
+        impl Box<type U: Ord> with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Box<type T> with Conv<str> { fun conv(self): str { "s" } }
+
+        fun main() {
+            let s: str = Box { v = 5 }.conv();
+            print(s);
+        }
+        "#,
+        "s\n",
     );
 }
 

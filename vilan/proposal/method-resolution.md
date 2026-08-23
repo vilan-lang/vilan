@@ -1644,3 +1644,18 @@ are collapsed onto the ruling — `std::into`, now just the trait
   legality pin (`b98_a_user_reflexive_into_impl_is_legal_and_not_a_duplicate`,
   program unchanged), and B84's pin stages two-impls-one-trait with
   two user impls on one subject.
+- **B128 closed as the passenger** (second commit of the same lane):
+  §13.8's deferred residue. `rank_member_candidates` now hands R2 each
+  home WITH its R3 verdict (`RankedHome`: the ranked winner, or the
+  unranked maxima with the first standing in as representative), and a
+  selection landing on an unrankable home reports that home's own
+  `AmbiguousImpls` (ledger row 214's head — no new head) instead of
+  silently answering with the first maximum, which was declaration
+  order wearing a selection's clothes. The probe the tree lacked —
+  argument-distinct homes AND an unrankable overlap inside the
+  selected one — is pinned red-then-green
+  (`b128_an_expectation_selecting_an_unrankable_home_reports_its_overlap`;
+  before the carry it compiled clean and printed `1`), with the
+  complement pinned green in both worlds
+  (`b128_an_expectation_selecting_a_ranked_home_beside_an_unrankable_one_runs`
+  — an overlap the call does not select never contaminates it).

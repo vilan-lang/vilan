@@ -24,6 +24,11 @@ What deleting buys: the common case stops paying an annotation tax. One type, on
 
 ---
 
+<!-- family: miscompile -->
+**A call landing on an impl overlap the compiler cannot rank is now reported, not answered by declaration order.** The shape takes both halves at once: one trait at two instantiations on one receiver, and — inside the instantiation the call selects — two impls neither of which is more specific. `impl Box<type T: Display> with Conv<Bar>` and `impl Box<type U: Ord> with Conv<Bar>` beside an `impl Box<type T> with Conv<str>`: the annotation on `let b: Bar = box.conv()` picks which *instantiation* the call means (that shipped with B73), but the unrankable `Conv<Bar>` pair was represented by its first maximum, so the program compiled clean and ran whichever of the two was declared first — swap the blocks, change the program. The selection now carries each instantiation's ranking verdict, and landing on an unrankable one reports the same "neither impl subject is more specific than the other" ambiguity the pair would report alone, naming both subjects with their bounds. An annotation selecting a ranked instantiation beside an unrankable pair still runs, exactly as before. (`proposal/method-resolution.md` §13.8's deferred residue, B128; no program in the tree had the shape — the probe was built to pin it.)
+
+---
+
 <!-- family: diagnostics -->
 **An unannotated function's `ret` now counts toward its inferred return type.** `fun f(x: bool) { ret 1; }` — no declared return type, a body that leaves only by `ret` — was `void` at every call site, so `let y: i32 = f(true)` reported `Expected i32, but got void instead.` at the call, the one line with nothing wrong on it. The return type was read from the body's final expression alone, and a `ret` was invisible to it. Invisible was worse than missing: `fun f(x: bool) { if x { ret "s"; } 2 }` compiled clean and handed a `str` to an `i32` binding at runtime, a bare `ret` beside a value tail handed back `undefined`, and an exhaustive `if`/`else` of `ret`s typed as `never` and let `let y: str = f(false)` through.
 
