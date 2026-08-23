@@ -17,6 +17,13 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**Editing a file that another open document imports no longer grows the language server for the session.** The compiler's module parses are cached process-globally by content — right for std and dependency files on disk, whose contents recur across every compile — but an open buffer's content is a keystroke's, which never recurs: with `helper.vl` open and edited while a `main.vl` importing it was also open, every landed keystroke re-analyzed the dependent and left one immortal copy of the edited file's text and parse tree in the cache (one per distinct content — on an 8.7 KB file, 8.7 KB of text plus the tree per keystroke, for the rest of the session), and a buffer that was mid-edit and did not parse clean left its text **twice** (`leak-soak.md` §7.5, §7.9.1). During a language-server analysis, module loads served from the open-document overlay now bypass the process-global caches and parse into allocations the analysis itself **owns** — text, tree, and rendered errors — reclaimed when the analysis is superseded or the document closes, the same discipline the entry's own text and tree have followed since M7. Outstanding module bytes are bounded by the open set, and distinct-content growth is zero at every cache site. The deliberate, bounded costs: a dependent's re-analysis re-parses each overlay-resident import (≈0.8 ms end-to-end on an 8.7 KB module in release, unmeasurable on a small one — parsing is the cheap phase), and a base world is never stored for an analysis that loaded an open buffer (a stored world must not borrow analysis-owned memory), so base-world caching pauses while a std or dependency file is open in the editor and resumes when it closes. The CLI, the wasm playground, and transient editor queries keep the shared caches byte for byte. Record: `proposal/leak-soak.md` §7.10.
+
+---
+
+---
+
 <!-- family: breaking -->
 **std no longer ships the reflexive `Into` blanket.** `std::into`'s `impl type T with Into<T>` — the identity conversion every imported `Into` gave every type — is deleted (B127, `proposal/method-resolution.md` §14; ruled 2026-08-22). The `Into` trait, the module, and the import path all stay, and every corpus program emits byte-identical JavaScript. The census that preceded the ruling measured the blanket selected by resolution at zero sites in the entire tree, and its one unique affordance — `fun accept<T: Into<Foo>>(x: T)` fed a `Foo` itself — dying in an internal compiler error ("a call resolved to `Into`'s requirement `into`, which has no body … please report this program", live in released 0.34.0), because the emitter cannot see a generic-subject impl on the bound path. If you called the identity `.into()`, write the reflexive impl yourself: `impl Foo with Into<Foo> { fun into(self): Foo { self } }` — three lines, already legal, and strictly more functional than the blanket it replaces: it satisfies the `T: Into<Foo>` bound *and* runs, where the blanket crashed the compiler.
 
@@ -29,6 +36,7 @@ What deleting buys: the common case stops paying an annotation tax. One type, on
 
 ---
 
+---
 <!-- family: diagnostics -->
 **An unannotated function's `ret` now counts toward its inferred return type.** `fun f(x: bool) { ret 1; }` — no declared return type, a body that leaves only by `ret` — was `void` at every call site, so `let y: i32 = f(true)` reported `Expected i32, but got void instead.` at the call, the one line with nothing wrong on it. The return type was read from the body's final expression alone, and a `ret` was invisible to it. Invisible was worse than missing: `fun f(x: bool) { if x { ret "s"; } 2 }` compiled clean and handed a `str` to an `i32` binding at runtime, a bare `ret` beside a value tail handed back `undefined`, and an exhaustive `if`/`else` of `ret`s typed as `never` and let `let y: str = f(false)` through.
 

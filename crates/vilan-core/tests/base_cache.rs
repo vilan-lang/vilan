@@ -575,3 +575,147 @@ fn parse_clean_cache_clear_forces_a_reparse() {
         "after the clear the same content must be re-parsed into a fresh leak"
     );
 }
+
+/// The M9 store gate (`leak-soak.md` §7.9.4a), the mechanism's stated proof
+/// obligation: an opted-in analysis that loaded an OVERLAY-SERVED source owns
+/// that text and tree — its program must be their only borrower — so
+/// `base_cache_store` refuses to store the world that borrows them. The
+/// consequence is deliberate: base-world caching is forfeited while a
+/// dependency (or std) file is open in the editor — repeat analyses keep
+/// missing — and resumes the moment the buffer closes. Without the gate the
+/// stored world would serve a later analysis borrows into freed memory (the
+/// §7.9.2 ctrl-Z shape, one seam over).
+#[test]
+fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes() {
+    use vilan_core::{MacroLimits, Workspace};
+
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+
+    // A workspace with one dependency package: dependency files are exactly
+    // the files a multi-package workspace has open in the editor, and —
+    // unlike a `pkg::` sibling, which bypasses the base cache anyway — they
+    // are loaded into the world the cache stores.
+    let root = std::env::temp_dir().join(format!("vilan_m9_gate_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).expect("app dir");
+    let entry_path = app_dir.join("main.vl");
+    std::fs::write(
+        &entry_path,
+        "import std::print;\nimport common::greeting;\n\nfun main() {\n\tprint(greeting());\n}\n",
+    )
+    .expect("write main.vl");
+    let dep_root = root.join("common");
+    std::fs::create_dir_all(&dep_root).expect("dep dir");
+    let dep_lib = dep_root.join("lib.vl");
+    std::fs::write(&dep_lib, "fun greeting(): i32 {\n\t7\n}\n").expect("write lib.vl");
+    let workspace = Workspace {
+        packages: vec![PackageSpec {
+            base_root: dep_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+        }],
+        entry_dependencies: vec![("common".to_string(), 0)],
+        macro_limits: MacroLimits::default(),
+    };
+    let source: &'static str = Box::leak(
+        std::fs::read_to_string(&entry_path)
+            .unwrap()
+            .into_boxed_str(),
+    );
+
+    // One opted-in analysis — the language server's shape — with the handles
+    // reclaimed the way their owner would.
+    let analyze_owning = || {
+        let workspace = workspace.clone();
+        let app_dir = app_dir.clone();
+        let entry_path = entry_path.clone();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let std = vilan_core::manifest::resolve_std(&std_root());
+                let analyzed = vilan_core::analyze_source_owning_overlay_modules(
+                    source,
+                    &std,
+                    &app_dir,
+                    &entry_path,
+                    Some(Platform::default()),
+                    &workspace,
+                );
+                assert!(
+                    analyzed.diagnostics.is_empty(),
+                    "the gate fixture must compile clean, got {:#?}",
+                    analyzed.diagnostics
+                );
+                drop(analyzed.program);
+                if let Some(ast) = analyzed.ast {
+                    // SAFETY: the program — the tree's only borrower — was
+                    // dropped on the line above.
+                    unsafe { ast.reclaim() };
+                }
+                // SAFETY: as above; with the store refused, the program was
+                // the owned copies' only borrower.
+                unsafe { analyzed.owned_modules.reclaim() };
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked");
+    };
+
+    // Disk-served: the dependency world stores and hits — the baseline that
+    // proves the fixture exercises the cache at all.
+    analyze_owning();
+    let (hits_before, _) = stats();
+    analyze_owning();
+    let (hits_disk, _) = stats();
+    assert_eq!(
+        hits_disk,
+        hits_before + 1,
+        "the disk-served dependency world must hit — the fixture is not \
+         reaching the base cache, so the gate assertions below are vacuous"
+    );
+
+    // The dependency's lib.vl is now OPEN in the editor, edited: every
+    // analysis loads it from the overlay into analysis-owned allocations, so
+    // no world may be stored — repeat analyses keep missing and never hit.
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::set_document_overlay(
+        &dep_lib,
+        Some("fun greeting(): i32 {\n\t42\n}\n".to_string()),
+    );
+    let (hits_open_before, misses_open_before) = stats();
+    analyze_owning();
+    analyze_owning();
+    let (hits_open, misses_open) = stats();
+    assert_eq!(
+        hits_open, hits_open_before,
+        "a world that loaded an overlay-served source was stored and served — \
+         the M9 store gate is gone, and the served world borrows memory the \
+         owning analysis will free (leak-soak.md §7.9.4a)"
+    );
+    assert_eq!(
+        misses_open,
+        misses_open_before + 2,
+        "with the store refused, every analysis over the open buffer misses"
+    );
+
+    // The buffer closes: loads come from disk again, the store resumes, and
+    // the very next repeat analysis hits.
+    vilan_core::analyzer::set_document_overlay(&dep_lib, None);
+    analyze_owning();
+    let (hits_closed_before, _) = stats();
+    analyze_owning();
+    let (hits_closed, _) = stats();
+    assert_eq!(
+        hits_closed,
+        hits_closed_before + 1,
+        "once the buffer closes the world must store and hit again"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}

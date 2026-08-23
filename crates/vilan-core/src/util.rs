@@ -49,15 +49,34 @@ pub fn strip_bom(text: &str) -> &str {
 /// is authoritative for its buffers, and VS Code already strips the BOM over
 /// the wire, so stripping again here would shift every span by three bytes.
 pub fn read_source(path: impl AsRef<Path>) -> std::io::Result<String> {
+    read_source_traced(path).map(|(contents, _)| contents)
+}
+
+/// Where [`read_source_traced`] found the content: the open-document overlay
+/// (an editor buffer, served verbatim) or the disk (BOM-stripped). The module
+/// loader is the caller that cares (M9, `leak-soak.md` §7.9.4): an
+/// overlay-served module during an opted-in analysis is parsed into
+/// analysis-owned allocations, and reading the provenance off the one
+/// overlay-then-disk seam keeps that decision from paying a second overlay
+/// probe (`canonical_path` canonicalizes on the filesystem).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SourceProvenance {
+    Overlay,
+    Disk,
+}
+
+/// [`read_source`], reporting where the content came from.
+pub fn read_source_traced(path: impl AsRef<Path>) -> std::io::Result<(String, SourceProvenance)> {
     let path = path.as_ref();
     if let Some(buffered) = crate::analyzer::document_overlay_get(path) {
-        return Ok(buffered);
+        return Ok((buffered, SourceProvenance::Overlay));
     }
     let contents = std::fs::read_to_string(path)?;
-    match contents.strip_prefix(BYTE_ORDER_MARK) {
-        Some(stripped) => Ok(stripped.to_string()),
-        None => Ok(contents),
-    }
+    let contents = match contents.strip_prefix(BYTE_ORDER_MARK) {
+        Some(stripped) => stripped.to_string(),
+        None => contents,
+    };
+    Ok((contents, SourceProvenance::Disk))
 }
 
 /// Rewrites `\r\n` to `\n`: a CRLF is ONE line terminator (`windows-support.md`

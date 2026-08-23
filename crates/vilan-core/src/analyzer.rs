@@ -33005,6 +33005,89 @@ pub(crate) fn build_twice_forced() -> bool {
     BUILD_TWICE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Renders a module lex/parse error at a source offset as
+/// `line N, column M: reason` — the loader's error shape, shared by the
+/// process-global rich path and the analysis-owned overlay path.
+fn render_at(source: &str, offset: usize, reason: String) -> String {
+    let offset = offset.min(source.len());
+    let line = source[..offset].matches('\n').count() + 1;
+    let column = offset - source[..offset].rfind('\n').map(|at| at + 1).unwrap_or(0) + 1;
+    format!("line {line}, column {column}: {reason}")
+}
+
+/// Parses one overlay-served module into ANALYSIS-OWNED allocations (M9,
+/// `leak-soak.md` §7.9.4): the text, the tree parsed from it, and — when the
+/// content does not parse clean — its rendered errors, each a `Leaked` handle
+/// pushed onto the active collection scope instead of an entry in the
+/// process-global caches. The scope memoizes the result by path, so a module
+/// reached twice in one analysis is parsed and owned once (§7.9.4d).
+///
+/// One parse serves clean and broken content alike, which also retires
+/// §7.9.1's double-leak: `parse_clean_cached` leaked a broken content's text
+/// before it knew the parse was not clean, and the rich path then leaked its
+/// own copy on top.
+fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
+    let text_bytes = source.len();
+    let (text_handle, text) = crate::leak_tally::Leaked::leak(
+        source.into_boxed_str(),
+        crate::leak_tally::LeakSite::OwnedModuleText,
+        text_bytes,
+    );
+    // The same pipeline as the global paths: the handwritten frontend always
+    // recovers a (possibly partial) tree beside its diagnostics, and the
+    // element/lift rewrites run before the tree freezes.
+    let (tree, parse_errors) = crate::parsing::parse(text);
+    let rendered: Vec<String> = parse_errors
+        .iter()
+        .map(|error| render_at(text, error.span.start, crate::parsing::render(error)))
+        .collect();
+    let root: Box<crate::span::Spanned<NodeList<'static>>> = match tree {
+        Some(mut root) => {
+            crate::elements::rewrite_items(&mut root.0, text);
+            crate::lift::rewrite_items(&mut root.0);
+            Box::new(root)
+        }
+        // Recovery failed outright: an empty module + the errors — loud,
+        // exactly as the global rich path degrades.
+        None => Box::new((Vec::new(), (0..0).into())),
+    };
+    let ast_bytes = std::mem::size_of_val(&*root);
+    let (ast_handle, ast) = crate::leak_tally::Leaked::leak(
+        root,
+        crate::leak_tally::LeakSite::OwnedModuleAst,
+        ast_bytes,
+    );
+    const NO_ERRORS: &[String] = &[];
+    let (errors_handle, parse_errors): (Option<crate::leak_tally::Leaked<[String]>>, _) =
+        if rendered.is_empty() {
+            (None, NO_ERRORS)
+        } else {
+            let boxed = rendered.into_boxed_slice();
+            let errors_bytes = std::mem::size_of_val(&*boxed);
+            let (handle, borrow) = crate::leak_tally::Leaked::leak(
+                boxed,
+                crate::leak_tally::LeakSite::OwnedModuleErrors,
+                errors_bytes,
+            );
+            (Some(handle), borrow)
+        };
+    let loaded = LoadedModule {
+        ast,
+        text,
+        parse_errors,
+    };
+    crate::owned_modules::adopt(
+        path,
+        crate::owned_modules::OwnedModuleAllocation {
+            text: text_handle,
+            ast: ast_handle,
+            parse_errors: errors_handle,
+        },
+        loaded,
+    );
+    loaded
+}
+
 pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
@@ -33022,11 +33105,34 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     static ERROR_CACHE: OnceLock<Mutex<HashMap<u64, LoadedModule>>> = OnceLock::new();
     let error_cache = ERROR_CACHE.get_or_init(|| Mutex::new(HashMap::default()));
 
+    // M9 (leak-soak.md §7.9.4): during an opted-in analysis — the language
+    // server's — a module served from the OPEN-DOCUMENT overlay bypasses both
+    // process-global caches below and parses into analysis-owned allocations.
+    // An open buffer's content is a keystroke's, which can never recur, so a
+    // content-keyed global entry for it is a session leak (§7.5); the
+    // analysis owns its copy instead, and reclaims it when it is superseded.
+    // A macro-world compile keeps the global caches even here — its world
+    // outlives every analysis (§7.9.4b) — and with no scope active (the CLI,
+    // the wasm front end, transient editor queries) nothing changes. The
+    // memo is consulted before the read, and the overlay decision rides the
+    // read's own provenance, so the opt-in adds no filesystem work to a
+    // disk-served load.
+    let analysis_owns_overlay_loads =
+        crate::owned_modules::collecting() && !crate::macros::in_macro_world();
+    if analysis_owns_overlay_loads {
+        if let Some(loaded) = crate::owned_modules::memoized(path) {
+            return Some(loaded);
+        }
+    }
+
     // `read_source` is now the one overlay-then-disk seam (buffer verbatim, disk
     // BOM-stripped per `windows-support.md` §2), so this reads like any other
     // reader. It used to open-code that match here, which is precisely why the
     // overlay reached the module loader and nothing else.
-    let source = crate::util::read_source(path).ok()?;
+    let (source, provenance) = crate::util::read_source_traced(path).ok()?;
+    if analysis_owns_overlay_loads && provenance == crate::util::SourceProvenance::Overlay {
+        return Some(parse_owned_module(path, source));
+    }
     let key = {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
@@ -33050,14 +33156,6 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
             text,
             parse_errors: &[],
         });
-    }
-
-    // Renders an error at a source offset as `line N, column M: reason`.
-    fn render_at(source: &str, offset: usize, reason: String) -> String {
-        let offset = offset.min(source.len());
-        let line = source[..offset].matches('\n').count() + 1;
-        let column = offset - source[..offset].rfind('\n').map(|at| at + 1).unwrap_or(0) + 1;
-        format!("line {line}, column {column}: {reason}")
     }
 
     // Non-clean and not yet seen: lex and parse for diagnostics. The source is
@@ -34774,9 +34872,11 @@ struct BaseCacheKey {
 /// CONTENT hashes (the E12 rule) and then cloned with the three entry slots
 /// patched. Worlds are stored SCRUBBED — entry path, hash, and text emptied —
 /// and every reference a stored world still holds is 'static in fact: std/dep
-/// texts live in `parse_clean_cached`'s leaked cache, and the entry-derived
-/// strings that reach the world's maps (seeded module names, dependency
-/// display names) are interned above.
+/// texts live in `parse_clean_cached`'s leaked cache (a world whose analysis
+/// loaded any ANALYSIS-OWNED overlay copy instead is never stored — the M9
+/// gate in `base_cache_store`), and the entry-derived strings that reach the
+/// world's maps (seeded module names, dependency display names) are interned
+/// above.
 static BASE_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, World<'static>>>> =
     std::sync::OnceLock::new();
 static BASE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -34885,6 +34985,20 @@ fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'sta
 
 /// Stores a scrubbed clone of `world` under its key.
 fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
+    // The M9 gate (leak-soak.md §7.9.4a), the mechanism's stated proof
+    // obligation: an opted-in analysis that loaded any overlay-served source
+    // OWNS that text and tree — its program must be their ONLY borrower,
+    // because they are freed when it drops — and this world borrows every
+    // module it loaded. A stored world outlives the analysis, so refuse the
+    // store. The consequence is deliberate and bounded: base-world caching
+    // is forfeited while a std or dependency file is open in the editor,
+    // visible in the stats as misses that never turn into hits. A
+    // macro-world compile is exempt: its loads keep the global caches
+    // (§7.9.4b), so ITS world borrows nothing analysis-owned even when the
+    // outer analysis does.
+    if !crate::macros::in_macro_world() && crate::owned_modules::analysis_owns_overlay_loads() {
+        return;
+    }
     let mut scrubbed = world.clone();
     scrubbed.sources[0] = PathBuf::new();
     scrubbed.source_hashes[0] = 0;
@@ -34893,7 +35007,10 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // SAFETY: lifetime-only transmute. After the scrub, every reference the
     // world holds is 'static in fact: module/dep texts and ASTs live in
     // `parse_clean_cached`'s leaked cache (`analyze` loads every non-entry
-    // file through it), the entry-derived strings that reach the world's maps
+    // file through it, EXCEPT an opted-in analysis's overlay-served loads —
+    // which are analysis-owned and freed, and exactly why the gate above
+    // refuses to store a world that made any: the M9 clause this argument
+    // now rests on), the entry-derived strings that reach the world's maps
     // — a seeded module name, whether it seeded `std` or a DEPENDENCY — go
     // through `interned_display_name`, dependency namespace display names go
     // through it too, and the three entry slots (the only places
@@ -37570,6 +37687,51 @@ mod path_tests {
             None,
             "and clearing through either spelling must clear the one entry"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M9's per-scope path memo (`leak-soak.md` §7.9.4d), pinned at the
+    /// loader itself: under an active collection scope, a SECOND
+    /// `load_package_module` of an overlay-served path is served from the
+    /// scope's memo — the identical allocation, one owned copy, one tally
+    /// record — not a second parse. (No analysis seam loads one module twice
+    /// today, so this is the loader-level contract the analysis-level pins
+    /// stand on.)
+    #[test]
+    fn an_active_scope_serves_a_repeat_load_from_its_memo() {
+        use crate::leak_tally::{self, LeakSite};
+
+        let root = scratch("m9-memo");
+        let path = root.join("memoized.vl");
+        assert!(!path.exists(), "the pin wants an overlay-only module");
+        let text = "fun value(): i32 { 7 }
+"
+        .to_string();
+        let text_bytes = text.len();
+        set_document_overlay(&path, Some(text));
+
+        leak_tally::reset();
+        let scope = crate::owned_modules::CollectionScope::activate();
+        let first = super::load_package_module(&path).expect("the overlay serves the module");
+        let second = super::load_package_module(&path).expect("the memo serves the module");
+        assert!(
+            std::ptr::eq(first.text, second.text) && std::ptr::eq(first.ast, second.ast),
+            "the second load must come from the per-scope memo — the identical              allocation — not a second parse"
+        );
+        assert_eq!(
+            leak_tally::bytes(LeakSite::OwnedModuleText),
+            text_bytes,
+            "two loads, one owned text copy"
+        );
+        let owned = scope.drain();
+        assert_eq!(owned.len(), 1, "two loads, one owned allocation");
+
+        set_document_overlay(&path, None);
+        // SAFETY: `first` and `second` are not read past this point, and the
+        // scope's copies reached no global (the loads bypassed both caches).
+        unsafe { owned.reclaim() };
+        assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+        assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

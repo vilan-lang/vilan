@@ -1185,3 +1185,201 @@ and conditions the S3c transmute argument — a semantics-level change the
 owner should ratify before `unsafe` is written. Nothing shipped with this
 section: the probe behind 7.9.1 was run and reverted, and its shape is one
 paragraph to re-create.
+
+### 7.10 M9, SHIPPED 2026-08-23 — overlay-served module loads are analysis-owned
+
+§7.9.4's mechanism, built as designed under the owner's NOD (2026-08-22).
+Nothing shared is ever freed and nothing churning is ever shared: an opted-in
+analysis parses every overlay-served module into allocations it owns and
+gives back, and the process-global caches keep exactly the job E12 built
+them for — stable disk content.
+
+#### The shape
+
+- **`owned_modules`** (`crates/vilan-core/src/owned_modules.rs`, new) — the
+  thread-local collection scope and its types. `CollectionScope` is the RAII
+  activation (`activate` asserts no scope is already active on the thread;
+  `drain` deactivates and hands back the collected set; a drop without drain
+  — the caller unwound — deactivates and keeps the allocations leaked, M7's
+  panic story). `OwnedModuleAllocation` is one load's handles: `Leaked<str>`
+  text, `Leaked<Spanned<NodeList>>` tree, `Option<Leaked<[String]>>`
+  rendered errors. `OwnedModules` is the drained set the owner reclaims
+  (`unsafe fn reclaim`, the M7 contract). The scope also carries the
+  per-analysis path memo (d) and the store-gate flag (a) — the flag IS the
+  set's non-emptiness.
+- **The loader hook** (`load_package_module`, `analyzer.rs`): with a scope
+  active and NOT inside a macro-world compile, a path the scope already
+  parsed is served from its memo, and a read the overlay served is parsed by
+  `parse_owned_module` — one parse serving clean and broken content alike
+  (text + tree + rendered errors when non-clean, at the new tally sites
+  `OwnedModuleText`/`OwnedModuleAst`/`OwnedModuleErrors`), which retires
+  §7.9.1's pre-cleanliness double-leak by construction: `parse_clean_cached`
+  is simply never asked. Two costs deliberately NOT paid, found by measuring
+  the first build (a flat ~1.1 ms per analysis on every phase): the overlay
+  decision reads the provenance off the existing overlay-then-disk seam
+  (`util::read_source_traced`, the seam unchanged for every other caller)
+  instead of probing the overlay a second time, and the memo is keyed by the
+  loader's REQUESTED path, uncanonicalized — `canonical_path` is a
+  filesystem round trip per call; a memo miss on a second spelling is
+  harmless (one more owned, reclaimed copy). Everything else — no scope,
+  macro world, disk-served paths — is byte-for-byte today's code.
+- **The opt-in** (`analyze_source_owning_overlay_modules`, `lib.rs`):
+  activates the scope, runs `analyze_source_reclaimable` unchanged, drains
+  into the new `AnalyzedEntry::owned_modules` field beside the entry's tree
+  handle. The panic paths drain too — an unwound analysis's copies have no
+  borrower left, so they ride the degraded entry and are reclaimed with it.
+  `analyze_source` and `analyze_source_reclaimable` themselves never
+  activate, so the CLI, the wasm front end (which serves everything from the
+  overlay and MUST keep the global caches), the macro world's nested
+  compile, and every test keep today's behavior — activation is the language
+  server's explicit call, not an ambient property of the overlay (c).
+- **The owner** (`AnalyzedProgram`, `vilan-lsp/document.rs`): gains the
+  `owned_modules` field; `Drop` reclaims it after the program, after the
+  entry text and tree; `adopt_analysis` needed no change — the pair was
+  already replaced as one value. `analyze_on_this_thread` is the one caller
+  switched to the opted-in entry point.
+
+#### The proof obligations, as built
+
+- **(a) The base-world gate** — `base_cache_store` refuses to store a world
+  when the active scope owns any overlay-served load (exempting a
+  macro-world compile, whose loads are global and whose world is therefore
+  storable even mid-opt-in). S3c's transmute SAFETY comment gains the
+  explicit clause instead of silently losing one. Consequence, recorded:
+  base-world caching is forfeited while a std or dependency file is open in
+  the editor — repeat analyses keep missing (visible in the stats) — and
+  resumes the moment the buffer closes. The lookup side is untouched: a hit
+  against a previously stored world validates by content through the
+  overlay, exactly as before, and such a world borrows only immortal cache
+  entries.
+- **(b) The macro-world carve-out** — `in_macro_world` gates both the loader
+  hook and the store gate. Toolchain content edited in an open buffer stays
+  a session leak per distinct content on the world-compile path, recorded
+  here, out of M9's scope.
+- **(c) Transient callers** — `module_importables`, platform inference's
+  `declares`, the CLI, the wasm front end: no scope, no change, pinned
+  (the non-opted path of the module_resolution pin below reads
+  `ParseCleanCacheText` growing exactly as today).
+- **(d) The per-scope path memo** — one parse per path per analysis. No
+  analysis seam loads one module twice on today's tree (the load loop dedups
+  by name; `check_library_contract` is CLI-only), so the memo is pinned at
+  the loader itself, where it is plantable.
+
+#### The pins, each planted red
+
+- `owned_modules` unit tests: collect/memoize/drain/reclaim to zero; an
+  undrained scope deactivates and keeps the leak; nested activation panics.
+- `vilan-lsp/document.rs` `overlay_module_reclaim` (platform-independent,
+  beside M7's `entry_reclaim`): the §7.5 dependent-edit shape through the
+  server's own flow (`analyze_on_this_thread` + `adopt_analysis`, helper
+  overlaid per keystroke) —
+  - *distinct contents*: zero growth at all four global cache sites, one
+    owned copy per analysis, adoption reclaims exactly the superseded copy,
+    close nets every owned site to zero. Planted two ways: loader hook
+    disabled → `ParseCleanCacheText` grew 10 × 36 B (the §7.5 leak, back);
+    reclaim disabled → outstanding 360 B where 36 was asserted.
+  - *broken contents*: `ParseCleanCacheText` growth zero (the §7.9.1
+    double-leak stays retired), error slices owned and reclaimed, the
+    importer still surfaces `parse error in …` (behavior parity). Planted:
+    hook disabled → 8 × 34 B at `ParseCleanCacheText`.
+  - *repeated content*: one parse and one owned copy per analysis — the
+    stated cost — reclaimed the same way.
+  - *multi-dependent*: two open importers own one copy EACH; dropping one
+    releases exactly its own (planted: reclaim disabled → 72 B outstanding
+    where 36); the survivor keeps answering.
+  - *no-dependent*: an analysis that loads no overlay module owns nothing
+    and releases nothing.
+- `module_resolution.rs`: the opted-in entry point owns exactly one copy per
+  analysis (two same-content analyses own two — no cross-analysis sharing),
+  reclaim nets the sites to zero with the gross record standing; the
+  NON-opted path over the same overlay keeps caching globally, byte for
+  byte. And `a_dependency_packages_overlaid_module_is_owned_and_reclaimed`:
+  the multi-package shape, owned through the dependency surface.
+- `analyzer.rs` `path_tests`: the loader-level memo pin — a second load of
+  an overlay-served path (same requested spelling, the loader's shape) under
+  an active scope returns the IDENTICAL allocation, one owned copy, one
+  tally record. Planted (memo lookup disabled): red on pointer identity.
+- `base_cache.rs`
+  `a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes`:
+  disk-served dependency world stores and hits (the vacuity guard); with the
+  dependency's `lib.vl` overlaid, repeat analyses miss and never hit; close
+  the buffer and the very next repeat hits again. **The plant is the stated
+  one — store one and watch the pin catch it**: with the gate disabled the
+  stored world was served on the second analysis and the pin went red — and
+  it went red with a corrupted resolution (`cannot find 'greeting' in the
+  imported path`) because the served world's borrows pointed into memory the
+  owning analysis had reclaimed: the §7.9.2 use-after-free, made visible in
+  one plant run.
+- **ASan**: positive control first — a planted use-after-reclaim through an
+  owned module's text reported `heap-use-after-free (READ of size 26)` —
+  then the full `vilan-lsp` test suite under
+  `-Zsanitizer=address` (nightly), clean.
+
+#### The measurement — §7.9.1's probe, promoted into the harness
+
+`overlay_module_reclaim::dependent_edit_measurement` (vilan-lsp): a 36-byte
+`helper.vl` open in the overlay, `main.vl` importing `pkg::helper`, the
+entry re-analyzed and landed through `adopt_analysis` after each helper
+rewrite; phases of 30 distinct clean / 30 repeated / 20 distinct broken
+contents, then the same on an 8,686-byte helper. Debug, counters read on the
+analyzing thread:
+
+| phase | `ParseCleanCacheText` | `ParseCleanCacheAst` | `ModuleErrorText` | `ModuleErrorAst` | owned gross (text/ast/errors) | owned outstanding after close |
+|---|---:|---:|---:|---:|---|---:|
+| 30 distinct clean (36 B), before | 1,080 | 1,200 | 0 | 0 | — | — |
+| 30 distinct clean (36 B), **after** | **0** | **0** | 0 | 0 | 1,080 / 1,200 / 0 | **0** |
+| 30 × one repeated content, before | 0 | 0 | 0 | 0 | — | — |
+| 30 × one repeated content, **after** | 0 | 0 | 0 | 0 | 1,080 / 1,200 / 0 | **0** |
+| 20 distinct broken (34 B), before | **680** | 0 | 680 | 1,760 | — | — |
+| 20 distinct broken (34 B), **after** | **0** | **0** | **0** | **0** | 680 / 800 / 960 | **0** |
+| 30 distinct clean (8,686 B), before | 260,580 | 1,200 | 0 | 0 | — | — |
+| 30 distinct clean (8,686 B), **after** | **0** | **0** | 0 | 0 | 260,580 / 1,200 / 0 | **0** |
+
+The before rows are §7.5/§7.9.1 exactly, re-measured through this harness on
+the pre-change tree: one text + tree per DISTINCT content leaked forever,
+the broken content's text leaked twice, 8.7 KB of the cache per keystroke on
+the realistic file. After: every global site at zero in every phase, the
+same bytes recorded as analysis-owned gross — and outstanding ZERO once the
+document closes. The dependent-edit leak reads 0; the bound is the open set.
+
+#### The perf cost — the builder's number, per the nod
+
+The cost is one parse of each overlay-resident import per dependent
+re-analysis (a repeated content is no longer a cache hit; a DISTINCT content
+was never a hit, so it costs nothing extra — its parse simply lands in
+analysis-owned memory instead of the global cache). Release, the box
+otherwise idle, the before tree rebuilt at `next` 9005ca18 with the
+identical timing loops; two interleaved before/after sessions, each cell a
+mean over 30 analyses (200 iterations for the isolated parse, the
+cross-session comparability anchor):
+
+| number | before (2 runs) | after (2 runs) | delta |
+|---|---:|---:|---:|
+| isolated parse of the 8,686 B helper | 0.62 / 0.58 ms | 0.57 / 0.63 ms | anchor holds |
+| dependent re-analysis, repeated 8,686 B content | 18.84 / 18.03 ms | 19.31 / 19.09 ms | **+0.8 ms** |
+| dependent re-analysis, distinct 8,686 B contents | 19.48 / 18.96 ms | 19.07 / 19.22 ms | ~0 |
+| dependent re-analysis, repeated 36 B content | 16.97 / 16.15 ms | 16.92 / 16.93 ms | ≤ +0.4 (noise) |
+| dependent re-analysis, distinct 36 B contents | 16.84 / 16.54 ms | 16.62 / 16.85 ms | ~0 |
+| dependent re-analysis, distinct broken 34 B | 16.98 / 16.05 ms | 16.43 / 16.83 ms | ~0 |
+
+The builder's number: **the overlay-parse cost per dependent re-analysis is
+the edited file's parse — ≈0.8 ms measured end-to-end on an 8,686-byte
+module (its isolated parse is ≈0.6 ms; the remainder is the rewrites and
+the owned allocation), unmeasurable on a 36-byte one — paid only on the
+repeated-content shape, only while a dependent is open, in the frontend,
+the cheap phase.** In exchange the session leak reads zero. The first build
+measured worse — a flat ~1.1 ms on every phase — and that was the
+instrument catching two accidental `canonical_path` filesystem round trips
+per module load in the hook, removed as recorded above: the shipped hook
+adds no filesystem work to a disk-served load. The other recorded cost is
+(a)'s: no base-world store while a std or dependency file is open.
+
+#### What stays open
+
+§7.9.4(b)'s carve-out: a macro-DEFINING file edited in an open buffer still
+leaks per distinct content through the world caches — the world outlives
+every analysis by design. Transient readers (`module_importables` on the
+request thread, `declares`) keep the global caches and so keep a
+per-distinct-content leak on overlay content they read — bounded by explicit
+editor queries, not by keystrokes. Both recorded here; neither is M9's
+bound.

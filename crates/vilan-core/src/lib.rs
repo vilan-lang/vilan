@@ -25,6 +25,7 @@ pub(crate) mod macros;
 pub mod manifest;
 pub mod node;
 pub mod options;
+pub mod owned_modules;
 pub mod parsing;
 pub mod platform_color;
 pub mod span;
@@ -42,6 +43,7 @@ pub use macros::MacroLimits;
 pub use macros::macro_world_cache_clear;
 pub use manifest::Manifest;
 pub use options::{BuildOptions, Preset};
+pub use owned_modules::OwnedModules;
 pub use span::{Span, Spanned};
 pub use target::{Backend, Platform, PlatformPattern};
 pub use transformer::{
@@ -320,6 +322,11 @@ pub struct AnalyzedEntry {
     pub program: Option<Program<'static>>,
     pub diagnostics: Vec<Error>,
     pub ast: Option<LeakedEntryAst>,
+    /// The overlay-served module allocations this analysis OWNS (M9,
+    /// `leak-soak.md` §7.9.4) — drained from the collection scope, reclaimable
+    /// with `ast` once the program is dropped. Empty unless the analysis
+    /// opted in ([`analyze_source_owning_overlay_modules`]).
+    pub owned_modules: OwnedModules,
 }
 
 /// Lex, parse, and fully analyze a source string. The source must already be
@@ -389,7 +396,47 @@ pub fn analyze_source_reclaimable(
             msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
         }],
         ast: None,
+        owned_modules: OwnedModules::none(),
     })
+}
+
+/// [`analyze_source_reclaimable`] with the M9 opt-in active (`leak-soak.md`
+/// §7.9.4): for the duration of this analysis, a module load served from the
+/// open-document overlay bypasses the process-global parse caches
+/// ([`parse_clean_cached`] and the loader's error cache) and parses into
+/// allocations the returned entry OWNS (`AnalyzedEntry::owned_modules`),
+/// reclaimable beside the entry's tree once the program is dropped.
+///
+/// The language server is the caller, and the reason is §7.5: an open
+/// buffer's content is a keystroke's, which can never recur, so caching it
+/// process-globally is a session leak — one text + tree of the edited file
+/// per landed keystroke while a dependent is open. Activation is THIS
+/// explicit opt-in, not an ambient property of the overlay: the wasm front
+/// end serves everything from the overlay and must keep the global caches,
+/// as must every transient reader. A macro-world compile inside the analysis
+/// keeps the global caches too — its world outlives every analysis
+/// (§7.9.4b) — and a base world is never stored for an analysis that loaded
+/// an overlay-served source (§7.9.4a, `base_cache_store`'s gate), which is
+/// what makes the returned handles' reclaim sound: the program is their only
+/// borrower.
+pub fn analyze_source_owning_overlay_modules(
+    source: &'static str,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    platform: Option<Platform>,
+    workspace: &Workspace,
+) -> AnalyzedEntry {
+    let scope = owned_modules::CollectionScope::activate();
+    let mut analyzed =
+        analyze_source_reclaimable(source, std, pkg_root, entry_path, platform, workspace);
+    // The panic paths land here too (`analyze_source_reclaimable` catches
+    // its unwinds): whatever the scope collected before the panic has no
+    // borrower left — the unwind dropped every analyzer local, and no global
+    // holds one (the store gate, the macro carve-out) — so the handles ride
+    // the degraded entry and are reclaimed with it, like the entry tree.
+    analyzed.owned_modules = scope.drain();
+    analyzed
 }
 
 fn analyze_source_unfenced(
@@ -420,6 +467,7 @@ fn analyze_source_unfenced(
             program: None,
             diagnostics,
             ast: None,
+            owned_modules: OwnedModules::none(),
         };
     };
 
@@ -542,6 +590,7 @@ fn analyze_source_unfenced(
                 program: Some(program),
                 diagnostics,
                 ast: Some(ast),
+                owned_modules: OwnedModules::none(),
             }
         }
         // The analysis unwound inside its fence: every analyzer local went
@@ -551,6 +600,7 @@ fn analyze_source_unfenced(
             program: None,
             diagnostics,
             ast: Some(ast),
+            owned_modules: OwnedModules::none(),
         },
     }
 }
