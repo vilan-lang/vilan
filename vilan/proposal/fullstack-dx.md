@@ -2759,6 +2759,13 @@ measurement).
 
 ### 16.13 E79 — the §10.1 review: the head helpers, with their customers (2026-08-21)
 
+> **RULED 2026-08-22 — all seven as recommended.** The bound moves (the
+> intersection plus the identity lines the document is the sole author
+> of); `description(text)` graduates (E85); icons and the social card
+> stay hatches; the theme metas become a site-side `theme_metas`
+> reading `themed_values` (K17); generic meta/CSP/`<base>` stay
+> declined; the hatch separator files (E86).
+
 §10.1 bounded rung 2 to "the intersection of the seven shells plus
 `head`/`body` escape hatches, and reviewed again if the first three
 feature requests are all in `head()`"; §15.2 applied the bound three

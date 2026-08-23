@@ -307,6 +307,12 @@ small backlog item now.
 
 ## 6. Owner questions
 
+> **RULED 2026-08-22 — all five as recommended** (namespace-over-split as
+> recorded direction, zero construction now; the window in package
+> revs; the tier seam may carry the sequencing; `std::markdown` built
+> package-shaped when K13 reaches it; the reserved names are L12's to
+> build).
+
 1. **The direction.** Ratify namespace-over-split as recorded intent
    (§5's three sentences), building nothing now? This forecloses only
    the hard split; every future choice about *when* stays open.

@@ -289,6 +289,11 @@ exists — the attribute will be ready; the promise waits.
 
 ## Owner questions
 
+> **RULED 2026-08-22 — all four as recommended**: the attribute; honored
+> wherever it appears and documented; the deprecating entry's family is
+> `breaking`; both §5 legs now plus the voluntary window on the next
+> real retirement.
+
 1. **Attribute vs compiler-side table.** Recommend the attribute
    (§2: one-place truth, testable in a plain fixture, serves
    LSP/docs/packages later). The table was the cheaper-looking option

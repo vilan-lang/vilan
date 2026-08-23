@@ -285,6 +285,13 @@ at the price of five stub files. Exact membership is an owner call (§8).
 
 ## 8. Owner questions
 
+> **RULED 2026-08-22**: `vilan-lang/proposals`; filter-repo extraction; license
+> and visibility inherited. Archive membership: old/superseded proposals
+> AND any inactive backlogs and roadmaps land under `archive/`. ONE
+> surface for tracking. The tracker moves with the papers but is kept
+> structurally separate (its own top-level directory) so it can move
+> elsewhere later without touching the papers. Book links per §5.6.
+
 1. **Name**: `vilan-lang/proposals` assumed. Bless, or prefer `design` /
    `records`?
 2. **History**: §2 recommends filter-repo extraction over a clean

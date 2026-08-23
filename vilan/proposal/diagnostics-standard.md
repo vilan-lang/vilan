@@ -88,6 +88,24 @@ boundary sketch, and this week's diagnostics (the B13 origin-naming, the
   preceded it in the noted file. Pinned in
   `vilan-cli/tests/diagnostics.rs` (`e76_*`).
 
+- **C3a — The requirement trace (E78; ruled in 2026-08-22).** Beside the C3 note,
+  `Error` carries `trace: Vec<TraceHop>` — one `Note` per uncovered
+  user-written call between the diagnostic's anchor and the offending site,
+  ordered entry → read, each hop flagged `call` (the elision tail, `… N more
+  uncovered calls on this path`, is the one non-call entry and rides at the
+  last kept hop's span). A **separate contract** from C3: the note stays one
+  location ("one, not a list"); the trace is a chain, empty for every
+  diagnostic except the context-coverage refusals. Every surface renders
+  trace first, note last: the CLI as ariadne sub-labels, the language server
+  as related information plus one diagnostic per call hop (E81), the HMR
+  overlay as indented `via file:line:col — label` lines, the playground as a
+  `trace` array on the wire (E80). A hop's `source` names its own file; a
+  surface locates each hop there, never in the anchor's. The contract is not
+  std-specific (the owner's ruling, 2026-08-22): code the user did not write — std
+  or **any external/linked package** — demotes and traces the same way. The
+  implementation's tests today exercise std; widening the demotion/labeling
+  checks to dependency packages is E84.
+
 ## 4. The classes outside `diagnostics.push`
 
 - **Lexer/parser errors** are chumsky-generated expected-lists ("found X,

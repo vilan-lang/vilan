@@ -451,6 +451,11 @@ the page's hands, and the render that follows is CodeMirror's own popup.
 
 ## 11. Open questions for the owner
 
+> **RULED 2026-08-22 — all as recommended.** The crate stays `vilan-ide`; a
+> cold instance answers empty until the first check; keywords and
+> snippets stay in the popup; the trigger set stays `.`/`:`/identifier
+> chars/Ctrl-Space. The scope-position cost is E83.
+
 1. **The crate's name.** `vilan-ide` (this paper) vs the brief's
    `vilan-completion`. The crate owns the line index and the navigation
    primitives as well as completion; renaming is a one-commit change.

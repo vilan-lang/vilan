@@ -1572,6 +1572,12 @@ commit, full gates.
 
 ### 14.1 Owner question
 
+> **RULED 2026-08-22: DELETE.** The owner's one check — "B130 looks like a
+> bug a user could recreate; it should be fixed" — is answered by the
+> deletion itself: probe C's internal error becomes the clean steered
+> refusal, and the deletion lane pins exactly that shape (B130 closes
+> with it; no separate fix exists to fund on the delete path).
+
 **Delete `std/src/into.vl` 5–9, or keep it and fund the fix?** Evidence
 for delete: resolution selects it *nowhere* in the tree, suite included
 (census above, three-legged and cross-checked); its one unique

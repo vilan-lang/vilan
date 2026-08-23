@@ -1117,6 +1117,9 @@ forever.
 
 #### 7.9.4 The contained mechanism, recommended: stop sharing what churns
 
+> **NOD 2026-08-22** — build as recorded; the base-world store gate is the
+> stated proof obligation, the perf cost measured by the builder.
+
 The growth §7.5 measures is the cache faithfully doing its job on contents
 that can never recur — keystrokes. What the cache was built for (E12) is
 std and dependency modules: stable disk content, reused across every compile
