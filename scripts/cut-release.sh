@@ -39,6 +39,16 @@
 # above its head and a dangling one would ride into the release section as a
 # comment nobody wrote. Within a family the authored order is preserved
 # exactly, so a thematic grouping a human wrote survives the sort.
+#
+# Lifetime markers (proposal/deprecation.md §3): `<!-- deprecates: KEY -->` /
+# `<!-- removes: KEY -->` above an entry's head - one KEY per line, one or
+# more per entry (unlike `family:`/`commit:`, repetition is legal). KEY is
+# the fully qualified path (`std::rpc_server::serve_service`) or the CLI
+# spelling (`vilan build --target`). A `removes:` under Unreleased is REFUSED
+# unless a RELEASED section carries the matching `deprecates:`; a patch cut
+# refuses either marker outright; shipped deprecations not yet removed are
+# reported at every cut. The stranding rule above applies to these markers
+# too.
 set -eu
 
 VERSION=""
@@ -163,10 +173,11 @@ function dash(value) { return value == "" ? "-" : value }
 function strand(marker, line) {
     problem("marker `" marker "` at line " line " opens no entry (a marker sits directly above its head)")
 }
-function strand_pending() {
+function strand_pending(   j) {
     if (pending_family != "") strand(family_marker, family_line)
     if (pending_commit != "") strand(commit_marker, commit_line)
-    pending_family = ""; pending_commit = ""
+    for (j = 1; j <= pending_life; j++) strand(pending_life_marker[j], pending_life_line[j])
+    pending_family = ""; pending_commit = ""; pending_life = 0
 }
 function close_entry(   text) {
     if (!open) return
@@ -194,14 +205,18 @@ function emit_section(   wanted, i, printed) {
         if (refusals > 0) {
             # Still list every entry, in file order, so the sweep below can
             # report on a section this script is refusing to order.
-            for (i = 1; i <= count; i++)
+            for (i = 1; i <= count; i++) {
                 printf "E\t0\t%s\t%s\t%s\n", dash(family[i]), dash(commit[i]), head[i]
+                emit_lifetimes(i)
+            }
             return
         }
         for (wanted = 1; wanted <= 4; wanted++)
             for (i = 1; i <= count; i++)
-                if (rank_of(family[i]) == wanted)
+                if (rank_of(family[i]) == wanted) {
                     printf "E\t%d\t%s\t%s\t%s\n", wanted, family[i], dash(commit[i]), head[i]
+                    emit_lifetimes(i)
+                }
         return
     }
     if (refusals > 0) return
@@ -213,14 +228,21 @@ function emit_section(   wanted, i, printed) {
             if (printed > 1) print "\n---\n"
             if (commit[i] != "") print "<!-- commit: " commit[i] " -->"
             print "<!-- family: " family[i] " -->"
+            for (j = 1; j <= life_count[i]; j++)
+                print "<!-- " life_kind[i, j] ": " life_key[i, j] " -->"
             print body[i]
         }
     }
+}
+function emit_lifetimes(i,   j) {
+    for (j = 1; j <= life_count[i]; j++)
+        printf "M\t%s\t%s\t%s\n", life_kind[i, j], life_key[i, j], head[i]
 }
 BEGIN {
     stage = 0; count = 0; open = 0; emitted = 0; refusals = 0
     pending_family = ""; pending_commit = ""; boundary = 1
     family_marker = ""; family_line = 0; commit_marker = ""; commit_line = 0
+    pending_life = 0
 }
 stage == 0 {
     if ($0 == "## Unreleased") {
@@ -254,6 +276,26 @@ stage == 1 {
         boundary = 1
         next
     }
+    # The lifetime markers (deprecation.md §3): `deprecates:`/`removes:`, one
+    # KEY per line, one or more per entry. Same discipline as the markers
+    # above - directly over the head - but a SECOND one of a kind is legal
+    # (an entry may deprecate, or remove, several forms at once).
+    if ($0 ~ /^<!--[ \t]*(deprecates|removes):.*-->[ \t]*$/) {
+        close_entry()
+        if (index($0, "deprecates:") > 0) { life_word = "deprecates" } else { life_word = "removes" }
+        life_value = marker_value($0, life_word ":")
+        if (life_value == "") {
+            problem("marker `" $0 "` at line " NR " names no key")
+        } else {
+            pending_life++
+            pending_life_kind[pending_life] = life_word
+            pending_life_key[pending_life] = life_value
+            pending_life_marker[pending_life] = $0
+            pending_life_line[pending_life] = NR
+        }
+        boundary = 1
+        next
+    }
     # Past the markers, only a bold head may follow a marker. Anything else -
     # a rule, a blank line, prose, the heading above - strands it.
     if (substr($0, 1, 2) != "**") strand_pending()
@@ -268,6 +310,12 @@ stage == 1 {
         head[count] = substr($0, 3, index(substr($0, 3), "**") - 1)
         family[count] = pending_family; pending_family = ""
         commit[count] = pending_commit; pending_commit = ""
+        life_count[count] = pending_life
+        for (lj = 1; lj <= pending_life; lj++) {
+            life_kind[count, lj] = pending_life_kind[lj]
+            life_key[count, lj] = pending_life_key[lj]
+        }
+        pending_life = 0
         body[count] = $0 "\n"
         open = 1
         boundary = 0
@@ -371,6 +419,87 @@ SWEEP_RED=0
 sweep || SWEEP_RED=1
 say ""
 
+# ---------------------------------------------------------------------------
+# Lifetimes - proposal/deprecation.md §3: a removal rides no earlier than the
+# minor AFTER the one that shipped its deprecation warning. For every
+# `removes: KEY` under `## Unreleased`, a `deprecates: KEY` must sit in a
+# RELEASED `## vX.Y.Z` section - a match inside the same Unreleased section
+# does not count. Every train is a minor, so "in a released section" IS "at
+# least one minor of warning": a fixed-string match, no version arithmetic.
+# Patches carry neither marker (patches are fixes - releases.md §4). A shipped
+# deprecation nothing has removed yet is REPORTED, never red: §5.2(1) is a
+# floor, not a deadline, and the report keeps the open window visible.
+# ---------------------------------------------------------------------------
+SHIPPED="$WORK/shipped"
+awk '
+/^## / { section = ""; if ($0 ~ /^## v[0-9]/) section = $2 }
+section != "" && /^<!--[ \t]*(deprecates|removes):.*-->[ \t]*$/ {
+    key = $0
+    kind = (index(key, "deprecates:") > 0) ? "deprecates" : "removes"
+    sub(/^<!--[ \t]*(deprecates|removes):[ \t]*/, "", key)
+    sub(/[ \t]*-->[ \t]*$/, "", key)
+    if (key != "") printf "S\t%s\t%s\t%s\n", kind, key, section
+}
+' CHANGELOG.md > "$SHIPPED"
+
+LIFE_RED=0
+PATCH="${VERSION##*.}"
+if grep -q "^M$TAB" "$LISTING"; then
+    say "lifetimes (deprecation.md §3) — removals against shipped deprecations"
+    say ""
+    while IFS="$TAB" read -r kind marker_kind marker_key entry_head <&3; do
+        [ "$kind" = "M" ] || continue
+        if [ "$PATCH" != 0 ]; then
+            say "  RED   \`$marker_kind: $marker_key\` on a PATCH cut - deprecations and removals ride minors only (releases.md §4)"
+            say "        $entry_head"
+            LIFE_RED=1
+            continue
+        fi
+        if [ "$marker_kind" = "removes" ]; then
+            shipped_in="$(awk -F"$TAB" -v key="$marker_key" \
+                '$1 == "S" && $2 == "deprecates" && $3 == key { print $4; exit }' "$SHIPPED")"
+            if [ -z "$shipped_in" ]; then
+                say "  RED   removes: $marker_key - no RELEASED section carries \`deprecates: $marker_key\`, so its warning never shipped"
+                say "        (a deprecation in this same Unreleased section does not count: the removal"
+                say "        comes no earlier than the minor after the warning - process.md §5.2(1))"
+                say "        $entry_head"
+                LIFE_RED=1
+            else
+                say "  ok    removes: $marker_key  (deprecated in $shipped_in)"
+            fi
+        else
+            say "  ok    deprecates: $marker_key  (the window opens with this cut)"
+        fi
+    done 3< "$LISTING"
+    say ""
+fi
+# The pending report - every released `deprecates:` no train has removed yet
+# (neither a released `removes:` nor one riding this cut), with the train
+# that shipped it.
+awk -F"$TAB" '
+    NR == FNR { if ($1 == "M" && $2 == "removes") unreleased[$3] = 1; next }
+    $1 == "S" && $2 == "removes" { removed[$3] = 1; next }
+    $1 == "S" && $2 == "deprecates" && !($3 in seen) { seen[$3] = 1; order[++n] = $3; from[$3] = $4 }
+    END {
+        for (i = 1; i <= n; i++) {
+            key = order[i]
+            if (!(key in removed) && !(key in unreleased))
+                printf "  pending  %s  (deprecated in %s, not yet removed - deprecation.md §3)\n", key, from[key]
+        }
+    }
+' "$LISTING" "$SHIPPED" | {
+    pending_said=0
+    while IFS= read -r line; do
+        if [ "$pending_said" = 0 ]; then
+            say "deprecations still in their window (report only)"
+            say ""
+            pending_said=1
+        fi
+        say "$line"
+    done
+    [ "$pending_said" = 0 ] || say ""
+}
+
 if [ "$REFUSED" != 3 ]; then
     say "order (§7.2) — breaking, then miscompiles, then features, then diagnostics and tooling"
     say ""
@@ -382,7 +511,7 @@ if [ "$REFUSED" != 3 ]; then
     say ""
 fi
 
-if [ "$REFUSED" = 3 ] || [ "$SWEEP_RED" != 0 ]; then
+if [ "$REFUSED" = 3 ] || [ "$SWEEP_RED" != 0 ] || [ "$LIFE_RED" != 0 ]; then
     fail "refusing to cut - fix the reds above (nothing was changed)"
 fi
 
