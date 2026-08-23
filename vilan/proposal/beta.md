@@ -277,7 +277,7 @@ the June-old thin host bindings that have not moved in weeks.
 | `std::task` | 2026-07-18 | `nursery`/structured spawn; quiet since 08-01; §J4's lint warns and §J5's handles add — neither breaks. |
 | `std::time` | 2026-06-18 | One incident ever (v0.3.0's instant comparison, June-era); K5's deliberate minimalism; quiet since `Timer` (07-28). |
 
-### Tier 2 — provisional (23 modules)
+### Tier 2 — provisional (24 modules)
 
 A break needs a Breaking entry, no deprecation window. The ratified
 §4 Q4 rulings (reactive, ui), the §3.2 candidate fullstack layer, the
@@ -310,14 +310,17 @@ gate clears.
 | `std::asset` | 2026-07-10 | hold | const-eval §8's deferred remainder and the A7-entangled emission both sit under it. |
 | `macro_std::meta` | 2026-07-06 | hold | The hermetic macro surface IS this package; the engine is a month old and its own proposal tail (G2) is open. |
 | `macro_std::build` | 2026-07-07 | hold | The construction API; same engine clock as `meta`. |
+| `std::into` | 2026-06-13 | runs | Moved from Tier 3 on B127's DELETE ruling (2026-08-22, method-resolution.md §14.1; shipped 2026-08-23): the blanket impl is deleted, and what remains is the `Into` trait `strings.md` teaches — Q3's "trait itself is settled" alternative. |
 
-### Tier 3 — experimental (1 module)
+### Tier 3 — experimental (0 modules)
 
 May be reworked wholesale with a CHANGELOG note.
 
-| Module | In tree since | Why Tier 3 |
-| --- | --- | --- |
-| `std::into` | 2026-06-13 | B127 holds its deletion question open — the blanket impl has zero in-tree dependents beyond the B98 pin; promising even Tier 2 ceremony for a surface that may vanish is ceremony; → Q3. |
+The table is empty since 2026-08-23: its only row, `std::into`, sat
+here for B127's open deletion question, and the ruling landed (DELETE,
+2026-08-22 — method-resolution.md §14.1). The blanket impl is gone;
+the module that remains is the `Into` trait, tabled at Tier 2 above
+(→ Q3).
 
 **Canvas is not a row.** §4 Q4 ruled "canvas at Tier 3", but no
 module named canvas exists in the tree (canvas.md is a proposal).
@@ -351,9 +354,12 @@ proposed as tabled above.
    Accept Tier 2 whole, or rule an item-level carve (operator traits
    Tier 1, `Try`/`Lift` Tier 2) — which amends §3.2's per-module
    grain.
-3. **`std::into` at Tier 3.** Proposed on B127's open deletion
-   question. If the `Into` trait itself is considered settled and only
-   the blanket is in question, Tier 2 is the alternative.
+3. **`std::into` at Tier 3.** COLLAPSED 2026-08-23: the row existed
+   because B127 was open, and the ruling landed (DELETE, 2026-08-22 —
+   method-resolution.md §14.1). With the blanket impl deleted the
+   module is just the `Into` trait — this question's own "trait itself
+   is settled" alternative — so it is tabled at Tier 2, and Tier 3 is
+   empty until canvas (or another experiment) lands.
 4. **The carve-outs: `std::process` and `std::dom` at Tier 1.** Both
    are June-old, thin, and quiet, and neither is in §3.2's candidate
    list — but Tier 1 here makes their directories non-uniform (every

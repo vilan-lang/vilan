@@ -1475,9 +1475,9 @@ struct ImplMemberCandidate {
     /// The trait the name comes from, or `None` when the member is INHERENT —
     /// the type's own, outranking every trait-provided candidate.
     home_trait: Option<Id>,
-    /// The home trait's arguments AS THIS RECEIVER INSTANTIATES THEM — std's
-    /// `impl type T with Into<T>` reached through a `Foo` is `Into<Foo>`, a
-    /// user's `impl Foo with Into<str>` is `Into<str>`. Empty for an inherent
+    /// The home trait's arguments AS THIS RECEIVER INSTANTIATES THEM — a
+    /// blanket `impl type T with Into<T>` reached through a `Foo` is
+    /// `Into<Foo>`, a specific `impl Foo with Into<str>` is `Into<str>`. Empty for an inherent
     /// member and for a trait with no parameters.
     ///
     /// Half of B73's R1 resolution key: the trait id alone made those two one
@@ -1493,6 +1493,24 @@ struct ImplMemberCandidate {
     inherits_the_default: bool,
 }
 
+/// One home's R3 verdict, carried through the trait-arguments ambiguity so R2
+/// can act on it (B128, method-resolution.md §13.8's deferred residue): when
+/// the expected type selects a home the specificity order ranked, the winner
+/// answers; when it selects a home the order could NOT rank, the home's own
+/// `AmbiguousImpls` report must fire — the first maximum answering silently
+/// was exactly the declaration-order dependence B73 was filed over.
+#[derive(Debug, Clone)]
+struct RankedHome {
+    /// The home's most specific impl — or, for a home R3 could not rank, its
+    /// first maximum, standing in only where one candidate must: the
+    /// ambiguity report's home label, and R2's return-type read (every impl
+    /// of a home shares the trait's signature at the home's instantiation).
+    representative: ImplMemberCandidate,
+    /// The unranked maxima, in declaration order — empty for a ranked home.
+    /// Non-empty is what R2 must refuse to resolve through.
+    unranked: Vec<ImplMemberCandidate>,
+}
+
 /// How `receiver.member` resolves against the impls whose subject matches
 /// (`proposal/method-resolution.md` §3).
 #[derive(Debug, Clone)]
@@ -1506,9 +1524,10 @@ enum ImplMemberResolution {
     /// ONE trait provides the name at two or more distinct instantiations —
     /// `Into<Foo>` and `Into<str>` for this receiver (B73's R1 key). §3.1's
     /// `Trait::member` disambiguator has no argument slot, so naming the trait
-    /// settles nothing; the call is reported. Carries one candidate per home,
-    /// in declaration order.
-    AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
+    /// settles nothing; the call is reported. Carries one [`RankedHome`] per
+    /// home, in declaration order, so R2's selection can honor each home's R3
+    /// verdict (B128).
+    AmbiguousTraitArguments(Vec<RankedHome>),
     /// Two or more impls of ONE home that the specificity order does not rank
     /// — `Box<type T: Display>` against `Box<type U: Ord>` for a `Box<i32>`
     /// that satisfies both (§13.4(a)(3), reported at the call site per §13.6
@@ -4862,13 +4881,14 @@ impl<'src> Analyzer<'src> {
     ///   together (`method-resolution.md` §2). Nothing here special-cases them;
     ///   the pairs are compared within one platform leg because only one leg
     ///   exists. Pinned on both legs.
-    /// - **The std `Into` blanket.** `impl type T with Into<T>` has a GENERIC
+    /// - **A reflexive blanket.** `impl type T with Into<T>` (std shipped one
+    ///   until B127 deleted it — the shape stays legal for users) has a GENERIC
     ///   subject; a user's `impl Foo with Into<Bar>` has a concrete one, and a
     ///   generic position matches only another generic position, so the pair
     ///   never forms. This is deliberate and load-bearing: a blanket impl
-    ///   OVERLAPPING a specific one is B73's specificity question, which stays
-    ///   open and stays out of this rule — an overlap resolves exactly as it did
-    ///   before, and only an exact repeat is refused.
+    ///   OVERLAPPING a specific one is B73's specificity question, answered by
+    ///   ranking (§13.4(a)) and not by this rule — only an exact repeat is
+    ///   refused.
     /// - **Two conditional impls with different bounds.**
     ///   `impl Pair<type T: Show>` and `impl Pair<type U: Marker>` are two
     ///   overlapping impls, not one written twice, which is why two generic
@@ -5024,8 +5044,8 @@ impl<'src> Analyzer<'src> {
     ///
     /// Deliberately NOT [`Self::compare_type`], which is compatibility: it
     /// treats a generic as a hole to be filled, so an unbounded one matches
-    /// anything and std's `impl type T with Into<T>` would read as a duplicate
-    /// of every user `Into` impl in the program. What this rule needs is
+    /// anything and a reflexive blanket `impl type T with Into<T>` would read
+    /// as a duplicate of every user `Into` impl in the program. What this rule needs is
     /// sameness — a parameter matches only another parameter, and only one bound
     /// the same way, so a blanket impl OVERLAPPING a specific one (B73) is not a
     /// repeat of it.
@@ -11397,9 +11417,9 @@ impl<'src> Analyzer<'src> {
         // not a static: which implementation runs is the RECEIVER's to decide,
         // and the path head falls through to `trait_qualified_calls` to let it.
         // An impl with a GENERIC subject compare_types the bare trait type,
-        // though, so std's `impl type T with Into<T>` answered the path itself
-        // and `Into::into(foo)` reached the blanket whatever `foo` implements
-        // (`method-resolution.md` §13.2 row 5). A trait's attached statics —
+        // though, so std's since-deleted `impl type T with Into<T>` (B127)
+        // answered the path itself and `Into::into(foo)` reached the blanket
+        // whatever `foo` implements (`method-resolution.md` §13.2 row 5). A trait's attached statics —
         // `Iterator::from_fn`, which take no `self` — are untouched.
         candidates
             .into_iter()
@@ -11723,15 +11743,25 @@ impl<'src> Analyzer<'src> {
         // Two homes of ONE trait have no `Trait::member` spelling to pick
         // between them. Reporting is what makes row 2 stop being a silent wrong
         // answer; R2 gives the call's expected type the first chance to choose.
-        // Each home is represented by its most specific impl — an unranked home
-        // by its first maximum, the residue §13.8 records as deferred.
+        // Each home travels WITH its R3 verdict (B128): the winner where the
+        // home ranked, and the unranked maxima where it did not — so a
+        // selection landing on an unrankable home reports that home's own
+        // ambiguity instead of silently answering with its first maximum.
         if ranked.len() > 1 {
             return ImplMemberResolution::AmbiguousTraitArguments(
                 ranked
                     .into_iter()
                     .filter_map(|home| match home {
-                        Ok(winner) => Some(winner.clone()),
-                        Err(unranked) => unranked.into_iter().next(),
+                        Ok(winner) => Some(RankedHome {
+                            representative: winner.clone(),
+                            unranked: Vec::new(),
+                        }),
+                        Err(unranked) => {
+                            unranked.first().cloned().map(|representative| RankedHome {
+                                representative,
+                                unranked,
+                            })
+                        }
                     })
                     .collect(),
             );
@@ -11953,8 +11983,9 @@ impl<'src> Analyzer<'src> {
     /// Method resolution runs receiver-first everywhere else, so this is the one
     /// place the annotation on the left of the `=` reaches across and chooses
     /// among the implementations on the right. It is what makes
-    /// `let b: Bar = foo.into()` mean the user's `impl Foo with Into<Bar>`
-    /// rather than std's blanket, and what `variadic-generics.md` 182–187
+    /// `let b: Bar = foo.into()` mean the `impl Foo with Into<Bar>` home
+    /// rather than a competing `Into` home (std's blanket, until §14 deleted
+    /// it; a user-written one still), and what `variadic-generics.md` 182–187
     /// recorded as its blocker.
     fn select_home_by_expected_type(
         &mut self,
@@ -12075,9 +12106,9 @@ impl<'src> Analyzer<'src> {
     }
 
     /// One candidate's home, spelled as THIS receiver instantiates it —
-    /// `Into<Foo>` for std's blanket reached through a `Foo`, `Into<str>` for
-    /// the user's own impl (B1: the reader has to be able to tell the two
-    /// apart, and `Into` twice does not).
+    /// `Into<Foo>` for a blanket `impl type T with Into<T>` reached through a
+    /// `Foo`, `Into<str>` for a specific impl (B1: the reader has to be able
+    /// to tell the two apart, and `Into` twice does not).
     fn home_label(&self, candidate: &ImplMemberCandidate) -> String {
         let Some(trait_id) = candidate.home_trait else {
             return String::new();
@@ -25091,7 +25122,7 @@ impl<'src> Analyzer<'src> {
         self.trait_qualified_calls.remove(&subject_id);
         // Every impl of the named trait whose subject matches, not just the
         // first: one subject may implement the trait at two instantiations
-        // (`Into<Bar>` beside std's `Into<Foo>`), and naming the trait says
+        // (`Into<Bar>` beside `Into<str>`), and naming the trait says
         // nothing about which — §3.1's spelling has no argument slot (B73 R2).
         let providers: Vec<(Option<Id>, TypeId)> = self
             .implementations
@@ -25769,7 +25800,7 @@ impl<'src> Analyzer<'src> {
             AmbiguousTraits(Vec<Id>),
             // ONE trait provides the name at two or more instantiations (B73's
             // R1) — `Trait::member` cannot name which, so the call is reported.
-            AmbiguousTraitArguments(Vec<ImplMemberCandidate>),
+            AmbiguousTraitArguments(Vec<RankedHome>),
             // Two impls of ONE home that specificity does not rank (B73's R3).
             AmbiguousImpls(Vec<ImplMemberCandidate>),
             // The receiver is a value typed as a bare trait (not `self` in a trait
@@ -25848,12 +25879,31 @@ impl<'src> Analyzer<'src> {
                 if let ImplMemberResolution::AmbiguousTraitArguments(homes) = &resolution {
                     let reachable: Vec<(Id, TypeId)> = homes
                         .iter()
-                        .map(|home| (home.member_id, home.impl_subject))
+                        .map(|home| {
+                            (
+                                home.representative.member_id,
+                                home.representative.impl_subject,
+                            )
+                        })
                         .collect();
                     if let Some((member_id, impl_subject)) =
                         self.select_home_by_expected_type(id, &subject_type, &reachable)
                     {
-                        resolution = ImplMemberResolution::Found(member_id, impl_subject);
+                        // B128: a selected home R3 could not rank is that
+                        // home's own ambiguity — the expected type picked the
+                        // home, not which of its unranked impls answers.
+                        let unranked = homes
+                            .iter()
+                            .find(|home| {
+                                home.representative.member_id == member_id
+                                    && home.representative.impl_subject == impl_subject
+                            })
+                            .map(|home| home.unranked.clone())
+                            .unwrap_or_default();
+                        resolution = match unranked.is_empty() {
+                            true => ImplMemberResolution::Found(member_id, impl_subject),
+                            false => ImplMemberResolution::AmbiguousImpls(unranked),
+                        };
                     }
                 }
                 match resolution {
@@ -26293,13 +26343,13 @@ impl<'src> Analyzer<'src> {
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 let trait_name = homes
                     .first()
-                    .and_then(|home| home.home_trait)
+                    .and_then(|home| home.representative.home_trait)
                     .and_then(|trait_id| self.traits.get(&trait_id))
                     .map(|trait_| trait_.name)
                     .unwrap_or("Trait");
                 let providers: Vec<String> = homes
                     .iter()
-                    .map(|home| format!("'{}'", self.home_label(home)))
+                    .map(|home| format!("'{}'", self.home_label(&home.representative)))
                     .collect();
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
