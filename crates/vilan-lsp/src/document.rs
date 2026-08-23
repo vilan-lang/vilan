@@ -14,8 +14,8 @@ use vilan_core::leak_tally::{LeakSite, Leaked};
 use vilan_core::lexing::tokenize;
 use vilan_core::node::Convention;
 use vilan_core::{
-    Error, LeakedEntryAst, Manifest, Platform as BuildPlatform, Program, Span,
-    Workspace as BuildWorkspace, analyze_source_reclaimable,
+    Error, LeakedEntryAst, Manifest, OwnedModules, Platform as BuildPlatform, Program, Span,
+    Workspace as BuildWorkspace, analyze_source_owning_overlay_modules,
 };
 
 use crate::line_index::LineIndex;
@@ -430,27 +430,35 @@ pub struct Document {
     import_roots: Option<ImportRoots>,
 }
 
-/// The analyzed `Program` together with the two allocations it borrows for
-/// `'static`: the copy of the entry text `analyze_on_this_thread` leaks and the
-/// entry tree `analyze_source_reclaimable` leaks. The program's lifetime
-/// parameter says `'static`; this pairing is what makes that true for exactly
-/// as long as the program lives, and gives the bytes back afterwards — the M7
-/// fix (`leak-soak.md` §7): before it, every keystroke's analysis leaked both
-/// for the rest of the session (3.12 MiB of RSS per keystroke on a 735-line
-/// file, 6.1 GiB after two thousand).
+/// The analyzed `Program` together with the allocations it borrows for
+/// `'static`: the copy of the entry text `analyze_on_this_thread` leaks, the
+/// entry tree the analysis leaks, and — M9 — the overlay-served module
+/// copies the analysis parsed for itself. The program's lifetime parameter
+/// says `'static`; this pairing is what makes that true for exactly as long
+/// as the program lives, and gives the bytes back afterwards — the M7 fix
+/// (`leak-soak.md` §7): before it, every keystroke's analysis leaked both
+/// entry allocations for the rest of the session (3.12 MiB of RSS per
+/// keystroke on a 735-line file, 6.1 GiB after two thousand); before M9
+/// (§7.5/§7.9.4), a keystroke in a file another open document imports leaked
+/// that file's text + tree once per distinct content through the
+/// process-global parse caches.
 ///
 /// **The invariant** (promised at [`AnalyzedProgram::new`], relied on in
-/// `Drop`): the program borrows only `text`, `ast`, and allocations that are
-/// immortal (std and module texts in `parse_clean_cached`, interned names,
-/// cached macro worlds); and nothing outside this value borrows `text` or
-/// `ast` — no process-global cache, no thread-local, nothing the server
-/// retains. `leak-soak.md` §7.2 is the audit that establishes the second half,
-/// global by global; the first half is what `analyze_source_reclaimable`
+/// `Drop`): the program borrows only `text`, `ast`, its `owned_modules`, and
+/// allocations that are immortal (std and module texts served from
+/// `parse_clean_cached`, interned names, cached macro worlds); and nothing
+/// outside this value borrows `text`, `ast`, or any owned module copy — no
+/// process-global cache, no thread-local, nothing the server retains.
+/// `leak-soak.md` §7.2 is the audit that establishes the second half for the
+/// entry pair, global by global; for the owned modules it is the mechanism's
+/// own construction (§7.9.4): the base-world store gate refuses to store a
+/// world that loaded one, and a macro-world compile never loads through the
+/// scope. The first half is what `analyze_source_owning_overlay_modules`
 /// returns. Every `Document` query returns owned values, so nothing borrowed
 /// from the program outlives the borrow of `self` that produced it.
 ///
 /// `Drop` does the ordering in one visible place — program first, then the
-/// two reclaims — rather than leaning on field declaration order.
+/// reclaims — rather than leaning on field declaration order.
 pub struct AnalyzedProgram {
     program: Option<Program<'static>>,
     /// The leaked entry text the program borrows (`None` on a document that
@@ -459,6 +467,10 @@ pub struct AnalyzedProgram {
     /// The leaked entry tree the program borrows (`None` when parsing produced
     /// no tree, or nothing was analyzed).
     ast: Option<LeakedEntryAst>,
+    /// The overlay-served module allocations the analysis owns (M9): one
+    /// text + tree (+ rendered errors when broken) per overlay-resident
+    /// module its loader read. Empty when it loaded none.
+    owned_modules: OwnedModules,
 }
 
 impl AnalyzedProgram {
@@ -467,16 +479,23 @@ impl AnalyzedProgram {
     /// # Safety
     ///
     /// `program` must borrow nothing with a non-`'static` life other than
-    /// `*text` and `*ast` — it is the program `analyze_source_reclaimable`
-    /// built over exactly that text and returned with exactly that `ast`
-    /// handle — and nothing else may hold a reference derived from either
-    /// leak: when this value drops, both are freed.
+    /// `*text`, `*ast`, and the `owned_modules` allocations — it is the
+    /// program `analyze_source_owning_overlay_modules` built over exactly
+    /// that text and returned with exactly these handles — and nothing else
+    /// may hold a reference derived from any of them: when this value drops,
+    /// all are freed.
     unsafe fn new(
         program: Option<Program<'static>>,
         text: Option<Leaked<str>>,
         ast: Option<LeakedEntryAst>,
+        owned_modules: OwnedModules,
     ) -> AnalyzedProgram {
-        AnalyzedProgram { program, text, ast }
+        AnalyzedProgram {
+            program,
+            text,
+            ast,
+            owned_modules,
+        }
     }
 
     /// No program, nothing leaked — the internal-error document's analysis.
@@ -485,6 +504,7 @@ impl AnalyzedProgram {
             program: None,
             text: None,
             ast: None,
+            owned_modules: OwnedModules::none(),
         }
     }
 
@@ -512,6 +532,10 @@ impl Drop for AnalyzedProgram {
             // SAFETY: as above; the tree's only borrower is gone.
             unsafe { ast.reclaim() };
         }
+        // SAFETY: as above — the program was the owned modules' only
+        // borrower (the `new` contract; leak-soak.md §7.9.4's store gate and
+        // macro carve-out are what keep every global out of them).
+        unsafe { std::mem::take(&mut self.owned_modules).reclaim() };
     }
 }
 
@@ -771,11 +795,18 @@ impl Document {
                 })
                 .collect(),
         };
+        // The M9 opt-in (leak-soak.md §7.9.4): modules served from the
+        // open-document overlay parse into allocations THIS analysis owns —
+        // returned as `owned_modules` — instead of entries in the
+        // process-global caches, which a keystroke's content would leak for
+        // the session (§7.5). The `AnalyzedProgram` built below owns and
+        // reclaims them beside the entry text and tree.
         let vilan_core::AnalyzedEntry {
             program,
             diagnostics,
             ast,
-        } = analyze_source_reclaimable(
+            owned_modules,
+        } = analyze_source_owning_overlay_modules(
             leaked,
             &std,
             &pkg_root,
@@ -815,13 +846,18 @@ impl Document {
             .as_ref()
             .map(vilan_core::platform_color::requirements)
             .unwrap_or_default();
-        // SAFETY: `program` was built by `analyze_source_reclaimable` over
-        // `leaked` (the text `leaked_text` owns) and returned with `ast`, the
-        // handle to the very tree it borrows; everything read from it above
-        // was copied into owned values (`entity_spans`, the diagnostics, the
-        // requirements). Nothing else borrows either allocation — leak-soak.md
-        // §7.2 audits every process-global and every thread-local for that.
-        let program = unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast) };
+        // SAFETY: `program` was built by `analyze_source_owning_overlay_modules`
+        // over `leaked` (the text `leaked_text` owns) and returned with `ast`
+        // — the handle to the very tree it borrows — and `owned_modules`, the
+        // allocations of exactly the overlay-served modules it loaded;
+        // everything read from it above was copied into owned values
+        // (`entity_spans`, the diagnostics, the requirements). Nothing else
+        // borrows any of these allocations — leak-soak.md §7.2 audits every
+        // process-global and thread-local for the entry pair, and §7.9.4's
+        // store gate and macro carve-out keep every global out of the owned
+        // modules.
+        let program =
+            unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) };
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
@@ -8058,6 +8094,544 @@ mod entry_reclaim {
         assert!(!document.program.is_some());
         drop(document);
         assert_eq!(leak_tally::released_total(), 0);
+    }
+}
+
+/// M9 (`leak-soak.md` §7.9.4): the §7.5 dependent-edit shape — an edited file
+/// that another OPEN document imports. `did_change` updates the overlay and
+/// `reanalyze_dependents` re-analyzes the importer, whose loader reads the
+/// edited buffer from the overlay; every landed keystroke is a DISTINCT
+/// content. This is §7.9.1's throwaway probe promoted into the harness as the
+/// measurement. Platform-independent like `entry_reclaim` above — the
+/// instrument is the thread-local leak tally and a wall clock, no `/proc`.
+#[cfg(test)]
+mod overlay_module_reclaim {
+    use super::*;
+    use crate::document::tests::{on_big_stack, std_root};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    /// The open importer: `main.vl`, importing the module under edit.
+    const ENTRY: &str =
+        "import pkg::helper::value;\n\nfun main() {\n\tlet doubled = value() * 2;\n}\n";
+
+    /// One DISTINCT, fixed-width clean helper content per `i` — a landed
+    /// keystroke in a 36-byte file. Fixed width so per-content byte claims
+    /// are exact multiples.
+    fn clean_helper(i: usize) -> String {
+        format!("export fun value(): i32 {{\n\t{:06}\n}}\n", 100000 + i)
+    }
+
+    /// One DISTINCT broken helper content per `i` — the same file mid-edit,
+    /// missing its closing brace, so it does not parse clean.
+    fn broken_helper(i: usize) -> String {
+        format!("export fun value(): i32 {{\n\t{:06}\n", 100000 + i)
+    }
+
+    /// A realistically sized module under edit (~8.5 KB, 121 functions): the
+    /// timing fixture, so the re-parse cost the mechanism trades for the leak
+    /// is measured on a file big enough to see.
+    fn large_helper(i: usize) -> String {
+        let mut text = clean_helper(i);
+        for ordinal in 0..120 {
+            text.push_str(&format!(
+                "export fun value_{ordinal:03}(): i32 {{\n\tlet a = {ordinal} + 1;\n\tlet b = a * 2;\n\ta + b\n}}\n"
+            ));
+        }
+        text
+    }
+
+    /// A scratch package on disk: `main.vl` beside `helper.vl` (the loader
+    /// resolves `pkg::helper` next to the entry). Unique per call — the
+    /// overlay is process-global, so two tests must never share a path.
+    fn scratch_package() -> (PathBuf, PathBuf, PathBuf) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_m9_overlay_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let entry_path = dir.join("main.vl");
+        let helper_path = dir.join("helper.vl");
+        std::fs::write(&entry_path, ENTRY).expect("write main.vl");
+        std::fs::write(&helper_path, clean_helper(0)).expect("write helper.vl");
+        (dir, entry_path, helper_path)
+    }
+
+    /// One measured phase: `count` dependent re-analyses of the entry, the
+    /// helper's overlay set to `helper_at(start + round)` before each, every
+    /// analysis landed through `adopt_analysis` — the server's flow. Returns
+    /// the wall time of the whole phase; the caller reads the tally.
+    fn run_phase(
+        document: &mut Document,
+        entry_path: &Path,
+        helper_path: &Path,
+        helper_at: &dyn Fn(usize) -> String,
+        start: usize,
+        count: usize,
+    ) -> Duration {
+        let std_dir = std_root();
+        let phase_start = Instant::now();
+        for round in start..start + count {
+            vilan_core::analyzer::set_document_overlay(helper_path, Some(helper_at(round)));
+            let analysis = Document::analyze_on_this_thread(ENTRY, &std_dir, entry_path);
+            document.adopt_analysis(analysis);
+        }
+        phase_start.elapsed()
+    }
+
+    fn per_analysis(wall: Duration, count: usize) -> String {
+        format!(
+            "{:.2} ms/analysis",
+            wall.as_secs_f64() * 1000.0 / count as f64
+        )
+    }
+
+    /// The M9 claim, asserted after every measured phase: the overlay's
+    /// churning contents reached NEITHER process-global cache — zero growth
+    /// at `parse_clean_cached`'s two sites (which §7.5 measured leaking one
+    /// text + tree per distinct content, and §7.9.1 measured leaking a
+    /// broken content's text a second time) and zero at the loader's
+    /// error-cache sites.
+    fn assert_no_global_cache_growth(label: &str) {
+        for site in [
+            LeakSite::ParseCleanCacheText,
+            LeakSite::ParseCleanCacheAst,
+            LeakSite::ModuleErrorText,
+            LeakSite::ModuleErrorAst,
+        ] {
+            assert_eq!(
+                leak_tally::bytes(site),
+                0,
+                "[{label}] the overlay-served module grew the process-global \
+                 cache site {site:?} — §7.5's session leak is back",
+            );
+        }
+    }
+
+    /// The measurement (§7.9.1's table, plus wall clocks): distinct clean
+    /// contents, one repeated content, distinct broken contents — small and
+    /// large helper — with the per-site tally read after each phase and the
+    /// outstanding balances read after the document drops.
+    #[test]
+    fn dependent_edit_measurement() {
+        let (dir, entry_path, helper_path) = scratch_package();
+        on_big_stack(move || {
+            let std_dir = std_root();
+            // Warmup: fills std's parses; the entry imports `pkg::`, so no
+            // base world is stored for it (the cache's own gate).
+            vilan_core::analyzer::set_document_overlay(&helper_path, Some(clean_helper(0)));
+            let mut document = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+            for _ in 0..2 {
+                let analysis = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+                document.adopt_analysis(analysis);
+            }
+            assert!(
+                document.diagnostics.is_empty(),
+                "the fixture must compile clean, got {:?}",
+                document.diagnostics
+            );
+
+            let report = |label: &str, analyses: usize, wall: Duration| {
+                println!(
+                    "[m9 {label}] {} over {analyses} analyses: \
+                     ParseCleanCacheText {} B, ParseCleanCacheAst {} B, \
+                     ModuleErrorText {} B, ModuleErrorAst {} B; \
+                     owned gross {} / {} / {} B, owned outstanding {} / {} / {} B; \
+                     entry outstanding {} / {} B",
+                    per_analysis(wall, analyses),
+                    leak_tally::bytes(LeakSite::ParseCleanCacheText),
+                    leak_tally::bytes(LeakSite::ParseCleanCacheAst),
+                    leak_tally::bytes(LeakSite::ModuleErrorText),
+                    leak_tally::bytes(LeakSite::ModuleErrorAst),
+                    leak_tally::bytes(LeakSite::OwnedModuleText),
+                    leak_tally::bytes(LeakSite::OwnedModuleAst),
+                    leak_tally::bytes(LeakSite::OwnedModuleErrors),
+                    leak_tally::outstanding(LeakSite::OwnedModuleText),
+                    leak_tally::outstanding(LeakSite::OwnedModuleAst),
+                    leak_tally::outstanding(LeakSite::OwnedModuleErrors),
+                    leak_tally::outstanding(LeakSite::LspEntryText),
+                    leak_tally::outstanding(LeakSite::EntryAst),
+                );
+            };
+
+            // Phase 1: 30 DISTINCT clean contents — 30 landed keystrokes.
+            leak_tally::reset();
+            let wall = run_phase(
+                &mut document,
+                &entry_path,
+                &helper_path,
+                &clean_helper,
+                1,
+                30,
+            );
+            report("distinct-clean", 30, wall);
+            assert_no_global_cache_growth("distinct-clean");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                30 * clean_helper(1).len(),
+                "each analysis owns exactly one copy of the edited module"
+            );
+
+            // Phase 2: 30 re-analyses of ONE content — a repeated buffer.
+            leak_tally::reset();
+            let wall = run_phase(
+                &mut document,
+                &entry_path,
+                &helper_path,
+                &|_| clean_helper(1),
+                0,
+                30,
+            );
+            report("repeated-clean", 30, wall);
+            assert_no_global_cache_growth("repeated-clean");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                30 * clean_helper(1).len(),
+                "a repeated content is parsed and owned per analysis — the \
+                 mechanism's stated, bounded cost"
+            );
+
+            // Phase 3: 20 DISTINCT broken contents — the file mid-edit.
+            leak_tally::reset();
+            let wall = run_phase(
+                &mut document,
+                &entry_path,
+                &helper_path,
+                &broken_helper,
+                1,
+                20,
+            );
+            assert!(
+                !document.diagnostics.is_empty(),
+                "a broken helper must surface diagnostics in the importer"
+            );
+            report("distinct-broken", 20, wall);
+            assert_no_global_cache_growth("distinct-broken");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                20 * broken_helper(1).len(),
+                "a broken content's text is owned ONCE — §7.9.1's \
+                 pre-cleanliness double-leak stays retired"
+            );
+            assert!(
+                leak_tally::bytes(LeakSite::OwnedModuleErrors) > 0,
+                "a broken content's rendered errors are analysis-owned"
+            );
+
+            // Phase 4/5: the large helper, distinct then repeated — the
+            // timing pair the perf number comes from.
+            leak_tally::reset();
+            let wall = run_phase(
+                &mut document,
+                &entry_path,
+                &helper_path,
+                &large_helper,
+                1,
+                30,
+            );
+            assert!(
+                document.diagnostics.is_empty(),
+                "the large fixture must compile clean, got {:?}",
+                document.diagnostics
+            );
+            report("distinct-clean-large", 30, wall);
+            assert_no_global_cache_growth("distinct-clean-large");
+
+            leak_tally::reset();
+            let wall = run_phase(
+                &mut document,
+                &entry_path,
+                &helper_path,
+                &|_| large_helper(1),
+                0,
+                30,
+            );
+            report("repeated-clean-large", 30, wall);
+            assert_no_global_cache_growth("repeated-clean-large");
+
+            // The raw parse cost of the module under edit, isolated from the
+            // analysis around it: what one overlay-resident import adds to
+            // one dependent re-analysis once it is parsed per analysis.
+            for (label, text) in [("small", clean_helper(1)), ("large", large_helper(1))] {
+                let iterations = 200;
+                let parse_start = Instant::now();
+                for _ in 0..iterations {
+                    let (tree, _errors) = vilan_core::parsing::parse(&text);
+                    std::hint::black_box(&tree);
+                }
+                let wall = parse_start.elapsed();
+                println!(
+                    "[m9 parse-cost {label}] {} B: {:.3} ms/parse",
+                    text.len(),
+                    wall.as_secs_f64() * 1000.0 / iterations as f64,
+                );
+            }
+
+            leak_tally::reset();
+            drop(document);
+            println!(
+                "[m9 after-drop] outstanding: LspEntryText {} B, EntryAst {} B, \
+                 OwnedModuleText {} B, OwnedModuleAst {} B, OwnedModuleErrors {} B",
+                leak_tally::outstanding(LeakSite::LspEntryText),
+                leak_tally::outstanding(LeakSite::EntryAst),
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                leak_tally::outstanding(LeakSite::OwnedModuleAst),
+                leak_tally::outstanding(LeakSite::OwnedModuleErrors),
+            );
+
+            vilan_core::analyzer::set_document_overlay(&helper_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The core M9 pin, per case: a DISTINCT overlay content per analysis (a
+    /// landed keystroke) grows neither process-global cache; each analysis
+    /// owns exactly one copy of the edited module; supersession
+    /// (`adopt_analysis`) reclaims the previous analysis's copy; and closing
+    /// the document nets every owned site to zero.
+    #[test]
+    fn a_dependent_edits_module_copies_are_analysis_owned_and_reclaimed() {
+        let (dir, entry_path, helper_path) = scratch_package();
+        on_big_stack(move || {
+            let std_dir = std_root();
+            // Warm the process-global caches on the DISK content, so the
+            // measured window below sees only the overlay-served loads.
+            let _ = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+
+            let helper_bytes = clean_helper(1).len();
+            leak_tally::reset();
+            vilan_core::analyzer::set_document_overlay(&helper_path, Some(clean_helper(1)));
+            let mut document = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+            assert!(
+                document.diagnostics.is_empty(),
+                "the overlaid fixture must compile clean, got {:?}",
+                document.diagnostics
+            );
+            for keystroke in 2..=10 {
+                vilan_core::analyzer::set_document_overlay(
+                    &helper_path,
+                    Some(clean_helper(keystroke)),
+                );
+                let analysis = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+                document.adopt_analysis(analysis);
+            }
+            assert_no_global_cache_growth("distinct-content pin");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                10 * helper_bytes,
+                "each of the 10 analyses owns exactly one copy of the module text"
+            );
+            assert!(
+                leak_tally::bytes(LeakSite::OwnedModuleAst) > 0,
+                "no owned tree was recorded — the pin is vacuous"
+            );
+            // Supersession reclaimed every previous copy: only the CURRENT
+            // analysis's is still out.
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                helper_bytes as isize,
+                "adoption must reclaim the superseded analysis's module copy"
+            );
+            drop(document);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
+
+            vilan_core::analyzer::set_document_overlay(&helper_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The error-path pin: a buffer that is mid-edit and does not parse clean
+    /// used to leak TWICE per distinct content — `parse_clean_cached`'s
+    /// pre-cleanliness text copy (§7.9.1) plus the error cache's own text,
+    /// tree, and rendered errors. All of it is analysis-owned now, the
+    /// importer still surfaces the module's parse error, and closing the
+    /// document reclaims the error slice with the rest.
+    #[test]
+    fn a_broken_buffers_copies_and_errors_are_owned_and_reclaimed() {
+        let (dir, entry_path, helper_path) = scratch_package();
+        on_big_stack(move || {
+            let std_dir = std_root();
+            let _ = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+
+            let broken_bytes = broken_helper(1).len();
+            leak_tally::reset();
+            vilan_core::analyzer::set_document_overlay(&helper_path, Some(broken_helper(1)));
+            let mut document = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+            for keystroke in 2..=8 {
+                vilan_core::analyzer::set_document_overlay(
+                    &helper_path,
+                    Some(broken_helper(keystroke)),
+                );
+                let analysis = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+                document.adopt_analysis(analysis);
+            }
+            // Behavior parity with the global rich path: the importer names
+            // the module's parse error.
+            assert!(
+                document
+                    .diagnostics
+                    .iter()
+                    .any(|error| error.msg.contains("parse error in")),
+                "the broken module's parse error must reach the importer, got {:?}",
+                document.diagnostics
+            );
+            assert_no_global_cache_growth("broken-content pin");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                8 * broken_bytes,
+                "a broken content's text is owned ONCE per analysis — the \
+                 §7.9.1 double-leak stays retired"
+            );
+            assert!(
+                leak_tally::bytes(LeakSite::OwnedModuleErrors) > 0,
+                "no owned error slice was recorded — the pin is vacuous"
+            );
+            drop(document);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
+
+            vilan_core::analyzer::set_document_overlay(&helper_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The repeated-content pin: the mechanism's honest cost is one parse and
+    /// one owned copy per analysis even when the buffer has not changed —
+    /// bounded by the open set, reclaimed on supersession, never cached
+    /// globally.
+    #[test]
+    fn a_repeated_content_is_owned_per_analysis_and_reclaimed() {
+        let (dir, entry_path, helper_path) = scratch_package();
+        on_big_stack(move || {
+            let std_dir = std_root();
+            let _ = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+
+            let helper_bytes = clean_helper(1).len();
+            leak_tally::reset();
+            vilan_core::analyzer::set_document_overlay(&helper_path, Some(clean_helper(1)));
+            let mut document = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+            for _ in 0..4 {
+                let analysis = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+                document.adopt_analysis(analysis);
+            }
+            assert_no_global_cache_growth("repeated-content pin");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                5 * helper_bytes,
+                "a repeated content is parsed and owned per analysis"
+            );
+            drop(document);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
+
+            vilan_core::analyzer::set_document_overlay(&helper_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The multi-dependent pin: two open documents importing the edited
+    /// module each own their OWN copy — the bound is the open set — and each
+    /// copy dies with its document: dropping one leaves the other's analysis
+    /// answering from its own, live copy.
+    #[test]
+    fn each_open_dependent_owns_and_reclaims_its_own_copy() {
+        let (dir, entry_path, helper_path) = scratch_package();
+        let second_entry_path = dir.join("other.vl");
+        const SECOND_ENTRY: &str = "import pkg::helper::value;
+
+fun main() {
+	let tripled = value() * 3;
+}
+";
+        std::fs::write(&second_entry_path, SECOND_ENTRY).expect("write other.vl");
+        on_big_stack(move || {
+            let std_dir = std_root();
+            let _ = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+
+            let helper_bytes = clean_helper(1).len();
+            leak_tally::reset();
+            vilan_core::analyzer::set_document_overlay(&helper_path, Some(clean_helper(1)));
+            let first = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
+            let second =
+                Document::analyze_on_this_thread(SECOND_ENTRY, &std_dir, &second_entry_path);
+            assert!(
+                first.diagnostics.is_empty() && second.diagnostics.is_empty(),
+                "both dependents must compile clean, got {:?} / {:?}",
+                first.diagnostics,
+                second.diagnostics
+            );
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                2 * helper_bytes,
+                "each open dependent owns its own copy of the module"
+            );
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                2 * helper_bytes as isize,
+            );
+            drop(first);
+            assert_eq!(
+                leak_tally::outstanding(LeakSite::OwnedModuleText),
+                helper_bytes as isize,
+                "dropping one dependent must reclaim exactly its own copy"
+            );
+            assert!(
+                !second.semantic_tokens().is_empty(),
+                "the surviving dependent no longer answers from its program"
+            );
+            drop(second);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
+
+            vilan_core::analyzer::set_document_overlay(&helper_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The no-dependent pin: an analysis that loads no overlay-served module
+    /// — the ordinary open document, whatever unrelated overlays exist —
+    /// owns nothing, so the mechanism costs it nothing and the base-world
+    /// cache keeps working for it (the store gate reads the same emptiness).
+    #[test]
+    fn an_analysis_that_loads_no_overlay_module_owns_nothing() {
+        let unrelated =
+            std::env::temp_dir().join(format!("vilan_m9_unrelated_{}.vl", std::process::id()));
+        on_big_stack(move || {
+            vilan_core::analyzer::set_document_overlay(&unrelated, Some("x".to_string()));
+            leak_tally::reset();
+            let document = Document::analyze_on_this_thread(
+                "import std::print;
+
+fun main() {
+	print(1);
+}
+",
+                &std_root(),
+                Path::new("m9_no_dependent.vl"),
+            );
+            assert!(document.program.is_some(), "the fixture analyzes");
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText)
+                    + leak_tally::bytes(LeakSite::OwnedModuleAst)
+                    + leak_tally::bytes(LeakSite::OwnedModuleErrors),
+                0,
+                "an analysis with no overlay-served import must own no module copies"
+            );
+            drop(document);
+            assert_eq!(
+                leak_tally::released(LeakSite::OwnedModuleText)
+                    + leak_tally::released(LeakSite::OwnedModuleAst)
+                    + leak_tally::released(LeakSite::OwnedModuleErrors),
+                0,
+                "nothing owned, nothing to release"
+            );
+            vilan_core::analyzer::set_document_overlay(&unrelated, None);
+        });
     }
 }
 

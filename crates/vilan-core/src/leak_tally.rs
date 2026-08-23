@@ -76,6 +76,19 @@ pub enum LeakSite {
     ModuleErrorText,
     /// A non-clean module's leaked AST/error slice in the loader's error path.
     ModuleErrorAst,
+    /// An overlay-served module's source, parsed into an ANALYSIS-OWNED
+    /// allocation during an opted-in analysis (M9, `leak-soak.md` §7.9.4)
+    /// instead of an entry in the process-global caches. Like the entry
+    /// sites, reclaimed when the owning analysis is superseded or closed —
+    /// so its [`outstanding`] balance, not its gross [`bytes`], is what the
+    /// session-leak claim reads.
+    OwnedModuleText,
+    /// An overlay-served module's AST, analysis-owned (M9). Shallow record,
+    /// like the cache-bounded AST sites: the claim is that it nets to zero.
+    OwnedModuleAst,
+    /// An overlay-served non-clean module's rendered parse errors,
+    /// analysis-owned (M9). Shallow record of the slice.
+    OwnedModuleErrors,
     /// The macro world's ambient-prelude import text.
     MacroPreludeText,
     /// A macro world's blanked entry source (content-keyed by `WORLDS`).
@@ -101,7 +114,7 @@ pub enum LeakSite {
 }
 
 /// The number of [`LeakSite`] variants — keep in step with the enum.
-const SITE_COUNT: usize = 16;
+const SITE_COUNT: usize = 19;
 
 /// Every site in declaration order — keep in step with the enum; [`report`]
 /// iterates it.
@@ -114,6 +127,9 @@ const ALL_SITES: [LeakSite; SITE_COUNT] = [
     LeakSite::DisplayName,
     LeakSite::ModuleErrorText,
     LeakSite::ModuleErrorAst,
+    LeakSite::OwnedModuleText,
+    LeakSite::OwnedModuleAst,
+    LeakSite::OwnedModuleErrors,
     LeakSite::MacroPreludeText,
     LeakSite::MacroWorldText,
     LeakSite::MacroWorldProgram,

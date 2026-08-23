@@ -1396,6 +1396,7 @@ fn the_reclaimable_entry_analysis_hands_back_the_tree_it_leaked() {
                 program,
                 diagnostics,
                 ast,
+                owned_modules,
             } = vilan_core::analyze_source_reclaimable(
                 source,
                 &std,
@@ -1410,6 +1411,11 @@ fn the_reclaimable_entry_analysis_hands_back_the_tree_it_leaked() {
             );
             let program = program.expect("a clean compile yields a program");
             let ast = ast.expect("a parsed entry yields its tree handle");
+            assert!(
+                owned_modules.is_empty(),
+                "`analyze_source_reclaimable` did not opt in to owned overlay \
+                 modules, so it must own none"
+            );
             let recorded = leak_tally::bytes(LeakSite::EntryAst);
             assert!(
                 recorded > 0,
@@ -1522,6 +1528,250 @@ fn a_macro_worlds_tree_records_at_its_own_site_not_the_entrys() {
                  {cold_entry} B and the warm one {warm_entry} B, so the world's tree is \
                  leaking into the entry's site"
             );
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+}
+
+/// M9 (`leak-soak.md` §7.9.4): the opted-in entry point
+/// (`analyze_source_owning_overlay_modules`) parses an overlay-served module
+/// into ANALYSIS-OWNED allocations — no growth at either process-global cache
+/// site, one owned copy per analysis (no cross-analysis sharing), reclaimed
+/// to a zero balance once the program is dropped. The non-opted entry points
+/// keep today's behavior byte for byte: the same overlaid load goes through
+/// `parse_clean_cached` exactly as before (§7.9.4c — the CLI, the wasm front
+/// end, and every transient reader must not switch).
+#[test]
+fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_m9_core_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry_path = dir.join("main.vl");
+    let helper_path = dir.join("helper.vl");
+    std::fs::write(
+        &entry_path,
+        "import pkg::helper::value;\n\nfun main() {\n\tlet doubled = value() * 2;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(&helper_path, "export fun value(): i32 {\n\t1\n}\n").unwrap();
+    let overlaid = "export fun value(): i32 {\n\t22222\n}\n".to_string();
+    let overlaid_bytes = overlaid.len();
+    vilan_core::analyzer::set_document_overlay(&helper_path, Some(overlaid));
+
+    let source: &'static str = Box::leak(
+        std::fs::read_to_string(&entry_path)
+            .unwrap()
+            .into_boxed_str(),
+    );
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let std = std_spec();
+            let analyze_owning = || {
+                vilan_core::analyze_source_owning_overlay_modules(
+                    source,
+                    &std,
+                    &dir,
+                    &entry_path,
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                )
+            };
+            // Warmup: fill the process-global caches with std's parses (and
+            // the disk helper), so the measured window below reads only what
+            // the OVERLAY loads do.
+            let _ = analyze_owning();
+            leak_tally::reset();
+            let first = analyze_owning();
+            assert!(
+                first.diagnostics.is_empty(),
+                "expected a clean compile, got: {:#?}",
+                first.diagnostics
+            );
+            assert!(first.program.is_some());
+            assert_eq!(
+                first.owned_modules.len(),
+                1,
+                "the analysis owns exactly the one overlay-served module it loaded"
+            );
+            assert_eq!(
+                leak_tally::bytes(LeakSite::ParseCleanCacheText),
+                0,
+                "the overlaid content must not reach the process-global clean cache"
+            );
+            assert_eq!(leak_tally::bytes(LeakSite::ModuleErrorText), 0);
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                overlaid_bytes,
+                "the owned copy records the overlaid text to the byte"
+            );
+
+            // A second opted-in analysis of the SAME content parses and owns
+            // its own copy — nothing is shared across analyses, which is the
+            // whole soundness story.
+            let second = analyze_owning();
+            assert_eq!(second.owned_modules.len(), 1);
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                2 * overlaid_bytes,
+                "a second analysis must own its own copy, not share the first's"
+            );
+
+            // Reclaim in the owner's order: program first, then the handles.
+            for analyzed in [first, second] {
+                drop(analyzed.program);
+                if let Some(ast) = analyzed.ast {
+                    // SAFETY: the program — the tree's only borrower — was
+                    // dropped on the line above.
+                    unsafe { ast.reclaim() };
+                }
+                // SAFETY: as above — the owned copies' only borrower (the
+                // program; the store gate and macro carve-out keep every
+                // global out of them) is gone.
+                unsafe { analyzed.owned_modules.reclaim() };
+            }
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleAst), 0);
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleErrors), 0);
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                2 * overlaid_bytes,
+                "the gross record stands after the reclaim"
+            );
+
+            // The NON-opted path, same overlay: the process-global cache is
+            // used exactly as before — the §7.5 leak is the recorded,
+            // deliberate behavior for every caller that does not opt in.
+            leak_tally::reset();
+            let (program, errors) = analyze_source(
+                source,
+                &std,
+                &dir,
+                &entry_path,
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean compile: {errors:#?}");
+            assert!(program.is_some());
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                0,
+                "a non-opted analysis must own nothing"
+            );
+            assert_eq!(
+                leak_tally::bytes(LeakSite::ParseCleanCacheText),
+                overlaid_bytes,
+                "a non-opted analysis must keep serving the overlay through \
+                 `parse_clean_cached`, byte for byte as today"
+            );
+
+            vilan_core::analyzer::set_document_overlay(&helper_path, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+}
+
+/// M9 through a DEPENDENCY package (`leak-soak.md` §7.9.4): the multi-package
+/// workspace is exactly where an overlay-served module reaches a stored base
+/// world, so the mechanism must hold there too — the dependency's overlaid
+/// module (loaded through its surface's `pkg::` self-reference) is
+/// analysis-owned, exactly one copy, reclaimed to zero once the program
+/// drops. (The per-scope path memo itself is pinned at the loader,
+/// `analyzer::path_tests::an_active_scope_serves_a_repeat_load_from_its_memo`
+/// — no analysis seam loads one module twice today.)
+#[test]
+fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_m9_memo_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\n\nfun main() {\n\tlet _x = greeting();\n}\n",
+    )
+    .unwrap();
+    let dep_root = root.join("common");
+    std::fs::create_dir_all(&dep_root).unwrap();
+    std::fs::write(
+        dep_root.join("lib.vl"),
+        "import pkg::helper::dep_value;\nfun greeting(): i32 { dep_value() }\n",
+    )
+    .unwrap();
+    let dep_helper = dep_root.join("helper.vl");
+    std::fs::write(&dep_helper, "fun dep_value(): i32 { 1 }\n").unwrap();
+    let workspace = Workspace {
+        packages: vec![PackageSpec {
+            base_root: dep_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+        }],
+        entry_dependencies: vec![("common".to_string(), 0)],
+        macro_limits: MacroLimits::default(),
+    };
+    let overlaid = "fun dep_value(): i32 { 424242 }\n".to_string();
+    let overlaid_bytes = overlaid.len();
+    vilan_core::analyzer::set_document_overlay(&dep_helper, Some(overlaid));
+    let entry_path = app_dir.join("main.vl");
+    let source: &'static str = Box::leak(
+        std::fs::read_to_string(&entry_path)
+            .unwrap()
+            .into_boxed_str(),
+    );
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let std = std_spec();
+            let analyze_owning = || {
+                vilan_core::analyze_source_owning_overlay_modules(
+                    source,
+                    &std,
+                    &app_dir,
+                    &entry_path,
+                    Some(Platform::default()),
+                    &workspace,
+                )
+            };
+            let _warmup = analyze_owning();
+            leak_tally::reset();
+            let analyzed = analyze_owning();
+            assert!(
+                analyzed.diagnostics.is_empty(),
+                "expected a clean compile, got: {:#?}",
+                analyzed.diagnostics
+            );
+            assert_eq!(
+                analyzed.owned_modules.len(),
+                1,
+                "the dependency's overlaid module must be parsed and owned once"
+            );
+            assert_eq!(
+                leak_tally::bytes(LeakSite::OwnedModuleText),
+                overlaid_bytes,
+                "the owned copy records the overlaid text to the byte"
+            );
+            drop(analyzed.program);
+            if let Some(ast) = analyzed.ast {
+                // SAFETY: the program was dropped on the line above.
+                unsafe { ast.reclaim() };
+            }
+            // SAFETY: as above — the program was the owned copy's only borrower.
+            unsafe { analyzed.owned_modules.reclaim() };
+            assert_eq!(leak_tally::outstanding(LeakSite::OwnedModuleText), 0);
+
+            vilan_core::analyzer::set_document_overlay(&dep_helper, None);
+            let _ = std::fs::remove_dir_all(&root);
         })
         .expect("spawn worker")
         .join()
