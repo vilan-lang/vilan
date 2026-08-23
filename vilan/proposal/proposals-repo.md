@@ -307,3 +307,68 @@ at the price of five stub files. Exact membership is an owner call (§8).
 6. **Tracker home**: §4 concludes papers and tracker move together, one
    `main`, lane worktrees on both repos. Confirm the working
    arrangement before any brief is written against it.
+
+## 9. Prepared (2026-08-23, lane n15-proposals-cutover)
+
+The §8 ruling is executed locally end-to-end; nothing external was
+touched. The extracted repo, the runbook, and the compiler-side freeze
+patch sit in the lane's scratch space (`n15/`: `runbook.md`,
+`extract.sh`, `0001-the-freeze.patch`, `make-freeze-commit.sh` +
+`repoint.diff`, `scaffold/`, and the verified dry-run repo at
+`proposals/`).
+
+- **Extraction, executed and verified** (dry run at `9005ca18`, this
+  branch's base). One correction to §2's command, found on the dry run:
+  the directory had two earlier roots (`src/vilan-source/proposal/` at
+  birth 2026-06-14, `vilan-source/proposal/` after "refactor stage 1"),
+  so the filter names all three prefixes, each renamed to `proposal/` —
+  the single-path form silently drops the 13 first-era commits. Result:
+  **105 files, 950 commits** kept of 1,714; tip tree byte-identical to
+  the freeze sha's `vilan/proposal/` (`diff -r` clean); no path outside
+  `proposal/` anywhere in the rewritten history; `--follow` spot-checks:
+  `process.md` subject-identical (4/4), `backlog.md` subject-identical
+  (155/155, plus the structure move), `memory-management.md` reaches its
+  2026-06-16 birth. The root-refactor rename commits drop out of
+  per-file logs in the new repo — the three roots normalize to one path,
+  which is the desired reading.
+- **Layout, as ruled**: top level `proposal/` (94 papers + the index +
+  `perf-baseline.jsonl` + `e63-drafts/` + seven one-line stubs),
+  `tracker/` (`backlog-2026-08-18.md`, `backlog-archive.md` —
+  structurally separate per the ruling), `archive/` (`backlog.md`,
+  `backlog-2026-07-18.md`, `roadmap.md`, `memory-management.md`,
+  `memory-management-rev-1.md`). §6's banner-stub device is extended to
+  the two tracker files so the dense `record:`-relative mesh keeps
+  landing. Two follow-up commits after the verified import — structure,
+  then scaffolding (repo README, the license pair copied at the freeze
+  sha, and the §6 gate: one python script + one workflow, needles
+  assembled at runtime, the owner-string allowlist re-rooted to
+  `proposal/org-migration.md`, `proposal/releases.md`,
+  `archive/backlog.md`, `archive/backlog-2026-07-18.md`, plus the
+  index-completeness gate — green on the result: 117 files at HEAD,
+  952 commits). The order deviates from §7.3 (structure before
+  scaffolding) so the allowlist is written once, against final paths.
+- **The compiler-side freeze** is a format-patch, deliberately not
+  committed: no pointer update is correct while `vilan/proposal/` still
+  exists and the new repo does not, so this records commit is the
+  branch's only content. The patch (one commit): delete all 105 files;
+  banner `vilan/proposal/README.md` naming the new repo, the freeze sha,
+  and the history-stays-queryable-here rule; hygiene.rs's owner-string
+  allowlist emptied with its doc comments re-pointed (§5.1); ci.yml's
+  prose-filter comment (§5.3); AGENTS.md and CLAUDE.md pointers
+  re-pointed workspace-relative (`proposals/proposal/…`, tracker at
+  `proposals/tracker/backlog-2026-08-18.md`); the nine §5.6 book links
+  (`introduction.md`'s backlog link goes to `tree/main/tracker` so era
+  re-baselines don't 404 it; `memory.md`'s rev-1 link goes to
+  `archive/`). `cut-release.sh`'s `^vilan/proposal/` exclusion stays per
+  §5.2 (the sweep is at line 360 today). Verified: the full suite is
+  green with the patch applied on a throwaway branch, and green without
+  it.
+- **Runbook** (`n15/runbook.md`): owner creates the empty repo → re-run
+  `extract.sh` at the real freeze sha (deterministic; aborts on any
+  verification miss) → push `main` → verify on GitHub (count, history
+  spot-check, tracker/, gate green) → freeze on `next` (`git am`; drift
+  fallback `make-freeze-commit.sh` rebuilds the same commit
+  mechanically) → suite by exit code → push → machinery checklist
+  (§7.5–6). Rollback at both half-way points; the ordering invariant —
+  proposals live and verified before the freeze lands — makes the only
+  intermediate state "both copies exist".
