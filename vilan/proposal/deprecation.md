@@ -1,7 +1,9 @@
 # Deprecation — the machinery for the one-minor window (L4)
 
-> Status: PROPOSED 2026-08-20 (cycle 25, work order 7). Proposal-only —
-> no code ships with this note. Tracker: backlog-2026-08-18.md §L item 4.
+> Status: PROPOSED 2026-08-20 (cycle 25, work order 7); RULED 2026-08-22
+> (all four questions as recommended — see the block above the questions);
+> MACHINERY SHIPPED 2026-08-23, lane l4 (order 9 wave 2) — the ship
+> record is §7. Tracker: backlog-2026-08-18.md §L item 4.
 >
 > This note decides nothing the ratified papers decided. process.md
 > §5.2(1) (RATIFIED 2026-08-07) is the promise: "a breaking change to
@@ -311,3 +313,98 @@ exists — the attribute will be ready; the promise waits.
    window on the next real retirement — versus holding the whole
    exercise for a real candidate. If you rule "hold", the machinery
    should still not merge unpinned; only the calendar rehearsal waits.
+
+## 7. Ship record (2026-08-23, lane l4)
+
+The machinery of §§1–5 is built, pinned, and merged as three commits
+(the attribute + warning; the lifetime markers + cut audit; the CLI
+rename mechanism) plus this record. Everything below is as designed
+above unless it says otherwise; the decisions the paper left open are
+recorded here.
+
+**§1–§2, the attribute and the warning — shipped.**
+`[deprecated("use …")]` leads the ordered function-attribute chain
+(before `[extern(..)]`; parsing.rs's `parse_deprecated_attribute`, the
+whitelist entry ×3 grammars under the grammar_sync gate), flattens into
+`Func::deprecated` beside `must_use`, and is carried on both `Function`
+and `ExternalFunction` in the analyzer — std's retire-shaped items are
+often externals. `check_deprecated` is the third producer on the
+warning channel, run beside `check_must_use`; the head is ledger row
+246 (row 247 the CLI flavor; both provisional to this lane — the
+orchestrator renumbers at merge). Pins: inference.rs (the
+`assert_warns_spanning` helper — the warning twin of
+`assert_fails_spanning`, asserting span, head fragment, and a CLEAN
+program — plus seven cases), vilan-lsp document.rs (publishes as a
+WARNING diagnostic), all plant-proven red. The book: spec §3.3 carries
+the production and the semantics; the lexical/appendix keyword lists
+and the error index carry the head.
+
+Decisions recorded:
+
+- **The steer is the attribute's argument, verbatim.** The message is
+  `` `{name}` is deprecated; {steer} `` and the `use {replacement}`
+  clause of §1's family head is the steer's *convention* (std will hold
+  to it; the book documents it), not compiler-enforced — the compiler
+  neither prepends `use` nor parses the clause. B4's code-shaped
+  replacement is the author's spelling choice inside the string.
+- **A use inside another deprecated item still warns.** No Rust-style
+  suppression: per §1, each site is an independent fix — the deprecated
+  wrapper's body must migrate too. Pinned
+  (`a_use_inside_another_deprecated_item_still_warns`).
+- **What counts as a use: calls (free and method) and the function
+  passed as a value.** All three warn, each at its name span, pinned.
+  An `import` line alone does not warn — the loader mints no value
+  reference for it — and that is the behavior we want: the actionable
+  fix sites are the uses; a dead import falls out with the last one.
+- **A2's boundary is `std_sources`,** not the S1 frozen ranges (which
+  are empty under full scan — the differential gate would split). A
+  *dependency package's* internal use of its own deprecated form is not
+  exempted; only std is. Revisit when L10 gives packages a deprecation
+  story of their own (§6's posture unchanged).
+- **Placement stays functions-only** (free, member, external — one
+  `parse_function`). A struct/module/field placement arrives with the
+  first deprecation that needs it, as §2 says. `[deprecated]` with no
+  argument does not parse: the warning's head needs its steer.
+
+**§3, the lifetime markers and the cut audit — shipped.**
+`deprecates:`/`removes:` markers in the family-marker idiom (one KEY
+per line; repetition legal, unlike `family:`/`commit:`); the sweep in
+`cut-release.sh` refuses an Unreleased `removes:` with no released
+`deprecates:` (same-section match refused, printed with the §5.2(1)
+rule), refuses either marker on a patch cut, reports pending
+deprecations (key + shipping train) at every cut, and the rewrite
+carries the markers into the release section. The L11 stranding
+discipline covers the new markers; an empty KEY refuses. Seven pins in
+release_scripts.rs through the `--out`/`--dry-run` seam, plant-proven.
+
+**§4, CLI renames — the mechanism shipped, unwired.**
+`reconcile_renamed_flag` + `deprecated_spelling_warning` in vilan-cli
+main.rs: the old spelling as its own `#[arg(long, hide = true)]` arg,
+folded at dispatch (old alone warns; both agreeing fold, still warning;
+both conflicting refuse naming the spelling to drop). Pinned on a
+SYNTHETIC pair (`--fresh-spelling`/`--stale-spelling`) in main.rs's
+tests — no real rename exists, and none was invented; `--target` stays
+the silent courtesy alias §4 distinguishes. The helpers carry
+`#[cfg_attr(not(test), allow(dead_code))]` until the first real rename
+wires them; a renamed *subcommand* and a `vilan.toml` key rename take
+the same shape through the same head helper when they arrive.
+
+**§5, the exercise — both synthetic legs shipped; the rehearsal
+pending.** The mechanism leg runs twice: the self-deprecating fixture
+program (per §5.1) and a FIXTURE STD — a copy of the real `std` with a
+`deprecated_probe` module, resolved through `resolve_std` and the real
+module loader — pinning both halves end to end: the std-marked item
+warns at its user-code use (exactly the call site), and the same item
+used only std-internally stays silent (the A2 pin). The process leg is
+§3's pins: the jumped-window refusal, the released-match accept, the
+same-train non-match, the pending report. **The voluntary two-train
+window is PENDING, not simulated**: the standing instruction stands —
+the next genuinely retire-shaped std ruling takes the window road even
+if it lands before the switch (warn in train N with the markers, remove
+in N+1). No candidate exists as of this record (E64/E71 drained the
+queue; B127's `into` is Tier 3 and proves nothing).
+
+**Follow-ups, unchanged from the paper:** the LSP's
+`DiagnosticTag::Deprecated` strikethrough (free once wanted; not
+scope), attribute placement beyond functions, `vilan.toml` key renames,
+and the L10 package story.

@@ -48,6 +48,11 @@ The return type is now inferred from every return position — the final express
 
 ---
 
+<!-- family: tooling -->
+**The deprecation machinery lands, ahead of the promise it serves.** The ratified beta contract promises that a breaking change to the language or std ships first as a *warning* naming its replacement, with the removal no earlier than the following minor — and until now nothing in the toolchain could carry that promise out. The machinery exists end to end: `[deprecated("use two()")]` on a function — std's or yours, the attribute is honored wherever it appears (spec §3.3 documents it, beside `[must_use]` and the rest of the attribute chain) — makes every use outside the standard library warn, `` `one` is deprecated; use two() `` at the using name, once per use site, never failing the build, in the terminal and as a warning diagnostic in the editor. The CHANGELOG carries each form's lifetime in marker lines the cut already reads: `<!-- deprecates: KEY -->` on the train that ships the warning, `<!-- removes: KEY -->` on the train that removes, and `scripts/cut-release.sh` now REFUSES a removal whose deprecation never shipped in a released minor — a deprecation in the same Unreleased section does not count, a patch cut carries neither marker, and a deprecation still in its window is reported at every cut so no open window lingers invisibly. For a CLI flag or subcommand rename, the old spelling can now stay through its window as a hidden argument that warns and folds into the new one (clap's `alias` records nothing to warn on, so it cannot do this job); no real rename exists yet — the mechanism is pinned on a synthetic pair, and `--target` remains what it always was, a documented courtesy alias with no removal intended. The window obligation itself starts at the beta switch; shipping the machinery first, exercised end to end before it is load-bearing, is what the beta paper asks. `proposal/deprecation.md` is the record.
+
+---
+
 ## v0.35.0 — 2026-08-21
 
 <!-- family: breaking -->
