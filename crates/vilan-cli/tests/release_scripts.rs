@@ -628,7 +628,10 @@ fn the_cut_reports_shipped_deprecations_still_pending_removal() {
         "## v0.1.0 — 2026-01-01\n\n<!-- deprecates: std::old::thing -->",
     );
     let fixture = Fixture::new("pending-report", &pending);
-    let (ok, report) = fixture.script("cut-release.sh", &["--date", "2026-01-02", "--dry-run", "9.9.0"]);
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &["--date", "2026-01-02", "--dry-run", "9.9.0"],
+    );
     assert!(ok, "a pending deprecation must not red the cut:\n{report}");
     assert!(
         report.contains("deprecations still in their window (report only)"),
@@ -682,7 +685,9 @@ fn a_stranded_lifetime_marker_is_refused_like_any_other() {
     let line = line_of(&empty, "<!-- removes: -->");
     let report = refuse_minor("empty-key", &empty);
     assert!(
-        report.contains(&format!("marker `<!-- removes: -->` at line {line} names no key")),
+        report.contains(&format!(
+            "marker `<!-- removes: -->` at line {line} names no key"
+        )),
         "{report}"
     );
 }
