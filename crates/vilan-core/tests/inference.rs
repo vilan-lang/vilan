@@ -11531,12 +11531,14 @@ fn one_bad_ret_among_good_ones_is_flagged() {
     );
 }
 
-// In a function with NO declared return type, `ret <value>` is unchecked and
-// the value is discarded — the same rule as the (unchecked) tail of a void
-// function. Consistency with the tail is the deliberate semantic
-// (proposal/ret-checking.md rule 3).
+// In a function with NO declared return type, a `ret` is return evidence
+// like the tail (proposal/ret-checking.md rule 3, amended by B126): here a
+// `ret` of a void call beside a body that ends without a value — both void,
+// so they agree. Re-pinned from `ret_with_a_value_in_an_undeclared_void_
+// function_is_allowed`, whose comment said the value was "discarded, not
+// diagnosed"; it is neither now, it is read.
 #[test]
-fn ret_with_a_value_in_an_undeclared_void_function_is_allowed() {
+fn b126_a_void_ret_agrees_with_a_void_body() {
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -11554,6 +11556,725 @@ fn ret_with_a_value_in_an_undeclared_void_function_is_allowed() {
         }
         "#,
         "early\nlate\n",
+    );
+}
+
+// --- B126: an unannotated function's return type is inferred from its
+// reachable tail AND every `ret` (proposal/ret-checking.md rule 3, amended
+// 2026-08-22). Before: the `Type::Function` arm read the tail id alone, so
+// `fun f(x: bool) { ret 1; }` was `void` at every call site and a `ret` of the
+// wrong type was invisible — `{ if x { ret "s"; } 2 }` handed a `str` to an
+// `i32` binding at runtime. One helper (`inferred_return_type`) now answers
+// for the call site, closure coercion, the `for` protocol's `next`, and trait
+// conformance; each pin below is one shape of the rule.
+
+// The headline: a body that leaves only by `ret` has an unreachable
+// (synthesized void) tail, which is no evidence. Plant-proven: dropping the
+// rets from the evidence, or reading the dead tail as reachable, turns this red.
+#[test]
+fn b126_a_ret_only_body_infers_its_return_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	ret 1;
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        	print(y);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// Unchanged by the amendment: no `ret`, the tail decides.
+#[test]
+fn b126_a_tail_only_body_still_infers_from_its_tail() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f() {
+        	5
+        }
+
+        fun main() {
+        	let y: i32 = f();
+        	print(y);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+// A reachable tail and a `ret` that agree — both paths run.
+#[test]
+fn b126_a_ret_and_a_tail_that_agree_infer_one_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	2
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        	print(y);
+        	print(f(false));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+// The disagreement is refused at the `ret`, naming both types and the tail it
+// is measured against, with a note at that tail — and it is the ONLY
+// diagnostic: the function's calls type as `any` afterwards, so the old
+// `Expected i32, but got void` never appears beside it (B5).
+#[test]
+fn b126_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret "s";
+        	}
+        	2
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        }
+        "#;
+    let head = "this `ret` returns str, but the function's return type is inferred as i32 from its tail; make every return agree, or declare the return type";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_once_with(source, "return type is inferred");
+    assert_fails_noting(source, head, "2", "the tail it is inferred from");
+    assert_fails_without(source, "Expected");
+}
+
+// A bare `ret` is `ret <void>` (rule 2's reading): it disagrees with a value
+// tail. Before the amendment `f(true)` handed back `undefined` under `i32`.
+#[test]
+fn b126_a_bare_ret_in_a_value_tailed_function_is_refused() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret;
+        	}
+        	2
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret",
+        "a bare `ret` returns nothing, but the function's return type is inferred as i32 from its tail; return a value, or declare the return type",
+    );
+    assert_fails_without(source, "Expected");
+}
+
+// The tail the body CAN reach is evidence even when it is the parser's
+// synthesized void after a last statement that does not leave: `f(false)`
+// falls through, so typing the function `i32` from its `ret` would be the
+// `undefined`-under-`i32` miscompile one layer up. The origin is named as the
+// body ending without a value, noted at the closing brace.
+#[test]
+fn b126_a_value_ret_beside_a_fall_through_is_refused() {
+    let source = r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	print("fell through");
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        }
+        "#;
+    let head = "this `ret` returns i32, but the function's return type is inferred as void from its body ending without a value; make every return agree, or declare the return type";
+    assert_fails_spanning(source, "ret 1", head);
+    assert_fails_noting_nth(source, head, "}", 1, "the body ends here without a value");
+    assert_fails_without(source, "Expected");
+}
+
+// The other fall-through spelling: the tail IS an `if` with no `else`, which
+// produces void on the path that takes no branch (S3's regime 2, named the
+// same way here).
+#[test]
+fn b126_a_value_ret_beside_an_else_less_if_tail_is_refused() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret 1",
+        "this `ret` returns i32, but the function's return type is inferred as void from its tail, an `if` with no `else`; make every return agree, or declare the return type",
+    );
+    assert_fails_noting(
+        source,
+        "an `if` with no `else`",
+        "if x {\n        \t\tret 1;\n        \t}",
+        "an `if` with no `else` produces void",
+    );
+}
+
+// A `ret` of a void call beside a value tail is the same disagreement, read
+// the other way round (rule 2's "a void call ret is not a value return").
+#[test]
+fn b126_a_void_ret_beside_a_value_tail_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret print("x");
+        	}
+        	1
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        }
+        "#,
+        "this `ret` returns void, but the function's return type is inferred as i32 from its tail",
+    );
+}
+
+// Several `ret`s and no reachable tail: they agree, and every path runs.
+#[test]
+fn b126_rets_that_agree_infer_one_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun sign(x: i32) {
+        	if x > 0 {
+        		ret 1;
+        	}
+        	if x < 0 {
+        		ret -1;
+        	}
+        	ret 0;
+        }
+
+        fun main() {
+        	let y: i32 = sign(5);
+        	print(y);
+        	print(sign(-3));
+        	print(sign(0));
+        }
+        "#,
+        "1\n-1\n0\n",
+    );
+}
+
+// With no reachable tail the first `ret` sets the type and a later one that
+// disagrees is refused at ITSELF, naming the earlier `ret` as the origin; one
+// refusal, no cascade at the call.
+#[test]
+fn b126_rets_that_disagree_are_refused_at_the_later_ret() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	ret "s";
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        }
+        "#;
+    let head = "this `ret` returns str, but the function's return type is inferred as i32 from an earlier `ret`; make every return agree, or declare the return type";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_noting(
+        source,
+        head,
+        "ret 1",
+        "the earlier `ret` it is inferred from",
+    );
+    assert_fails_once_with(source, "return type is inferred");
+    assert_fails_without(source, "Expected");
+}
+
+// A generic return-position call in a `ret` is read WITH the tail's type as
+// its expectation, so `List::new()` binds its element from the tail.
+#[test]
+fn b126_a_ret_of_a_generic_call_binds_from_the_tail() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+
+        fun make(flag: bool) {
+        	if flag {
+        		ret List::new();
+        	}
+        	mut items = List::new();
+        	items.push(1);
+        	items
+        }
+
+        fun main() {
+        	let xs: List<i32> = make(false);
+        	print(xs.len());
+        	let empty: List<i32> = make(true);
+        	print(empty.len());
+        }
+        "#,
+        "1\n0\n",
+    );
+}
+
+// A generic function's `ret` of its own parameter agrees with a tail of the
+// same parameter type, at every instantiation.
+#[test]
+fn b126_a_generic_function_infers_from_a_ret_of_its_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun pick<T>(flag: bool, a: T, b: T) {
+        	if flag {
+        		ret a;
+        	}
+        	b
+        }
+
+        fun main() {
+        	let y: i32 = pick(true, 1, 2);
+        	print(y);
+        	let s: str = pick(false, "a", "b");
+        	print(s);
+        }
+        "#,
+        "1\nb\n",
+    );
+}
+
+// A closure inside an unannotated function keeps its own frame: its `ret`s
+// type the closure (rule 4), the function's `ret`s type the function, and the
+// two may differ. The negative half: a closure's bad `ret` is the CLOSURE's
+// diagnostic, never the function's.
+#[test]
+fn b126_a_nested_closures_rets_stay_on_the_closures_frame() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun label(g: |i32| str): str {
+        	g(10)
+        }
+
+        fun outer(x: bool) {
+        	let text = label(|v| {
+        		if v > 5 {
+        			ret "big";
+        		}
+        		"small"
+        	});
+        	if x {
+        		ret text.len();
+        	}
+        	ret 0;
+        }
+
+        fun main() {
+        	let y: i32 = outer(true);
+        	print(y);
+        }
+        "#,
+        "3\n",
+    );
+    let source = r#"
+        fun apply(g: |i32| i32): i32 {
+        	g(10)
+        }
+
+        fun outer(x: bool) {
+        	let inner = apply(|v| {
+        		if v > 5 {
+        			ret "str";
+        		}
+        		v
+        	});
+        	if x {
+        		ret inner;
+        	}
+        	ret 0;
+        }
+
+        fun main() {
+        	let y: i32 = outer(true);
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "this `ret` returns str, but the closure's body yields i32",
+    );
+    assert_fails_without(source, "the function's return type is inferred");
+}
+
+// Recursion: a self-call contributes nothing (its type IS the answer under
+// construction), so the OTHER returns decide — through a `ret` of an
+// expression over the self-call, a tail over it, and a `ret` that is nothing
+// but the self-call (which used to be "could not be resolved").
+#[test]
+fn b126_a_recursive_unannotated_function_infers_from_its_other_returns() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun count(n: i32) {
+        	if n == 0 {
+        		ret 0;
+        	}
+        	ret 1 + count(n - 1);
+        }
+
+        fun fact(n: i32) {
+        	if n <= 1 {
+        		ret 1;
+        	}
+        	n * fact(n - 1)
+        }
+
+        fun down(n: i32) {
+        	if n == 0 {
+        		ret 0;
+        	}
+        	ret down(n - 1);
+        }
+
+        fun main() {
+        	let a: i32 = count(3);
+        	print(a);
+        	let b: i32 = fact(5);
+        	print(b);
+        	let c: i32 = down(4);
+        	print(c);
+        }
+        "#,
+        "3\n120\n0\n",
+    );
+}
+
+// Mutual recursion: each function's answer is built on the other's, and the
+// one built on an unfinished neighbour is not recorded — each computes
+// top-level through its own constraint, so both coerce and both call.
+#[test]
+fn b126_mutually_recursive_unannotated_functions_infer_together() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(n: i32) {
+        	if n == 0 {
+        		ret 0;
+        	}
+        	b(n - 1)
+        }
+
+        fun b(n: i32) {
+        	a(n - 1)
+        }
+
+        fun main() {
+        	let y: i32 = a(4);
+        	print(y);
+        	let z: i32 = b(3);
+        	print(z);
+        }
+        "#,
+        "0\n0\n",
+    );
+}
+
+// B126 residue (2026-08-22), KNOWN, NOT FIXED: a self-call bound by a `let`
+// and read in the tail. The inference path does not read a `let` binding
+// through its initializer, so the tail `x + 1` is unresolved while `x`'s own
+// constraint is waiting on `g(n - 1)` — and the function's answer never
+// lands: "type of variable 'x' could not be resolved". Same on `next` before
+// the amendment. Asserts what SHOULD hold; goes green when the binding is
+// read through its initializer on the inference path.
+#[test]
+#[ignore = "B126 residue, 2026-08-22: a self-call bound by a `let` and read in the tail \
+            (`let x = g(n - 1); x + 1`) in an unannotated recursive body still fails \
+            \"could not be resolved\" — a `let` binding is not read through its \
+            initializer on the inference path"]
+fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = g(n - 1);
+        	x + 1
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+// A function whose only return evidence is itself never returns: `never`,
+// which satisfies any expectation (as `panic(..)` does). It used to be
+// "could not be resolved".
+#[test]
+fn b126_a_function_that_only_calls_itself_is_never() {
+    assert_compiles(
+        r#"
+        fun forever(n: i32) {
+        	forever(n - 1)
+        }
+
+        fun main() {
+        	if false {
+        		let y: i32 = forever(5);
+        	}
+        }
+        "#,
+    );
+}
+
+// The conformance reader sees the unified type: an unannotated impl member
+// that leaves by `ret` conforms when the `ret` agrees with the trait, and is
+// refused when it does not (it used to pass leniently and print "wide").
+#[test]
+fn b126_an_unannotated_impl_method_conforms_by_its_unified_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Shape {
+        	fun area(self): i32;
+        }
+
+        struct Sq { s: i32 }
+
+        impl Sq with Shape {
+        	fun area(self) {
+        		ret self.s * self.s;
+        	}
+        }
+
+        fun main() {
+        	let q = Sq { s = 3 };
+        	print(q.area());
+        }
+        "#,
+        "9\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Shape {
+        	fun area(self): i32;
+        }
+
+        struct Sq { s: i32 }
+
+        impl Sq with Shape {
+        	fun area(self) {
+        		ret "wide";
+        	}
+        }
+
+        fun main() {
+        	let q = Sq { s = 3 };
+        	print(q.area());
+        }
+        "#,
+        "`Sq`'s `area` returns `str`, but `Shape` declares `i32`",
+    );
+}
+
+// The rule is the function's, not the shape's: an `async fun` without an
+// annotation infers the same way, and an awaited call yields that type.
+#[test]
+fn b126_an_async_function_without_annotation_infers_from_its_rets() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        async fun f(x: bool) {
+        	ret 1;
+        }
+
+        async fun g(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	2
+        }
+
+        async fun main() {
+        	let y: i32 = f(true);
+        	print(y);
+        	let z: i32 = g(true);
+        	print(z);
+        	print(g(false));
+        }
+        "#,
+        "1\n1\n2\n",
+    );
+}
+
+// The `for` protocol's reader (B92) goes through the same helper: an
+// unannotated `next` that leaves by `ret Some(..)`/`ret None` drives the loop
+// (it used to be refused as yielding `void`), and one whose `ret` yields a
+// non-`Option` is refused by B92's own message with the unified type.
+#[test]
+fn b126_an_unannotated_next_that_leaves_by_ret_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Two { at: i32 }
+
+        impl Two {
+        	fun next(&mut self) {
+        		if self.at >= 2 {
+        			ret None;
+        		}
+        		self.at += 1;
+        		ret Some(self.at);
+        	}
+        }
+
+        fun main() {
+        	mut two = Two { at = 0 };
+        	for item in two {
+        		print(item);
+        	}
+        	print(9);
+        }
+        "#,
+        "1\n2\n9\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num { at: i32 }
+
+        impl Num {
+        	fun next(&mut self) {
+        		self.at += 1;
+        		ret self.at;
+        	}
+        }
+
+        fun main() {
+        	mut num = Num { at = 0 };
+        	for item in num {
+        		print(item);
+        	}
+        }
+        "#,
+        "its `next` is unannotated and its body yields `i32`",
+    );
+}
+
+// Closure coercion (B20) reads the helper on both of its paths — the
+// inferring one in `reconcile_type` and the recorded one in `compare_type` —
+// so a `ret`-only function fits a `|bool| i32` slot (it used to be refused as
+// `fn say(bool)` against `|bool| i32`).
+#[test]
+fn b126_a_ret_only_function_coerces_to_a_closure_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run(f: |bool| i32) {
+        	print(f(true));
+        }
+
+        fun say(x: bool) {
+        	ret 1;
+        }
+
+        fun main() {
+        	run(say);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// An exhaustive `if`/`else` of `ret`s in tail position types `never` (B124),
+// which is no evidence; the `ret`s decide. Before, the function itself was
+// `never` and `let y: str = f(false)` compiled and printed `2`.
+#[test]
+fn b126_an_exhaustive_if_else_of_rets_infers_from_the_rets() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	} else {
+        		ret 2;
+        	}
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        	print(y);
+        }
+        "#,
+        "2\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	} else {
+        		ret 2;
+        	}
+        }
+
+        fun main() {
+        	let y: str = f(false);
+        	print(y);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
     );
 }
 
