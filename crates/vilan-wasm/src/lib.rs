@@ -22,16 +22,28 @@
 //! Those caches also leak by design (`Box::leak`, tallied by core's
 //! `leak_tally`), which is why the page recycles the instance rather than
 //! trusting it to run forever.
+//!
+//! ## What is retained between calls
+//!
+//! One thing, since K9 (`proposal/playground-completion.md` §5): the analysis
+//! the last compile produced, so that [`complete_program`] can answer a
+//! keystroke without analyzing. Every `compile_program_for` replaces it; the
+//! instance dying (the page's recycle) discards it; `complete_program` only
+//! reads it, leaks nothing, and answers empty when nothing is retained. The
+//! same single-threaded discipline covers it: a completion never runs
+//! concurrently with an analysis because nothing here runs concurrently.
 
-mod line_index;
-
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use line_index::LineIndex;
+use vilan_core::analyzer::SourceId;
+use vilan_core::fx::FxHashMap as HashMap;
+use vilan_core::id::Id;
 use vilan_core::{
-    BuildOptions, Layer, PackageSpec, Platform, PlatformPattern, Workspace, analyze_source,
-    transform,
+    BuildOptions, Layer, PackageSpec, Platform, PlatformPattern, Program, Workspace,
+    analyze_source, transform,
 };
+use vilan_ide::{Analysis, Completion, CompletionKind, ImportRoots, LineIndex, Position};
 
 /// The synthetic root the embedded toolchain is registered under. It never
 /// exists on any disk; `util::canonical_path` normalizes a non-existent path
@@ -57,11 +69,36 @@ pub struct Diagnostic {
     pub message: String,
     /// The "declared here" style note, when the diagnostic carries one.
     pub note: Option<String>,
+    /// The requirement trace (backlog E78, surfaced here by E80): one entry
+    /// per uncovered call between the program's entry and the offending read,
+    /// in that order. A channel of its own beside `note` — the note stays one
+    /// location — and empty for every diagnostic but the context-coverage
+    /// refusals.
+    pub trace: Vec<TraceEntry>,
     /// `"error"` or `"warning"`.
     pub severity: &'static str,
     /// The file the span indexes, as the visitor would name it. `main.vl` for
     /// their own code; a toolchain path for a diagnostic inside std.
     pub file: String,
+}
+
+/// One entry of a diagnostic's requirement trace, located the way the
+/// diagnostic itself is: the file the hop's span indexes (its OWN file — a
+/// hop's `Note::source` names another when the call sits elsewhere), the
+/// zero-based line and UTF-16 column in it, and the hop's label.
+///
+/// `call` marks an uncovered CALL SITE; it is `false` only for the chain's
+/// elision tail, which is anchored at the last kept hop's span and carries
+/// its text (`… N more uncovered calls on this path`) — a surface that names
+/// each call's location renders the tail as text alone rather than naming
+/// that location twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEntry {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    pub message: String,
+    pub call: bool,
 }
 
 /// What a compile produced. `js` is `None` exactly when the program did not
@@ -71,6 +108,154 @@ pub struct CompileOutput {
     pub js: Option<String>,
     pub css: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// One completion candidate, in the shape the page consumes
+/// (`proposal/playground-completion.md` §6): the language server's
+/// `CompletionItem` mapping (`main.rs::to_completion_item`) with the wire's
+/// sort bands as a CodeMirror `boost`, and the call shape fixed at the
+/// server's defaults (`Full`, snippets on) because the page has no settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// The name shown, and matched against the typed prefix.
+    pub label: String,
+    /// `macro` `function` `method` `field` `struct` `enum` `enum_variant`
+    /// `trait` `variable` `module` `keyword` `snippet` — the page maps these
+    /// to its icon set.
+    pub kind: &'static str,
+    /// The signature (functions/methods), the type (variables), or the module
+    /// an auto-import candidate comes from.
+    pub detail: Option<String>,
+    /// The first paragraph of the declaration's `///` doc.
+    pub documentation: Option<String>,
+    /// What accepting inserts: the bare label, the call shape, or a construct
+    /// snippet's body.
+    pub insert: String,
+    /// `insert` is an LSP-syntax snippet (`${1:name}` tab-stops, `$0` the
+    /// final cursor) rather than plain text.
+    pub is_snippet: bool,
+    /// The language server's `sort_text` bands as a CodeMirror boost: an
+    /// in-scope candidate `0`, an auto-import candidate `-(1 + tier)` (the
+    /// user's own `pkg` above `std`), a construct snippet `-9`.
+    pub boost: i32,
+    /// The import an auto-import candidate adds when accepted (E54c), in the
+    /// LIVE text's coordinates.
+    pub import_edit: Option<ImportEdit>,
+}
+
+/// A text edit that adds an import: the range to replace (zero-based line,
+/// UTF-16 character — the same units as [`Diagnostic`]) and its replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportEdit {
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub text: String,
+}
+
+impl CompletionItem {
+    /// The page's shape of one engine candidate — the same decisions as the
+    /// language server's `to_completion_item`, minus the wire types.
+    fn from_completion(completion: Completion, live: &LineIndex) -> CompletionItem {
+        let kind = match completion.kind {
+            CompletionKind::Macro => "macro",
+            CompletionKind::Function => "function",
+            CompletionKind::Method => "method",
+            CompletionKind::Field => "field",
+            CompletionKind::Struct => "struct",
+            CompletionKind::Enum => "enum",
+            CompletionKind::EnumVariant => "enum_variant",
+            CompletionKind::Trait => "trait",
+            CompletionKind::Variable => "variable",
+            CompletionKind::Module => "module",
+            CompletionKind::Keyword => "keyword",
+            CompletionKind::Snippet => "snippet",
+        };
+        let mut detail = completion.detail;
+        let (mut insert, mut is_snippet) = (completion.label.clone(), false);
+        let mut boost = 0;
+        if let Some(parameters) = &completion.call_parameters {
+            if let Some(call) = vilan_ide::call_insertion(
+                &completion.label,
+                parameters,
+                vilan_ide::CompletionFunctionCall::Full,
+                true,
+            ) {
+                insert = call.text;
+                is_snippet = call.is_snippet;
+            }
+        }
+        if let Some(snippet) = completion.snippet {
+            insert = snippet.body;
+            is_snippet = true;
+            boost = -9;
+        }
+        let import_edit = completion.needs_import.map(|auto_import| {
+            detail = Some(auto_import.module_path.join("::"));
+            boost = -(1 + i32::from(auto_import.origin_tier));
+            let (start, end) = live.range(&auto_import.edit_span);
+            ImportEdit {
+                line: start.line,
+                character: start.character,
+                end_line: end.line,
+                end_character: end.character,
+                text: auto_import.edit_replacement,
+            }
+        });
+        CompletionItem {
+            label: completion.label,
+            kind,
+            detail,
+            documentation: completion.documentation,
+            insert,
+            is_snippet,
+            boost,
+            import_edit,
+        }
+    }
+}
+
+/// The analysis the last compile left behind, kept for [`complete_program`]
+/// (`proposal/playground-completion.md` §5). The program borrows only
+/// `'static` data — the interned entry text and the leaked tree
+/// `analyze_source` never reclaims — so holding it costs no new leak; it is
+/// dropped when the next compile replaces it.
+struct Retained {
+    /// The interned entry text the program was analyzed from — the key a
+    /// completion request's live text is compared against.
+    text: &'static str,
+    program: Program<'static>,
+    /// The index of `text`: the coordinate space the program's spans live in.
+    analyzed: LineIndex,
+    entity_spans: Vec<(usize, usize, Id)>,
+    platform_requirements: HashMap<Id, String>,
+    import_roots: ImportRoots,
+}
+
+impl Retained {
+    fn new(text: &'static str, program: Program<'static>) -> Retained {
+        let entity_spans = vilan_ide::entity_spans(&program);
+        let platform_requirements = vilan_core::platform_color::requirements(&program);
+        Retained {
+            text,
+            program,
+            analyzed: LineIndex::new(text),
+            entity_spans,
+            platform_requirements,
+            import_roots: ImportRoots {
+                std: embedded_std_spec(),
+                pkg_root: PathBuf::from(PROJECT_ROOT),
+                dependencies: Vec::new(),
+            },
+        }
+    }
+}
+
+thread_local! {
+    /// One per instance — the instance is one thread. (Natively, the tests
+    /// each run on their own thread and see exactly their own compiles.)
+    static RETAINED: RefCell<Option<Retained>> = const { RefCell::new(None) };
 }
 
 /// The `PackageSpec` `resolve_std` would build for the embedded std, without
@@ -109,6 +294,7 @@ fn embedded_std_spec() -> PackageSpec {
         ],
         dependencies: Vec::new(),
         surface: true,
+        member: false,
     }
 }
 
@@ -202,52 +388,53 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         &Workspace::default(),
     );
 
-    // The visitor's own file is the common case for a span, so index it once.
-    let entry_index = LineIndex::new(source);
-    let mut indices: Vec<(PathBuf, LineIndex)> = Vec::new();
-    let mut diagnostics = Vec::new();
-
-    let mut convert = |error: &vilan_core::Error, severity: &'static str, path: Option<&Path>| {
-        let range = error.span.into_range();
-        let (index, file) = match path {
-            None => (&entry_index, ENTRY_NAME.to_string()),
-            Some(path) if path == entry_path => (&entry_index, ENTRY_NAME.to_string()),
-            Some(path) => {
-                if !indices.iter().any(|(known, _)| known == path) {
-                    let text = vilan_core::util::read_source(path).unwrap_or_default();
-                    indices.push((path.to_path_buf(), LineIndex::new(&text)));
-                }
-                let index = indices
-                    .iter()
-                    .find(|(known, _)| known == path)
-                    .map(|(_, index)| index)
-                    .unwrap_or(&entry_index);
-                (index, display_path(path))
-            }
-        };
-        let (start, _) = index.range(&error.span);
-        diagnostics.push(Diagnostic {
-            start: range.start,
-            end: range.end,
-            line: start.line,
-            column: start.character,
-            message: error.msg.clone(),
-            note: error.note.as_ref().map(|note| note.msg.clone()),
-            severity,
-            file,
-        });
-    };
-
     let Some(program) = program else {
-        for error in &errors {
-            convert(error, "error", None);
-        }
+        // No tree at all (a panic past the fence): nothing to answer
+        // completion from either, so the previous program does not linger.
+        RETAINED.with(|slot| *slot.borrow_mut() = None);
+        let entry_index = LineIndex::new(source);
+        // Only a program can name another source, so these diagnostics —
+        // the entry's own — resolve every span, trace hops included, in the
+        // entry.
+        let mut locator = Locator {
+            entry_path: &entry_path,
+            entry_index: &entry_index,
+            indices: Vec::new(),
+        };
+        let diagnostics = errors
+            .iter()
+            .map(|error| convert_diagnostic(error, "error", None, &|_| None, &mut locator))
+            .collect();
         return CompileOutput {
             js: None,
             css: None,
             diagnostics,
         };
     };
+    let retained = Retained::new(leaked, program);
+    let output = emit(&retained.program, &retained.analyzed, &entry_path, &errors);
+    RETAINED.with(|slot| *slot.borrow_mut() = Some(retained));
+    output
+}
+
+/// The diagnostics and, when clean, the emitted program — over an analysis
+/// that is about to be retained. `entry_index` indexes the entry text the
+/// program was analyzed from.
+fn emit(
+    program: &Program<'static>,
+    entry_index: &LineIndex,
+    entry_path: &Path,
+    errors: &[vilan_core::Error],
+) -> CompileOutput {
+    // The visitor's own file is the common case for a span, so it is indexed
+    // already; every other file on first use.
+    let mut locator = Locator {
+        entry_path,
+        entry_index,
+        indices: Vec::new(),
+    };
+    let source_path = |source: SourceId| program.source_path(source).map(Path::to_path_buf);
+    let mut diagnostics = Vec::new();
 
     // `errors` is the ENTRY's own lex/parse errors followed by the program's
     // (`analyze_source`), while `diagnostic_sources` is parallel to the
@@ -256,14 +443,20 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
     // attribution by N wherever N parse errors preceded, and a recovered parse
     // is exactly when a playground program has both (backlog E42). The language
     // server does the same subtraction in `document.rs`. An index inside the
-    // prefix is the entry's own, which is what `None` means to `convert`.
+    // prefix is the entry's own, which is what `None` means to the converter.
     let prefix = errors.len().saturating_sub(program.diagnostics.len());
     for (index, error) in errors.iter().enumerate() {
         let path = index
             .checked_sub(prefix)
             .and_then(|offset| program.source_path(program.diagnostic_source(offset)))
             .map(Path::to_path_buf);
-        convert(error, "error", path.as_deref());
+        diagnostics.push(convert_diagnostic(
+            error,
+            "error",
+            path.as_deref(),
+            &source_path,
+            &mut locator,
+        ));
     }
 
     if !errors.is_empty() {
@@ -278,14 +471,20 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         .remove("css")
         .filter(|content| !content.is_empty());
 
-    match transform(&program, &BuildOptions::default()) {
+    match transform(program, &BuildOptions::default()) {
         Ok(javascript) => CompileOutput {
             js: Some(javascript),
             css,
             diagnostics,
         },
         Err(error) => {
-            convert(&error, "error", None);
+            diagnostics.push(convert_diagnostic(
+                &error,
+                "error",
+                None,
+                &source_path,
+                &mut locator,
+            ));
             CompileOutput {
                 js: None,
                 css: None,
@@ -293,6 +492,131 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
             }
         }
     }
+}
+
+/// One diagnostic as the page consumes it. `path` is the file the
+/// diagnostic's own span indexes (`None` = the entry); `hop_path` answers the
+/// same for a trace hop that names another source — each hop is located in
+/// ITS file (`Note::source` when it names one, the diagnostic's own
+/// otherwise, the `None` contract of `Note`), the E16 rule per hop (E80).
+fn convert_diagnostic(
+    error: &vilan_core::Error,
+    severity: &'static str,
+    path: Option<&Path>,
+    hop_path: &dyn Fn(SourceId) -> Option<PathBuf>,
+    locator: &mut Locator<'_>,
+) -> Diagnostic {
+    let range = error.span.into_range();
+    let (line, column, file) = locator.locate(path, &error.span);
+    let trace = error
+        .trace
+        .iter()
+        .map(|hop| {
+            let hop_path = hop.note.source.and_then(hop_path);
+            let (line, column, file) = locator.locate(hop_path.as_deref().or(path), &hop.note.span);
+            TraceEntry {
+                file,
+                line,
+                column,
+                message: hop.note.msg.clone(),
+                call: hop.call,
+            }
+        })
+        .collect();
+    Diagnostic {
+        start: range.start,
+        end: range.end,
+        line,
+        column,
+        message: error.msg.clone(),
+        note: error.note.as_ref().map(|note| note.msg.clone()),
+        trace,
+        severity,
+        file,
+    }
+}
+
+/// Resolves spans to the page's positions, one `LineIndex` per file touched:
+/// the visitor's entry is indexed already (the common case — it is the
+/// index the analysis retains), every other file — std, for a diagnostic or
+/// a trace hop inside the toolchain — on first use.
+struct Locator<'a> {
+    entry_path: &'a Path,
+    entry_index: &'a LineIndex,
+    indices: Vec<(PathBuf, LineIndex)>,
+}
+
+impl Locator<'_> {
+    /// The zero-based line, the UTF-16 column, and the visitor-facing file
+    /// name of `span` in `path` (`None`, or the entry's own path, is the
+    /// entry).
+    fn locate(&mut self, path: Option<&Path>, span: &vilan_core::span::Span) -> (u32, u32, String) {
+        let (index, file) = match path {
+            None => (self.entry_index, ENTRY_NAME.to_string()),
+            Some(path) if path == self.entry_path => (self.entry_index, ENTRY_NAME.to_string()),
+            Some(path) => {
+                if !self.indices.iter().any(|(known, _)| known == path) {
+                    let text = vilan_core::util::read_source(path).unwrap_or_default();
+                    self.indices
+                        .push((path.to_path_buf(), LineIndex::new(&text)));
+                }
+                let index = self
+                    .indices
+                    .iter()
+                    .find(|(known, _)| known == path)
+                    .map(|(_, index)| index)
+                    .unwrap_or(self.entry_index);
+                (index, display_path(path))
+            }
+        };
+        let (start, _) = index.range(span);
+        (start.line, start.character, file)
+    }
+}
+
+/// Completion candidates at a cursor in `source` — `line` zero-based, and
+/// `character` a UTF-16 offset within it, the units the page already speaks
+/// for diagnostics — answered from the analysis the last compile retained
+/// (`proposal/playground-completion.md` §5–§6). Never analyzes: a keystroke
+/// cannot pay for one, and the page's debounced check keeps the retained
+/// program at most one debounce behind the buffer. Empty when nothing is
+/// retained (a fresh instance before its first check).
+///
+/// When `source` is the retained text the two coordinate spaces coincide.
+/// When it is not — the usual case, the visitor having just typed the
+/// character that triggered this — the engine reads the trigger off the live
+/// text and converts to the analyzed text through line/character, E52's rule
+/// (`lsp-snapshot-consistency.md`), exactly as the language server does
+/// between a keystroke and its debounced re-analysis.
+pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<CompletionItem> {
+    RETAINED.with(|slot| {
+        let slot = slot.borrow();
+        let Some(retained) = slot.as_ref() else {
+            return Vec::new();
+        };
+        let live_index;
+        let live: &LineIndex = if source == retained.text {
+            &retained.analyzed
+        } else {
+            live_index = LineIndex::new(source);
+            &live_index
+        };
+        let analysis = Analysis {
+            program: &retained.program,
+            analyzed: &retained.analyzed,
+            live,
+            entity_spans: &retained.entity_spans,
+            platform_requirements: &retained.platform_requirements,
+            import_roots: Some(&retained.import_roots),
+            source_texts: Default::default(),
+        };
+        let offset = live.offset(Position { line, character });
+        analysis
+            .completion(offset)
+            .into_iter()
+            .map(|completion| CompletionItem::from_completion(completion, live))
+            .collect()
+    })
 }
 
 /// Formats one Vilan source string — the CLI's `vilan fmt` rule exactly
@@ -329,6 +653,33 @@ mod bindings {
         pub note: Option<String>,
         pub severity: String,
         pub file: String,
+        trace: Vec<TraceEntry>,
+    }
+
+    /// One hop of a diagnostic's requirement trace (E80), as the page
+    /// consumes it: the same field names and units as `Diagnostic`'s own
+    /// position (zero-based line, UTF-16 column, the visitor-facing file).
+    #[wasm_bindgen(getter_with_clone)]
+    #[derive(Clone)]
+    pub struct TraceEntry {
+        pub file: String,
+        pub line: u32,
+        pub column: u32,
+        pub message: String,
+        pub call: bool,
+    }
+
+    #[wasm_bindgen]
+    impl Diagnostic {
+        /// The requirement trace, as a JS array of `TraceEntry` objects in
+        /// entry → read order — empty for every diagnostic but the
+        /// context-coverage refusals. A getter for the same reason
+        /// `CompileResult::diagnostics` is one: a `Vec` of exported structs
+        /// crosses as a return value, not as a field.
+        #[wasm_bindgen(getter)]
+        pub fn trace(&self) -> Vec<TraceEntry> {
+            self.trace.clone()
+        }
     }
 
     #[wasm_bindgen(getter_with_clone)]
@@ -355,6 +706,7 @@ mod bindings {
                     note: diagnostic.note.clone(),
                     severity: diagnostic.severity.clone(),
                     file: diagnostic.file.clone(),
+                    trace: diagnostic.trace.clone(),
                 })
                 .collect()
         }
@@ -376,6 +728,17 @@ mod bindings {
                     note: diagnostic.note,
                     severity: diagnostic.severity.to_string(),
                     file: diagnostic.file,
+                    trace: diagnostic
+                        .trace
+                        .into_iter()
+                        .map(|hop| TraceEntry {
+                            file: hop.file,
+                            line: hop.line,
+                            column: hop.column,
+                            message: hop.message,
+                            call: hop.call,
+                        })
+                        .collect(),
                 })
                 .collect(),
         }
@@ -412,5 +775,54 @@ mod bindings {
     #[wasm_bindgen]
     pub fn version() -> String {
         crate::version().to_string()
+    }
+
+    // --- completion (K9) — its own block, beside the compile surface ---------
+
+    /// One completion candidate, as the page consumes it. The auto-import
+    /// edit rides as five optional flat fields rather than a nested struct,
+    /// which `wasm_bindgen` does not pass by value.
+    #[wasm_bindgen(getter_with_clone)]
+    pub struct CompletionItem {
+        pub label: String,
+        pub kind: String,
+        pub detail: Option<String>,
+        pub documentation: Option<String>,
+        pub insert: String,
+        pub is_snippet: bool,
+        pub boost: i32,
+        pub import_line: Option<u32>,
+        pub import_character: Option<u32>,
+        pub import_end_line: Option<u32>,
+        pub import_end_character: Option<u32>,
+        pub import_text: Option<String>,
+    }
+
+    /// Completion candidates at `line`/`character` (zero-based line, UTF-16
+    /// character) in `source`, from the analysis the last compile retained;
+    /// empty before any compile. The page feature-detects this export, so a
+    /// glue built before it existed simply registers no completion source.
+    #[wasm_bindgen]
+    pub fn complete(source: String, line: u32, character: u32) -> Vec<CompletionItem> {
+        crate::complete_program(&source, line, character)
+            .into_iter()
+            .map(|item| {
+                let edit = item.import_edit;
+                CompletionItem {
+                    label: item.label,
+                    kind: item.kind.to_string(),
+                    detail: item.detail,
+                    documentation: item.documentation,
+                    insert: item.insert,
+                    is_snippet: item.is_snippet,
+                    boost: item.boost,
+                    import_line: edit.as_ref().map(|edit| edit.line),
+                    import_character: edit.as_ref().map(|edit| edit.character),
+                    import_end_line: edit.as_ref().map(|edit| edit.end_line),
+                    import_end_character: edit.as_ref().map(|edit| edit.end_character),
+                    import_text: edit.map(|edit| edit.text),
+                }
+            })
+            .collect()
     }
 }

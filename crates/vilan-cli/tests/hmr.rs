@@ -1108,6 +1108,90 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
     outcome.unwrap();
 }
 
+/// E80: a context-coverage refusal reaches the overlay WITH its E78 chain, each
+/// hop located in the file the call sits in. The read lives in the module
+/// (`common.vl`), the uncovered call in the entry (`client.vl`): the overlay
+/// locates the primary in the module and renders the hop as an indented
+/// `via <client.vl>:13:8 — …` line — the entry's own line/column, resolved
+/// against the entry's text — between the message and the end of the
+/// diagnostic, and names that location nowhere else (the shim would count a
+/// bare location line as a second error).
+#[test]
+fn the_overlay_traces_a_cross_module_requirement_chain_in_each_hops_file() {
+    let dir = temp_project("overlay_trace");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n",
+    );
+    write(&dir, "src/common.vl", &common_source("BANNER_ONE"));
+    write(&dir, "src/client.vl", &shared_client_source("x1"));
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        assert!(
+            wait_for_file(&dir.join("dist/client.js"), deadline),
+            "round 1 should have written dist/client.js"
+        );
+
+        let mut sse = SseClient::connect(port);
+        // The module now reads a context that nothing provides; the entry's
+        // `print(banner())` (line 13, column 8 of `shared_client_source`) is
+        // the one uncovered call on the path.
+        write(
+            &dir,
+            "src/common.vl",
+            "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\n\
+             fun banner(): str {\n\tcurrent.get();\n\t\"BANNER_ONE\"\n}\n",
+        );
+        let error_event = sse.expect_event("error", deadline);
+        assert!(
+            error_event.contains("common.vl:6:2"),
+            "the primary is located at the read, in the module: {error_event}"
+        );
+        let hop = "via ";
+        let hop_at = error_event
+            .find(hop)
+            .unwrap_or_else(|| panic!("the overlay carries a trace line: {error_event}"));
+        assert!(
+            error_event[hop_at..].starts_with("via ")
+                && error_event[hop_at..]
+                    .contains("client.vl:13:8 — the context requirement flows through this call"),
+            "the hop is located in the ENTRY, against the entry's text: {error_event}"
+        );
+        assert!(
+            hop_at > error_event.find("common.vl:6:2").unwrap(),
+            "the chain follows the primary it belongs to: {error_event}"
+        );
+        assert_eq!(
+            error_event.matches("client.vl:13:8").count(),
+            1,
+            "the hop's location is named once, on its trace line: {error_event}"
+        );
+        assert!(
+            error_event.contains("client.vl: 1 error"),
+            "one diagnostic, one error in the header: {error_event}"
+        );
+    }));
+
+    support::kill_watcher(&mut watcher);
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome.unwrap();
+}
+
 // --- E55 (css half): the css hot-swap must not round-trip a stale server -----
 
 /// A server shaped exactly like `examples/todo/src/server.vl`: `fs::read` the

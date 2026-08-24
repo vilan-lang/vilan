@@ -120,6 +120,35 @@ impl List<type T: PartialEq> {
 	}
 }
 
+/// Element-wise equality, length first (I4): two lists are equal when they
+/// are the same length and every pair of elements at the same index is. What
+/// this buys beyond `list == list`: `List<T>` satisfies `T: PartialEq`
+/// bounds, so lists nest (`List<List<i32>>` compares through it) and a
+/// struct holding a `List` field can `[derive(PartialEq)]` — the shape that
+/// used to be refused.
+///
+/// The elements compare with `==`, not `.eq()`, and that is load-bearing —
+/// the `Option`/`Result` idiom: an operator on a `T: PartialEq` operand
+/// rides the `OnConstraint` generic dispatch, which lowers to native JS at
+/// an all-native binding (`List<i32> == List<i32>` emits this body
+/// UNSPECIALIZED), where an explicit `.eq()` there would resolve to the
+/// trait's bodyless requirement and trip the emitter's never-silent check.
+impl List<type T: PartialEq> with PartialEq {
+	fun eq(self, b: List<T>): bool {
+		if self.len() != b.len() {
+			ret false;
+		}
+		mut index = 0;
+		for item in self {
+			if !(item == b[index]) {
+				ret false;
+			}
+			index += 1;
+		}
+		true
+	}
+}
+
 // `str` carries the full ordering family (lexicographic, the native `<`), so
 // generic `T: Ord` code (sorting, `math::min`/`max`, `clamp`) accepts it.
 // The numeric primitives' ordering impls live with their other trait impls

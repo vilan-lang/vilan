@@ -39,6 +39,7 @@
 - [Cells](std/cells.md)
 - [Time](std/time.md)
 - [Encoding](std/encoding.md)
+- [Markdown](std/markdown.md)
 - [Networking](std/net.md)
 - [Reactive](std/reactive.md)
 - [Style](std/style.md)

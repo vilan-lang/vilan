@@ -551,11 +551,16 @@ The most common first UI error: you built reactive state (an `effect`, a
 binding) outside every ownership boundary. Wrap the entry point in
 `mount_root`, or `run_with_owner` in a test. The error points at your
 `effect`/`map`/`or` call; the note under it shows the read inside the
-standard library that your call reaches, and every call of yours on the
+library — the standard library, or an external dependency package your
+code calls — that your call reaches, and every call of yours on the
 uncovered path above it is underlined too ("the context requirement
 flows through this call") — follow the chain up to where the ownership
 boundary belongs. Calls inside a covering `run` are clean and never
-appear in the chain.
+appear in the chain, and an external package's internal calls are never
+underlined: the error always lands on code you wrote. (Your own
+workspace is yours: a member package your project root's `packages`
+declares reports exactly like your entry's modules — the read anchors
+at itself, in the member's file.)
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
 
 **"`…` reads context `…`, so it can't be used as a value"**
@@ -575,6 +580,15 @@ The call returns something that stops working if you drop it (a
 `Subscription`, typically). Keep it, hand it to an owner, or discard it
 on purpose with `let _ = …`.
 → [Reactive state](../guide/reactive.md)
+
+**"`…` is deprecated; use …"** *(a warning)*
+The named function still works — this never fails a build — but it is
+marked `[deprecated]` and scheduled for removal, no earlier than the
+minor release *after* this warning first shipped. The message names the
+replacement; switch to it at each warned use site. The removal itself,
+when it comes, is announced under the CHANGELOG's Breaking entries with
+migration notes.
+→ [spec §3.3](../spec/grammar.md) for the attribute
 
 ## Wire and rpc
 

@@ -145,7 +145,10 @@ through to the list.
 > Only `fun slot(&mut self): &mut T` hands back the alias, as it must.
 > References are transparent in the type system, so inside the body
 > `self` looks the same either way; the signature is the only thing that
-> says which one you meant.
+> says which one you meant. Leave the return type off and it is inferred
+> as a value type: an unannotated function always returns a value — the
+> caller's copy — never a view, through its final expression and through
+> every `ret` alike.
 
 ## `Shared<T>`: one cell, many holders
 

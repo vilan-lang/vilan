@@ -275,8 +275,8 @@ A trait parameterized differently is a different implementation:
 `impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` both stand.
 
 The rule refuses exact repeats, not OVERLAP: a blanket impl and a specific
-one that both match a type — `std::into`'s `impl type T with Into<T>`
-beside a type's own `Into` impl, or two conditional impls with different
+one that both match a type — your own `impl type T with Show`
+beside `impl Bag with Show`, or two conditional impls with different
 bounds — both stand, and a call is answered by the **more specific** of
 them, never by whichever was declared first. More specific means, in
 order: the impl whose subject pattern the other's matches and not
@@ -376,6 +376,53 @@ Generic code is **monomorphized**: each distinct binding vector of a
 generic function/impl produces its own specialization; dispatch is
 static. A program that would require an unbounded set of specializations
 (polymorphic recursion) is not required to compile.
+
+**Return-type inference.** A function with no declared return type takes
+its type from its body's return positions — the tail, when the body can
+reach it, and every `ret` — and they must agree. A tail the body cannot
+reach (every path before it leaves by `ret`) is not a return position, so
+`fun f(x: bool) { ret 1; }` is `i32`; a tail it can reach is one, so a
+`ret 1` beside an `if` with no `else` disagrees with the void that path
+produces. A bare `ret` is a void return; it agrees only with a void body.
+A disagreeing `ret` is an error at that `ret`, naming both types and
+where the inferred one came from — the function then has no type, so
+the error is not repeated at its calls. A call the function makes to
+itself contributes nothing (its type is the one being inferred); a
+function whose only return positions are such calls is `Never`. Declaring
+the return type replaces inference with checking (every position against
+the declaration). A closure (and an `async` block) infers the same way:
+its return type is the unification of its reachable tail and every
+`ret`, so `|x| { ret x * 2; }` is `|i32| i32`, and a `ret` that
+disagrees — with the tail, an earlier `ret`, or a body path that ends
+without a value — is an error at that `ret`. When the closure's return
+type is known ahead of the body (its own annotation, or the call site's
+expectation), the `ret`s check against that type instead, exactly as a
+declared function's do.
+
+```vilan
+import std::print;
+
+fun sign(x: i32) {
+	if x > 0 {
+		ret 1;
+	}
+	if x < 0 {
+		ret -1;
+	}
+	0
+}
+
+fun main() {
+	let s: i32 = sign(-4);
+	print(s);
+}
+```
+
+```vilan,fragment
+fun f(x: bool) { if x { ret "s"; } 2 }   // error at `ret "s"`: the tail is i32
+fun g(x: bool) { if x { ret; } 2 }       // error at `ret`: a bare ret is void
+fun h(x: bool) { if x { ret 1; } }       // error at `ret 1`: the if can produce void
+```
 
 ## 5.7 Operator and method dispatch
 

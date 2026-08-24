@@ -115,31 +115,18 @@ fn no_tracked_file_publishes_a_personal_mailbox() {
     );
 }
 
-/// Documents *about* the migration, which necessarily name the old owner.
-/// Everything else must have been swept (F9 S4).
-const OWNER_STRING_ALLOWLIST: &[(&str, &str)] = &[
-    (
-        "vilan/proposal/org-migration.md",
-        "the migration plan itself — the old owner is its subject",
-    ),
-    (
-        "vilan/proposal/backlog-2026-07-18.md",
-        "the F9 backlog entry states the problem in terms of the old owner",
-    ),
-    (
-        "vilan/proposal/releases.md",
-        "release history quotes the install one-liner as it was published",
-    ),
-    (
-        "vilan/proposal/backlog.md",
-        "the historical record — ship records moved from the distilled file \
-         (2026-08-03) name the old owner as their subject, same as the F9 entry",
-    ),
-];
+/// Files that may legitimately name the old owner. Emptied at the N15
+/// cutover: the four carriers (the org-migration plan, the F9-era
+/// trackers, the release history) moved to the `vilan-lang/proposals`
+/// repo, whose own hygiene gate carries their allowlist rows forward.
+/// The gate itself stays, and stays non-vacuous — it scans every
+/// remaining tracked file.
+const OWNER_STRING_ALLOWLIST: &[(&str, &str)] = &[];
 
 /// The repository moved from the maintainer's personal account to the
 /// `vilan-lang` org, and the book with it — it now publishes at
-/// `vilan-lang.org/docs` (F9, `vilan/proposal/org-migration.md`).
+/// `vilan-lang.org/docs` (F9, `org-migration.md` — since N15 in the
+/// `vilan-lang/proposals` repo).
 /// The invariant behind this gate: **the old GitHub repository name is never
 /// reused.** A transfer leaves permanent redirects for git operations *and*
 /// `releases/download/…` URLs, which is the only thing keeping every

@@ -572,7 +572,11 @@ impl Manifest {
             Some(name) if !is_identifier(name) => errors.push(format!(
                 "`[package] name` must be a valid identifier (got `{name}`)"
             )),
-            Some(_) => {}
+            Some(name) => {
+                if let Some(reason) = reserved_package_name(name) {
+                    errors.push(reserved_name_refusal(name, reason, "package"));
+                }
+            }
         }
         if let Some(target) = &package.target {
             if let Err(error) = Platform::parse(target) {
@@ -760,6 +764,13 @@ fn validate_dependencies(
     errors: &mut Vec<String>,
 ) {
     for (name, dependency) in dependencies {
+        // A dependency's key IS the import root it binds, so a reserved name
+        // here is a claim on the namespace itself — refused whatever the
+        // declaration's source looks like (a second, independent problem with
+        // the source still reports beside this: different root causes).
+        if let Some(reason) = reserved_package_name(name) {
+            errors.push(reserved_name_refusal(name, reason, "dependency"));
+        }
         match dependency.source() {
             Ok(DependencySource::Path(_)) | Ok(DependencySource::Git(_)) => {}
             Ok(DependencySource::Inherited) if !inheritable => errors.push(format!(
@@ -921,12 +932,24 @@ pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace,
     let mut packages = Vec::new();
     let mut index_by_path = HashMap::new();
     let mut visiting = HashSet::new();
+    // E90 (diagnostics-standard.md C3a): the enclosing workspace root's
+    // declared members, resolved once against the ENTRY's directory — the
+    // packages the demotion carve-out treats as the user's own code, wherever
+    // in the graph their edge appears. Read only when there are dependencies
+    // to classify, so a dependency-free package still reads no file outside
+    // its own directory.
+    let members = if declared.is_empty() {
+        HashSet::new()
+    } else {
+        workspace_member_dirs(package_dir)?
+    };
     let entry_dependencies = resolve_dependency_edges(
         declared,
         package_dir,
         &mut packages,
         &mut index_by_path,
         &mut visiting,
+        &members,
         git,
     )?;
     Ok(Workspace {
@@ -950,7 +973,10 @@ pub fn resolve_library(dir: &Path) -> PackageSpec {
     if let Ok(contents) = crate::util::read_source(dir.join("vilan.toml")) {
         if let Ok((manifest, _)) = Manifest::parse(&contents) {
             if let Some(library) = manifest.library {
-                return library_spec(dir, &library, Vec::new());
+                // A library's OWN spec (std's, a contract check's) is never a
+                // workspace member — membership is a property of the entry's
+                // workspace, decided during `resolve_workspace` (E90).
+                return library_spec(dir, &library, Vec::new(), false);
             }
         }
     }
@@ -959,6 +985,7 @@ pub fn resolve_library(dir: &Path) -> PackageSpec {
         layers: Vec::new(),
         dependencies: Vec::new(),
         surface: true,
+        member: false,
     }
 }
 
@@ -989,8 +1016,14 @@ pub fn resolve_std(std_dir: &Path) -> PackageSpec {
 
 /// Builds a [`PackageSpec`] for the `[library]` rooted at `dir`: its base root
 /// (default `src`) plus each declared layer (root default `src/<name>`, with the
-/// platform patterns it serves), and the already-resolved dependency edges.
-fn library_spec(dir: &Path, library: &Library, dependencies: Vec<(String, usize)>) -> PackageSpec {
+/// platform patterns it serves), the already-resolved dependency edges, and
+/// whether the package is a declared workspace member (E90).
+fn library_spec(
+    dir: &Path,
+    library: &Library,
+    dependencies: Vec<(String, usize)>,
+    member: bool,
+) -> PackageSpec {
     let layers = library
         .layer
         .iter()
@@ -1017,6 +1050,7 @@ fn library_spec(dir: &Path, library: &Library, dependencies: Vec<(String, usize)
         layers,
         dependencies,
         surface: true,
+        member,
     }
 }
 
@@ -1041,24 +1075,26 @@ fn load_manifest(directory: &Path) -> Result<Manifest, String> {
 
 /// The nearest enclosing workspace root of `package_dir` — the closest ancestor
 /// (starting at `package_dir` itself) whose `vilan.toml` declares a `[project]`
-/// — together with that project's `[project.dependencies]`, the table a member
-/// inherits from.
+/// — together with that whole `[project]` declaration: its `packages` (the
+/// declared members, E90's carve-out reads them) and its
+/// `[project.dependencies]` (the table a member inherits from).
 ///
 /// Two properties are deliberate. **The walk is lazy**: it runs only when a
-/// manifest actually writes `project = true`, so a package that inherits
-/// nothing reads no file outside its own directory and behaves exactly as it
-/// did before inheritance existed. And **membership is not required**: as in
-/// P2's Q5, `[project] packages` is the *build set*, not a visibility list, so
-/// what makes a package a member for inheritance is simply living under the
-/// project root.
+/// manifest actually writes `project = true` or the resolution has dependency
+/// packages to classify as members (E90), so a dependency-free package that
+/// inherits nothing reads no file outside its own directory and behaves
+/// exactly as it did before inheritance existed. And **membership is not
+/// required for inheritance**: as in P2's Q5, `[project] packages` is the
+/// *build set*, not a visibility list, so what makes a package a member for
+/// inheritance is simply living under the project root. (Demotion is the
+/// opposite, by the owner's E90 ruling: there, membership IS the `packages`
+/// declaration — see [`workspace_member_dirs`].)
 ///
 /// A `vilan.toml` on the way up that is not a `[project]` (the member's own,
 /// a nested package) is skipped; one that cannot be read or parsed stops the
 /// walk with that error, since staying quiet would report "no workspace" for a
 /// workspace that is merely broken.
-fn enclosing_project(
-    package_dir: &Path,
-) -> Result<Option<(PathBuf, BTreeMap<String, Dependency>)>, WorkspaceError> {
+fn enclosing_project(package_dir: &Path) -> Result<Option<(PathBuf, Project)>, WorkspaceError> {
     let start = crate::util::canonical_path(package_dir);
     for directory in start.ancestors() {
         let manifest_path = directory.join("vilan.toml");
@@ -1090,9 +1126,31 @@ fn enclosing_project(
             .declared_in_manifest(&manifest_path));
         }
         let project = manifest.project.expect("checked just above");
-        return Ok(Some((directory.to_path_buf(), project.dependencies)));
+        return Ok(Some((directory.to_path_buf(), project)));
     }
     Ok(None)
+}
+
+/// The canonical directories the workspace enclosing `package_dir` DECLARES as
+/// members (`[project] packages`) — the membership test behind E90's demotion
+/// carve-out (diagnostics-standard.md C3a): a dependency package resolving to
+/// one of these is the user's own code, so the analyzer never demotes it.
+/// Empty when no ancestor declares a `[project]`.
+///
+/// Membership is the declaration and nothing else (the owner's rule): a path
+/// dependency living under the project directory but absent from `packages` is
+/// external, and a declared member is a member however its edge was written —
+/// never a path-containment heuristic. A git dependency can never match: its
+/// checkout lives in the cache, which no root would declare.
+fn workspace_member_dirs(package_dir: &Path) -> Result<HashSet<PathBuf>, WorkspaceError> {
+    Ok(match enclosing_project(package_dir)? {
+        Some((project_dir, project)) => project
+            .packages
+            .iter()
+            .map(|member| crate::util::canonical_path(&project_dir.join(member)))
+            .collect(),
+        None => HashSet::new(),
+    })
 }
 
 /// What a dependency table declares, for an error that has to say what IS
@@ -1125,12 +1183,13 @@ fn resolve_dependency_edges(
     packages: &mut Vec<PackageSpec>,
     index_by_path: &mut HashMap<PathBuf, usize>,
     visiting: &mut HashSet<PathBuf>,
+    members: &HashSet<PathBuf>,
     git: &GitDeps,
 ) -> Result<Vec<(String, usize)>, WorkspaceError> {
     let mut edges = Vec::new();
     // The enclosing workspace root, read at most once per manifest and only if
     // some declaration actually asks to inherit.
-    let mut project: Option<(PathBuf, BTreeMap<String, Dependency>)> = None;
+    let mut project: Option<(PathBuf, Project)> = None;
     let mut project_searched = false;
     for (import_name, dependency) in dependencies {
         // `project = true` substitutes the workspace root's declaration — and
@@ -1147,7 +1206,7 @@ fn resolve_dependency_edges(
                 // true` where there is no project, or for a name the project
                 // does not declare. They stay addressed to the member manifest,
                 // which is where the opt-in that has to change lives.
-                let Some((project_dir, declared)) = &project else {
+                let Some((project_dir, root_project)) = &project else {
                     return Err(WorkspaceError::broken(format!(
                         "dependency `{import_name}` sets `project = true`, but `{}` is not \
                          inside a workspace: inheritance reads the `[project.dependencies]` \
@@ -1155,12 +1214,12 @@ fn resolve_dependency_edges(
                         base_dir.display()
                     )));
                 };
-                let Some(inherited) = declared.get(import_name) else {
+                let Some(inherited) = root_project.dependencies.get(import_name) else {
                     return Err(WorkspaceError::broken(format!(
                         "dependency `{import_name}` sets `project = true`, but {} declares \
                          no `{import_name}`; {}",
                         project_dir.join("vilan.toml").display(),
-                        declared_names(declared)
+                        declared_names(&root_project.dependencies)
                     )));
                 };
                 (
@@ -1254,12 +1313,19 @@ fn resolve_dependency_edges(
             packages,
             index_by_path,
             visiting,
+            members,
             git,
         )?;
         visiting.remove(&canonical);
         let index = packages.len();
+        // E90 (diagnostics-standard.md C3a): a dependency that IS a declared
+        // workspace member is the user's own code — the analyzer reads this
+        // flag to keep the package out of its demotion set. Decided on the
+        // same canonical key the dedup uses, by the root manifest's
+        // `packages` declaration alone.
+        let member = members.contains(&canonical);
         let spec = match &library {
-            Some(library) => library_spec(&dependency_dir, library, dependency_edges),
+            Some(library) => library_spec(&dependency_dir, library, dependency_edges, member),
             // A `[package]` dependency: base-only over its `src/`, no layers,
             // no `lib.vl` surface.
             None => PackageSpec {
@@ -1267,6 +1333,7 @@ fn resolve_dependency_edges(
                 layers: Vec::new(),
                 dependencies: dependency_edges,
                 surface: false,
+                member,
             },
         };
         packages.push(spec);
@@ -1285,6 +1352,37 @@ fn split_needs_a_browser_leg(key: &str, declared: &str) -> String {
         "`{key}` applies to a `browser` leg only: route chunks are fetched \
          with `import()` when a navigation advances the route signal, and \
          this leg targets `{declared}`"
+    )
+}
+
+/// Why `name` is reserved as a package name, if it is. The three reserved
+/// names are the import roots the toolchain itself owns (spec §4.2's three
+/// namespaces). A dependency key under one of them would silently shadow the
+/// root (`std`, `macro_std` — the analyzer binds dependency edges before the
+/// global roots) or be silently unreachable behind it (`pkg` — the hardcoded
+/// self-package root wins); a `[package]` claiming one as its own name stakes
+/// the same claim for the day it is depended on or published (std-shape.md
+/// §4, L12). `[library] name` deliberately carries NO check: the reserved
+/// names are reserved *for* the toolchain's own `[library]` manifests (std is
+/// `[library] name = "std"`, likewise macro_std), a context-free validation
+/// cannot tell the owner from an impostor, and a library's own name — unlike
+/// a dependency key — never binds an import root.
+fn reserved_package_name(name: &str) -> Option<&'static str> {
+    match name {
+        "std" => Some("the standard library owns it"),
+        "pkg" => Some("it always means the importing package's own modules"),
+        "macro_std" => Some("the macro standard library owns it"),
+        _ => None,
+    }
+}
+
+/// The refusal for a reserved package name: the rule, the whole reserved set,
+/// and the one fix (`renamed` names the thing to rename — the package or the
+/// dependency).
+fn reserved_name_refusal(name: &str, reason: &str, renamed: &str) -> String {
+    format!(
+        "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
+         `macro_std` are all reserved); rename the {renamed}"
     )
 }
 
@@ -1396,6 +1494,7 @@ mod tests {
             &mut packages,
             &mut index_by_path,
             &mut visiting,
+            &HashSet::new(),
             &GitDeps::cache_only(root.join("unused-git-cache")),
         )
         .expect("both spellings resolve");
@@ -1437,6 +1536,255 @@ mod tests {
     fn non_identifier_name_is_an_error() {
         let manifest = parse("[package]\nname = \"my-pkg\"\n");
         assert!(manifest.validate().iter().any(|e| e.contains("identifier")));
+    }
+
+    // The reserved package names (L12, std-shape.md §4): `std`, `pkg`, and
+    // `macro_std` are the import roots the toolchain owns. Before the refusal,
+    // a dependency named `std` silently shadowed the whole standard library
+    // (`import std::print` stopped resolving), one named `pkg` was silently
+    // unreachable behind the self-package root, and one named `macro_std`
+    // shadowed the macro world's std — measured 2026-08-24, the plant these
+    // pins were proven red against.
+
+    /// The refusal's exact head for `name`, as [`reserved_name_refusal`]
+    /// builds it — asserted verbatim so the ledger row's key stays honest.
+    fn reserved_head(name: &str, reason: &str, renamed: &str) -> String {
+        format!(
+            "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
+             `macro_std` are all reserved); rename the {renamed}"
+        )
+    }
+
+    #[test]
+    fn a_package_named_std_is_refused() {
+        let manifest = parse("[package]\nname = \"std\"\n");
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "package"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_package_named_pkg_is_refused() {
+        let manifest = parse("[package]\nname = \"pkg\"\n");
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "pkg",
+                "it always means the importing package's own modules",
+                "package"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_package_named_macro_std_is_refused() {
+        let manifest = parse("[package]\nname = \"macro_std\"\n");
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "macro_std",
+                "the macro standard library owns it",
+                "package"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dependency_named_std_is_refused() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             std = { path = \"../std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dependency_named_pkg_is_refused() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             pkg = { path = \"../helpers\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "pkg",
+                "it always means the importing package's own modules",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dependency_named_macro_std_is_refused() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             macro_std = { path = \"../macro_std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "macro_std",
+                "the macro standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_library_dependency_named_std_is_refused() {
+        let manifest = parse(
+            "[library]\nname = \"helpers\"\n[library.dependencies]\n\
+             std = { path = \"../std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_project_dependency_named_std_is_refused() {
+        // The workspace root's table is the one members inherit FROM, so a
+        // reserved key there would hand every opted-in member the shadowing.
+        let manifest = parse(
+            "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+             std = { path = \"std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_reserved_dependency_with_a_broken_source_reports_both_problems() {
+        // Different root causes, both actionable: the name is reserved AND the
+        // declaration pins nothing.
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             std = { git = \"https://example.com/repo\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(errors.len(), 2, "both problems report: {errors:?}");
+        assert!(errors[0].contains("reserved package name"));
+        assert!(errors[1].contains("no point to pin"));
+    }
+
+    #[test]
+    fn a_library_named_std_is_the_standard_librarys_own_shape() {
+        // `[library] name` deliberately carries no reserved check: std itself
+        // is `[library] name = "std"` (likewise macro_std), and a library's
+        // own name — unlike a dependency key — never binds an import root.
+        let std_manifest = parse("[library]\nname = \"std\"\n");
+        assert!(std_manifest.validate().is_empty());
+        let macro_std_manifest = parse("[library]\nname = \"macro_std\"\n");
+        assert!(macro_std_manifest.validate().is_empty());
+    }
+
+    #[test]
+    fn a_near_miss_of_a_reserved_name_is_not_refused() {
+        // Exact match only: `stdx`, `std_helpers`, `pkg_tools`,
+        // `macro_stdlib` are ordinary names.
+        let manifest = parse(
+            "[package]\nname = \"stdx\"\n[package.dependencies]\n\
+             std_helpers = { path = \"../std_helpers\" }\n\
+             pkg_tools = { path = \"../pkg_tools\" }\n\
+             macro_stdlib = { path = \"../macro_stdlib\" }\n",
+        );
+        assert!(manifest.validate().is_empty());
+    }
+
+    #[test]
+    fn a_legal_dependency_name_still_resolves_end_to_end() {
+        // The refusal sits on `Manifest::validate`, which every
+        // `resolve_workspace` rides — so the complement is pinned through the
+        // real resolution path, not just `validate()`.
+        let root = workspace_tree(
+            "legal-name-loads",
+            &[
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { path = \"../shapes\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("a legal name resolves");
+        assert_eq!(workspace.packages.len(), 1);
+        assert_eq!(workspace.entry_dependencies.len(), 1);
+        assert_eq!(workspace.entry_dependencies[0].0, "shapes");
+        assert!(
+            !workspace.packages[0].member,
+            "no enclosing `[project]`, so no member (E90)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reserved_dependency_name_is_refused_through_resolution_too() {
+        // The same channel, refusing: `resolve_workspace` never resolves a
+        // manifest `validate` rejects, so the CLI and the editor both see the
+        // refusal before any dependency work happens.
+        let root = workspace_tree(
+            "reserved-name-refuses",
+            &[
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     std = { path = \"../shapes\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+            ],
+        );
+        let error = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect_err("a reserved name refuses");
+        assert!(!error.is_unfetched());
+        assert!(
+            error.message().contains("`std` is a reserved package name"),
+            "unexpected message: {}",
+            error.message()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2121,6 +2469,144 @@ mod tests {
                 .ends_with(Path::new("own_shapes").join("src")),
             "{:?}",
             workspace.packages[0].base_root
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- E90 (diagnostics-standard.md C3a): workspace membership ---
+    // A dependency package that IS a declared member of the entry's enclosing
+    // `[project]` resolves with `member: true` — the flag the analyzer's
+    // demotion carve-out reads. Membership is the root manifest's `packages`
+    // declaration, never a path test.
+
+    #[test]
+    fn a_declared_project_member_resolves_flagged_as_a_member() {
+        let root = workspace_tree(
+            "member-declared",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\", \"common\"]\n",
+                ),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     common = { path = \"../common\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+                ("common/vilan.toml", "[library]\nname = \"common\"\n"),
+                ("common/src/lib.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("a member workspace resolves");
+        assert_eq!(workspace.packages.len(), 1);
+        assert!(
+            workspace.packages[0].member,
+            "`common` is in `[project] packages`, so its spec is a member"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unlisted_path_dependency_under_the_project_root_is_not_a_member() {
+        // The "never by path" half of the owner's rule: `common` LIVES inside
+        // the project directory, but the root's `packages` does not declare
+        // it — path containment must not make it a member.
+        let root = workspace_tree(
+            "member-unlisted",
+            &[
+                ("vilan.toml", "[project]\npackages = [\"app\"]\n"),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     common = { path = \"../common\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+                ("common/vilan.toml", "[library]\nname = \"common\"\n"),
+                ("common/src/lib.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("resolves");
+        assert_eq!(workspace.packages.len(), 1);
+        assert!(
+            !workspace.packages[0].member,
+            "an undeclared directory is external, wherever it lives"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_git_dependency_is_never_a_member() {
+        // A git dependency materializes into the cache, which no `[project]`
+        // declares — so even inside a workspace it stays external and keeps
+        // the E84 demotion.
+        let root = std::env::temp_dir().join(format!("vilan-member-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        let source = crate::git_dep::GitSource {
+            url: "https://example.invalid/org/shapes".to_string(),
+            reference: GitRef::Tag("v1.0.0".to_string()),
+        };
+        seed_cache_entry(&cache, &source, "shapes");
+        std::fs::create_dir_all(root.join("app").join("src")).expect("create the app");
+        std::fs::write(root.join("vilan.toml"), "[project]\npackages = [\"app\"]\n")
+            .expect("the project manifest");
+        std::fs::write(
+            root.join("app").join("vilan.toml"),
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             shapes = { git = \"https://example.invalid/org/shapes\", tag = \"v1.0.0\" }\n",
+        )
+        .expect("the app manifest");
+        let workspace = resolve_workspace(&root.join("app"), &GitDeps::cache_only(&cache))
+            .expect("a warm cache resolves");
+        assert_eq!(workspace.packages.len(), 1);
+        assert!(
+            !workspace.packages[0].member,
+            "a cached checkout is nobody's member"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_member_inherited_from_the_project_root_is_still_a_member() {
+        // Membership rides the resolved DIRECTORY, not the edge's spelling: a
+        // member reached through `project = true` inheritance canonicalizes to
+        // the same declared directory a direct path edge would.
+        let root = workspace_tree(
+            "member-inherited",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\", \"common\"]\n[project.dependencies]\n\
+                     common = { path = \"common\" }\n",
+                ),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     common = { project = true }\n",
+                ),
+                ("app/src/main.vl", ""),
+                ("common/vilan.toml", "[library]\nname = \"common\"\n"),
+                ("common/src/lib.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("resolves");
+        assert_eq!(workspace.packages.len(), 1);
+        assert!(
+            workspace.packages[0].member,
+            "the inherited edge resolves to the declared member directory"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

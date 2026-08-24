@@ -114,12 +114,18 @@ taken as a value, is entered without the value and is never covered,
 whatever its other callers.
 
 The error anchors at **your code**. A strict read you wrote reports at
-that read. A strict read that sits inside a standard-library helper —
-`effect`, `map`, and `or` all reach the ambient owner through one read
-in `std::reactive` — reports at each of your calls that enters
-the library on an uncovered path, one error per call (a call inside a
-covering `run` is never blamed), with a secondary note pointing at the
-library-internal read it reaches.
+that read — anywhere in your workspace: an imported sibling module, or
+a member package your workspace root's `[project] packages` declares
+(membership is that declaration, never where a directory happens to
+live). A strict read that sits inside **library code** — a
+standard-library helper (`effect`, `map`, and `or` all reach the
+ambient owner through one read in `std::reactive`), or an external
+dependency package's function (a git dependency, or a path dependency
+that is not a declared member) — reports at each of your calls that
+enters the library on an uncovered path, one error per call (a call
+inside a covering `run` is never blamed), with a secondary note
+pointing at the library-internal read it reaches, in the library's own
+file. Library-internal calls never carry labels of their own.
 
 The error also shows the **whole uncovered path**, not just its
 endpoint: every call of yours between the program's entry and the

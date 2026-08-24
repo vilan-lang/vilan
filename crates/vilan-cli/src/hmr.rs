@@ -645,12 +645,36 @@ pub struct OverlayDiagnostic {
     pub column: usize,
     pub message: String,
     pub note: Option<String>,
+    /// The diagnostic's requirement trace (backlog E78, surfaced here by E80),
+    /// in the analyzer's entry → read order. Empty for every diagnostic but
+    /// the context-coverage refusals.
+    pub trace: Vec<OverlayTraceEntry>,
+}
+
+/// One entry of a requirement trace bound for the overlay: the hop's OWN file
+/// with the 1-based location inside it, its label, and whether it marks an
+/// uncovered call site. Located at capture like the diagnostic itself — a
+/// chain hop in an importing module indexes the module's text
+/// (`Note::source`), never the anchor's — so rendering needs no source.
+///
+/// `call` decides the line form: a call hop renders as `via file:line:col —
+/// label`; the chain's elision tail (the one non-call entry, anchored at the
+/// last kept hop's span) renders its text alone, so a location is never named
+/// twice in a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayTraceEntry {
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+    pub call: bool,
 }
 
 impl OverlayDiagnostic {
     /// Captures a diagnostic against the source its span indexes into: `file`
     /// names that source and `text` is its content, so a module diagnostic
-    /// resolves in the module and the entry's in the entry.
+    /// resolves in the module and the entry's in the entry. Trace-free; a
+    /// chain is attached with [`OverlayDiagnostic::with_trace`].
     pub fn located(
         file: &str,
         text: &str,
@@ -665,18 +689,59 @@ impl OverlayDiagnostic {
             column,
             message,
             note,
+            trace: Vec::new(),
+        }
+    }
+
+    /// Attaches the diagnostic's requirement trace, each entry already located
+    /// in its own file.
+    pub fn with_trace(mut self, trace: Vec<OverlayTraceEntry>) -> OverlayDiagnostic {
+        self.trace = trace;
+        self
+    }
+}
+
+impl OverlayTraceEntry {
+    /// Captures one hop against the source ITS span indexes into — which is
+    /// the hop's `Note::source` when that names another file, and the
+    /// diagnostic's own otherwise.
+    pub fn located(
+        file: &str,
+        text: &str,
+        span: std::ops::Range<usize>,
+        message: String,
+        call: bool,
+    ) -> OverlayTraceEntry {
+        let (line, column) = line_col(text, span.start);
+        OverlayTraceEntry {
+            file: file.to_string(),
+            line,
+            column,
+            message,
+            call,
         }
     }
 }
 
 /// Renders a failed leg's diagnostics as ANSI-free plain text for the `error`
 /// event (the in-page overlay, hmr.md §§2/§6). A header line naming the leg,
-/// then each diagnostic as `<file>:<line>:<col>` / `<message>` with any note
-/// indented beneath, diagnostics separated by a blank line. Each diagnostic
-/// names **its own** file (E16), so a module error points at the module rather
-/// than at the leg's entry. Capped at `cap`; the remainder collapses to a
-/// trailing "… and N more". The terminal path is untouched: this is a second,
-/// additive rendering of the same messages.
+/// then each diagnostic as `<file>:<line>:<col>` / `<message>`, its
+/// requirement trace (E80) as one indented line per entry — `via
+/// <file>:<line>:<col> — <label>` for a call hop, the elision tail's text
+/// alone — and any note indented beneath, diagnostics separated by a blank
+/// line. The trace sits between the message and the note in the analyzer's
+/// entry → read order, the same trace-then-note order the terminal's labels
+/// and the language server's related information keep. Each diagnostic names
+/// **its own** file (E16), so a module error points at the module rather than
+/// at the leg's entry, and each hop names ITS file. Capped at `cap`; the
+/// remainder collapses to a trailing "… and N more". The terminal path is
+/// untouched: this is a second, additive rendering of the same messages.
+///
+/// The line classes are the shim's contract (`hmr_shim.js`): a location line
+/// is unindented `file:line:col`; a trace line is indented and begins with
+/// `via ` or the tail's `…`; a note line is indented `note:`. A trace line
+/// names a location too, so the shim classes it FIRST — it colours the
+/// chain and never counts a hop toward the header badge.
 pub fn render_overlay(leg_file: &str, diagnostics: &[OverlayDiagnostic], cap: usize) -> String {
     use std::fmt::Write;
     let shown = diagnostics.len().min(cap);
@@ -692,6 +757,17 @@ pub fn render_overlay(leg_file: &str, diagnostics: &[OverlayDiagnostic], cap: us
             "\n\n{}:{}:{}\n{}",
             diagnostic.file, diagnostic.line, diagnostic.column, diagnostic.message
         );
+        for hop in &diagnostic.trace {
+            if hop.call {
+                let _ = write!(
+                    out,
+                    "\n    via {}:{}:{} — {}",
+                    hop.file, hop.line, hop.column, hop.message
+                );
+            } else {
+                let _ = write!(out, "\n    {}", hop.message);
+            }
+        }
         if let Some(note) = &diagnostic.note {
             let _ = write!(out, "\n    note: {note}");
         }
@@ -1073,6 +1149,88 @@ mod tests {
         );
         // ANSI-free: the overlay is HTML text, never a terminal control stream.
         assert!(!rendered.contains('\x1b'));
+    }
+
+    #[test]
+    fn the_overlay_renders_a_requirement_trace_between_the_message_and_the_note() {
+        // E80: a diagnostic's E78 chain renders as one indented line per
+        // entry, entry → read, AFTER the message and BEFORE the note — the
+        // same trace-then-note order the terminal's labels and the language
+        // server's related information keep. A call hop names its own
+        // file:line:col behind `via`; the elision tail (the non-call entry)
+        // is its text alone, since its span is the last kept hop's.
+        let entry = "import pkg::common::banner;\n\nfun main() {\n\tbanner();\n}\n";
+        let module = "fun banner(): str {\n\tcurrent.get()\n}\n";
+        // `current.get()` starts at byte 21 of the MODULE (line 2, column 2);
+        // `banner()` starts at byte 43 of the ENTRY (line 4, column 2).
+        let diagnostic = OverlayDiagnostic::located(
+            "src/common.vl",
+            module,
+            21..34,
+            "context `current` is read here, but this code can be reached without an enclosing `run`"
+                .to_string(),
+            Some("`current` is declared here".to_string()),
+        )
+        .with_trace(vec![
+            OverlayTraceEntry::located(
+                "src/client.vl",
+                entry,
+                43..51,
+                "the context requirement flows through this call".to_string(),
+                true,
+            ),
+            OverlayTraceEntry::located(
+                "src/client.vl",
+                entry,
+                43..51,
+                "… 2 more uncovered calls on this path".to_string(),
+                false,
+            ),
+        ]);
+        let rendered = render_overlay("src/client.vl", &[diagnostic], OVERLAY_DIAGNOSTIC_CAP);
+        assert_eq!(
+            rendered,
+            "src/client.vl: 1 error\n\n\
+             src/common.vl:2:2\n\
+             context `current` is read here, but this code can be reached without an enclosing `run`\n\
+             \x20   via src/client.vl:4:2 — the context requirement flows through this call\n\
+             \x20   … 2 more uncovered calls on this path\n\
+             \x20   note: `current` is declared here"
+        );
+        // The shim's line-class contract: every trace line is indented, so
+        // `/^\s+(via |…)/` classes it before the location regex can count it —
+        // a chain never inflates the header badge (the shim e2e drives the
+        // real count; this pins the text shape it relies on).
+        for line in rendered
+            .lines()
+            .filter(|line| line.contains("via ") || line.starts_with("    …"))
+        {
+            assert!(
+                line.starts_with("    via ") || line.starts_with("    …"),
+                "a trace line must be indented for the shim to class it: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trace_hop_is_located_in_its_own_file() {
+        // E16's rule, applied per hop: a chain hop in an importing module
+        // resolves its line/column against THAT module's text, not the
+        // anchor's — the anchor's text would put the same offset elsewhere.
+        let entry = "import pkg::common::banner;\n\nfun main() {\n\tbanner();\n}\n";
+        let module = "fun banner(): str {\n\tcurrent.get()\n}\n";
+        let hop = OverlayTraceEntry::located(
+            "src/client.vl",
+            entry,
+            43..51,
+            "the context requirement flows through this call".to_string(),
+            true,
+        );
+        assert_eq!(
+            (hop.file.as_str(), hop.line, hop.column),
+            ("src/client.vl", 4, 2)
+        );
+        assert_ne!(line_col(module, 43), (4, 2));
     }
 
     #[test]

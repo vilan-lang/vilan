@@ -70,7 +70,7 @@
 		// one — `[macro]` is a `vilan.toml` section, never a source attribute.
 		const ATTRIBUTE = {
 			className: "meta",
-			begin: "^\\s*\\[(?:derive|service|extern|must_use|rpc|trait_only|doc|expose|platform)\\b",
+			begin: "^\\s*\\[(?:derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b",
 			end: "\\]",
 		};
 		// `context` and `sync` are CONTEXTUAL: the lexer hands both back as

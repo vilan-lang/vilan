@@ -945,6 +945,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E84 (diagnostics-standard.md C3a): the demotion is not std-specific.
+    // A strict read inside a DEPENDENCY package (here a path dependency
+    // resolved through the real manifest chain) publishes its primary at
+    // the user's call, the package-internal read as related information
+    // into the package's own file, hop diagnostics only at user-written
+    // calls — and nothing at all into the dependency. Pre-widening (the
+    // probe, 2026-08-24) the primary anchored inside `lib.vl` and the
+    // package's file carried the diagnostic.
+    #[test]
+    fn a_dependency_reads_demotion_publishes_at_the_users_call() {
+        let main_text = "import std::print;\nimport depctx::read_it;\nfun main() {\n\tprint(read_it());\n}\nmain();\n";
+        let (dir, _) = analyze_workspace(&[
+            ("app/src/main.vl", main_text),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n\n[package.dependencies]\ndepctx = { path = \"../depctx\" }\n",
+            ),
+            ("depctx/vilan.toml", "[library]\nname = \"depctx\"\n"),
+            (
+                "depctx/src/lib.vl",
+                "import std::context::Context;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+            ),
+        ]);
+        let mut state = PublishState::new();
+        let (main_uri, main_document) = open(&dir, "app/src/main.vl");
+        let published = state.plan_publish(&main_uri, &main_document);
+        let main_group = published
+            .iter()
+            .find(|(target, _)| target.path().ends_with("main.vl"))
+            .map(|(_, group)| group)
+            .expect("main.vl publishes");
+        let primary = main_group
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("can be reached without an enclosing `run`")
+            })
+            .expect("the coverage refusal publishes in main.vl");
+        assert_eq!(
+            primary.range,
+            range_of(main_text, "read_it()", 0),
+            "the primary sits at the USER call, never inside the package: {primary:#?}"
+        );
+        let related = primary
+            .related_information
+            .as_ref()
+            .expect("trace + note travel with the primary");
+        let note = related.last().unwrap();
+        assert!(
+            note.location.uri.path().ends_with("lib.vl"),
+            "the demoted read is related information in the PACKAGE's file: {note:#?}"
+        );
+        assert_eq!(note.message, "the read is inside `read_it` here");
+        let hops: Vec<&Diagnostic> = main_group
+            .iter()
+            .filter(|item| item.message == "the context requirement flows through this call")
+            .collect();
+        assert_eq!(
+            hops.len(),
+            1,
+            "one user hop (the top-level `main();`): {main_group:#?}"
+        );
+        assert_eq!(hops[0].range, range_of(main_text, "main()", 1));
+        assert!(
+            !published
+                .iter()
+                .any(|(target, group)| target.path().ends_with("lib.vl") && !group.is_empty()),
+            "nothing publishes into the dependency: {published:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // A BOM'd module on disk publishes its diagnostic at the right COLUMN
     // (windows-support.md §2). Two reads have to agree: the analyzer's, which
     // produces the span, and the planner's, which builds the `LineIndex` that

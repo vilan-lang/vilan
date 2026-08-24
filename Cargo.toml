@@ -4,6 +4,7 @@ members = [
     "crates/vilan-core",
     "crates/vilan-cli",
     "crates/vilan-lsp",
+    "crates/vilan-ide",
     "crates/vilan-embedded-std",
     "crates/vilan-wasm",
 ]

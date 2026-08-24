@@ -32,8 +32,8 @@ use std::process::Command;
 
 use tower_lsp::lsp_types::{CodeActionKind, CodeActionProviderCapability, ServerCapabilities};
 
-use crate::document::{BOOK_BASE, KEYWORD_DOCS};
 use crate::server_capabilities;
+use vilan_ide::{BOOK_BASE, KEYWORD_DOCS};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

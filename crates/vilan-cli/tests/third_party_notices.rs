@@ -26,7 +26,13 @@ fn repo_root() -> PathBuf {
 }
 
 /// The workspace's own crates — first-party, not third-party.
-const WORKSPACE_CRATES: &[&str] = &["vilan-cli", "vilan-core", "vilan-embedded-std", "vilan-lsp"];
+const WORKSPACE_CRATES: &[&str] = &[
+    "vilan-cli",
+    "vilan-core",
+    "vilan-embedded-std",
+    "vilan-lsp",
+    "vilan-ide",
+];
 
 #[test]
 fn every_locked_dependency_appears_in_the_notices() {

@@ -698,6 +698,171 @@ fn a_valid_hatch_passes_the_check_and_rides_the_page() {
     }
 }
 
+/// E86 (fullstack-dx.md §16.13, ruled 2026-08-22): consecutive `head()` /
+/// `body()` calls used to concatenate with NO separator — two calls put two
+/// items on one line, which is why the first real site called each hatch once
+/// with a pre-joined string. Each call now lands on its own line at the
+/// hatch's indent, so the hatch is usable per item.
+const REPEATED_HATCH: &str = r#"import std::build::LegBuild;
+import std::document::Document;
+import std::io::print;
+import std::option::Option::{ None, Some, self };
+
+fun main() {
+	let build = LegBuild {
+		leg = "client",
+		dist = "dist",
+		bundle = "client.js",
+		styles = Some("client.css"),
+		chunks = [],
+		classic_script = false,
+	};
+	print(Document::of(build)
+		.title("Notes")
+		.head("<meta name=\"alpha\" content=\"1\" />")
+		.head("<meta name=\"beta\" content=\"2\" />")
+		.body("<aside>one</aside>")
+		.body("<aside>two</aside>")
+		.html());
+}
+"#;
+
+#[test]
+fn consecutive_hatch_calls_land_one_per_line() {
+    let report = run_probe("repeatedhatch", REPEATED_HATCH);
+    // Two `head()` calls → two lines, both at the hatch's two-tab indent,
+    // still inside `<head>`.
+    assert!(
+        report.contains(
+            "\t\t<meta name=\"alpha\" content=\"1\" />\n\t\t<meta name=\"beta\" content=\"2\" />\n\t</head>"
+        ),
+        "two head() calls should land as two lines at the hatch's indent:\n{report}"
+    );
+    // The `body()` twin: after the mount element, before the script tag.
+    assert!(
+        report.contains(
+            "\t\t<aside>one</aside>\n\t\t<aside>two</aside>\n\t\t<script type=\"module\" src=\"/client.js\"></script>"
+        ),
+        "two body() calls should land as two lines at the hatch's indent:\n{report}"
+    );
+}
+
+/// The same rule on the SUPPLIED arm: hatch markup splices in before the
+/// shell's closing tags (E77), and consecutive calls arrive there one per
+/// line too — the join happens where the calls append, so both arms share it.
+const REPEATED_HATCH_SUPPLIED: &str = r#"import std::build::LegBuild;
+import std::document::Document;
+import std::io::print;
+import std::option::Option::{ None, Some, self };
+import std::result::Result::{ Err, Ok, self };
+
+fun main() {
+	let build = LegBuild {
+		leg = "client",
+		dist = "dist",
+		bundle = "client.js",
+		styles = Some("client.css"),
+		chunks = [],
+		classic_script = false,
+	};
+	let shell = "<!doctype html>\n<html lang=\"en\">\n\t<head>\n\t\t<meta charset=\"utf-8\" />\n\t\t<link rel=\"stylesheet\" href=\"/client.css\" />\n\t</head>\n\t<body>\n\t\t<div id=\"app\"></div>\n\t\t<script type=\"module\" src=\"/client.js\"></script>\n\t</body>\n</html>\n";
+	match Document::from_shell(shell, build) {
+		Ok(let supplied) => print(supplied
+			.head("<meta name=\"alpha\" content=\"1\" />")
+			.head("<meta name=\"beta\" content=\"2\" />")
+			.html()),
+		Err(let faults) => {
+			for fault in faults {
+				print(i"refused: {fault.message()}");
+			}
+		},
+	}
+}
+"#;
+
+#[test]
+fn consecutive_head_calls_compose_one_per_line_into_a_supplied_shell() {
+    let report = run_probe("repeatedsupplied", REPEATED_HATCH_SUPPLIED);
+    assert!(
+        report.contains(
+            "<meta name=\"alpha\" content=\"1\" />\n\t\t<meta name=\"beta\" content=\"2\" /></head>"
+        ),
+        "two head() calls should compose as two lines immediately before </head>:\n{report}"
+    );
+}
+
+// --- E85: `description(text)`, `title`'s twin (§16.13, ruled 2026-08-22) ----
+//
+// The ruled bound: rung 2 is the intersection of the shells in the tree, plus
+// the identity lines the document is the SOLE AUTHOR of — `title` and
+// `description` — plus the hatches for everything naming a second party std
+// cannot see. The description is escaped the way the title is (through the
+// attribute escaper, since it lives in an attribute) and emitted beside it in
+// the generated prefix; a document not given one carries no description meta
+// at all. Like `title`, it shapes the generated document only — a supplied
+// shell's identity lines are the shell's own.
+const DESCRIPTION: &str = r#"import std::build::LegBuild;
+import std::document::Document;
+import std::io::print;
+import std::option::Option::{ None, Some, self };
+
+fun main() {
+	let build = LegBuild {
+		leg = "client",
+		dist = "dist",
+		bundle = "client.js",
+		styles = Some("client.css"),
+		chunks = [],
+		classic_script = false,
+	};
+	print("===DESCRIBED===");
+	print(Document::of(build).title("Notes").description("A tidy list.").html());
+	print("===HOSTILE===");
+	print(Document::of(build).title("Notes").description("Tasks & \"quoted\" <notes>").html());
+	print("===BARE===");
+	print(Document::of(build).title("Notes").html());
+	print("===END===");
+}
+"#;
+
+#[test]
+fn a_description_rides_the_generated_prefix_beside_the_title() {
+    let report = run_probe("description", DESCRIPTION);
+    // Beside the title: the meta lands on the line immediately after it, in
+    // the generated prefix — not in hatch position.
+    assert!(
+        report.contains(
+            "\t\t<title>Notes</title>\n\t\t<meta name=\"description\" content=\"A tidy list.\" />\n"
+        ),
+        "the description meta should sit immediately beside the <title>:\n{report}"
+    );
+    // A document not given a description carries no description meta at all.
+    let bare = report
+        .split("===BARE===")
+        .nth(1)
+        .expect("the probe should print the bare page");
+    assert!(
+        !bare.contains("name=\"description\""),
+        "a document with no description must emit no description meta:\n{bare}"
+    );
+}
+
+#[test]
+fn a_hostile_description_is_escaped_like_the_title() {
+    // The graduation's whole payoff (§16.13): the site interpolated the text
+    // raw, so a `"` in a description ended the attribute and the remainder
+    // became junk attributes a browser tolerates — the page looked right and
+    // the search snippet was wrong. Escaped through the attribute escaper,
+    // the hostile text stays one attribute value.
+    let report = run_probe("hostiledescription", DESCRIPTION);
+    assert!(
+        report.contains(
+            "<meta name=\"description\" content=\"Tasks &amp; &quot;quoted&quot; <notes>\" />"
+        ),
+        "a hostile description should escape the way an attribute value does:\n{report}"
+    );
+}
+
 /// The other side of the ruling: NO hatch markup means no check at all — the
 /// page is derived from the build alone, proven to pass by construction, so
 /// `html()` decides by a cheap emptiness flag and never re-reads its own

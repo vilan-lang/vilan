@@ -1,7 +1,10 @@
 //! `macro_std` (proposal/macro-engine.md §3, Phase 0): the macro world's std.
 //! Until the hermetic resolver lands (Phase 1), the package is exercised as an
 //! ordinary path dependency — this pins that its reflection surface compiles,
-//! constructs, and dispatches end to end.
+//! constructs, and dispatches end to end. The dependency key is `reflection`,
+//! not `macro_std`: `macro_std` is a reserved package name the manifest
+//! refuses (L12, std-shape.md §4), and the key — not the library's own name —
+//! is what binds the import root, so any legal key exercises the same package.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -46,7 +49,7 @@ fn the_reflection_surface_works_end_to_end() {
         &dir,
         "app/vilan.toml",
         &format!(
-            "[package]\nname = \"app\"\ntarget = \"node\"\n\n[package.dependencies]\nmacro_std = {{ path = '{}' }}\n",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n\n[package.dependencies]\nreflection = {{ path = '{}' }}\n",
             macro_std.display()
         ),
     );
@@ -55,8 +58,8 @@ fn the_reflection_surface_works_end_to_end() {
         "app/src/main.vl",
         r#"import std::print;
 import std::option::Option::{ self, Some, None };
-import macro_std::source;
-import macro_std::meta::{ TypeExpr, Item, StructItem, Field };
+import reflection::source;
+import reflection::meta::{ TypeExpr, Item, StructItem, Field };
 
 fun main() {
     let list_of_i32 = TypeExpr { name = "List", arguments = [TypeExpr { name = "i32", arguments = [] }] };

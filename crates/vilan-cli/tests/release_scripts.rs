@@ -269,6 +269,429 @@ fn the_cut_refuses_an_entry_it_cannot_classify_instead_of_guessing() {
     assert!(report.contains("the unknown family `refactor`"), "{report}");
 }
 
+/// The 1-based line `needle` sits on, for a refusal that must name it.
+fn line_of(text: &str, needle: &str) -> usize {
+    text.lines()
+        .position(|line| line == needle)
+        .map(|index| index + 1)
+        .unwrap_or_else(|| panic!("no line of the fixture reads `{needle}`"))
+}
+
+fn refuse(name: &str, changelog: &str) -> String {
+    let fixture = Fixture::new(name, changelog);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.9",
+        ],
+    );
+    assert!(!ok, "the cut accepted a section it must refuse:\n{report}");
+    assert!(
+        report.contains("refusing to cut"),
+        "the refusal must say nothing was changed:\n{report}"
+    );
+    assert!(!out.exists(), "a refused cut must write nothing");
+    assert!(fixture.read("CHANGELOG.md").contains("## Unreleased"));
+    report
+}
+
+/// The 2026-08-20 shape (backlog L11): a `<!-- family: ... -->` line that a
+/// CHANGELOG merge-union left with nothing under it — blank lines, then the
+/// next rule. The parser used to let the rule clear the pending family and
+/// the dry-run stayed green, so the dangling comment would have ridden into
+/// the release section. A marker that reaches a rule, another marker of its
+/// kind, or the section's end without a bold head is refused, by line.
+#[test]
+fn the_cut_refuses_a_marker_that_opens_no_entry() {
+    let stranded = SCRAMBLED.replace(
+        "---\n\n---\n\n<!-- family: miscompile -->",
+        "---\n\n<!-- family: diagnostics -->\n\n\n---\n\n<!-- family: miscompile -->",
+    );
+    let line = line_of(&stranded, "<!-- family: diagnostics -->");
+    let report = refuse("orphan-family", &stranded);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "the refusal must name the stranded marker and its line:\n{report}"
+    );
+    // Refusing is not a reason to stop reporting: the sweep still traces the
+    // four entries the section does hold.
+    assert_eq!(report.matches("  ok    ").count(), 4, "{report}");
+
+    // A `commit:` marker is a marker too.
+    let stranded = SCRAMBLED.replace(
+        "---\n\n---\n\n<!-- family: miscompile -->",
+        "---\n\n<!-- commit: 0123abcd -->\n---\n\n<!-- family: miscompile -->",
+    );
+    let line = line_of(&stranded, "<!-- commit: 0123abcd -->");
+    let report = refuse("orphan-commit", &stranded);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- commit: 0123abcd -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+
+    // Two family markers in a row: the first opens nothing.
+    let doubled = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.**",
+        "<!-- family: diagnostics -->\n<!-- family: feature -->\n**A feature entry.**",
+    );
+    let line = line_of(&doubled, "<!-- family: diagnostics -->");
+    let report = refuse("doubled-family", &doubled);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+    // The second marker is the one the entry carries: it is placed, and the
+    // stranded first marker is the only red.
+    assert!(
+        !report.contains("carries no `<!-- family: ... -->` marker"),
+        "{report}"
+    );
+    assert_eq!(report.matches("  RED   ").count(), 1, "{report}");
+
+    // A marker the next section's heading cuts off, and one the file ends on.
+    let at_heading = SCRAMBLED.replace(
+        "---\n\n## v0.1.0",
+        "---\n\n<!-- family: diagnostics -->\n## v0.1.0",
+    );
+    let line = line_of(&at_heading, "<!-- family: diagnostics -->");
+    let report = refuse("orphan-at-heading", &at_heading);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+    let at_end = format!(
+        "{}<!-- family: diagnostics -->\n",
+        &SCRAMBLED[..SCRAMBLED.find("## v0.1.0").expect("the released section")]
+    );
+    let line = line_of(&at_end, "<!-- family: diagnostics -->");
+    let report = refuse("orphan-at-end", &at_end);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: diagnostics -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+}
+
+/// A marker sits directly above its head — the changelog's own writing note
+/// says so, every marker in the tree does so, and the only marker a blank
+/// line ever followed was the 2026-08-20 orphan. So a blank between the two
+/// is refused rather than tolerated, and the head below it is then an entry
+/// with no family: both reds name the one fault, from each side.
+#[test]
+fn the_cut_refuses_a_marker_parted_from_its_head_by_a_blank_line() {
+    let parted = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.**",
+        "<!-- family: feature -->\n\n**A feature entry.**",
+    );
+    let line = line_of(&parted, "<!-- family: feature -->");
+    let report = refuse("parted-marker", &parted);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: feature -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains("carries no `<!-- family: ... -->` marker: A feature entry."),
+        "{report}"
+    );
+}
+
+/// A marker followed by prose instead of a bold head: the prose was already
+/// refused as text that begins no entry, and the marker above it is now
+/// refused as well.
+#[test]
+fn the_cut_refuses_a_marker_followed_by_prose() {
+    let prose = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.** What is newly possible.",
+        "<!-- family: feature -->\nA feature entry, with no bold head to open it.",
+    );
+    let line = line_of(&prose, "<!-- family: feature -->");
+    let report = refuse("marker-then-prose", &prose);
+    assert!(
+        report.contains(
+            "text under `## Unreleased` that begins no entry: A feature entry, with no bold head to open it."
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- family: feature -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+}
+
+/// The legitimate shapes: a `commit:` marker above or below the `family:`
+/// marker, each directly above the head. Both cut, and the rewrite puts the
+/// two lines in one order.
+#[test]
+fn the_cut_accepts_a_commit_marker_on_either_side_of_the_family_marker() {
+    let fixture = Fixture::new("commit-marker-order", SCRAMBLED);
+    let sha = String::from_utf8_lossy(&fixture.git(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    let claimed = SCRAMBLED
+        .replace(
+            "<!-- family: breaking -->",
+            &format!("<!-- commit: {sha} -->\n<!-- family: breaking -->"),
+        )
+        .replace(
+            "<!-- family: feature -->",
+            &format!("<!-- family: feature -->\n<!-- commit: {sha} -->"),
+        );
+    fs::write(fixture.root.join("CHANGELOG.md"), claimed).expect("write the changelog");
+    fixture.git(&["commit", "-am", "records: name the commits"]);
+
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.9",
+        ],
+    );
+    assert!(
+        ok,
+        "the cut refused a commit marker beside a family marker:\n{report}"
+    );
+    assert_eq!(report.matches("  ok    ").count(), 4, "{report}");
+    let proposed = fs::read_to_string(&out).expect("read the proposed changelog");
+    for family in ["breaking", "feature"] {
+        let expected =
+            format!("<!-- commit: {sha} -->\n<!-- family: {family} -->\n**A {family} entry.**");
+        assert!(
+            proposed.contains(&expected),
+            "expected the {family} entry to carry both markers, commit first:\n{proposed}"
+        );
+    }
+}
+
+// --- The deprecation lifetime sweep (proposal/deprecation.md §3) ------------
+//
+// `<!-- deprecates: KEY -->` / `<!-- removes: KEY -->` above an entry's head:
+// a `removes:` under Unreleased cuts only when a RELEASED section carries the
+// matching `deprecates:` — one minor of warning, with no version arithmetic,
+// because every train is a minor. These pins ride the same fixture repos as
+// the family sweep's; note the cut VERSION matters here (9.9.0, not 9.9.9 —
+// a patch cut refuses the markers outright, which is itself pinned below).
+
+/// `refuse`, but cutting the MINOR 9.9.0 (the lifetime sweep's ordinary
+/// train; `refuse`'s 9.9.9 would trip the patch rule first).
+fn refuse_minor(name: &str, changelog: &str) -> String {
+    let fixture = Fixture::new(name, changelog);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.0",
+        ],
+    );
+    assert!(!ok, "the cut accepted a section it must refuse:\n{report}");
+    assert!(
+        report.contains("refusing to cut"),
+        "the refusal must say nothing was changed:\n{report}"
+    );
+    assert!(!out.exists(), "a refused cut must write nothing");
+    assert!(fixture.read("CHANGELOG.md").contains("## Unreleased"));
+    report
+}
+
+#[test]
+fn the_cut_refuses_a_removal_whose_deprecation_never_shipped() {
+    // The plant-proven case §3 exists for: a removal jumping the window. No
+    // released section carries `deprecates: std::old::thing`, so the cut is
+    // REFUSED and the key printed — never guessed.
+    let jumped = SCRAMBLED.replace(
+        "<!-- family: breaking -->",
+        "<!-- family: breaking -->\n<!-- removes: std::old::thing -->",
+    );
+    let report = refuse_minor("removal-unshipped", &jumped);
+    assert!(
+        report.contains(
+            "RED   removes: std::old::thing - no RELEASED section carries \
+             `deprecates: std::old::thing`, so its warning never shipped"
+        ),
+        "the refusal must name the key and the missing warning:\n{report}"
+    );
+    assert!(
+        report.contains("A breaking entry."),
+        "the refusal must name the entry carrying the marker:\n{report}"
+    );
+}
+
+#[test]
+fn a_deprecation_in_the_same_unreleased_section_does_not_license_its_removal() {
+    // Warning and removal riding ONE train is exactly the no-window shape the
+    // check refuses: the match must sit in a released section.
+    let same_train = SCRAMBLED
+        .replace(
+            "<!-- family: breaking -->",
+            "<!-- family: breaking -->\n<!-- removes: std::old::thing -->",
+        )
+        .replace(
+            "<!-- family: tooling -->",
+            "<!-- family: tooling -->\n<!-- deprecates: std::old::thing -->",
+        );
+    let report = refuse_minor("same-train", &same_train);
+    assert!(
+        report.contains("no RELEASED section carries `deprecates: std::old::thing`"),
+        "{report}"
+    );
+    assert!(
+        report.contains("a deprecation in this same Unreleased section does not count"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_cut_accepts_a_removal_whose_deprecation_shipped_and_keeps_the_markers() {
+    // The released `deprecates:` licenses the removal; the cut orders,
+    // names the shipping train, and the rewrite carries BOTH marker lines
+    // into the release section (the CHANGELOG stays the ledger).
+    let windowed = SCRAMBLED
+        .replace(
+            "<!-- family: breaking -->",
+            "<!-- family: breaking -->\n<!-- removes: std::old::thing -->",
+        )
+        .replace(
+            "<!-- family: feature -->",
+            "<!-- family: feature -->\n<!-- deprecates: std::next::form -->",
+        )
+        .replace(
+            "## v0.1.0 — 2026-01-01\n",
+            "## v0.1.0 — 2026-01-01\n\n<!-- deprecates: std::old::thing -->",
+        );
+    let fixture = Fixture::new("removal-windowed", &windowed);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.0",
+        ],
+    );
+    assert!(ok, "the cut refused a windowed removal:\n{report}");
+    assert!(
+        report.contains("ok    removes: std::old::thing  (deprecated in v0.1.0)"),
+        "the sweep must name the train that shipped the warning:\n{report}"
+    );
+    assert!(
+        report.contains("ok    deprecates: std::next::form  (the window opens with this cut)"),
+        "{report}"
+    );
+    let proposed = fs::read_to_string(&out).expect("read the proposed changelog");
+    assert!(
+        proposed.contains(
+            "<!-- family: breaking -->\n<!-- removes: std::old::thing -->\n**A breaking entry.**"
+        ),
+        "the rewrite must keep the removal marker above its head:\n{proposed}"
+    );
+    assert!(
+        proposed.contains(
+            "<!-- family: feature -->\n<!-- deprecates: std::next::form -->\n**A feature entry.**"
+        ),
+        "the rewrite must keep the deprecation marker above its head:\n{proposed}"
+    );
+}
+
+#[test]
+fn the_cut_reports_shipped_deprecations_still_pending_removal() {
+    // A `deprecates:` with no `removes:` yet is NOT an error (§5.2(1) is a
+    // floor) — the sweep reports it, key and shipping train, at every cut.
+    let pending = SCRAMBLED.replace(
+        "## v0.1.0 — 2026-01-01\n",
+        "## v0.1.0 — 2026-01-01\n\n<!-- deprecates: std::old::thing -->",
+    );
+    let fixture = Fixture::new("pending-report", &pending);
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &["--date", "2026-01-02", "--dry-run", "9.9.0"],
+    );
+    assert!(ok, "a pending deprecation must not red the cut:\n{report}");
+    assert!(
+        report.contains("deprecations still in their window (report only)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("pending  std::old::thing  (deprecated in v0.1.0, not yet removed"),
+        "the report names the key and the train that shipped it:\n{report}"
+    );
+}
+
+#[test]
+fn a_patch_cut_refuses_lifetime_markers_outright() {
+    // Deprecations and removals ride minors only (releases.md §4: patches are
+    // fixes) — `refuse`'s 9.9.9 cut is the patch here.
+    let on_a_patch = SCRAMBLED.replace(
+        "<!-- family: breaking -->",
+        "<!-- family: breaking -->\n<!-- deprecates: std::old::thing -->",
+    );
+    let report = refuse("patch-lifetime", &on_a_patch);
+    assert!(
+        report.contains(
+            "RED   `deprecates: std::old::thing` on a PATCH cut - deprecations and removals \
+             ride minors only (releases.md §4)"
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_stranded_lifetime_marker_is_refused_like_any_other() {
+    // The L11 discipline extends to the new markers: one parted from its head
+    // by a blank line opens no entry, and an empty KEY names nothing to track.
+    let stranded = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.**",
+        "<!-- deprecates: std::old::thing -->\n\n<!-- family: feature -->\n**A feature entry.**",
+    );
+    let line = line_of(&stranded, "<!-- deprecates: std::old::thing -->");
+    let report = refuse_minor("orphan-lifetime", &stranded);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- deprecates: std::old::thing -->` at line {line} opens no entry"
+        )),
+        "{report}"
+    );
+
+    let empty = SCRAMBLED.replace(
+        "<!-- family: feature -->",
+        "<!-- family: feature -->\n<!-- removes: -->",
+    );
+    let line = line_of(&empty, "<!-- removes: -->");
+    let report = refuse_minor("empty-key", &empty);
+    assert!(
+        report.contains(&format!(
+            "marker `<!-- removes: -->` at line {line} names no key"
+        )),
+        "{report}"
+    );
+}
+
 #[test]
 fn the_sweep_reds_an_entry_whose_commit_is_not_an_ancestor_of_the_tag() {
     // The drift §7.1 was written about: an entry filed under Unreleased whose

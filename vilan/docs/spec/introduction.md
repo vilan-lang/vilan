@@ -13,7 +13,7 @@ this defines. Where the two disagree, this document wins.
   where behavior is deliberately implementation-defined.
 - The specification states **intent**. A compiler behavior that contradicts
   normative text is a compiler bug, even before it is fixed; such gaps are
-  tracked in [the repository's backlog](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/backlog.md) and pinned as `#[ignore]`d tests.
+  tracked in [the project's backlog](https://github.com/vilan-lang/proposals/tree/main/tracker) and pinned as `#[ignore]`d tests.
 
 Deliberately implementation-defined (a conforming implementation may vary):
 diagnostic wording and spans; the shape of emitted JavaScript (subject to

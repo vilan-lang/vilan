@@ -36,6 +36,9 @@ impl List<type T: PartialEq> {
 	fun contains(self, value: T): bool
 	fun index_of(self, value: T): Option<i32>
 }
+impl List<type T: PartialEq> with PartialEq {
+	fun eq(self, b: List<T>): bool           // element-wise, length first
+}
 impl List<type T: Display> { fun join(self, separator: str): str }
 ```
 
@@ -84,10 +87,15 @@ fun main() {
 }
 ```
 
-### Searching
+### Searching & equality
 
 `find` takes a predicate and short-circuits; `contains` and `index_of` take a
 value and need `T: PartialEq`. Missing answers are `None`, never a panic.
+
+A `List<T: PartialEq>` is itself `PartialEq`: `==` compares element-wise,
+length first. Because the impl is conditional, lists nest
+(`List<List<i32>>` compares through its elements) and a struct holding a
+`List` field can `[derive(PartialEq)]`.
 
 ```vilan
 import std::print;
@@ -98,6 +106,8 @@ fun main() {
 	print(scores.contains(65));                   // true
 	print(scores.index_of(65).unwrap_or(-1));     // 2
 	print(scores.index_of(7).is_none());          // true
+	print(scores == [40, 91, 65]);                // true
+	print(scores == [40, 91]);                    // false — length first
 }
 ```
 

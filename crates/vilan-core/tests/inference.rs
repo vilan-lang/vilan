@@ -957,6 +957,78 @@ fn warnings(source: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// [`warnings`] with each warning's span, through a CLEAN analysis against the
+/// given std: panics unless analysis produced a program with zero diagnostics
+/// (a warning that rides an error is not the non-fatal path), then returns
+/// `(message, span)` per warning in the analyzer's own (C1-sorted) order.
+fn warning_diagnostics_with_std(
+    source: &str,
+    std: PackageSpec,
+) -> Vec<(String, std::ops::Range<usize>)> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std,
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            program
+                .expect("analysis should produce a program")
+                .warnings
+                .into_iter()
+                .map(|warning| (warning.msg, warning.span.into_range()))
+                .collect::<Vec<_>>()
+        })
+        .expect("spawn worker")
+        .join()
+        .unwrap()
+}
+
+/// [`warning_diagnostics_with_std`] against the real std.
+fn warning_diagnostics(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    warning_diagnostics_with_std(source, std_spec())
+}
+
+/// The warning twin of [`assert_fails_spanning`] (deprecation.md §1's C2 pin):
+/// asserts a warning containing `message_part` spans the FIRST occurrence of
+/// `spanning`, and — through [`warning_diagnostics`] — that the analysis was
+/// clean and produced a program.
+#[track_caller]
+fn assert_warns_spanning(source: &str, spanning: &str, message_part: &str) {
+    let expected_start = source
+        .find(spanning)
+        .expect("the `spanning` snippet must occur in the source");
+    let expected = expected_start..expected_start + spanning.len();
+    let warnings = warning_diagnostics(source);
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains(message_part))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "no warning contains {message_part:?}; got: {warnings:#?}"
+    );
+    assert!(
+        matching.iter().any(|(_, range)| *range == expected),
+        "no {message_part:?} warning spans {expected:?} ({spanning:?}); spans: {:#?}",
+        matching
+            .iter()
+            .map(|(message, range)| (message.as_str(), range.clone(), &source[range.clone()]))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The rendered per-function requirement line (`platform_color::requirements`
 /// — the hover's data) for the named function, through the real pipeline on
 /// the default platform. `None` = the function is colorless. Panics on
@@ -6872,6 +6944,236 @@ fn a_closures_ret_still_cannot_hand_back_a_view() {
     );
 }
 
+// --- B134: `return_sites` completes — the tail and each value-carrying `ret`
+// of EVERY bodied function, annotated or not. B116 built the join for
+// declared-return functions; B126 typed an unannotated function's `ret`s, so
+// the seam readers (`infer_borrows`, the crossing scan, `check_view_escape`,
+// the return clone sites) must see those positions too. Every pin below is a
+// B116/B122 shape with the return annotation REMOVED: the two spellings of
+// one return — and the two spellings of one signature — must answer alike.
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_reference_leaf_copies() {
+    // B116's first shape without the `: Inner`. The `ret` was refused with
+    // the generic "a view cannot escape its scope" (the raw FunctionReturn
+    // scan — the seams never saw an unannotated `ret`) while the tail
+    // ALIASED (below). Both spellings now emit the same copy the annotated
+    // twin has always emitted.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self, flag: bool) {
+                if flag { ret &self.inner; }
+                &self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let early = h.grab(true);
+            let tail = h.grab(false);
+            h.inner.n = 99;
+            print(early.n);
+            print(tail.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function grab(self, flag) {\n\
+             \tif (flag) {\n\t\treturn __clone(self[0]);\n\t}\n\
+             \treturn __clone(self[0]);\n}"
+        ),
+        "both unannotated spellings should emit the same copy, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n3\n",
+        "neither spelling may hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b134_an_unannotated_tail_of_a_loaned_place_copies() {
+    // The tail half of the same gap, and the sharpest tooth: with no
+    // annotation the tail was not a clone seam at all (`return_sites` was
+    // the clone-site pass's only function source), so `fun grab(&self) {
+    // self.inner }` handed back the receiver's LIVE storage — this program
+    // printed 99 where its annotated twin printed 3.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self) {
+                self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let got = h.grab();
+            h.inner.n = 99;
+            print(got.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("return __clone(self[0]);"),
+        "the unannotated tail must copy the loaned place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "the unannotated tail may not hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_scalar_view_reads_the_place() {
+    // B108's shape without the `: i32`: a scalar's copy is its read
+    // (`v[0][v[1]]`), at the `ret` as at the tail.
+    let javascript = compile(
+        r#"
+        import std::print;
+        fun same(v: &mut i32, flag: bool) {
+            if flag { ret v; }
+            v
+        }
+        fun main() { mut n = 5; print(same(&mut n, true)); print(same(&mut n, false)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function same(v, flag) {\n\
+             \tif (flag) {\n\t\treturn v[0][v[1]];\n\t}\n\
+             \treturn v[0][v[1]];\n}"
+        ),
+        "both unannotated spellings should read the scalar place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "5\n5\n",
+        "neither spelling may hand back the view pair"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_borrows_call_leaf_copies() {
+    // The call-leaf shape: the caller is unannotated, the `borrows` callee
+    // keeps its declaration (that sanction is the SIGNATURE's, and an
+    // unannotated function has none to give). The projection is copied out
+    // at both of the caller's return positions.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder, flag: bool) {
+            if flag { ret peek(h); }
+            peek(h)
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let early = get(&h, true);
+            h.pair.1 = 99;
+            print(early.1);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\tif (flag) {\n\t\treturn __clone(peek(h2));\n\t}\n\treturn __clone(peek(h2));"
+        ),
+        "both unannotated spellings should copy the call's projection, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "neither spelling may hand back the callee's alias"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_resource_reference_leaf_is_refused() {
+    // A resource cannot copy (R1), so the crossing is a MOVE and the move
+    // scan refuses it — the same words as the annotated twin
+    // (`b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused`),
+    // where the unannotated `ret` used to draw the generic escape refusal
+    // (the crossing scan never saw it).
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool) {
+                if flag { ret &self.g; }
+                &self.g
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b134_an_unannotated_ret_only_resource_crossing_is_named_by_the_move_scan() {
+    // The crossing half isolated, as B116 isolated it: the resource leaves
+    // only through the `ret` (the tail hands back an owned value), so
+    // walking the tail alone says nothing about it.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool) {
+                if flag { ret &self.g; }
+                Guard { tag = "fresh" }
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_view_of_a_local_still_cannot_escape() {
+    // The half that must NOT change: a view of a LOCAL dangles whatever the
+    // signature says, and the seam walk refuses it in both spellings exactly
+    // as the raw scan did.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool) {
+            let local = Inner { n = 3 };
+            if flag { ret &local; }
+            &local
+        }
+        fun main() { print(grab(true).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
 #[test]
 fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local() {
     // The un-masking pin (`element-clones.md` §13.4 / backlog B123): B122 gave
@@ -7735,6 +8037,209 @@ fn must_use_consumed_result_no_warning() {
         messages.is_empty(),
         "expected no warnings, got {messages:?}"
     );
+}
+
+// --- [deprecated] (proposal/deprecation.md) ---------------------------------
+
+/// A copy of the real std with one extra module, `std::deprecated_probe`,
+/// whose `stale()` is `[deprecated("use fresh()")]` and whose `wrapper()`
+/// calls it std-internally — the §5 mechanism leg's std half, end to end
+/// through `resolve_std` and the module loader (the copy's modules register
+/// as `std_sources` exactly as the real std's do).
+fn deprecation_fixture_std(tag: &str) -> (PathBuf, PackageSpec) {
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the fixture std directory");
+        for entry in std::fs::read_dir(from).expect("read the std tree") {
+            let entry = entry.expect("read a std tree entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("stat a std tree entry").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy a std source");
+            }
+        }
+    }
+    let root =
+        std::env::temp_dir().join(format!("vilan-deprecated-std-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // `macro_std` rides along: the macro world resolves it BESIDE `std`.
+    let tree = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    let std_root = root.join("std");
+    copy_tree(&tree.join("std"), &std_root);
+    copy_tree(&tree.join("macro_std"), &root.join("macro_std"));
+    std::fs::write(
+        std_root.join("src").join("deprecated_probe.vl"),
+        r#"// Test-only module: a deprecated item beside its replacement, plus a
+// std-internal caller (deprecation.md §5's mechanism leg).
+fun fresh(): i32 { 1 }
+
+[deprecated("use fresh()")]
+fun stale(): i32 { 1 }
+
+fun wrapper(): i32 { stale() }
+"#,
+    )
+    .expect("write the fixture std module");
+    let spec = vilan_core::manifest::resolve_std(&std_root);
+    (root, spec)
+}
+
+#[test]
+fn a_deprecated_functions_call_warns_at_the_callee_name() {
+    // The family head, verbatim, anchored at the callee NAME (A1/A4 — names
+    // over argument lists). The use precedes the declaration so the first
+    // occurrence of `one` is the use site.
+    assert_warns_spanning(
+        r#"
+        fun main() { one(); }
+        [deprecated("use two()")]
+        fun one() { }
+        fun two() { }
+        "#,
+        "one",
+        "`one` is deprecated; use two()",
+    );
+}
+
+#[test]
+fn an_unmarked_function_does_not_warn() {
+    let messages = warnings(
+        r#"
+        fun one() { }
+        fun main() { one(); }
+        "#,
+    );
+    assert!(
+        messages.is_empty(),
+        "expected no warnings, got {messages:?}"
+    );
+}
+
+#[test]
+fn every_use_site_of_a_deprecated_function_warns_independently() {
+    // Per USE SITE, not once per form (§1, B5): two calls and a passed-as-value
+    // reference are three independent fixes, so three warnings.
+    let warnings = warning_diagnostics(
+        r#"
+        fun apply(action: sync || void) { action(); }
+        fun main() { old(); old(); apply(old); }
+        [deprecated("use fresh()")]
+        fun old() { }
+        fun fresh() { }
+        "#,
+    );
+    let deprecation_count = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("`old` is deprecated; use fresh()"))
+        .count();
+    assert_eq!(
+        deprecation_count, 3,
+        "each use site warns once; got {warnings:#?}"
+    );
+}
+
+#[test]
+fn a_use_inside_another_deprecated_item_still_warns() {
+    // DECIDED (recorded in deprecation.md's ship record): no Rust-style
+    // suppression inside deprecated items. Per §1 each use site is an
+    // independent fix — the deprecated wrapper's body must migrate too, and
+    // std's own hygiene rule (migrate your callers in the deprecating train)
+    // reads the same way for user code.
+    let warnings = warning_diagnostics(
+        r#"
+        fun main() { old_outer(); }
+        [deprecated("use fresh()")]
+        fun old_outer() { old_inner(); }
+        [deprecated("use fresh()")]
+        fun old_inner() { }
+        fun fresh() { }
+        "#,
+    );
+    let heads: Vec<&str> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("is deprecated"))
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert_eq!(
+        heads,
+        vec![
+            "`old_outer` is deprecated; use fresh()",
+            "`old_inner` is deprecated; use fresh()",
+        ],
+        "both use sites warn — the one in `main` and the one inside the deprecated wrapper"
+    );
+}
+
+#[test]
+fn a_deprecated_method_warns_at_the_member_name() {
+    // The attribute parses on a member `fun` (one `parse_function`), and the
+    // warning anchors at the MEMBER name (`.old_area`), not the whole access.
+    assert_warns_spanning(
+        r#"
+        fun main() {
+            let sq = Square { side = 3 };
+            let _ = sq.old_area();
+        }
+        struct Square { side: i32 }
+        impl Square {
+            [deprecated("use area()")]
+            fun old_area(self): i32 { self.side * self.side }
+            fun area(self): i32 { self.side * self.side }
+        }
+        "#,
+        "old_area",
+        "`old_area` is deprecated; use area()",
+    );
+}
+
+#[test]
+fn a_std_marked_item_warns_at_its_use() {
+    // The std half of §5's mechanism leg: an item marked in (fixture) std
+    // source warns at its user-code use, head and span, through the real
+    // module loader.
+    let (root, std) = deprecation_fixture_std("warns");
+    let source = r#"
+        import std::deprecated_probe::{ stale };
+        fun main() { let _ = stale(); }
+    "#;
+    let warnings = warning_diagnostics_with_std(source, std);
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|(message, _)| message.contains("`stale` is deprecated; use fresh()"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly the call site warns (the import line is not a use); got {warnings:#?}"
+    );
+    let expected = source.rfind("stale").expect("the call site");
+    assert_eq!(
+        matching[0].1,
+        expected..expected + "stale".len(),
+        "the warning anchors at the callee name"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_deprecated_form_used_only_inside_std_stays_silent() {
+    // A2: the check keys on the use site's source. `wrapper()` calls the
+    // deprecated `stale()` INSIDE std — the user program that only calls
+    // `wrapper` sees no warning, which is also what keeps the
+    // std-must-be-warning-clean gate green.
+    let (root, std) = deprecation_fixture_std("silent");
+    let warnings = warning_diagnostics_with_std(
+        r#"
+        import std::deprecated_probe::{ wrapper };
+        fun main() { let _ = wrapper(); }
+        "#,
+        std,
+    );
+    assert!(
+        warnings.is_empty(),
+        "a std-internal use of a deprecated form is silent; got {warnings:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -11531,12 +12036,14 @@ fn one_bad_ret_among_good_ones_is_flagged() {
     );
 }
 
-// In a function with NO declared return type, `ret <value>` is unchecked and
-// the value is discarded — the same rule as the (unchecked) tail of a void
-// function. Consistency with the tail is the deliberate semantic
-// (proposal/ret-checking.md rule 3).
+// In a function with NO declared return type, a `ret` is return evidence
+// like the tail (proposal/ret-checking.md rule 3, amended by B126): here a
+// `ret` of a void call beside a body that ends without a value — both void,
+// so they agree. Re-pinned from `ret_with_a_value_in_an_undeclared_void_
+// function_is_allowed`, whose comment said the value was "discarded, not
+// diagnosed"; it is neither now, it is read.
 #[test]
-fn ret_with_a_value_in_an_undeclared_void_function_is_allowed() {
+fn b126_a_void_ret_agrees_with_a_void_body() {
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -11554,6 +12061,725 @@ fn ret_with_a_value_in_an_undeclared_void_function_is_allowed() {
         }
         "#,
         "early\nlate\n",
+    );
+}
+
+// --- B126: an unannotated function's return type is inferred from its
+// reachable tail AND every `ret` (proposal/ret-checking.md rule 3, amended
+// 2026-08-22). Before: the `Type::Function` arm read the tail id alone, so
+// `fun f(x: bool) { ret 1; }` was `void` at every call site and a `ret` of the
+// wrong type was invisible — `{ if x { ret "s"; } 2 }` handed a `str` to an
+// `i32` binding at runtime. One helper (`inferred_return_type`) now answers
+// for the call site, closure coercion, the `for` protocol's `next`, and trait
+// conformance; each pin below is one shape of the rule.
+
+// The headline: a body that leaves only by `ret` has an unreachable
+// (synthesized void) tail, which is no evidence. Plant-proven: dropping the
+// rets from the evidence, or reading the dead tail as reachable, turns this red.
+#[test]
+fn b126_a_ret_only_body_infers_its_return_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	ret 1;
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        	print(y);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// Unchanged by the amendment: no `ret`, the tail decides.
+#[test]
+fn b126_a_tail_only_body_still_infers_from_its_tail() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f() {
+        	5
+        }
+
+        fun main() {
+        	let y: i32 = f();
+        	print(y);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+// A reachable tail and a `ret` that agree — both paths run.
+#[test]
+fn b126_a_ret_and_a_tail_that_agree_infer_one_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	2
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        	print(y);
+        	print(f(false));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+// The disagreement is refused at the `ret`, naming both types and the tail it
+// is measured against, with a note at that tail — and it is the ONLY
+// diagnostic: the function's calls type as `any` afterwards, so the old
+// `Expected i32, but got void` never appears beside it (B5).
+#[test]
+fn b126_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret "s";
+        	}
+        	2
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        }
+        "#;
+    let head = "this `ret` returns str, but the function's return type is inferred as i32 from its tail; make every return agree, or declare the return type";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_once_with(source, "return type is inferred");
+    assert_fails_noting(source, head, "2", "the tail it is inferred from");
+    assert_fails_without(source, "Expected");
+}
+
+// A bare `ret` is `ret <void>` (rule 2's reading): it disagrees with a value
+// tail. Before the amendment `f(true)` handed back `undefined` under `i32`.
+#[test]
+fn b126_a_bare_ret_in_a_value_tailed_function_is_refused() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret;
+        	}
+        	2
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret",
+        "a bare `ret` returns nothing, but the function's return type is inferred as i32 from its tail; return a value, or declare the return type",
+    );
+    assert_fails_without(source, "Expected");
+}
+
+// The tail the body CAN reach is evidence even when it is the parser's
+// synthesized void after a last statement that does not leave: `f(false)`
+// falls through, so typing the function `i32` from its `ret` would be the
+// `undefined`-under-`i32` miscompile one layer up. The origin is named as the
+// body ending without a value, noted at the closing brace.
+#[test]
+fn b126_a_value_ret_beside_a_fall_through_is_refused() {
+    let source = r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	print("fell through");
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        }
+        "#;
+    let head = "this `ret` returns i32, but the function's return type is inferred as void from its body ending without a value; make every return agree, or declare the return type";
+    assert_fails_spanning(source, "ret 1", head);
+    assert_fails_noting_nth(source, head, "}", 1, "the body ends here without a value");
+    assert_fails_without(source, "Expected");
+}
+
+// The other fall-through spelling: the tail IS an `if` with no `else`, which
+// produces void on the path that takes no branch (S3's regime 2, named the
+// same way here).
+#[test]
+fn b126_a_value_ret_beside_an_else_less_if_tail_is_refused() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret 1",
+        "this `ret` returns i32, but the function's return type is inferred as void from its tail, an `if` with no `else`; make every return agree, or declare the return type",
+    );
+    assert_fails_noting(
+        source,
+        "an `if` with no `else`",
+        "if x {\n        \t\tret 1;\n        \t}",
+        "an `if` with no `else` produces void",
+    );
+}
+
+// A `ret` of a void call beside a value tail is the same disagreement, read
+// the other way round (rule 2's "a void call ret is not a value return").
+#[test]
+fn b126_a_void_ret_beside_a_value_tail_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret print("x");
+        	}
+        	1
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        }
+        "#,
+        "this `ret` returns void, but the function's return type is inferred as i32 from its tail",
+    );
+}
+
+// Several `ret`s and no reachable tail: they agree, and every path runs.
+#[test]
+fn b126_rets_that_agree_infer_one_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun sign(x: i32) {
+        	if x > 0 {
+        		ret 1;
+        	}
+        	if x < 0 {
+        		ret -1;
+        	}
+        	ret 0;
+        }
+
+        fun main() {
+        	let y: i32 = sign(5);
+        	print(y);
+        	print(sign(-3));
+        	print(sign(0));
+        }
+        "#,
+        "1\n-1\n0\n",
+    );
+}
+
+// With no reachable tail the first `ret` sets the type and a later one that
+// disagrees is refused at ITSELF, naming the earlier `ret` as the origin; one
+// refusal, no cascade at the call.
+#[test]
+fn b126_rets_that_disagree_are_refused_at_the_later_ret() {
+    let source = r#"
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	ret "s";
+        }
+
+        fun main() {
+        	let y: i32 = f(true);
+        }
+        "#;
+    let head = "this `ret` returns str, but the function's return type is inferred as i32 from an earlier `ret`; make every return agree, or declare the return type";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_noting(
+        source,
+        head,
+        "ret 1",
+        "the earlier `ret` it is inferred from",
+    );
+    assert_fails_once_with(source, "return type is inferred");
+    assert_fails_without(source, "Expected");
+}
+
+// A generic return-position call in a `ret` is read WITH the tail's type as
+// its expectation, so `List::new()` binds its element from the tail.
+#[test]
+fn b126_a_ret_of_a_generic_call_binds_from_the_tail() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+
+        fun make(flag: bool) {
+        	if flag {
+        		ret List::new();
+        	}
+        	mut items = List::new();
+        	items.push(1);
+        	items
+        }
+
+        fun main() {
+        	let xs: List<i32> = make(false);
+        	print(xs.len());
+        	let empty: List<i32> = make(true);
+        	print(empty.len());
+        }
+        "#,
+        "1\n0\n",
+    );
+}
+
+// A generic function's `ret` of its own parameter agrees with a tail of the
+// same parameter type, at every instantiation.
+#[test]
+fn b126_a_generic_function_infers_from_a_ret_of_its_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun pick<T>(flag: bool, a: T, b: T) {
+        	if flag {
+        		ret a;
+        	}
+        	b
+        }
+
+        fun main() {
+        	let y: i32 = pick(true, 1, 2);
+        	print(y);
+        	let s: str = pick(false, "a", "b");
+        	print(s);
+        }
+        "#,
+        "1\nb\n",
+    );
+}
+
+// A closure inside an unannotated function keeps its own frame: its `ret`s
+// type the closure (rule 4), the function's `ret`s type the function, and the
+// two may differ. The negative half: a closure's bad `ret` is the CLOSURE's
+// diagnostic, never the function's.
+#[test]
+fn b126_a_nested_closures_rets_stay_on_the_closures_frame() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun label(g: |i32| str): str {
+        	g(10)
+        }
+
+        fun outer(x: bool) {
+        	let text = label(|v| {
+        		if v > 5 {
+        			ret "big";
+        		}
+        		"small"
+        	});
+        	if x {
+        		ret text.len();
+        	}
+        	ret 0;
+        }
+
+        fun main() {
+        	let y: i32 = outer(true);
+        	print(y);
+        }
+        "#,
+        "3\n",
+    );
+    let source = r#"
+        fun apply(g: |i32| i32): i32 {
+        	g(10)
+        }
+
+        fun outer(x: bool) {
+        	let inner = apply(|v| {
+        		if v > 5 {
+        			ret "str";
+        		}
+        		v
+        	});
+        	if x {
+        		ret inner;
+        	}
+        	ret 0;
+        }
+
+        fun main() {
+        	let y: i32 = outer(true);
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "this `ret` returns str, but the closure's body yields i32",
+    );
+    assert_fails_without(source, "the function's return type is inferred");
+}
+
+// Recursion: a self-call contributes nothing (its type IS the answer under
+// construction), so the OTHER returns decide — through a `ret` of an
+// expression over the self-call, a tail over it, and a `ret` that is nothing
+// but the self-call (which used to be "could not be resolved").
+#[test]
+fn b126_a_recursive_unannotated_function_infers_from_its_other_returns() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun count(n: i32) {
+        	if n == 0 {
+        		ret 0;
+        	}
+        	ret 1 + count(n - 1);
+        }
+
+        fun fact(n: i32) {
+        	if n <= 1 {
+        		ret 1;
+        	}
+        	n * fact(n - 1)
+        }
+
+        fun down(n: i32) {
+        	if n == 0 {
+        		ret 0;
+        	}
+        	ret down(n - 1);
+        }
+
+        fun main() {
+        	let a: i32 = count(3);
+        	print(a);
+        	let b: i32 = fact(5);
+        	print(b);
+        	let c: i32 = down(4);
+        	print(c);
+        }
+        "#,
+        "3\n120\n0\n",
+    );
+}
+
+// Mutual recursion: each function's answer is built on the other's, and the
+// one built on an unfinished neighbour is not recorded — each computes
+// top-level through its own constraint, so both coerce and both call.
+#[test]
+fn b126_mutually_recursive_unannotated_functions_infer_together() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(n: i32) {
+        	if n == 0 {
+        		ret 0;
+        	}
+        	b(n - 1)
+        }
+
+        fun b(n: i32) {
+        	a(n - 1)
+        }
+
+        fun main() {
+        	let y: i32 = a(4);
+        	print(y);
+        	let z: i32 = b(3);
+        	print(z);
+        }
+        "#,
+        "0\n0\n",
+    );
+}
+
+// B126 residue (2026-08-22), KNOWN, NOT FIXED: a self-call bound by a `let`
+// and read in the tail. The inference path does not read a `let` binding
+// through its initializer, so the tail `x + 1` is unresolved while `x`'s own
+// constraint is waiting on `g(n - 1)` — and the function's answer never
+// lands: "type of variable 'x' could not be resolved". Same on `next` before
+// the amendment. Asserts what SHOULD hold; goes green when the binding is
+// read through its initializer on the inference path.
+#[test]
+#[ignore = "B126 residue, 2026-08-22: a self-call bound by a `let` and read in the tail \
+            (`let x = g(n - 1); x + 1`) in an unannotated recursive body still fails \
+            \"could not be resolved\" — a `let` binding is not read through its \
+            initializer on the inference path"]
+fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun g(n: i32) {
+        	if n == 0 {
+        		ret 1;
+        	}
+        	let x = g(n - 1);
+        	x + 1
+        }
+
+        fun main() {
+        	let y: i32 = g(3);
+        	print(y);
+        }
+        "#,
+        "4\n",
+    );
+}
+
+// A function whose only return evidence is itself never returns: `never`,
+// which satisfies any expectation (as `panic(..)` does). It used to be
+// "could not be resolved".
+#[test]
+fn b126_a_function_that_only_calls_itself_is_never() {
+    assert_compiles(
+        r#"
+        fun forever(n: i32) {
+        	forever(n - 1)
+        }
+
+        fun main() {
+        	if false {
+        		let y: i32 = forever(5);
+        	}
+        }
+        "#,
+    );
+}
+
+// The conformance reader sees the unified type: an unannotated impl member
+// that leaves by `ret` conforms when the `ret` agrees with the trait, and is
+// refused when it does not (it used to pass leniently and print "wide").
+#[test]
+fn b126_an_unannotated_impl_method_conforms_by_its_unified_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Shape {
+        	fun area(self): i32;
+        }
+
+        struct Sq { s: i32 }
+
+        impl Sq with Shape {
+        	fun area(self) {
+        		ret self.s * self.s;
+        	}
+        }
+
+        fun main() {
+        	let q = Sq { s = 3 };
+        	print(q.area());
+        }
+        "#,
+        "9\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Shape {
+        	fun area(self): i32;
+        }
+
+        struct Sq { s: i32 }
+
+        impl Sq with Shape {
+        	fun area(self) {
+        		ret "wide";
+        	}
+        }
+
+        fun main() {
+        	let q = Sq { s = 3 };
+        	print(q.area());
+        }
+        "#,
+        "`Sq`'s `area` returns `str`, but `Shape` declares `i32`",
+    );
+}
+
+// The rule is the function's, not the shape's: an `async fun` without an
+// annotation infers the same way, and an awaited call yields that type.
+#[test]
+fn b126_an_async_function_without_annotation_infers_from_its_rets() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        async fun f(x: bool) {
+        	ret 1;
+        }
+
+        async fun g(x: bool) {
+        	if x {
+        		ret 1;
+        	}
+        	2
+        }
+
+        async fun main() {
+        	let y: i32 = f(true);
+        	print(y);
+        	let z: i32 = g(true);
+        	print(z);
+        	print(g(false));
+        }
+        "#,
+        "1\n1\n2\n",
+    );
+}
+
+// The `for` protocol's reader (B92) goes through the same helper: an
+// unannotated `next` that leaves by `ret Some(..)`/`ret None` drives the loop
+// (it used to be refused as yielding `void`), and one whose `ret` yields a
+// non-`Option` is refused by B92's own message with the unified type.
+#[test]
+fn b126_an_unannotated_next_that_leaves_by_ret_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Two { at: i32 }
+
+        impl Two {
+        	fun next(&mut self) {
+        		if self.at >= 2 {
+        			ret None;
+        		}
+        		self.at += 1;
+        		ret Some(self.at);
+        	}
+        }
+
+        fun main() {
+        	mut two = Two { at = 0 };
+        	for item in two {
+        		print(item);
+        	}
+        	print(9);
+        }
+        "#,
+        "1\n2\n9\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num { at: i32 }
+
+        impl Num {
+        	fun next(&mut self) {
+        		self.at += 1;
+        		ret self.at;
+        	}
+        }
+
+        fun main() {
+        	mut num = Num { at = 0 };
+        	for item in num {
+        		print(item);
+        	}
+        }
+        "#,
+        "its `next` is unannotated and its body yields `i32`",
+    );
+}
+
+// Closure coercion (B20) reads the helper on both of its paths — the
+// inferring one in `reconcile_type` and the recorded one in `compare_type` —
+// so a `ret`-only function fits a `|bool| i32` slot (it used to be refused as
+// `fn say(bool)` against `|bool| i32`).
+#[test]
+fn b126_a_ret_only_function_coerces_to_a_closure_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run(f: |bool| i32) {
+        	print(f(true));
+        }
+
+        fun say(x: bool) {
+        	ret 1;
+        }
+
+        fun main() {
+        	run(say);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// An exhaustive `if`/`else` of `ret`s in tail position types `never` (B124),
+// which is no evidence; the `ret`s decide. Before, the function itself was
+// `never` and `let y: str = f(false)` compiled and printed `2`.
+#[test]
+fn b126_an_exhaustive_if_else_of_rets_infers_from_the_rets() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	} else {
+        		ret 2;
+        	}
+        }
+
+        fun main() {
+        	let y: i32 = f(false);
+        	print(y);
+        }
+        "#,
+        "2\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun f(x: bool) {
+        	if x {
+        		ret 1;
+        	} else {
+        		ret 2;
+        	}
+        }
+
+        fun main() {
+        	let y: str = f(false);
+        	print(y);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
     );
 }
 
@@ -11770,22 +12996,17 @@ fn missing_return_value_regime_3_parameter_mismatch_keeps_the_whole_value_anchor
     );
 }
 
-// P21 — KNOWN, NOT FIXED by this slice: the closure's void return
-// propagates through a GENERIC binding (`map<U>`'s `U`) before the mismatch
-// surfaces, one level out, on the initializer — a different, harder
-// mechanism (tracing the root cause back through generic instantiation)
-// than the direct context-return-type case P23/P24 cover. `type_is_ground`
-// deliberately declines to route a still-abstract target through the new
-// check (I5/B19's family — see its own doc comment), which is what leaves
-// this one on today's path.
+// P21 — the generic-binding case, closed by B125 (type-solver.md "The
+// expectation is an input of generic call resolution"): `map<U>`'s `U` is
+// bound from the call site's EXPECTATION (`let widths: List<i32>`) before the
+// closure argument is typed, so the closure arm's return-position check has
+// a ground target on the first attempt and reports at the closure's own
+// brace — not one level out as `List<void>` against the annotation. The
+// `type_is_ground` gate is unchanged: it still declines a target nobody has
+// bound; the expectation is what binds it now.
 #[test]
-#[ignore = "S3 residue (editing-dx.md P21): the closure's void return reaches List<void> \
-            through a generic binding before it mismatches, one level out — the new \
-            return-position check only fires when the expected return type is fully \
-            ground, so this stays on the whole-call anchor. Un-ignore once generic-return \
-            provenance tracing ships."]
-fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
-    assert_fails_spanning(
+fn missing_return_value_regime_3_through_a_generic_binding() {
+    assert_fails_spanning_nth(
         r#"
         import std::print;
 
@@ -11801,7 +13022,908 @@ fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
         }
         "#,
         "}",
+        2,
         "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// The same binding through a declared return type's TAIL — the expectation
+// the function walk seeds for its body tail reaches the call at priority 6
+// exactly as the `let` annotation does.
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_tail_position() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun widths(points: List<Point>): List<i32> {
+        	points.map(|point| {
+        		point.x * 2;
+        	})
+        }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	print(widths(points).len());
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// And through a `ret` — the third walk-time expectation seed.
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_ret_position() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun widths(points: List<Point>): List<i32> {
+        	ret points.map(|point| {
+        		point.x * 2;
+        	});
+        }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	print(widths(points).len());
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// The free-function path rides the same binding source (B90 aligned the two
+// call paths; B125 keeps them aligned): `apply<U>`'s `U` from the `let`.
+#[test]
+fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+
+        fun apply<U>(xs: List<i32>, f: |i32| U): List<U> {
+        	xs.map(f)
+        }
+
+        fun main() {
+        	let xs = [1, 2];
+        	let ys: List<i32> = apply(xs, |x| {
+        		x * 2;
+        	});
+        	print(ys.len());
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// `Signal::map<U>` — the shape the todo example annotates around; `sync |T|
+// U` binds the same way as `List::map`'s `|T| U`.
+#[test]
+fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        fun main() {
+        	let scope = Owner::new();
+        	let n = owner_scope.run(scope, || {
+        		let count = Signal::new(1);
+        		let doubled: Signal<i32> = count.map(|n| {
+        			n * 2;
+        		});
+        		doubled.get()
+        	});
+        	print(n);
+        	scope.dispose();
+        }
+        "#,
+        "}",
+        1,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// The nested shapes: the expectation reaches a call standing in a block
+// tail, a value-`if`'s branch tail, or a match leg — seeded at WALK time
+// through the syntactic tails (`seed_tail_expectations`), and by
+// `resolve_match` before its subject can defer the attempt.
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_a_block_tail() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = {
+        		points.map(|point| {
+        			point.x * 2;
+        		})
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_an_if_branch() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = if points.len() > 0 {
+        		points.map(|point| {
+        			point.x * 2;
+        		})
+        	} else {
+        		[]
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+// A match whose SUBJECT is itself a call: the legs used to be seeded only
+// once the subject landed (a pass after the leg's call had committed).
+#[test]
+fn missing_return_value_regime_3_through_a_generic_binding_in_a_match_leg() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = match points.len() {
+        		0 => [],
+        		_ => points.map(|point| {
+        			point.x * 2;
+        		}),
+        	};
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning_nth(
+        source,
+        "}",
+        2,
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+// --- B125's B5 set: when the closure's tail, the annotation and the receiver
+// disagree in different combinations, exactly ONE diagnostic fires, and the
+// value-position reconcile at the `let` never doubles it — the closure's
+// reported type is the target it was held to (S3's rule), so the call types
+// as the annotation says and the `let` has nothing to add.
+
+// The void tail under an annotation: one report, at the brace, and the old
+// whole-call `List<void>` message is gone rather than joined.
+#[test]
+fn b125_a_void_closure_tail_under_an_annotation_reports_once_at_the_brace() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| {
+        		point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_without(source, "List<void>");
+}
+
+// A block tail that produces the WRONG value (i32 where the annotation's `U`
+// is str): one report, at the brace, in the annotation's terms.
+#[test]
+fn b125_a_closure_tail_disagreeing_with_the_annotation_reports_once_at_the_brace() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point| {
+        		point.x * 2
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning_nth(source, "}", 2, "Expected str, but got i32 instead.");
+    assert_fails_without(source, "List<str>");
+}
+
+// The bare-expression spelling: S3's route used to be scoped to block bodies
+// ("no closing brace to anchor at"), so this reported the closure as a whole
+// value at the argument check. B132 routes bare bodies through the same
+// return-position check, anchored ON the expression — the b125 B5 claim
+// (exactly one diagnostic, the `let` never doubles it) is unchanged; only
+// the anchor narrowed. Re-pinned from
+// `b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closure`:
+// same program, the new anchor.
+#[test]
+fn b132_a_bare_closure_body_disagreeing_with_the_annotation_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point| point.x * 2);
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "point.x * 2", "Expected str, but got i32 instead.");
+    assert_fails_without(source, "|Point| str");
+    assert_fails_without(source, "List<str>");
+}
+
+// The void-valued bare body: the same route, the same anchor, the plain
+// mismatch wording (a real void value, not the missing-value regime — there
+// is no `;` to blame in a bare expression).
+#[test]
+fn b132_a_void_bare_closure_body_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| print(point.x));
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "print(point.x)",
+        "Expected i32, but got void instead.",
+    );
+    assert_fails_without(source, "List<void>");
+}
+
+// A bare `if` with no `else` gets regime 2's wording (S3), exactly as the
+// same tail inside a block body does.
+#[test]
+fn b132_a_bare_if_without_else_body_names_the_gap() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| if point.x > 0 { 1 });
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "if point.x > 0 { 1 }",
+        "Expected i32, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// The free-function spelling shares the route (B90 keeps the two call paths
+// one rule): the expectation binds `U`, and the bare body reports on the
+// expression there too.
+#[test]
+fn b132_the_free_function_spelling_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        fun apply<U>(xs: List<i32>, f: |i32| U): List<U> {
+        	xs.map(f)
+        }
+
+        fun main() {
+        	let xs = [1, 2];
+        	let out: List<str> = apply(xs, |x| x * 2);
+        	print(out.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "x * 2", "Expected str, but got i32 instead.");
+    assert_fails_without(source, "List<str>");
+}
+
+// A closure's OWN return annotation over a bare body takes the same route
+// (rule 2 "directly"): the report lands on the expression, not the closure
+// as a whole value.
+#[test]
+fn b132_an_annotated_bare_body_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32|: str x + 1;
+        	print(f(1));
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "x + 1", "Expected str, but got i32 instead.");
+}
+
+// The route must not manufacture failures: an agreeing bare body under the
+// same expectation still compiles and runs.
+#[test]
+fn b132_an_agreeing_bare_body_still_compiles_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| point.x * 2);
+        	print(widths[0]);
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// --- B133: rule 4 lifted to the reachable-tail rule (ret-checking.md rule 4
+// as amended). A closure's return type is the unification of its REACHABLE
+// tail and every `ret` — the same evidence, through the same fold, an
+// unannotated function uses (B126) — so `{ ret 1; }` infers in a closure
+// exactly as it does in a function, and the dead synthesized-void tail is no
+// longer a void vote against its own `ret`s. The conservative "make the
+// ret'd value the body's tail" steer survives exactly where the genuine
+// disagreement remains: a value-`ret` beside a body path that yields no
+// value.
+
+// The headline: a `ret`-only closure body infers its return type, and every
+// reader agrees — a direct call, and a typed binding of the result.
+#[test]
+fn b133_a_ret_only_closure_body_infers_its_return_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		ret x * 2;
+        	};
+        	print(f(3));
+        	let y: i32 = f(4);
+        	print(y);
+        }
+        "#,
+        "6\n8\n",
+    );
+}
+
+// A closure that leaves only by `ret` can bind a caller's return-position
+// generic bottom-up (the `from_fn` family's shape): the rets ARE the
+// closure's return evidence.
+#[test]
+fn b133_a_closure_ret_binds_a_callers_return_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun apply<U>(f: || U): U {
+        	f()
+        }
+
+        fun main() {
+        	let n = apply(|| {
+        		ret 5;
+        	});
+        	print(n + 1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+// A dead tail under a known target: the `ret`s are the only return
+// positions, and they check against the target — one refusal, at the `ret`,
+// and the pre-lift steer (which blamed the dead tail's synthesized void) is
+// gone.
+#[test]
+fn b133_a_dead_tail_ret_is_checked_against_the_target() {
+    let source = r#"
+        import std::print;
+
+        fun run(f: |i32| i32): i32 {
+        	f(1)
+        }
+
+        fun main() {
+        	let out = run(|value| {
+        		ret "s";
+        	});
+        	print(out);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret \"s\"",
+        "this `ret` returns str, but the closure's body yields i32",
+    );
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_without(source, "make the ret'd value the body's tail");
+    assert_fails_without(source, "Expected");
+}
+
+// B125 interplay, the B5 probe extended to `ret`s: under an annotated `let`
+// the expectation binds `U` before the closure is typed, and a dead-tail
+// `ret` that disagrees reports ONCE, at the `ret`, in the expectation's
+// terms — the `let` and the call add nothing.
+#[test]
+fn b133_a_dead_tail_ret_reports_once_under_an_expectation() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point| {
+        		ret point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret point.x * 2",
+        "this `ret` returns i32, but the closure's body yields str",
+    );
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_without(source, "Expected");
+    assert_fails_without(source, "List<str>");
+}
+
+// ...and the agreeing spellings bind from the expectation and run: a
+// `ret`-only body, and a guard-`ret` beside an agreeing tail.
+#[test]
+fn b133_an_agreeing_ret_closure_binds_from_the_expectation_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| {
+        		ret point.x * 2;
+        	});
+        	print(widths[0]);
+        	let guarded = points.map(|point| {
+        		if point.x > 100 {
+        			ret 0;
+        		}
+        		point.x + 5
+        	});
+        	print(guarded[0]);
+        }
+        "#,
+        "2\n6\n",
+    );
+}
+
+// A return-position generic in a closure `ret` binds from the target, in
+// both the mixed (guard-`ret` beside a tail) and the dead-tail shapes.
+#[test]
+fn b133_a_ret_of_a_generic_call_binds_from_the_target() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run(f: |i32| List<i32>): List<i32> {
+        	f(3)
+        }
+
+        fun main() {
+        	let out = run(|seed| {
+        		if seed < 0 {
+        			ret List::new();
+        		}
+        		mut xs: List<i32> = List::new();
+        		xs.push(seed);
+        		xs
+        	});
+        	print(out.len());
+        	let dead_tail = run(|seed| {
+        		ret List::new();
+        	});
+        	print(dead_tail.len());
+        }
+        "#,
+        "1\n0\n",
+    );
+}
+
+// The I5/B19 shape with `ret`s: `from_fn`'s callback target (`|| Option<T>`)
+// is abstract, `type_is_ground` declines it, and the rets bind `T`
+// bottom-up — a callback that leaves only by `ret` now types (the pre-lift
+// rule refused it with the steer).
+#[test]
+fn b133_a_from_fn_callback_that_leaves_by_ret_types() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+        	mut n = 0;
+        	let counter = Iterator::from_fn(|| {
+        		n = n + 1;
+        		if n > 3 {
+        			ret None;
+        		}
+        		ret Some(n);
+        	});
+        	print(counter.count());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+// A value-`ret` beside a REACHABLE fall-through is still the genuine
+// disagreement rule 4's steer was written for — kept, now with a note at
+// the origin (the same origin vocabulary as a function's refusal).
+#[test]
+fn b133_a_value_ret_beside_a_reachable_fall_through_keeps_the_steer() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let helper = |x: i32| {
+        		if x > 5 {
+        			ret 99;
+        		}
+        		print("small");
+        	};
+        	helper(1);
+        }
+        "#;
+    let head = "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail";
+    assert_fails_spanning(source, "ret 99", head);
+    assert_fails_noting_nth(source, head, "}", 1, "the body ends here without a value");
+}
+
+// The other reachable-void spelling: the closure's tail is an `if` with no
+// `else`, which produces void on the path that takes no branch.
+#[test]
+fn b133_a_value_ret_beside_an_else_less_if_tail_keeps_the_steer() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 5 {
+        			ret 99;
+        		}
+        	};
+        	f(1);
+        	print("done");
+        }
+        "#;
+    let head = "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail";
+    assert_fails_spanning(source, "ret 99", head);
+    assert_fails_noting(
+        source,
+        head,
+        "if x > 5 {\n        \t\t\tret 99;\n        \t\t}",
+        "an `if` with no `else` produces void",
+    );
+}
+
+// A `ret` disagreeing with a REACHABLE tail is refused at the `ret`, noting
+// the tail — no target in sight (an unannotated binding, a direct call).
+#[test]
+fn b133_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: bool| {
+        		if x {
+        			ret "s";
+        		}
+        		2
+        	};
+        	f(true);
+        	print("done");
+        }
+        "#;
+    let head = "this `ret` returns str, but the closure's body yields i32";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_noting(source, head, "2", "the tail it disagrees with");
+    assert_fails_without(source, "Expected");
+}
+
+// Two `ret`s that disagree under a dead tail: one refusal, at the later
+// `ret`, noting the earlier one it disagrees with (the function rule's
+// source-order reading).
+#[test]
+fn b133_rets_that_disagree_are_refused_at_the_later_ret() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 0 {
+        			ret 1;
+        		}
+        		ret "s";
+        	};
+        	f(1);
+        }
+        "#;
+    let head = "this `ret` returns str, but the closure's body yields i32";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_noting(source, head, "ret 1", "the earlier `ret` it disagrees with");
+}
+
+// The no-target bare-`ret` twin: a bare `ret` beside a value tail is
+// refused at the `ret` (the existing wording), noting the tail.
+#[test]
+fn b133_a_bare_ret_beside_a_value_tail_is_still_refused() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 5 {
+        			ret;
+        		}
+        		x + 1
+        	};
+        	f(1);
+        	print("done");
+        }
+        "#;
+    let head = "a bare `ret` exits a closure whose body yields i32; return a value";
+    assert_fails_spanning(source, "ret", head);
+    assert_fails_noting(source, head, "x + 1", "the tail it disagrees with");
+}
+
+// An `async` block whose body leaves only by `ret` settles with the rets'
+// type: `async { ret 1; }` is a task of `i32`, and awaiting it hands the
+// value back.
+#[test]
+fn b133_an_async_block_of_rets_settles_with_their_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let t = async {
+        		ret 1;
+        	};
+        	let n: i32 = await t;
+        	print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// An `async` block's disagreeing `ret`s are refused the same way a
+// closure's are — at the later `ret`, noting the earlier one.
+#[test]
+fn b133_an_async_blocks_disagreeing_rets_are_refused() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let flag = true;
+        	let pending = async {
+        		if flag {
+        			ret "a";
+        		}
+        		ret 2;
+        	};
+        	print("x");
+        }
+        "#;
+    let head = "this `ret` returns i32, but the closure's body yields str";
+    assert_fails_spanning(source, "ret 2", head);
+    assert_fails_noting(
+        source,
+        head,
+        "ret \"a\"",
+        "the earlier `ret` it disagrees with",
+    );
+}
+
+// A `ret`-only closure that is never called stays quiet (deferred), exactly
+// as loosely as a never-called closure types everywhere else — the pre-lift
+// rule refused it with the steer, a false positive: the `ret` and the dead
+// tail never disagreed.
+#[test]
+fn b133_a_never_called_ret_closure_stays_quiet() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x| {
+        		ret 1;
+        	};
+        	print("quiet");
+        }
+        "#,
+        "quiet\n",
+    );
+}
+
+// A PARAMETER that disagrees with the receiver keeps P27's whole-value anchor
+// — the expectation binding adds nothing beside it.
+#[test]
+fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point: str| point.len());
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "|point: str| point.len()",
+        "Expected |Point| i32, but got |str| i32 instead.",
+    );
+}
+
+// All three disagree (parameter vs receiver, tail vs annotation): one
+// report, the whole closure, in the receiver's and the annotation's terms.
+#[test]
+fn b125_a_closure_disagreeing_with_receiver_and_annotation_reports_once() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point: i32| {
+        		point;
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_with(source, "Expected |Point| str, but got |i32| void instead.");
+}
+
+// Precedence: a generic a NON-closure argument binds is never overridden by
+// the expectation — `fold<B>`'s `B` is `i32` from the literal, and the `let`
+// reports the mismatch where it always did.
+#[test]
+fn b125_an_argument_bound_generic_outranks_the_expectation() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let xs = [1, 2];
+        	let s: str = xs.fold(0, |acc, x| acc + x);
+        	print(s);
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "xs.fold(0, |acc, x| acc + x)",
+        "Expected str, but got i32 instead.",
+    );
+}
+
+// No expectation, no change: an unannotated `let` still takes the closure's
+// bottom-up binding (`List<void>` here, and the program is legal).
+#[test]
+fn b125_an_unannotated_let_keeps_the_bottom_up_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths = points.map(|point| {
+        		point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// An expectation naming the ENCLOSING function's generic binds `U = T`; the
+// closure's target is then abstract, `type_is_ground` declines it (exactly
+// the "don't freeze unbound" case the gate exists for), and the body types
+// bottom-up as before.
+#[test]
+fn b125_an_expectation_naming_the_enclosing_generic_binds_through() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun ident<T>(xs: List<T>): List<T> {
+        	xs.map(|x| x)
+        }
+
+        fun main() {
+        	let ys = ident([1, 2, 3]);
+        	print(ys.len());
+        }
+        "#,
+        "3\n",
     );
 }
 
@@ -12164,32 +14286,35 @@ fn an_async_function_whose_tail_is_an_if_else_of_rets_is_not_a_missing_return() 
     );
 }
 
-// A closure whose body is an exhaustive `if`/`else` of value-`ret`s. The
-// FALSE mismatch on the closure is gone; ret-checking.md §4's deliberate
-// guidance ("make the ret'd value the body's tail" — the conservative rule
-// that avoids the diverging-tail swamp) is untouched, since B124 does not
-// reopen closure return inference.
+// A closure whose body is an exhaustive `if`/`else` of value-`ret`s now
+// infers like a function (rule 4 lifted to the reachable-tail rule, B133):
+// the dead tail is no evidence, the `ret`s agree on `str`, and the program
+// runs. Re-pinned from
+// `a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance`
+// (which pinned the pre-lift conservative refusal): same program, the new
+// rule.
 #[test]
-fn a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance() {
-    let source = r#"
+fn b133_a_closure_of_rets_infers_like_a_function() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
         fun run(f: |i32| str): str {
         	f(1)
         }
 
         fun main() {
-        	run(|value| {
+        	let out = run(|value| {
         		if value > 0 {
         			ret "positive";
         		} else {
         			ret "non-positive";
         		}
         	});
+        	print(out);
         }
-        "#;
-    assert_fails_without(source, "Expected str, but got void instead.");
-    assert_fails_with(
-        source,
-        "the closure's body ends without a value, but this `ret` returns one",
+        "#,
+        "positive\n",
     );
 }
 
@@ -15182,6 +17307,130 @@ fn prelude_derives_need_no_import() {
     );
 }
 
+// --- I4: `List<T: PartialEq>` implements `PartialEq` (element-wise, length
+// first). Found by E80's lane: `[derive(PartialEq)]` on a struct with a
+// `List<…>` field was refused ("type 'List' does not implement the PartialEq
+// operator"), and the website's `DiagRow` wrote its `eq` by hand. One pin per
+// case; the derive pin is the shape that was refused, and removing the impl
+// reddens every one of them with that exact refusal — the plant IS the old
+// state.
+
+#[test]
+fn i4_empty_lists_are_equal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let a: List<i32> = [];
+            let b: List<i32> = [];
+            print(a == b);
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn i4_equal_lists_compare_equal_through_both_spellings() {
+    // `==` is what the derive emits per field; `.eq` is the trait member the
+    // generic `T: PartialEq` world calls — same impl, both pinned.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let a = [1, 2, 3];
+            let b = [1, 2, 3];
+            print(a == b);
+            print(a.eq(b));
+            print(a != b);
+        }
+        main();
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_lists_of_unequal_length_are_not_equal() {
+    // Length first: a strict prefix is not equal, in either direction — the
+    // shorter side never indexes past its end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print(["a", "b"] == ["a", "b", "c"]);
+            print(["a", "b", "c"] == ["a", "b"]);
+        }
+        main();
+        "#,
+        "false\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_lists_with_a_differing_element_are_not_equal() {
+    // Same length, one pair disagrees — first, middle, and last position.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print([9, 2, 3] == [1, 2, 3]);
+            print([1, 9, 3] == [1, 2, 3]);
+            print([1, 2, 9] == [1, 2, 3]);
+        }
+        main();
+        "#,
+        "false\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_nested_lists_compare_element_wise() {
+    // The impl is conditional (`T: PartialEq`), so `List<i32>: PartialEq`
+    // makes `List<List<i32>>: PartialEq` — equality recurses through the
+    // element impl, and a deep disagreement surfaces.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print([[1, 2], [3]] == [[1, 2], [3]]);
+            print([[1, 2], [3]] == [[1, 2], [4]]);
+            print([[1, 2], [3]] == [[1, 2]]);
+        }
+        main();
+        "#,
+        "true\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_a_struct_with_a_list_field_derives_partial_eq() {
+    // The refused shape itself (E80's finding, the website's `DiagRow`): the
+    // derive emits `self.tags == other.tags`, which lands on the new impl.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        [derive(PartialEq)]
+        struct Row {
+            id: i32,
+            tags: List<str>,
+        }
+
+        fun main() {
+            let a = Row { id = 1, tags = ["x", "y"] };
+            let b = Row { id = 1, tags = ["x", "y"] };
+            let c = Row { id = 1, tags = ["x"] };
+            print(a == b);
+            print(a == c);
+        }
+        main();
+        "#,
+        "true\nfalse\n",
+    );
+}
+
 // The macro world's AMBIENT meta prelude (macro-engine.md §3/§10): the
 // reflection vocabulary — the meta types, `source`, `fresh` — is in scope in
 // every macro body with no imports at all. Libraries (`option`, `build`)
@@ -16367,6 +18616,707 @@ main();
                 "the context requirement flows through this call",
             ),
         ],
+    );
+}
+
+// --- E84: the demotion/trace contract widens to any dependency package ---
+// (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
+// user did not write — std or ANY external/linked package — demotes and
+// traces the same way. The seam is the loader's `Origin::Dep` (the
+// `Workspace`/`PackageSpec` layer — the same classification the manifest
+// resolver feeds), surfaced as `Program::dependency_sources`; never a path
+// heuristic. Before the widening, a read inside a dependency anchored IN the
+// dependency's file and the package's internal frames were labeled as hops.
+
+/// A dependency-package fixture: its import name and its files (`lib.vl` at
+/// the package root), staged on disk and handed to `analyze_source` as a
+/// real `Workspace` package — the loader classifies it `Origin::Dep`
+/// exactly as it does one resolved from a manifest.
+struct DependencyFixture {
+    import_name: &'static str,
+    files: &'static [(&'static str, &'static str)],
+    /// Whether the package is a declared workspace MEMBER (`[project]
+    /// packages`, E90) — the manifest resolver's classification, staged
+    /// directly here since the harness enters the `Workspace` by hand
+    /// (`manifest.rs` pins the resolver's own decision). A member is the
+    /// user's code: never demoted. An external package (`false`) keeps the
+    /// E84 demotion.
+    member: bool,
+}
+
+/// One diagnostic from a workspace-with-dependencies analysis, fully
+/// file-attributed so a pin can say WHERE each part landed: the primary's
+/// file and exact spanned text, the C3 note's (message, file, spanned text),
+/// and each trace hop's (label, file, spanned text, `call`), in analyzer
+/// order.
+struct WorkspaceDiagnostic {
+    message: String,
+    file: String,
+    anchor: String,
+    note: Option<(String, String, String)>,
+    trace: Vec<(String, String, String, bool)>,
+}
+
+/// Analyzes `entry_files` (under an `app/` root; `main.vl` is the entry)
+/// against `dependencies`, each staged in its own directory beside `app/`
+/// and entered into the `Workspace` by hand — the same staging
+/// `module_resolution.rs` uses, with the diagnostics kept whole (note and
+/// trace included) instead of flattened to messages.
+fn analyze_workspace_with_dependencies(
+    entry_files: &[(&str, &str)],
+    dependencies: &[DependencyFixture],
+) -> Vec<WorkspaceDiagnostic> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_e84_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    // Every file's text by its NAME, for slicing spans back into words.
+    // Fixture file names are unique across packages by construction.
+    let mut texts: Vec<(String, String)> = Vec::new();
+    for (relative, contents) in entry_files {
+        let path = app_dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        texts.push((
+            Path::new(relative)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            contents.to_string(),
+        ));
+    }
+    let mut packages = Vec::new();
+    let mut entry_dependencies = Vec::new();
+    for (index, dependency) in dependencies.iter().enumerate() {
+        let dependency_root = root.join(dependency.import_name);
+        for (relative, contents) in dependency.files {
+            let path = dependency_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            texts.push((
+                Path::new(relative)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                contents.to_string(),
+            ));
+        }
+        packages.push(PackageSpec {
+            base_root: dependency_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: dependency.member,
+        });
+        entry_dependencies.push((dependency.import_name.to_string(), index));
+    }
+    let workspace = Workspace {
+        packages,
+        entry_dependencies,
+        ..Workspace::default()
+    };
+
+    let entry_path = app_dir.join("main.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let leaked: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    leaked,
+                    &std_spec(),
+                    &app_dir,
+                    &entry_path,
+                    Some(Platform::default()),
+                    &workspace,
+                );
+                // The entry's own parse errors lead; `diagnostic_sources` is
+                // parallel to the program's half (as in `analyze_package`).
+                let prefix = errors.len()
+                    - program
+                        .as_ref()
+                        .map(|program| program.diagnostics.len())
+                        .unwrap_or(0);
+                let file_name_of = |source: vilan_core::analyzer::SourceId| -> Option<String> {
+                    let program = program.as_ref()?;
+                    let path = program.source_path(source)?;
+                    Some(path.file_name()?.to_string_lossy().into_owned())
+                };
+                let text_at = |file: &Option<String>, span: vilan_core::span::Span| -> String {
+                    file.as_deref()
+                        .and_then(|file| {
+                            texts
+                                .iter()
+                                .find(|(name, _)| name == file)
+                                .map(|(_, text)| {
+                                    text.get(span.into_range()).unwrap_or("").to_string()
+                                })
+                        })
+                        .unwrap_or_default()
+                };
+                let diagnostics = errors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, error)| {
+                        let primary_source = index
+                            .checked_sub(prefix)
+                            .and_then(|offset| {
+                                let program = program.as_ref()?;
+                                program.diagnostic_sources.get(offset).copied()
+                            })
+                            .unwrap_or(vilan_core::analyzer::SourceId(0));
+                        let primary_file = file_name_of(primary_source);
+                        // `Note::source` contract: `None` = the primary's file.
+                        let located =
+                            |source: Option<vilan_core::analyzer::SourceId>| -> Option<String> {
+                                match source {
+                                    Some(source) => file_name_of(source),
+                                    None => primary_file.clone(),
+                                }
+                            };
+                        WorkspaceDiagnostic {
+                            message: error.msg.clone(),
+                            anchor: text_at(&primary_file, error.span),
+                            note: error.note.as_ref().map(|note| {
+                                let file = located(note.source);
+                                (
+                                    note.msg.clone(),
+                                    file.clone().unwrap_or_default(),
+                                    text_at(&file, note.span),
+                                )
+                            }),
+                            trace: error
+                                .trace
+                                .iter()
+                                .map(|hop| {
+                                    let file = located(hop.note.source);
+                                    (
+                                        hop.note.msg.clone(),
+                                        file.clone().unwrap_or_default(),
+                                        text_at(&file, hop.note.span),
+                                        hop.call,
+                                    )
+                                })
+                                .collect(),
+                            file: primary_file.unwrap_or_default(),
+                        }
+                    })
+                    .collect();
+                let _ = std::fs::remove_dir_all(&root);
+                diagnostics
+            }))
+            .unwrap_or_else(|_| panic!("the compiler panicked analyzing the E84 workspace fixture"))
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker thread aborted")
+}
+
+/// The dependency counterpart of `e74_an_uncovered_effect_anchors_at_the_users_call`
+/// (shape: the strict read sits directly in the dependency function the user
+/// calls). Pre-widening (the probe, 2026-08-24): the primary anchored at
+/// `current.get()` IN `lib.vl`, the user's calls rode as mere hops, and no
+/// C3 note existed.
+#[test]
+fn e84_a_dependency_read_anchors_at_the_users_call() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+            )],
+            member: false,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert!(
+        diagnostic.message.contains(
+            "context `current` is read here, but this code can be reached without an enclosing `run`"
+        ),
+        "{message}",
+        message = diagnostic.message
+    );
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "read_it()"),
+        "the primary anchors at the USER's call, never inside the package"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the read is inside `read_it` here",
+            "lib.vl",
+            "current.get()"
+        )),
+        "the C3 note demotes the package-internal read, in ITS file"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "the chain holds the user's calls only"
+    );
+}
+
+/// The chain shape: the user calls the package's entry function and the read
+/// sits two package-internal frames deeper. The exact-length trace assertion
+/// is the internal-frames pin — pre-widening, `deep_read()` and `middle()`
+/// (both inside `lib.vl`) were labeled as hops.
+#[test]
+fn e84_a_dependency_chains_hops_exclude_package_internals() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun deep_read(): i32 {\n\tcurrent.get()\n}\n\nfun middle(): i32 {\n\tdeep_read()\n}\n\nfun entry(): i32 {\n\tmiddle()\n}\n",
+            )],
+            member: false,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "entry()"),
+        "the primary anchors at the user's call into the package"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the read is inside `deep_read` here",
+            "lib.vl",
+            "current.get()"
+        )),
+        "the note names the function holding the read, in the package's file"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "package-internal frames (`middle`, `deep_read`) are traversed but never labeled"
+    );
+}
+
+/// The injected-call flavor (row 223) gains its first library-internal
+/// incidence: the dependency declares the context AND the `context`-clause
+/// function; the user's call site is the entry. Pre-widening the primary
+/// anchored at `body()` inside `lib.vl`, note-free.
+#[test]
+fn e84_a_dependency_injected_call_demotes_the_same_way() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun call_it(body: (|| void) context current) {\n\tbody();\n}\n",
+            )],
+            member: false,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert!(
+        diagnostic.message.contains(
+            "an injected closure is called here, but this code can be reached without an enclosing `run` for context `current`"
+        ),
+        "{message}",
+        message = diagnostic.message
+    );
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "call_it(|| print(1))"),
+        "the primary anchors at the user's call"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the injected call is inside `call_it` here",
+            "lib.vl",
+            "body()"
+        )),
+        "the C3 note demotes the package-internal injected call"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "the injected flavor traces through the same helpers as the read flavor"
+    );
+}
+
+/// The C3a boundary, from the other side: a WORKSPACE sibling module (the
+/// user's own `pkg::` code, `Origin::Pkg`) never demotes — the primary stays
+/// at the read in the module's file, note-free, with the user-side chain as
+/// the trace. This is what pins "non-workspace" to the loader's
+/// classification rather than to "any other file".
+#[test]
+fn e84_a_workspace_sibling_read_still_anchors_at_itself() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::helper::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+            ),
+            (
+                "helper.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+            ),
+        ],
+        &[],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("helper.vl", "current.get()"),
+        "the user's own module anchors at the read (E74's no-over-correction half)"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for code the user wrote: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "read_it()",
+                true
+            ),
+        ],
+        "the chain labels the user's calls, entry → read"
+    );
+}
+
+// --- E90: workspace MEMBERS are carved out of the E84 demotion ---
+// (diagnostics-standard.md C3a ruling note, RULED 2026-08-24): a `[project]`
+// member reached through a path edge classifies `Origin::Dep` like any
+// dependency, but it is code the user edits — so it gets full user
+// treatment: reads anchor at themselves in the member's file, note-free,
+// with member-internal calls labeled as hops. Only genuinely external
+// packages (git, unlisted path) demote. Membership is the root manifest's
+// `packages` declaration (`PackageSpec::member`, pinned in `manifest.rs`),
+// never a path test; the harness stages the resolver's decision directly.
+
+/// The member counterpart of `e84_a_dependency_chains_hops_exclude_package_internals`:
+/// the same chain shape (entry → middle → deep_read → the read), now in a
+/// declared workspace member. Pre-carve-out (the E84 tree) the primary
+/// anchored at the user's `entry()` call with the read demoted to the C3
+/// note and the member's internal frames unlabeled.
+#[test]
+fn e90_a_member_package_read_anchors_at_itself_with_its_chain_labeled() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport common::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "common",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun deep_read(): i32 {\n\tcurrent.get()\n}\n\nfun middle(): i32 {\n\tdeep_read()\n}\n\nfun entry(): i32 {\n\tmiddle()\n}\n",
+            )],
+            member: true,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("lib.vl", "current.get()"),
+        "a member's read anchors AT ITSELF, in the member's file"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for the user's own workspace member: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "entry()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "lib.vl",
+                "middle()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "lib.vl",
+                "deep_read()",
+                true
+            ),
+        ],
+        "member-internal calls are labeled like the user's own, entry → read"
+    );
+}
+
+/// The same carve-out through the OTHER load site (the module loop, not the
+/// `lib.vl` surface): the read sits in a member's module reached as
+/// `common::util::read_it`. Pre-carve-out it demoted exactly like
+/// `e90_an_external_packages_module_read_still_demotes`' shape.
+#[test]
+fn e90_a_member_packages_module_read_anchors_at_itself() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport common::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "common",
+            files: &[
+                ("lib.vl", ""),
+                (
+                    "util.vl",
+                    "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+                ),
+            ],
+            member: true,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("util.vl", "current.get()"),
+        "a member module's read anchors at itself"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for a member's module: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "read_it()",
+                true
+            ),
+        ],
+        "the chain labels the calls, entry → read"
+    );
+}
+
+/// The injected-call flavor (row 223) in a MEMBER: the member declares both
+/// the context and the `context`-clause function, and carves out exactly
+/// like the read flavor — the primary anchors at the member-internal
+/// `body()` in the member's file, note-free, with the user's calls as the
+/// chain. Pre-carve-out this shape demoted like
+/// `e84_a_dependency_injected_call_demotes_the_same_way`.
+#[test]
+fn e90_a_member_packages_injected_call_anchors_at_itself() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport common::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "common",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun call_it(body: (|| void) context current) {\n\tbody();\n}\n",
+            )],
+            member: true,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert!(
+        diagnostic.message.contains(
+            "an injected closure is called here, but this code can be reached without an enclosing `run` for context `current`"
+        ),
+        "{message}",
+        message = diagnostic.message
+    );
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("lib.vl", "body()"),
+        "a member's injected call anchors at itself, in the member's file"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for the user's own workspace member: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "call_it(|| print(1))",
+                true
+            ),
+        ],
+        "the chain labels the user's calls, entry → injected call"
+    );
+}
+
+/// The boundary's other side, at the module load site: an EXTERNAL package's
+/// module (member: false — a git checkout or an unlisted path dep) keeps the
+/// E84 demotion. This is the control that pins the carve-out to MEMBERSHIP —
+/// an over-carve of every `Origin::Dep` package goes red here.
+#[test]
+fn e90_an_external_packages_module_read_still_demotes() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[
+                ("lib.vl", ""),
+                (
+                    "util.vl",
+                    "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+                ),
+            ],
+            member: false,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "read_it()"),
+        "an external package's module still demotes to the user's call"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the read is inside `read_it` here",
+            "util.vl",
+            "current.get()"
+        )),
+        "the C3 note demotes the read into the module's own file"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "the chain holds the user's calls only"
     );
 }
 
@@ -27850,6 +30800,36 @@ fn a_diagnostic_in_generated_code_anchors_at_the_attribute() {
                 && *range == expected
         }),
         "expected the generated-code error re-anchored at the attribute: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn e82_a_derive_refusal_anchors_at_the_attribute_not_the_generated_text() {
+    // `[derive(PartialEq)]` on a struct whose field type provides no
+    // `PartialEq` refuses inside the GENERATED `eq` — its field compare is an
+    // `==` the post-fixpoint binary-operator pass checks. That pass pushed
+    // without attributing, so the refusal kept the generated TEMPLATE's span
+    // while claiming the entry file and drew its label over whatever the
+    // entry held at those offsets (E82's live shape: a comment line). It
+    // re-anchors at the attribute that generated the code, provenance said in
+    // the message, exactly like every other generated-code diagnostic
+    // (standard A2, `a_diagnostic_in_generated_code_anchors_at_the_attribute`).
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        [derive(PartialEq)]
+        struct Widget { item: Opaque }
+
+        struct Opaque { x: i32 }
+
+        fun main() {
+            let w = Widget { item = Opaque { x = 1 } };
+            print(w.item.x);
+        }
+        "#,
+        "PartialEq",
+        "in code generated by this attribute: type 'Opaque' does not implement the `PartialEq` operator",
     );
 }
 
@@ -41833,6 +44813,26 @@ fn ssr_element_renders_mixed_content() {
 }
 
 #[test]
+fn hyphenated_attribute_names_parse_and_emit_verbatim() {
+    // E87 (element-syntax.md §2, blessed 2026-08-22): hyphens are ordinary
+    // attribute-name characters, exactly as in HTML — `data-*`/`aria-*` need
+    // no special form and no method twin, because the name-blind desugar
+    // lowers `data-foo-bar("x")` to `.attr("data-foo-bar", "x")` without
+    // ever reading the name. The owner's probe, pinned end to end: parse,
+    // check, and the emitted attributes verbatim.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(<div data-foo-bar("x") aria-label("y")>"z"</div>));
+        }
+        "#,
+        "<div data-foo-bar=\"x\" aria-label=\"y\">z</div>\n",
+    );
+}
+
+#[test]
 fn an_element_without_view_in_scope_fails_at_the_element_head() {
     // No auto-import: the desugared `view` accessor spans `<tag`, so the
     // unresolved-name diagnostic underlines the element head the user wrote —
@@ -49846,12 +52846,15 @@ fn b98_the_same_trait_at_different_arguments_is_two_impls() {
 }
 
 #[test]
-fn b98_the_std_into_blanket_is_not_a_duplicate_of_a_user_impl() {
-    // The carve-out that would have taken std down: `impl type T with Into<T>`
-    // matches every subject under ordinary type COMPATIBILITY, so a rule built
-    // on `compare_type` would call it a duplicate of every user `Into` impl. It
-    // is an OVERLAP, which is B73's open specificity question — unchanged here,
-    // in both directions (`Into<Fahrenheit>` and the reflexive `Into<Celsius>`).
+fn b98_a_user_reflexive_into_impl_is_legal_and_not_a_duplicate() {
+    // Originally the carve-out that would have taken std down: a rule built on
+    // `compare_type` would have called std's `impl type T with Into<T>` a
+    // duplicate of every user `Into` impl. That blanket is deleted (B127,
+    // method-resolution.md §14), and this program — unchanged — is now the
+    // migration path's legality pin: a USER-written reflexive impl
+    // (`impl Fahrenheit with Into<Fahrenheit>`) is an ordinary impl, legal
+    // beside a converting `Into<Fahrenheit>` on another subject, because the
+    // pair key is `(trait, arguments, subject)` and the subjects differ.
     assert_compiles(
         r#"
         import std::into::Into;
@@ -52921,7 +55924,31 @@ fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
             print(1);
         }
         "#,
-        "Expected |Route| Route, but got |Route| Other instead.",
+        // B132 narrowed the anchor: the bound target (`T = Route`) is ground,
+        // so the bare body takes S3's return-position route and the mismatch
+        // reports ON the expression in the binding's terms, no longer as the
+        // whole closure value (`Expected |Route| Route, but got |Route| Other`).
+        "Expected Route, but got Other instead.",
+    );
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            let made = Holder { tag = 0 }.twice(Route::Away(1), |current| Other::Second(3));
+            print(1);
+        }
+        "#,
+        "Other::Second(3)",
+        "Expected Route, but got Other instead.",
     );
 }
 
@@ -53828,8 +56855,10 @@ fn b84_one_name_per_block_across_two_blocks_still_compiles() {
 #[test]
 fn b84_two_impls_of_one_trait_are_still_not_a_duplicate() {
     // §9(6), kept load-bearing: the trait tier dedups by trait, so the name
-    // still has one home. `Into`'s std blanket impl is the live instance, and
-    // a user's own `Into` impl beside it must stay legal.
+    // still has one home. Std's `Into<T>` blanket was the live instance until
+    // B127 deleted it (method-resolution.md §14); two user impls of `Into` at
+    // different arguments on one subject keep the shape — two blocks, one
+    // trait, both declaring `into`, and legal.
     assert_compiles(
         r#"
         import std::into::Into;
@@ -53839,6 +56868,10 @@ fn b84_two_impls_of_one_trait_are_still_not_a_duplicate() {
 
         impl Celsius with Into<Fahrenheit> {
             fun into(self): Fahrenheit { Fahrenheit { degrees = self.degrees * 2 } }
+        }
+
+        impl Celsius with Into<Celsius> {
+            fun into(self): Celsius { self }
         }
 
         fun main() { }
@@ -58722,15 +61755,23 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
 // LIVE and asserts the shipped semantics — R1 (the trait's effective
 // arguments join the resolution key), R2 (the expected type selects among
 // argument-distinct homes), R3 (specificity ranks a genuine overlap). The
-// residue no row exercises is B128, deferred.
+// residue §13.8 deferred, B128, is closed (2026-08-23) — its pins sit after
+// the §14 deletion block below. The `Into` pins originally staged their second
+// home with std's `Into<T>` blanket; §14 deleted it, so they stage the same
+// shapes with user impls (each rewrite plant-proven red: the R1 home key
+// collapsed to the bare trait id reds the direct-call pins, the re-point's
+// selection disabled reds the trait-qualified one).
 
-/// §13.2 row 1, closed by R2. Before it: `Expected Bar, but got Foo instead.`
-/// — std's `impl type T with Into<T>` (`std/src/into.vl` 5–9) is a candidate for
-/// every receiver and, being tier 0, sorted first, so the user's own impl was
-/// dead code. R1 makes the two separate homes (`Into<Foo>` and `Into<Bar>`) and
-/// R2 lets the `let`'s annotation say which was meant.
+/// §13.2 row 1, closed by R2, then simplified by §14: std's
+/// `impl type T with Into<T>` was a candidate for every receiver and, being
+/// tier 0, sorted first, so this program reported `Expected Bar, but got Foo
+/// instead.` and the user's own impl was dead code — R1 split the homes and R2
+/// let the `let`'s annotation say which was meant. The blanket is deleted now,
+/// so the user's impl is the only home and the annotated call reaches it with
+/// nothing to select against. (R2's let-annotation selection between two live
+/// homes stays pinned by the rows-6/7 and rows-18/19 pins.)
 #[test]
-fn b73_a_user_into_impl_beats_the_std_blanket() {
+fn b73_an_annotated_into_call_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -58752,15 +61793,17 @@ fn b73_a_user_into_impl_beats_the_std_blanket() {
     );
 }
 
-/// §13.2 row 2 — the beta-critical miscompile, closed by R1. Before it, this
-/// compiled clean, exited 0, and printed `[ 1 ]`: the blanket's
-/// `fun into(self): T { self }` was emitted (`function $a(self) { return
-/// __clone(self); }`) and the user's `into` never was. With the trait's
-/// arguments in the resolution key the two are separate homes (`Into<Foo>` and
-/// `Into<str>`), and with no expected type to steer R2's selection the call is
-/// reported rather than silently resolved.
+/// §13.2 row 2 — the beta-critical miscompile, closed by R1. As filed, the
+/// second home was std's `Into<T>` blanket: this program with only the
+/// `Into<str>` impl compiled clean, exited 0, and printed `[ 1 ]`, because the
+/// blanket's identity `into` was emitted and the user's never was. The blanket
+/// is deleted (§14), so the pin keeps R1's point with two USER impls — before
+/// R1, one home meant `candidates.first()` and the first-declared impl
+/// answered silently. With the trait's arguments in the key the two are
+/// separate homes (`Into<str>` and `Into<Bar>`), and with no expected type to
+/// steer R2's selection the call is reported rather than silently resolved.
 #[test]
-fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
+fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_first_declared() {
     assert_fails_with(
         r#"
         import std::print;
@@ -58768,9 +61811,14 @@ fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
         import std::string::str;
 
         struct Foo { n: i32 }
+        struct Bar { n: i32 }
 
         impl Foo with Into<str> {
             fun into(self): str { "converted" }
+        }
+
+        impl Foo with Into<Bar> {
+            fun into(self): Bar { Bar { n = self.n + 100 } }
         }
 
         fun main() {
@@ -58784,16 +61832,24 @@ fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_identity() {
 
 /// §13.2 row 3, closed by R2 — the same defect in RETURN position, where the
 /// expectation comes from the declared return type rather than from a `let`.
-/// Before: `Expected Bar, but got Foo instead.` on the `x.into()` tail.
+/// As filed the competing home was std's blanket (before R2: `Expected Bar,
+/// but got Foo instead.` on the `x.into()` tail); the blanket is deleted
+/// (§14), so a second user impl — declared FIRST, so first-declared cannot
+/// masquerade as selection — keeps the two homes this leg selects between.
 #[test]
 fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
         import std::print;
         import std::into::Into;
+        import std::string::str;
 
         struct Foo { n: i32 }
         struct Bar { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
 
         impl Foo with Into<Bar> {
             fun into(self): Bar { Bar { n = self.n + 100 } }
@@ -58810,20 +61866,26 @@ fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
 /// §13.2 row 5, closed by R2. §3.1's disambiguator is no escape hatch here —
 /// both candidates have the same trait head, so naming it settles nothing; the
 /// annotation is what picks the home. Two defects stood between: the path head
-/// `Into::into` never reached §3.1's re-point at all, because the blanket's
-/// GENERIC subject compare_types the bare trait type and answered the static
-/// path itself (a `self`-method can no longer do that); and the re-point's own
-/// provider scan then took the first impl of the trait rather than the one the
-/// expectation names.
+/// `Into::into` never reached §3.1's re-point at all, because std's blanket's
+/// GENERIC subject compare_typed the bare trait type and answered the static
+/// path itself (a `self`-method can no longer do that, and the blanket is gone
+/// — §14); and the re-point's own provider scan took the first impl of the
+/// trait rather than the one the expectation names. The second user impl —
+/// declared FIRST — is what keeps that provider scan a real selection.
 #[test]
 fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
         import std::print;
         import std::into::Into;
+        import std::string::str;
 
         struct Foo { n: i32 }
         struct Bar { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
 
         impl Foo with Into<Bar> {
             fun into(self): Bar { Bar { n = self.n + 100 } }
@@ -59141,15 +62203,16 @@ fn b73_a_bound_selects_the_impl_matching_its_trait_arguments() {
 }
 
 /// R1's diagnostic (C2). The two homes are named as THIS receiver instantiates
-/// them — `Into<Foo>` for std's blanket, `Into<str>` for the user's impl —
-/// because `Into` twice tells the reader nothing, and the message says what
-/// does select rather than offering an `Into::into` spelling that cannot
-/// (B83's "an impossible steer is worse than no steer"). Anchored at the method
-/// name (A1/A4), the same span the two-trait ambiguity uses.
+/// them — `Into<Foo>` for the blanket (a USER-written one since §14 deleted
+/// std's), `Into<str>` for the specific impl — because `Into` twice tells the
+/// reader nothing, and the message says what does select rather than offering
+/// an `Into::into` spelling that cannot (B83's "an impossible steer is worse
+/// than no steer"). Anchored at the method name (A1/A4), the same span the
+/// two-trait ambiguity uses.
 #[test]
 fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them() {
-    // The third `into` in the source is the CALL — the first two are the import
-    // path and the impl's declaration.
+    // The fourth `into` in the source is the CALL — the first three are the
+    // import path and the two impls' declarations.
     assert_fails_spanning_nth(
         r#"
         import std::print;
@@ -59157,6 +62220,10 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
         import std::string::str;
 
         struct Foo { n: i32 }
+
+        impl type T with Into<T> {
+            fun into(self): T { self }
+        }
 
         impl Foo with Into<str> {
             fun into(self): str { "converted" }
@@ -59168,7 +62235,7 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
         }
         "#,
         "into",
-        2,
+        3,
         "'into' is ambiguous on 'Foo': both 'Into<Foo>' and 'Into<str>' provide it, and \
          'Into::into' names only the trait, not which of its instantiations; annotate the \
          type this call must produce to pick one",
@@ -59178,7 +62245,9 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
 /// R2's ZERO-match leg. An expectation that fits neither home does not get to
 /// pick one by being nearest: the call stays ambiguous and says so, rather than
 /// resolving to some impl and then reporting a type mismatch against it. That
-/// second message would name a home the program never chose.
+/// second message would name a home the program never chose. (The `Into<Foo>`
+/// home comes from a user-written blanket — the same shape std's deleted
+/// blanket gave this pin originally, §14.)
 #[test]
 fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
     assert_fails_with(
@@ -59188,6 +62257,10 @@ fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
         import std::string::str;
 
         struct Foo { n: i32 }
+
+        impl type T with Into<T> {
+            fun into(self): T { self }
+        }
 
         impl Foo with Into<str> {
             fun into(self): str { "converted" }
@@ -59462,6 +62535,211 @@ fn b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins() {
         "#;
     assert_compiles_and_runs(direct, "7\n");
     assert_compiles_and_runs(through_a_bound, "7\n");
+}
+
+// --- B127/B130: std ships no `Into<T>` blanket (method-resolution.md §14) ---
+//
+// RULED DELETE 2026-08-22 (§14.1). std's `impl type T with Into<T>` was
+// selected by resolution at zero sites in the whole tree, the suite included;
+// its one working surface was an identity `.into()` nothing called; and its
+// one unique affordance — a `T: Into<Foo>` bound fed a `Foo` itself — died in
+// an internal compiler error (B130, §14 probe C), because the transformer's
+// nominal re-dispatch cannot see a generic subject (§13.3 D3). The trait, the
+// module, and the import path all stay; a user who wants identity conversion
+// writes the three-line reflexive impl, which is strictly more functional
+// than the blanket it replaces (it carries the bound path — probe G). The
+// pins below are the deleted world's contract; each `b127_`/the probe-C pin
+// was run RED against the pre-deletion tree before the impl was removed.
+
+/// §14 probe B. With no blanket in std, an `into` call reaches only what the
+/// program itself implements — no impl, no method. Re-adding a std blanket
+/// impl would turn this refusal into a clean compile that prints the receiver.
+#[test]
+fn b127_an_into_call_with_no_user_impl_is_a_missing_method() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+
+        fun main() {
+            let f = Foo { n = 1 }.into();
+            print(f);
+        }
+        "#,
+        "Foo has no method 'into'",
+    );
+}
+
+/// §13.2 row 2's FIRST-choice correct answer, reachable at last: one user
+/// impl, no annotation, and the call selects it. Std's blanket made every
+/// `.into()` receiver a two-home call, so this exact program — the shape
+/// `docs/std/strings.md` teaches — was an ambiguity that demanded an
+/// annotation (the tax §14 repeals). Red before the deletion, green after.
+#[test]
+fn b127_an_unannotated_into_call_with_one_user_impl_selects_it() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+        import std::string::str;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<str> {
+            fun into(self): str { "converted" }
+        }
+
+        fun main() {
+            let s = Foo { n = 1 }.into();
+            print(s);
+        }
+        "#,
+        "converted\n",
+    );
+}
+
+/// B130, closed by the deletion. A `T: Into<Foo>` bound fed a `Foo` was the
+/// blanket's one unique affordance, and it died with "internal: a call
+/// resolved to 'Into''s requirement 'into', which has no body … please report
+/// this program" anchored at the import line (live in released 0.34.0): the
+/// analyzer accepted the bound through the blanket, and the transformer's
+/// `nominal_matches` re-dispatch cannot see a generic subject (§13.3 D3), so
+/// the no-body guard fired. With no blanket the bound is refused cleanly at
+/// the call, with the note at the bound's declaration. This pin is the red
+/// half of the plant: against the pre-deletion tree it fails on the internal
+/// error where the refusal should be.
+#[test]
+fn b130_an_into_bound_fed_its_target_without_an_impl_is_refused_cleanly() {
+    let source = r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+
+        fun accept<T: Into<Foo>>(x: T): Foo { x.into() }
+
+        fun main() { print(accept(Foo { n = 7 }).n); }
+        "#;
+    assert_fails_with(
+        source,
+        "'Foo' does not implement trait 'Into<Foo>', required by a generic bound of this call",
+    );
+    assert_fails_noting(
+        source,
+        "'Foo' does not implement trait 'Into<Foo>'",
+        "T",
+        "the bound is declared here",
+    );
+}
+
+/// §14 probe G, the migration path: a user-written reflexive impl delivers
+/// what the blanket only promised. It satisfies the `T: Into<Foo>` bound AND
+/// carries the bound path's re-dispatch, because a nominal subject is visible
+/// where a generic one never was (§13.3 D3) — measured identical with the
+/// blanket still in std, which is what makes the three-line impl "strictly
+/// more functional" than the five lines it replaces (§14, migration).
+#[test]
+fn b130_a_user_reflexive_impl_carries_the_bound_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::into::Into;
+
+        struct Foo { n: i32 }
+
+        impl Foo with Into<Foo> {
+            fun into(self): Foo { self }
+        }
+
+        fun accept<T: Into<Foo>>(x: T): Foo { x.into() }
+
+        fun main() { print(accept(Foo { n = 7 }).n); }
+        "#,
+        "7\n",
+    );
+}
+
+// --- B128: R2 selecting an unrankable home reports it (§13.8's residue) -----
+//
+// `rank_member_candidates` used to hand R2 one REPRESENTATIVE per home — an
+// unranked home was stood in for by its first maximum — so when the expected
+// type selected a home R3's specificity order could not rank, the first
+// maximum answered silently where the home's own `AmbiguousImpls` report
+// should. The shape needs BOTH an argument-distinct split (so R2 runs at all)
+// AND an unrankable overlap inside the selected home; no §13.2 row and no
+// program in the tree had it, which is why §13.8 shipped with it deferred.
+
+/// The probe the tree lacked, and B128's close. `Conv<Bar>`'s home holds two
+/// impls bounded by unrelated traits (`Box<i32>` satisfies both, neither
+/// subsumes — the row-214 shape); `Conv<str>`'s home is the argument-distinct
+/// split that routes the call through R2. The `Bar` annotation selects the
+/// unrankable home, and the call must report that home's overlap — before the
+/// fix this compiled cleanly and printed `1`, the first maximum by
+/// declaration order, which is the exact order-dependence B73 was filed over.
+#[test]
+fn b128_an_expectation_selecting_an_unrankable_home_reports_its_overlap() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::display::Display;
+        import std::compare::Ord;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Box<T> { v: T }
+        struct Bar { n: i32 }
+
+        impl Box<type T: Display> with Conv<Bar> { fun conv(self): Bar { Bar { n = 1 } } }
+
+        impl Box<type U: Ord> with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Box<type T> with Conv<str> { fun conv(self): str { "s" } }
+
+        fun main() {
+            let b: Bar = Box { v = 5 }.conv();
+            print(b.n);
+        }
+        "#,
+        "'conv' is ambiguous on 'Box<i32>': both 'Box<T> where T: Display' and \
+         'Box<U> where U: Ord' provide it and neither impl subject is more specific than \
+         the other",
+    );
+}
+
+/// The complement that keeps the fix honest: the same program, with the
+/// expectation selecting the RANKED home instead. An unrankable overlap the
+/// call does not select must not contaminate it — the `str` annotation picks
+/// `Conv<str>`'s single impl and the program runs.
+#[test]
+fn b128_an_expectation_selecting_a_ranked_home_beside_an_unrankable_one_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::display::Display;
+        import std::compare::Ord;
+        import std::string::str;
+
+        trait Conv<T> { fun conv(self): T; }
+
+        struct Box<T> { v: T }
+        struct Bar { n: i32 }
+
+        impl Box<type T: Display> with Conv<Bar> { fun conv(self): Bar { Bar { n = 1 } } }
+
+        impl Box<type U: Ord> with Conv<Bar> { fun conv(self): Bar { Bar { n = 2 } } }
+
+        impl Box<type T> with Conv<str> { fun conv(self): str { "s" } }
+
+        fun main() {
+            let s: str = Box { v = 5 }.conv();
+            print(s);
+        }
+        "#,
+        "s\n",
+    );
 }
 
 // --- A25: remote sources — subscribe by demand, unsubscribe at zero ---------
@@ -60389,18 +63667,20 @@ fn b129_an_empty_list_argument_binding_a_free_generic_still_errors() {
     );
 }
 
-/// The OTHER gap the original A25 pin's body carried, isolated: a `.map` on a
-/// `let`-bound signal freezes its closure parameter before the receiver's
-/// binding lands, so the parameter types as `any` and a field access on the
-/// element fails — with a NON-empty initial and no `[]` anywhere, so it is
-/// not B129's. Inlining the chain (`Signal::new(..).map(..)` in one
-/// expression) works; only the intermediate unannotated `let` trips it. This
-/// is B125/P21's solver-ordering family (the binding is read one level out,
-/// after the closure is already inferred — analyzer.rs's own P21 comment in
-/// the closure arm); it stays ignored until that design lands. Annotating the
-/// `let` sidesteps it, which is what the examples and docs do.
+/// The OTHER gap the original A25 pin's body carried, isolated — and, closed,
+/// re-diagnosed (B125's lane, type-solver.md "What B129's second gap actually
+/// was"): it was never P21's family and never about the `let`. The closure
+/// parameter `list` is filled fine once `.map` resolves; what went wrong is
+/// that `for todo in list` resolved FIRST — `ForEachItem` sits at priority 8,
+/// the `.map` call deferred to the next pass because its receiver had not
+/// grounded yet, and the for-each resolver committed the item to `any` on
+/// sight of an `Unknown` iterable instead of deferring on an unknown closure
+/// parameter the way the field-accessor, method-call, call-subject and match
+/// resolvers already do. Annotating `items` only worked because it let the
+/// call resolve at priority 6 of the first pass, ahead of the loop; the
+/// inline chain failed the same way (its receiver is a call). The resolver
+/// now defers; `resolve_subscript` got the same rule.
 #[test]
-#[ignore = "analyzer: a `.map` on a let-bound signal freezes its closure parameter before the receiver's binding lands — B125/P21 solver-ordering family, editing-dx.md §16; found isolating B129"]
 fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
     assert_compiles_and_runs(
         r#"
@@ -60430,5 +63710,896 @@ fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
         }
         "#,
         "1\n",
+    );
+}
+
+/// The same defect on `List` with no signal and no `let` in the way beyond the
+/// receiver's own: indexing the parameter (`resolve_subscript` reported
+/// "cannot index unknown" on the first pass, before the call filled it).
+#[test]
+fn b129_indexing_an_unannotated_closure_parameter_waits_for_its_owning_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let items = [[Todo { id = 1, done = false }]];
+        	let ids: List<i32> = items.map(|list| list[0].id);
+        	print(ids[0]);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// Iterating it — the for-each shape of the todo example, on a plain nested
+/// list whose receiver grounds only at priority 10 of the first pass.
+#[test]
+fn b129_iterating_an_unannotated_closure_parameter_waits_for_its_owning_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let items = [[Todo { id = 1, done = false }, Todo { id = 2, done = true }]];
+        	let remaining: List<i32> = items.map(|list| {
+        		mut open = 0;
+        		for todo in list {
+        			if !todo.done {
+        				open += 1;
+        			}
+        		}
+        		open
+        	});
+        	print(remaining[0]);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The inline chain the old pin's comment said worked — it did not (the
+/// receiver is a call, resolved at priority 11, so the loop ran first just
+/// the same), and it is pinned here so the claim is checked rather than
+/// remembered.
+#[test]
+fn b129_the_inline_chain_types_its_closure_parameter_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Owner, Signal, owner_scope };
+
+        struct Todo { id: i32, done: bool }
+
+        fun main() {
+        	let scope = Owner::new();
+        	let n = owner_scope.run(scope, || {
+        		let remaining = Signal::new([Todo { id = 1, done = false }]).map(|list| {
+        			mut open = 0;
+        			for todo in list {
+        				if !todo.done {
+        					open += 1;
+        				}
+        			}
+        			open
+        		});
+        		remaining.get()
+        	});
+        	print(n);
+        	scope.dispose();
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The bound on the defer: a parameter NO call ever fills stays open to the
+/// end of the fixpoint and reports — it is not silently accepted. Indexing
+/// it used to report "cannot index unknown" on the first pass; iterating it
+/// used to type the item `any` and compile clean (the `any` leaking out of
+/// an untyped parameter). Both reported through the leftover sweep at first
+/// ("could not be resolved" at the use); since B131 the report is the
+/// parameter-anchored refusal (the b131_* pins below own its anchor, its
+/// one-per-root-cause count, and the called-closure complement).
+#[test]
+fn b129_a_never_called_closures_parameter_still_reports() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let first = |xs| xs[0];
+        	print(1);
+        }
+        "#,
+        "is never given a type",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let walk = |xs| {
+        		for x in xs {
+        			print(x);
+        		}
+        	};
+        	print(1);
+        }
+        "#,
+        "is never given a type",
+    );
+}
+
+/// B131 — the head and the anchor. B13's rule names the invisible decision
+/// ("inferred from the closure's first call"); a closure that is NEVER
+/// called has no such call, so nothing can ever fill its unannotated
+/// parameter and every use of it stalls. The refusal names the parameter
+/// and anchors AT the parameter — the one place the fix (an annotation)
+/// goes — instead of surfacing as the leftover sweep's "could not be
+/// resolved" at whichever use happened to stall.
+#[test]
+fn b131_a_never_called_closures_parameter_reports_at_the_parameter() {
+    // The indexing shape: the sweep used to report "type of variable 'first'
+    // could not be resolved" over the whole `let`.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let first = |xs| xs[0];
+        	print(1);
+        }
+        "#,
+        "xs",
+        "`xs` is never given a type: this closure is never called and its parameter is \
+         unannotated; annotate it (e.g. `|xs: List<i32>|`)",
+    );
+    // The iterating shape: the sweep used to report "type of function call
+    // arguments could not be resolved" at `print(x)` — the use, two hops
+    // from the cause.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let walk = |xs| {
+        		for x in xs {
+        			print(x);
+        		}
+        	};
+        	print(1);
+        }
+        "#,
+        "xs",
+        "`xs` is never given a type: this closure is never called and its parameter is \
+         unannotated; annotate it (e.g. `|xs: List<i32>|`)",
+    );
+}
+
+/// B131 × B5 — one diagnostic per root cause: the parameter refusal replaces
+/// the leftover sweep's residuals at the uses rather than stacking on top of
+/// them (the residuals stay silent behind it exactly as behind any real
+/// diagnostic).
+#[test]
+fn b131_the_leftover_sweep_stays_silent_behind_the_parameter_refusal() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let walk = |xs| {
+        		for x in xs {
+        			print(x);
+        		}
+        	};
+        	print(1);
+        }
+        "#;
+    assert_fails_once_with(source, "is never given a type");
+    assert_fails_without(source, "could not be resolved");
+}
+
+/// B131's complement — a closure that IS called still infers its parameter
+/// from the first call (B13) and stays refusal-free.
+#[test]
+fn b131_a_called_closure_still_infers_from_its_first_call() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let double = |x| x * 2;
+        	print(double(3));
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// B131, the multi-parameter edge: only the parameter whose uses stalled is
+/// named — a sibling parameter with no stalled use raises nothing, so the
+/// refusal count stays one per root cause.
+#[test]
+fn b131_only_the_starved_parameter_is_named() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let pick = |rows, fallback| rows[0];
+        	print(1);
+        }
+        "#;
+    assert_fails_once_with(source, "is never given a type");
+    assert_fails_spanning(
+        source,
+        "rows",
+        "`rows` is never given a type: this closure is never called and its parameter is \
+         unannotated; annotate it (e.g. `|rows: List<i32>|`)",
+    );
+}
+
+// --- std::markdown — the census parser's construct pins (proposal/markdown.md,
+// --- RULED 2026-08-24; the book-wide anchor golden lives in
+// --- markdown_golden.rs, the fence-rule mirror pins near the end of this
+// --- section, and every §1.2 refusal has its own strict pin below) ----------
+
+#[test]
+fn markdown_parses_atx_headings_with_mdbook_ids() {
+    // The §3 table's first two rows: `§`, the em-dash, `&` and `.` all drop,
+    // each space becomes its own hyphen — measured against mdBook v0.5.4.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	let source = "# Spec §1 — Introduction & conformance\n\n## 6.0 The law — owners, epochs, and claims\n";
+        	match parse(source) {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Heading(let level, let content, let id) => {
+        						print("h" + level.to_string() + " " + id);
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "##,
+        "h1 spec-1--introduction--conformance\nh2 60-the-law--owners-epochs-and-claims\n",
+    );
+}
+
+#[test]
+fn markdown_heading_ids_match_the_adversarial_corpus() {
+    // The rest of the §3 corpus plus the shapes the LSP twin pins (impl:,
+    // if/else with a closing run) and the non-ASCII cases — every id verified
+    // against a local mdBook v0.5.4 build of this exact page.
+    assert_compiles_and_runs(
+        r####"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	let source = "## `Shared<T>`: one cell, many holders\n\n# Macros & const\n\n### Option::take and Option::replace\n\n## Conversions: `as_*`\n\n## `macro { … }` blocks\n\n## impl: methods and statics\n\n## if / else ##\n\n## Café naïveté\n\n## École Été\n\n## <a id=\"x\"></a> anchored\n";
+        	match parse(source) {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Heading(let level, let content, let id) => { print(id); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "####,
+        "sharedt-one-cell-many-holders\nmacros--const\noptiontake-and-optionreplace\nconversions-as_\nmacro----blocks\nimpl-methods-and-statics\nif--else\ncafé-naïveté\nécole-été\nanchored\n",
+    );
+}
+
+#[test]
+fn markdown_dedupes_repeated_ids_in_document_order() {
+    // §3 step 3: the second occurrence of a base becomes `-1`, the third
+    // `-2` — and a heading inside a blockquote participates in document
+    // order, exactly as a renderer meets it.
+    assert_compiles_and_runs(
+        r####"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun emit(blocks: List<Block>) {
+        	for block in blocks {
+        		match block {
+        			Block::Heading(let level, let content, let id) => { print(id); }
+        			Block::Quote(let inner) => { emit(inner); }
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("## Setup\n\n> ## Setup\n\n## Setup\n") {
+        		Ok(let doc) => { emit(doc.blocks); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "####,
+        "setup\nsetup-1\nsetup-2\n",
+    );
+}
+
+#[test]
+fn markdown_heading_id_is_the_dedupe_free_base() {
+    // The public `heading_id` is §3's base algorithm: same input, same id,
+    // no dedupe state between calls.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ heading_id, Inline };
+        fun main() {
+        	mut content: List<Inline> = [];
+        	content.push(Inline::Text("Conversions: "));
+        	content.push(Inline::Code("as_*"));
+        	print(heading_id(content));
+        	print(heading_id(content));
+        }
+        "#,
+        "conversions-as_\nconversions-as_\n",
+    );
+}
+
+#[test]
+fn markdown_parses_inline_code_strong_emph_and_links() {
+    // The inline constructs, with payload boundaries: span content
+    // CommonMark-trimmed, `Link` is (destination, label), `_` emphasis only
+    // at a word boundary (snake_case stays text).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun show(inlines: List<Inline>) {
+        	for inline in inlines {
+        		match inline {
+        			Inline::Text(let t) => { print("text[" + t + "]"); }
+        			Inline::Code(let t) => { print("code[" + t + "]"); }
+        			Inline::Strong(let children) => { print("strong:"); show(children); }
+        			Inline::Emph(let children) => { print("emph:"); show(children); }
+        			Inline::Link(let dest, let label) => { print("link[" + dest + "]:"); show(label); }
+        			Inline::Html(let raw) => { print("html[" + raw + "]"); }
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("a `code span` and **bold `x`** and *it* and _uh_ in snake_case [label](https://d) end\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Paragraph(let inlines) => { show(inlines); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "text[a ]\ncode[code span]\ntext[ and ]\nstrong:\ntext[bold ]\ncode[x]\ntext[ and ]\nemph:\ntext[it]\ntext[ and ]\nemph:\ntext[uh]\ntext[ in snake_case ]\nlink[https://d]:\ntext[label]\ntext[ end]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_the_a_id_passthrough_and_autolink() {
+    // The census's one HTML shape rides through verbatim; `<https://…>`
+    // autolinks become links labeled with their destination.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("<a id=\"view\"></a>**view**: see <https://vilan-lang.org> now\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Paragraph(let inlines) => {
+        						for inline in inlines {
+        							match inline {
+        								Inline::Html(let raw) => { print("html[" + raw + "]"); }
+        								Inline::Link(let dest, let label) => { print("link[" + dest + "]"); }
+        								_ => {}
+        							}
+        						}
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "html[<a id=\"view\">]\nhtml[</a>]\nlink[https://vilan-lang.org]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_fenced_code_with_info_string_and_verbatim_body() {
+    // The info string is carried verbatim (`vilan,browser` stays one
+    // string); the body is byte-faithful with one trailing newline per line
+    // — the docs gate's extraction shape — blank lines included.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("```vilan,browser\nlet x = 1;\n\n    deep();\n```\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::CodeFence(let info, let body) => {
+        						print("info[" + info + "]");
+        						print("body[" + body + "]");
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "info[vilan,browser]\nbody[let x = 1;\n\n    deep();\n]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_flat_lists_ordered_and_unordered() {
+    // Census lists: `-` and `1.` markers, flat; a marker change starts a new
+    // Items block; a simple item is one Paragraph of inlines.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("- alpha\n- beta\n  continued\n\n1. one\n2. two\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Items(let ordered, let items) => {
+        						mut kind = "unordered";
+        						if ordered { kind = "ordered"; }
+        						print(kind + " " + items.len().to_string());
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "unordered 2\nordered 2\n",
+    );
+}
+
+#[test]
+fn markdown_a_list_item_carries_blocks() {
+    // The recorded §2 deviation, pinned by the book's own shape
+    // (tour/async.md): an item with a second paragraph and an indented
+    // fence holds them as blocks — not flattened into siblings, not
+    // glommed into the item's first line.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	let source = "- **Item.** first paragraph\n  wraps here\n\n  second paragraph\n\n  ```vilan\n  let x = 1;\n  ```\n\n- next item\n";
+        	match parse(source) {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Items(let ordered, let items) => {
+        						print("items " + items.len().to_string());
+        						for inner in items[0] {
+        							match inner {
+        								Block::Paragraph(let inlines) => { print("paragraph"); }
+        								Block::CodeFence(let info, let body) => { print("fence[" + body + "]"); }
+        								_ => { print("unexpected"); }
+        							}
+        						}
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "items 2\nparagraph\nparagraph\nfence[let x = 1;\n]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_blockquotes_recursively() {
+    // §2's probed recursion: a quote holds blocks, including another quote.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun depth(blocks: List<Block>, level: i32) {
+        	for block in blocks {
+        		match block {
+        			Block::Quote(let inner) => {
+        				print("quote@" + level.to_string());
+        				depth(inner, level + 1);
+        			}
+        			Block::Paragraph(let inlines) => { print("paragraph@" + level.to_string()); }
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("> outer text\n>\n> > inner text\n") {
+        		Ok(let doc) => { depth(doc.blocks, 0); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "quote@0\nparagraph@1\nquote@1\nparagraph@2\n",
+    );
+}
+
+#[test]
+fn markdown_parses_pipe_tables_and_unescapes_cell_pipes() {
+    // Census tables: header + rows, no alignment — and the `\|` cell escape
+    // (vilan's closure syntax in cells) unescapes before inline parsing, so
+    // the code span carries a real `|`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("| op | means |\n|----|-------|\n| `\\|n\\| n * 2` | doubler |\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Table(let header, let rows) => {
+        						print("header " + header.len().to_string() + " rows " + rows.len().to_string());
+        						for inline in rows[0][0] {
+        							match inline {
+        								Inline::Code(let t) => { print("code[" + t + "]"); }
+        								_ => { print("unexpected"); }
+        							}
+        						}
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "header 2 rows 1\ncode[|n| n * 2]\n",
+    );
+}
+
+// --- std::markdown × the docs gate's fence rules (docs.rs extract_pins,
+// --- mirrored — the package's fences must agree with the gate's) ------------
+
+#[test]
+fn markdown_bullet_indented_fence_extracts_and_dedents() {
+    // docs.rs `bullet_indented_fence_extracts_and_dedents`: a fence indented
+    // two columns under a bullet is found, and its body loses the fence's
+    // own indent.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun emit(blocks: List<Block>) {
+        	for block in blocks {
+        		match block {
+        			Block::CodeFence(let info, let body) => { print("body[" + body + "]"); }
+        			Block::Items(let ordered, let items) => {
+        				for item in items { emit(item); }
+        			}
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("- A bullet:\n\n  ```vilan\n  let x = 1;\n  ```\n\n- Next bullet\n") {
+        		Ok(let doc) => { emit(doc.blocks); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "body[let x = 1;\n]\n",
+    );
+}
+
+#[test]
+fn markdown_deeper_fence_body_lines_keep_relative_indent() {
+    // docs.rs `nested_deeper_body_lines_keep_relative_indent`: only the
+    // fence's columns come off; deeper indentation survives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("  ```vilan\n  fun main() {\n      let x = 1;\n  }\n  ```\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::CodeFence(let info, let body) => { print("body[" + body + "]"); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "body[fun main() {\n    let x = 1;\n}\n]\n",
+    );
+}
+
+#[test]
+fn markdown_an_indented_fence_does_not_swallow_following_prose() {
+    // docs.rs `an_indented_fence_does_not_swallow_following_prose` (the D3
+    // bug): the indented fence closes at its own indent, the prose stays
+    // prose, and the flush fence after it survives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun emit(blocks: List<Block>) {
+        	for block in blocks {
+        		match block {
+        			Block::CodeFence(let info, let body) => { print("fence[" + body + "]"); }
+        			Block::Paragraph(let inlines) => { print("paragraph"); }
+        			Block::Items(let ordered, let items) => {
+        				print("items");
+        				for item in items { emit(item); }
+        			}
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("- Bullet:\n\n  ```vilan\n  fun first() {}\n  ```\n\nThis prose must stay prose.\n\n```vilan\nfun second() {}\n```\n") {
+        		Ok(let doc) => { emit(doc.blocks); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "items\nparagraph\nfence[fun first() {}\n]\nparagraph\nfence[fun second() {}\n]\n",
+    );
+}
+
+#[test]
+fn markdown_a_fence_like_line_at_a_different_indent_does_not_close() {
+    // docs.rs `a_fence_like_line_inside_the_body_at_a_different_indent_does_
+    // not_close`: a ``` deeper than the opener is body, not the closer.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("  ```vilan\n  outer\n    ```\n  more outer\n  ```\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::CodeFence(let info, let body) => { print("body[" + body + "]"); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "body[outer\n  ```\nmore outer\n]\n",
+    );
+}
+
+// --- std::markdown strict refusals — one pin per §1.2 construct (the ruled
+// --- failure mode: a loud ParseError naming the construct and its line) -----
+
+fn assert_markdown_refuses(source_literal: &str, expected_error: &str) {
+    // Each refusal pin drives the same tiny program: parse the literal,
+    // print the error (or a loud "parsed" if the refusal regressed).
+    let program = format!(
+        r#"
+        import std::print;
+        import std::markdown::{{ parse, Doc, ParseError }};
+        import std::result::Result::{{ Err, Ok }};
+        fun main() {{
+        	match parse("{source_literal}") {{
+        		Ok(let doc) => {{ print("parsed"); }}
+        		Err(let error) => {{ print(error.to_string()); }}
+        	}}
+        }}
+        "#
+    );
+    assert_compiles_and_runs(&program, &format!("{expected_error}\n"));
+}
+
+#[test]
+fn markdown_refuses_a_setext_heading() {
+    assert_markdown_refuses(
+        "Title\\n=====\\n",
+        "line 2: a setext heading underline or thematic break (---, ===, ***) — both outside the census grammar; headings are ATX (# Title)",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_thematic_break() {
+    assert_markdown_refuses(
+        "before\\n\\n---\\n\\nafter\\n",
+        "line 3: a setext heading underline or thematic break (---, ===, ***) — both outside the census grammar; headings are ATX (# Title)",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_nested_list() {
+    assert_markdown_refuses(
+        "- outer\\n  - inner\\n",
+        "line 2: a nested list item — the census grammar's lists are flat",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_indented_list_item() {
+    assert_markdown_refuses(
+        "  - indented\\n",
+        "line 1: an indented list item — the census grammar's lists are flat, at the left margin",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_indented_code_block() {
+    assert_markdown_refuses(
+        "para\\n\\n    let x = 1;\\n",
+        "line 3: an indented code block (four or more leading spaces) — the census grammar's only code blocks are backtick fences",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_footnote() {
+    assert_markdown_refuses(
+        "some text[^1] here\\n",
+        "line 1: a footnote ([^label]) — footnotes are outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_reference_link() {
+    assert_markdown_refuses(
+        "a [text][label] link\\n",
+        "line 1: a reference-style link ([text][label]) — only inline [text](destination) links are in the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_reference_definition() {
+    assert_markdown_refuses(
+        "[label]: https://example.com\\n",
+        "line 1: a reference link definition ([label]: destination) — only inline [text](destination) links are in the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_image() {
+    assert_markdown_refuses(
+        "an ![alt](img.png) image\\n",
+        "line 1: an image (![alt](destination)) — images are outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_strikethrough() {
+    assert_markdown_refuses(
+        "some ~~gone~~ text\\n",
+        "line 1: strikethrough (~~text~~) — outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_raw_html_tag() {
+    assert_markdown_refuses(
+        "a <br> break\\n",
+        "line 1: a raw HTML tag (<br>) — the census grammar's only HTML passthrough is <a id=\"…\"></a>; wrap literal <…> text (a generic like List<T>) in backticks",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_backslash_escape() {
+    assert_markdown_refuses(
+        "escaped \\\\* star\\n",
+        "line 1: a backslash escape (\\*) — the census grammar's only escape is \\| inside a table cell",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_hard_line_break() {
+    assert_markdown_refuses(
+        "line one  \\nline two\\n",
+        "line 1: a hard line break (two trailing spaces) — outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_backslash_line_break() {
+    assert_markdown_refuses(
+        "line one\\\\\\nline two\\n",
+        "line 1: a backslash line break — outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_tilde_fence() {
+    assert_markdown_refuses(
+        "~~~\\ncode\\n~~~\\n",
+        "line 1: a tilde fence (~~~) — the census grammar's fences use backticks",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_unclosed_fence() {
+    assert_markdown_refuses(
+        "```vilan\\nlet x = 1;\\n",
+        "line 1: an unclosed code fence — no closing ``` at the opening fence's indent",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_table_alignment_colon() {
+    assert_markdown_refuses(
+        "| a | b |\\n|:--|--:|\\n| 1 | 2 |\\n",
+        "line 2: a table alignment colon (:---) — the census grammar's tables carry no alignment",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_custom_heading_id() {
+    assert_markdown_refuses(
+        "# Title {#custom}\\n",
+        "line 1: a custom heading id ({#…}) — census-grammar heading ids are computed, mdBook's algorithm",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_lazy_blockquote_continuation() {
+    assert_markdown_refuses(
+        "> quoted\\nlazy line\\n",
+        "line 2: a lazy blockquote continuation — prefix the line with > or separate it from the quote with a blank line",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_lazy_list_continuation() {
+    assert_markdown_refuses(
+        "- item\\nlazy line\\n",
+        "line 2: a lazy list continuation — indent the line under its item (two spaces) or separate it from the list with a blank line",
     );
 }

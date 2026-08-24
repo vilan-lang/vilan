@@ -24,14 +24,17 @@ own package). The namespaces are disjoint: resolution is scoped by the
 root segment, so a package is free to name a module `ui` or `json` even
 though std has one: `pkg::ui` is always the package's own module,
 `std::ui` always std's, and neither shadows the other. (Conversely,
-`pkg::` never reaches a std module.) A module name that resolves both as
-`name.vl` and `name/lib.vl` is an **ambiguity error**.
+`pkg::` never reaches a std module.) The root names themselves are
+**reserved**: a manifest may not declare a dependency — or a
+`[package] name` — as `std`, `pkg`, or `macro_std` (§11.4), so no
+package can shadow a root or vanish behind one. A module name that
+resolves both as `name.vl` and `name/lib.vl` is an **ambiguity error**.
 
 A module name must match the on-disk directory entry **byte for byte**: a
 case-insensitive filesystem that answers `import foo` with `Foo.vl` is a
 **diagnostic naming both spellings**, not a resolution, so that a program
 compiles identically on case-sensitive and case-insensitive filesystems
-([design notes](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/windows-support.md) §5). Every component of the resolved path
+([design notes](https://github.com/vilan-lang/proposals/blob/main/proposal/windows-support.md) §5). Every component of the resolved path
 carries the rule, so `foo/lib.vl` is reached by `import foo` only when the
 directory is spelled `foo`.
 

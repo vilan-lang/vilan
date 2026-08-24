@@ -75,6 +75,42 @@ check(text.includes("note: declared nowhere"), "the overlay shows the note");
 check(text.includes("1 error"), "the header counts the diagnostic");
 check(text.toLowerCase().includes("next save"), "the overlay has the fixed-on-next-save hint");
 
+// E80: a diagnostic carrying an E78 requirement trace — three indented trace
+// lines (two call hops + the elision tail) between the message and the note.
+// Every line rides through, the chain is its OWN line class (neither the
+// location's nor the note's nor the plain one), and the header badge counts
+// the diagnostic ONCE: a `via` line names a `file:line:col` too, and an overlay
+// that classed it as a location would read "4 errors".
+const traced = [
+    "src/common.vl:6:2",
+    "context `current` is read here, but this code can be reached without an enclosing `run`",
+    "    via src/client.vl:13:8 — the context requirement flows through this call",
+    "    via src/client.vl:9:2 — the context requirement flows through this call",
+    "    … 1 more uncovered call on this path",
+    "    note: `current` is declared here",
+];
+hmr.handleEvent({{ kind: "error", version: 1, message: traced.join("\n") }});
+const tracedOverlay = document.getElementById("__vilan_hmr_overlay__");
+const tracedText = tracedOverlay ? tracedOverlay.allText() : "";
+for (const line of traced) {{
+    check(tracedText.includes(line), "the overlay carries the trace line verbatim: " + line);
+}}
+check(tracedText.includes("1 error") && !tracedText.includes("4 errors"), "a diagnostic with three trace lines counts once in the badge");
+const rows = new Map();
+(function collect(node) {{ if (node.tagName === "div" && node._text && !node.children.length) rows.set(node._text, node.style.cssText || ""); for (const child of node.children) collect(child); }})(tracedOverlay || body);
+const cssOf = (line) => rows.get(line);
+const locationCss = cssOf(traced[0]);
+const messageCss = cssOf(traced[1]);
+const viaCss = cssOf(traced[2]);
+const noteCss = cssOf(traced[5]);
+check(typeof viaCss === "string" && viaCss.length > 0, "a trace line is styled");
+check(viaCss !== locationCss, "a trace line is not styled as a location line");
+check(viaCss !== messageCss, "a trace line is not styled as a plain message line");
+check(viaCss !== noteCss, "a trace line is not styled as a note line");
+check(cssOf(traced[3]) === viaCss, "every call hop shares the trace line class");
+check(cssOf(traced[4]) === viaCss, "the elision tail shares the trace line class");
+check(tracedText.indexOf(traced[2]) > tracedText.indexOf(traced[1]) && tracedText.indexOf(traced[5]) > tracedText.indexOf(traced[4]), "the chain sits between the message and the note");
+
 // clear-on-good: any non-error round removes the overlay (a css round here).
 hmr.handleEvent({{ kind: "css", version: 1, asset: "app.css" }});
 check(document.getElementById("__vilan_hmr_overlay__") === null, "a good round clears the overlay");

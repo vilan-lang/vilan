@@ -3,7 +3,7 @@
 How to use the Vilan language, its standard library, and the frameworks
 built on top of it. If you're wondering where something lives: this book
 is about *using* Vilan. Design history and rationale live in the
-repository's [`vilan/proposal/`](https://github.com/vilan-lang/vilan/tree/main/vilan/proposal/).
+[`vilan-lang/proposals`](https://github.com/vilan-lang/proposals) repository.
 
 **Brand new?** [Hello Vilan](tour/hello-vilan.md) installs the toolchain and
 gets a program running in a couple of minutes. Everything in this book

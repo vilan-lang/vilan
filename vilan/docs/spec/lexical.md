@@ -16,7 +16,7 @@ leading U+FEFF byte-order mark is an encoding marker rather than source
 text: it is ignored, and positions are counted from the byte after it. A
 U+FEFF anywhere else is content. Together these make a program's meaning
 independent of how an editor saved it: the same source is the same
-program on every platform. (See [the design notes](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/windows-support.md) §2; the
+program on every platform. (See [the design notes](https://github.com/vilan-lang/proposals/blob/main/proposal/windows-support.md) §2; the
 canonical on-disk form is LF with no BOM, and `vilan fmt` writes it.)
 
 ## 2.1 Comments
@@ -46,9 +46,10 @@ ret    struct trait    type      use     with   true    false
 `context` (the clause after a closure type, §3.9), `sync` (the marker
 opening a closure type, §3.9), `void` (the unit value/type), `self` and
 `Self` (receiver and receiver type), `derive`, `service`, `extern`,
-`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform` (attribute
-names in `[...]` position), and jump targets (`break`, `continue`) after
-`jump`. All remain usable as ordinary identifiers elsewhere.
+`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
+`deprecated` (attribute names in `[...]` position), and jump targets
+(`break`, `continue`) after `jump`. All remain usable as ordinary
+identifiers elsewhere.
 
 ## 2.3 Literals
 

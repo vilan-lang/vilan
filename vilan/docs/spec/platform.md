@@ -87,6 +87,14 @@ The manifest declares what a directory builds. Sections:
 - **`[macro]`**: the compile-time interpreter budget: `fuel` (steps
   per macro/const run) and `depth` (nested expansion), §9.3/§10.4.
 
+`std`, `pkg`, and `macro_std` are **reserved package names**: they name
+the import roots themselves (§4.2), so a `[package] name` or a key in
+any `dependencies` table claiming one is a manifest error — a dependency
+under such a key could only shadow the root or be unreachable behind it.
+`[library] name` is exempt: the standard library itself is the
+`[library]` named `std` (likewise `macro_std`), and a library's own
+name, unlike a dependency key, never binds an import root.
+
 ## 11.5 Build products
 
 Each entry emits `dist/<name>.<ext>` for its platform (browser entries
