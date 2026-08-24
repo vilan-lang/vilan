@@ -3640,6 +3640,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_reserved_package_name_publishes_on_the_manifest() {
+        // L12 (std-shape.md §4): a dependency key claiming a reserved import
+        // root — before the refusal, this dependency silently shadowed the
+        // whole standard library — reaches the editor through the same
+        // channel every manifest problem rides.
+        let (dir, document) = analyze_workspace(&[
+            ("src/main.vl", "fun main() {}\n"),
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 std = { path = \"../std\" }\n",
+            ),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the reserved name is published");
+        assert!(!item.warning, "a reserved package name is an error");
+        assert!(
+            item.message.contains("`std` is a reserved package name"),
+            "{}",
+            item.message
+        );
+        assert!(
+            item.message.contains("rename the dependency"),
+            "{}",
+            item.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_unresolvable_dependency_publishes_the_reason_on_the_manifest() {
         // The wall-of-unresolved-imports case: the manifest parses, but its
         // dependency does not resolve, so the workspace is empty and every
