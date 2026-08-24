@@ -72,9 +72,10 @@ jobs:
           echo "$CHANGED"
 
           # Root prose never turns the suite red, so it does not buy a windows
-          # leg. vilan/docs/** and vilan/proposal/** are deliberately NOT in
-          # this set: docs fences are compiled by the docs gate, and the hygiene
-          # tripwire reads the proposals. Anything not listed here is code.
+          # leg. vilan/docs/** is deliberately NOT in this set: docs fences are
+          # compiled by the docs gate. (vilan/proposal/ is a one-file banner
+          # since the N15 move to vilan-lang/proposals; records pushes no
+          # longer happen in this repo at all.) Anything not listed here is code.
           PROSE='^(README\.md|AI_STANCE\.md|AGENTS\.md|CLAUDE\.md|CODE_OF_CONDUCT\.md|LICENSE-APACHE|LICENSE-MIT|\.gitignore)$'
 
           if [ -z "$CHANGED" ] || printf '%s\n' "$CHANGED" | grep -qvE "$PROSE"; then

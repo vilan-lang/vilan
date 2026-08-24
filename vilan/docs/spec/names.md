@@ -31,7 +31,7 @@ A module name must match the on-disk directory entry **byte for byte**: a
 case-insensitive filesystem that answers `import foo` with `Foo.vl` is a
 **diagnostic naming both spellings**, not a resolution, so that a program
 compiles identically on case-sensitive and case-insensitive filesystems
-([design notes](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/windows-support.md) §5). Every component of the resolved path
+([design notes](https://github.com/vilan-lang/proposals/blob/main/proposal/windows-support.md) §5). Every component of the resolved path
 carries the rule, so `foo/lib.vl` is reached by `import foo` only when the
 directory is spelled `foo`.
 

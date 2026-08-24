@@ -11,7 +11,7 @@ Rust workspace, five crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
-  chumsky 2026-07-22, `proposal/frontend.md`) → AST in `node.rs` → macro
+  chumsky 2026-07-22, `proposals/proposal/frontend.md`) → AST in `node.rs` → macro
   expansion in `macros.rs` (with `interpreter.rs`, the native evaluator that
   must stay behaviorally equivalent to emitted JS) → `elements.rs`
   (element-syntax desugar) and `lift.rs` (the expression-lifting rewrite;
@@ -23,7 +23,7 @@ Rust workspace, five crates, plus the language's own tree:
   diagnostics in `error.rs` — there is a house diagnostics standard, so match
   the shape of existing messages; `formatter.rs` is `vilan fmt`. Also in this
   crate: `bindgen/` (`vilan bindgen`, generating `external` bindings from
-  `.d.ts` files, `proposal/bindgen.md`) and `leak_tally.rs` (per-site leak
+  `.d.ts` files, `proposals/proposal/bindgen.md`) and `leak_tally.rs` (per-site leak
   instrumentation the test suite reads — not a compile stage).
 - `crates/vilan-cli` — the `vilan` binary and the end-to-end suites
   (`tests/corpus.rs`, `cancellation.rs`, `rpc_http.rs`, `streaming.rs`,
@@ -31,15 +31,17 @@ Rust workspace, five crates, plus the language's own tree:
 - `crates/vilan-lsp` — the language server.
 - `crates/vilan-embedded-std` — embeds the std source into the binary.
 - `crates/vilan-wasm` — the compiler as a WebAssembly module; the web
-  playground's engine (`proposal/web-playground.md`). The compile logic is
+  playground's engine (`proposals/proposal/web-playground.md`). The compile logic is
   plain Rust tested natively on the host; the `wasm_bindgen` layer at the
   bottom is a thin type-conversion shim, not where behavior lives.
 - `vilan/std/src/*.vl` — the standard library, written in vilan. std loads as its own
   package with root-scoped module resolution.
 - `vilan/test/` — the corpus: `.vl` programs with **byte-identical** `.mjs` goldens.
 - `vilan/docs/` — the user-facing book + spec; every fenced example compiles.
-- `vilan/proposal/` — design documents. Semantics are settled here **before** code;
-  the proposal named in your work order is the spec for your change.
+- The `proposals` sibling repo (`proposals/proposal/…`, workspace-relative —
+  N15 moved the design memory out of this tree) — design documents. Semantics
+  are settled there **before** code; the proposal named in your work order is
+  the spec for your change.
 
 ## Definition of done (the gates)
 
@@ -134,10 +136,11 @@ Rust workspace, five crates, plus the language's own tree:
 - **Root causes.** Fix the general path; a special case that handles one input is a
   smell. If the general fix implies a refactor, say so in your report rather than
   building around the debt.
-- **Read the named proposal sections first.** `vilan/proposal/backlog-2026-08-18.md`
-  is the single planning surface (its Now/Next/Later block names what's
-  active); the papers under `vilan/proposal/` are the specs, and each backlog
-  item cites the one that governs it. A work-order brief that names sections
+- **Read the named proposal sections first.** `proposals/tracker/backlog-2026-08-18.md`
+  (in the `vilan-lang/proposals` sibling repo) is the single planning surface
+  (its Now/Next/Later block names what's active); the papers under
+  `proposals/proposal/` are the specs, and each backlog item cites the one
+  that governs it. A work-order brief that names sections
   overrides this default. (Arcs move; the tracker is the pointer that stays
   true.)
 - **Report honestly and compactly — your final message is the report,** not a
