@@ -13187,6 +13187,402 @@ fn b132_an_agreeing_bare_body_still_compiles_and_runs() {
     );
 }
 
+// --- B133: rule 4 lifted to the reachable-tail rule (ret-checking.md rule 4
+// as amended). A closure's return type is the unification of its REACHABLE
+// tail and every `ret` — the same evidence, through the same fold, an
+// unannotated function uses (B126) — so `{ ret 1; }` infers in a closure
+// exactly as it does in a function, and the dead synthesized-void tail is no
+// longer a void vote against its own `ret`s. The conservative "make the
+// ret'd value the body's tail" steer survives exactly where the genuine
+// disagreement remains: a value-`ret` beside a body path that yields no
+// value.
+
+// The headline: a `ret`-only closure body infers its return type, and every
+// reader agrees — a direct call, and a typed binding of the result.
+#[test]
+fn b133_a_ret_only_closure_body_infers_its_return_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		ret x * 2;
+        	};
+        	print(f(3));
+        	let y: i32 = f(4);
+        	print(y);
+        }
+        "#,
+        "6\n8\n",
+    );
+}
+
+// A closure that leaves only by `ret` can bind a caller's return-position
+// generic bottom-up (the `from_fn` family's shape): the rets ARE the
+// closure's return evidence.
+#[test]
+fn b133_a_closure_ret_binds_a_callers_return_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun apply<U>(f: || U): U {
+        	f()
+        }
+
+        fun main() {
+        	let n = apply(|| {
+        		ret 5;
+        	});
+        	print(n + 1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+// A dead tail under a known target: the `ret`s are the only return
+// positions, and they check against the target — one refusal, at the `ret`,
+// and the pre-lift steer (which blamed the dead tail's synthesized void) is
+// gone.
+#[test]
+fn b133_a_dead_tail_ret_is_checked_against_the_target() {
+    let source = r#"
+        import std::print;
+
+        fun run(f: |i32| i32): i32 {
+        	f(1)
+        }
+
+        fun main() {
+        	let out = run(|value| {
+        		ret "s";
+        	});
+        	print(out);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret \"s\"",
+        "this `ret` returns str, but the closure's body yields i32",
+    );
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_without(source, "make the ret'd value the body's tail");
+    assert_fails_without(source, "Expected");
+}
+
+// B125 interplay, the B5 probe extended to `ret`s: under an annotated `let`
+// the expectation binds `U` before the closure is typed, and a dead-tail
+// `ret` that disagrees reports ONCE, at the `ret`, in the expectation's
+// terms — the `let` and the call add nothing.
+#[test]
+fn b133_a_dead_tail_ret_reports_once_under_an_expectation() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point| {
+        		ret point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret point.x * 2",
+        "this `ret` returns i32, but the closure's body yields str",
+    );
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_without(source, "Expected");
+    assert_fails_without(source, "List<str>");
+}
+
+// ...and the agreeing spellings bind from the expectation and run: a
+// `ret`-only body, and a guard-`ret` beside an agreeing tail.
+#[test]
+fn b133_an_agreeing_ret_closure_binds_from_the_expectation_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| {
+        		ret point.x * 2;
+        	});
+        	print(widths[0]);
+        	let guarded = points.map(|point| {
+        		if point.x > 100 {
+        			ret 0;
+        		}
+        		point.x + 5
+        	});
+        	print(guarded[0]);
+        }
+        "#,
+        "2\n6\n",
+    );
+}
+
+// A return-position generic in a closure `ret` binds from the target, in
+// both the mixed (guard-`ret` beside a tail) and the dead-tail shapes.
+#[test]
+fn b133_a_ret_of_a_generic_call_binds_from_the_target() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run(f: |i32| List<i32>): List<i32> {
+        	f(3)
+        }
+
+        fun main() {
+        	let out = run(|seed| {
+        		if seed < 0 {
+        			ret List::new();
+        		}
+        		mut xs: List<i32> = List::new();
+        		xs.push(seed);
+        		xs
+        	});
+        	print(out.len());
+        	let dead_tail = run(|seed| {
+        		ret List::new();
+        	});
+        	print(dead_tail.len());
+        }
+        "#,
+        "1\n0\n",
+    );
+}
+
+// The I5/B19 shape with `ret`s: `from_fn`'s callback target (`|| Option<T>`)
+// is abstract, `type_is_ground` declines it, and the rets bind `T`
+// bottom-up — a callback that leaves only by `ret` now types (the pre-lift
+// rule refused it with the steer).
+#[test]
+fn b133_a_from_fn_callback_that_leaves_by_ret_types() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+        	mut n = 0;
+        	let counter = Iterator::from_fn(|| {
+        		n = n + 1;
+        		if n > 3 {
+        			ret None;
+        		}
+        		ret Some(n);
+        	});
+        	print(counter.count());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+// A value-`ret` beside a REACHABLE fall-through is still the genuine
+// disagreement rule 4's steer was written for — kept, now with a note at
+// the origin (the same origin vocabulary as a function's refusal).
+#[test]
+fn b133_a_value_ret_beside_a_reachable_fall_through_keeps_the_steer() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let helper = |x: i32| {
+        		if x > 5 {
+        			ret 99;
+        		}
+        		print("small");
+        	};
+        	helper(1);
+        }
+        "#;
+    let head = "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail";
+    assert_fails_spanning(source, "ret 99", head);
+    assert_fails_noting_nth(source, head, "}", 1, "the body ends here without a value");
+}
+
+// The other reachable-void spelling: the closure's tail is an `if` with no
+// `else`, which produces void on the path that takes no branch.
+#[test]
+fn b133_a_value_ret_beside_an_else_less_if_tail_keeps_the_steer() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 5 {
+        			ret 99;
+        		}
+        	};
+        	f(1);
+        	print("done");
+        }
+        "#;
+    let head = "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail";
+    assert_fails_spanning(source, "ret 99", head);
+    assert_fails_noting(
+        source,
+        head,
+        "if x > 5 {\n        \t\t\tret 99;\n        \t\t}",
+        "an `if` with no `else` produces void",
+    );
+}
+
+// A `ret` disagreeing with a REACHABLE tail is refused at the `ret`, noting
+// the tail — no target in sight (an unannotated binding, a direct call).
+#[test]
+fn b133_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: bool| {
+        		if x {
+        			ret "s";
+        		}
+        		2
+        	};
+        	f(true);
+        	print("done");
+        }
+        "#;
+    let head = "this `ret` returns str, but the closure's body yields i32";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_noting(source, head, "2", "the tail it disagrees with");
+    assert_fails_without(source, "Expected");
+}
+
+// Two `ret`s that disagree under a dead tail: one refusal, at the later
+// `ret`, noting the earlier one it disagrees with (the function rule's
+// source-order reading).
+#[test]
+fn b133_rets_that_disagree_are_refused_at_the_later_ret() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 0 {
+        			ret 1;
+        		}
+        		ret "s";
+        	};
+        	f(1);
+        }
+        "#;
+    let head = "this `ret` returns str, but the closure's body yields i32";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_noting(source, head, "ret 1", "the earlier `ret` it disagrees with");
+}
+
+// The no-target bare-`ret` twin: a bare `ret` beside a value tail is
+// refused at the `ret` (the existing wording), noting the tail.
+#[test]
+fn b133_a_bare_ret_beside_a_value_tail_is_still_refused() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 5 {
+        			ret;
+        		}
+        		x + 1
+        	};
+        	f(1);
+        	print("done");
+        }
+        "#;
+    let head = "a bare `ret` exits a closure whose body yields i32; return a value";
+    assert_fails_spanning(source, "ret", head);
+    assert_fails_noting(source, head, "x + 1", "the tail it disagrees with");
+}
+
+// An `async` block whose body leaves only by `ret` settles with the rets'
+// type: `async { ret 1; }` is a task of `i32`, and awaiting it hands the
+// value back.
+#[test]
+fn b133_an_async_block_of_rets_settles_with_their_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let t = async {
+        		ret 1;
+        	};
+        	let n: i32 = await t;
+        	print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// An `async` block's disagreeing `ret`s are refused the same way a
+// closure's are — at the later `ret`, noting the earlier one.
+#[test]
+fn b133_an_async_blocks_disagreeing_rets_are_refused() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let flag = true;
+        	let pending = async {
+        		if flag {
+        			ret "a";
+        		}
+        		ret 2;
+        	};
+        	print("x");
+        }
+        "#;
+    let head = "this `ret` returns i32, but the closure's body yields str";
+    assert_fails_spanning(source, "ret 2", head);
+    assert_fails_noting(
+        source,
+        head,
+        "ret \"a\"",
+        "the earlier `ret` it disagrees with",
+    );
+}
+
+// A `ret`-only closure that is never called stays quiet (deferred), exactly
+// as loosely as a never-called closure types everywhere else — the pre-lift
+// rule refused it with the steer, a false positive: the `ret` and the dead
+// tail never disagreed.
+#[test]
+fn b133_a_never_called_ret_closure_stays_quiet() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x| {
+        		ret 1;
+        	};
+        	print("quiet");
+        }
+        "#,
+        "quiet\n",
+    );
+}
+
 // A PARAMETER that disagrees with the receiver keeps P27's whole-value anchor
 // — the expectation binding adds nothing beside it.
 #[test]
@@ -13660,32 +14056,35 @@ fn an_async_function_whose_tail_is_an_if_else_of_rets_is_not_a_missing_return() 
     );
 }
 
-// A closure whose body is an exhaustive `if`/`else` of value-`ret`s. The
-// FALSE mismatch on the closure is gone; ret-checking.md §4's deliberate
-// guidance ("make the ret'd value the body's tail" — the conservative rule
-// that avoids the diverging-tail swamp) is untouched, since B124 does not
-// reopen closure return inference.
+// A closure whose body is an exhaustive `if`/`else` of value-`ret`s now
+// infers like a function (rule 4 lifted to the reachable-tail rule, B133):
+// the dead tail is no evidence, the `ret`s agree on `str`, and the program
+// runs. Re-pinned from
+// `a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance`
+// (which pinned the pre-lift conservative refusal): same program, the new
+// rule.
 #[test]
-fn a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance() {
-    let source = r#"
+fn b133_a_closure_of_rets_infers_like_a_function() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
         fun run(f: |i32| str): str {
         	f(1)
         }
 
         fun main() {
-        	run(|value| {
+        	let out = run(|value| {
         		if value > 0 {
         			ret "positive";
         		} else {
         			ret "non-positive";
         		}
         	});
+        	print(out);
         }
-        "#;
-    assert_fails_without(source, "Expected str, but got void instead.");
-    assert_fails_with(
-        source,
-        "the closure's body ends without a value, but this `ret` returns one",
+        "#,
+        "positive\n",
     );
 }
 
