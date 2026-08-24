@@ -7503,22 +7503,15 @@ impl<'src> Analyzer<'src> {
     fn compute_return_value_crossings(&self) -> HashSet<Id> {
         let mut crossings = HashSet::default();
         // Every return position of every by-value function: the tail, and (B116)
-        // each `ret`. `return_sites` carries both but only for a function with a
-        // DECLARED return type, so the tails are taken from the functions
-        // themselves and the rets joined on top — the overlap is a set, and
-        // re-scanning one seam names the same places twice.
-        let mut seams: Vec<(&Function, Id)> = self
-            .functions
-            .values()
-            .map(|function| (function, function.body.1))
+        // each `ret`. `return_sites` carries both, for every bodied function —
+        // annotated or not, since B134 completed the join.
+        let seams: Vec<(&Function, Id)> = self
+            .return_sites
+            .iter()
+            .filter_map(|(function_id, value_id)| {
+                Some((self.functions.get(function_id)?, *value_id))
+            })
             .collect();
-        seams.extend(
-            self.return_sites
-                .iter()
-                .filter_map(|(function_id, value_id)| {
-                    Some((self.functions.get(function_id)?, *value_id))
-                }),
-        );
         for (function, seam) in seams {
             if !function.has_body || function.returns_view {
                 continue;
@@ -13836,12 +13829,12 @@ impl<'src> Analyzer<'src> {
     ///
     /// B122: a `ret` is a return position exactly like the tail
     /// (`ret-checking.md`), and the root-set is asked per POSITION, joined —
-    /// `return_sites` carries both for a function with a declared return type
-    /// (B116's join, `element-clones.md` §12.2). Without it, a view handed
-    /// back only through an early `ret` (an owned tail beside it) never
-    /// contributed its parameter, so `check_view_escape`'s own leaf question
-    /// found `borrows` empty and refused a program its conditional-tail twin
-    /// compiles (`element-clones.md` §13).
+    /// `return_sites` carries both (B116's join, `element-clones.md` §12.2;
+    /// completed for unannotated functions by B134). Without it, a view
+    /// handed back only through an early `ret` (an owned tail beside it)
+    /// never contributed its parameter, so `check_view_escape`'s own leaf
+    /// question found `borrows` empty and refused a program its
+    /// conditional-tail twin compiles (`element-clones.md` §13).
     fn infer_borrows(&mut self) {
         let function_ids: Vec<Id> = self.functions.keys().copied().collect();
         let mut return_sites_by_function: HashMap<Id, Vec<Id>> = HashMap::default();
@@ -13854,20 +13847,20 @@ impl<'src> Analyzer<'src> {
         loop {
             let mut updates: Vec<(Id, BTreeSet<u32>)> = Vec::new();
             for function_id in &function_ids {
-                let (has_body, body_tail, current) = {
+                let current = {
                     let Some(function) = self.functions.get(function_id) else {
                         continue;
                     };
-                    (function.has_body, function.body.1, function.borrows.clone())
+                    function.borrows.clone()
                 };
-                if !has_body {
-                    continue;
-                }
                 let mut positions = current.clone();
-                self.collect_borrows_positions(*function_id, body_tail, &mut positions);
-                if let Some(ret_value_ids) = return_sites_by_function.get(function_id) {
-                    for ret_value_id in ret_value_ids {
-                        self.collect_borrows_positions(*function_id, *ret_value_id, &mut positions);
+                if let Some(return_position_ids) = return_sites_by_function.get(function_id) {
+                    for return_position_id in return_position_ids {
+                        self.collect_borrows_positions(
+                            *function_id,
+                            *return_position_id,
+                            &mut positions,
+                        );
                     }
                 }
                 if positions != current {
@@ -14487,14 +14480,15 @@ impl<'src> Analyzer<'src> {
             .flat_map(|function_id| self.wrapped_view_return_calls(function_id))
             .chain(self.transient_wrapped_view_calls())
             .collect();
-        // A CLOSURE's `ret` never enters `return_sites` (its rets check against
-        // the inferred tail type instead, `ret-checking.md`) and gets no
-        // exemption at all — a closure may not declare `borrows`, so nothing
-        // sanctions a view leaving through one, by-value copy included (P4c:
-        // second-class all the way). The function-ret positions below get the
-        // leaf-wise seam walk with its exemption; this set is how the loop
-        // tells the two apart without re-deriving return_site_functions per
-        // leaf.
+        // A CLOSURE's `ret` never enters `return_sites` (its rets take part
+        // in the closure's own return inference, `ret-checking.md` rule 4)
+        // and gets no exemption at all — a closure may not declare `borrows`,
+        // so nothing sanctions a view leaving through one, by-value copy
+        // included (P4c: second-class all the way). The function-ret
+        // positions below — of every bodied function since B134, annotated
+        // or not — get the leaf-wise seam walk with its exemption; this set
+        // is how the loop tells the two apart without re-deriving
+        // return_site_functions per leaf.
         let function_return_value_ids: HashSet<Id> = self
             .return_sites
             .iter()
@@ -14560,20 +14554,13 @@ impl<'src> Analyzer<'src> {
         // (the false positive rule 1 already saw through `ret`, B116), and an
         // unsound view of a LOCAL let through beside an owned arm because the
         // same averaging hid the arm that mattered (`element-clones.md` §13).
-        // `return_sites` indexes every return position of a declared-return
-        // function — the tail and each `ret` (B116) — and `collect_tail_leaves`
-        // is the same walk rule 1's return clause and the crossing scan already
-        // use for the identical seams, so all three agree about what a return
-        // position hands back. A HashSet dedupes: `return_sites` already
-        // carries the tail for a function with a declared return type, so
-        // adding every function's tail again would ask the same seam twice.
-        let mut function_seams: HashSet<(Id, Id)> = self
-            .functions
-            .values()
-            .filter(|function| function.has_body)
-            .map(|function| (function.id, function.body.1))
-            .collect();
-        function_seams.extend(self.return_sites.iter().copied());
+        // `return_sites` indexes every return position of every bodied
+        // function — the tail and each value-carrying `ret` (B116's join,
+        // completed for unannotated functions by B134) — and
+        // `collect_tail_leaves` is the same walk rule 1's return clause and
+        // the crossing scan already use for the identical seams, so all three
+        // agree about what a return position hands back. A HashSet dedupes.
+        let function_seams: HashSet<(Id, Id)> = self.return_sites.iter().copied().collect();
         for (function_id, seam) in function_seams {
             if self.frozen_entity(function_id) {
                 continue;
@@ -17329,9 +17316,6 @@ impl<'src> Analyzer<'src> {
                 _ => {}
             }
         }
-        for function in self.functions.values() {
-            self.insert_seam_roots(function.body.1, &mut seam_roots);
-        }
         let closure_tails: Vec<Id> = self
             .closures
             .values()
@@ -17340,6 +17324,8 @@ impl<'src> Analyzer<'src> {
         for tail in closure_tails {
             self.insert_seam_roots(tail, &mut seam_roots);
         }
+        // Every function return position — the tail and each value-carrying
+        // `ret` of every bodied function (B116's join, completed by B134).
         for (_, value_id) in &self.return_sites {
             self.insert_seam_roots(*value_id, &mut seam_roots);
         }
@@ -19070,6 +19056,29 @@ impl<'src> Analyzer<'src> {
                         Some(ReturnFrame::Inferred { rets }) => rets,
                         _ => Vec::new(),
                     };
+                    // B134: `return_sites` is the one join of a function's
+                    // return positions — the tail and each value-carrying
+                    // `ret` — for EVERY bodied function, annotated or not.
+                    // B116 built it for declared-return functions; B126 typed
+                    // an unannotated function's `ret`s, so the seam readers
+                    // (`infer_borrows`, the crossing scan, `check_view_escape`,
+                    // the return clone sites) must see those positions too, or
+                    // the two spellings of one return disagree: an unannotated
+                    // `ret &self.x` was refused by the raw escape arm while
+                    // its tail twin copied, and an unannotated TAIL handing
+                    // back a loaned place was never a clone seam at all —
+                    // live storage left the frame. A declared-return bare
+                    // `ret`'s synthesized void still enters (it IS the checked
+                    // value); an unannotated bare `ret` synthesizes none and
+                    // has no leaves to contribute.
+                    if function.body.is_some() {
+                        self.return_sites.push((id, expr_id));
+                        for (_, ret_value_id) in &rets {
+                            if let Some(ret_value_id) = ret_value_id {
+                                self.return_sites.push((id, *ret_value_id));
+                            }
+                        }
+                    }
                     // Infer the body's tail against the declared return type (the
                     // way a `let v: R = ..` annotation drives its value), so a
                     // return-position generic call binds its type parameters from
@@ -19079,7 +19088,6 @@ impl<'src> Analyzer<'src> {
                     {
                         self.expected_types.insert(expr_id, return_type_id);
                         self.seed_tail_expectations(expr_id, return_type_id);
-                        self.return_sites.push((id, expr_id));
                         // The synthesized void tail after a last statement that
                         // LEAVES is unreachable, and checking it draws a second
                         // diagnostic that adds no information (P28's duplicate,

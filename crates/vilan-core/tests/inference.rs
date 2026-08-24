@@ -6944,6 +6944,236 @@ fn a_closures_ret_still_cannot_hand_back_a_view() {
     );
 }
 
+// --- B134: `return_sites` completes — the tail and each value-carrying `ret`
+// of EVERY bodied function, annotated or not. B116 built the join for
+// declared-return functions; B126 typed an unannotated function's `ret`s, so
+// the seam readers (`infer_borrows`, the crossing scan, `check_view_escape`,
+// the return clone sites) must see those positions too. Every pin below is a
+// B116/B122 shape with the return annotation REMOVED: the two spellings of
+// one return — and the two spellings of one signature — must answer alike.
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_reference_leaf_copies() {
+    // B116's first shape without the `: Inner`. The `ret` was refused with
+    // the generic "a view cannot escape its scope" (the raw FunctionReturn
+    // scan — the seams never saw an unannotated `ret`) while the tail
+    // ALIASED (below). Both spellings now emit the same copy the annotated
+    // twin has always emitted.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self, flag: bool) {
+                if flag { ret &self.inner; }
+                &self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let early = h.grab(true);
+            let tail = h.grab(false);
+            h.inner.n = 99;
+            print(early.n);
+            print(tail.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function grab(self, flag) {\n\
+             \tif (flag) {\n\t\treturn __clone(self[0]);\n\t}\n\
+             \treturn __clone(self[0]);\n}"
+        ),
+        "both unannotated spellings should emit the same copy, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n3\n",
+        "neither spelling may hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b134_an_unannotated_tail_of_a_loaned_place_copies() {
+    // The tail half of the same gap, and the sharpest tooth: with no
+    // annotation the tail was not a clone seam at all (`return_sites` was
+    // the clone-site pass's only function source), so `fun grab(&self) {
+    // self.inner }` handed back the receiver's LIVE storage — this program
+    // printed 99 where its annotated twin printed 3.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self) {
+                self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let got = h.grab();
+            h.inner.n = 99;
+            print(got.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("return __clone(self[0]);"),
+        "the unannotated tail must copy the loaned place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "the unannotated tail may not hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_scalar_view_reads_the_place() {
+    // B108's shape without the `: i32`: a scalar's copy is its read
+    // (`v[0][v[1]]`), at the `ret` as at the tail.
+    let javascript = compile(
+        r#"
+        import std::print;
+        fun same(v: &mut i32, flag: bool) {
+            if flag { ret v; }
+            v
+        }
+        fun main() { mut n = 5; print(same(&mut n, true)); print(same(&mut n, false)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function same(v, flag) {\n\
+             \tif (flag) {\n\t\treturn v[0][v[1]];\n\t}\n\
+             \treturn v[0][v[1]];\n}"
+        ),
+        "both unannotated spellings should read the scalar place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "5\n5\n",
+        "neither spelling may hand back the view pair"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_borrows_call_leaf_copies() {
+    // The call-leaf shape: the caller is unannotated, the `borrows` callee
+    // keeps its declaration (that sanction is the SIGNATURE's, and an
+    // unannotated function has none to give). The projection is copied out
+    // at both of the caller's return positions.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder, flag: bool) {
+            if flag { ret peek(h); }
+            peek(h)
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let early = get(&h, true);
+            h.pair.1 = 99;
+            print(early.1);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\tif (flag) {\n\t\treturn __clone(peek(h2));\n\t}\n\treturn __clone(peek(h2));"
+        ),
+        "both unannotated spellings should copy the call's projection, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "neither spelling may hand back the callee's alias"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_resource_reference_leaf_is_refused() {
+    // A resource cannot copy (R1), so the crossing is a MOVE and the move
+    // scan refuses it — the same words as the annotated twin
+    // (`b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused`),
+    // where the unannotated `ret` used to draw the generic escape refusal
+    // (the crossing scan never saw it).
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool) {
+                if flag { ret &self.g; }
+                &self.g
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b134_an_unannotated_ret_only_resource_crossing_is_named_by_the_move_scan() {
+    // The crossing half isolated, as B116 isolated it: the resource leaves
+    // only through the `ret` (the tail hands back an owned value), so
+    // walking the tail alone says nothing about it.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool) {
+                if flag { ret &self.g; }
+                Guard { tag = "fresh" }
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_view_of_a_local_still_cannot_escape() {
+    // The half that must NOT change: a view of a LOCAL dangles whatever the
+    // signature says, and the seam walk refuses it in both spellings exactly
+    // as the raw scan did.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool) {
+            let local = Inner { n = 3 };
+            if flag { ret &local; }
+            &local
+        }
+        fun main() { print(grab(true).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
 #[test]
 fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local() {
     // The un-masking pin (`element-clones.md` §13.4 / backlog B123): B122 gave
