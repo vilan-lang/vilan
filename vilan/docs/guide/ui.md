@@ -106,7 +106,10 @@ One rule governs the head — everything between `<tag` and `>`:
 - An **undotted** `name(value)` is an attribute: `.attr("name", value)`,
   the value's type deciding static vs tracked as always. A bare name
   (`disabled`) is a boolean attribute. Keyword and hyphenated names
-  (`type`, `aria-label`) are ordinary attribute names.
+  (`type`, `data-state`, `aria-label`) are ordinary attribute names —
+  hyphens are ordinary attribute-name characters, exactly as in HTML, so
+  every `data-*`/`aria-*` attribute is written in the same undotted form
+  and emitted verbatim.
 - A **leading dot** is the chain, verbatim: `.styled(card)`,
   `.bind_value(draft)`, `.show(flag)`, `.bind_each(rows, |r| r.id,
   |r| row(r))`. Every `View` method works in head position — the dot is

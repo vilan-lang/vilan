@@ -23,6 +23,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 ---
 
 <!-- family: feature -->
+**`data-*`/`aria-*` attributes in element heads are a documented, pinned guarantee.** `<div data-foo-bar("x") aria-label("y")>` has always parsed, checked, and emitted its attributes verbatim — the name-blind desugar never cared that a name has hyphens — but nothing said so, and nothing pinned it (E87, the owner's question, probed 2026-08-22). Now the guide says it (hyphens are ordinary attribute-name characters, exactly as in HTML — no `data:` marker family, no `.data("foo-bar", v)` method twin) and a compiler test pins the probe end to end, so the spelling can never silently regress into needing one.
+
+---
+
+<!-- family: feature -->
 **Repeated `head()`/`body()` calls land one per line.** Consecutive hatch calls used to concatenate with no separator — two `head()` calls put two items on one line of the served page — which is why the first real site wrote its own `joined()` helper and called the hatch once with everything pre-joined (E86, `proposal/fullstack-dx.md` §16.13, ruled 2026-08-22). Consecutive calls now join with a newline at the hatch's indent, on the generated document and the supplied-shell splice alike, so the hatch is usable per item and the written page still reads in View Source — the §15.1 promise, kept for both spellings.
 
 ---

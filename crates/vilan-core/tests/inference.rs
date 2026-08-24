@@ -43217,6 +43217,26 @@ fn ssr_element_renders_mixed_content() {
 }
 
 #[test]
+fn hyphenated_attribute_names_parse_and_emit_verbatim() {
+    // E87 (element-syntax.md §2, blessed 2026-08-22): hyphens are ordinary
+    // attribute-name characters, exactly as in HTML — `data-*`/`aria-*` need
+    // no special form and no method twin, because the name-blind desugar
+    // lowers `data-foo-bar("x")` to `.attr("data-foo-bar", "x")` without
+    // ever reading the name. The owner's probe, pinned end to end: parse,
+    // check, and the emitted attributes verbatim.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(<div data-foo-bar("x") aria-label("y")>"z"</div>));
+        }
+        "#,
+        "<div data-foo-bar=\"x\" aria-label=\"y\">z</div>\n",
+    );
+}
+
+#[test]
 fn an_element_without_view_in_scope_fails_at_the_element_head() {
     // No auto-import: the desugared `view` accessor spans `<tag`, so the
     // unresolved-name diagnostic underlines the element head the user wrote —
