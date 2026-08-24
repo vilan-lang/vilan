@@ -96,6 +96,8 @@ The return type is now inferred from every return position — the final express
 
 The join now carries every return position of every bodied function, annotated or not — the last release made an unannotated function's `ret`s typed, so the seams can finally see them. An unannotated function has no return annotation to declare a view with, so its return is **by value in both spellings**: a returned loaned place is copied (a scalar view is read), at the tail and at each `ret`, exactly as the annotated twin; a resource crossing is named by the move scan at either position; a view of a local still cannot escape either way. Tour "Memory model" (the projection-or-copy box), `proposal/ret-checking.md` "Rule 3, amended" Q2 (B134).
 
+Note plainly: programs that RELIED on the aliasing change behavior on upgrade. An unannotated method or function returning a field of a live receiver used to hand back the storage itself — mutate the receiver after the call and the "returned value" moved with it; it now gets the copy the annotated spelling always got. And an unannotated `ret &self.x` that was refused outright now compiles and copies. No program in the tree had either shape; a program that did was depending on a miscompile.
+
 ---
 
 <!-- family: diagnostics -->
