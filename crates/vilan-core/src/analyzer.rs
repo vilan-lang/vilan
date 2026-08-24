@@ -32836,12 +32836,16 @@ pub struct Program<'src> {
     /// never an LSP-overlaid buffer. Post-passes consult this the way the
     /// in-analyze checks consult `Analyzer::frozen_entity`.
     pub std_sources: HashSet<SourceId>,
-    /// The dependency packages' sources loaded from disk (E84,
+    /// The EXTERNAL dependency packages' sources loaded from disk (E84,
     /// diagnostics-standard.md C3a): code the user did not write, whether
     /// fetched (git) or path-linked. The context-coverage pass demotes and
     /// traces these exactly like `std_sources`' members — and unlike those,
-    /// they are never frozen (S1 stays std-only). Never the entry and never
-    /// an LSP-overlaid buffer, by the same rule as `std_sources`.
+    /// they are never frozen (S1 stays std-only). Never the entry, never an
+    /// LSP-overlaid buffer (the same rule as `std_sources`), and never a
+    /// workspace MEMBER (`PackageSpec::member`, E90): a `[project]`-declared
+    /// member is the user's own code, so its reads anchor at themselves and
+    /// its calls label — membership decided by the root manifest's
+    /// declaration, never by path.
     pub dependency_sources: HashSet<SourceId>,
     /// Where each run of GENERATED entities came from: the entity-id range, the
     /// span of the attribute that generated it, and the file that attribute is
@@ -35192,6 +35196,15 @@ pub struct PackageSpec {
     /// libraries, false for a `[package]` dependency (its modules import by
     /// path; it has a `main.vl` instead).
     pub surface: bool,
+    /// Whether this package is a declared MEMBER of the entry's workspace —
+    /// listed in the enclosing `[project]`'s `packages` (E90,
+    /// diagnostics-standard.md C3a). A member is the user's own code reached
+    /// through a path edge, so the context-coverage pass never demotes it the
+    /// way it does an external package. Membership is the root manifest's
+    /// declaration and nothing else — never a path test: an unlisted
+    /// directory inside the project stays external. Git dependencies and
+    /// packages outside any workspace are `false`, as is `std`'s own spec.
+    pub member: bool,
 }
 
 impl PackageSpec {
@@ -35400,7 +35413,9 @@ pub fn base_cache_clear() {
 }
 
 /// The workspace half of a [`BaseCacheKey`], rendered as sorted rows: the
-/// dependency packages by IDENTITY (roots, surface flag, dependency edges),
+/// dependency packages by IDENTITY (roots, surface and member flags,
+/// dependency edges — the member flag decides `dependency_sources`, so two
+/// workspaces differing only in membership must not share a world, E90),
 /// the entry's own dependency edges, and the entry's references into each
 /// dependency. Everything the load loop consults about the workspace is here;
 /// what the packages CONTAIN is validated per hit by content hash instead,
@@ -35428,9 +35443,10 @@ fn workspace_fingerprint(
             .map(|(name, dependency_index)| format!("{name}->{dependency_index}"))
             .collect();
         rows.push(format!(
-            "package {index} root={} surface={} layers=[{}] deps=[{}]",
+            "package {index} root={} surface={} member={} layers=[{}] deps=[{}]",
             spec.base_root.display(),
             spec.surface,
+            spec.member,
             layers.join(","),
             dependencies.join(","),
         ));
@@ -36147,7 +36163,10 @@ fn analyze_inner<'src>(
             // buffer is overlaid (open in the editor) — the same disk-only
             // rule as the load loop's. Unlike std's `lib.vl` (re-exports
             // only), a library's surface routinely holds real function bodies.
-            if !document_overlay_contains(&lib_path) {
+            // A workspace MEMBER's surface is the user's own code (E90,
+            // `PackageSpec::member`), so it never enters the set — reads
+            // there anchor and label exactly like the entry's modules.
+            if !spec.member && !document_overlay_contains(&lib_path) {
                 analyzer
                     .dependency_sources
                     .insert(SourceId(sources.len() as u32));
@@ -36371,11 +36390,18 @@ fn analyze_inner<'src>(
                     // like std's. Same disk-only gate — an overlaid buffer
                     // (open in the editor) is live user territory and keeps
                     // anchoring at itself. No S1 freezing rides on this set.
-                    if matches!(origin, Origin::Dep(_)) && !document_overlay_contains(&module_path)
-                    {
-                        analyzer
-                            .dependency_sources
-                            .insert(SourceId(sources.len() as u32));
+                    // A workspace MEMBER (`PackageSpec::member`, E90) is the
+                    // user's own code behind a path edge: it never enters
+                    // the set, so its reads anchor and its calls label like
+                    // the entry's own modules.
+                    if let Origin::Dep(package_index) = origin {
+                        if !workspace.packages[package_index].member
+                            && !document_overlay_contains(&module_path)
+                        {
+                            analyzer
+                                .dependency_sources
+                                .insert(SourceId(sources.len() as u32));
+                        }
                     }
                     sources.push(module_path);
                     source_hashes.push(crate::content_hash(loaded.text));

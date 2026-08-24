@@ -334,6 +334,7 @@ fn analyze_workspace_files(
             layers: Vec::new(),
             dependencies: Vec::new(),
             surface: true,
+            member: false,
         });
         entry_dependencies.push((dep.import_name.to_string(), index));
     }
@@ -432,6 +433,7 @@ fn dependency_pkg_self_reference_is_isolated() {
             layers: Vec::new(),
             dependencies: Vec::new(),
             surface: true,
+            member: false,
         }],
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
@@ -608,6 +610,7 @@ fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
             ],
             dependencies: Vec::new(),
             surface: true,
+            member: false,
         }],
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
@@ -709,6 +712,7 @@ fn base_lib_reexporting_a_layer_module_errors() {
             }],
             dependencies: Vec::new(),
             surface: true,
+            member: false,
         }],
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
@@ -832,6 +836,7 @@ fn contract_violations(
         ],
         dependencies: Vec::new(),
         surface: true,
+        member: false,
     };
     let violations = vilan_core::analyzer::check_library_contract(&spec)
         .into_iter()
@@ -1472,6 +1477,7 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
         layers: Vec::new(),
         dependencies: Vec::new(),
         surface: true,
+        member: false,
     };
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -1849,6 +1855,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
             layers: Vec::new(),
             dependencies: Vec::new(),
             surface: true,
+            member: false,
         }],
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),

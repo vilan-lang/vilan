@@ -618,6 +618,7 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
             layers: Vec::new(),
             dependencies: Vec::new(),
             surface: true,
+            member: false,
         }],
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),

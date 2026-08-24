@@ -294,6 +294,7 @@ fn embedded_std_spec() -> PackageSpec {
         ],
         dependencies: Vec::new(),
         surface: true,
+        member: false,
     }
 }
 
