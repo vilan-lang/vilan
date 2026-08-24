@@ -25,9 +25,28 @@ fn compiler() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Runs `work` on a thread with the same 256 MiB stack every vilan-core
+/// test harness spawns: the analyzer's recursion on a real program can
+/// overflow libtest's ~2 MiB worker thread — the v0.36.0 release gate
+/// aborted (SIGABRT) exactly one margin short of a local pass — while the
+/// SHIPPED wasm links with a 64 MiB stack (release.yml's `-zstack-size`),
+/// so the test thread was the only under-provisioned host. `RETAINED` is
+/// thread-local, so a compile and the completion that reads it must ride
+/// ONE spawn — wrap whole bodies, never per call.
+fn on_big_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn_scoped(scope, work)
+            .expect("spawn the big-stack test thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 fn compile(source: &str) -> CompileOutput {
     let _guard = compiler();
-    compile_program(source)
+    on_big_stack(|| compile_program(source))
 }
 
 #[test]
@@ -405,31 +424,36 @@ fn recompiling_identical_source_interns_the_entry_text() {
     use vilan_core::leak_tally::{self, LeakSite};
 
     let source = "import std::print;\nfun main() { print(41047); }\n";
-    leak_tally::reset();
-    let first = compile(source);
-    assert!(
-        first.diagnostics.is_empty(),
-        "expected a clean compile, got: {:#?}",
-        first.diagnostics
-    );
-    assert_eq!(
-        leak_tally::bytes(LeakSite::WasmEntryText),
-        source.len(),
-        "the first compile of a distinct source must leak (and tally) exactly \
-         one copy of it"
-    );
-    leak_tally::reset();
-    let second = compile(source);
-    assert_eq!(
-        first.js, second.js,
-        "a repeated compile of identical source must be identical"
-    );
-    assert_eq!(
-        leak_tally::bytes(LeakSite::WasmEntryText),
-        0,
-        "recompiling identical source re-leaked the entry text — the intern is \
-         not deduping"
-    );
+    // The tally is THREAD-LOCAL: every reset, both compiles, and every read
+    // ride one spawn — `compile()` would nest a second thread and lose it.
+    let _guard = compiler();
+    on_big_stack(|| {
+        leak_tally::reset();
+        let first = compile_program(source);
+        assert!(
+            first.diagnostics.is_empty(),
+            "expected a clean compile, got: {:#?}",
+            first.diagnostics
+        );
+        assert_eq!(
+            leak_tally::bytes(LeakSite::WasmEntryText),
+            source.len(),
+            "the first compile of a distinct source must leak (and tally) exactly \
+             one copy of it"
+        );
+        leak_tally::reset();
+        let second = compile_program(source);
+        assert_eq!(
+            first.js, second.js,
+            "a repeated compile of identical source must be identical"
+        );
+        assert_eq!(
+            leak_tally::bytes(LeakSite::WasmEntryText),
+            0,
+            "recompiling identical source re-leaked the entry text — the intern is \
+             not deduping"
+        );
+    });
 }
 
 // --- format: the fmt button's contract ---------------------------------------
@@ -463,7 +487,7 @@ fn a_program_that_does_not_parse_formats_to_itself() {
 
 fn compile_for_node(source: &str) -> CompileOutput {
     let _guard = compiler();
-    vilan_wasm::compile_program_for(source, vilan_core::Platform::default())
+    on_big_stack(|| vilan_wasm::compile_program_for(source, vilan_core::Platform::default()))
 }
 
 const SERVER_PROGRAM: &str = "import std::http::{ Response, Server };\n\
@@ -554,9 +578,11 @@ fn a_diagnostic_after_a_parse_error_keeps_its_own_file() {
     );
     // Two parse errors in the entry (the prefix the attribution has to lose),
     // and one analyzer error that belongs to the injected module.
-    let output = vilan_wasm::compile_program(
-        "import std::e42_probe::probe;\n\nfun main() {\n    let value = probe();\n}\n\n@\n@\n",
-    );
+    let output = on_big_stack(|| {
+        vilan_wasm::compile_program(
+            "import std::e42_probe::probe;\n\nfun main() {\n    let value = probe();\n}\n\n@\n@\n",
+        )
+    });
     let files: Vec<&str> = output
         .diagnostics
         .iter()
@@ -597,8 +623,10 @@ use vilan_wasm::CompletionItem;
 
 fn complete_after(compiled: &str, live: &str, line: u32, character: u32) -> Vec<CompletionItem> {
     let _guard = compiler();
-    compile_program(compiled);
-    vilan_wasm::complete_program(live, line, character)
+    on_big_stack(|| {
+        compile_program(compiled);
+        vilan_wasm::complete_program(live, line, character)
+    })
 }
 
 fn labels(items: &[CompletionItem]) -> Vec<&str> {
@@ -768,13 +796,15 @@ fn a_stale_buffer_maps_through_line_and_character_not_bytes() {
 #[test]
 fn completion_before_any_compile_is_empty_and_an_out_of_range_position_clamps() {
     let _guard = compiler();
-    assert!(
-        vilan_wasm::complete_program("fun main() {}\n", 0, 5).is_empty(),
-        "no analysis retained on this thread yet"
-    );
-    let program = "import std::print;\n\nfun main() {\n\tprint(1);\n}\n";
-    compile_program(program);
-    let items = vilan_wasm::complete_program(program, 999, 999);
+    let items = on_big_stack(|| {
+        assert!(
+            vilan_wasm::complete_program("fun main() {}\n", 0, 5).is_empty(),
+            "no analysis retained on this thread yet (the fresh spawn guarantees it)"
+        );
+        let program = "import std::print;\n\nfun main() {\n\tprint(1);\n}\n";
+        compile_program(program);
+        vilan_wasm::complete_program(program, 999, 999)
+    });
     assert!(
         !items.is_empty(),
         "a clamped position still answers the scope at the text's end"
@@ -789,22 +819,25 @@ fn completing_leaks_nothing() {
     use vilan_core::leak_tally;
     let _guard = compiler();
     let program = "import std::json::encode_json;\n\nfun main() {\n\t\n}\n";
-    compile_program(program);
-    leak_tally::reset();
-    for live in [
-        "import std::json::encode_json;\n\nfun main() {\n\tenc\n}\n",
-        "import std::json::encode_json;\nimport std::json::\n\nfun main() {\n\t\n}\n",
-        program,
-    ] {
-        let items = vilan_wasm::complete_program(live, 3, 1);
-        assert!(!items.is_empty());
-    }
-    assert_eq!(
-        leak_tally::total(),
-        0,
-        "a completion request must not leak: {}",
-        leak_tally::report()
-    );
+    on_big_stack(|| {
+        compile_program(program);
+        leak_tally::reset();
+        for live in [
+            "import std::json::encode_json;\n\nfun main() {\n\tenc\n}\n",
+            "import std::json::encode_json;\nimport std::json::\n\nfun main() {\n\t\n}\n",
+            program,
+        ] {
+            let items = vilan_wasm::complete_program(live, 3, 1);
+            assert!(!items.is_empty());
+        }
+        // The tally is thread-local — read it on the thread that recorded it.
+        assert_eq!(
+            leak_tally::total(),
+            0,
+            "a completion request must not leak: {}",
+            leak_tally::report()
+        );
+    });
 }
 
 /// An auto-import candidate's edit (E54c) is positioned in the LIVE text's
