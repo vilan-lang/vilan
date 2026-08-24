@@ -572,7 +572,11 @@ impl Manifest {
             Some(name) if !is_identifier(name) => errors.push(format!(
                 "`[package] name` must be a valid identifier (got `{name}`)"
             )),
-            Some(_) => {}
+            Some(name) => {
+                if let Some(reason) = reserved_package_name(name) {
+                    errors.push(reserved_name_refusal(name, reason, "package"));
+                }
+            }
         }
         if let Some(target) = &package.target {
             if let Err(error) = Platform::parse(target) {
@@ -760,6 +764,13 @@ fn validate_dependencies(
     errors: &mut Vec<String>,
 ) {
     for (name, dependency) in dependencies {
+        // A dependency's key IS the import root it binds, so a reserved name
+        // here is a claim on the namespace itself — refused whatever the
+        // declaration's source looks like (a second, independent problem with
+        // the source still reports beside this: different root causes).
+        if let Some(reason) = reserved_package_name(name) {
+            errors.push(reserved_name_refusal(name, reason, "dependency"));
+        }
         match dependency.source() {
             Ok(DependencySource::Path(_)) | Ok(DependencySource::Git(_)) => {}
             Ok(DependencySource::Inherited) if !inheritable => errors.push(format!(
@@ -1288,6 +1299,37 @@ fn split_needs_a_browser_leg(key: &str, declared: &str) -> String {
     )
 }
 
+/// Why `name` is reserved as a package name, if it is. The three reserved
+/// names are the import roots the toolchain itself owns (spec §4.2's three
+/// namespaces). A dependency key under one of them would silently shadow the
+/// root (`std`, `macro_std` — the analyzer binds dependency edges before the
+/// global roots) or be silently unreachable behind it (`pkg` — the hardcoded
+/// self-package root wins); a `[package]` claiming one as its own name stakes
+/// the same claim for the day it is depended on or published (std-shape.md
+/// §4, L12). `[library] name` deliberately carries NO check: the reserved
+/// names are reserved *for* the toolchain's own `[library]` manifests (std is
+/// `[library] name = "std"`, likewise macro_std), a context-free validation
+/// cannot tell the owner from an impostor, and a library's own name — unlike
+/// a dependency key — never binds an import root.
+fn reserved_package_name(name: &str) -> Option<&'static str> {
+    match name {
+        "std" => Some("the standard library owns it"),
+        "pkg" => Some("it always means the importing package's own modules"),
+        "macro_std" => Some("the macro standard library owns it"),
+        _ => None,
+    }
+}
+
+/// The refusal for a reserved package name: the rule, the whole reserved set,
+/// and the one fix (`renamed` names the thing to rename — the package or the
+/// dependency).
+fn reserved_name_refusal(name: &str, reason: &str, renamed: &str) -> String {
+    format!(
+        "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
+         `macro_std` are all reserved); rename the {renamed}"
+    )
+}
+
 /// Whether `name` is a valid Vilan identifier: a leading letter or `_`, then
 /// letters, digits, or `_`.
 fn is_identifier(name: &str) -> bool {
@@ -1437,6 +1479,251 @@ mod tests {
     fn non_identifier_name_is_an_error() {
         let manifest = parse("[package]\nname = \"my-pkg\"\n");
         assert!(manifest.validate().iter().any(|e| e.contains("identifier")));
+    }
+
+    // The reserved package names (L12, std-shape.md §4): `std`, `pkg`, and
+    // `macro_std` are the import roots the toolchain owns. Before the refusal,
+    // a dependency named `std` silently shadowed the whole standard library
+    // (`import std::print` stopped resolving), one named `pkg` was silently
+    // unreachable behind the self-package root, and one named `macro_std`
+    // shadowed the macro world's std — measured 2026-08-24, the plant these
+    // pins were proven red against.
+
+    /// The refusal's exact head for `name`, as [`reserved_name_refusal`]
+    /// builds it — asserted verbatim so the ledger row's key stays honest.
+    fn reserved_head(name: &str, reason: &str, renamed: &str) -> String {
+        format!(
+            "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
+             `macro_std` are all reserved); rename the {renamed}"
+        )
+    }
+
+    #[test]
+    fn a_package_named_std_is_refused() {
+        let manifest = parse("[package]\nname = \"std\"\n");
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "package"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_package_named_pkg_is_refused() {
+        let manifest = parse("[package]\nname = \"pkg\"\n");
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "pkg",
+                "it always means the importing package's own modules",
+                "package"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_package_named_macro_std_is_refused() {
+        let manifest = parse("[package]\nname = \"macro_std\"\n");
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "macro_std",
+                "the macro standard library owns it",
+                "package"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dependency_named_std_is_refused() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             std = { path = \"../std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dependency_named_pkg_is_refused() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             pkg = { path = \"../helpers\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "pkg",
+                "it always means the importing package's own modules",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dependency_named_macro_std_is_refused() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             macro_std = { path = \"../macro_std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "macro_std",
+                "the macro standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_library_dependency_named_std_is_refused() {
+        let manifest = parse(
+            "[library]\nname = \"helpers\"\n[library.dependencies]\n\
+             std = { path = \"../std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_project_dependency_named_std_is_refused() {
+        // The workspace root's table is the one members inherit FROM, so a
+        // reserved key there would hand every opted-in member the shadowing.
+        let manifest = parse(
+            "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+             std = { path = \"std\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "std",
+                "the standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_reserved_dependency_with_a_broken_source_reports_both_problems() {
+        // Different root causes, both actionable: the name is reserved AND the
+        // declaration pins nothing.
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             std = { git = \"https://example.com/repo\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(errors.len(), 2, "both problems report: {errors:?}");
+        assert!(errors[0].contains("reserved package name"));
+        assert!(errors[1].contains("no point to pin"));
+    }
+
+    #[test]
+    fn a_library_named_std_is_the_standard_librarys_own_shape() {
+        // `[library] name` deliberately carries no reserved check: std itself
+        // is `[library] name = "std"` (likewise macro_std), and a library's
+        // own name — unlike a dependency key — never binds an import root.
+        let std_manifest = parse("[library]\nname = \"std\"\n");
+        assert!(std_manifest.validate().is_empty());
+        let macro_std_manifest = parse("[library]\nname = \"macro_std\"\n");
+        assert!(macro_std_manifest.validate().is_empty());
+    }
+
+    #[test]
+    fn a_near_miss_of_a_reserved_name_is_not_refused() {
+        // Exact match only: `stdx`, `std_helpers`, `pkg_tools`,
+        // `macro_stdlib` are ordinary names.
+        let manifest = parse(
+            "[package]\nname = \"stdx\"\n[package.dependencies]\n\
+             std_helpers = { path = \"../std_helpers\" }\n\
+             pkg_tools = { path = \"../pkg_tools\" }\n\
+             macro_stdlib = { path = \"../macro_stdlib\" }\n",
+        );
+        assert!(manifest.validate().is_empty());
+    }
+
+    #[test]
+    fn a_legal_dependency_name_still_resolves_end_to_end() {
+        // The refusal sits on `Manifest::validate`, which every
+        // `resolve_workspace` rides — so the complement is pinned through the
+        // real resolution path, not just `validate()`.
+        let root = workspace_tree(
+            "legal-name-loads",
+            &[
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { path = \"../shapes\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("a legal name resolves");
+        assert_eq!(workspace.packages.len(), 1);
+        assert_eq!(workspace.entry_dependencies.len(), 1);
+        assert_eq!(workspace.entry_dependencies[0].0, "shapes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reserved_dependency_name_is_refused_through_resolution_too() {
+        // The same channel, refusing: `resolve_workspace` never resolves a
+        // manifest `validate` rejects, so the CLI and the editor both see the
+        // refusal before any dependency work happens.
+        let root = workspace_tree(
+            "reserved-name-refuses",
+            &[
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     std = { path = \"../shapes\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+            ],
+        );
+        let error = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect_err("a reserved name refuses");
+        assert!(!error.is_unfetched());
+        assert!(
+            error.message().contains("`std` is a reserved package name"),
+            "unexpected message: {}",
+            error.message()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

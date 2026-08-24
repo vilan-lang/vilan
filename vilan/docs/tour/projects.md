@@ -23,6 +23,16 @@ work offline and a moved tag cannot change what you already built.
 Nothing else fetches: the editor uses the cache when it's there and
 never reaches the network.
 
+## Reserved names
+
+Three names are refused wherever a manifest names a package: `std`,
+`pkg`, and `macro_std`. They are the import roots the toolchain owns —
+`std::` is always the standard library, `pkg::` is always your own
+package, `macro_std::` is always the macro world's std — so a dependency
+declared under one of them could only shadow the root or vanish behind
+it. The dependency key is yours to choose, so pick any other name; the
+library it points at keeps its own.
+
 ## Pre-build commands and `default-entry`
 
 Two more keys matter once a project grows. `[build] run` names a
