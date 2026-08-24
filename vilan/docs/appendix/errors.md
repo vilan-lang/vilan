@@ -551,11 +551,13 @@ The most common first UI error: you built reactive state (an `effect`, a
 binding) outside every ownership boundary. Wrap the entry point in
 `mount_root`, or `run_with_owner` in a test. The error points at your
 `effect`/`map`/`or` call; the note under it shows the read inside the
-standard library that your call reaches, and every call of yours on the
+library — the standard library, or a dependency package your code
+calls — that your call reaches, and every call of yours on the
 uncovered path above it is underlined too ("the context requirement
 flows through this call") — follow the chain up to where the ownership
 boundary belongs. Calls inside a covering `run` are clean and never
-appear in the chain.
+appear in the chain, and a package's internal calls are never
+underlined: the error always lands on code you wrote.
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
 
 **"`…` reads context `…`, so it can't be used as a value"**

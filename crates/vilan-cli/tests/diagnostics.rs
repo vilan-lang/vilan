@@ -848,3 +848,57 @@ fn e76_a_same_file_note_is_unmoved_by_the_char_conversion() {
         "and the note still renders with it: {stderr}"
     );
 }
+
+#[test]
+fn e84_a_dependency_read_reports_at_the_users_call() {
+    // The E84 flavor of the e76 coverage pin (diagnostics-standard.md C3a,
+    // ruled 2026-08-22): the demotion is not std-specific — a strict read
+    // inside a PATH-DEPENDENCY package anchors at the user's call in
+    // `main.vl`, the read demotes to the cross-source note in the package's
+    // own file, and the package's INTERNAL frames (`middle()`, the
+    // `deep_read()` call) are traversed but never labeled. Pre-widening
+    // (the probe, 2026-08-24) the primary rendered inside `lib.vl` and both
+    // internal call lines rendered as hops.
+    let dir = temp_files(
+        "e84_dependency",
+        &[
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n\n[package.dependencies]\ndepctx = { path = \"../depctx\" }\n",
+            ),
+            (
+                "app/src/main.vl",
+                "import std::print;\nimport depctx::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+            ),
+            ("depctx/vilan.toml", "[library]\nname = \"depctx\"\n"),
+            (
+                "depctx/src/lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun deep_read(): i32 {\n\tcurrent.get()\n}\n\nfun middle(): i32 {\n\tdeep_read()\n}\n\nfun entry(): i32 {\n\tmiddle()\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir.join("app"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the uncovered read must fail");
+    assert!(
+        renders_in(&stderr, "main.vl", "print(entry());"),
+        "the primary renders at the user's call: {stderr}"
+    );
+    assert!(
+        stderr.contains("the read is inside `deep_read` here"),
+        "the demotion note names the package function: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "lib.vl", "current.get()"),
+        "the note renders in the package's own file: {stderr}"
+    );
+    assert!(
+        stderr.find("main.vl").unwrap() < stderr.find("lib.vl").unwrap(),
+        "the user's file leads; the package file is the sub-report: {stderr}"
+    );
+    assert!(
+        !stderr.contains("middle()"),
+        "package-internal frames are never labeled, so their lines never render: {stderr}"
+    );
+}

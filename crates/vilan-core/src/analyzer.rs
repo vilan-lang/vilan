@@ -2278,6 +2278,13 @@ pub struct Analyzer<'src> {
     // these sources via `frozen_entity`; the std-clean invariant that makes
     // that sound is pinned in `check_scope_differential.rs`.
     std_sources: HashSet<SourceId>,
+    // The dependency packages' sources loaded from DISK (E84,
+    // diagnostics-standard.md C3a): code the user did not write, whether
+    // fetched (git) or path-linked. The context-coverage pass demotes and
+    // traces these exactly like `std_sources`' members; unlike those they
+    // are never frozen — S1 stays std-only. Never the entry and never an
+    // LSP-overlaid buffer, by the same rule as `std_sources`.
+    dependency_sources: HashSet<SourceId>,
     // Counts every write into `type_id_to_type_map` that CHANGES what a slot
     // held — the constraint fixpoint's third progress signal (S3b): an attempt
     // that refines a type without resolving still moves the world, and the exit
@@ -3143,6 +3150,7 @@ impl<'src> Analyzer<'src> {
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: HashSet::default(),
+            dependency_sources: HashSet::default(),
             type_map_writes: 0,
             frozen_ranges: Vec::new(),
             source_texts: Vec::new(),
@@ -32345,6 +32353,13 @@ pub struct Program<'src> {
     /// never an LSP-overlaid buffer. Post-passes consult this the way the
     /// in-analyze checks consult `Analyzer::frozen_entity`.
     pub std_sources: HashSet<SourceId>,
+    /// The dependency packages' sources loaded from disk (E84,
+    /// diagnostics-standard.md C3a): code the user did not write, whether
+    /// fetched (git) or path-linked. The context-coverage pass demotes and
+    /// traces these exactly like `std_sources`' members — and unlike those,
+    /// they are never frozen (S1 stays std-only). Never the entry and never
+    /// an LSP-overlaid buffer, by the same rule as `std_sources`.
+    pub dependency_sources: HashSet<SourceId>,
     /// Where each run of GENERATED entities came from: the entity-id range, the
     /// span of the attribute that generated it, and the file that attribute is
     /// written in. `source_ranges` files those entities under [`DERIVED_SOURCE`]
@@ -35644,6 +35659,16 @@ fn analyze_inner<'src>(
             report_module_parse_errors(&mut analyzer.diagnostics, &lib_path, &lib_loaded);
             analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
             let lib_ast = lib_loaded.ast;
+            // A dependency's surface is dependency code like any of its
+            // modules (E84): the context-coverage pass demotes it, unless the
+            // buffer is overlaid (open in the editor) — the same disk-only
+            // rule as the load loop's. Unlike std's `lib.vl` (re-exports
+            // only), a library's surface routinely holds real function bodies.
+            if !document_overlay_contains(&lib_path) {
+                analyzer
+                    .dependency_sources
+                    .insert(SourceId(sources.len() as u32));
+            }
             sources.push(lib_path);
             source_hashes.push(crate::content_hash(lib_loaded.text));
             let lib_source_id = SourceId((sources.len() - 1) as u32);
@@ -35856,6 +35881,18 @@ fn analyze_inner<'src>(
                     // (open in the editor, possibly dirty) does not.
                     if matches!(origin, Origin::Std) && !document_overlay_contains(&module_path) {
                         analyzer.std_sources.insert(SourceId(sources.len() as u32));
+                    }
+                    // A dependency package's module is code the user did not
+                    // write (E84, diagnostics-standard.md C3a): the
+                    // context-coverage walk demotes and traces it exactly
+                    // like std's. Same disk-only gate — an overlaid buffer
+                    // (open in the editor) is live user territory and keeps
+                    // anchoring at itself. No S1 freezing rides on this set.
+                    if matches!(origin, Origin::Dep(_)) && !document_overlay_contains(&module_path)
+                    {
+                        analyzer
+                            .dependency_sources
+                            .insert(SourceId(sources.len() as u32));
                     }
                     sources.push(module_path);
                     source_hashes.push(crate::content_hash(loaded.text));
@@ -37356,6 +37393,7 @@ fn analyze_over_world<'src>(
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
         std_sources: std::mem::take(&mut analyzer.std_sources),
+        dependency_sources: std::mem::take(&mut analyzer.dependency_sources),
         derived_origins: std::mem::take(&mut analyzer.derived_origins),
         layer_platforms,
         diagnostic_sources,
