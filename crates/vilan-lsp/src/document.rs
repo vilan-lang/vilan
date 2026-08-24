@@ -1103,6 +1103,7 @@ impl Document {
             entity_spans: &self.entity_spans,
             platform_requirements: &self.platform_requirements,
             import_roots: self.import_roots.as_ref(),
+            source_texts: Default::default(),
         }
     }
 
@@ -3231,6 +3232,84 @@ pub(crate) mod tests {
             auto_import_labels.len(),
             AUTO_IMPORT_COMPLETION_CAP,
             "29 candidates over a cap of {AUTO_IMPORT_COMPLETION_CAP} should saturate it: {auto_import_labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E83: ONE whole-buffer parse per completion request, however many
+    // auto-import candidates the request shapes. `insert_import`'s
+    // string-input form re-parses the buffer per call, and calling it once
+    // per surviving candidate (up to `AUTO_IMPORT_COMPLETION_CAP`) is what
+    // made a bare scope position cost ~20 member completions
+    // (playground-completion.md §9) — in the language server and the
+    // playground alike, since both drive this engine. The shared
+    // `formatter::ParsedSource` pays the parse once; this pin holds the
+    // count, not the time.
+    #[test]
+    fn a_scope_completion_with_many_auto_import_candidates_parses_the_buffer_once() {
+        let many_functions: String = (0..30)
+            .map(|index| format!("fun sibling{index:02}() {{}}\n"))
+            .collect();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::sibling00;\n\nfun main() {\n\tsibling00();\n\t\n}\n",
+            ),
+            ("helper.vl", &many_functions),
+        ]);
+        let marker = "sibling00();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let parses_before = vilan_core::formatter::buffer_parse_count();
+        let candidates = document.completion(offset);
+        let parses = vilan_core::formatter::buffer_parse_count() - parses_before;
+        let auto_imports = candidates
+            .iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .count();
+        assert_eq!(
+            auto_imports, AUTO_IMPORT_COMPLETION_CAP,
+            "the scenario must shape a full cap of candidates for the parse count to mean anything"
+        );
+        assert_eq!(
+            parses, 1,
+            "a completion request parses the buffer once, not once per auto-import candidate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E83's other per-candidate cost: a non-entry declaration's `///` doc is
+    // sliced out of its module's text, and a bare scope position resolves
+    // docs for every Function candidate in scope — three names imported from
+    // `std::math` used to be three reads (three clones) of math.vl in ONE
+    // request. The per-query cache on `Analysis` (`source_texts`) makes it
+    // one read per module per request. The fixture imports from exactly one
+    // std module and declares its other functions locally (entry-file docs
+    // slice the analyzed text, no read), so the expected count is exactly 1;
+    // if this goes red after a std reshuffle, first check what the entry
+    // scope now resolves docs from.
+    #[test]
+    fn one_completion_request_reads_a_docs_module_text_once() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::math::{ max, min, minmax };\n\n\
+             fun main() {\n\tlet low = min(1, 2);\n\t\n}\n",
+        )]);
+        let marker = "min(1, 2);\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let reads_before = vilan_core::util::source_read_count();
+        let candidates = document.completion(offset);
+        let reads = vilan_core::util::source_read_count() - reads_before;
+        for name in ["max", "min", "minmax"] {
+            assert!(
+                candidates.iter().any(|candidate| candidate.label == name),
+                "{name} must be offered for the read count to mean anything"
+            );
+        }
+        assert_eq!(
+            reads, 1,
+            "three same-module candidates resolve docs from one read of math.vl, not three"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

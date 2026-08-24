@@ -2,14 +2,17 @@
 //! navigation primitives every editor query is built on
 //! (`proposal/playground-completion.md` §3).
 //!
-//! [`Analysis`] is a struct of references, built per query by whoever owns
-//! the analysis: the language server from its `Document`, the playground
+//! [`Analysis`] is a struct of references (plus one per-query text cache,
+//! [`Analysis::source_texts`]), built per query by whoever owns the
+//! analysis: the language server from its `Document`, the playground
 //! from the handle it retains between compiles. The primitives here are the
 //! ones completion shares with hover and go-to-definition — the chain walkers
 //! that resolve a use to its declaration (`function_target`, `hover_label`),
 //! the declaration's name span and `///` doc, the entity under an offset —
 //! measured as the whole overlap (nine functions) when completion was lifted
 //! out of the server. Everything hover-shaped above them stays in the server.
+
+use std::cell::{Ref, RefCell};
 
 use vilan_core::analyzer::{Expr, SourceId};
 use vilan_core::fx::FxHashMap as HashMap;
@@ -49,6 +52,18 @@ pub struct Analysis<'a, 'src> {
     /// the analysis resolved no package tree (the language server's degraded
     /// internal-error document).
     pub import_roots: Option<&'a ImportRoots>,
+    /// Non-entry source texts already materialized FOR THIS QUERY — the one
+    /// owned field on this otherwise reference-only struct, so the cache
+    /// lives exactly as long as the query does (E83). [`Analysis::doc_comment_of`]
+    /// reads a non-entry declaration's `///` doc out of its module's text,
+    /// and a bare scope position resolves docs for many candidates declared
+    /// in the SAME std module; before this cache each candidate re-read (and
+    /// re-cloned) that text through `util::read_source`
+    /// (`proposals/proposal/playground-completion.md` §9). Per query and
+    /// never global on purpose: an overlay edit must land in the next
+    /// query's reads. A failed read is recorded (`None`) so it is not
+    /// retried. Construct with `Default::default()`.
+    pub source_texts: RefCell<HashMap<SourceId, Option<String>>>,
 }
 
 /// `(start, end, id)` for every entry-file entity with a real span, for
@@ -218,12 +233,37 @@ impl<'a, 'src> Analysis<'a, 'src> {
         span_of(program, id)
     }
 
+    /// The text of a non-entry source, materialized AT MOST ONCE per query
+    /// (E83): the cache is [`Analysis::source_texts`], whose doc carries the
+    /// why. BOM-stripped by `read_source`, so a program span (from the
+    /// analyzer's own read) slices this text at the right offset
+    /// (windows-support.md §2) — and answered from the open-document overlay
+    /// before disk, like every other source read.
+    fn source_text(&self, source: SourceId) -> Option<Ref<'_, str>> {
+        {
+            let mut texts = self.source_texts.borrow_mut();
+            if !texts.contains_key(&source) {
+                let text = self
+                    .program
+                    .source_path(source)
+                    .and_then(|path| vilan_core::util::read_source(path).ok());
+                texts.insert(source, text);
+            }
+        }
+        Ref::filter_map(self.source_texts.borrow(), |texts| {
+            texts.get(&source).and_then(|text| text.as_deref())
+        })
+        .ok()
+    }
+
     /// The contiguous `//` block directly above a declaration's name line —
     /// its doc comment, with the comment markers stripped. Attribute lines
     /// (`[must_use]`, `[platform(…)]`) between the block and the name are
     /// skipped. The entry file reads the ANALYZED text (`name_span` is a
     /// program span, so it slices the text the analysis consumed); other
-    /// sources read from disk on demand (hover-time, cheap).
+    /// sources read on demand through the per-query cache
+    /// ([`Self::source_text`] — once per module per query, not once per
+    /// candidate, E83).
     pub fn doc_comment_of(&self, declaration_id: Id) -> Option<String> {
         let program = self.program;
         let source = program.source_of(declaration_id)?;
@@ -232,10 +272,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         let text: &str = if source == SourceId(0) {
             self.analyzed.text()
         } else {
-            let path = program.source_path(source)?;
-            // BOM-stripped so `name_span` (from the analyzer's read) slices
-            // this text at the right offset (windows-support.md §2).
-            owned = vilan_core::util::read_source(path).ok()?;
+            owned = self.source_text(source)?;
             &owned
         };
         let start = name_span.into_range().start.min(text.len());

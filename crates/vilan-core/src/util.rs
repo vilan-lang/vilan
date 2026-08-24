@@ -65,8 +65,28 @@ pub enum SourceProvenance {
     Disk,
 }
 
+thread_local! {
+    /// How many times THIS THREAD has materialized a source text through
+    /// [`read_source_traced`] — overlay and disk alike, each one a fresh
+    /// `String` of the whole file. What made a bare scope completion clone a
+    /// std module's text once per doc-carrying candidate before E83
+    /// (`Analysis::doc_comment_of`, `proposals/proposal/playground-completion.md`
+    /// §9).
+    static SOURCE_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The number of source texts this thread has materialized through
+/// [`read_source_traced`] — an instrumentation probe (E83), not a behavior
+/// surface. Monotonic: read a snapshot before and after the work under test
+/// and assert on the difference. The pin that holds a completion request to
+/// one read per module (not one per candidate) is what this exists for.
+pub fn source_read_count() -> u64 {
+    SOURCE_READS.with(Cell::get)
+}
+
 /// [`read_source`], reporting where the content came from.
 pub fn read_source_traced(path: impl AsRef<Path>) -> std::io::Result<(String, SourceProvenance)> {
+    SOURCE_READS.with(|count| count.set(count.get() + 1));
     let path = path.as_ref();
     if let Some(buffered) = crate::analyzer::document_overlay_get(path) {
         return Ok((buffered, SourceProvenance::Overlay));
