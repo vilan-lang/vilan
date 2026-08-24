@@ -262,6 +262,7 @@ impl Document {
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>>
 
 	fun title(own self, title: str): Document
+	fun description(own self, text: str): Document        // <meta name="description">
 	fun lang(own self, lang: str): Document
 	fun mount(own self, id: str): Document                // the other end of mount_root
 	fun head(own self, markup: str): Document             // raw, appended inside <head>
@@ -333,10 +334,11 @@ script's own string is not a mount element.
 **`Document::of(build)` writes the document instead.** Same value, same
 rules — every document it can produce passes `check_shell`, which is what
 keeps the generator and the checker from drifting apart. It emits a
-doctype, `<html lang>`, charset, viewport, `<title>`, the stylesheet link
-*if and only if* the build emitted styles, the mount element, and the
-bundle's script tag in the form the build requires (a classic script for a
-leg that splits, since chunk resolution reads `document.currentScript`):
+doctype, `<html lang>`, charset, viewport, `<title>`, the description meta
+*if one was given*, the stylesheet link *if and only if* the build emitted
+styles, the mount element, and the bundle's script tag in the form the
+build requires (a classic script for a leg that splits, since chunk
+resolution reads `document.currentScript`):
 
 ```vilan,norun
 import std::build::require_build;
@@ -347,6 +349,7 @@ async fun main() {
 	let build = require_build("client");
 	let page = Document::of(build)
 		.title("Notes")
+		.description("A tidy list of everything you meant to do.")
 		.head("<style>body { font: 16px/1.5 system-ui; }</style>")
 		.html();
 
@@ -359,14 +362,23 @@ async fun main() {
 }
 ```
 
+`title` and `description` are the two *identity lines* — head matter the
+document is the sole author of, so escaping is the only thing that can go
+wrong and the document does it. Both shape the generated document only: a
+supplied shell's identity lines are the shell's own. Everything in the
+`<head>` that names a second party the build cannot see — a file (a
+favicon), an address (`og:url`), a palette (`theme-color`) — stays a
+`head()` call, where the raw markup says what it is.
+
 `head`/`body` take raw markup and append (a favicon, an `og:` tag, a CSP,
 a `<noscript>`), which is what keeps the generated document small enough
-to be worth having: everything else is derived. They work on a supplied
-shell too (`require_shell`, `from_shell`): `head()` markup splices in
-immediately before the shell's own `</head>`, `body()`'s immediately
-before its `</body>` — and a shell that lacks the closing tag a used
-hatch needs stops at `html()` rather than having the markup guessed into
-it. They are an escape hatch, not an exemption — when `html()` writes the
+to be worth having: everything else is derived. They are repeatable, and
+each call lands on its own line of the written page, so a hatch reads
+naturally used once per item. They work on a supplied shell too
+(`require_shell`, `from_shell`): `head()` markup splices in immediately
+before the shell's own `</head>`, `body()`'s immediately before its
+`</body>` — and a shell that lacks the closing tag a used hatch needs
+stops at `html()` rather than having the markup guessed into it. They are an escape hatch, not an exemption — when `html()` writes the
 page, markup you added there is checked like any other, so a `<link>` to
 a stylesheet the build did not emit stops the boot exactly as it would in
 a hand-written shell. A document with no hatch markup runs no check at
