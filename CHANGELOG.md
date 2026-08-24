@@ -18,6 +18,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 ## Unreleased
 
 <!-- family: feature -->
+**Lists compare with `==`, and a struct with a `List` field can derive `PartialEq`.** `std::List` carried only the inherent `T: PartialEq` methods (`contains`, `index_of`) — the type itself never satisfied a `PartialEq` bound, so `[derive(PartialEq)]` on a struct holding a `List<…>` field was refused ("type 'List' does not implement the `PartialEq` operator") and the first real site wrote its `eq` by hand, hop by hop (I4, found by E80's lane). `impl List<T: PartialEq> with PartialEq` now compares element-wise, length first; the impl is conditional, so nested lists (`List<List<i32>>`) compare through their elements and the derive on a `List`-holding struct just works. The hand-written impl and its helper can be deleted wherever a struct was carrying one.
+
+---
+
+<!-- family: feature -->
 **`Document` gains `description(text)` — `title`'s twin.** The first real site put its `<meta name="description">` through the `head()` hatch and interpolated the text raw, so a `"` in a description would have ended the attribute and turned the remainder into junk attributes a browser tolerates — the page looks right and the search snippet is wrong (E85, the §10.1 review's first graduation; `proposal/fullstack-dx.md` §16.13, ruled 2026-08-22). `Document::of(build).title("Notes").description("A tidy list.")` now writes `<meta name="description" content="A tidy list." />` beside the `<title>` in the generated prefix, escaped the way an attribute value must be; a document not given one carries no description meta at all. The ruled bound moves with it: rung 2 is the intersection of the shells in the tree, **plus the identity lines the document is the sole author of** — `title` and `description` — while everything naming a second party the build cannot see (a file, a host, an address, a palette) stays a `head()` call. Like `title`, it shapes the generated document only: a supplied shell's identity lines are the shell's own.
 
 ---
