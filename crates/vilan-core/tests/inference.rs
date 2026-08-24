@@ -17754,6 +17754,434 @@ main();
     );
 }
 
+// --- E84: the demotion/trace contract widens to any dependency package ---
+// (diagnostics-standard.md C3a, the owner's 2026-08-22 ruling): code the
+// user did not write — std or ANY external/linked package — demotes and
+// traces the same way. The seam is the loader's `Origin::Dep` (the
+// `Workspace`/`PackageSpec` layer — the same classification the manifest
+// resolver feeds), surfaced as `Program::dependency_sources`; never a path
+// heuristic. Before the widening, a read inside a dependency anchored IN the
+// dependency's file and the package's internal frames were labeled as hops.
+
+/// A dependency-package fixture: its import name and its files (`lib.vl` at
+/// the package root), staged on disk and handed to `analyze_source` as a
+/// real `Workspace` package — the loader classifies it `Origin::Dep`
+/// exactly as it does one resolved from a manifest.
+struct DependencyFixture {
+    import_name: &'static str,
+    files: &'static [(&'static str, &'static str)],
+}
+
+/// One diagnostic from a workspace-with-dependencies analysis, fully
+/// file-attributed so a pin can say WHERE each part landed: the primary's
+/// file and exact spanned text, the C3 note's (message, file, spanned text),
+/// and each trace hop's (label, file, spanned text, `call`), in analyzer
+/// order.
+struct WorkspaceDiagnostic {
+    message: String,
+    file: String,
+    anchor: String,
+    note: Option<(String, String, String)>,
+    trace: Vec<(String, String, String, bool)>,
+}
+
+/// Analyzes `entry_files` (under an `app/` root; `main.vl` is the entry)
+/// against `dependencies`, each staged in its own directory beside `app/`
+/// and entered into the `Workspace` by hand — the same staging
+/// `module_resolution.rs` uses, with the diagnostics kept whole (note and
+/// trace included) instead of flattened to messages.
+fn analyze_workspace_with_dependencies(
+    entry_files: &[(&str, &str)],
+    dependencies: &[DependencyFixture],
+) -> Vec<WorkspaceDiagnostic> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_e84_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    // Every file's text by its NAME, for slicing spans back into words.
+    // Fixture file names are unique across packages by construction.
+    let mut texts: Vec<(String, String)> = Vec::new();
+    for (relative, contents) in entry_files {
+        let path = app_dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        texts.push((
+            Path::new(relative)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            contents.to_string(),
+        ));
+    }
+    let mut packages = Vec::new();
+    let mut entry_dependencies = Vec::new();
+    for (index, dependency) in dependencies.iter().enumerate() {
+        let dependency_root = root.join(dependency.import_name);
+        for (relative, contents) in dependency.files {
+            let path = dependency_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            texts.push((
+                Path::new(relative)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                contents.to_string(),
+            ));
+        }
+        packages.push(PackageSpec {
+            base_root: dependency_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+        });
+        entry_dependencies.push((dependency.import_name.to_string(), index));
+    }
+    let workspace = Workspace {
+        packages,
+        entry_dependencies,
+        ..Workspace::default()
+    };
+
+    let entry_path = app_dir.join("main.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let leaked: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    leaked,
+                    &std_spec(),
+                    &app_dir,
+                    &entry_path,
+                    Some(Platform::default()),
+                    &workspace,
+                );
+                // The entry's own parse errors lead; `diagnostic_sources` is
+                // parallel to the program's half (as in `analyze_package`).
+                let prefix = errors.len()
+                    - program
+                        .as_ref()
+                        .map(|program| program.diagnostics.len())
+                        .unwrap_or(0);
+                let file_name_of = |source: vilan_core::analyzer::SourceId| -> Option<String> {
+                    let program = program.as_ref()?;
+                    let path = program.source_path(source)?;
+                    Some(path.file_name()?.to_string_lossy().into_owned())
+                };
+                let text_at = |file: &Option<String>, span: vilan_core::span::Span| -> String {
+                    file.as_deref()
+                        .and_then(|file| {
+                            texts
+                                .iter()
+                                .find(|(name, _)| name == file)
+                                .map(|(_, text)| {
+                                    text.get(span.into_range()).unwrap_or("").to_string()
+                                })
+                        })
+                        .unwrap_or_default()
+                };
+                let diagnostics = errors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, error)| {
+                        let primary_source = index
+                            .checked_sub(prefix)
+                            .and_then(|offset| {
+                                let program = program.as_ref()?;
+                                program.diagnostic_sources.get(offset).copied()
+                            })
+                            .unwrap_or(vilan_core::analyzer::SourceId(0));
+                        let primary_file = file_name_of(primary_source);
+                        // `Note::source` contract: `None` = the primary's file.
+                        let located =
+                            |source: Option<vilan_core::analyzer::SourceId>| -> Option<String> {
+                                match source {
+                                    Some(source) => file_name_of(source),
+                                    None => primary_file.clone(),
+                                }
+                            };
+                        WorkspaceDiagnostic {
+                            message: error.msg.clone(),
+                            anchor: text_at(&primary_file, error.span),
+                            note: error.note.as_ref().map(|note| {
+                                let file = located(note.source);
+                                (
+                                    note.msg.clone(),
+                                    file.clone().unwrap_or_default(),
+                                    text_at(&file, note.span),
+                                )
+                            }),
+                            trace: error
+                                .trace
+                                .iter()
+                                .map(|hop| {
+                                    let file = located(hop.note.source);
+                                    (
+                                        hop.note.msg.clone(),
+                                        file.clone().unwrap_or_default(),
+                                        text_at(&file, hop.note.span),
+                                        hop.call,
+                                    )
+                                })
+                                .collect(),
+                            file: primary_file.unwrap_or_default(),
+                        }
+                    })
+                    .collect();
+                let _ = std::fs::remove_dir_all(&root);
+                diagnostics
+            }))
+            .unwrap_or_else(|_| panic!("the compiler panicked analyzing the E84 workspace fixture"))
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker thread aborted")
+}
+
+/// The dependency counterpart of `e74_an_uncovered_effect_anchors_at_the_users_call`
+/// (shape: the strict read sits directly in the dependency function the user
+/// calls). Pre-widening (the probe, 2026-08-24): the primary anchored at
+/// `current.get()` IN `lib.vl`, the user's calls rode as mere hops, and no
+/// C3 note existed.
+#[test]
+fn e84_a_dependency_read_anchors_at_the_users_call() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+            )],
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert!(
+        diagnostic.message.contains(
+            "context `current` is read here, but this code can be reached without an enclosing `run`"
+        ),
+        "{message}",
+        message = diagnostic.message
+    );
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "read_it()"),
+        "the primary anchors at the USER's call, never inside the package"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the read is inside `read_it` here",
+            "lib.vl",
+            "current.get()"
+        )),
+        "the C3 note demotes the package-internal read, in ITS file"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "the chain holds the user's calls only"
+    );
+}
+
+/// The chain shape: the user calls the package's entry function and the read
+/// sits two package-internal frames deeper. The exact-length trace assertion
+/// is the internal-frames pin — pre-widening, `deep_read()` and `middle()`
+/// (both inside `lib.vl`) were labeled as hops.
+#[test]
+fn e84_a_dependency_chains_hops_exclude_package_internals() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun deep_read(): i32 {\n\tcurrent.get()\n}\n\nfun middle(): i32 {\n\tdeep_read()\n}\n\nfun entry(): i32 {\n\tmiddle()\n}\n",
+            )],
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "entry()"),
+        "the primary anchors at the user's call into the package"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the read is inside `deep_read` here",
+            "lib.vl",
+            "current.get()"
+        )),
+        "the note names the function holding the read, in the package's file"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "package-internal frames (`middle`, `deep_read`) are traversed but never labeled"
+    );
+}
+
+/// The injected-call flavor (row 223) gains its first library-internal
+/// incidence: the dependency declares the context AND the `context`-clause
+/// function; the user's call site is the entry. Pre-widening the primary
+/// anchored at `body()` inside `lib.vl`, note-free.
+#[test]
+fn e84_a_dependency_injected_call_demotes_the_same_way() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun call_it(body: (|| void) context current) {\n\tbody();\n}\n",
+            )],
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert!(
+        diagnostic.message.contains(
+            "an injected closure is called here, but this code can be reached without an enclosing `run` for context `current`"
+        ),
+        "{message}",
+        message = diagnostic.message
+    );
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "call_it(|| print(1))"),
+        "the primary anchors at the user's call"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the injected call is inside `call_it` here",
+            "lib.vl",
+            "body()"
+        )),
+        "the C3 note demotes the package-internal injected call"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "the injected flavor traces through the same helpers as the read flavor"
+    );
+}
+
+/// The C3a boundary, from the other side: a WORKSPACE sibling module (the
+/// user's own `pkg::` code, `Origin::Pkg`) never demotes — the primary stays
+/// at the read in the module's file, note-free, with the user-side chain as
+/// the trace. This is what pins "non-workspace" to the loader's
+/// classification rather than to "any other file".
+#[test]
+fn e84_a_workspace_sibling_read_still_anchors_at_itself() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::helper::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+            ),
+            (
+                "helper.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+            ),
+        ],
+        &[],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("helper.vl", "current.get()"),
+        "the user's own module anchors at the read (E74's no-over-correction half)"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for code the user wrote: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "read_it()",
+                true
+            ),
+        ],
+        "the chain labels the user's calls, entry → read"
+    );
+}
+
 // The dead-reader exemption: a program that imports `std::reactive` without
 // ever using the ambient layer must compile — an uncalled reader cannot run,
 // so it cannot run uncovered.

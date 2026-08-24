@@ -217,7 +217,8 @@ fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
 
 /// [`anchored`], carrying the E78 requirement trace (one label per uncovered
 /// user-written call, ordered entry → site) and, when the offending site sits
-/// in std, the C3 note that demotes the std frame.
+/// in library code (std or a dependency package — C3a/E84), the C3 note that
+/// demotes the library frame.
 fn anchored_tracing(
     program: &Program,
     anchor: Id,
@@ -236,12 +237,13 @@ fn anchored_tracing(
     )
 }
 
-/// The C3 note that demotes a std-internal site under a user-anchored primary
-/// (diagnostics-standard.md A2): the site's own span, labeled with the std
+/// The C3 note that demotes a library-internal site under a user-anchored
+/// primary (diagnostics-standard.md A2, widened by C3a/E84 from std to any
+/// dependency package): the site's own span, labeled with the library
 /// function whose body holds it (`the read is inside `get_owner` here`), in
 /// its own file. `what` names the site's role — "read" for a strict `get`,
 /// "injected call" for a call through a `context`-clause closure.
-fn std_frame_note(
+fn library_frame_note(
     program: &Program,
     graph: &CallGraph,
     site: Id,
@@ -250,15 +252,16 @@ fn std_frame_note(
     anchor: Id,
 ) -> Note {
     // The nearest enclosing FUNCTION of the site's owner node (a closure hops
-    // its lexical parents), for the label.
+    // its lexical parents), for the label; a site with no named holder (a
+    // module initializer's read) names its package instead.
     let mut current = site_owner;
     let holder = loop {
         if let Some(function) = program.functions.get(&current) {
-            break function.name;
+            break function.name.to_string();
         }
         match graph.closure_parent_of(current) {
             Some(parent) => current = parent,
-            None => break "std",
+            None => break package_name_of(program, site),
         }
     };
     Note {
@@ -270,6 +273,25 @@ fn std_frame_note(
             .note_source_of(site)
             .filter(|source| Some(*source) != program.note_source_of(anchor)),
     }
+}
+
+/// The name a demoted site's package was recorded under in `layer_platforms`
+/// (the same canonicalized containment test platform coloring uses): `std`,
+/// an entry dependency's import name, or the literal `a dependency` for a
+/// package only reachable transitively. The `std` fallback keeps the label
+/// honest for a std source that predates `layer_platforms` recording.
+fn package_name_of(program: &Program, site: Id) -> String {
+    program
+        .source_of(site)
+        .and_then(|source| program.canonical_sources.get(source.0 as usize))
+        .and_then(|path| {
+            program
+                .layer_platforms
+                .iter()
+                .find(|(root, _, _, _)| path.starts_with(root))
+                .map(|(_, name, _, _)| name.clone())
+        })
+        .unwrap_or_else(|| "std".to_string())
 }
 
 fn span_of(program: &Program, id: Id) -> crate::span::Span {
@@ -836,12 +858,13 @@ fn analyze(
     }
 
     // --- The A2 walk-back's inputs (E74, diagnostics-standard.md §1). ---
-    // A coverage refusal whose offending site sits in STD was caused by user
-    // code calling a std helper (`effect`/`map`/`or` all funnel to
-    // `get_owner`'s strict read), so the diagnostic must lead with the user's
-    // call, not std's body. The reporting loops below walk from the site's
-    // owner back along the same edges the strictness climbed, and these are
-    // those edges at call-site grain.
+    // A coverage refusal whose offending site sits in library code — std
+    // (`effect`/`map`/`or` all funnel to `get_owner`'s strict read) or a
+    // dependency package (E84) — was caused by user code calling into that
+    // library, so the diagnostic must lead with the user's call, not the
+    // library's body. The reporting loops below walk from the site's owner
+    // back along the same edges the strictness climbed, and these are those
+    // edges at call-site grain.
     let mut dispatch_incoming: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
     for (owner, call_id, candidates) in &dispatch_sites {
         for &candidate in candidates {
@@ -851,10 +874,15 @@ fn analyze(
                 .push((*owner, *call_id));
         }
     }
-    let std_spanned = |id: Id| -> bool {
-        program
-            .source_of(id)
-            .is_some_and(|source| program.std_sources.contains(&source))
+    // C3a's demotion domain (E84): code the user did not write — a std module
+    // or a dependency package's, both disk-loaded (an overlaid buffer is live
+    // user territory and anchors at itself). The anchoring walk (A2/E74) and
+    // hop labeling (E78) both go through this one predicate, so std and
+    // dependencies demote and trace identically.
+    let library_spanned = |id: Id| -> bool {
+        program.source_of(id).is_some_and(|source| {
+            program.std_sources.contains(&source) || program.dependency_sources.contains(&source)
+        })
     };
     // Whether a dispatch site can actually select `candidate` — the
     // concrete-receiver narrowing the coverage refinement uses, applied at
@@ -1275,23 +1303,25 @@ fn analyze(
             }
         }
 
-        // The A2 walk-back (E74): a refused site whose own span sits in std
-        // anchors at the user-written calls that enter std on an uncovered
-        // path — the async-polymorphism origin discipline (`record_origin`:
-        // ids are minted in walk order, so call-id order is program order),
-        // with the std site demoted to the C3 note. E74 kept only the
-        // least-id entry; E78 keeps them all — each uncovered entry becomes
-        // its own diagnostic (fixing the first must not merely reveal the
-        // next), returned in id order so the least-id one still leads,
-        // exactly where E74 anchored. A site in user code anchors at itself
-        // and returns no entries here. The walk descends the same edges the
-        // strictness climbed — direct calls, admitted dispatch calls, the
-        // capture hop — and only through UNBOUND callers: a covered caller
-        // is not on the uncovered path and must not take the blame. No user
-        // entry found (an uncovered read reachable only from std's own load
-        // would be std's bug, not the user's) falls back to the std anchor.
+        // The A2 walk-back (E74, widened to any dependency package by
+        // C3a/E84): a refused site whose own span sits in library code
+        // anchors at the user-written calls that enter the library on an
+        // uncovered path — the async-polymorphism origin discipline
+        // (`record_origin`: ids are minted in walk order, so call-id order
+        // is program order), with the library site demoted to the C3 note.
+        // E74 kept only the least-id entry; E78 keeps them all — each
+        // uncovered entry becomes its own diagnostic (fixing the first must
+        // not merely reveal the next), returned in id order so the least-id
+        // one still leads, exactly where E74 anchored. A site in user code
+        // anchors at itself and returns no entries here. The walk descends
+        // the same edges the strictness climbed — direct calls, admitted
+        // dispatch calls, the capture hop — and only through UNBOUND
+        // callers: a covered caller is not on the uncovered path and must
+        // not take the blame. No user entry found (an uncovered read
+        // reachable only from a library's own load would be the library's
+        // bug, not the user's) falls back to the library anchor.
         let user_entries_of = |site: Id, start: Id| -> Vec<Id> {
-            if !std_spanned(site) {
+            if !library_spanned(site) {
                 return Vec::new();
             }
             let mut entries: Vec<Id> = Vec::new();
@@ -1305,7 +1335,7 @@ fn analyze(
                     if bound.contains(&caller) {
                         continue;
                     }
-                    if std_spanned(call_id) {
+                    if library_spanned(call_id) {
                         walk.push(caller);
                     } else {
                         entries.push(call_id);
@@ -1315,7 +1345,7 @@ fn analyze(
                     if bound.contains(&caller) || !dispatch_admits(call_id, node) {
                         continue;
                     }
-                    if std_spanned(call_id) {
+                    if library_spanned(call_id) {
                         walk.push(caller);
                     } else {
                         entries.push(call_id);
@@ -1324,7 +1354,7 @@ fn analyze(
                 // A top-level call is an uncovered entry by construction; it
                 // has no node to walk onward to.
                 for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
-                    if !std_spanned(call_id) {
+                    if !library_spanned(call_id) {
                         entries.push(call_id);
                     }
                 }
@@ -1349,8 +1379,9 @@ fn analyze(
         // primary), breadth-first so a hop's depth is its least distance
         // from that frame. A covered caller's edge is skipped exactly as in
         // the walk above — a providing call is never labeled and stops the
-        // trace — and std-internal calls are traversed but never labeled
-        // (A2 demotes std frames; the C3 note already names the std site).
+        // trace — and library-internal calls (std's or a dependency
+        // package's, E84) are traversed but never labeled (A2 demotes
+        // library frames; the C3 note already names the library site).
         // The capture hop crosses no call site, so it adds no label and no
         // depth: the closure blames its defining scope's callers directly.
         struct Hop {
@@ -1373,7 +1404,7 @@ fn analyze(
                     if bound.contains(&caller) {
                         continue;
                     }
-                    if !std_spanned(call_id) {
+                    if !library_spanned(call_id) {
                         hops.push(Hop {
                             call: call_id,
                             dispatch: false,
@@ -1386,7 +1417,7 @@ fn analyze(
                     if bound.contains(&caller) || !dispatch_admits(call_id, node) {
                         continue;
                     }
-                    if !std_spanned(call_id) {
+                    if !library_spanned(call_id) {
                         hops.push(Hop {
                             call: call_id,
                             dispatch: true,
@@ -1396,7 +1427,7 @@ fn analyze(
                     frontier.push_back((caller, depth + 1));
                 }
                 for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
-                    if !std_spanned(call_id) {
+                    if !library_spanned(call_id) {
                         hops.push(Hop {
                             call: call_id,
                             dispatch: false,
@@ -1480,9 +1511,9 @@ fn analyze(
             let entries = user_entries_of(get.call_id, get.owner.id());
             if entries.is_empty() {
                 // A user-written read anchors at itself (E74), now carrying
-                // its upstream chain; a std-spanned read no user entry
-                // reaches keeps the bare std anchor, trace-free.
-                let trace = if std_spanned(get.call_id) {
+                // its upstream chain; a library-spanned read no user entry
+                // reaches keeps the bare library anchor, trace-free.
+                let trace = if library_spanned(get.call_id) {
                     Vec::new()
                 } else {
                     trace_of(get.owner.id(), get.call_id)
@@ -1501,7 +1532,7 @@ fn analyze(
                         entry,
                         message.clone(),
                         trace,
-                        Some(std_frame_note(
+                        Some(library_frame_note(
                             program,
                             graph,
                             get.call_id,
@@ -1525,7 +1556,7 @@ fn analyze(
             );
             let entries = user_entries_of(*call_id, owner.id());
             if entries.is_empty() {
-                let trace = if std_spanned(*call_id) {
+                let trace = if library_spanned(*call_id) {
                     Vec::new()
                 } else {
                     trace_of(owner.id(), *call_id)
@@ -1542,7 +1573,7 @@ fn analyze(
                         entry,
                         message.clone(),
                         trace,
-                        Some(std_frame_note(
+                        Some(library_frame_note(
                             program,
                             graph,
                             *call_id,
