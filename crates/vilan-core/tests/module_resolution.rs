@@ -1131,12 +1131,12 @@ fn a_derive_refusal_in_a_module_is_attributed_to_the_deriving_module() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::page::Widget;\n\
-                 fun main() {\n\tlet w = Widget { items = [1] };\n\tprint(w.items[0]);\n}\n",
+                "import std::print;\nimport pkg::page::{ Widget, Opaque };\n\
+                 fun main() {\n\tlet w = Widget { item = Opaque { x = 1 } };\n\tprint(w.item.x);\n}\n",
             ),
             (
                 "page.vl",
-                "[derive(PartialEq)]\nstruct Widget { items: List<i32> }\n",
+                "[derive(PartialEq)]\nstruct Widget { item: Opaque }\n\nstruct Opaque { x: i32 }\n",
             ),
         ],
         "main.vl",
