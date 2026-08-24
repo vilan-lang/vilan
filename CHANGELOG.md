@@ -17,6 +17,26 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: feature -->
+**Lists compare with `==`, and a struct with a `List` field can derive `PartialEq`.** `std::List` carried only the inherent `T: PartialEq` methods (`contains`, `index_of`) — the type itself never satisfied a `PartialEq` bound, so `[derive(PartialEq)]` on a struct holding a `List<…>` field was refused ("type 'List' does not implement the `PartialEq` operator") and the first real site wrote its `eq` by hand, hop by hop (I4, found by E80's lane). `impl List<T: PartialEq> with PartialEq` now compares element-wise, length first; the impl is conditional, so nested lists (`List<List<i32>>`) compare through their elements and the derive on a `List`-holding struct just works. The hand-written impl and its helper can be deleted wherever a struct was carrying one.
+
+---
+
+<!-- family: feature -->
+**`Document` gains `description(text)` — `title`'s twin.** The first real site put its `<meta name="description">` through the `head()` hatch and interpolated the text raw, so a `"` in a description would have ended the attribute and turned the remainder into junk attributes a browser tolerates — the page looks right and the search snippet is wrong (E85, the §10.1 review's first graduation; `proposal/fullstack-dx.md` §16.13, ruled 2026-08-22). `Document::of(build).title("Notes").description("A tidy list.")` now writes `<meta name="description" content="A tidy list." />` beside the `<title>` in the generated prefix, escaped the way an attribute value must be; a document not given one carries no description meta at all. The ruled bound moves with it: rung 2 is the intersection of the shells in the tree, **plus the identity lines the document is the sole author of** — `title` and `description` — while everything naming a second party the build cannot see (a file, a host, an address, a palette) stays a `head()` call. Like `title`, it shapes the generated document only: a supplied shell's identity lines are the shell's own.
+
+---
+
+<!-- family: feature -->
+**`data-*`/`aria-*` attributes in element heads are a documented, pinned guarantee.** `<div data-foo-bar("x") aria-label("y")>` has always parsed, checked, and emitted its attributes verbatim — the name-blind desugar never cared that a name has hyphens — but nothing said so, and nothing pinned it (E87, the owner's question, probed 2026-08-22). Now the guide says it (hyphens are ordinary attribute-name characters, exactly as in HTML — no `data:` marker family, no `.data("foo-bar", v)` method twin) and a compiler test pins the probe end to end, so the spelling can never silently regress into needing one.
+
+---
+
+<!-- family: feature -->
+**Repeated `head()`/`body()` calls land one per line.** Consecutive hatch calls used to concatenate with no separator — two `head()` calls put two items on one line of the served page — which is why the first real site wrote its own `joined()` helper and called the hatch once with everything pre-joined (E86, `proposal/fullstack-dx.md` §16.13, ruled 2026-08-22). Consecutive calls now join with a newline at the hatch's indent, on the generated document and the supplied-shell splice alike, so the hatch is usable per item and the written page still reads in View Source — the §15.1 promise, kept for both spellings.
+
+---
+
 <!-- family: breaking -->
 **`std`, `pkg`, and `macro_std` are reserved package names; the manifest now refuses them.** They name the three import roots themselves, and until now nothing defended that: a dependency declared as `std = { path = "…" }` silently shadowed the entire standard library — every `import std::…` in the package resolved into the dependency, so `import std::print` failed with "cannot find 'print' in the imported path" while `std::whatever_the_dependency_has` quietly bound — a dependency named `pkg` was accepted and then silently unreachable (the self-package root always wins, so the declaration did nothing), a dependency named `macro_std` shadowed the macro world's std and satisfied the macro-body hermeticity check by spelling alone, and a `[package]` could name itself `std` without a word. Now a `[package] name` or a dependency key in `[package.dependencies]`, `[library.dependencies]`, or `[project.dependencies]` claiming one of the three is a manifest error, at the same layer every manifest problem reports: `` `std` is a reserved package name: the standard library owns it (`std`, `pkg`, and `macro_std` are all reserved); rename the package `` — the CLI refuses before any dependency work, and the editor publishes it on the `vilan.toml`. The dependency fix is free: the key is the import name and yours to choose, so rename it; the library it points at keeps its own name. `[library] name` is deliberately exempt — the standard library itself is the `[library]` named `std` (likewise `macro_std`), and a library's own name, unlike a dependency key, never binds an import root. Spec §4.2/§11.4, tour "Projects and dependencies"; the ruling is `proposals/proposal/std-shape.md` §4 (L12, RULED 2026-08-22).
 
@@ -24,6 +44,8 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 <!-- family: tooling -->
 **A bare scope-position completion no longer costs twenty member completions.** K9's measurement (`proposal/playground-completion.md` §9) had members and import paths answering in ~3 ms but a bare scope position at 51 ms for 131 items — in the language server and the playground alike, since both drive the same engine: the E54c auto-import path called `formatter::insert_import`, a full re-parse of the buffer, once per surviving candidate (the cap is 20), and every candidate's `///` doc re-read — re-cloned — its module's text through `read_source`. The buffer is now parsed once per completion request and shared across every candidate's edit (`formatter::ParsedSource`, a parsed-input twin beside the string `insert_import`, both pinned to answer byte-identically), and module texts are cached per request on the `Analysis` — per query, never global, so an overlay edit still lands in the next query's reads. The pins hold the *counts*, not the time: a completion request pays exactly one whole-buffer parse and one text read per docs module, each plant-proven red by restoring the per-candidate call. Re-measured on §9's folded walkthrough scenario (release wasm under node, median of 20): the scope position 60.8 ms → 5.8 ms for the same 136 items, with member completion (2.7 ms) and the worker round trip (3.0 ms) unchanged; the completion wire is byte-identical. Record: `proposal/playground-completion.md` §9 (amended 2026-08-24).
+
+---
 
 ---
 

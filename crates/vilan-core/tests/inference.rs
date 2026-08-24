@@ -16566,6 +16566,130 @@ fn prelude_derives_need_no_import() {
     );
 }
 
+// --- I4: `List<T: PartialEq>` implements `PartialEq` (element-wise, length
+// first). Found by E80's lane: `[derive(PartialEq)]` on a struct with a
+// `List<…>` field was refused ("type 'List' does not implement the PartialEq
+// operator"), and the website's `DiagRow` wrote its `eq` by hand. One pin per
+// case; the derive pin is the shape that was refused, and removing the impl
+// reddens every one of them with that exact refusal — the plant IS the old
+// state.
+
+#[test]
+fn i4_empty_lists_are_equal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let a: List<i32> = [];
+            let b: List<i32> = [];
+            print(a == b);
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn i4_equal_lists_compare_equal_through_both_spellings() {
+    // `==` is what the derive emits per field; `.eq` is the trait member the
+    // generic `T: PartialEq` world calls — same impl, both pinned.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let a = [1, 2, 3];
+            let b = [1, 2, 3];
+            print(a == b);
+            print(a.eq(b));
+            print(a != b);
+        }
+        main();
+        "#,
+        "true\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_lists_of_unequal_length_are_not_equal() {
+    // Length first: a strict prefix is not equal, in either direction — the
+    // shorter side never indexes past its end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print(["a", "b"] == ["a", "b", "c"]);
+            print(["a", "b", "c"] == ["a", "b"]);
+        }
+        main();
+        "#,
+        "false\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_lists_with_a_differing_element_are_not_equal() {
+    // Same length, one pair disagrees — first, middle, and last position.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print([9, 2, 3] == [1, 2, 3]);
+            print([1, 9, 3] == [1, 2, 3]);
+            print([1, 2, 9] == [1, 2, 3]);
+        }
+        main();
+        "#,
+        "false\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_nested_lists_compare_element_wise() {
+    // The impl is conditional (`T: PartialEq`), so `List<i32>: PartialEq`
+    // makes `List<List<i32>>: PartialEq` — equality recurses through the
+    // element impl, and a deep disagreement surfaces.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print([[1, 2], [3]] == [[1, 2], [3]]);
+            print([[1, 2], [3]] == [[1, 2], [4]]);
+            print([[1, 2], [3]] == [[1, 2]]);
+        }
+        main();
+        "#,
+        "true\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn i4_a_struct_with_a_list_field_derives_partial_eq() {
+    // The refused shape itself (E80's finding, the website's `DiagRow`): the
+    // derive emits `self.tags == other.tags`, which lands on the new impl.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        [derive(PartialEq)]
+        struct Row {
+            id: i32,
+            tags: List<str>,
+        }
+
+        fun main() {
+            let a = Row { id = 1, tags = ["x", "y"] };
+            let b = Row { id = 1, tags = ["x", "y"] };
+            let c = Row { id = 1, tags = ["x"] };
+            print(a == b);
+            print(a == c);
+        }
+        main();
+        "#,
+        "true\nfalse\n",
+    );
+}
+
 // The macro world's AMBIENT meta prelude (macro-engine.md §3/§10): the
 // reflection vocabulary — the meta types, `source`, `fresh` — is in scope in
 // every macro body with no imports at all. Libraries (`option`, `build`)
@@ -43669,6 +43793,26 @@ fn ssr_element_renders_mixed_content() {
         }
         "#,
         "<p title=\"a &amp; b\">Take <code>vilan upgrade</code> &amp; &lt;go&gt;</p>\n",
+    );
+}
+
+#[test]
+fn hyphenated_attribute_names_parse_and_emit_verbatim() {
+    // E87 (element-syntax.md §2, blessed 2026-08-22): hyphens are ordinary
+    // attribute-name characters, exactly as in HTML — `data-*`/`aria-*` need
+    // no special form and no method twin, because the name-blind desugar
+    // lowers `data-foo-bar("x")` to `.attr("data-foo-bar", "x")` without
+    // ever reading the name. The owner's probe, pinned end to end: parse,
+    // check, and the emitted attributes verbatim.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(<div data-foo-bar("x") aria-label("y")>"z"</div>));
+        }
+        "#,
+        "<div data-foo-bar=\"x\" aria-label=\"y\">z</div>\n",
     );
 }
 

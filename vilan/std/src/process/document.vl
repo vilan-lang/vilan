@@ -209,6 +209,10 @@ struct Document {
 	/// The `<title>`'s text. Empty until `title()` says otherwise: a document
 	/// that was not given one has no title rather than an invented one.
 	title: str,
+	/// The `<meta name="description">`'s text (E85) — `title`'s twin. Empty
+	/// until `description()` says otherwise, and an empty description emits
+	/// no meta at all: absent beats an empty identity line.
+	description: str,
 	/// `<html lang>`.
 	lang: str,
 	/// The mount element's id, for a generated document.
@@ -247,6 +251,7 @@ impl Document {
 			shell = None,
 			source = "",
 			title = "",
+			description = "",
 			lang = "en",
 			mount = default_mount,
 			head = "",
@@ -268,7 +273,7 @@ impl Document {
 	/// precisely so that dropping a rung never drops the check.
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>> {
 		match check_shell(shell, build, default_mount) {
-			Ok(let _checked) => Ok(Document { build = build, shell = Some(shell), source = "this supplied shell", title = "", lang = "en", mount = default_mount, head = "", body = "", rendered = "", splice = splice_point(shell, default_mount) }),
+			Ok(let _checked) => Ok(Document { build = build, shell = Some(shell), source = "this supplied shell", title = "", description = "", lang = "en", mount = default_mount, head = "", body = "", rendered = "", splice = splice_point(shell, default_mount) }),
 			Err(let faults) => Err(faults),
 		}
 	}
@@ -276,6 +281,23 @@ impl Document {
 	/// The `<title>`'s text, escaped when the document is written.
 	fun title(own self, title: str): Document {
 		self.title = title;
+		self
+	}
+
+	/// The description's text — `<meta name="description" content="…">`,
+	/// escaped when the document is written, beside the `<title>` in the
+	/// generated prefix. `title`'s twin (E85): the two identity lines the
+	/// document is the sole author of (fullstack-dx.md §16.13's ruled bound)
+	/// — everything that names a second party std cannot see (a file, a
+	/// host, an address, a palette) stays a `head()` hatch. A document not
+	/// given a description carries no description meta at all.
+	///
+	/// Like `title`, this shapes the GENERATED document only. A supplied
+	/// shell's `<head>` already has an author, so its identity lines are the
+	/// shell's to write — the document is not their sole author there, and
+	/// splicing a second copy in would make two.
+	fun description(own self, text: str): Document {
+		self.description = text;
 		self
 	}
 
@@ -298,11 +320,13 @@ impl Document {
 	}
 
 	/// Raw markup appended inside `<head>`: a favicon, an `og:` tag, a CSP, an
-	/// inline `<style>` for the page frame. Repeatable — each call appends.
-	/// On a generated document it lands inside the `<head>` the document
-	/// writes; on a supplied shell it splices in immediately before the
-	/// shell's own `</head>` (E77) — a shell that carries no `</head>` stops
-	/// at `html()` rather than having the markup guessed into it.
+	/// inline `<style>` for the page frame. Repeatable — each call appends on
+	/// its own line (E86), so the hatch is usable per item and the written
+	/// page still reads in View Source (§15.1). On a generated document it
+	/// lands inside the `<head>` the document writes; on a supplied shell it
+	/// splices in immediately before the shell's own `</head>` (E77) — a
+	/// shell that carries no `</head>` stops at `html()` rather than having
+	/// the markup guessed into it.
 	///
 	/// It is raw on purpose (that is what an escape hatch is), and it is not an
 	/// exemption: when the page is written, `html()` runs the assembled markup
@@ -310,16 +334,17 @@ impl Document {
 	/// here to a stylesheet the build did not emit stops the boot exactly as
 	/// it would in a hand-written shell.
 	fun head(own self, markup: str): Document {
-		self.head = self.head + markup;
+		self.head = joined_hatch(self.head, markup);
 		self
 	}
 
 	/// Raw markup appended inside `<body>` — before the script tag on a
 	/// generated document, immediately before the shell's own `</body>` on a
-	/// supplied one (E77). Repeatable. An escape hatch like `head`, and
-	/// checked at `html()` like it too.
+	/// supplied one (E77). Repeatable, each call on its own line, like `head`
+	/// (E86). An escape hatch like `head`, and checked at `html()` like it
+	/// too.
 	fun body(own self, markup: str): Document {
-		self.body = self.body + markup;
+		self.body = joined_hatch(self.body, markup);
 		self
 	}
 
@@ -406,6 +431,10 @@ impl Document {
 		markup = markup + "\t\t<meta charset=\"utf-8\" />\n";
 		markup = markup + "\t\t<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n";
 		markup = markup + i"\t\t<title>{escape_text(self.title)}</title>\n";
+		// The other identity line (E85) — if and only if one was given.
+		if self.description != "" {
+			markup = markup + i"\t\t<meta name=\"description\" content=\"{escape_attribute(self.description)}\" />\n";
+		}
 		// If and only if the build emitted styles — the whole of F1 and F2, on
 		// the generating side.
 		match self.build.styles {
@@ -515,6 +544,22 @@ fun closing_point(shell: str, name: str): Option<i32> {
 /// shell the tag, or give the markup to the shell.
 fun missing_closing_tag(source: str, name: str): str {
 	i"{source} has no </{name}> for this document's {name}() markup to splice before — add </{name}> to the shell, or write the markup into the shell itself"
+}
+
+/// Consecutive `head()`/`body()` calls, joined: a newline at the hatch's
+/// indent (two tabs — where the generated document writes hatch markup)
+/// between one call's markup and the next, so a hatch used PER ITEM puts each
+/// item on its own line of the written page (E86, fullstack-dx.md §16.13)
+/// instead of running them together on one. Empty markup joins as nothing:
+/// `head("")` was a no-op before this and stays one.
+fun joined_hatch(existing: str, markup: str): str {
+	if existing == "" {
+		markup
+	} else if markup == "" {
+		existing
+	} else {
+		existing + "\n\t\t" + markup
+	}
 }
 
 /// `text` with each insertion's markup spliced in at its index. The indices
