@@ -23105,13 +23105,27 @@ impl<'src> Analyzer<'src> {
                     }
                 }
 
-                if let Some(target_return_type_id) = target_return_type_id
-                    && let Some((brace_span, tail_id, last_statement_id)) =
-                        self.closure_block_tail(return_expr_id)
-                {
+                if let Some(target_return_type_id) = target_return_type_id {
+                    // The route's anchor and checked position, per body shape:
+                    // a BLOCK body checks its tail, anchored at the closing
+                    // brace (S3); a BARE-EXPRESSION body (`|x| x + 1`, B132)
+                    // has no brace, so the route checks the expression itself,
+                    // anchored ON it — the same check, the same steer quality,
+                    // where it used to fall through to the whole-value
+                    // comparison at the argument and report the closure as
+                    // `Expected |Point| str, but got |Point| i32`.
+                    let (anchor_span, checked_id, last_statement_id) =
+                        match self.closure_block_tail(return_expr_id) {
+                            Some(block) => block,
+                            None => {
+                                let expression_span =
+                                    **self.span_map.get(&return_expr_id).unwrap_or(&&EMPTY_SPAN);
+                                (expression_span, return_expr_id, None)
+                            }
+                        };
                     let target_return_type = target_return_type_id.get_type(self);
                     match self.check_return_position(
-                        tail_id,
+                        checked_id,
                         &target_return_type,
                         last_statement_id,
                         substitution_context,
@@ -23142,7 +23156,7 @@ impl<'src> Analyzer<'src> {
                             // reports then. A statement that is itself an
                             // error node never types and is not waited for
                             // (its own diagnostic is the root cause).
-                            if matches!(self.expr_id_to_expr_map.get(&tail_id), Some(Expr::Void))
+                            if matches!(self.expr_id_to_expr_map.get(&checked_id), Some(Expr::Void))
                                 && let Some(statement_id) = last_statement_id
                                 && !self.variables.contains_key(&statement_id)
                                 && !matches!(
@@ -23169,12 +23183,12 @@ impl<'src> Analyzer<'src> {
                             if !self
                                 .diagnostics
                                 .iter()
-                                .any(|d| d.span == brace_span && d.msg == msg)
+                                .any(|d| d.span == anchor_span && d.msg == msg)
                             {
                                 self.diagnostics.push(Error {
                                     trace: Vec::new(),
                                     note: None,
-                                    span: brace_span,
+                                    span: anchor_span,
                                     msg,
                                 });
                             }
@@ -27116,12 +27130,12 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// The braced-block form of a closure body (`|x| { .. }`, as opposed to
-    /// the bare-expression form `|x| x + 1`, which has no closing brace to
-    /// anchor at): the block's own span (whose LAST byte, after S3's parser
-    /// fix, is exactly the closing `}`), its tail's id, and — mirroring the
-    /// named-function walk — its last STATEMENT's id for the regime-1/1'
-    /// distinction.
+    /// The braced-block form of a closure body (`|x| { .. }`): the block's
+    /// own span (whose LAST byte, after S3's parser fix, is exactly the
+    /// closing `}`), its tail's id, and — mirroring the named-function walk —
+    /// its last STATEMENT's id for the regime-1/1' distinction. `None` for
+    /// the bare-expression form (`|x| x + 1`), which S3's route anchors at
+    /// the expression itself instead (B132).
     fn closure_block_tail(&self, return_expr_id: Id) -> Option<(Span, Id, Option<Id>)> {
         let Expr::Block((statement_ids, tail_id)) =
             self.expr_id_to_expr_map.get(&return_expr_id)?

@@ -13048,12 +13048,16 @@ fn b125_a_closure_tail_disagreeing_with_the_annotation_reports_once_at_the_brace
     assert_fails_without(source, "List<str>");
 }
 
-// The bare-expression spelling has no brace to anchor at (S3 scoped the
-// return-position route to block bodies), so the argument check reports the
-// closure as a whole value — still once, still narrower than the whole call
-// the annotation used to be compared against.
+// The bare-expression spelling: S3's route used to be scoped to block bodies
+// ("no closing brace to anchor at"), so this reported the closure as a whole
+// value at the argument check. B132 routes bare bodies through the same
+// return-position check, anchored ON the expression — the b125 B5 claim
+// (exactly one diagnostic, the `let` never doubles it) is unchanged; only
+// the anchor narrowed. Re-pinned from
+// `b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closure`:
+// same program, the new anchor.
 #[test]
-fn b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closure() {
+fn b132_a_bare_closure_body_disagreeing_with_the_annotation_reports_on_the_expression() {
     let source = r#"
         import std::print;
 
@@ -13067,12 +13071,120 @@ fn b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closu
         }
         "#;
     assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "point.x * 2", "Expected str, but got i32 instead.");
+    assert_fails_without(source, "|Point| str");
+    assert_fails_without(source, "List<str>");
+}
+
+// The void-valued bare body: the same route, the same anchor, the plain
+// mismatch wording (a real void value, not the missing-value regime — there
+// is no `;` to blame in a bare expression).
+#[test]
+fn b132_a_void_bare_closure_body_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| print(point.x));
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
     assert_fails_spanning(
         source,
-        "|point| point.x * 2",
-        "Expected |Point| str, but got |Point| i32 instead.",
+        "print(point.x)",
+        "Expected i32, but got void instead.",
     );
+    assert_fails_without(source, "List<void>");
+}
+
+// A bare `if` with no `else` gets regime 2's wording (S3), exactly as the
+// same tail inside a block body does.
+#[test]
+fn b132_a_bare_if_without_else_body_names_the_gap() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| if point.x > 0 { 1 });
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "if point.x > 0 { 1 }",
+        "Expected i32, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// The free-function spelling shares the route (B90 keeps the two call paths
+// one rule): the expectation binds `U`, and the bare body reports on the
+// expression there too.
+#[test]
+fn b132_the_free_function_spelling_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        fun apply<U>(xs: List<i32>, f: |i32| U): List<U> {
+        	xs.map(f)
+        }
+
+        fun main() {
+        	let xs = [1, 2];
+        	let out: List<str> = apply(xs, |x| x * 2);
+        	print(out.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "x * 2", "Expected str, but got i32 instead.");
     assert_fails_without(source, "List<str>");
+}
+
+// A closure's OWN return annotation over a bare body takes the same route
+// (rule 2 "directly"): the report lands on the expression, not the closure
+// as a whole value.
+#[test]
+fn b132_an_annotated_bare_body_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32|: str x + 1;
+        	print(f(1));
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "x + 1", "Expected str, but got i32 instead.");
+}
+
+// The route must not manufacture failures: an agreeing bare body under the
+// same expectation still compiles and runs.
+#[test]
+fn b132_an_agreeing_bare_body_still_compiles_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| point.x * 2);
+        	print(widths[0]);
+        }
+        "#,
+        "2\n",
+    );
 }
 
 // A PARAMETER that disagrees with the receiver keeps P27's whole-value anchor
@@ -54308,7 +54420,31 @@ fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
             print(1);
         }
         "#,
-        "Expected |Route| Route, but got |Route| Other instead.",
+        // B132 narrowed the anchor: the bound target (`T = Route`) is ground,
+        // so the bare body takes S3's return-position route and the mismatch
+        // reports ON the expression in the binding's terms, no longer as the
+        // whole closure value (`Expected |Route| Route, but got |Route| Other`).
+        "Expected Route, but got Other instead.",
+    );
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            let made = Holder { tag = 0 }.twice(Route::Away(1), |current| Other::Second(3));
+            print(1);
+        }
+        "#,
+        "Other::Second(3)",
+        "Expected Route, but got Other instead.",
     );
 }
 
