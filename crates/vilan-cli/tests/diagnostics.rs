@@ -902,3 +902,62 @@ fn e84_a_dependency_read_reports_at_the_users_call() {
         "package-internal frames are never labeled, so their lines never render: {stderr}"
     );
 }
+
+#[test]
+fn e90_a_workspace_member_read_reports_at_itself() {
+    // The member carve-out, end to end through the real manifest chain (E90,
+    // diagnostics-standard.md C3a ruling note): the SAME package shape as
+    // `e84_a_dependency_read_reports_at_the_users_call`, now declared in the
+    // enclosing `[project]`'s `packages` — so it is the user's own code, and
+    // the demotion never happens: the primary renders at the read in the
+    // member's file, no C3 demotion note, and the member-internal call
+    // frames render as labeled hops. Only the declaration differs from the
+    // e84 fixture — membership, never path.
+    let dir = temp_files(
+        "e90_member",
+        &[
+            (
+                "vilan.toml",
+                "[project]\npackages = [\"app\", \"common\"]\n",
+            ),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
+            ),
+            (
+                "app/src/main.vl",
+                "import std::print;\nimport common::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+            ),
+            ("common/vilan.toml", "[library]\nname = \"common\"\n"),
+            (
+                "common/src/lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun deep_read(): i32 {\n\tcurrent.get()\n}\n\nfun middle(): i32 {\n\tdeep_read()\n}\n\nfun entry(): i32 {\n\tmiddle()\n}\n",
+            ),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir.join("app"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the uncovered read must fail");
+    assert!(
+        renders_in(&stderr, "lib.vl", "current.get()"),
+        "the primary renders at the read, in the member's own file: {stderr}"
+    );
+    assert!(
+        stderr.find("lib.vl").unwrap() < stderr.find("main.vl").unwrap(),
+        "the member's file LEADS the report — it holds the primary, not a sub-report \
+         (the demoted rendering leads with main.vl): {stderr}"
+    );
+    assert!(
+        !stderr.contains("the read is inside"),
+        "no demotion note for a workspace member: {stderr}"
+    );
+    assert!(
+        stderr.contains("middle()"),
+        "member-internal frames are labeled hops, so their lines render: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "print(entry());"),
+        "the user-side hop still renders in main.vl: {stderr}"
+    );
+}

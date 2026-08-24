@@ -18635,6 +18635,13 @@ main();
 struct DependencyFixture {
     import_name: &'static str,
     files: &'static [(&'static str, &'static str)],
+    /// Whether the package is a declared workspace MEMBER (`[project]
+    /// packages`, E90) — the manifest resolver's classification, staged
+    /// directly here since the harness enters the `Workspace` by hand
+    /// (`manifest.rs` pins the resolver's own decision). A member is the
+    /// user's code: never demoted. An external package (`false`) keeps the
+    /// E84 demotion.
+    member: bool,
 }
 
 /// One diagnostic from a workspace-with-dependencies analysis, fully
@@ -18705,6 +18712,7 @@ fn analyze_workspace_with_dependencies(
             layers: Vec::new(),
             dependencies: Vec::new(),
             surface: true,
+            member: dependency.member,
         });
         entry_dependencies.push((dependency.import_name.to_string(), index));
     }
@@ -18829,6 +18837,7 @@ fn e84_a_dependency_read_anchors_at_the_users_call() {
                 "lib.vl",
                 "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
             )],
+            member: false,
         }],
     );
     assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
@@ -18891,6 +18900,7 @@ fn e84_a_dependency_chains_hops_exclude_package_internals() {
                 "lib.vl",
                 "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun deep_read(): i32 {\n\tcurrent.get()\n}\n\nfun middle(): i32 {\n\tdeep_read()\n}\n\nfun entry(): i32 {\n\tmiddle()\n}\n",
             )],
+            member: false,
         }],
     );
     assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
@@ -18946,6 +18956,7 @@ fn e84_a_dependency_injected_call_demotes_the_same_way() {
                 "lib.vl",
                 "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun call_it(body: (|| void) context current) {\n\tbody();\n}\n",
             )],
+            member: false,
         }],
     );
     assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
@@ -19044,6 +19055,268 @@ fn e84_a_workspace_sibling_read_still_anchors_at_itself() {
             ),
         ],
         "the chain labels the user's calls, entry → read"
+    );
+}
+
+// --- E90: workspace MEMBERS are carved out of the E84 demotion ---
+// (diagnostics-standard.md C3a ruling note, RULED 2026-08-24): a `[project]`
+// member reached through a path edge classifies `Origin::Dep` like any
+// dependency, but it is code the user edits — so it gets full user
+// treatment: reads anchor at themselves in the member's file, note-free,
+// with member-internal calls labeled as hops. Only genuinely external
+// packages (git, unlisted path) demote. Membership is the root manifest's
+// `packages` declaration (`PackageSpec::member`, pinned in `manifest.rs`),
+// never a path test; the harness stages the resolver's decision directly.
+
+/// The member counterpart of `e84_a_dependency_chains_hops_exclude_package_internals`:
+/// the same chain shape (entry → middle → deep_read → the read), now in a
+/// declared workspace member. Pre-carve-out (the E84 tree) the primary
+/// anchored at the user's `entry()` call with the read demoted to the C3
+/// note and the member's internal frames unlabeled.
+#[test]
+fn e90_a_member_package_read_anchors_at_itself_with_its_chain_labeled() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport common::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "common",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun deep_read(): i32 {\n\tcurrent.get()\n}\n\nfun middle(): i32 {\n\tdeep_read()\n}\n\nfun entry(): i32 {\n\tmiddle()\n}\n",
+            )],
+            member: true,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("lib.vl", "current.get()"),
+        "a member's read anchors AT ITSELF, in the member's file"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for the user's own workspace member: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "entry()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "lib.vl",
+                "middle()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "lib.vl",
+                "deep_read()",
+                true
+            ),
+        ],
+        "member-internal calls are labeled like the user's own, entry → read"
+    );
+}
+
+/// The same carve-out through the OTHER load site (the module loop, not the
+/// `lib.vl` surface): the read sits in a member's module reached as
+/// `common::util::read_it`. Pre-carve-out it demoted exactly like
+/// `e90_an_external_packages_module_read_still_demotes`' shape.
+#[test]
+fn e90_a_member_packages_module_read_anchors_at_itself() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport common::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "common",
+            files: &[
+                ("lib.vl", ""),
+                (
+                    "util.vl",
+                    "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+                ),
+            ],
+            member: true,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("util.vl", "current.get()"),
+        "a member module's read anchors at itself"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for a member's module: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "read_it()",
+                true
+            ),
+        ],
+        "the chain labels the calls, entry → read"
+    );
+}
+
+/// The injected-call flavor (row 223) in a MEMBER: the member declares both
+/// the context and the `context`-clause function, and carves out exactly
+/// like the read flavor — the primary anchors at the member-internal
+/// `body()` in the member's file, note-free, with the user's calls as the
+/// chain. Pre-carve-out this shape demoted like
+/// `e84_a_dependency_injected_call_demotes_the_same_way`.
+#[test]
+fn e90_a_member_packages_injected_call_anchors_at_itself() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport common::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "common",
+            files: &[(
+                "lib.vl",
+                "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun call_it(body: (|| void) context current) {\n\tbody();\n}\n",
+            )],
+            member: true,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert!(
+        diagnostic.message.contains(
+            "an injected closure is called here, but this code can be reached without an enclosing `run` for context `current`"
+        ),
+        "{message}",
+        message = diagnostic.message
+    );
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("lib.vl", "body()"),
+        "a member's injected call anchors at itself, in the member's file"
+    );
+    assert!(
+        diagnostic.note.is_none(),
+        "no demotion note for the user's own workspace member: {note:?}",
+        note = diagnostic.note
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "main()",
+                true
+            ),
+            (
+                "the context requirement flows through this call",
+                "main.vl",
+                "call_it(|| print(1))",
+                true
+            ),
+        ],
+        "the chain labels the user's calls, entry → injected call"
+    );
+}
+
+/// The boundary's other side, at the module load site: an EXTERNAL package's
+/// module (member: false — a git checkout or an unlisted path dep) keeps the
+/// E84 demotion. This is the control that pins the carve-out to MEMBERSHIP —
+/// an over-carve of every `Origin::Dep` package goes red here.
+#[test]
+fn e90_an_external_packages_module_read_still_demotes() {
+    let diagnostics = analyze_workspace_with_dependencies(
+        &[(
+            "main.vl",
+            "import std::print;\nimport depctx::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+        )],
+        &[DependencyFixture {
+            import_name: "depctx",
+            files: &[
+                ("lib.vl", ""),
+                (
+                    "util.vl",
+                    "import std::context::Context;\n\nlet current: Context<i32> = Context::new();\n\nfun read_it(): i32 {\n\tcurrent.get()\n}\n",
+                ),
+            ],
+            member: false,
+        }],
+    );
+    assert_eq!(diagnostics.len(), 1, "one refusal, one primary");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        (diagnostic.file.as_str(), diagnostic.anchor.as_str()),
+        ("main.vl", "read_it()"),
+        "an external package's module still demotes to the user's call"
+    );
+    assert_eq!(
+        diagnostic.note.as_ref().map(|(msg, file, text)| (
+            msg.as_str(),
+            file.as_str(),
+            text.as_str()
+        )),
+        Some((
+            "the read is inside `read_it` here",
+            "util.vl",
+            "current.get()"
+        )),
+        "the C3 note demotes the read into the module's own file"
+    );
+    assert_eq!(
+        diagnostic
+            .trace
+            .iter()
+            .map(|(msg, file, text, call)| (msg.as_str(), file.as_str(), text.as_str(), *call))
+            .collect::<Vec<_>>(),
+        vec![(
+            "the context requirement flows through this call",
+            "main.vl",
+            "main()",
+            true
+        )],
+        "the chain holds the user's calls only"
     );
 }
 
