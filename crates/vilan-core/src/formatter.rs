@@ -7,12 +7,33 @@
 //! input's (ignoring spans, whitespace, and comments); on any mismatch it returns
 //! the source unchanged rather than risk corrupting the file.
 
+use std::cell::Cell;
+
 use crate::node::{
     BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
     NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
+
+thread_local! {
+    /// How many whole-buffer parses ([`parse`]) this thread has paid so far —
+    /// the formatter's unit of real work, and what made a bare scope
+    /// completion cost ~20 member completions before E83 (`insert_import`
+    /// re-parsed the buffer per auto-import candidate,
+    /// `proposals/proposal/playground-completion.md` §9).
+    static BUFFER_PARSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The number of whole-buffer parses this thread's formatter has performed —
+/// an instrumentation probe (E83), not a behavior surface. Monotonic: read a
+/// snapshot before and after the work under test and assert on the
+/// difference, the way the E23 leak tally is read. The pins that hold a
+/// completion request to ONE buffer parse (however many auto-import
+/// candidates it shapes) are what this exists for.
+pub fn buffer_parse_count() -> u64 {
+    BUFFER_PARSES.with(Cell::get)
+}
 
 /// Extracts `//` line comments from `source` as `(span, text)` in source order.
 /// `text` keeps the leading `//` and is trimmed of trailing whitespace. String
@@ -694,6 +715,35 @@ fn statement_end(source: &str, from: usize) -> usize {
     index
 }
 
+/// One clean parse of a source buffer, held so repeated [`insert_import`]
+/// probes share it (E83): auto-import completion computes an edit for every
+/// surviving candidate against the SAME buffer, and the parse is the
+/// expensive half of each probe — a bare scope position used to pay it once
+/// per candidate (`proposals/proposal/playground-completion.md` §9). Parse
+/// once per request, probe once per candidate.
+pub struct ParsedSource<'src> {
+    source: &'src str,
+    items: NodeList<'src>,
+}
+
+impl<'src> ParsedSource<'src> {
+    /// Parses `source` for [`Self::insert_import`] probes — `None` when it
+    /// does not parse cleanly (the formatter's usual safety rule: no edit
+    /// would be safe, so no probe could answer either).
+    pub fn parse(source: &'src str) -> Option<Self> {
+        Some(ParsedSource {
+            source,
+            items: parse(source)?,
+        })
+    }
+
+    /// [`insert_import`] against the already-parsed buffer: byte-identical
+    /// answers, one parse however many leaves are probed.
+    pub fn insert_import(&self, module_path: &[&str], leaf: &str) -> Option<ImportInsertEdit> {
+        insert_import_into(self.source, &self.items, module_path, leaf)
+    }
+}
+
 /// Computes the edit that adds `import <module_path>::<leaf>;` to `source` —
 /// the LSP add-import quickfix's insert half, and the edit an auto-import
 /// completion candidate carries (E54). Extends an existing PLAIN `import`
@@ -707,9 +757,23 @@ fn statement_end(source: &str, from: usize) -> usize {
 /// rule: no edit would be safe) or the leaf is already imported from
 /// `module_path` (nothing to do — the caller asked to add something that's
 /// already there).
+///
+/// Parses `source` per call. A caller probing MANY leaves against one buffer
+/// — auto-import completion, one probe per candidate — goes through
+/// [`ParsedSource`] instead and pays the parse once (E83).
 pub fn insert_import(source: &str, module_path: &[&str], leaf: &str) -> Option<ImportInsertEdit> {
-    let items = parse(source)?;
-    for item in &items {
+    ParsedSource::parse(source)?.insert_import(module_path, leaf)
+}
+
+/// The shared body behind [`insert_import`] and [`ParsedSource::insert_import`]:
+/// the probe over an already-parsed item list.
+fn insert_import_into(
+    source: &str,
+    items: &NodeList<'_>,
+    module_path: &[&str],
+    leaf: &str,
+) -> Option<ImportInsertEdit> {
+    for item in items {
         let Some(branch) = plain_import_branch(&item.0) else {
             continue;
         };
@@ -722,7 +786,7 @@ pub fn insert_import(source: &str, module_path: &[&str], leaf: &str) -> Option<I
         }
     }
     let new_line = format!("import {}::{leaf};", module_path.join("::"));
-    let Some((start, end)) = first_import_run(&items) else {
+    let Some((start, end)) = first_import_run(items) else {
         // No import anywhere in the file: a new first line.
         return Some(ImportInsertEdit {
             span: Span { start: 0, end: 0 },
@@ -764,6 +828,7 @@ pub fn insert_import(source: &str, module_path: &[&str], leaf: &str) -> Option<I
 /// user-written parentheses PRESERVED: the formatter reprints the group it was
 /// given and never adjudicates whether it was redundant.
 fn parse(source: &str) -> Option<NodeList<'_>> {
+    BUFFER_PARSES.with(|count| count.set(count.get() + 1));
     let (tree, errors) = crate::parsing::parse_preserving_groups(source);
     tree.filter(|_| errors.is_empty()).map(|(items, _)| items)
 }
@@ -7170,7 +7235,7 @@ mod insert {
     //! that adds `import <path>::<leaf>;` to the file — extending an existing
     //! import that already reaches the module, or inserting a new, sorted
     //! line when none does.
-    use super::insert_import;
+    use super::{ParsedSource, buffer_parse_count, insert_import};
 
     /// Applies `insert_import`'s edit to `source`, or `None` when it offers
     /// none (the leaf is already imported).
@@ -7179,6 +7244,52 @@ mod insert {
         let mut result = source.to_string();
         result.replace_range(edit.span.into_range(), &edit.replacement);
         Some(result)
+    }
+
+    // E83: auto-import completion probes MANY leaves against ONE buffer, so
+    // `insert_import` gained a parsed-input twin. The twin must answer
+    // byte-identically to the string entry across the edit shapes — extend a
+    // set, extend the surface import, a fresh sorted statement, already
+    // imported — while paying the whole-buffer parse once, not once per
+    // probe (the string entry pays it per call, which is the cost §9 measured).
+    #[test]
+    fn a_parsed_source_answers_every_probe_identically_from_one_parse() {
+        let source = "import std::json::{ Alpha, Zeta };\nimport std::print;\n\nfun main() {}\n";
+        let probes: [(&[&str], &str); 4] = [
+            (&["std", "json"], "Mid"),   // inserts into the brace set
+            (&["std"], "read"),          // extends the surface import
+            (&["std", "math"], "sqrt"),  // a fresh, sorted statement
+            (&["std", "json"], "Alpha"), // already imported: no edit
+        ];
+        let parses_before = buffer_parse_count();
+        let parsed = ParsedSource::parse(source).expect("the fixture parses cleanly");
+        for (module_path, leaf) in probes {
+            let from_parsed = parsed.insert_import(module_path, leaf);
+            let from_string = insert_import(source, module_path, leaf);
+            assert_eq!(
+                from_parsed
+                    .as_ref()
+                    .map(|edit| (edit.span.into_range(), &edit.replacement)),
+                from_string
+                    .as_ref()
+                    .map(|edit| (edit.span.into_range(), &edit.replacement)),
+                "the parsed and string entries must answer identically for {module_path:?}::{leaf}"
+            );
+        }
+        // One parse for `ParsedSource::parse`, one per string-entry call —
+        // the parsed entry's probes never re-parse.
+        assert_eq!(
+            buffer_parse_count() - parses_before,
+            1 + probes.len() as u64
+        );
+    }
+
+    // The parsed entry keeps the string entry's safety rule: a buffer that
+    // does not parse cleanly yields no handle at all, so no probe can offer
+    // an edit into text the formatter does not understand.
+    #[test]
+    fn a_source_that_does_not_parse_cleanly_yields_no_parsed_source() {
+        assert!(ParsedSource::parse("import std::json::{\n").is_none());
     }
 
     // --- Brace-set extension ---------------------------------------------------

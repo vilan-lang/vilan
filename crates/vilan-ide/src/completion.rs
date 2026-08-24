@@ -1304,12 +1304,25 @@ impl<'a, 'src> Analysis<'a, 'src> {
         }
         candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         candidates.truncate(AUTO_IMPORT_COMPLETION_CAP);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        // ONE parse of the live buffer, shared by every candidate's edit
+        // (E83): the string-input `insert_import` re-parses per call, which
+        // made a bare scope position cost ~20 member completions — the parse
+        // was the whole bill (playground-completion.md §9). When the buffer
+        // does not parse cleanly there is no candidate to offer at all: no
+        // import edit would be safe, which is exactly the `None` each
+        // per-candidate call used to answer.
         let source = self.live.text();
+        let Some(parsed) = vilan_core::formatter::ParsedSource::parse(source) else {
+            return Vec::new();
+        };
         candidates
             .into_iter()
             .filter_map(|(tier, name, kind, module_path)| {
                 let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
-                let edit = vilan_core::formatter::insert_import(source, &path_refs, &name)?;
+                let edit = parsed.insert_import(&path_refs, &name)?;
                 Some(Completion {
                     label: name,
                     kind,
