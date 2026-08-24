@@ -136,7 +136,7 @@ Rust workspace, five crates, plus the language's own tree:
 - **Root causes.** Fix the general path; a special case that handles one input is a
   smell. If the general fix implies a refactor, say so in your report rather than
   building around the debt.
-- **Read the named proposal sections first.** `proposals/tracker/backlog-2026-08-18.md`
+- **Read the named proposal sections first.** `proposals/tracker/backlog.md`
   (in the `vilan-lang/proposals` sibling repo) is the single planning surface
   (its Now/Next/Later block names what's active); the papers under
   `proposals/proposal/` are the specs, and each backlog item cites the one
