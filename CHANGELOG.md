@@ -18,6 +18,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 ## Unreleased
 
 <!-- family: feature -->
+**`std::markdown` — a strict markdown parser with mdBook-exact heading ids, the first package-shaped std module.** `parse(source)` returns `Result<Doc, ParseError>`: a plain-data AST (two enums, two structs — no `Shared`, no `View`, no closures, const-eligible by construction) covering the docs book's measured grammar — ATX headings, backtick fences with verbatim info strings and bodies, paragraphs, flat lists whose items carry real block bodies, recursive blockquotes, pipe tables with `\|` cell escapes, inline code/strong/emphasis/links, autolinks, and the `<a id>` passthrough (`proposal/markdown.md`, RULED 2026-08-24). The parser is **strict**: every census-zero construct — images, footnotes, setext headings, nested lists, indented code, reference links, thematic breaks, hard breaks, stray HTML, and friends — is a loud `ParseError` naming the construct and its line, so the first page to write one fails the docs walk instead of rendering wrong. Heading ids are a pinned compatibility surface: bit-exact mdBook v0.5.4 parity (per-whitespace hyphens, entity drops, Unicode lowercase, per-page `-1`/`-2` dedupe), held by an adversarial unit corpus and a book-wide golden of all 456 rendered anchors generated from a real mdBook build (`scripts/regen-markdown-golden.py`). The whole 56-page book parses in ~55 ms on the process leg; the largest page in ~0.9 ms. New docs page: `std/markdown.md`.
+
+---
+
+<!-- family: feature -->
 **Lists compare with `==`, and a struct with a `List` field can derive `PartialEq`.** `std::List` carried only the inherent `T: PartialEq` methods (`contains`, `index_of`) — the type itself never satisfied a `PartialEq` bound, so `[derive(PartialEq)]` on a struct holding a `List<…>` field was refused ("type 'List' does not implement the `PartialEq` operator") and the first real site wrote its `eq` by hand, hop by hop (I4, found by E80's lane). `impl List<T: PartialEq> with PartialEq` now compares element-wise, length first; the impl is conditional, so nested lists (`List<List<i32>>`) compare through their elements and the derive on a `List`-holding struct just works. The hand-written impl and its helper can be deleted wherever a struct was carrying one.
 
 ---

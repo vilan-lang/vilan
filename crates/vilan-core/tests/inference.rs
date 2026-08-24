@@ -63668,3 +63668,665 @@ fn b131_only_the_starved_parameter_is_named() {
          unannotated; annotate it (e.g. `|rows: List<i32>|`)",
     );
 }
+
+// --- std::markdown — the census parser's construct pins (proposal/markdown.md,
+// --- RULED 2026-08-24; the book-wide anchor golden lives in
+// --- markdown_golden.rs, the fence-rule mirror pins near the end of this
+// --- section, and every §1.2 refusal has its own strict pin below) ----------
+
+#[test]
+fn markdown_parses_atx_headings_with_mdbook_ids() {
+    // The §3 table's first two rows: `§`, the em-dash, `&` and `.` all drop,
+    // each space becomes its own hyphen — measured against mdBook v0.5.4.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	let source = "# Spec §1 — Introduction & conformance\n\n## 6.0 The law — owners, epochs, and claims\n";
+        	match parse(source) {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Heading(let level, let content, let id) => {
+        						print("h" + level.to_string() + " " + id);
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "##,
+        "h1 spec-1--introduction--conformance\nh2 60-the-law--owners-epochs-and-claims\n",
+    );
+}
+
+#[test]
+fn markdown_heading_ids_match_the_adversarial_corpus() {
+    // The rest of the §3 corpus plus the shapes the LSP twin pins (impl:,
+    // if/else with a closing run) and the non-ASCII cases — every id verified
+    // against a local mdBook v0.5.4 build of this exact page.
+    assert_compiles_and_runs(
+        r####"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	let source = "## `Shared<T>`: one cell, many holders\n\n# Macros & const\n\n### Option::take and Option::replace\n\n## Conversions: `as_*`\n\n## `macro { … }` blocks\n\n## impl: methods and statics\n\n## if / else ##\n\n## Café naïveté\n\n## École Été\n\n## <a id=\"x\"></a> anchored\n";
+        	match parse(source) {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Heading(let level, let content, let id) => { print(id); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "####,
+        "sharedt-one-cell-many-holders\nmacros--const\noptiontake-and-optionreplace\nconversions-as_\nmacro----blocks\nimpl-methods-and-statics\nif--else\ncafé-naïveté\nécole-été\nanchored\n",
+    );
+}
+
+#[test]
+fn markdown_dedupes_repeated_ids_in_document_order() {
+    // §3 step 3: the second occurrence of a base becomes `-1`, the third
+    // `-2` — and a heading inside a blockquote participates in document
+    // order, exactly as a renderer meets it.
+    assert_compiles_and_runs(
+        r####"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun emit(blocks: List<Block>) {
+        	for block in blocks {
+        		match block {
+        			Block::Heading(let level, let content, let id) => { print(id); }
+        			Block::Quote(let inner) => { emit(inner); }
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("## Setup\n\n> ## Setup\n\n## Setup\n") {
+        		Ok(let doc) => { emit(doc.blocks); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "####,
+        "setup\nsetup-1\nsetup-2\n",
+    );
+}
+
+#[test]
+fn markdown_heading_id_is_the_dedupe_free_base() {
+    // The public `heading_id` is §3's base algorithm: same input, same id,
+    // no dedupe state between calls.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ heading_id, Inline };
+        fun main() {
+        	mut content: List<Inline> = [];
+        	content.push(Inline::Text("Conversions: "));
+        	content.push(Inline::Code("as_*"));
+        	print(heading_id(content));
+        	print(heading_id(content));
+        }
+        "#,
+        "conversions-as_\nconversions-as_\n",
+    );
+}
+
+#[test]
+fn markdown_parses_inline_code_strong_emph_and_links() {
+    // The inline constructs, with payload boundaries: span content
+    // CommonMark-trimmed, `Link` is (destination, label), `_` emphasis only
+    // at a word boundary (snake_case stays text).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun show(inlines: List<Inline>) {
+        	for inline in inlines {
+        		match inline {
+        			Inline::Text(let t) => { print("text[" + t + "]"); }
+        			Inline::Code(let t) => { print("code[" + t + "]"); }
+        			Inline::Strong(let children) => { print("strong:"); show(children); }
+        			Inline::Emph(let children) => { print("emph:"); show(children); }
+        			Inline::Link(let dest, let label) => { print("link[" + dest + "]:"); show(label); }
+        			Inline::Html(let raw) => { print("html[" + raw + "]"); }
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("a `code span` and **bold `x`** and *it* and _uh_ in snake_case [label](https://d) end\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Paragraph(let inlines) => { show(inlines); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "text[a ]\ncode[code span]\ntext[ and ]\nstrong:\ntext[bold ]\ncode[x]\ntext[ and ]\nemph:\ntext[it]\ntext[ and ]\nemph:\ntext[uh]\ntext[ in snake_case ]\nlink[https://d]:\ntext[label]\ntext[ end]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_the_a_id_passthrough_and_autolink() {
+    // The census's one HTML shape rides through verbatim; `<https://…>`
+    // autolinks become links labeled with their destination.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("<a id=\"view\"></a>**view**: see <https://vilan-lang.org> now\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Paragraph(let inlines) => {
+        						for inline in inlines {
+        							match inline {
+        								Inline::Html(let raw) => { print("html[" + raw + "]"); }
+        								Inline::Link(let dest, let label) => { print("link[" + dest + "]"); }
+        								_ => {}
+        							}
+        						}
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "html[<a id=\"view\">]\nhtml[</a>]\nlink[https://vilan-lang.org]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_fenced_code_with_info_string_and_verbatim_body() {
+    // The info string is carried verbatim (`vilan,browser` stays one
+    // string); the body is byte-faithful with one trailing newline per line
+    // — the docs gate's extraction shape — blank lines included.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("```vilan,browser\nlet x = 1;\n\n    deep();\n```\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::CodeFence(let info, let body) => {
+        						print("info[" + info + "]");
+        						print("body[" + body + "]");
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "info[vilan,browser]\nbody[let x = 1;\n\n    deep();\n]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_flat_lists_ordered_and_unordered() {
+    // Census lists: `-` and `1.` markers, flat; a marker change starts a new
+    // Items block; a simple item is one Paragraph of inlines.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("- alpha\n- beta\n  continued\n\n1. one\n2. two\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Items(let ordered, let items) => {
+        						mut kind = "unordered";
+        						if ordered { kind = "ordered"; }
+        						print(kind + " " + items.len().to_string());
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "unordered 2\nordered 2\n",
+    );
+}
+
+#[test]
+fn markdown_a_list_item_carries_blocks() {
+    // The recorded §2 deviation, pinned by the book's own shape
+    // (tour/async.md): an item with a second paragraph and an indented
+    // fence holds them as blocks — not flattened into siblings, not
+    // glommed into the item's first line.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	let source = "- **Item.** first paragraph\n  wraps here\n\n  second paragraph\n\n  ```vilan\n  let x = 1;\n  ```\n\n- next item\n";
+        	match parse(source) {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Items(let ordered, let items) => {
+        						print("items " + items.len().to_string());
+        						for inner in items[0] {
+        							match inner {
+        								Block::Paragraph(let inlines) => { print("paragraph"); }
+        								Block::CodeFence(let info, let body) => { print("fence[" + body + "]"); }
+        								_ => { print("unexpected"); }
+        							}
+        						}
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "items 2\nparagraph\nparagraph\nfence[let x = 1;\n]\n",
+    );
+}
+
+#[test]
+fn markdown_parses_blockquotes_recursively() {
+    // §2's probed recursion: a quote holds blocks, including another quote.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun depth(blocks: List<Block>, level: i32) {
+        	for block in blocks {
+        		match block {
+        			Block::Quote(let inner) => {
+        				print("quote@" + level.to_string());
+        				depth(inner, level + 1);
+        			}
+        			Block::Paragraph(let inlines) => { print("paragraph@" + level.to_string()); }
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("> outer text\n>\n> > inner text\n") {
+        		Ok(let doc) => { depth(doc.blocks, 0); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "quote@0\nparagraph@1\nquote@1\nparagraph@2\n",
+    );
+}
+
+#[test]
+fn markdown_parses_pipe_tables_and_unescapes_cell_pipes() {
+    // Census tables: header + rows, no alignment — and the `\|` cell escape
+    // (vilan's closure syntax in cells) unescapes before inline parsing, so
+    // the code span carries a real `|`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("| op | means |\n|----|-------|\n| `\\|n\\| n * 2` | doubler |\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::Table(let header, let rows) => {
+        						print("header " + header.len().to_string() + " rows " + rows.len().to_string());
+        						for inline in rows[0][0] {
+        							match inline {
+        								Inline::Code(let t) => { print("code[" + t + "]"); }
+        								_ => { print("unexpected"); }
+        							}
+        						}
+        					}
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "header 2 rows 1\ncode[|n| n * 2]\n",
+    );
+}
+
+// --- std::markdown × the docs gate's fence rules (docs.rs extract_pins,
+// --- mirrored — the package's fences must agree with the gate's) ------------
+
+#[test]
+fn markdown_bullet_indented_fence_extracts_and_dedents() {
+    // docs.rs `bullet_indented_fence_extracts_and_dedents`: a fence indented
+    // two columns under a bullet is found, and its body loses the fence's
+    // own indent.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun emit(blocks: List<Block>) {
+        	for block in blocks {
+        		match block {
+        			Block::CodeFence(let info, let body) => { print("body[" + body + "]"); }
+        			Block::Items(let ordered, let items) => {
+        				for item in items { emit(item); }
+        			}
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("- A bullet:\n\n  ```vilan\n  let x = 1;\n  ```\n\n- Next bullet\n") {
+        		Ok(let doc) => { emit(doc.blocks); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "body[let x = 1;\n]\n",
+    );
+}
+
+#[test]
+fn markdown_deeper_fence_body_lines_keep_relative_indent() {
+    // docs.rs `nested_deeper_body_lines_keep_relative_indent`: only the
+    // fence's columns come off; deeper indentation survives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("  ```vilan\n  fun main() {\n      let x = 1;\n  }\n  ```\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::CodeFence(let info, let body) => { print("body[" + body + "]"); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "body[fun main() {\n    let x = 1;\n}\n]\n",
+    );
+}
+
+#[test]
+fn markdown_an_indented_fence_does_not_swallow_following_prose() {
+    // docs.rs `an_indented_fence_does_not_swallow_following_prose` (the D3
+    // bug): the indented fence closes at its own indent, the prose stays
+    // prose, and the flush fence after it survives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun emit(blocks: List<Block>) {
+        	for block in blocks {
+        		match block {
+        			Block::CodeFence(let info, let body) => { print("fence[" + body + "]"); }
+        			Block::Paragraph(let inlines) => { print("paragraph"); }
+        			Block::Items(let ordered, let items) => {
+        				print("items");
+        				for item in items { emit(item); }
+        			}
+        			_ => {}
+        		}
+        	}
+        }
+        fun main() {
+        	match parse("- Bullet:\n\n  ```vilan\n  fun first() {}\n  ```\n\nThis prose must stay prose.\n\n```vilan\nfun second() {}\n```\n") {
+        		Ok(let doc) => { emit(doc.blocks); }
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "items\nparagraph\nfence[fun first() {}\n]\nparagraph\nfence[fun second() {}\n]\n",
+    );
+}
+
+#[test]
+fn markdown_a_fence_like_line_at_a_different_indent_does_not_close() {
+    // docs.rs `a_fence_like_line_inside_the_body_at_a_different_indent_does_
+    // not_close`: a ``` deeper than the opener is body, not the closer.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ parse, Block, Doc, Inline, ParseError };
+        import std::result::Result::{ Err, Ok };
+        fun main() {
+        	match parse("  ```vilan\n  outer\n    ```\n  more outer\n  ```\n") {
+        		Ok(let doc) => {
+        			for block in doc.blocks {
+        				match block {
+        					Block::CodeFence(let info, let body) => { print("body[" + body + "]"); }
+        					_ => { print("unexpected"); }
+        				}
+        			}
+        		}
+        		Err(let error) => { print(error.to_string()); }
+        	}
+        }
+        "#,
+        "body[outer\n  ```\nmore outer\n]\n",
+    );
+}
+
+// --- std::markdown strict refusals — one pin per §1.2 construct (the ruled
+// --- failure mode: a loud ParseError naming the construct and its line) -----
+
+fn assert_markdown_refuses(source_literal: &str, expected_error: &str) {
+    // Each refusal pin drives the same tiny program: parse the literal,
+    // print the error (or a loud "parsed" if the refusal regressed).
+    let program = format!(
+        r#"
+        import std::print;
+        import std::markdown::{{ parse, Doc, ParseError }};
+        import std::result::Result::{{ Err, Ok }};
+        fun main() {{
+        	match parse("{source_literal}") {{
+        		Ok(let doc) => {{ print("parsed"); }}
+        		Err(let error) => {{ print(error.to_string()); }}
+        	}}
+        }}
+        "#
+    );
+    assert_compiles_and_runs(&program, &format!("{expected_error}\n"));
+}
+
+#[test]
+fn markdown_refuses_a_setext_heading() {
+    assert_markdown_refuses(
+        "Title\\n=====\\n",
+        "line 2: a setext heading underline or thematic break (---, ===, ***) — both outside the census grammar; headings are ATX (# Title)",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_thematic_break() {
+    assert_markdown_refuses(
+        "before\\n\\n---\\n\\nafter\\n",
+        "line 3: a setext heading underline or thematic break (---, ===, ***) — both outside the census grammar; headings are ATX (# Title)",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_nested_list() {
+    assert_markdown_refuses(
+        "- outer\\n  - inner\\n",
+        "line 2: a nested list item — the census grammar's lists are flat",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_indented_list_item() {
+    assert_markdown_refuses(
+        "  - indented\\n",
+        "line 1: an indented list item — the census grammar's lists are flat, at the left margin",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_indented_code_block() {
+    assert_markdown_refuses(
+        "para\\n\\n    let x = 1;\\n",
+        "line 3: an indented code block (four or more leading spaces) — the census grammar's only code blocks are backtick fences",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_footnote() {
+    assert_markdown_refuses(
+        "some text[^1] here\\n",
+        "line 1: a footnote ([^label]) — footnotes are outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_reference_link() {
+    assert_markdown_refuses(
+        "a [text][label] link\\n",
+        "line 1: a reference-style link ([text][label]) — only inline [text](destination) links are in the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_reference_definition() {
+    assert_markdown_refuses(
+        "[label]: https://example.com\\n",
+        "line 1: a reference link definition ([label]: destination) — only inline [text](destination) links are in the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_image() {
+    assert_markdown_refuses(
+        "an ![alt](img.png) image\\n",
+        "line 1: an image (![alt](destination)) — images are outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_strikethrough() {
+    assert_markdown_refuses(
+        "some ~~gone~~ text\\n",
+        "line 1: strikethrough (~~text~~) — outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_raw_html_tag() {
+    assert_markdown_refuses(
+        "a <br> break\\n",
+        "line 1: a raw HTML tag (<br>) — the census grammar's only HTML passthrough is <a id=\"…\"></a>; wrap literal <…> text (a generic like List<T>) in backticks",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_backslash_escape() {
+    assert_markdown_refuses(
+        "escaped \\\\* star\\n",
+        "line 1: a backslash escape (\\*) — the census grammar's only escape is \\| inside a table cell",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_hard_line_break() {
+    assert_markdown_refuses(
+        "line one  \\nline two\\n",
+        "line 1: a hard line break (two trailing spaces) — outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_backslash_line_break() {
+    assert_markdown_refuses(
+        "line one\\\\\\nline two\\n",
+        "line 1: a backslash line break — outside the census grammar",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_tilde_fence() {
+    assert_markdown_refuses(
+        "~~~\\ncode\\n~~~\\n",
+        "line 1: a tilde fence (~~~) — the census grammar's fences use backticks",
+    );
+}
+
+#[test]
+fn markdown_refuses_an_unclosed_fence() {
+    assert_markdown_refuses(
+        "```vilan\\nlet x = 1;\\n",
+        "line 1: an unclosed code fence — no closing ``` at the opening fence's indent",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_table_alignment_colon() {
+    assert_markdown_refuses(
+        "| a | b |\\n|:--|--:|\\n| 1 | 2 |\\n",
+        "line 2: a table alignment colon (:---) — the census grammar's tables carry no alignment",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_custom_heading_id() {
+    assert_markdown_refuses(
+        "# Title {#custom}\\n",
+        "line 1: a custom heading id ({#…}) — census-grammar heading ids are computed, mdBook's algorithm",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_lazy_blockquote_continuation() {
+    assert_markdown_refuses(
+        "> quoted\\nlazy line\\n",
+        "line 2: a lazy blockquote continuation — prefix the line with > or separate it from the quote with a blank line",
+    );
+}
+
+#[test]
+fn markdown_refuses_a_lazy_list_continuation() {
+    assert_markdown_refuses(
+        "- item\\nlazy line\\n",
+        "line 2: a lazy list continuation — indent the line under its item (two spaces) or separate it from the list with a blank line",
+    );
+}
