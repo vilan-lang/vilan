@@ -390,9 +390,14 @@ the error is not repeated at its calls. A call the function makes to
 itself contributes nothing (its type is the one being inferred); a
 function whose only return positions are such calls is `Never`. Declaring
 the return type replaces inference with checking (every position against
-the declaration). A closure's `ret`s are checked against its tail
-instead; a closure whose body leaves only by `ret` must make the
-returned value its tail.
+the declaration). A closure (and an `async` block) infers the same way:
+its return type is the unification of its reachable tail and every
+`ret`, so `|x| { ret x * 2; }` is `|i32| i32`, and a `ret` that
+disagrees — with the tail, an earlier `ret`, or a body path that ends
+without a value — is an error at that `ret`. When the closure's return
+type is known ahead of the body (its own annotation, or the call site's
+expectation), the `ret`s check against that type instead, exactly as a
+declared function's do.
 
 ```vilan
 import std::print;

@@ -177,6 +177,12 @@ Closure **types** are written `|T| U`. A closure with no parameters is
 `|| U`, and one that returns nothing is `|| void`. These appear as
 parameter types, in `let` annotations, and as struct fields.
 
+`ret` inside a closure returns from the closure, and the closure's
+return type is inferred exactly the way a function's is: from the final
+expression when the body can reach it, and from every `ret`, which have
+to agree — a body that only ever leaves by `ret` is typed by those
+`ret`s. A `ret` that disagrees is reported at that `ret`.
+
 Closures capture their surroundings **by value** at the moment they are
 created. Vilan copies, remember. When a closure needs to share mutable
 state with its creator, they hold a `Shared` cell together. The

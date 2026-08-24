@@ -6944,6 +6944,236 @@ fn a_closures_ret_still_cannot_hand_back_a_view() {
     );
 }
 
+// --- B134: `return_sites` completes — the tail and each value-carrying `ret`
+// of EVERY bodied function, annotated or not. B116 built the join for
+// declared-return functions; B126 typed an unannotated function's `ret`s, so
+// the seam readers (`infer_borrows`, the crossing scan, `check_view_escape`,
+// the return clone sites) must see those positions too. Every pin below is a
+// B116/B122 shape with the return annotation REMOVED: the two spellings of
+// one return — and the two spellings of one signature — must answer alike.
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_reference_leaf_copies() {
+    // B116's first shape without the `: Inner`. The `ret` was refused with
+    // the generic "a view cannot escape its scope" (the raw FunctionReturn
+    // scan — the seams never saw an unannotated `ret`) while the tail
+    // ALIASED (below). Both spellings now emit the same copy the annotated
+    // twin has always emitted.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self, flag: bool) {
+                if flag { ret &self.inner; }
+                &self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let early = h.grab(true);
+            let tail = h.grab(false);
+            h.inner.n = 99;
+            print(early.n);
+            print(tail.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function grab(self, flag) {\n\
+             \tif (flag) {\n\t\treturn __clone(self[0]);\n\t}\n\
+             \treturn __clone(self[0]);\n}"
+        ),
+        "both unannotated spellings should emit the same copy, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n3\n",
+        "neither spelling may hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b134_an_unannotated_tail_of_a_loaned_place_copies() {
+    // The tail half of the same gap, and the sharpest tooth: with no
+    // annotation the tail was not a clone seam at all (`return_sites` was
+    // the clone-site pass's only function source), so `fun grab(&self) {
+    // self.inner }` handed back the receiver's LIVE storage — this program
+    // printed 99 where its annotated twin printed 3.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self) {
+                self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let got = h.grab();
+            h.inner.n = 99;
+            print(got.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("return __clone(self[0]);"),
+        "the unannotated tail must copy the loaned place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "the unannotated tail may not hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_scalar_view_reads_the_place() {
+    // B108's shape without the `: i32`: a scalar's copy is its read
+    // (`v[0][v[1]]`), at the `ret` as at the tail.
+    let javascript = compile(
+        r#"
+        import std::print;
+        fun same(v: &mut i32, flag: bool) {
+            if flag { ret v; }
+            v
+        }
+        fun main() { mut n = 5; print(same(&mut n, true)); print(same(&mut n, false)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function same(v, flag) {\n\
+             \tif (flag) {\n\t\treturn v[0][v[1]];\n\t}\n\
+             \treturn v[0][v[1]];\n}"
+        ),
+        "both unannotated spellings should read the scalar place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "5\n5\n",
+        "neither spelling may hand back the view pair"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_borrows_call_leaf_copies() {
+    // The call-leaf shape: the caller is unannotated, the `borrows` callee
+    // keeps its declaration (that sanction is the SIGNATURE's, and an
+    // unannotated function has none to give). The projection is copied out
+    // at both of the caller's return positions.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder, flag: bool) {
+            if flag { ret peek(h); }
+            peek(h)
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let early = get(&h, true);
+            h.pair.1 = 99;
+            print(early.1);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\tif (flag) {\n\t\treturn __clone(peek(h2));\n\t}\n\treturn __clone(peek(h2));"
+        ),
+        "both unannotated spellings should copy the call's projection, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "neither spelling may hand back the callee's alias"
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_resource_reference_leaf_is_refused() {
+    // A resource cannot copy (R1), so the crossing is a MOVE and the move
+    // scan refuses it — the same words as the annotated twin
+    // (`b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused`),
+    // where the unannotated `ret` used to draw the generic escape refusal
+    // (the crossing scan never saw it).
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool) {
+                if flag { ret &self.g; }
+                &self.g
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b134_an_unannotated_ret_only_resource_crossing_is_named_by_the_move_scan() {
+    // The crossing half isolated, as B116 isolated it: the resource leaves
+    // only through the `ret` (the tail hands back an owned value), so
+    // walking the tail alone says nothing about it.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool) {
+                if flag { ret &self.g; }
+                Guard { tag = "fresh" }
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b134_the_unannotated_ret_spelling_of_a_view_of_a_local_still_cannot_escape() {
+    // The half that must NOT change: a view of a LOCAL dangles whatever the
+    // signature says, and the seam walk refuses it in both spellings exactly
+    // as the raw scan did.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool) {
+            let local = Inner { n = 3 };
+            if flag { ret &local; }
+            &local
+        }
+        fun main() { print(grab(true).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
 #[test]
 fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local() {
     // The un-masking pin (`element-clones.md` §13.4 / backlog B123): B122 gave
@@ -13048,12 +13278,16 @@ fn b125_a_closure_tail_disagreeing_with_the_annotation_reports_once_at_the_brace
     assert_fails_without(source, "List<str>");
 }
 
-// The bare-expression spelling has no brace to anchor at (S3 scoped the
-// return-position route to block bodies), so the argument check reports the
-// closure as a whole value — still once, still narrower than the whole call
-// the annotation used to be compared against.
+// The bare-expression spelling: S3's route used to be scoped to block bodies
+// ("no closing brace to anchor at"), so this reported the closure as a whole
+// value at the argument check. B132 routes bare bodies through the same
+// return-position check, anchored ON the expression — the b125 B5 claim
+// (exactly one diagnostic, the `let` never doubles it) is unchanged; only
+// the anchor narrowed. Re-pinned from
+// `b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closure`:
+// same program, the new anchor.
 #[test]
-fn b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closure() {
+fn b132_a_bare_closure_body_disagreeing_with_the_annotation_reports_on_the_expression() {
     let source = r#"
         import std::print;
 
@@ -13067,12 +13301,516 @@ fn b125_a_bare_closure_disagreeing_with_the_annotation_reports_once_at_the_closu
         }
         "#;
     assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "point.x * 2", "Expected str, but got i32 instead.");
+    assert_fails_without(source, "|Point| str");
+    assert_fails_without(source, "List<str>");
+}
+
+// The void-valued bare body: the same route, the same anchor, the plain
+// mismatch wording (a real void value, not the missing-value regime — there
+// is no `;` to blame in a bare expression).
+#[test]
+fn b132_a_void_bare_closure_body_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| print(point.x));
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
     assert_fails_spanning(
         source,
-        "|point| point.x * 2",
-        "Expected |Point| str, but got |Point| i32 instead.",
+        "print(point.x)",
+        "Expected i32, but got void instead.",
     );
+    assert_fails_without(source, "List<void>");
+}
+
+// A bare `if` with no `else` gets regime 2's wording (S3), exactly as the
+// same tail inside a block body does.
+#[test]
+fn b132_a_bare_if_without_else_body_names_the_gap() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| if point.x > 0 { 1 });
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(
+        source,
+        "if point.x > 0 { 1 }",
+        "Expected i32, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// The free-function spelling shares the route (B90 keeps the two call paths
+// one rule): the expectation binds `U`, and the bare body reports on the
+// expression there too.
+#[test]
+fn b132_the_free_function_spelling_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        fun apply<U>(xs: List<i32>, f: |i32| U): List<U> {
+        	xs.map(f)
+        }
+
+        fun main() {
+        	let xs = [1, 2];
+        	let out: List<str> = apply(xs, |x| x * 2);
+        	print(out.len());
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "x * 2", "Expected str, but got i32 instead.");
     assert_fails_without(source, "List<str>");
+}
+
+// A closure's OWN return annotation over a bare body takes the same route
+// (rule 2 "directly"): the report lands on the expression, not the closure
+// as a whole value.
+#[test]
+fn b132_an_annotated_bare_body_reports_on_the_expression() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32|: str x + 1;
+        	print(f(1));
+        }
+        "#;
+    assert_fails_once_with(source, "Expected");
+    assert_fails_spanning(source, "x + 1", "Expected str, but got i32 instead.");
+}
+
+// The route must not manufacture failures: an agreeing bare body under the
+// same expectation still compiles and runs.
+#[test]
+fn b132_an_agreeing_bare_body_still_compiles_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| point.x * 2);
+        	print(widths[0]);
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// --- B133: rule 4 lifted to the reachable-tail rule (ret-checking.md rule 4
+// as amended). A closure's return type is the unification of its REACHABLE
+// tail and every `ret` — the same evidence, through the same fold, an
+// unannotated function uses (B126) — so `{ ret 1; }` infers in a closure
+// exactly as it does in a function, and the dead synthesized-void tail is no
+// longer a void vote against its own `ret`s. The conservative "make the
+// ret'd value the body's tail" steer survives exactly where the genuine
+// disagreement remains: a value-`ret` beside a body path that yields no
+// value.
+
+// The headline: a `ret`-only closure body infers its return type, and every
+// reader agrees — a direct call, and a typed binding of the result.
+#[test]
+fn b133_a_ret_only_closure_body_infers_its_return_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		ret x * 2;
+        	};
+        	print(f(3));
+        	let y: i32 = f(4);
+        	print(y);
+        }
+        "#,
+        "6\n8\n",
+    );
+}
+
+// A closure that leaves only by `ret` can bind a caller's return-position
+// generic bottom-up (the `from_fn` family's shape): the rets ARE the
+// closure's return evidence.
+#[test]
+fn b133_a_closure_ret_binds_a_callers_return_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun apply<U>(f: || U): U {
+        	f()
+        }
+
+        fun main() {
+        	let n = apply(|| {
+        		ret 5;
+        	});
+        	print(n + 1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+// A dead tail under a known target: the `ret`s are the only return
+// positions, and they check against the target — one refusal, at the `ret`,
+// and the pre-lift steer (which blamed the dead tail's synthesized void) is
+// gone.
+#[test]
+fn b133_a_dead_tail_ret_is_checked_against_the_target() {
+    let source = r#"
+        import std::print;
+
+        fun run(f: |i32| i32): i32 {
+        	f(1)
+        }
+
+        fun main() {
+        	let out = run(|value| {
+        		ret "s";
+        	});
+        	print(out);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret \"s\"",
+        "this `ret` returns str, but the closure's body yields i32",
+    );
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_without(source, "make the ret'd value the body's tail");
+    assert_fails_without(source, "Expected");
+}
+
+// B125 interplay, the B5 probe extended to `ret`s: under an annotated `let`
+// the expectation binds `U` before the closure is typed, and a dead-tail
+// `ret` that disagrees reports ONCE, at the `ret`, in the expectation's
+// terms — the `let` and the call add nothing.
+#[test]
+fn b133_a_dead_tail_ret_reports_once_under_an_expectation() {
+    let source = r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<str> = points.map(|point| {
+        		ret point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "ret point.x * 2",
+        "this `ret` returns i32, but the closure's body yields str",
+    );
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_without(source, "Expected");
+    assert_fails_without(source, "List<str>");
+}
+
+// ...and the agreeing spellings bind from the expectation and run: a
+// `ret`-only body, and a guard-`ret` beside an agreeing tail.
+#[test]
+fn b133_an_agreeing_ret_closure_binds_from_the_expectation_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| {
+        		ret point.x * 2;
+        	});
+        	print(widths[0]);
+        	let guarded = points.map(|point| {
+        		if point.x > 100 {
+        			ret 0;
+        		}
+        		point.x + 5
+        	});
+        	print(guarded[0]);
+        }
+        "#,
+        "2\n6\n",
+    );
+}
+
+// A return-position generic in a closure `ret` binds from the target, in
+// both the mixed (guard-`ret` beside a tail) and the dead-tail shapes.
+#[test]
+fn b133_a_ret_of_a_generic_call_binds_from_the_target() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run(f: |i32| List<i32>): List<i32> {
+        	f(3)
+        }
+
+        fun main() {
+        	let out = run(|seed| {
+        		if seed < 0 {
+        			ret List::new();
+        		}
+        		mut xs: List<i32> = List::new();
+        		xs.push(seed);
+        		xs
+        	});
+        	print(out.len());
+        	let dead_tail = run(|seed| {
+        		ret List::new();
+        	});
+        	print(dead_tail.len());
+        }
+        "#,
+        "1\n0\n",
+    );
+}
+
+// The I5/B19 shape with `ret`s: `from_fn`'s callback target (`|| Option<T>`)
+// is abstract, `type_is_ground` declines it, and the rets bind `T`
+// bottom-up — a callback that leaves only by `ret` now types (the pre-lift
+// rule refused it with the steer).
+#[test]
+fn b133_a_from_fn_callback_that_leaves_by_ret_types() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+        	mut n = 0;
+        	let counter = Iterator::from_fn(|| {
+        		n = n + 1;
+        		if n > 3 {
+        			ret None;
+        		}
+        		ret Some(n);
+        	});
+        	print(counter.count());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+// A value-`ret` beside a REACHABLE fall-through is still the genuine
+// disagreement rule 4's steer was written for — kept, now with a note at
+// the origin (the same origin vocabulary as a function's refusal).
+#[test]
+fn b133_a_value_ret_beside_a_reachable_fall_through_keeps_the_steer() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let helper = |x: i32| {
+        		if x > 5 {
+        			ret 99;
+        		}
+        		print("small");
+        	};
+        	helper(1);
+        }
+        "#;
+    let head = "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail";
+    assert_fails_spanning(source, "ret 99", head);
+    assert_fails_noting_nth(source, head, "}", 1, "the body ends here without a value");
+}
+
+// The other reachable-void spelling: the closure's tail is an `if` with no
+// `else`, which produces void on the path that takes no branch.
+#[test]
+fn b133_a_value_ret_beside_an_else_less_if_tail_keeps_the_steer() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 5 {
+        			ret 99;
+        		}
+        	};
+        	f(1);
+        	print("done");
+        }
+        "#;
+    let head = "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail";
+    assert_fails_spanning(source, "ret 99", head);
+    assert_fails_noting(
+        source,
+        head,
+        "if x > 5 {\n        \t\t\tret 99;\n        \t\t}",
+        "an `if` with no `else` produces void",
+    );
+}
+
+// A `ret` disagreeing with a REACHABLE tail is refused at the `ret`, noting
+// the tail — no target in sight (an unannotated binding, a direct call).
+#[test]
+fn b133_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: bool| {
+        		if x {
+        			ret "s";
+        		}
+        		2
+        	};
+        	f(true);
+        	print("done");
+        }
+        "#;
+    let head = "this `ret` returns str, but the closure's body yields i32";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_noting(source, head, "2", "the tail it disagrees with");
+    assert_fails_without(source, "Expected");
+}
+
+// Two `ret`s that disagree under a dead tail: one refusal, at the later
+// `ret`, noting the earlier one it disagrees with (the function rule's
+// source-order reading).
+#[test]
+fn b133_rets_that_disagree_are_refused_at_the_later_ret() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 0 {
+        			ret 1;
+        		}
+        		ret "s";
+        	};
+        	f(1);
+        }
+        "#;
+    let head = "this `ret` returns str, but the closure's body yields i32";
+    assert_fails_spanning(source, "ret \"s\"", head);
+    assert_fails_once_with(source, "this `ret` returns");
+    assert_fails_noting(source, head, "ret 1", "the earlier `ret` it disagrees with");
+}
+
+// The no-target bare-`ret` twin: a bare `ret` beside a value tail is
+// refused at the `ret` (the existing wording), noting the tail.
+#[test]
+fn b133_a_bare_ret_beside_a_value_tail_is_still_refused() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x: i32| {
+        		if x > 5 {
+        			ret;
+        		}
+        		x + 1
+        	};
+        	f(1);
+        	print("done");
+        }
+        "#;
+    let head = "a bare `ret` exits a closure whose body yields i32; return a value";
+    assert_fails_spanning(source, "ret", head);
+    assert_fails_noting(source, head, "x + 1", "the tail it disagrees with");
+}
+
+// An `async` block whose body leaves only by `ret` settles with the rets'
+// type: `async { ret 1; }` is a task of `i32`, and awaiting it hands the
+// value back.
+#[test]
+fn b133_an_async_block_of_rets_settles_with_their_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let t = async {
+        		ret 1;
+        	};
+        	let n: i32 = await t;
+        	print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// An `async` block's disagreeing `ret`s are refused the same way a
+// closure's are — at the later `ret`, noting the earlier one.
+#[test]
+fn b133_an_async_blocks_disagreeing_rets_are_refused() {
+    let source = r#"
+        import std::print;
+
+        fun main() {
+        	let flag = true;
+        	let pending = async {
+        		if flag {
+        			ret "a";
+        		}
+        		ret 2;
+        	};
+        	print("x");
+        }
+        "#;
+    let head = "this `ret` returns i32, but the closure's body yields str";
+    assert_fails_spanning(source, "ret 2", head);
+    assert_fails_noting(
+        source,
+        head,
+        "ret \"a\"",
+        "the earlier `ret` it disagrees with",
+    );
+}
+
+// A `ret`-only closure that is never called stays quiet (deferred), exactly
+// as loosely as a never-called closure types everywhere else — the pre-lift
+// rule refused it with the steer, a false positive: the `ret` and the dead
+// tail never disagreed.
+#[test]
+fn b133_a_never_called_ret_closure_stays_quiet() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let f = |x| {
+        		ret 1;
+        	};
+        	print("quiet");
+        }
+        "#,
+        "quiet\n",
+    );
 }
 
 // A PARAMETER that disagrees with the receiver keeps P27's whole-value anchor
@@ -13548,32 +14286,35 @@ fn an_async_function_whose_tail_is_an_if_else_of_rets_is_not_a_missing_return() 
     );
 }
 
-// A closure whose body is an exhaustive `if`/`else` of value-`ret`s. The
-// FALSE mismatch on the closure is gone; ret-checking.md §4's deliberate
-// guidance ("make the ret'd value the body's tail" — the conservative rule
-// that avoids the diverging-tail swamp) is untouched, since B124 does not
-// reopen closure return inference.
+// A closure whose body is an exhaustive `if`/`else` of value-`ret`s now
+// infers like a function (rule 4 lifted to the reachable-tail rule, B133):
+// the dead tail is no evidence, the `ret`s agree on `str`, and the program
+// runs. Re-pinned from
+// `a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance`
+// (which pinned the pre-lift conservative refusal): same program, the new
+// rule.
 #[test]
-fn a_closure_of_rets_loses_the_false_mismatch_and_keeps_rule_4s_guidance() {
-    let source = r#"
+fn b133_a_closure_of_rets_infers_like_a_function() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
         fun run(f: |i32| str): str {
         	f(1)
         }
 
         fun main() {
-        	run(|value| {
+        	let out = run(|value| {
         		if value > 0 {
         			ret "positive";
         		} else {
         			ret "non-positive";
         		}
         	});
+        	print(out);
         }
-        "#;
-    assert_fails_without(source, "Expected str, but got void instead.");
-    assert_fails_with(
-        source,
-        "the closure's body ends without a value, but this `ret` returns one",
+        "#,
+        "positive\n",
     );
 }
 
@@ -54910,7 +55651,31 @@ fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
             print(1);
         }
         "#,
-        "Expected |Route| Route, but got |Route| Other instead.",
+        // B132 narrowed the anchor: the bound target (`T = Route`) is ground,
+        // so the bare body takes S3's return-position route and the mismatch
+        // reports ON the expression in the binding's terms, no longer as the
+        // whole closure value (`Expected |Route| Route, but got |Route| Other`).
+        "Expected Route, but got Other instead.",
+    );
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            let made = Holder { tag = 0 }.twice(Route::Away(1), |current| Other::Second(3));
+            print(1);
+        }
+        "#,
+        "Other::Second(3)",
+        "Expected Route, but got Other instead.",
     );
 }
 

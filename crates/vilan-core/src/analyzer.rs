@@ -1718,6 +1718,11 @@ pub struct Closure {
     // Destructures for tuple parameters (`|(a, b)| ..`), run before the body.
     pub parameter_destructures: Vec<Id>,
     pub return_: Id,
+    /// The body's `ret` sites (span + optional value) — the closure twin of
+    /// `Function::rets`: a closure's return type is inferred from these
+    /// together with its reachable tail (proposal/ret-checking.md rule 4,
+    /// lifted by B133), and `Constraint::ClosureReturns` checks them.
+    pub rets: Vec<(Span, Option<Id>)>,
     /// The closure's OWN return-type annotation (`|x: i32|: i32 { .. }`), if
     /// written — S3 (editing-dx.md §3.4/§3.9): an annotated closure gets the
     /// same return-position check a named function's declared return type
@@ -1902,13 +1907,11 @@ enum Constraint<'src> {
         steps: Vec<(Id, Id, bool)>,
         body_id: Id,
     },
-    /// A closure's collected `ret`s, checked against its inferred tail type
-    /// (proposal/ret-checking.md rule 4's follow-up).
-    ClosureReturns {
-        closure_id: Id,
-        tail_id: Id,
-        rets: Vec<(Span, Option<Id>)>,
-    },
+    /// A closure's (or `async` block's) collected `ret`s take part in its
+    /// return typing (proposal/ret-checking.md rule 4, lifted to rule 3's
+    /// reachable-tail unification by B133). The rets themselves live on the
+    /// `Closure` record.
+    ClosureReturns { closure_id: Id },
     /// An unannotated function's return positions — its reachable tail and
     /// every `ret` — must agree (proposal/ret-checking.md rule 3).
     FunctionReturns { function_id: Id },
@@ -1940,7 +1943,7 @@ impl Constraint<'_> {
             Constraint::TryAssert { id, .. } => *id,
             Constraint::Lift { id, .. } => *id,
             Constraint::LiftRegion { id, .. } => *id,
-            Constraint::ClosureReturns { closure_id, .. } => *closure_id,
+            Constraint::ClosureReturns { closure_id } => *closure_id,
             Constraint::FunctionReturns { function_id } => *function_id,
         }
     }
@@ -2241,6 +2244,13 @@ pub struct Analyzer<'src> {
     /// function, for the read-only coercion path (`compare_type`) that cannot
     /// infer on the spot.
     inferred_return_types: HashMap<Id, TypeId>,
+    /// The ground return type S3's route held a closure's body to (the
+    /// context's expectation, or the closure's own annotation) — recorded so
+    /// `resolve_closure_returns` checks the closure's `ret`s against the SAME
+    /// type the body was checked against (rule 2's regime), never against the
+    /// tail the target already vouched for (proposal/ret-checking.md rule 4,
+    /// lifted by B133).
+    closure_held_targets: HashMap<Id, TypeId>,
     /// Non-fatal diagnostics (e.g. an unused `[must_use]` result). Rendered as
     /// warnings; they do not block codegen.
     warnings: Vec<Error>,
@@ -3138,6 +3148,7 @@ impl<'src> Analyzer<'src> {
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
             inferred_return_types: HashMap::default(),
+            closure_held_targets: HashMap::default(),
             warnings: Vec::new(),
             warning_sources: Vec::new(),
             entity_id: 0,
@@ -7500,22 +7511,15 @@ impl<'src> Analyzer<'src> {
     fn compute_return_value_crossings(&self) -> HashSet<Id> {
         let mut crossings = HashSet::default();
         // Every return position of every by-value function: the tail, and (B116)
-        // each `ret`. `return_sites` carries both but only for a function with a
-        // DECLARED return type, so the tails are taken from the functions
-        // themselves and the rets joined on top — the overlap is a set, and
-        // re-scanning one seam names the same places twice.
-        let mut seams: Vec<(&Function, Id)> = self
-            .functions
-            .values()
-            .map(|function| (function, function.body.1))
+        // each `ret`. `return_sites` carries both, for every bodied function —
+        // annotated or not, since B134 completed the join.
+        let seams: Vec<(&Function, Id)> = self
+            .return_sites
+            .iter()
+            .filter_map(|(function_id, value_id)| {
+                Some((self.functions.get(function_id)?, *value_id))
+            })
             .collect();
-        seams.extend(
-            self.return_sites
-                .iter()
-                .filter_map(|(function_id, value_id)| {
-                    Some((self.functions.get(function_id)?, *value_id))
-                }),
-        );
         for (function, seam) in seams {
             if !function.has_body || function.returns_view {
                 continue;
@@ -13833,12 +13837,12 @@ impl<'src> Analyzer<'src> {
     ///
     /// B122: a `ret` is a return position exactly like the tail
     /// (`ret-checking.md`), and the root-set is asked per POSITION, joined —
-    /// `return_sites` carries both for a function with a declared return type
-    /// (B116's join, `element-clones.md` §12.2). Without it, a view handed
-    /// back only through an early `ret` (an owned tail beside it) never
-    /// contributed its parameter, so `check_view_escape`'s own leaf question
-    /// found `borrows` empty and refused a program its conditional-tail twin
-    /// compiles (`element-clones.md` §13).
+    /// `return_sites` carries both (B116's join, `element-clones.md` §12.2;
+    /// completed for unannotated functions by B134). Without it, a view
+    /// handed back only through an early `ret` (an owned tail beside it)
+    /// never contributed its parameter, so `check_view_escape`'s own leaf
+    /// question found `borrows` empty and refused a program its
+    /// conditional-tail twin compiles (`element-clones.md` §13).
     fn infer_borrows(&mut self) {
         let function_ids: Vec<Id> = self.functions.keys().copied().collect();
         let mut return_sites_by_function: HashMap<Id, Vec<Id>> = HashMap::default();
@@ -13851,20 +13855,20 @@ impl<'src> Analyzer<'src> {
         loop {
             let mut updates: Vec<(Id, BTreeSet<u32>)> = Vec::new();
             for function_id in &function_ids {
-                let (has_body, body_tail, current) = {
+                let current = {
                     let Some(function) = self.functions.get(function_id) else {
                         continue;
                     };
-                    (function.has_body, function.body.1, function.borrows.clone())
+                    function.borrows.clone()
                 };
-                if !has_body {
-                    continue;
-                }
                 let mut positions = current.clone();
-                self.collect_borrows_positions(*function_id, body_tail, &mut positions);
-                if let Some(ret_value_ids) = return_sites_by_function.get(function_id) {
-                    for ret_value_id in ret_value_ids {
-                        self.collect_borrows_positions(*function_id, *ret_value_id, &mut positions);
+                if let Some(return_position_ids) = return_sites_by_function.get(function_id) {
+                    for return_position_id in return_position_ids {
+                        self.collect_borrows_positions(
+                            *function_id,
+                            *return_position_id,
+                            &mut positions,
+                        );
                     }
                 }
                 if positions != current {
@@ -14484,14 +14488,15 @@ impl<'src> Analyzer<'src> {
             .flat_map(|function_id| self.wrapped_view_return_calls(function_id))
             .chain(self.transient_wrapped_view_calls())
             .collect();
-        // A CLOSURE's `ret` never enters `return_sites` (its rets check against
-        // the inferred tail type instead, `ret-checking.md`) and gets no
-        // exemption at all — a closure may not declare `borrows`, so nothing
-        // sanctions a view leaving through one, by-value copy included (P4c:
-        // second-class all the way). The function-ret positions below get the
-        // leaf-wise seam walk with its exemption; this set is how the loop
-        // tells the two apart without re-deriving return_site_functions per
-        // leaf.
+        // A CLOSURE's `ret` never enters `return_sites` (its rets take part
+        // in the closure's own return inference, `ret-checking.md` rule 4)
+        // and gets no exemption at all — a closure may not declare `borrows`,
+        // so nothing sanctions a view leaving through one, by-value copy
+        // included (P4c: second-class all the way). The function-ret
+        // positions below — of every bodied function since B134, annotated
+        // or not — get the leaf-wise seam walk with its exemption; this set
+        // is how the loop tells the two apart without re-deriving
+        // return_site_functions per leaf.
         let function_return_value_ids: HashSet<Id> = self
             .return_sites
             .iter()
@@ -14557,20 +14562,13 @@ impl<'src> Analyzer<'src> {
         // (the false positive rule 1 already saw through `ret`, B116), and an
         // unsound view of a LOCAL let through beside an owned arm because the
         // same averaging hid the arm that mattered (`element-clones.md` §13).
-        // `return_sites` indexes every return position of a declared-return
-        // function — the tail and each `ret` (B116) — and `collect_tail_leaves`
-        // is the same walk rule 1's return clause and the crossing scan already
-        // use for the identical seams, so all three agree about what a return
-        // position hands back. A HashSet dedupes: `return_sites` already
-        // carries the tail for a function with a declared return type, so
-        // adding every function's tail again would ask the same seam twice.
-        let mut function_seams: HashSet<(Id, Id)> = self
-            .functions
-            .values()
-            .filter(|function| function.has_body)
-            .map(|function| (function.id, function.body.1))
-            .collect();
-        function_seams.extend(self.return_sites.iter().copied());
+        // `return_sites` indexes every return position of every bodied
+        // function — the tail and each value-carrying `ret` (B116's join,
+        // completed for unannotated functions by B134) — and
+        // `collect_tail_leaves` is the same walk rule 1's return clause and
+        // the crossing scan already use for the identical seams, so all three
+        // agree about what a return position hands back. A HashSet dedupes.
+        let function_seams: HashSet<(Id, Id)> = self.return_sites.iter().copied().collect();
         for (function_id, seam) in function_seams {
             if self.frozen_entity(function_id) {
                 continue;
@@ -17326,9 +17324,6 @@ impl<'src> Analyzer<'src> {
                 _ => {}
             }
         }
-        for function in self.functions.values() {
-            self.insert_seam_roots(function.body.1, &mut seam_roots);
-        }
         let closure_tails: Vec<Id> = self
             .closures
             .values()
@@ -17337,6 +17332,8 @@ impl<'src> Analyzer<'src> {
         for tail in closure_tails {
             self.insert_seam_roots(tail, &mut seam_roots);
         }
+        // Every function return position — the tail and each value-carrying
+        // `ret` of every bodied function (B116's join, completed by B134).
         for (_, value_id) in &self.return_sites {
             self.insert_seam_roots(*value_id, &mut seam_roots);
         }
@@ -19067,6 +19064,29 @@ impl<'src> Analyzer<'src> {
                         Some(ReturnFrame::Inferred { rets }) => rets,
                         _ => Vec::new(),
                     };
+                    // B134: `return_sites` is the one join of a function's
+                    // return positions — the tail and each value-carrying
+                    // `ret` — for EVERY bodied function, annotated or not.
+                    // B116 built it for declared-return functions; B126 typed
+                    // an unannotated function's `ret`s, so the seam readers
+                    // (`infer_borrows`, the crossing scan, `check_view_escape`,
+                    // the return clone sites) must see those positions too, or
+                    // the two spellings of one return disagree: an unannotated
+                    // `ret &self.x` was refused by the raw escape arm while
+                    // its tail twin copied, and an unannotated TAIL handing
+                    // back a loaned place was never a clone seam at all —
+                    // live storage left the frame. A declared-return bare
+                    // `ret`'s synthesized void still enters (it IS the checked
+                    // value); an unannotated bare `ret` synthesizes none and
+                    // has no leaves to contribute.
+                    if function.body.is_some() {
+                        self.return_sites.push((id, expr_id));
+                        for (_, ret_value_id) in &rets {
+                            if let Some(ret_value_id) = ret_value_id {
+                                self.return_sites.push((id, *ret_value_id));
+                            }
+                        }
+                    }
                     // Infer the body's tail against the declared return type (the
                     // way a `let v: R = ..` annotation drives its value), so a
                     // return-position generic call binds its type parameters from
@@ -19076,7 +19096,6 @@ impl<'src> Analyzer<'src> {
                     {
                         self.expected_types.insert(expr_id, return_type_id);
                         self.seed_tail_expectations(expr_id, return_type_id);
-                        self.return_sites.push((id, expr_id));
                         // The synthesized void tail after a last statement that
                         // LEAVES is unreachable, and checking it draws a second
                         // diagnostic that adds no information (P28's duplicate,
@@ -20041,19 +20060,19 @@ impl<'src> Analyzer<'src> {
                     })
                     .collect::<Vec<_>>();
                 // A closure is a `ret` boundary with an INFERRED return type:
-                // its rets collect here and check against the tail once it
-                // resolves (proposal/ret-checking.md rule 4's follow-up).
+                // its rets collect here and take part in that inference
+                // beside the reachable tail (proposal/ret-checking.md rule 4,
+                // lifted by B133).
                 self.return_type_stack
                     .push(ReturnFrame::Inferred { rets: Vec::new() });
                 let expr_id = self.walk_expr_node(&closure.return_value, body_scope_id);
-                if let Some(ReturnFrame::Inferred { rets }) = self.return_type_stack.pop()
-                    && !rets.is_empty()
-                {
-                    self.constraints.push(Constraint::ClosureReturns {
-                        closure_id: id,
-                        tail_id: expr_id,
-                        rets,
-                    });
+                let rets = match self.return_type_stack.pop() {
+                    Some(ReturnFrame::Inferred { rets }) => rets,
+                    _ => Vec::new(),
+                };
+                if !rets.is_empty() {
+                    self.constraints
+                        .push(Constraint::ClosureReturns { closure_id: id });
                 }
                 // S3 (editing-dx.md §3.4/§3.9): resolved in the body scope,
                 // like a named function's return type, so it can name the
@@ -20069,6 +20088,7 @@ impl<'src> Analyzer<'src> {
                         parameters,
                         parameter_destructures,
                         return_: expr_id,
+                        rets,
                         return_type_id,
                     },
                 );
@@ -20086,14 +20106,13 @@ impl<'src> Analyzer<'src> {
                 self.return_type_stack
                     .push(ReturnFrame::Inferred { rets: Vec::new() });
                 let return_id = self.walk_expr_node(body, body_scope_id);
-                if let Some(ReturnFrame::Inferred { rets }) = self.return_type_stack.pop()
-                    && !rets.is_empty()
-                {
-                    self.constraints.push(Constraint::ClosureReturns {
-                        closure_id,
-                        tail_id: return_id,
-                        rets,
-                    });
+                let rets = match self.return_type_stack.pop() {
+                    Some(ReturnFrame::Inferred { rets }) => rets,
+                    _ => Vec::new(),
+                };
+                if !rets.is_empty() {
+                    self.constraints
+                        .push(Constraint::ClosureReturns { closure_id });
                 }
                 self.closures.insert(
                     closure_id,
@@ -20102,6 +20121,7 @@ impl<'src> Analyzer<'src> {
                         parameters: Vec::new(),
                         parameter_destructures: Vec::new(),
                         return_: return_id,
+                        rets,
                         // `async` has no return-type annotation grammar, and
                         // this desugared closure is reached only through
                         // `Expr::Async`, never `Expr::Closure` — S3's
@@ -22159,7 +22179,11 @@ impl<'src> Analyzer<'src> {
             // If the expected type is itself `Task<U>` (or `Promise<U>`), the
             // body is checked against U.
             Expr::Async(closure_id) => {
-                let body_id = self.closures.get(closure_id).map(|closure| closure.return_);
+                let closure_id = *closure_id;
+                let body_id = self
+                    .closures
+                    .get(&closure_id)
+                    .map(|closure| closure.return_);
                 let inner_constraint = match &constraint {
                     Type::Struct(id, arguments) if self.is_task_handle(*id) => arguments
                         .first()
@@ -22167,16 +22191,32 @@ impl<'src> Analyzer<'src> {
                         .unwrap_or(Type::Unknown),
                     _ => Type::Unknown,
                 };
-                let body_type = body_id
-                    .map(|body_id| {
-                        self.infer_type_inner(
-                            body_id,
+                // An `async` block with `ret`s settles with the unification
+                // of its reachable tail and every `ret` (rule 4 lifted,
+                // B133), directed by the context's payload — so
+                // `async { ret 1; }` is `Task<i32>`, not `Task<void>`.
+                let has_rets = self
+                    .closures
+                    .get(&closure_id)
+                    .is_some_and(|closure| !closure.rets.is_empty());
+                let body_type = match body_id {
+                    Some(_) if has_rets => {
+                        self.closure_return_inference(
+                            closure_id,
                             &inner_constraint,
                             substitution_context,
                             exprs_seen,
                         )
-                    })
-                    .unwrap_or(Type::Unknown);
+                        .type_
+                    }
+                    Some(body_id) => self.infer_type_inner(
+                        body_id,
+                        &inner_constraint,
+                        substitution_context,
+                        exprs_seen,
+                    ),
+                    None => Type::Unknown,
+                };
                 // Defer while the body type is still settling, so the wrapped
                 // `Task<unresolved>` isn't compared against and rejected.
                 if matches!(body_type, Type::Unresolved) {
@@ -23050,7 +23090,8 @@ impl<'src> Analyzer<'src> {
                 }
             }
             Expr::Closure(closure_id) => {
-                let closure = self.closures.get(closure_id).unwrap();
+                let closure_id = *closure_id;
+                let closure = self.closures.get(&closure_id).unwrap();
                 let parameter_ids = closure.parameters.clone();
                 let return_expr_id = closure.return_;
                 let declared_return_type_id = closure.return_type_id;
@@ -23155,13 +23196,32 @@ impl<'src> Analyzer<'src> {
                     }
                 }
 
-                if let Some(target_return_type_id) = target_return_type_id
-                    && let Some((brace_span, tail_id, last_statement_id)) =
-                        self.closure_block_tail(return_expr_id)
-                {
+                if let Some(target_return_type_id) = target_return_type_id {
+                    // The route's anchor and checked position, per body shape:
+                    // a BLOCK body checks its tail, anchored at the closing
+                    // brace (S3); a BARE-EXPRESSION body (`|x| x + 1`, B132)
+                    // has no brace, so the route checks the expression itself,
+                    // anchored ON it — the same check, the same steer quality,
+                    // where it used to fall through to the whole-value
+                    // comparison at the argument and report the closure as
+                    // `Expected |Point| str, but got |Point| i32`.
+                    let (anchor_span, checked_id, last_statement_id) =
+                        match self.closure_block_tail(return_expr_id) {
+                            Some(block) => block,
+                            None => {
+                                let expression_span =
+                                    **self.span_map.get(&return_expr_id).unwrap_or(&&EMPTY_SPAN);
+                                (expression_span, return_expr_id, None)
+                            }
+                        };
+                    // Record the target the body is held to, so
+                    // `Constraint::ClosureReturns` checks the closure's
+                    // `ret`s against the SAME type (rule 4 lifted, B133).
+                    self.closure_held_targets
+                        .insert(closure_id, target_return_type_id);
                     let target_return_type = target_return_type_id.get_type(self);
                     match self.check_return_position(
-                        tail_id,
+                        checked_id,
                         &target_return_type,
                         last_statement_id,
                         substitution_context,
@@ -23169,6 +23229,26 @@ impl<'src> Analyzer<'src> {
                     ) {
                         ReturnPositionCheck::Unresolved => return Type::Unresolved,
                         ReturnPositionCheck::Matched => {
+                            // A DEAD tail matches vacuously (every path out is
+                            // a `ret`, B124's question) — the `ret`s are then
+                            // the only return positions, and they check
+                            // against the target here.
+                            // `Constraint::ClosureReturns` runs the same
+                            // deduped check, but a deferred owning call can
+                            // reach this attempt after that constraint already
+                            // resolved (resolution is monotone), so the route
+                            // must not rely on it alone.
+                            let tail_dead = self.expr_diverges(checked_id)
+                                || last_statement_id
+                                    .is_some_and(|statement_id| self.expr_diverges(statement_id));
+                            if tail_dead {
+                                self.check_closure_rets_against_target(
+                                    closure_id,
+                                    target_return_type_id,
+                                    substitution_context,
+                                    exprs_seen,
+                                );
+                            }
                             return Type::Closure(parameter_type_ids, target_return_type_id);
                         }
                         ReturnPositionCheck::Mismatched(msg) => {
@@ -23192,7 +23272,7 @@ impl<'src> Analyzer<'src> {
                             // reports then. A statement that is itself an
                             // error node never types and is not waited for
                             // (its own diagnostic is the root cause).
-                            if matches!(self.expr_id_to_expr_map.get(&tail_id), Some(Expr::Void))
+                            if matches!(self.expr_id_to_expr_map.get(&checked_id), Some(Expr::Void))
                                 && let Some(statement_id) = last_statement_id
                                 && !self.variables.contains_key(&statement_id)
                                 && !matches!(
@@ -23219,12 +23299,12 @@ impl<'src> Analyzer<'src> {
                             if !self
                                 .diagnostics
                                 .iter()
-                                .any(|d| d.span == brace_span && d.msg == msg)
+                                .any(|d| d.span == anchor_span && d.msg == msg)
                             {
                                 self.diagnostics.push(Error {
                                     trace: Vec::new(),
                                     note: None,
-                                    span: brace_span,
+                                    span: anchor_span,
                                     msg,
                                 });
                             }
@@ -23238,12 +23318,33 @@ impl<'src> Analyzer<'src> {
                     }
                 }
 
-                let return_type = self.infer_type_inner(
-                    return_expr_id,
-                    &Type::Unknown,
-                    substitution_context,
-                    exprs_seen,
-                );
+                // Bottom-up: a closure with `ret`s types like an unannotated
+                // function — the unification of its reachable tail and every
+                // `ret` (rule 4 lifted, B133), so `{ ret 1; }` is `|..| i32`
+                // and can bind a caller's return-position generic. A closure
+                // without any stays on the plain body inference — the same
+                // answer (evidence = the tail alone), on the well-trodden
+                // path that also seeds the tail's expectation.
+                let has_rets = self
+                    .closures
+                    .get(&closure_id)
+                    .is_some_and(|closure| !closure.rets.is_empty());
+                let return_type = if has_rets {
+                    self.closure_return_inference(
+                        closure_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    )
+                    .type_
+                } else {
+                    self.infer_type_inner(
+                        return_expr_id,
+                        &Type::Unknown,
+                        substitution_context,
+                        exprs_seen,
+                    )
+                };
                 match return_type {
                     Type::Unresolved => Type::Unresolved,
                     _ => Type::Closure(parameter_type_ids, return_type.get_type_id(self)),
@@ -23512,6 +23613,34 @@ impl<'src> Analyzer<'src> {
             function.last_statement_id,
             function.rets.clone(),
         );
+        let evidence = self.return_evidence(tail_id, last_statement_id, &rets);
+        self.return_inference_stack.push((function_id, true));
+        let inference =
+            self.unify_return_evidence(&evidence, &Type::Unknown, substitution_context, exprs_seen);
+        let exact = self
+            .return_inference_stack
+            .pop()
+            .is_some_and(|(_, exact)| exact);
+        if exact && !matches!(inference.type_, Type::Unresolved) {
+            let type_id = inference.type_.clone().get_type_id(self);
+            self.inferred_return_types.insert(function_id, type_id);
+        }
+        inference
+    }
+
+    /// One callable's return-position evidence (proposal/ret-checking.md
+    /// rules 3 and 4): the tail — only when the body can REACH it (dead code
+    /// is no evidence: the block's last statement leaves, or the tail itself
+    /// diverges, B124's question) — tagged with where it sits for the
+    /// refusal's wording, followed by every `ret` in source order. Shared by
+    /// the function path (`infer_function_returns`) and the closure path
+    /// (`closure_return_inference`) — one rule, not two copies.
+    fn return_evidence(
+        &self,
+        tail_id: Id,
+        last_statement_id: Option<Id>,
+        rets: &[(Span, Option<Id>)],
+    ) -> Vec<(ReturnOrigin, Option<Id>)> {
         let mut evidence: Vec<(ReturnOrigin, Option<Id>)> = Vec::new();
         let tail_reachable = !(self.expr_diverges(tail_id)
             || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id)));
@@ -23535,32 +23664,27 @@ impl<'src> Analyzer<'src> {
             evidence.push((origin, value_id));
         }
         evidence.extend(
-            rets.into_iter()
-                .map(|(span, value_id)| (ReturnOrigin::Ret(span), value_id)),
+            rets.iter()
+                .map(|(span, value_id)| (ReturnOrigin::Ret(*span), *value_id)),
         );
-        self.return_inference_stack.push((function_id, true));
-        let inference = self.unify_return_evidence(&evidence, substitution_context, exprs_seen);
-        let exact = self
-            .return_inference_stack
-            .pop()
-            .is_some_and(|(_, exact)| exact);
-        if exact && !matches!(inference.type_, Type::Unresolved) {
-            let type_id = inference.type_.clone().get_type_id(self);
-            self.inferred_return_types.insert(function_id, type_id);
-        }
-        inference
+        evidence
     }
 
-    /// The fold under `infer_function_returns`: each item reconciles with the
-    /// running type (the first item that constrains sets it). An item that
-    /// constrains nothing — `never` (a leaving branch, a self-call), `any`
-    /// (a `panic`), `unknown` — is skipped, kept only as the answer of last
-    /// resort when nothing else speaks; the first `Unresolved` item makes the
-    /// whole answer `Unresolved`. A disagreeing item is listed, and the
-    /// answer becomes `any` so the refusal at the `ret` is the only one (B5).
+    /// The fold under `infer_function_returns` and `closure_return_inference`:
+    /// each item reconciles with the running type (the first item that
+    /// constrains sets it). An item that constrains nothing — `never` (a
+    /// leaving branch, a self-call), `any` (a `panic`), `unknown` — is
+    /// skipped, kept only as the answer of last resort when nothing else
+    /// speaks; the first `Unresolved` item makes the whole answer
+    /// `Unresolved`. A disagreeing item is listed, and the answer becomes
+    /// `any` so the refusal at the `ret` is the only one (B5).
+    /// `initial_expectation` directs the FIRST constraining item's inference
+    /// (before the running type takes over): `Unknown` for a function, the
+    /// context's `Task<T>` payload for an `async` block.
     fn unify_return_evidence(
         &mut self,
         evidence: &[(ReturnOrigin, Option<Id>)],
+        initial_expectation: &Type,
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnInference {
@@ -23571,7 +23695,7 @@ impl<'src> Analyzer<'src> {
             let expectation = running
                 .as_ref()
                 .map(|(type_, _)| type_.clone())
-                .unwrap_or(Type::Unknown);
+                .unwrap_or_else(|| initial_expectation.clone());
             let item_type = match value_id {
                 Some(value_id) => {
                     self.infer_type_inner(*value_id, &expectation, substitution_context, exprs_seen)
@@ -23678,6 +23802,49 @@ impl<'src> Analyzer<'src> {
             });
         }
         Resolution::Resolved
+    }
+
+    /// A closure body's return positions: a BLOCK body's tail and its own
+    /// last statement (the reachability question's other half), a
+    /// bare-expression body itself. The closure twin of what the function
+    /// walk stores as `body.1` + `last_statement_id`.
+    fn closure_body_positions(&self, body_id: Id) -> (Id, Option<Id>) {
+        match self.expr_id_to_expr_map.get(&body_id) {
+            Some(Expr::Block((statement_ids, tail_id))) => {
+                (*tail_id, statement_ids.last().copied())
+            }
+            _ => (body_id, None),
+        }
+    }
+
+    /// "What does this closure return?" — rule 4 lifted to rule 3's
+    /// reachable-tail unification (B133): the same evidence
+    /// (`return_evidence`) through the same fold (`unify_return_evidence`)
+    /// an unannotated function uses; only the refusals' wording is the
+    /// closure's (`resolve_closure_returns`). No recursion stack: a closure
+    /// has no name to re-enter itself through.
+    fn closure_return_inference(
+        &mut self,
+        closure_id: Id,
+        initial_expectation: &Type,
+        substitution_context: &SubstitutionContext,
+        exprs_seen: &mut HashSet<Id>,
+    ) -> ReturnInference {
+        let Some(closure) = self.closures.get(&closure_id) else {
+            return ReturnInference {
+                type_: Type::Unresolved,
+                disagreements: Vec::new(),
+            };
+        };
+        let (body_id, rets) = (closure.return_, closure.rets.clone());
+        let (tail_id, last_statement_id) = self.closure_body_positions(body_id);
+        let evidence = self.return_evidence(tail_id, last_statement_id, &rets);
+        self.unify_return_evidence(
+            &evidence,
+            initial_expectation,
+            substitution_context,
+            exprs_seen,
+        )
     }
 
     /// The closure type an eligible named function coerces to, inferring the
@@ -24789,11 +24956,7 @@ impl<'src> Analyzer<'src> {
             Constraint::LiftRegion { id, steps, body_id } => {
                 self.resolve_lift_region(*id, &steps.clone(), *body_id)
             }
-            Constraint::ClosureReturns {
-                closure_id,
-                tail_id,
-                rets,
-            } => self.resolve_closure_returns(*closure_id, *tail_id, rets),
+            Constraint::ClosureReturns { closure_id } => self.resolve_closure_returns(*closure_id),
             Constraint::FunctionReturns { function_id } => {
                 self.resolve_function_returns(*function_id)
             }
@@ -27166,12 +27329,12 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// The braced-block form of a closure body (`|x| { .. }`, as opposed to
-    /// the bare-expression form `|x| x + 1`, which has no closing brace to
-    /// anchor at): the block's own span (whose LAST byte, after S3's parser
-    /// fix, is exactly the closing `}`), its tail's id, and — mirroring the
-    /// named-function walk — its last STATEMENT's id for the regime-1/1'
-    /// distinction.
+    /// The braced-block form of a closure body (`|x| { .. }`): the block's
+    /// own span (whose LAST byte, after S3's parser fix, is exactly the
+    /// closing `}`), its tail's id, and — mirroring the named-function walk —
+    /// its last STATEMENT's id for the regime-1/1' distinction. `None` for
+    /// the bare-expression form (`|x| x + 1`), which S3's route anchors at
+    /// the expression itself instead (B132).
     fn closure_block_tail(&self, return_expr_id: Id) -> Option<(Span, Id, Option<Id>)> {
         let Expr::Block((statement_ids, tail_id)) =
             self.expr_id_to_expr_map.get(&return_expr_id)?
@@ -27908,77 +28071,206 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
-    /// A closure's `ret`s participate in its return typing: each value-`ret`
-    /// must reconcile with the inferred tail type (with the tail as the
-    /// directed expectation, so return-position generics bind); a bare `ret`
-    /// requires a void tail; and a value-`ret` in a void-tailed closure is
-    /// rejected with guidance (proposal/ret-checking.md rule 4's follow-up).
-    fn resolve_closure_returns(
-        &mut self,
-        _closure_id: Id,
-        tail_id: Id,
-        rets: &[(Span, Option<Id>)],
-    ) -> Resolution {
-        let tail_type = self.infer_type(tail_id, &Type::Unknown, &HashMap::default());
-        // `Unknown` means the closure's parameters haven't been typed yet (the
-        // call site reconciles them later) — defer; the run-all backstop
-        // retries once they land. A closure that never types (unbound, never
-        // called) leaves the constraint deferred, matching how loosely such a
-        // closure types everywhere else.
-        if matches!(tail_type, Type::Unresolved | Type::Unknown) {
+    /// A closure's (or `async` block's) `ret`s take part in its return typing
+    /// — proposal/ret-checking.md rule 4, lifted by B133 to rule 3's
+    /// reachable-tail unification. The evidence is the REACHABLE tail plus
+    /// every `ret` (`closure_return_inference` — the same construction and
+    /// fold an unannotated function uses); a dead tail is no longer a void
+    /// vote against its own `ret`s, so `{ ret 1; }` infers `i32` exactly as
+    /// it does in a function. One refusal per disagreeing `ret`, at that
+    /// `ret`, in the closure's wording, with a note at the origin: the
+    /// conservative "make the ret'd value the body's tail" steer survives
+    /// exactly where the genuine disagreement remains — a value-`ret` beside
+    /// a body path that yields no value.
+    ///
+    /// When the tail is dead and the closure's return type is KNOWN anyway —
+    /// its own annotation, or the ground target S3's route held the body to
+    /// (`closure_held_targets`) — the `ret`s are all the return positions
+    /// there are, and they check against that type
+    /// (`check_closure_rets_against_target`; the route runs the same check on
+    /// its dead-tail path, span+message-deduped, because resolution is
+    /// monotone and this constraint may resolve before a deferred call
+    /// records the target).
+    ///
+    /// Deferred while a parameter is untyped (the body's types can depend on
+    /// them, and the call that fills them may also bring a target) or any
+    /// evidence is unresolved; a closure that never types (unbound, never
+    /// called) leaves the constraint deferred, matching how loosely such a
+    /// closure types everywhere else.
+    fn resolve_closure_returns(&mut self, closure_id: Id) -> Resolution {
+        let Some(closure) = self.closures.get(&closure_id) else {
+            return Resolution::Resolved;
+        };
+        let (body_id, parameter_ids, own_annotation) = (
+            closure.return_,
+            closure.parameters.clone(),
+            closure.return_type_id,
+        );
+        let parameters_untyped = parameter_ids.iter().any(|parameter_id| {
+            self.parameters
+                .get(parameter_id)
+                .is_some_and(|parameter| matches!(parameter.type_id.get_type(self), Type::Unknown))
+        });
+        if parameters_untyped {
             return Resolution::Deferred;
         }
-        // A tail that DIVERGES yields no value either (B124 made an `if`/`match`
-        // of `ret`s in tail position type as `never` rather than `void`), so
-        // rule 4's void-tail rules apply to it unchanged: the conservative
-        // "make the ret'd value the body's tail" guidance is what
-        // ret-checking.md §4 settled to avoid the diverging-tail swamp, and
-        // B124 does not reopen it. Reading `never` as a produced value would
-        // instead have rejected a bare `ret` for "exiting a closure whose body
-        // yields never".
-        let tail_yields_no_value = matches!(tail_type, Type::Void | Type::Never);
+        let inference = self.closure_return_inference(
+            closure_id,
+            &Type::Unknown,
+            &HashMap::default(),
+            &mut HashSet::default(),
+        );
+        if matches!(inference.type_, Type::Unresolved) {
+            return Resolution::Deferred;
+        }
+        for disagreement in &inference.disagreements {
+            self.report_closure_ret_disagreement(disagreement);
+        }
+        let (tail_id, last_statement_id) = self.closure_body_positions(body_id);
+        let tail_dead = self.expr_diverges(tail_id)
+            || last_statement_id.is_some_and(|statement_id| self.expr_diverges(statement_id));
+        if tail_dead {
+            let target = own_annotation
+                .filter(|annotation| self.type_is_ground(*annotation))
+                .or_else(|| self.closure_held_targets.get(&closure_id).copied());
+            if let Some(target_id) = target
+                && !self.check_closure_rets_against_target(
+                    closure_id,
+                    target_id,
+                    &HashMap::default(),
+                    &mut HashSet::default(),
+                )
+            {
+                return Resolution::Deferred;
+            }
+        }
+        Resolution::Resolved
+    }
+
+    /// One disagreement out of a closure's return-evidence unification
+    /// (rule 4 as lifted): anchored at the `ret`, noting the origin of the
+    /// type it disagrees with — the same origin vocabulary as a function's
+    /// refusal (rule 3). The wording is the closure's: a `ret` of a value
+    /// where the body's path yields none keeps rule 4's conservative steer.
+    fn report_closure_ret_disagreement(&mut self, disagreement: &ReturnDisagreement) {
+        let (origin_span, origin_note) = match disagreement.origin {
+            ReturnOrigin::Tail(span) => (span, "the tail it disagrees with"),
+            ReturnOrigin::FallThrough(span) => (span, "the body ends here without a value"),
+            ReturnOrigin::IfWithoutElse(span) => (span, "an `if` with no `else` produces void"),
+            ReturnOrigin::Ret(span) => (span, "the earlier `ret` it disagrees with"),
+        };
+        let msg = match (&disagreement.value, &disagreement.inferred) {
+            // A value-`ret` where the body's path yields no value: rule 4's
+            // conservative guidance, kept (the genuine disagreement).
+            (Some(value), Type::Void) if !matches!(value, Type::Void) => {
+                "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail"
+                    .to_string()
+            }
+            (Some(value), inferred) => {
+                let value = self.pretty_print_type(value, &HashMap::default());
+                let inferred = self.pretty_print_type(inferred, &HashMap::default());
+                format!("this `ret` returns {value}, but the closure's body yields {inferred}")
+            }
+            (None, inferred) => {
+                let inferred = self.pretty_print_type(inferred, &HashMap::default());
+                format!("a bare `ret` exits a closure whose body yields {inferred}; return a value")
+            }
+        };
+        self.push_closure_ret_diagnostic(
+            disagreement.span,
+            msg,
+            Some(Note::here(origin_span, origin_note.to_string())),
+        );
+    }
+
+    /// Rule 2's regime for a closure whose `ret`s are its only return
+    /// positions (a dead tail) and whose return type is known anyway — its
+    /// own annotation, or the ground target the body was held to: each `ret`
+    /// checks against that type. Returns `false` while a value is still
+    /// settling (the caller defers). Runs both from S3's route (every
+    /// inference attempt on the dead-tail path) and from
+    /// `Constraint::ClosureReturns`; the span+message dedup keeps whichever
+    /// side runs second from adding anything.
+    fn check_closure_rets_against_target(
+        &mut self,
+        closure_id: Id,
+        target_id: TypeId,
+        substitution_context: &SubstitutionContext,
+        exprs_seen: &mut HashSet<Id>,
+    ) -> bool {
+        let Some(closure) = self.closures.get(&closure_id) else {
+            return true;
+        };
+        let rets = closure.rets.clone();
+        let target = target_id.get_type(self);
+        let target_yields_no_value = matches!(target, Type::Void | Type::Never);
+        let mut settled = true;
         for (span, value_id) in rets {
             match value_id {
                 None => {
-                    if !tail_yields_no_value {
-                        let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
-                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
-                            span: *span,
-                            msg: format!(
-                                "a bare `ret` exits a closure whose body yields {tail_rendered}; return a value"
+                    if !target_yields_no_value {
+                        let target_rendered = self.pretty_print_type(&target, substitution_context);
+                        self.push_closure_ret_diagnostic(
+                            span,
+                            format!(
+                                "a bare `ret` exits a closure whose body yields {target_rendered}; return a value"
                             ),
-                        });
+                            None,
+                        );
                     }
                 }
                 Some(value_id) => {
-                    let value_type = self.infer_type(*value_id, &tail_type, &HashMap::default());
+                    let value_type =
+                        self.infer_type_inner(value_id, &target, substitution_context, exprs_seen);
                     if matches!(value_type, Type::Unresolved) {
-                        return Resolution::Deferred;
+                        settled = false;
+                        continue;
                     }
-                    if tail_yields_no_value && !matches!(value_type, Type::Void) {
-                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
-                            span: *span,
-                            msg: "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail"
+                    if target_yields_no_value && !matches!(value_type, Type::Void) {
+                        self.push_closure_ret_diagnostic(
+                            span,
+                            "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail"
                                 .to_string(),
-                        });
+                            None,
+                        );
                     } else if self
-                        .reconcile_type(&value_type, &tail_type, &HashMap::default())
+                        .reconcile_type(&value_type, &target, substitution_context)
                         .is_none()
                     {
                         let value_rendered =
-                            self.pretty_print_type(&value_type, &HashMap::default());
-                        let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
-                        self.diagnostics.push(Error { trace: Vec::new(), note: None,
-                            span: *span,
-                            msg: format!(
-                                "this `ret` returns {value_rendered}, but the closure's body yields {tail_rendered}"
+                            self.pretty_print_type(&value_type, substitution_context);
+                        let target_rendered = self.pretty_print_type(&target, substitution_context);
+                        self.push_closure_ret_diagnostic(
+                            span,
+                            format!(
+                                "this `ret` returns {value_rendered}, but the closure's body yields {target_rendered}"
                             ),
-                        });
+                            None,
+                        );
                     }
                 }
             }
         }
-        Resolution::Resolved
+        settled
+    }
+
+    /// A closure-`ret` refusal, deduped by span+message: the same check runs
+    /// from S3's route (re-entered on every inference attempt) and from
+    /// `Constraint::ClosureReturns`, and one root cause reports once (B5).
+    fn push_closure_ret_diagnostic(&mut self, span: Span, msg: String, note: Option<Note>) {
+        if self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.span == span && diagnostic.msg == msg)
+        {
+            return;
+        }
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note,
+            span,
+            msg,
+        });
     }
 
     /// `expr!` (proposal/try-and-lift.md §2): type the expression as the
@@ -32130,10 +32422,10 @@ enum ReturnFrame {
     Function(Id, TypeId),
     /// A callable whose return type is INFERRED — a closure, an `async` block,
     /// or a function with no declared return type: rets collect here (span +
-    /// optional value) and take part in that inference. A closure checks them
-    /// against its tail (`Constraint::ClosureReturns`, rule 4); a function
-    /// unifies them with its reachable tail (`Constraint::FunctionReturns`,
-    /// rule 3).
+    /// optional value) and take part in that inference — the unification of
+    /// the reachable tail and every `ret`, for functions (rule 3,
+    /// `Constraint::FunctionReturns`) and closures alike (rule 4 as lifted by
+    /// B133, `Constraint::ClosureReturns`).
     Inferred { rets: Vec<(Span, Option<Id>)> },
 }
 
