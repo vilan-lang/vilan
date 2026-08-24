@@ -21356,17 +21356,25 @@ impl<'src> Analyzer<'src> {
     /// The shared tail of the three `for`-subject diagnostics: anchor the error
     /// on the iterable expression, falling back to the loop itself.
     fn report_for_each_error(&mut self, for_each_id: Id, iterable_id: Id, msg: String) {
-        let span = **self
-            .span_map
-            .get(&iterable_id)
-            .or_else(|| self.span_map.get(&for_each_id))
-            .unwrap_or(&&EMPTY_SPAN);
-        self.diagnostics.push(Error {
-            trace: Vec::new(),
-            note: None,
-            span,
-            msg,
-        });
+        // The anchor follows the span's owner, so the diagnostic is attributed
+        // to (and, for generated code, re-anchored through) the entity whose
+        // text it underlines (E82).
+        let (span, anchor) = match self.span_map.get(&iterable_id) {
+            Some(span) => (**span, iterable_id),
+            None => (
+                **self.span_map.get(&for_each_id).unwrap_or(&&EMPTY_SPAN),
+                for_each_id,
+            ),
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            anchor,
+        );
     }
 
     /// Whether a concrete `for` subject with no `next` of its own is one of the
@@ -21890,17 +21898,51 @@ impl<'src> Analyzer<'src> {
     /// (an unannotated `|x| ..` awaiting bidirectional inference), following
     /// `Local` indirections to the `Parameter` entity.
     fn is_unknown_closure_parameter(&self, expr_id: Id) -> bool {
+        self.unfilled_closure_parameter(expr_id).is_some()
+    }
+
+    /// [`Self::is_unknown_closure_parameter`], answering WHICH parameter: the
+    /// `Parameter` entity id behind `expr_id`, when it is a closure parameter
+    /// whose type slot is still `Unknown`. The post-fixpoint starved-parameter
+    /// refusal (B131) reports against this id — its span is the parameter
+    /// itself, the one place the fix (an annotation) goes.
+    fn unfilled_closure_parameter(&self, expr_id: Id) -> Option<Id> {
         let mut id = expr_id;
         loop {
             match self.expr_id_to_expr_map.get(&id) {
                 Some(Expr::Local(target_id)) => id = *target_id,
                 Some(Expr::Parameter(parameter_id)) => {
-                    return self.parameters.get(parameter_id).is_some_and(|parameter| {
-                        self.closures.contains_key(&parameter.function_id)
-                            && matches!(parameter.type_id.get_type(self), Type::Unknown)
-                    });
+                    let parameter = self.parameters.get(parameter_id)?;
+                    return (self.closures.contains_key(&parameter.function_id)
+                        && matches!(parameter.type_id.get_type(self), Type::Unknown))
+                    .then_some(*parameter_id);
                 }
-                _ => return false,
+                _ => return None,
+            }
+        }
+    }
+
+    /// The closure a call SUBJECT ultimately names — `wrap` in `let wrap =
+    /// |x| ..; wrap(..)` — following `Local`/`Variable` indirections to the
+    /// literal. `None` for any other callee. The starved-parameter refusal
+    /// (B131) uses it to tell a closure that is genuinely never called from
+    /// one whose call is merely STALLED in the leftover queue: the latter is
+    /// not "never called", and its stalls keep their own reports.
+    fn closure_behind_callee(&self, subject_id: Id) -> Option<Id> {
+        let mut id = subject_id;
+        loop {
+            match self.expr_id_to_expr_map.get(&id)? {
+                Expr::Local(target_id) if *target_id != id => id = *target_id,
+                // A let-bound name: follow the binding to its initial value.
+                Expr::Variable(variable_id) => {
+                    let initial = self.variables.get(variable_id)?.initial?;
+                    if initial == id {
+                        return None;
+                    }
+                    id = initial;
+                }
+                Expr::Closure(closure_id) | Expr::Async(closure_id) => return Some(*closure_id),
+                _ => return None,
             }
         }
     }
@@ -30715,14 +30757,17 @@ impl<'src> Analyzer<'src> {
                 ) && !self.compare_type(&bool_type, &condition, &HashMap::default())
                 {
                     let label = self.pretty_print_type(&condition, &HashMap::default());
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: **self.span_map.get(&condition_id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "this {construct} is `{label}`, but a condition must be `bool`"
-                        ),
-                    });
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&condition_id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "this {construct} is `{label}`, but a condition must be `bool`"
+                            ),
+                        },
+                        condition_id,
+                    );
                 }
             }
         }
@@ -30795,12 +30840,15 @@ impl<'src> Analyzer<'src> {
                             && !self.compare_type(&bool_type, &operand, &HashMap::default())
                         {
                             let label = self.pretty_print_type(&operand, &HashMap::default());
-                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
-                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
-                                msg: format!(
-                                    "`{symbol}` takes `bool` operands; the {side} operand is `{label}`"
-                                ),
-                            });
+                            self.push_anchored(
+                                Error { trace: Vec::new(), note: None,
+                                    span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "`{symbol}` takes `bool` operands; the {side} operand is `{label}`"
+                                    ),
+                                },
+                                binary_id,
+                            );
                         }
                     }
                     continue;
@@ -30811,15 +30859,18 @@ impl<'src> Analyzer<'src> {
                 };
                 if is_ordering_operator(op) && grounded(&lhs_type) {
                     if is_bool(&lhs_type) {
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "`bool` has no ordering: `{symbol}` models `PartialOrd`, which \
-                                 `bool` does not implement; compare with `==`/`!=`"
-                            ),
-                        });
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`bool` has no ordering: `{symbol}` models `PartialOrd`, which \
+                                     `bool` does not implement; compare with `==`/`!=`"
+                                ),
+                            },
+                            binary_id,
+                        );
                         continue;
                     }
                     // §3.6: a STRING backing is not an order. `<` on one would
@@ -30831,17 +30882,20 @@ impl<'src> Analyzer<'src> {
                     // The integer form is untouched.
                     if let Some(enum_) = self.string_backed_enum(&lhs_type) {
                         let enum_name = enum_.name;
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "`{enum_name}` is backed by strings, and a backing value is not an \
-                                 order: `{symbol}` would compare the strings lexicographically, \
-                                 not the variants; write an `impl {enum_name} with PartialOrd`, or \
-                                 back the enum with integers"
-                            ),
-                        });
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{enum_name}` is backed by strings, and a backing value is not an \
+                                     order: `{symbol}` would compare the strings lexicographically, \
+                                     not the variants; write an `impl {enum_name} with PartialOrd`, or \
+                                     back the enum with integers"
+                                ),
+                            },
+                            binary_id,
+                        );
                         continue;
                     }
                 }
@@ -30858,16 +30912,19 @@ impl<'src> Analyzer<'src> {
                     {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "`{symbol}` compares two values of the same type, but the \
-                                 operands are `{lhs_label}` and `{rhs_label}`: there are no \
-                                 implicit conversions; suffix the literal or convert with `as_*`"
-                            ),
-                        });
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` compares two values of the same type, but the \
+                                     operands are `{lhs_label}` and `{rhs_label}`: there are no \
+                                     implicit conversions; suffix the literal or convert with `as_*`"
+                                ),
+                            },
+                            binary_id,
+                        );
                         continue;
                     }
                 }
@@ -30977,15 +31034,25 @@ impl<'src> Analyzer<'src> {
                     } else {
                         method_name
                     };
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
-                        msg: format!(
-                            "type '{type_name}' does not implement the `{trait_name}` operator; \
-                             add `impl {type_name} with {trait_name}` providing `{required}`"
-                        ),
-                    });
+                    // Anchored, not bare-pushed (E82): in a module the refusal
+                    // belongs to the module's file, and in DERIVED code (a
+                    // `[derive(PartialEq)]` whose generated `eq` compares a
+                    // field type that lacks the impl) it re-anchors at the
+                    // attribute that generated the compare — a bare push kept
+                    // the generated template's span while claiming the entry,
+                    // drawing the label over unrelated entry text.
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                            msg: format!(
+                                "type '{type_name}' does not implement the `{trait_name}` operator; \
+                                 add `impl {type_name} with {trait_name}` providing `{required}`"
+                            ),
+                        },
+                        binary_id,
+                    );
                 }
             }
         }
@@ -31064,12 +31131,15 @@ impl<'src> Analyzer<'src> {
                         }
                         _ => "",
                     };
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span,
-                        msg: format!("unknown numeric suffix `{suffix}`{hint}"),
-                    });
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!("unknown numeric suffix `{suffix}`{hint}"),
+                        },
+                        literal_id,
+                    );
                 }
                 continue;
             }
@@ -31132,12 +31202,106 @@ impl<'src> Analyzer<'src> {
             };
             if let Some(span) = self.span_map.get(&literal_id) {
                 let span = **span;
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span,
-                    msg: format!("the literal `{whole}` is out of range for `{name}` ({range})"),
-                });
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "the literal `{whole}` is out of range for `{name}` ({range})"
+                        ),
+                    },
+                    literal_id,
+                );
+            }
+        }
+
+        // --- The starved-closure-parameter refusal (B131) --- a closure that
+        // is never called leaves an unannotated parameter `Unknown` for good:
+        // B13's channel ("inferred from the closure's first call") has no call
+        // to fill from, so every use of the parameter stalls in the leftover
+        // queue. The residual sweep below would report those stalls one by one
+        // at the USES ("could not be resolved" at a `print(x)` two hops from
+        // the cause); the root cause is the parameter, so ONE diagnostic
+        // anchors there, names the two facts that starve it, and carries the
+        // fix (standard A1/B3/B4 — and B5: the residuals stay silent behind
+        // it, exactly as behind any real diagnostic). Gated the same way the
+        // sweep is: with a real error already reported, an unfilled parameter
+        // may be that error's cascade — a closure whose one call site failed
+        // to resolve is not "never called".
+        if self.diagnostics.is_empty() {
+            // A closure with a leftover CALL is not never-called either — the
+            // call merely STALLED (`let wrap = |x| view("p").child(x);
+            // wrap("later")`: the call defers on the closure's own unresolved
+            // type, so B13's fill never ran). Its parameters are excluded, and
+            // its stalls keep their own residual reports below.
+            let mut called_closure_ids: Vec<Id> = Vec::new();
+            for constraint in &self.constraints {
+                if let Constraint::CallSubject(constraint) = constraint
+                    && let Some(closure_id) = self.closure_behind_callee(constraint.subject_id)
+                    && !called_closure_ids.contains(&closure_id)
+                {
+                    called_closure_ids.push(closure_id);
+                }
+            }
+            let mut starved_parameter_ids: Vec<Id> = Vec::new();
+            for constraint in &self.constraints {
+                // The ids each leftover kind was consulting — the ones its
+                // resolver defers on when they are unfilled closure parameters.
+                let mut consulted: Vec<Id> = Vec::new();
+                match constraint {
+                    Constraint::Subscript { subject_id, .. } => consulted.push(*subject_id),
+                    Constraint::FieldAccessor(constraint) => consulted.push(constraint.subject_id),
+                    Constraint::MethodCall {
+                        subject_id,
+                        argument_ids,
+                        ..
+                    } => {
+                        consulted.push(*subject_id);
+                        consulted.extend(argument_ids.iter().copied());
+                    }
+                    Constraint::CallSubject(constraint) => {
+                        consulted.push(constraint.subject_id);
+                        consulted.extend(constraint.argument_ids.iter().copied());
+                    }
+                    Constraint::ForEachItem { iterable_id, .. } => consulted.push(*iterable_id),
+                    Constraint::Comprehension { source_id, .. } => consulted.push(*source_id),
+                    Constraint::Match(prepped) => consulted.push(prepped.subject_id),
+                    _ => {}
+                }
+                for id in consulted {
+                    if let Some(parameter_id) = self.unfilled_closure_parameter(id)
+                        && !starved_parameter_ids.contains(&parameter_id)
+                        && self.parameters.get(&parameter_id).is_none_or(|parameter| {
+                            !called_closure_ids.contains(&parameter.function_id)
+                        })
+                    {
+                        starved_parameter_ids.push(parameter_id);
+                    }
+                }
+            }
+            for parameter_id in starved_parameter_ids {
+                let Some(name) = self
+                    .parameters
+                    .get(&parameter_id)
+                    .map(|parameter| parameter.name)
+                else {
+                    continue;
+                };
+                let span = **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN);
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "`{name}` is never given a type: this closure is never called and \
+                             its parameter is unannotated; annotate it (e.g. `|{name}: \
+                             List<i32>|`)"
+                        ),
+                    },
+                    parameter_id,
+                );
             }
         }
 
@@ -31149,48 +31313,66 @@ impl<'src> Analyzer<'src> {
         // B5 (diagnostics-standard.md): these residuals are near-information-
         // free ("could not be resolved"), and when a REAL diagnostic already
         // exists they are its cascade — the std-missing wall printed five of
-        // them for one root cause. They surface only as the LONE signal
-        // (a genuinely undetermined program); the actionable never-determined
-        // messages below stay unconditional.
+        // them for one root cause (and the starved-parameter refusal above
+        // covers its stalled uses the same way). They surface only as the LONE
+        // signal (a genuinely undetermined program); the actionable
+        // never-determined messages below stay unconditional.
         let residuals_are_cascade = !self.diagnostics.is_empty();
         if !residuals_are_cascade {
+            let mut residuals: Vec<(Error, Id)> = Vec::new();
             for constraint in &self.constraints {
                 match constraint {
-                    Constraint::StructInitializer(constraint) => self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: constraint.fields_span,
-                        msg: "type of struct initializer could not be resolved".to_string(),
-                    }),
-                    Constraint::FieldAccessor(constraint) => self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: **(self.span_map.get(&constraint.id).unwrap_or(&&EMPTY_SPAN)),
-                        msg: "type of accessor subject could not be resolved".to_string(),
-                    }),
-                    Constraint::Variable(constraint) => self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: **(self
-                            .span_map
-                            .get(&constraint.variable_id)
-                            .unwrap_or(&&EMPTY_SPAN)),
-                        msg: format!(
-                            "type of variable '{}' could not be resolved",
-                            self.variables
+                    Constraint::StructInitializer(constraint) => residuals.push((
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: constraint.fields_span,
+                            msg: "type of struct initializer could not be resolved".to_string(),
+                        },
+                        constraint.initializer_id,
+                    )),
+                    Constraint::FieldAccessor(constraint) => residuals.push((
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **(self.span_map.get(&constraint.id).unwrap_or(&&EMPTY_SPAN)),
+                            msg: "type of accessor subject could not be resolved".to_string(),
+                        },
+                        constraint.id,
+                    )),
+                    Constraint::Variable(constraint) => residuals.push((
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: **(self
+                                .span_map
                                 .get(&constraint.variable_id)
-                                .map(|variable| variable.name)
-                                .unwrap_or("unknown")
-                        ),
-                    }),
-                    Constraint::CallSubject(constraint) => self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span: constraint.arguments_span,
-                        msg: "type of function call arguments could not be resolved".to_string(),
-                    }),
+                                .unwrap_or(&&EMPTY_SPAN)),
+                            msg: format!(
+                                "type of variable '{}' could not be resolved",
+                                self.variables
+                                    .get(&constraint.variable_id)
+                                    .map(|variable| variable.name)
+                                    .unwrap_or("unknown")
+                            ),
+                        },
+                        constraint.variable_id,
+                    )),
+                    Constraint::CallSubject(constraint) => residuals.push((
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: constraint.arguments_span,
+                            msg: "type of function call arguments could not be resolved"
+                                .to_string(),
+                        },
+                        constraint.call_id,
+                    )),
                     _ => {}
                 }
+            }
+            for (error, anchor) in residuals {
+                self.push_anchored(error, anchor);
             }
         }
         // A subscript left deferred because its list's element slot never
@@ -31208,14 +31390,17 @@ impl<'src> Analyzer<'src> {
         for (subscript_id, subject_id) in unresolved_subscripts {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             if self.list_element_slot(&subject_type).is_some() {
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: **self.span_map.get(&subscript_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: "cannot index this List: its element type is never determined \
-                          (give the list a type, e.g. `: List<i32>`)"
-                        .to_string(),
-                });
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: **self.span_map.get(&subscript_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: "cannot index this List: its element type is never determined \
+                              (give the list a type, e.g. `: List<i32>`)"
+                            .to_string(),
+                    },
+                    subscript_id,
+                );
             }
         }
         let unresolved_matches: Vec<(Id, Span)> = if residuals_are_cascade {
@@ -31232,15 +31417,18 @@ impl<'src> Analyzer<'src> {
         for (subject_id, span) in unresolved_matches {
             let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
-            self.diagnostics.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span,
-                msg: format!(
-                    "type of match expression could not be resolved (subject: {})",
-                    subject_str
-                ),
-            });
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "type of match expression could not be resolved (subject: {})",
+                        subject_str
+                    ),
+                },
+                subject_id,
+            );
         }
 
         // B16's Map-shaped remainder: a binding whose final type still carries
@@ -31328,16 +31516,19 @@ impl<'src> Analyzer<'src> {
                     .map(|variable| variable.name)
                     .unwrap_or("unknown");
                 let rendered = self.pretty_print_type(&variable_type, &HashMap::default());
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span,
-                    msg: format!(
-                        "the type of '{name}' is never fully determined: `{rendered}` keeps \
-                         its callee's type parameters, so uses of it cannot be checked; \
-                         annotate the binding (e.g. `: Map<str, i32>`)"
-                    ),
-                });
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "the type of '{name}' is never fully determined: `{rendered}` keeps \
+                             its callee's type parameters, so uses of it cannot be checked; \
+                             annotate the binding (e.g. `: Map<str, i32>`)"
+                        ),
+                    },
+                    variable_id,
+                );
             }
         }
 
