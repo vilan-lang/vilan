@@ -124,12 +124,21 @@ the server is the canonical use).
 fun random_bytes(length: i32): Bytes        // cryptographically secure
 fun random_uuid(): str
 fun equals_constant_time(a: Bytes, b: Bytes): bool   // timing-safe compare
+async fun hmac_sha512(key: Bytes, data: Bytes): Bytes
+async fun pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: i32, bits: i32): Bytes
 ```
 
-WebCrypto-backed (async where the host is). For password hashing on the
-server, bind the host's sync primitives as externs (the walkthrough
-example binds Node's `pbkdf2Sync` this way). These are candidates for
-std promotion.
+WebCrypto-backed (async where the host is). `pbkdf2_sha512` is the v1
+password-hashing primitive — store the salt beside the derived hash and
+compare with `equals_constant_time`; `hmac_sha512` signs raw byte
+messages (for tokens, `std::jwt` below is the shaped surface). Neither
+needs an extern any more.
+
+The std surface is **async** because WebCrypto is. On a path that must
+stay sync — the walkthrough's rpc dispatch hashes passwords inside a
+sync method — binding the host's sync primitive as an extern is still
+the right move: the walkthrough example binds Node's `pbkdf2Sync` that
+way, and that lesson stands.
 
 ## std::jwt
 

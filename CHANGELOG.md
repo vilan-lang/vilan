@@ -20,6 +20,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 <!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 
+---
+
+<!-- family: tooling -->
+**`std::crypto`'s promoted primitives are documented.** `hmac_sha512` and `pbkdf2_sha512` shipped in std, but the misc page's crypto section still listed only `random_bytes`/`random_uuid`/`equals_constant_time` and sent readers off to "bind the host's sync primitives as externs … candidates for std promotion" — teaching a workaround for a need std now covers. The section lists both promoted functions and keeps the extern lesson for what it is still for: std's surface is async because WebCrypto is, so a path that must stay sync (the walkthrough's rpc dispatch hashes passwords inside a sync method) still binds Node's `pbkdf2Sync`, exactly as the walkthrough example does. Same sweep, same class: `content_type_of`'s doc comment no longer claims `std::fs` cannot read bytes — stale since `read_bytes` shipped.
+
 ## v0.36.0 — 2026-08-24
 
 <!-- family: breaking -->
