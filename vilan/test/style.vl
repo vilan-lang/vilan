@@ -36,9 +36,9 @@ fun main() {
 	// byte — a composed dark rule still starts with ':', which is what keeps
 	// it in the same cascade band as every other dark rule (B35).
 	let themed = const style()
+		.md(style().dark(style().hover(style().background(Color::gray(50)))))
 		.dark(style().background(Color::gray(900)))
-		.dark(style().hover(style().background(Color::gray(700))))
-		.md(style().dark(style().hover(style().background(Color::gray(50)))));
+		.dark(style().hover(style().background(Color::gray(700))));
 	print(themed.class_list());
 
 	// The value types (ui-styling.md §0bis.3). A translucent token renders as
@@ -47,8 +47,8 @@ fun main() {
 	// bytes. Every line this block adds is an ADDITION: the rules above keep
 	// the exact class names they had before the value types existed.
 	let translucent = const style()
-		.background(Color::rgba(27, 6, 13, 0.9))
-		.color(Color::gray(900).alpha(0.08));
+		.color(Color::gray(900).alpha(0.08))
+		.background(Color::rgba(27, 6, 13, 0.9));
 	print(translucent.class_list());
 
 	// A gradient is `background-image`, a different slot from `background` —
@@ -68,9 +68,9 @@ fun main() {
 	// the class list shows the override.
 	let framed = const style()
 		.display(Display::InlineFlex)
-		.border_top(Length::px(1), Color::gray(300))
 		.padding_top(space(2))
-		.margin_left(Length::auto());
+		.margin_left(Length::auto())
+		.border_top(Length::px(1), Color::gray(300));
 	print(framed.class_list());
 	print(const style().border(Length::px(1), Color::gray(300)).border_none().class_list());
 
@@ -79,8 +79,8 @@ fun main() {
 	// where that pair is proven in bytes. Additions again: nothing above moves.
 	let zeroed = const style()
 		.inset(Length::zero())
-		.min_width(Length::zero())
 		.left(Length::css("clamp(120px, 30%, 185px)"))
+		.min_width(Length::zero())
 		.max_width(Length::calc("100% - 2rem"));
 	print(zeroed.class_list());
 
@@ -97,8 +97,8 @@ fun main() {
 	// components, the hue a bare degree count. `.alpha()` composes through
 	// the relative form, the same as over every other colour.
 	let perceptual = const style()
-		.background(Color::oklch(0.62, 0.19, 313.0))
-		.color(Color::oklch(0.97, 0.02, 340.0).alpha(0.8));
+		.color(Color::oklch(0.97, 0.02, 340.0).alpha(0.8))
+		.background(Color::oklch(0.62, 0.19, 313.0));
 	print(perceptual.class_list());
 
 	// `size` writes the SAME two slots `width` and `height` write — the class
@@ -115,10 +115,10 @@ fun main() {
 	// media(dark(attribute(pseudo(..)))) stack — attribute rules start with
 	// '.', so they stay in the base cascade band (B35).
 	let disclosed = const style()
-		.attribute("data-open", "true", style().display(Display::Flex))
-		.attribute("data-open", "true", style().hover(style().background(Color::gray(100))))
+		.md(style().dark(style().attribute("data-open", "true", style().hover(style().color(Color::gray(50))))))
 		.dark(style().attribute("data-open", "true", style().background(Color::gray(800))))
-		.md(style().dark(style().attribute("data-open", "true", style().hover(style().color(Color::gray(50))))));
+		.attribute("data-open", "true", style().display(Display::Flex))
+		.attribute("data-open", "true", style().hover(style().background(Color::gray(100))));
 	print(disclosed.class_list());
 
 	// Two methods per slot, deliberately: `background_image` writes the slot
@@ -126,10 +126,10 @@ fun main() {
 	// `line_height` writes. So each pair OVERRIDES rather than racing — the
 	// class list shows one class per slot even though two methods wrote it.
 	let tiled = const style()
-		.background_image("url(tile.png)")
-		.background_size("120px 120px")
 		.line_height(1.5)
-		.line_height_length(Length::px(24));
+		.line_height_length(Length::px(24))
+		.background_image("url(tile.png)")
+		.background_size("120px 120px");
 	print(tiled.class_list());
 }
 main();

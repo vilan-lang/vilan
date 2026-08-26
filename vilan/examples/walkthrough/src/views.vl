@@ -28,12 +28,12 @@ import pkg::store::NotesClient;
 // --- styles (compiled at build time; see the styling guide) ---
 
 let shell = const style()
-	.max_width(Length::rem(30))
-	.margin_x(Length::auto())
-	.padding(space(6))
 	.display(Display::Flex)
 	.flex_direction(FlexDirection::Column)
 	.gap(space(3))
+	.padding(space(6))
+	.margin_x(Length::auto())
+	.max_width(Length::rem(30))
 	.font_family("system-ui, sans-serif");
 
 let row = const style().display(Display::Flex).gap(space(2)).align_items(AlignItems::Center);
@@ -46,9 +46,9 @@ let field = const style()
 let button = const style()
 	.padding_x(space(3))
 	.padding_y(space(2))
-	.radius(space(1))
-	.background(Color::blue(600))
 	.color(Color::white())
+	.background(Color::blue(600))
+	.radius(space(1))
 	.border_none()
 	.cursor(Cursor::Pointer);
 
