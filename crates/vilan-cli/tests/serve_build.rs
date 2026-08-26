@@ -324,6 +324,76 @@ fn an_artifact_the_build_named_and_did_not_write_stops_the_server() {
 }
 
 #[test]
+fn an_artifact_with_an_unknown_extension_is_skipped_with_a_warning_not_silently() {
+    // kolt.local 022(b): the §5.10 fence stands — `serve_build` serves a
+    // build, not a directory, and an extension the content-type table does not
+    // name is not served — but the drop is no longer silent: boot names the
+    // artifact it skipped. FENCE-NEUTRAL by assertion: no new type is served,
+    // and the known artifacts' list is exactly what it was.
+    let port = free_port();
+    let staged = stage("unknown_ext", port, Client::Styled, false);
+    build(&staged);
+    // Teach the manifest an artifact the table does not know — a `.png` chunk
+    // entry — with the file ON DISK, so what this test observes is the
+    // extension skip and not the missing-artifact stop.
+    let manifest_path = staged.join("dist/client.chunks.json");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("the manifest");
+    assert!(
+        manifest.contains("\"chunks\": []"),
+        "the fixture's manifest shape moved under this test: {manifest}"
+    );
+    std::fs::write(
+        &manifest_path,
+        manifest.replace("\"chunks\": []", "\"chunks\": [{\"file\": \"logo.png\"}]"),
+    )
+    .expect("name the unknown-extension artifact");
+    std::fs::write(staged.join("dist/logo.png"), "png-bytes").expect("write the artifact");
+
+    let mut server = Command::new("node")
+        .arg("dist/server.mjs")
+        .current_dir(&staged)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the server");
+    assert!(wait_for_port(port), "the server should bind {port}");
+
+    // The unknown extension is still not served: the app's fallback answers.
+    let (_, body) = http_get(port, "/logo.png");
+    assert!(
+        body.contains("id=\"app\""),
+        "an unknown-extension artifact must fall through to the app, not be served:\n{body}"
+    );
+    // And the known artifacts still are — the asset list is unchanged.
+    let (head, _) = http_get(port, "/client.js");
+    assert!(
+        head.contains("Content-Type: text/javascript"),
+        "the bundle's route must be untouched by the skipped artifact:\n{head}"
+    );
+    let (head, _) = http_get(port, "/client.css");
+    assert!(
+        head.contains("Content-Type: text/css"),
+        "the sidecar's route must be untouched by the skipped artifact:\n{head}"
+    );
+
+    let _ = server.kill();
+    let mut boot_output = Vec::new();
+    if let Some(mut stdout) = server.stdout.take() {
+        let _ = stdout.read_to_end(&mut boot_output);
+    }
+    let _ = server.wait();
+    let boot_output = String::from_utf8_lossy(&boot_output);
+    assert!(
+        boot_output.contains(
+            "warning: the `client` build names dist/logo.png, whose extension \
+             `serve_build` has no content type for — the artifact is not served"
+        ),
+        "the boot must name the artifact it skipped:\n{boot_output}"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
 fn the_dev_policy_revalidates_only_while_watching() {
     // `dev-refresh.md` §5, item 1 — E55's headline defect, at the one call site
     // that can close it. A server holds its assets in a closure for the life of

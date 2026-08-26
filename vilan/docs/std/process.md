@@ -121,9 +121,10 @@ Three details are decisions, not defaults. The route shape is
 `/<file name>`, which is what every shell already asks for, so adopting it
 moves no HTML. Content types come from a short fixed table (`.js`/`.mjs`,
 `.css`, `.json`, `.html`); anything else is not served, because
-`serve_build` serves a *build*, not a directory. And an artifact the build
-named but did not write **stops the server at boot**, naming the file and
-the leg, rather than 404ing for the life of the process.
+`serve_build` serves a *build*, not a directory — and the skip is said, not
+silent: boot prints a warning naming the artifact it will not serve. And an
+artifact the build named but did not write **stops the server at boot**,
+naming the file and the leg, rather than 404ing for the life of the process.
 
 Freshness is its dev-mode policy: under `vilan run --watch`
 ([`is_watching`](#stdwatch)) each asset is re-read per request, so a
