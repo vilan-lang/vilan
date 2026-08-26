@@ -458,6 +458,60 @@ fn dependency_pkg_self_reference_is_isolated() {
 }
 
 #[test]
+fn a_workspace_dependency_edge_named_std_is_refused() {
+    // E88 (defensive since L12): a manifest declaring a dependency named `std`
+    // is refused up front, but a programmatically built `Workspace` (wasm,
+    // embedders, this very harness) could still stage one — and the analyzer
+    // bound it OVER the standard library (`resolve_import_root` checks
+    // dependency edges first) while the IDE's completion answered the stdlib:
+    // one name, two resolvers, two answers. The `analyze` funnel now reports
+    // the edge and drops it, so `std::` keeps meaning the standard library
+    // for every resolver.
+    let entry = "import std::print;\nfun main() { print(\"hi\") }\n";
+    let imposter = Dep {
+        import_name: "std",
+        files: &[("lib.vl", "fun shadow(): str { \"shadow\" }\n")],
+    };
+    let errors = analyze_workspace(entry, &[imposter], Platform::default());
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`std` is a reserved package name")),
+        "expected the reserved-name refusal, got: {errors:#?}"
+    );
+    // Dropped, not fatal: `std::print` still resolves to the real standard
+    // library, so the refusal is the only diagnostic.
+    assert_eq!(
+        errors.len(),
+        1,
+        "`std::print` must keep resolving to the standard library: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_workspace_dependency_edge_named_pkg_is_refused() {
+    // The other root the world itself owns. Unlike `std`, a `pkg` edge was
+    // never consulted (`resolve_import_root` answers the importing package's
+    // own namespace first), so pre-refusal the declaration was silently dead —
+    // now it is loud, matching the manifest layer's L12 refusal.
+    let entry = "fun main() {}\n";
+    let imposter = Dep {
+        import_name: "pkg",
+        files: &[("lib.vl", "fun shadow(): str { \"shadow\" }\n")],
+    };
+    let errors = analyze_workspace(entry, &[imposter], Platform::default());
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly the reserved-name refusal, got: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("`pkg` is a reserved package name"),
+        "expected the reserved-name refusal, got: {errors:#?}"
+    );
+}
+
+#[test]
 fn unknown_dependency_name_errors() {
     // The entry imports a package it doesn't declare — resolution finds no such
     // root and reports it (rather than silently resolving against another package).

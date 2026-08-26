@@ -35712,7 +35712,9 @@ pub fn analyze<'src>(
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
-    analyze_inner(
+    let (sanitized, refusals) = drop_reserved_dependency_edges(workspace);
+    let workspace = sanitized.as_ref().unwrap_or(workspace);
+    let mut program = analyze_inner(
         nodes,
         entry_source,
         std,
@@ -35721,7 +35723,74 @@ pub fn analyze<'src>(
         platform,
         workspace,
         true,
-    )
+    );
+    for refusal in refusals {
+        program.diagnostics.push(refusal);
+        program.diagnostic_sources.push(SourceId(0));
+    }
+    program
+}
+
+/// The dependency-edge names the analyzer refuses to register (E88, defensive
+/// since L12). `std` and `pkg` are the world's own import roots: a manifest
+/// declaring either as a dependency key is refused before analysis
+/// ([`crate::manifest::reserved_package_name`], L12), and a [`Workspace`]
+/// built programmatically — wasm, embedders, tests — is held to the same rule
+/// here, at the one funnel every entry path passes through. Pre-refusal the
+/// analyzer bound a `std` edge OVER the standard library
+/// (`resolve_import_root` checks dependency edges first) while the IDE's
+/// completion answered the stdlib and the macro world's `scope_for` did too —
+/// one name, three resolvers, two answers. The offending edge is reported and
+/// DROPPED rather than made fatal: `std::`/`pkg::` keep meaning the roots
+/// they always name, the program still analyzes, and every resolver agrees by
+/// construction because the shape no longer exists past this point.
+/// `macro_std` stays a legal EDGE name at this layer — the macro world itself
+/// stages the macro standard library as one (`macros.rs` builds that
+/// workspace), and it collides with no regular-world root; user manifests
+/// remain refused by L12.
+fn drop_reserved_dependency_edges(workspace: &Workspace) -> (Option<Workspace>, Vec<Error>) {
+    fn refused_root(name: &str) -> bool {
+        matches!(name, "std" | "pkg")
+    }
+    let refusal = |name: &str| {
+        let reason = crate::manifest::reserved_package_name(name)
+            .expect("a refused edge name is a reserved package name");
+        Error {
+            trace: Vec::new(),
+            note: None,
+            span: EMPTY_SPAN,
+            msg: format!(
+                "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
+                 `macro_std` are all reserved); this workspace staged a dependency \
+                 edge named `{name}` — the edge is ignored and `{name}::` keeps \
+                 meaning the root it always names; rename the dependency"
+            ),
+        }
+    };
+    let mut refusals: Vec<Error> = Vec::new();
+    for (name, _) in &workspace.entry_dependencies {
+        if refused_root(name) {
+            refusals.push(refusal(name));
+        }
+    }
+    for spec in &workspace.packages {
+        for (name, _) in &spec.dependencies {
+            if refused_root(name) {
+                refusals.push(refusal(name));
+            }
+        }
+    }
+    if refusals.is_empty() {
+        return (None, refusals);
+    }
+    let mut sanitized = workspace.clone();
+    sanitized
+        .entry_dependencies
+        .retain(|(name, _)| !refused_root(name));
+    for spec in &mut sanitized.packages {
+        spec.dependencies.retain(|(name, _)| !refused_root(name));
+    }
+    (Some(sanitized), refusals)
 }
 
 /// `analyze` with the cache switchable: the derive/macro hoist's fallback —
