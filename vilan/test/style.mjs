@@ -148,6 +148,8 @@ const zeroed = [ [ new Map([ [ "::inset", [ "::inset", [ "s1ucbaf9", "inset:0" ]
 console.log(class_list(zeroed));
 const accented = [ [ new Map([ [ "::background-color", [ "::background-color", [ "sumjtxl", "background-color:var(--accent)" ] ] ], [ "::border-color", [ "::border-color", [ "s1rhkqzm", "border-color:rgb(from var(--accent) r g b / 0.5)" ] ] ] ]) ] ];
 console.log(class_list(accented));
+const perceptual = [ [ new Map([ [ "::background-color", [ "::background-color", [ "s1yxmxe6", "background-color:oklch(0.62 0.19 313)" ] ] ], [ "::color", [ "::color", [ "s1ouskes", "color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)" ] ] ] ]) ] ];
+console.log(class_list(perceptual));
 const squared = [ [ new Map([ [ "::width", [ "::width", [ "s178h6ec", "width:1rem" ] ] ], [ "::height", [ "::height", [ "s22ylrq", "height:1rem" ] ] ] ]) ] ];
 console.log(class_list(squared));
 console.log("s178h6ec s22zdhz");

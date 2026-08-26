@@ -252,6 +252,20 @@ impl Color {
 		Color { css = i"rgba({red}, {green}, {blue}, {alpha})", root = "" }
 	}
 
+	/// A perceptual literal — OKLCH, Oklab's polar form: `lightness` 0.0-1.0
+	/// (the CSS number form — 1.0 is white), `chroma` 0.0-0.5 (0 is
+	/// achromatic; sRGB tops out near 0.37), `hue` in degrees, 0.0-360.0.
+	/// The space palette derivation works in: hold a hue angle, step the
+	/// lightness, and the steps look even across hues — which rgb cannot
+	/// promise. Ranges are validated at const time like `rgba`'s channels,
+	/// and the hue is required in its canonical turn: angles wrap in CSS, so
+	/// admitting 700 beside 340 would mint two classes for one colour.
+	/// `.alpha()` composes over the result like over any other colour.
+	fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
+		check_oklch(lightness, chroma, hue);
+		Color { css = i"oklch({lightness} {chroma} {hue})", root = "" }
+	}
+
 	/// This color at `alpha` (0.0-1.0). Renders the RELATIVE color form,
 	/// `rgb(from <this> r g b / a)`, which keeps a token's identity intact —
 	/// `Color::gray(900).alpha(0.08)` is still `var(--gray-900)` underneath,
@@ -274,6 +288,18 @@ fun check_channel(name: str, value: i32) {
 fun check_alpha(value: f64) {
 	if value < 0.0 || value > 1.0 {
 		panic(i"alpha {value} is outside 0.0-1.0");
+	}
+}
+
+fun check_oklch(lightness: f64, chroma: f64, hue: f64) {
+	if lightness < 0.0 || lightness > 1.0 {
+		panic(i"oklch lightness {lightness} is outside 0.0-1.0 (the CSS number form — 1.0 is white)");
+	}
+	if chroma < 0.0 || chroma > 0.5 {
+		panic(i"oklch chroma {chroma} is outside 0.0-0.5 (0 is achromatic; sRGB tops out near 0.37)");
+	}
+	if hue < 0.0 || hue > 360.0 {
+		panic(i"oklch hue {hue} is outside 0.0-360.0 (degrees; angles wrap, so write the canonical turn)");
 	}
 }
 

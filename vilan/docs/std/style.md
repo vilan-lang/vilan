@@ -43,6 +43,7 @@ impl Color {
 	fun green(step: i32): Color
 
 	fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color  // a literal, 0-255 / 0.0-1.0
+	fun oklch(lightness: f64, chroma: f64, hue: f64): Color  // perceptual: 0.0-1.0 / 0.0-0.5 / degrees
 	fun alpha(self, value: f64): Color   // THIS colour at that alpha
 }
 
@@ -58,6 +59,16 @@ so a ramp step stays a `var(--gray-900)` and keeps re-theming — which an
 8-digit hex could not do. Channels, alphas and the two-stop gradient
 minimum are checked during const evaluation, so a bad value stops the
 build naming itself.
+
+`oklch` is the perceptual literal — hold a hue angle and step the
+lightness, and the steps look even across hues, which is what deriving a
+palette wants and what `rgba` cannot promise. Lightness takes the CSS
+**number** form (0.0–1.0, not a percentage), chroma runs 0.0–0.5 (0 is
+achromatic; sRGB tops out near 0.37), and the hue angle is degrees in its
+canonical 0–360 turn — angles wrap in CSS, so one colour keeps one
+spelling and one class. All three ranges are checked during const
+evaluation, and `.alpha()` composes over the result like over any other
+colour.
 
 `Color::var` is `Length::var`'s counterpart — the typed end of the
 dynamic-value channel. It renders `var(--name)` and **declares nothing**:

@@ -26610,6 +26610,103 @@ fn color_var_references_without_declaring() {
     );
 }
 
+/// `Color::oklch` (item 013): the perceptual literal, emitted in the CSS
+/// number form — space-joined components, the hue a bare degree count — with
+/// `.alpha()` composing through the relative form like over any colour.
+#[test]
+fn oklch_emits_the_number_form() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style()
+                .background(Color::oklch(0.62, 0.19, 313.0))
+                .color(Color::oklch(0.97, 0.02, 340.0).alpha(0.8))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:oklch(0.62 0.19 313)}",
+        "{color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The three range refusals, per case like `rgba`'s channels: lightness is
+/// the CSS NUMBER form (0.0-1.0), not the percentage.
+#[test]
+fn an_oklch_lightness_outside_the_unit_range_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(62.0, 0.19, 313.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch lightness 62 is outside 0.0-1.0")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_oklch_chroma_outside_its_range_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(0.62, 0.7, 313.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch chroma 0.7 is outside 0.0-0.5")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// Angles wrap in CSS, so admitting 700 beside 340 would mint two classes
+/// for one colour — the canonical turn is required.
+#[test]
+fn an_oklch_hue_outside_the_canonical_turn_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(0.62, 0.19, 700.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch hue 700 is outside 0.0-360.0")),
+        "{diagnostics:#?}"
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the

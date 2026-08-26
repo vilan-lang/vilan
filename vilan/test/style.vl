@@ -93,6 +93,14 @@ fun main() {
 		.border_color(Color::var("--accent").alpha(0.5));
 	print(accented.class_list());
 
+	// `oklch` is the perceptual literal: number-form lightness, space-joined
+	// components, the hue a bare degree count. `.alpha()` composes through
+	// the relative form, the same as over every other colour.
+	let perceptual = const style()
+		.background(Color::oklch(0.62, 0.19, 313.0))
+		.color(Color::oklch(0.97, 0.02, 340.0).alpha(0.8));
+	print(perceptual.class_list());
+
 	// `size` writes the SAME two slots `width` and `height` write — the class
 	// list shows two classes for one call, and a later `height` narrows the
 	// square by the ordinary last-wins rule (three calls, two classes).

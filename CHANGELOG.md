@@ -27,6 +27,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ---
 
+<!-- family: feature -->
+**`Color::oklch(lightness, chroma, hue)` — the perceptual colour literal.** "oklch" had zero hits in the whole tree while the design language derives its palette by hand along stated hue angles — exactly the workflow the space exists to serve: hold a hue, step the lightness, and the steps look even across hues, which rgb cannot promise. The CSS **number** form: lightness 0.0–1.0 (not a percentage), chroma 0.0–0.5 (0 is achromatic; sRGB tops out near 0.37), hue in degrees in its canonical 0–360 turn — angles wrap in CSS, and a class name is a content hash, so admitting `700` beside `340` would mint two classes for one colour. All three ranges are validated during const evaluation like `rgba`'s channels, and `.alpha()` composes over the result through the relative-colour form. `oklab` is deliberately not shipped alongside: its signed a/b axes are a different validation and a different authoring model, and the palette workflow asks for the polar form. Docs `std/style.md`. (kolt dogfood, item 013)
+
+---
+
 <!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 
