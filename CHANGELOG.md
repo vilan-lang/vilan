@@ -20,6 +20,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 <!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 
+---
+
+<!-- family: feature -->
+**`std::process::cwd()` — the working directory, readable at last.** `std::process` was exit/scan/args/env: std itself leaned on a working directory nothing in the language could read — `build_of` hardcodes `"dist"` because "a server runs from the project root", and `BuildError::NotBuilt`'s message blames a wrong working directory — while the only near-workaround was `env("PWD")`, shell-dependent and absent outright when the process is not started from a POSIX shell (the dogfood exhibit: a server that panicked at boot unless a hand-set `CWD` env var said where it was). One extern to `process.cwd()`: `cwd(): str`, the absolute path every relative path in a `std::fs` or `std::build` call resolves against. Deliberately NOT included: a project-root discovery helper (walk up to `vilan.toml`) — a real, separate decision this binding records and does not preempt. Docs `std/process.md`; the demand case is kolt (`proposals/projects/kolt.local` tracker item 018).
+
 ## v0.36.0 — 2026-08-24
 
 <!-- family: breaking -->

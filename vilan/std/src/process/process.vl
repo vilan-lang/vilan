@@ -16,3 +16,11 @@ external fun args(): List<str>;
 
 /// Look up an environment variable, `None` if it is unset.
 external fun env(key: str): Option<str>;
+
+/// The process's current working directory, as an absolute path — what every
+/// relative path in the program (`build_of`'s `"dist"`, a `read_dir` argument)
+/// resolves against. One extern to `process.cwd()`; deliberately NOT a
+/// project-root finder — discovering the project root (walking up to
+/// `vilan.toml`) is a separate decision this binding does not preempt.
+[extern("process.cwd")]
+external fun cwd(): str;

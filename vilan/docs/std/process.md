@@ -404,10 +404,17 @@ of the same material.
 
 ```vilan,fragment
 fun args(): List<str>            // CLI arguments
+fun cwd(): str                   // current working directory, absolute
 fun env(key: str): Option<str>   // environment variable
 fun exit(code: i32)
 fun scan(): str                  // read a line from stdin
 ```
+
+Every relative path in a `std::fs` or `std::build` call resolves against the
+process's working directory; `cwd()` reads it (absolute), so a boot check can
+say which directory the server actually ran from instead of guessing. It is
+*not* a project-root finder — walking up to `vilan.toml` is a separate,
+undecided helper, and `cwd()` does not preempt it.
 
 Server-side hot-swapping of code is not a thing
 here and is not planned — the node leg restarts.
