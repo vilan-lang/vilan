@@ -6,10 +6,15 @@
 // build time. `+` combines named styles (right side wins per property).
 //
 // Slot keys encode conditions as `media:condition:property`, where a CONDITION
-// is "" (base), a pseudo-class ("hover"), the dark marker ("dark"), or dark
-// stacked over a pseudo-class ("dark hover") — the space mirroring the
-// descendant combinator the selector renders. Conditions nest OUTSIDE-IN in
-// the order the CSS nests them, `md(dark(hover(..)))`; any other order is
+// is up to three optional tokens, space-joined outside-in: the dark marker
+// ("dark", the one ancestor form — the space under it mirroring the
+// descendant combinator the selector renders), a self-targeting attribute
+// selector (`[data-open="true"]`, always the bracketed token), and a
+// pseudo-class ("hover", always last). So "" (base), "hover", "dark",
+// "dark hover", `[data-open="true"] hover` and the full
+// `dark [data-open="true"] hover` are all conditions. Conditions nest
+// OUTSIDE-IN in the order the CSS nests them,
+// `md(dark(attribute(.., hover(..))))`; any other order is
 // refused with a message naming the fix. Class names are
 // content hashes of `key|declaration` (deterministic across builds — the
 // channel dedups identical rules program-wide, which is what makes the
@@ -288,6 +293,32 @@ fun check_channel(name: str, value: i32) {
 fun check_alpha(value: f64) {
 	if value < 0.0 || value > 1.0 {
 		panic(i"alpha {value} is outside 0.0-1.0");
+	}
+}
+
+/// What an attribute condition's name must avoid: the characters that
+/// delimit the machinery it rides — `:` (the slot key's fields), the space
+/// (the condition grammar's tokens), quotes (the selector's own), and the
+/// selector syntax an attribute NAME never contains anyway.
+fun check_attribute_name(name: str) {
+	if name.trim() == "" {
+		panic("attribute was given an empty name");
+	}
+	for banned in ["\"", "'", " ", ":", "[", "]", "="] {
+		if name.contains(banned) {
+			panic(i"an attribute name cannot contain '{banned}' (got \"{name}\") — a name is one token, like data-open");
+		}
+	}
+}
+
+/// The value's fence is the name's minus the selector syntax: `[data-x="a=b"]`
+/// is legal CSS and breaks nothing here. An EMPTY value stays legal — CSS
+/// `[name=""]` matches an attribute explicitly set to the empty string.
+fun check_attribute_value(value: str) {
+	for banned in ["\"", "'", " ", ":"] {
+		if value.contains(banned) {
+			panic(i"an attribute value cannot contain '{banned}' (got \"{value}\") — a styling hook's value is one token, like \"true\"");
+		}
 	}
 }
 
@@ -598,24 +629,37 @@ fun is_dark(condition: str): bool {
 	condition.split(" ")[0] == "dark"
 }
 
-/// The condition's pseudo-class, if any: `"hover"` from `"hover"` and from
-/// `"dark hover"`, `""` from `""` and from `"dark"`.
-fun condition_pseudo(condition: str): str {
-	if !is_dark(condition) {
-		ret condition;
+/// The condition's attribute token, if any: `[data-open="true"]` from any
+/// condition carrying one, `""` otherwise. The attribute token is the one
+/// bracketed form, so the scan is a prefix check per token.
+fun condition_attribute(condition: str): str {
+	for part in condition.split(" ") {
+		if part.starts_with("[") {
+			ret part;
+		}
 	}
+	""
+}
+
+/// The condition's pseudo-class, if any — always the LAST token, when that
+/// token is neither the dark marker nor an attribute selector: `"hover"`
+/// from `"hover"`, from `"dark hover"` and from `dark [data-open="true"]
+/// hover`; `""` from `""`, from `"dark"` and from `[data-open="true"]`.
+fun condition_pseudo(condition: str): str {
 	let parts = condition.split(" ");
-	if parts.len() > 1 {
-		parts[1]
-	} else {
+	let last = parts[parts.len() - 1];
+	if last == "dark" || last.starts_with("[") {
 		""
+	} else {
+		last
 	}
 }
 
-/// One atomic rule as CSS text. The three condition axes nest the way CSS
+/// One atomic rule as CSS text. The four condition axes nest the way CSS
 /// nests them — media outermost, then the dark ancestor selector, then the
-/// pseudo-class suffix — which is exactly the outside-in order the condition
-/// combinators require at the call site.
+/// attribute suffix on the element itself, then the pseudo-class suffix —
+/// which is exactly the outside-in order the condition combinators require
+/// at the call site.
 ///
 /// The leading byte is load-bearing (B35): `assemble_assets` has no
 /// "base < pseudo < media" comparator, it sorts lines lexically with a numeric
@@ -641,6 +685,13 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 	};
 	if is_dark(condition) {
 		selector = ":root[data-theme=\"dark\"] " + selector;
+	}
+	// The attribute token is already selector syntax, appended to the
+	// element's own compound selector — an attribute-conditioned base rule
+	// still starts with '.', so it stays in the base cascade band (B35).
+	let attribute = condition_attribute(condition);
+	if attribute != "" {
+		selector = selector + attribute;
 	}
 	let pseudo = condition_pseudo(condition);
 	if pseudo != "" {
@@ -1044,10 +1095,11 @@ impl Style {
 	// rules also emit — deduplicated, possibly unused: the recorded
 	// over-approximation, shared with unused styles generally.)
 	//
-	// The three axes nest OUTSIDE-IN in the order the selector nests them:
-	// media, then dark, then the pseudo-class — `md(dark(hover(..)))`. Every
-	// other order is a build error naming the fix, so there is exactly one
-	// spelling per combination and one slot key per combination with it.
+	// The four axes nest OUTSIDE-IN in the order the selector nests them:
+	// media, then dark, then the attribute, then the pseudo-class —
+	// `md(dark(attribute(.., hover(..))))`. Every other order is a build
+	// error naming the fix, so there is exactly one spelling per combination
+	// and one slot key per combination with it.
 
 	fun hover(self, inner: Style): Style {
 		self.pseudo("hover", inner)
@@ -1107,10 +1159,60 @@ impl Style {
 		out
 	}
 
+	/// An attribute condition on the element ITSELF — `.sX[data-open="true"]`
+	/// — where `dark`'s hardcoded ancestor is the one ancestor form. The
+	/// general spelling of state carried in markup: `data-state`, `data-open`,
+	/// `aria-expanded` — any attribute rides, `aria-*` included, and the value
+	/// matches exactly (CSS `[name="value"]`). Its own slot in the condition
+	/// axis, between dark and the pseudo-class —
+	/// `md(dark(attribute(.., hover(..))))` — so a dark theme composes with an
+	/// element's state; every other order is refused naming the fix, and one
+	/// attribute per slot, like one dark and one pseudo-class. The composed
+	/// rule outranks its parts on SPECIFICITY, the dark×pseudo rule again:
+	/// `.sX[..]:hover` is (0,3,0) over both (0,2,0) components.
+	///
+	/// The app owns SETTING the attribute on the element; the style only
+	/// selects on it. Name and value are validated at const time: no quotes,
+	/// no spaces, no `:` — those delimit the machinery underneath (the slot
+	/// key, the condition grammar, the selector's own quoting), and a styling
+	/// hook is a single token in practice.
+	fun attribute(self, name: str, value: str, inner: Style): Style {
+		check_attribute_name(name);
+		check_attribute_value(value);
+		mut out = self;
+		for key in inner.rules.keys() {
+			match inner.rules.get(key) {
+				Some(let entry) => {
+					let (_class, declaration) = entry;
+					let parts = key.split(":");
+					if parts[0] != "" {
+						panic("nest conditions as md(attribute(..)) — attribute cannot wrap a media-conditioned style");
+					}
+					if is_dark(parts[1]) {
+						panic("nest dark OUTSIDE the attribute — dark(attribute(..)), not attribute(dark(..))");
+					}
+					if condition_attribute(parts[1]) != "" {
+						panic("attribute cannot wrap an already attribute-conditioned style");
+					}
+					let token = i"[{name}=\"{value}\"]";
+					let condition = if parts[1] == "" {
+						token
+					} else {
+						token + " " + parts[1]
+					};
+					out = out.rule("", condition, parts[2], declaration);
+				}
+				None => {}
+			}
+		}
+		out
+	}
+
 	/// An arbitrary pseudo-class — `.pseudo("focus-visible", ..)`; the named
 	/// methods above are the common set. A pseudo-class takes the INNERMOST
-	/// position: `dark` and a breakpoint may wrap it, and it may wrap neither
-	/// (nor another pseudo-class). `pseudo("dark", ..)` is `dark(..)`.
+	/// position: `dark`, an attribute and a breakpoint may wrap it, and it may
+	/// wrap none of them (nor another pseudo-class). `pseudo("dark", ..)` is
+	/// `dark(..)`.
 	fun pseudo(self, name: str, inner: Style): Style {
 		if name == "dark" {
 			ret self.dark(inner);
@@ -1126,6 +1228,9 @@ impl Style {
 					}
 					if is_dark(parts[1]) {
 						panic(i"nest dark OUTSIDE the pseudo — dark({name}(..)), not {name}(dark(..))");
+					}
+					if condition_attribute(parts[1]) != "" {
+						panic(i"nest the attribute OUTSIDE the pseudo — attribute(.., {name}(..)), not {name}(attribute(..))");
 					}
 					if parts[1] != "" {
 						panic(i"{name} cannot wrap an already pseudo-conditioned style");

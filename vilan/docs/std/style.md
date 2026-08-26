@@ -201,6 +201,7 @@ fun disabled(self, inner: Style): Style
 fun first(self, inner: Style): Style      // :first-child
 fun last(self, inner: Style): Style       // :last-child
 fun dark(self, inner: Style): Style       // :root[data-theme="dark"] ancestor
+fun attribute(self, name: str, value: str, inner: Style): Style  // .sX[name="value"] — the element itself
 fun pseudo(self, name: str, inner: Style): Style
 
 fun sm(self, inner: Style): Style          // breakpoints (min-width):
@@ -212,25 +213,40 @@ fun media(self, min_width: str, inner: Style): Style
 
 ### Stacking
 
-The three condition axes nest **outside-in, in the order the selector
-nests them** — media, then dark, then the pseudo-class:
+The four condition axes nest **outside-in, in the order the selector
+nests them** — media, then dark, then the attribute, then the
+pseudo-class:
 
 ```vilan,fragment
 style().md(style().dark(style().hover(style().opacity(0.8))))
 // @media (min-width: 768px){:root[data-theme="dark"] .sX:hover{opacity:0.8}}
+
+style().md(style().dark(style().attribute("data-open", "true", style().hover(style().opacity(0.8)))))
+// @media (min-width: 768px){:root[data-theme="dark"] .sX[data-open="true"]:hover{opacity:0.8}}
 ```
 
 Every other order is a compile-time-evaluation panic naming the fix
 (`hover(dark(..))` says to write `dark(hover(..))`), and no axis can wrap
-itself — one media, one dark, one pseudo-class per slot. Media rules emit
-in ascending min-width order, so a chain like `.sm(x).lg(y)` is
-mobile-first: the widest matching breakpoint wins.
+itself — one media, one dark, one attribute, one pseudo-class per slot.
+Media rules emit in ascending min-width order, so a chain like
+`.sm(x).lg(y)` is mobile-first: the widest matching breakpoint wins.
+
+`attribute` conditions on the element **itself** — `.sX[data-open="true"]`
+— where `dark` is the ancestor form. It is the general spelling of state
+carried in markup: `data-state`, `data-open`, `aria-expanded` — any
+attribute rides, `aria-*` included, and the value matches exactly. The
+app owns *setting* the attribute on the element; the style only selects
+on it. Name and value refuse quotes, spaces and `:` at const time (they
+delimit the machinery underneath), and a styling hook is a single token
+in practice.
 
 `dark` is an ancestor selector, so a composed `dark(hover(..))` rule is
 more specific than either `dark(..)` or `hover(..)` alone and wins
-against both. Between an *un*composed `dark(x)` and `hover(y)` on the
-same property the two are equally specific and dark wins, so use
-`dark(hover(..))` when a dark theme needs its own hover.
+against both — and the same holds along the attribute axis:
+`attribute(.., hover(..))` outranks both of its parts. Between an
+*un*composed `dark(x)` and `hover(y)` on the same property the two are
+equally specific and dark wins, so use `dark(hover(..))` when a dark
+theme needs its own hover.
 
 ## Runtime-legal operations
 

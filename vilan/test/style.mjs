@@ -153,5 +153,7 @@ console.log(class_list(perceptual));
 const squared = [ [ new Map([ [ "::width", [ "::width", [ "s178h6ec", "width:1rem" ] ] ], [ "::height", [ "::height", [ "s22ylrq", "height:1rem" ] ] ] ]) ] ];
 console.log(class_list(squared));
 console.log("s178h6ec s22zdhz");
+const disclosed = [ [ new Map([ [ ":[data-open=\"true\"]:display", [ ":[data-open=\"true\"]:display", [ "s11vlq4c", "display:flex" ] ] ], [ ":[data-open=\"true\"] hover:background-color", [ ":[data-open=\"true\"] hover:background-color", [ "s1j5l6ea", "background-color:var(--gray-100)" ] ] ], [ ":dark [data-open=\"true\"]:background-color", [ ":dark [data-open=\"true\"]:background-color", [ "s1bn73s7", "background-color:var(--gray-800)" ] ] ], [ "768px:dark [data-open=\"true\"] hover:color", [ "768px:dark [data-open=\"true\"] hover:color", [ "s1pifanf", "color:var(--gray-50)" ] ] ] ]) ] ];
+console.log(class_list(disclosed));
 const tiled = [ [ new Map([ [ "::background-image", [ "::background-image", [ "s5hidsk", "background-image:url(tile.png)" ] ] ], [ "::background-size", [ "::background-size", [ "skugn91", "background-size:120px 120px" ] ] ], [ "::line-height", [ "::line-height", [ "snq90yh", "line-height:24px" ] ] ] ]) ] ];
 console.log(class_list(tiled));

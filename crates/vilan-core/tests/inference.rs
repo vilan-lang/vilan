@@ -26707,6 +26707,294 @@ fn an_oklch_hue_outside_the_canonical_turn_fails_the_build() {
     );
 }
 
+// `Style::attribute(name, value, inner)` (item 010): a condition on the
+// element ITSELF — `.sX[data-open="true"]` — where dark's hardcoded ancestor
+// is the one ancestor form. Its own slot in the condition axis, between dark
+// and the pseudo-class: `md(dark(attribute(.., hover(..))))`. The pins mirror
+// the dark×pseudo set: composition on each axis pair, the full stack, the
+// ordering refusals naming the fix, the const validation, per-(condition,
+// property) merge, and the ssr leg.
+
+#[test]
+fn an_attribute_condition_selects_on_the_element_itself() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            // Starts with '.' — no ancestor, and the base cascade band (B35).
+            line.starts_with('.') && line.contains("[data-open=\"true\"]{opacity:0.5}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The attribute suffix sits between the class and the pseudo-class, the
+/// outside-in order of the call: `attribute(.., hover(..))`.
+#[test]
+fn an_attribute_condition_wraps_a_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().hover(style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with('.') && line.contains("[data-open=\"true\"]:hover{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// dark's ancestor composes over an attribute-conditioned style through the
+/// same generic path it composes over a pseudo-class — dark() unchanged.
+#[test]
+fn dark_wraps_an_attribute_condition() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().dark(style().attribute("data-open", "true", style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with(":root[data-theme=\"dark\"] .")
+                && line.contains("[data-open=\"true\"]{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// All four axes at once, outside-in: media, dark, attribute, pseudo. The
+/// composed line still starts with '@', so B35's media ordering sees it.
+#[test]
+fn all_four_condition_axes_compose_outside_in() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().md(style().dark(style().attribute(
+                "data-open",
+                "true",
+                style().hover(style().opacity(0.8)),
+            )))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@media (min-width: 768px){:root[data-theme=\"dark\"] .")
+                && line.ends_with("[data-open=\"true\"]:hover{opacity:0.8}}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The four ordering refusals, each naming the fix — the dark×pseudo
+/// refusal set extended to the new axis.
+#[test]
+fn an_attribute_cannot_wrap_a_media_conditioned_style() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().md(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("nest conditions as md(attribute(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_cannot_wrap_dark() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().dark(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("dark(attribute(..)), not attribute(dark(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_pseudo_class_cannot_wrap_an_attribute_condition() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().hover(style().attribute("data-open", "true", style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message
+                .contains("attribute(.., hover(..)), not hover(attribute(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_cannot_wrap_an_attribute_condition() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute(
+                "data-open",
+                "true",
+                style().attribute("data-side", "left", style().background(Color::gray(700))),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already attribute-conditioned")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The name and value fences: the characters that delimit the slot key, the
+/// condition grammar, and the selector's own quoting are refused at const
+/// time, like every other validation in the module.
+#[test]
+fn an_attribute_name_with_a_delimiter_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data open", "true", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("an attribute name cannot contain ' '")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_value_with_a_quote_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "tr\"ue", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("an attribute value cannot contain '\"'")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The slot key carries the attribute condition, so last-wins merge stays
+/// per-(condition, property): the same attribute and property override to
+/// one class; two values of one attribute are two conditions and coexist.
+#[test]
+fn attribute_slots_merge_per_condition_and_property() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style };
+        fun main() {
+            let togged = const style()
+                .attribute("data-open", "true", style().opacity(0.5))
+                .attribute("data-open", "true", style().opacity(1.0));
+            print(togged.class_list().split(" ").len());
+            let sided = const style()
+                .attribute("data-side", "left", style().opacity(0.5))
+                .attribute("data-side", "right", style().opacity(1.0));
+            print(sided.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+/// The ssr leg: an attribute-conditioned style reaches `styled` like any
+/// other — the class attribute carries the attribute class beside the base
+/// class, and the rules were already in the build-time stylesheet.
+#[test]
+fn ssr_renders_attribute_conditioned_classes() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Color };
+        import std::ui::{ view, render };
+        fun main() {
+            let disclosure = const style()
+                .color(Color::gray(700))
+                .attribute("data-open", "true", style().color(Color::gray(900)));
+            print(render(view("div").styled(disclosure)));
+        }
+        main();
+        "#,
+        "<div class=\"s1hbtfg8 sjt5x3g\"></div>\n",
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the

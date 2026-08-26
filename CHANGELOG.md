@@ -32,6 +32,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ---
 
+<!-- family: feature -->
+**`Style::attribute(name, value, inner)` — selecting on `data-*`/`aria-*` state, a fourth condition axis.** The machinery existed hardcoded for exactly one case — `dark()` emits `:root[data-theme="dark"] .sX` — so state carried in markup (`data-open`, `data-state`, `aria-expanded`) had no styled spelling and apps emitted those rules by hand through `asset::emit`. `attribute` is the generalization, with two deliberate differences from `dark`: it conditions on the element **itself** (`.sX[data-open="true"]` — dark's ancestor stays the one ancestor form), and it takes its **own slot** in the condition axis, between dark and the pseudo-class — `md(dark(attribute(.., hover(..))))` — so a dark theme still composes with an element's state, which a shared slot would have refused. The slot key carries the attribute condition, so last-wins merge stays per-(condition, property): two values of one attribute are two conditions and coexist, the same value overrides. Every wrong nesting is a const-eval refusal naming the fix, mirroring dark's; names and values refuse quotes, spaces and `:` at const time (they delimit the slot key, the condition grammar, and the selector's own quoting). Every pre-existing class name is byte-identical — the condition grammar grew a token, not a field. `dark()` itself is untouched; whether it becomes sugar for one attribute condition is item 014's question, now sharpened. Docs `std/style.md`. (kolt dogfood, item 010)
+
+---
+
 <!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 

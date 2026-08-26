@@ -108,6 +108,19 @@ fun main() {
 	print(squared.class_list());
 	print(const style().size(Length::rem(1.0)).height(Length::rem(2.0)).class_list());
 
+	// The attribute condition selects on the element ITSELF, where dark's
+	// hardcoded ancestor is the one ancestor form. The golden pins the
+	// composed selectors in bytes: the bare suffix, the suffix before a
+	// pseudo-class, under the dark ancestor, and the full
+	// media(dark(attribute(pseudo(..)))) stack — attribute rules start with
+	// '.', so they stay in the base cascade band (B35).
+	let disclosed = const style()
+		.attribute("data-open", "true", style().display(Display::Flex))
+		.attribute("data-open", "true", style().hover(style().background(Color::gray(100))))
+		.dark(style().attribute("data-open", "true", style().background(Color::gray(800))))
+		.md(style().dark(style().attribute("data-open", "true", style().hover(style().color(Color::gray(50))))));
+	print(disclosed.class_list());
+
 	// Two methods per slot, deliberately: `background_image` writes the slot
 	// `background_gradient` writes, and `line_height_length` the slot
 	// `line_height` writes. So each pair OVERRIDES rather than racing — the
