@@ -147,11 +147,19 @@ The rules are short:
 - Each is a command line for your shell (`sh -c` / `cmd /C`), so pipes, globs
   and `&&` work; the working directory is the manifest's own, so relative paths
   mean what they say in the file you wrote them in.
+- They run as you. A hook has your privileges — your files, your environment,
+  your keys — and nothing prompts: building a project runs its hooks, silently
+  and unsandboxed, exactly as if you had typed the command. That is the trust
+  `cargo build` and `npm run` already take, and Vilan doesn't ask for code you
+  wrote. Only the manifest being built declares hooks — a dependency's are never
+  run — so an unfamiliar `vilan.toml` is worth reading before you build it, the
+  way you would read a `Makefile`.
 - A hook that exits non-zero fails the build, naming the command. Nothing
   after it runs.
-- Output goes straight to your terminal. (Under `vilan build --stdout`, which
-  writes the emitted JS to stdout, a chatty hook shares that stream; redirect
-  it in the command if you pipe the build.)
+- Vilan prints each command before spawning it, and the output goes straight to
+  your terminal. (Under `vilan build --stdout`, which writes the emitted JS to
+  stdout, a chatty hook shares that stream; redirect it in the command if you
+  pipe the build.)
 - `vilan check` produces no artifacts, so it runs no hooks.
 
 ## Freshness for a hand-rolled server
