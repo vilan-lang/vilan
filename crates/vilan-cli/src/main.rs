@@ -1603,6 +1603,45 @@ fn artifact_path(dist: &Path, name: &str, platform: Platform) -> PathBuf {
     dist.join(format!("{name}.{}", platform.script_extension()))
 }
 
+/// E92: the bundle just written at `output` may sit beside a SUPERSEDED
+/// generation — the same stem under the other script classification's
+/// extension (`dist/server.js` beside the `dist/server.mjs` every
+/// post-v0.33.0 build writes, or a stranded `.mjs` after a leg retargeted to
+/// the browser). Within one build the `<name>.*` namespace belongs to one
+/// leg (`reject_output_collisions`), so a surviving other-classification
+/// sibling can only be an earlier generation's artifact — and a script,
+/// Dockerfile, or process manager still naming it keeps launching the
+/// superseded application silently, exactly the drift the gotchas page
+/// warns about. Nothing here deletes: no record proves the build wrote the
+/// old file (pre-rename builds recorded nothing), and the output directory
+/// is not exclusively the build's — the drift is reported instead, with the
+/// fix in the message.
+fn warn_superseded_sibling(output: &Path) {
+    let Some(extension) = output.extension().and_then(|extension| extension.to_str()) else {
+        return;
+    };
+    let retired_extension = match extension {
+        "mjs" => "js",
+        "js" => "mjs",
+        _ => return,
+    };
+    let superseded = output.with_extension(retired_extension);
+    if !superseded.is_file() {
+        return;
+    }
+    eprintln!(
+        "{} {} looks superseded by {} — this build names the artifact \
+         `.{extension}` and never rewrites the old spelling, so a launcher \
+         still naming the `.{retired_extension}` file runs a stale \
+         generation. Remove it, and point `node`/Dockerfile/process-manager \
+         entries at {}",
+        paint::warning_prefix(),
+        superseded.display(),
+        output.display(),
+        output.display(),
+    );
+}
+
 /// The platform of a leg selected to be *run* under `node`. `select_node_entry`
 /// filters to `Platform::Node`, so every launch path below is Node by
 /// construction; naming it keeps those paths reading through
@@ -1859,6 +1898,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
                 unit.entry.display(),
                 paint::out(paint::Style::BOLD, &output_path.display().to_string())
             );
+            warn_superseded_sibling(&output_path);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -2017,6 +2057,7 @@ fn build_workspace_artifacts(
             unit.entry.display(),
             paint::out(paint::Style::BOLD, &output.display().to_string())
         );
+        warn_superseded_sibling(&output);
     }
     Ok(())
 }

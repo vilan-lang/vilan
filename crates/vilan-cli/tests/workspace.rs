@@ -41,6 +41,15 @@ fn vilan(args: &[&str]) -> Output {
         .expect("run vilan")
 }
 
+/// As [`vilan`], with `NO_COLOR=1` so warning text can be asserted literally.
+fn vilan_plain(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vilan")
+}
+
 /// Writes a small client/server/common workspace into `dir` (the client and server
 /// both `import common::greeting`).
 fn write_fullstack_workspace(dir: &Path) {
@@ -283,6 +292,89 @@ fn a_multi_entry_package_builds_every_entry_into_dist() {
     assert!(
         dir.join("dist/client.js").is_file(),
         "missing dist/client.js"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_superseded_generation_left_in_dist_is_warned_about_not_swept() {
+    // E92: a project last built before v0.33.0's artifact rename rebuilds
+    // clean on the current toolchain and leaves the OLD `dist/server.js`
+    // beside the new `dist/server.mjs` — nothing removed or flagged it, so a
+    // script, Dockerfile, or process manager still saying `node
+    // dist/server.js` kept launching the superseded application silently.
+    // The build now WARNS, naming both generations. It deliberately does not
+    // delete: no record proves the build wrote the old file (pre-rename
+    // builds recorded nothing), and `dist/` is not exclusively the build's
+    // directory.
+    let dir = temp_project("superseded_generation");
+    write_multi_entry_package(&dir);
+    // The pre-rename generation, as a 0.32.x build would have left it.
+    write(&dir, "dist/server.js", "stale generation\n");
+    let output = vilan_plain(&["build", dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("looks superseded by"),
+        "expected the superseded-generation warning, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("server.js") && stderr.contains("server.mjs"),
+        "the warning must name both generations, got: {stderr}"
+    );
+    // Warned, not swept — and the current generation was written.
+    assert!(
+        dir.join("dist/server.js").is_file(),
+        "the stale file must be left in place (warned, never deleted)"
+    );
+    assert!(
+        dir.join("dist/server.mjs").is_file(),
+        "missing the current artifact"
+    );
+    // With the stale generation removed, a rebuild is quiet again.
+    std::fs::remove_file(dir.join("dist/server.js")).unwrap();
+    let output = vilan_plain(&["build", dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "rebuild failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("looks superseded by"),
+        "a clean dist must not warn: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_leg_retargeted_off_node_warns_about_its_stranded_mjs() {
+    // The symmetric direction of E92's drift: a leg that used to build for a
+    // process target leaves `dist/<name>.mjs` behind when it is retargeted to
+    // the browser — the same one-namespace rule (`dist/<name>.*` belongs to
+    // one leg per build) makes the surviving other-classification sibling a
+    // superseded generation whichever way the rename went.
+    let dir = temp_project("retargeted_leg");
+    write_multi_entry_package(&dir);
+    write(&dir, "dist/client.mjs", "stale generation\n");
+    let output = vilan_plain(&["build", dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("looks superseded by") && stderr.contains("client.mjs"),
+        "expected the superseded-generation warning for client.mjs, got: {stderr}"
+    );
+    assert!(
+        dir.join("dist/client.mjs").is_file(),
+        "the stale file must be left in place (warned, never deleted)"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
