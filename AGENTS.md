@@ -97,19 +97,27 @@ Rust workspace, five crates, plus the language's own tree:
   `let` binding.
 - **Numerics:** the JS-backed integers are `i53`/`u53` (a ±2^53 contract); unknown
   numeric suffixes are hard errors.
-- **A new keyword lands in THREE places** — the lexer (`lexing.rs`, whose
-  keyword table is the `KEYWORDS` const `read_identifier` looks up), the
-  TextMate grammar (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the
-  book's highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource`
-  keyword shipped with only the first and was caught twice, days apart. The
-  same drift reaches the **primitive-type** and **attribute-marker** lists
-  that sit beside the keywords in both grammars (`SCALAR_PRIMITIVE_NAMES` and
-  `NUMERIC_SUFFIXES` in `type_.rs`, `KNOWN_ATTRIBUTE_MARKERS` in `parsing.rs`
-  are the sources of truth); D15's audit found `i64`/`u64` still highlighted
-  as valid types a release after they became a hard error. The lexer-vs-list
-  diff is a gate: `crates/vilan-cli/tests/grammar_sync.rs` reads those tables
-  and holds both grammars to them in both directions on every suite run, so
-  a keyword added to the lexer fails the suite until both grammars carry it.
+- **A new keyword lands in THREE places — and two of them are generated** —
+  the lexer (`lexing.rs`, whose keyword table is the `KEYWORDS` const
+  `read_identifier` looks up), the TextMate grammar
+  (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the book's
+  highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource` keyword
+  shipped with only the first and was caught twice, days apart. The same
+  drift reaches the **primitive-type**, **attribute-marker**,
+  **numeric-suffix** and **operator** lists that sit beside the keywords in
+  both grammars (`SCALAR_PRIMITIVE_NAMES` and `NUMERIC_SUFFIXES` in
+  `type_.rs`, `KNOWN_ATTRIBUTE_MARKERS` in `parsing.rs`,
+  `TWO_CHARACTER_OPERATORS` in `lexing.rs` are the sources of truth); D15's
+  audit found `i64`/`u64` still highlighted as valid types a release after
+  they became a hard error. Since E91 the grammars' word-list halves are
+  GENERATED from those tables: `crates/vilan-cli/tests/grammar_sync.rs`
+  byte-holds every generated fragment — and what each grammar actually
+  registers — to the compiler's tables on every suite run. A new keyword is a
+  `KEYWORDS` row + a `Token` variant + a role row in grammar_sync.rs's
+  `KEYWORD_ROLES`; then
+  `VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated`
+  rewrites both grammars in place. Never hand-edit a generated fragment —
+  only the structural rules (strings, elements, captures) are hand-written.
   Its sibling `crates/vilan-lsp/src/book_sync.rs` holds the LSP's 32
   keyword-hover deep links to the book's headings and
   `docs/appendix/editor.md` to the server's code-action titles, capabilities
