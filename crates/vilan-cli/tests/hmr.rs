@@ -92,11 +92,13 @@ struct SseClient {
 }
 
 impl SseClient {
-    fn connect(port: u16) -> SseClient {
+    fn connect(port: u16, token: &str) -> SseClient {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to dev channel");
-        stream
-            .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .expect("send SSE request");
+        write!(
+            stream,
+            "GET /events?token={token} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .expect("send SSE request");
         stream
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
@@ -225,8 +227,85 @@ fn kind_of(json: &str) -> Option<String> {
     Some(after.split('"').next()?.to_string())
 }
 
-/// A plain (non-SSE) HTTP GET against the dev channel, returning the response
-/// body as bytes (the connection closes after the response).
+/// This run's dev-channel token (backlog E93), read from the instrumented
+/// bundle in `dist/` — the SAME copy the browser gets, and the only place the
+/// CLI writes it besides the Node child's environment. Deliberately not printed
+/// by the CLI and deliberately not passed to these tests any other way: reading
+/// it here is the real delivery path, so a shim that stopped carrying it would
+/// take every dev-channel test in this file down with it.
+///
+/// Bounded by `deadline` because round 1 is what writes `dist/`.
+fn dev_token(dir: &Path, leg: &str, deadline: Duration) -> String {
+    let bundle = dir.join("dist").join(format!("{leg}.js"));
+    let start = Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&bundle)
+            && let Some(after) = text.split("var TOKEN = \"").nth(1)
+            && let Some(token) = after.split('"').next()
+            && !token.is_empty()
+            && token != "__VILAN_HMR_TOKEN__"
+        {
+            return token.to_string();
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "the instrumented bundle {} should carry this run's token within {deadline:?}",
+            bundle.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A GET against the dev channel, presenting this run's token as every route
+/// requires (backlog E93). The app's OWN server is reached with [`http_get`]
+/// instead — it has no token and wants none.
+fn dev_get(port: u16, path: &str, token: &str) -> Vec<u8> {
+    http_get(port, &format!("{path}?token={token}"))
+}
+
+/// One request against the dev channel, returning its STATUS LINE and headers
+/// as text. A refusal has no body to inspect, so the status is the assertion —
+/// and reading a `403` here is what proves the gate answered rather than the
+/// route.
+///
+/// `/events` is included among the routes checked this way, which is why this
+/// reads only the head and then drops the socket: a *successful* SSE request
+/// would hold the connection open forever, so `read_to_end` would be a hang
+/// rather than a failure if the gate ever stopped refusing.
+fn http_request_head(port: u16, method: &str, target: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for a head request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+    )
+    .expect("send the request");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while head.len() < 4096 {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+/// [`http_request_head`] for a GET.
+fn http_get_head(port: u16, target: &str) -> String {
+    http_request_head(port, "GET", target)
+}
+
+/// A plain (non-SSE) HTTP GET, returning the response body as bytes (the
+/// connection closes after the response). Used verbatim against the app's own
+/// server, and via [`dev_get`] against the dev channel.
 fn http_get(port: u16, path: &str) -> Vec<u8> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for GET");
     stream
@@ -364,7 +443,8 @@ fn the_dev_channel_drives_the_watch_round() {
             "round 1 should have written dist/client.css"
         );
 
-        let mut sse = SseClient::connect(port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(port, &token);
 
         // (a) A code change → `swap`.
         write(&dir, "src/client.vl", &client_source("b", "x1"));
@@ -411,23 +491,58 @@ fn the_dev_channel_drives_the_watch_round() {
 
         // (d) The artifact routes: the browser bundle carries the shim (the
         // singleton marker), and the sidecar serves the current CSS.
-        let bundle = String::from_utf8_lossy(&http_get(port, "/bundle/client.js")).into_owned();
+        let bundle =
+            String::from_utf8_lossy(&dev_get(port, "/bundle/client.js", &token)).into_owned();
         assert!(
             bundle.contains("window.__VILAN_HMR__"),
             "the served bundle should carry the dev-runtime shim:\n{bundle}"
         );
-        let css = String::from_utf8_lossy(&http_get(port, "/asset/client.css")).into_owned();
+        let css = String::from_utf8_lossy(&dev_get(port, "/asset/client.css", &token)).into_owned();
         assert_eq!(
             css, ".x2{color:red}\n",
             "the sidecar should serve the current CSS"
         );
 
-        // Path traversal is refused.
-        let traversal = http_get(port, "/bundle/../secret.js");
+        // Path traversal is refused — with the token (the guard's own 404) and,
+        // since backlog E93, without it (the gate refuses before the guard is
+        // reached). Neither serves a byte.
+        let traversal = dev_get(port, "/bundle/../secret.js", &token);
         assert!(
             traversal.is_empty(),
             "a traversal path must not serve any bytes"
         );
+        let untokened = http_get_head(port, "/bundle/../secret.js");
+        assert!(
+            untokened.starts_with("HTTP/1.1 403 Forbidden"),
+            "an untokened request is refused before the traversal guard: {untokened:?}"
+        );
+
+        // (e) The gate itself, on the wire the browser actually uses: the same
+        // routes that just answered are refused outright without this run's
+        // token (backlog E93). This is the whole of what a page the developer
+        // happens to visit while `run --watch` runs can reach — the compiled
+        // bundle, the sidecar, the diagnostics stream, and the reload trigger.
+        for (method, route) in [
+            ("GET", "/events"),
+            ("GET", "/bundle/client.js"),
+            ("GET", "/asset/client.css"),
+            ("POST", "/refresh"),
+        ] {
+            let refused = http_request_head(port, method, route);
+            assert!(
+                refused.starts_with("HTTP/1.1 403 Forbidden"),
+                "{method} {route} without the token must be refused: {refused:?}"
+            );
+            let wrong = http_request_head(
+                port,
+                method,
+                &format!("{route}?token=00000000000000000000000000000000"),
+            );
+            assert!(
+                wrong.starts_with("HTTP/1.1 403 Forbidden"),
+                "{method} {route} with a wrong token must be refused: {wrong:?}"
+            );
+        }
     }));
 
     support::kill_watcher(&mut watcher);
@@ -492,7 +607,8 @@ fn an_awaiting_initializer_cannot_reach_the_hmr_adopt_thunk() {
             "round 1 should have written dist/client.js"
         );
         std::thread::sleep(Duration::from_millis(500));
-        let mut sse = SseClient::connect(port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(port, &token);
 
         // The edit that used to produce the unparseable bundle.
         write(&dir, "src/client.vl", &awaiting_initializer_source());
@@ -520,7 +636,8 @@ fn an_awaiting_initializer_cannot_reach_the_hmr_adopt_thunk() {
             "the awaited binding must never be handed to the adopt thunk:\n{bundle}"
         );
         // The same, through the route the browser actually fetches.
-        let served = String::from_utf8_lossy(&http_get(port, "/bundle/client.js")).into_owned();
+        let served =
+            String::from_utf8_lossy(&dev_get(port, "/bundle/client.js", &token)).into_owned();
         assert!(
             !served.contains("return await (") && !served.contains("pkg::value"),
             "the served bundle must not carry the awaited binding's thunk:\n{served}"
@@ -602,7 +719,8 @@ fn a_server_edit_restarts_quietly_and_a_shared_edit_swaps() {
             "the server leg should have booted in round 1"
         );
 
-        let mut sse = SseClient::connect(port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(port, &token);
 
         // Row 1 — server-only edit: the server bundle changes, the client bundle
         // does not. The Node child restarts (its new boot marker appears on
@@ -691,9 +809,10 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
             "the server leg should have booted in round 1"
         );
 
-        let mut sse = SseClient::connect(port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(port, &token);
         let bundle_before =
-            String::from_utf8_lossy(&http_get(port, "/bundle/client.js")).into_owned();
+            String::from_utf8_lossy(&dev_get(port, "/bundle/client.js", &token)).into_owned();
         assert!(
             bundle_before.contains("clientmark_one"),
             "the round-1 client bundle carries the original marker"
@@ -717,7 +836,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
         // The served client bundle reflects the edit — the content-keyed cache
         // returns the NEW parse, never the stale one.
         let bundle_after =
-            String::from_utf8_lossy(&http_get(port, "/bundle/client.js")).into_owned();
+            String::from_utf8_lossy(&dev_get(port, "/bundle/client.js", &token)).into_owned();
         assert!(
             bundle_after.contains("clientmark_two"),
             "the served client bundle must reflect the edit:\n{bundle_after}"
@@ -936,7 +1055,8 @@ fn run_watch_honors_entry_and_hmr_rounds_work_for_the_chosen_leg() {
             "the non-selected probe leg still compiles into the workspace"
         );
 
-        let mut sse = SseClient::connect(port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(port, &token);
 
         // A client edit → the browser swaps under the selected-entry watcher.
         write(&dir, "src/client.vl", &client_source("c2", "x1"));
@@ -1079,7 +1199,8 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
             "round 1 should have written dist/client.js"
         );
 
-        let mut sse = SseClient::connect(port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(port, &token);
         // Break the MODULE, on its own second line, leaving the entry intact.
         // (The margin that stood here paid for E20's baseline-snapshot race.)
         write(
@@ -1147,7 +1268,8 @@ fn the_overlay_traces_a_cross_module_requirement_chain_in_each_hops_file() {
             "round 1 should have written dist/client.js"
         );
 
-        let mut sse = SseClient::connect(port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(port, &token);
         // The module now reads a context that nothing provides; the entry's
         // `print(banner())` (line 13, column 8 of `shared_client_source`) is
         // the one uncovered call on the path.
@@ -1397,7 +1519,8 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
             "the server's boot-time read should be round 1's css"
         );
 
-        let mut sse = SseClient::connect(dev_port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(dev_port, &token);
 
         // A style-only edit (the bundle stays byte-identical) → a `css` event
         // naming its sidecar.
@@ -1421,7 +1544,7 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
 
         // The dev channel, meanwhile, already has the fresh bytes (S0/S1 —
         // `write_assets` runs every round); this is the route the fix must use.
-        let dev_channel_css = http_get(dev_port, "/asset/client.css");
+        let dev_channel_css = dev_get(dev_port, "/asset/client.css", &token);
         assert_eq!(
             dev_channel_css,
             b".x2{color:red}\n".to_vec(),
@@ -1432,7 +1555,7 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
 
         // The bundle the browser actually runs — fetched from the dev channel,
         // exactly as the real shim's own `<script>` origin would be.
-        let bundle_a = http_get(dev_port, "/bundle/client.js");
+        let bundle_a = dev_get(dev_port, "/bundle/client.js", &token);
         assert!(
             String::from_utf8_lossy(&bundle_a).contains("window.__VILAN_HMR__"),
             "the served bundle should carry the dev-runtime shim"
@@ -1607,7 +1730,8 @@ fn force_refresh_reloads_a_connected_browser_once() {
             .expect("the force-refresh server should announce `refresh-server-up <port>`");
         refresh_server_port.set(Some(server_port));
 
-        let mut sse = SseClient::connect(dev_port);
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(dev_port, &token);
 
         // Trigger the server's route — it calls `force_refresh()`, which
         // POSTs `/refresh` on the dev channel it was handed over

@@ -45,15 +45,24 @@ fun is_watching(): bool {
 
 /// Ask every connected browser to reload once (`dev-refresh.md` §5 item 2).
 /// The watcher hands its child the dev channel's port over `VILAN_HMR_PORT`
-/// (the node-child spawn site inside `run --watch`'s HMR round); with no
-/// watch session — the env var unset, a plain `vilan run`, or any shipped
-/// process — this is a no-op. Fire-and-forget: the call doesn't wait for the
-/// POST to land or for the browser to actually reload, so it never blocks
-/// the caller.
+/// and that run's channel token over `VILAN_HMR_TOKEN` (the node-child spawn
+/// site inside `run --watch`'s HMR round); with no watch session — the env
+/// vars unset, a plain `vilan run`, or any shipped process — this is a no-op.
+/// Fire-and-forget: the call doesn't wait for the POST to land or for the
+/// browser to actually reload, so it never blocks the caller.
+///
+/// The token is required by every dev-channel route (backlog E93): the channel
+/// used to take an unauthenticated `POST /refresh`, which meant any page the
+/// developer's browser happened to be on could fire a reload flood at the dev
+/// session. This process is the one legitimate caller that is not the browser
+/// shim, and it learns the token the same way it learns everything else about
+/// the session — an environment variable inherited at spawn, alongside
+/// `VILAN_WATCHING`. `zip` is the "both or nothing" the pairing wants: a port
+/// without a token could only produce a refused POST, so it stays a no-op.
 fun force_refresh(): void {
-	match env("VILAN_HMR_PORT") {
-		Some(let port) => {
-			let _ = async post(i"http://127.0.0.1:{port}/refresh", "").send();
+	match env("VILAN_HMR_PORT").zip(env("VILAN_HMR_TOKEN")) {
+		Some(let (port, token)) => {
+			let _ = async post(i"http://127.0.0.1:{port}/refresh?token={token}", "").send();
 		},
 		None => {},
 	}

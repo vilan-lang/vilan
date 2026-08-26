@@ -26,6 +26,16 @@ to. From then on every save rebuilds all legs and the channel tells the
 browser exactly what changed. There is no separate `dev` command:
 `run --watch` already *means* "the dev loop".
 
+The channel binds `127.0.0.1` only, and every one of its routes requires a
+token minted fresh for that `run --watch` process. Your page has it because
+`run --watch` bakes it into the browser bundle your own server hands out;
+nothing else does, so another page open in the same browser cannot read your
+compile diagnostics off the channel or trigger reloads at it. Nothing to
+configure — the token is per-run and dies with the process — but it does mean
+a browser tab left over from a *previous* watch session cannot talk to the
+new one until you reload it, and that hand-driving the routes with `curl`
+needs the token out of `dist/<leg>.js`.
+
 ## What each edit does
 
 Change detection is by output bytes, not by guessing from the source: each
