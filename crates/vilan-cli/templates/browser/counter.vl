@@ -20,8 +20,8 @@ fun card_style(): Style {
 		.flex_direction(FlexDirection::Column)
 		.gap(space(3))
 		.padding(space(4))
-		.radius(space(2))
 		.background(Color::gray(100))
+		.radius(space(2))
 }
 
 fun counter(): View {
