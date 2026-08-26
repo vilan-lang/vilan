@@ -2715,6 +2715,11 @@ pub struct Analyzer<'src> {
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
+    // The phase-1 walk's recursion depth against `WALK_DEPTH_LIMIT` (B138),
+    // and whether the bound already refused once — one diagnostic per
+    // analysis, not one per refused sibling subtree.
+    walk_depth: usize,
+    walk_depth_refused: bool,
     // `!`'s std fast-path identities and the `Try` trait, resolved by name from
     // their std modules after loading (like `panic_fn_id`).
     option_enum_id: Option<Id>,
@@ -3260,6 +3265,8 @@ impl<'src> Analyzer<'src> {
             panic_fn_id: None,
             asset_emit_fn_id: None,
             const_exprs: Vec::new(),
+            walk_depth: 0,
+            walk_depth_refused: false,
             option_enum_id: None,
             result_enum_id: None,
             try_trait_id: None,
@@ -18303,7 +18310,47 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The walk's depth bound (B138): the walk recurses once per level of
+    /// syntactic nesting carrying the largest frame in the analyzer — the
+    /// union of [`Self::walk_expr_node_inner`]'s ~90 arms, measured by
+    /// `VILAN_DEPTH_STATS` at ~36 KiB per level unoptimized, ~4.5 KiB
+    /// optimized — so nesting depth, not node count, is what outgrows a
+    /// stack (the v0.36.0 incident, commit 0fb5e5f0: a modest server
+    /// program's walk closed a CI worker's ~2 MiB margin). Every realistic
+    /// fixture peaks at 20 levels (both walkthrough entries, the std
+    /// twin-parity and release-emission corpora); 500 is 25x that, and caps
+    /// the bounded worst case near 18 MiB unoptimized — deeper nesting gets
+    /// a clean diagnostic instead of a stack overflow.
+    const WALK_DEPTH_LIMIT: usize = 500;
+
     fn walk_expr_node(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::EXPR_WALK);
+        self.walk_depth += 1;
+        if self.walk_depth > Self::WALK_DEPTH_LIMIT {
+            self.walk_depth -= 1;
+            if !self.walk_depth_refused {
+                self.walk_depth_refused = true;
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: format!(
+                        "this expression nests more than {} levels deep, which analysis \
+                         refuses; lift inner expressions into `let` bindings to flatten it",
+                        Self::WALK_DEPTH_LIMIT
+                    ),
+                });
+            }
+            let id = self.new_entity_id();
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return id;
+        }
+        let id = self.walk_expr_node_inner(node, scope_id);
+        self.walk_depth -= 1;
+        id
+    }
+
+    fn walk_expr_node_inner(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
         // `const expr` marks and FORWARDS: the inner expression is the entity
         // (no wrapper), so every downstream pass sees a plain subtree; the
         // const pass (const_eval.rs) evaluates the marked ids after analysis.
@@ -20569,6 +20616,7 @@ impl<'src> Analyzer<'src> {
         expected_type_id: TypeId,
         lookup_scope_id: Id,
     ) -> Option<ExprPattern> {
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PATTERN);
         match pattern {
             WalkPattern::Wildcard => Some(ExprPattern::Wildcard),
             WalkPattern::Binding(capture_id) => {
@@ -22112,6 +22160,7 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> Type {
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::INFER);
         // `exprs_seen` guards against infinite recursion through a genuine cycle
         // (an expression whose type depends on itself). It tracks the current
         // recursion *path*, not every expression ever visited: the id is removed
@@ -35745,6 +35794,12 @@ fn analyze_inner<'src>(
     // `VILAN_PHASE_TIMING` asks. The marks are unconditional — three
     // `Instant::now()` calls are noise next to an analysis.
     let phase_analyze_start = crate::PhaseClock::now();
+    // The depth instrument (B138) anchors per top-level analysis, like the
+    // marks above; a macro world is a nested analysis on the same thread whose
+    // depths belong to the outer run, so it must not re-anchor.
+    if !crate::macros::in_macro_world() {
+        crate::depth_stats::reset();
+    }
     // The base cache (S3c): a WORLD — everything up to and including the
     // pre-entry `resolve_world` — is a pure function of the loaded files'
     // content plus [`BaseCacheKey`] (platform, the entry's std:: reference

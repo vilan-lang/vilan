@@ -149,7 +149,8 @@ jobs:
       # runtime, not here, which is the worst place to find out.
       - name: wasm-bindgen
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
-      # The same stack size the playground runs with: the compiler recurses
+      # The same 64 MiB stack the playground ships with (release.yml, where
+      # the measured B138 rationale for the size lives): the compiler recurses
       # over deep expression trees, and wasm's default stack is far smaller
       # than a host thread's.
       - name: The artifact builds

@@ -178,11 +178,20 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    // Compilation recurses over deeply-nested ASTs and type graphs (e.g. closures
-    // stored in data structures plus generic monomorphization), which can run
-    // past the default main-thread stack on otherwise-valid programs. Do the work
-    // on a worker with a generous stack, as rustc and other compilers do; the
-    // reservation is virtual address space, so it costs nothing unless used.
+    // Compilation recurses over deeply-nested ASTs and type graphs, which can
+    // run past the default main-thread stack on otherwise-valid programs. Do the
+    // work on a worker with a generous stack, as rustc and other compilers do;
+    // the reservation is virtual address space, so it costs nothing unless used.
+    //
+    // The margin is measured now, not folklore (B138, `VILAN_DEPTH_STATS`): a
+    // realistic server program's analysis peaks under 1 MiB of stack even
+    // unoptimized, and the deepest recursion — the phase-1 expression walk at
+    // ~36 KiB per nesting level unoptimized — is depth-bounded at 500 levels
+    // (~18 MiB worst case, then a clean diagnostic). What keeps the number at
+    // 256 MiB is the paths a bound does not yet cap: cross-function
+    // return-inference chains cost ~12.5 KiB per call link unoptimized, so this
+    // reservation holds chains past 20,000 calls. Shrink it only when those
+    // paths are bounded too.
     const COMPILER_STACK_SIZE: usize = 256 * 1024 * 1024;
     std::thread::Builder::new()
         .stack_size(COMPILER_STACK_SIZE)

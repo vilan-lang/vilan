@@ -33,6 +33,13 @@ fn compiler() -> MutexGuard<'static, ()> {
 /// so the test thread was the only under-provisioned host. `RETAINED` is
 /// thread-local, so a compile and the completion that reads it must ride
 /// ONE spawn — wrap whole bodies, never per call.
+///
+/// Measured since (B138, `VILAN_DEPTH_STATS`): the analyses these tests run
+/// peak under 1 MiB of stack unoptimized — what closed the CI margin was the
+/// expression walk's ~36 KiB-per-nesting-level frames, depth-bounded at 500
+/// levels now. The 256 MiB here matches the vilan-core harness convention
+/// (headroom for the not-yet-bounded return-inference chains), not a measured
+/// need of these fixtures.
 fn on_big_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| {
         std::thread::Builder::new()

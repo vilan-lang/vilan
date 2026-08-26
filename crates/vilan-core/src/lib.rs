@@ -10,6 +10,7 @@ pub mod chunks;
 pub mod closest_name;
 pub mod const_eval;
 pub mod context;
+pub(crate) mod depth_stats;
 pub mod elements;
 pub mod error;
 pub mod formatter;
@@ -739,6 +740,13 @@ pub fn post_analysis_passes(
             milliseconds(const_interp),
             milliseconds(phase_init),
         );
+    }
+    // The depth line (B138), after the last pass that recurses: macro worlds
+    // are nested analyses whose depths already accumulated into the outer
+    // run's peaks, so only the top-level run prints (the same reason the
+    // in-analyze phase line guards).
+    if !macros::in_macro_world() {
+        depth_stats::report();
     }
 }
 
