@@ -26526,6 +26526,55 @@ fn the_two_value_padding_sites_compose_from_the_axis_methods() {
     );
 }
 
+// --- W11 style dogfood: size / Color::var / Color::oklch / attribute ----------
+// Cycle 29's kolt-dogfood additions (kolt.local tracker items 010-013). Same
+// pin idioms as A8/A22/A23 above: table-shaped declarations through
+// `collected_assets`, refusals through `failure_diagnostics`, rendered class
+// lists through `assert_compiles_and_runs`.
+
+/// `size` is the sizing pair's axis shorthand (`padding_x`'s pattern): one
+/// value into the two slots `width` and `height` already own — two classes,
+/// not a new property (item 011).
+#[test]
+fn size_writes_the_width_and_height_slots() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Length };
+        fun s(): Style {
+            style().size(Length::rem(1.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in ["{width:1rem}", "{height:1rem}"] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// Because they are the SAME slots, a later `height` narrows the square by
+/// the ordinary last-wins rule: three calls, two classes.
+#[test]
+fn a_height_after_size_narrows_by_last_wins() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Length };
+        fun main() {
+            let squared = const style().size(Length::rem(1.0)).height(Length::rem(2.0));
+            print(squared.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the

@@ -84,6 +84,13 @@ fun main() {
 		.max_width(Length::calc("100% - 2rem"));
 	print(zeroed.class_list());
 
+	// `size` writes the SAME two slots `width` and `height` write — the class
+	// list shows two classes for one call, and a later `height` narrows the
+	// square by the ordinary last-wins rule (three calls, two classes).
+	let squared = const style().size(Length::rem(1.0));
+	print(squared.class_list());
+	print(const style().size(Length::rem(1.0)).height(Length::rem(2.0)).class_list());
+
 	// Two methods per slot, deliberately: `background_image` writes the slot
 	// `background_gradient` writes, and `line_height_length` the slot
 	// `line_height` writes. So each pair OVERRIDES rather than racing — the

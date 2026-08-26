@@ -111,6 +111,7 @@ Layout:
 | `padding_top`, `padding_right`, `padding_bottom`, `padding_left` | `Length` — one edge |
 | `margin_top`, `margin_right`, `margin_bottom`, `margin_left` | `Length` — one edge |
 | `width`, `height`, `min_width`, `max_width`, `min_height`, `max_height` | `Length` |
+| `size` | `Length` — width *and* height, the square case (`size(Length::rem(1.0))` for an icon box); writes the same two slots, so mixing with `width`/`height` is last-wins |
 | `top`, `right`, `bottom`, `left`, `inset` | `Length` |
 | `overflow` | `Overflow` |
 

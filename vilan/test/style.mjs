@@ -146,5 +146,8 @@ console.log(class_list(framed));
 console.log("s1mnphwb");
 const zeroed = [ [ new Map([ [ "::inset", [ "::inset", [ "s1ucbaf9", "inset:0" ] ] ], [ "::min-width", [ "::min-width", [ "sitgfdt", "min-width:0" ] ] ], [ "::left", [ "::left", [ "s1ypvw5g", "left:clamp(120px, 30%, 185px)" ] ] ], [ "::max-width", [ "::max-width", [ "s63dg6q", "max-width:calc(100% - 2rem)" ] ] ] ]) ] ];
 console.log(class_list(zeroed));
+const squared = [ [ new Map([ [ "::width", [ "::width", [ "s178h6ec", "width:1rem" ] ] ], [ "::height", [ "::height", [ "s22ylrq", "height:1rem" ] ] ] ]) ] ];
+console.log(class_list(squared));
+console.log("s178h6ec s22zdhz");
 const tiled = [ [ new Map([ [ "::background-image", [ "::background-image", [ "s5hidsk", "background-image:url(tile.png)" ] ] ], [ "::background-size", [ "::background-size", [ "skugn91", "background-size:120px 120px" ] ] ], [ "::line-height", [ "::line-height", [ "snq90yh", "line-height:24px" ] ] ] ]) ] ];
 console.log(class_list(tiled));

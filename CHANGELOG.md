@@ -17,6 +17,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: feature -->
+**`Style.size(value)` — width and height in one call.** The sizing pair was the one multi-property group in `std::style` without an axis shorthand — `padding_x`/`padding_y`, `margin_x`/`margin_y`, and `inset` all have one — and the square case is the measured demand: an icon box spells `width(Length::rem(1.0)).height(Length::rem(1.0))` today. One arity only, deliberately: `size` writes the same two slots `width` and `height` write, so a later `height` narrows the square under the ordinary last-wins rule, and the rectangle keeps its `width(w).height(h)` spelling — the no-multi-value-shorthand rule of `proposal/ui-styling.md` §0bis.5. Docs `std/style.md`. (kolt dogfood, item 011)
+
+---
+
 <!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 

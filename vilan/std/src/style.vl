@@ -768,6 +768,17 @@ impl Style {
 		self.with_length("height", value)
 	}
 
+	/// Width and height in one call — the sizing pair's axis shorthand,
+	/// `padding_x`'s pattern (one value, two slots), and the square case is
+	/// the demand: `size(Length::rem(1.0))` is the icon-box idiom. One arity
+	/// only, because `width(w).height(h)` already spells the rectangle and
+	/// this file mints no multi-value shorthands (§0bis.5). Writes the same
+	/// two slots `width` and `height` write, so mixing is the ordinary
+	/// last-wins override.
+	fun size(self, value: Length): Style {
+		self.with_length("width", value).with_length("height", value)
+	}
+
 	fun min_width(self, value: Length): Style {
 		self.with_length("min-width", value)
 	}
