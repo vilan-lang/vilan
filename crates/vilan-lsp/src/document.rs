@@ -696,8 +696,10 @@ impl Document {
     pub fn analyze(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
         // The pipeline recurses deeply (chumsky), and macro-world compiles NEST
         // a full analysis inside the analysis — run the whole thing on a
-        // dedicated big-stack thread, like the CLI's compiler thread. Callers
-        // stay synchronous (the LSP already wraps this in spawn_blocking).
+        // dedicated big-stack thread, like the CLI's compiler thread (256 MiB,
+        // whose measured rationale lives at its `COMPILER_STACK_SIZE`; B138).
+        // Callers stay synchronous (the LSP already wraps this in
+        // spawn_blocking).
         //
         // The thread body is panic-fenced (B40): the core pipeline carries its
         // own fence, but the stages around it (workspace/manifest discovery,

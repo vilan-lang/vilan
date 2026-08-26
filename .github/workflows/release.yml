@@ -199,6 +199,13 @@ jobs:
       # a mismatch between the two fails in the browser, not in this job.
       - name: wasm-bindgen
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      # The 64 MiB `-zstack-size` is the compiler's stack inside the page's
+      # linear memory. Measured (B138, `VILAN_DEPTH_STATS`): a realistic
+      # analysis peaks well under 1 MiB optimized, and the depth-bounded
+      # expression walk caps near 2.3 MiB at native-release frame sizes; the
+      # headroom above that exists for the not-yet-bounded return-inference
+      # chains (~2 KiB per call link optimized — 64 MiB holds chains past
+      # 30,000 calls). Shrink it only when those chains are bounded too.
       - name: Build
         run: |
           RUSTFLAGS="-C link-arg=-zstack-size=67108864" \

@@ -53,6 +53,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 ---
 
 <!-- family: tooling -->
+**The analyzer's recursion depth is measured now, and its deepest path is bounded.** The stack margins around the compiler were sized by incident, not measurement — the v0.36.0 gate SIGABRT'd when a modest server program's analysis outgrew a CI worker's ~2 MiB stack. `VILAN_DEPTH_STATS` answers the question that incident left open, the `VILAN_PHASE_TIMING` way: set it and every top-level analysis prints one stderr line with, per recursive family (`infer`, `type-walk`, `expr-walk`, `pattern`), the peak recursion depth and the stack consumed at that peak. What it measured: every realistic fixture — both walkthrough entries, the std twin-parity and release-emission corpora, the incident's own server program — peaks at 20 levels, and the deepest path by bytes is the phase-1 expression walk at ~36 KiB per nesting level unoptimized (~4.5 KiB optimized), one frame per level of syntactic nesting, unguarded. That walk is now depth-bounded at 500 levels — 25× the deepest realistic fixture — and an expression nesting past it gets one clean diagnostic steering toward `let`-flattening instead of a stack overflow: a 5000-deep method chain that aborted a 64 MiB worker (SIGABRT) now refuses in under a second. The 256 MiB worker spawns and the wasm build's 64 MiB `-zstack-size` keep their values but lose their folklore status — each site now carries the measured rationale, and what keeps them generous is named precisely: cross-function return-inference chains (~12.5 KiB per call link unoptimized) are not yet bounded.
+
+---
+
+<!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 
 ---
