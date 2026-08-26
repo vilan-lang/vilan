@@ -1000,6 +1000,17 @@ fn helper_source(name: &str) -> &'static str {
              \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
              }"
         }
+        // `str.substring(start, end)` — the checked slice. The native JS method
+        // clamps a negative to 0 and SWAPS an inverted pair, so `s.substring(k,
+        // -1)` quietly returns `s[0..k]`, the complement of the request; and it
+        // clamps `end` past the length rather than saying so. One rule replaces
+        // all three guesses: `0 <= start <= end <= len`, refused otherwise.
+        "__substring" => {
+            "function __substring(text, start, end) {\n\
+             \tif (0 <= start && start <= end && end <= text.length) return text.substring(start, end);\n\
+             \tthrow \"substring out of range: the length is \" + text.length + \" but the range is \" + start + \"..\" + end + \" — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end\";\n\
+             }"
+        }
         // `List.pop(): Option<T>` — removes and returns the last element (no clone:
         // the element leaves the list), or `None` when empty.
         "__list_pop" => {
@@ -5565,7 +5576,18 @@ impl<'src> Transformer<'src> {
             Intrinsic::StrReplace => native_method(&mut args, "replaceAll"),
             Intrinsic::StrRepeat => native_method(&mut args, "repeat"),
             Intrinsic::StrSplit => native_method(&mut args, "split"),
-            Intrinsic::StrSubstring => native_method(&mut args, "substring"),
+            // NOT `native_method`: JS `substring` clamps negatives to 0 and
+            // SWAPS an inverted pair, so `s.substring(offset, -1)` silently
+            // returns the prefix — the complement of what was asked for. The
+            // checked helper refuses instead, the way `list[i]` goes through
+            // `__at` rather than a bare subscript.
+            Intrinsic::StrSubstring => {
+                self.used_helpers.insert("__substring");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__substring".to_string())),
+                    args.collect(),
+                )
+            }
             Intrinsic::StrLen | Intrinsic::ListLen => js::Node::Property(
                 Box::new(args.next().unwrap_or(js::Node::Void)),
                 "length".to_string(),

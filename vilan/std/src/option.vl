@@ -297,6 +297,30 @@ impl str {
 	/// any full numeric text the host accepts — including `"1e3"` and
 	/// `"Infinity"` — parses.
 	external fun parse_f64(self): Option<f64>;
+
+	/// The text with `prefix` removed, or `None` when it does not start with it
+	/// — `starts_with` tests, this one cuts. Distinguishing "absent" from
+	/// "present but empty" is why it is an `Option`: `"ab".strip_prefix("ab")`
+	/// is `Some("")`, `"ab".strip_prefix("c")` is `None`.
+	fun strip_prefix(self, prefix: str): Option<str> {
+		if self.starts_with(prefix) {
+			Some(self.substring(prefix.len(), self.len()))
+		} else {
+			None
+		}
+	}
+
+	/// The text with `suffix` removed, or `None` when it does not end with it.
+	/// The verb `substring` cannot spell safely without arithmetic: cutting a
+	/// trailing affix by hand is what invited `substring(offset, -1)`, whose
+	/// negative end JS silently reinterpreted into the PREFIX.
+	fun strip_suffix(self, suffix: str): Option<str> {
+		if self.ends_with(suffix) {
+			Some(self.substring(0, self.len() - suffix.len()))
+		} else {
+			None
+		}
+	}
 }
 
 // `List`'s `Option`-returning methods live here (not `list.vl`) so the

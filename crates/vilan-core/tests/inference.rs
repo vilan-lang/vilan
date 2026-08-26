@@ -65645,3 +65645,239 @@ fn b136_an_is_in_an_if_inside_a_loop_stays_fresh() {
         "0\n",
     );
 }
+
+// --- `str::substring` refuses rather than clamping or swapping -----------
+// The host's `substring` clamps a negative bound to 0 and SWAPS an inverted
+// pair, so `s.substring(offset, -1)` quietly returns the PREFIX — the
+// complement of the request. The rule is now `0 <= start <= end <= len`,
+// refused otherwise: at compile time where the bounds are literals, at run
+// time where they are computed, and identically under `const`.
+
+#[test]
+fn substring_with_a_negative_literal_start_is_a_compile_error() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(-1, 3)); }
+        main();
+        "#,
+        "-1",
+        "substring start -1 is negative",
+    );
+}
+
+#[test]
+fn substring_with_a_negative_literal_end_is_a_compile_error() {
+    // The exact spelling the ban is named for.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello, world".substring(7, -1)); }
+        main();
+        "#,
+        "-1",
+        "substring end -1 is negative",
+    );
+}
+
+#[test]
+fn substring_with_literal_bounds_inverted_is_a_compile_error() {
+    // No negative in sight: `start > end` is the same silent reinterpretation,
+    // which is why the rule is stated as one inequality rather than a sign check.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(5, 2)); }
+        main();
+        "#,
+        "2",
+        "substring end 2 is before its start 5",
+    );
+}
+
+#[test]
+fn substring_past_the_end_of_a_string_literal_is_a_compile_error() {
+    // `end > len` is refused too, not clamped: a caller who means "to the end"
+    // writes `s.len()`.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(0, 100)); }
+        main();
+        "#,
+        "100",
+        "substring end 100 is past the length 5 of this string",
+    );
+}
+
+#[test]
+fn substring_names_the_replacement_verbs_in_its_note() {
+    assert_fails_noting(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(2, -1)); }
+        main();
+        "#,
+        "substring end -1 is negative",
+        "-1",
+        "strip_suffix",
+    );
+}
+
+#[test]
+fn substring_admits_its_boundary_ranges() {
+    // The refusal is of the ranges OUTSIDE `0 <= start <= end <= len`, not of
+    // the degenerate ones inside it: both empty ends and the whole string work.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            print(s.substring(0, 0).len());
+            print(s.substring(s.len(), s.len()).len());
+            print(s.substring(2, 2).len());
+            print(s.substring(0, s.len()));
+        }
+        main();
+        "#,
+        "0\n0\n0\nhello\n",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_negative_start_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            let start = 0 - 1;
+            print(s.substring(start, 3));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is -1..3",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_negative_end_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello, world";
+            let offset = 7;
+            let end = 0 - 1;
+            print(s.substring(offset, end));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 12 but the range is 7..-1",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_inverted_range_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            let start = 4;
+            let end = 2;
+            print(s.substring(start, end));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is 4..2",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_end_past_the_length_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            let end = 100;
+            print(s.substring(0, end));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is 0..100",
+    );
+}
+
+#[test]
+fn substring_out_of_range_fails_const_evaluation() {
+    // Const eval and the runtime must agree: this arm used to reproduce JS's
+    // clamp-and-swap faithfully, which would have folded a wrong string into
+    // the build instead of failing it.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun cut(text: str, start: i32, end: i32): str { text.substring(start, end) }
+        fun main() { let bad = const cut("hello", 4, 2); print(bad); }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is 4..2",
+    );
+}
+
+#[test]
+fn strip_prefix_and_strip_suffix_cut_or_report_absence() {
+    // `starts_with`/`ends_with` test; these two cut — the verbs a caller
+    // reaching for `substring(offset, -1)` actually wanted.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            match "data: 42".strip_prefix("data: ") {
+                Some(let body) => print(body),
+                None => print("none"),
+            }
+            match "report.md".strip_suffix(".md") {
+                Some(let stem) => print(stem),
+                None => print("none"),
+            }
+            match "data: 42".strip_prefix("zz") {
+                Some(let body) => print(body),
+                None => print("prefix absent"),
+            }
+            match "report.md".strip_suffix(".zz") {
+                Some(let stem) => print(stem),
+                None => print("suffix absent"),
+            }
+        }
+        main();
+        "#,
+        "42\nreport\nprefix absent\nsuffix absent\n",
+    );
+}
+
+#[test]
+fn stripping_a_whole_match_is_some_empty_not_none() {
+    // Why these return `Option<str>` and not `str`: "absent" and "present but
+    // empty" are different answers, and a bare `str` could not tell them apart.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            match "ab".strip_prefix("ab") {
+                Some(let rest) => print(i"some:{rest}"),
+                None => print("none"),
+            }
+            match "ab".strip_suffix("ab") {
+                Some(let rest) => print(i"some:{rest}"),
+                None => print("none"),
+            }
+        }
+        main();
+        "#,
+        "some:\nsome:\n",
+    );
+}

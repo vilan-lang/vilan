@@ -22,6 +22,10 @@ async function __pbkdf2_sha512(password, salt, iterations, bits) {
 function __shared_new(value) {
 	return { v: value };
 }
+function __substring(text, start, end) {
+	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);
+	throw "substring out of range: the length is " + text.length + " but the range is " + start + ".." + end + " — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end";
+}
 function __try_parse_json(text) {
 	try {
 		return [ 0, JSON.parse(text) ];
@@ -30,7 +34,7 @@ function __try_parse_json(text) {
 	}
 }
 function char_at(value2) {
-	return alphabet.substring(value2, value2 + 1);
+	return __substring(alphabet, value2, value2 + 1);
 }
 function encode_url(bytes) {
 	const total = bytes.length;

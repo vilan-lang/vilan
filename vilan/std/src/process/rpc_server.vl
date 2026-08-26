@@ -353,16 +353,21 @@ fun accept_socket(
 						let rest = frame.substring(2, frame.len());
 						let parts = rest.split(":");
 						let id_text = parts[0];
-						let payload = rest.substring(id_text.len() + 1, rest.len());
-						let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Text(payload)));
-						match reply {
-							Frame::Text(let answer) => {
-								socket.write_bytes(text_frame(i"r:{id_text}:{answer}"));
-							},
-							Frame::Binary(let bytes) => {
-								let id = id_text.parse_i32().unwrap_or(0 - 1);
-								socket.write_bytes(binary_frame(tag_rpc_bytes(id, bytes)));
-							},
+						// `r:<id>` with no second `:` carries no payload — a
+						// malformed frame off the wire, ignored rather than
+						// answered. (`r:7:` is the well-formed empty payload.)
+						if id_text.len() < rest.len() {
+							let payload = rest.substring(id_text.len() + 1, rest.len());
+							let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Text(payload)));
+							match reply {
+								Frame::Text(let answer) => {
+									socket.write_bytes(text_frame(i"r:{id_text}:{answer}"));
+								},
+								Frame::Binary(let bytes) => {
+									let id = id_text.parse_i32().unwrap_or(0 - 1);
+									socket.write_bytes(binary_frame(tag_rpc_bytes(id, bytes)));
+								},
+							}
 						}
 					} else if frame.starts_with("d:") {
 						// the wire turn: the frame's signal writes coalesce
