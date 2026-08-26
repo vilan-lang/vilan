@@ -1,7 +1,8 @@
 // vilan dev runtime (HMR) — prepended to browser-leg bundles by an HMR-active
 // `vilan run --watch` (hmr.md §2/§3). Plain ES2020, no dependencies. The port,
-// this build's version, and this leg's bundle name are template-substituted at
-// write time. It installs a `window.__VILAN_HMR__` singleton (a re-evaluated
+// this run's dev-channel token, this build's version, and this leg's bundle
+// name are template-substituted at write time. It installs a
+// `window.__VILAN_HMR__` singleton (a re-evaluated
 // bundle reuses it), defines the instrumentation globals the compiled bundle
 // calls (`__hmr_adopt*`/`__hmr_expose`, hmr.md §5) plus the `std::dev` host
 // globals (`__hmr_register_teardown`/`__hmr_stash`/`__hmr_take`), and reacts to
@@ -14,8 +15,20 @@
         return;
     }
     var PORT = __VILAN_HMR_PORT__;
+    var TOKEN = "__VILAN_HMR_TOKEN__";
     var VERSION = __VILAN_HMR_VERSION__;
     var BUNDLE = "__VILAN_HMR_BUNDLE__";
+
+    // Every dev-channel route requires this run's token (backlog E93), so every
+    // request this file makes goes through here — there is no second way to
+    // spell a channel URL. We can hold it because this bundle came from the
+    // page's own origin; a page that merely knows the port cannot read it, which
+    // is what keeps our compile diagnostics and our bundle to ourselves and
+    // makes `POST /refresh` unforgeable. The token is hex, so it needs no
+    // escaping.
+    function channelUrl(route) {
+        return "http://127.0.0.1:" + PORT + route + "?token=" + TOKEN;
+    }
 
     // Swap state (hmr.md §3/§4). Held in this closure AND on the singleton, so
     // the globals below and the swap protocol share one view; `seed` and
@@ -397,7 +410,7 @@
     }
 
     function fetchAndApplyCss(link, name) {
-        return fetch("http://127.0.0.1:" + PORT + "/asset/" + name)
+        return fetch(channelUrl("/asset/" + name))
             .then(function (response) {
                 if (!response.ok) {
                     throw new Error("unexpected status " + response.status);
@@ -441,7 +454,7 @@
     // the same version gap and reloads again, forever. The dev channel, not
     // the page reload, is the only sure route to current bytes.
     function fetchAndSwap(version) {
-        return fetch("http://127.0.0.1:" + PORT + "/bundle/" + BUNDLE + ".js")
+        return fetch(channelUrl("/bundle/" + BUNDLE + ".js"))
             .then(function (response) {
                 return response.text();
             })
@@ -501,7 +514,10 @@
         if (typeof EventSource === "undefined") {
             return;
         }
-        var source = new EventSource("http://127.0.0.1:" + PORT + "/events");
+        // `EventSource` cannot set request headers, which is why the token
+        // travels as a query parameter on this route — and, for one shape rather
+        // than two, on all of them.
+        var source = new EventSource(channelUrl("/events"));
         source.onmessage = function (event) {
             var data;
             try {

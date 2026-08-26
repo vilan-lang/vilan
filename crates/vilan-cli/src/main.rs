@@ -852,7 +852,13 @@ fn hmr_round(
     for leg in &next {
         let bundle_path = dist.join(format!("{}.{}", leg.name, leg.script_extension));
         let contents = if leg.is_browser {
-            hmr::instrument(&leg.bundle, channel.port(), version, &leg.name)
+            hmr::instrument(
+                &leg.bundle,
+                channel.port(),
+                channel.token(),
+                version,
+                &leg.name,
+            )
         } else {
             leg.bundle.clone()
         };
@@ -916,8 +922,17 @@ fn hmr_round(
                 let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
                 // `dev-refresh.md` §5 item 2: the dev channel's port, so the
                 // child's `std::watch::force_refresh()` (a no-op without it)
-                // knows where to POST.
-                let extra = [("VILAN_HMR_PORT", channel.port().to_string())];
+                // knows where to POST — and, since backlog E93, this run's token
+                // beside it, because every route now requires one. The child is
+                // the one legitimate caller that is not the browser shim, and an
+                // inherited environment variable is how it already learns
+                // everything else about the session (`VILAN_WATCHING`,
+                // `VILAN_HMR_PORT`): nothing on disk, nothing to clean up, and
+                // no way for another process to pick it up.
+                let extra = [
+                    ("VILAN_HMR_PORT", channel.port().to_string()),
+                    ("VILAN_HMR_TOKEN", channel.token().to_string()),
+                ];
                 match spawn_watched_node(&script, args, Some(&root), &extra) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
@@ -3195,10 +3210,11 @@ fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Re
 const WATCHING_ENV: &str = "VILAN_WATCHING";
 
 /// [`spawn_node`] for a child a `--watch` session owns — [`WATCHING_ENV`], plus
-/// whatever `extra` the round carries (the HMR round adds `VILAN_HMR_PORT`,
-/// `dev-refresh.md` §5 item 2 — the plain restart loop adds nothing). Both
-/// watch paths go through it; plain `vilan run` does not, which is what makes
-/// `is_watching()` answer the question it is named for.
+/// whatever `extra` the round carries (the HMR round adds `VILAN_HMR_PORT` and
+/// `VILAN_HMR_TOKEN`, `dev-refresh.md` §5 item 2 and backlog E93 — the plain
+/// restart loop adds nothing). Both watch paths go through it; plain
+/// `vilan run` does not, which is what makes `is_watching()` answer the question
+/// it is named for.
 fn spawn_watched_node(
     script: &Path,
     args: &[String],

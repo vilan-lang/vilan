@@ -13,15 +13,44 @@
 //!   404 (the traversal guard).
 //! - `POST /refresh` — `std::watch::force_refresh()`'s wire target
 //!   (`dev-refresh.md` §5 item 2; §6 records it as shipped): broadcasts a
-//!   `reload` event to every connected browser and answers `204`. No body, no
-//!   auth — a localhost-only dev convenience, same trust boundary as every
-//!   other route here.
+//!   `reload` event to every connected browser and answers `204`.
+//!
+//! **Every one of them requires this run's token** (backlog E93). The listener
+//! was always localhost-only and the artifact routes always had the traversal
+//! guard, so the channel was never a network surface and never a file-read
+//! primitive — but it was open to any page the developer happened to visit **in
+//! the same browser** while `run --watch` ran. Such a page could read the
+//! compiled bundle off `/bundle/<leg>.js`, hold `/events` open and watch every
+//! compile failure scroll past as it was typed (`render_overlay` carries
+//! `file:line:col`, the diagnostic text, and trace hops), and fire `POST
+//! /refresh` for a reload flood — the port being a fixed, trivially probed
+//! default. [`mint_token`] closes all three: the legitimate page has the token
+//! baked into the bundle its own origin served it, and a hostile page cannot
+//! read that bundle (the only copies are the local `dist/` and the app's origin,
+//! which its own CORS protects) so it can neither fetch nor forge.
+//!
+//! `Access-Control-Allow-Origin: *` stays, and is load-bearing: the app's origin
+//! is the user's own server and is genuinely unknowable here. An origin
+//! allowlist would not have been an alternative anyway — a simple cross-origin
+//! POST needs no CORS permission, so the refresh flood survives it and only a
+//! secret the caller must present closes it.
+//!
+//! One residual, recorded rather than papered over: a tab left open from a
+//! PREVIOUS watch session carries that session's token, so when the developer
+//! restarts `run --watch` on the same port the old tab's `EventSource` is
+//! refused instead of healing itself through the `connected` version gap. The
+//! fix is to reload the tab. Answering a stale token any differently would mean
+//! answering an unknown one, which is precisely what the gate exists to refuse —
+//! and the shim must not reload on its own here, for the same reason
+//! `fetchAndSwap` never does: a page whose own server hands out bytes it read
+//! once at boot would loop forever.
 //!
 //! The browser side is [`SHIM`], a small dev-runtime prepended to browser-leg
 //! bundles by an HMR-active `run --watch` (never by `build`, so goldens are
 //! untouched). [`classify`] is the pure byte-diff decision the watch round runs
 //! each rebuild; it is unit-tested without processes.
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -36,16 +65,68 @@ use std::sync::{Arc, Mutex};
 pub const DEFAULT_HMR_PORT: u16 = 35917;
 
 /// The dev-runtime shim, prepended to each browser leg's bundle when HMR is
-/// active. Its `__VILAN_HMR_PORT__` / `__VILAN_HMR_VERSION__` /
-/// `__VILAN_HMR_BUNDLE__` placeholders are substituted at write time by
-/// [`instrument`].
+/// active. Its `__VILAN_HMR_PORT__` / `__VILAN_HMR_TOKEN__` /
+/// `__VILAN_HMR_VERSION__` / `__VILAN_HMR_BUNDLE__` placeholders are substituted
+/// at write time by [`instrument`].
 const SHIM: &str = include_str!("hmr_shim.js");
 
-/// One browser leg's bundle, with the shim's port, version, and own bundle name
-/// embedded (the last so a `swap` event can fetch `/bundle/<leg>.js`, hmr.md §3).
-pub fn instrument(bundle: &str, port: u16, version: u64, leg: &str) -> String {
+/// The dev-channel token's length in hex characters — 128 bits. A fixed,
+/// non-secret constant: [`token_matches`] compares lengths in the clear, and
+/// there is nothing to hide in a number every shipped shim carries anyway.
+const TOKEN_HEX_LEN: usize = 32;
+
+/// Mints this run's dev-channel token (backlog E93) — 128 bits, hex, generated
+/// once per `run --watch` process and required on every route.
+///
+/// No RNG crate, in keeping with the dependency-free watcher: the token is a
+/// SHA-256 digest (the `sha2` the upgrade path already pulls in) of four
+/// independent unpredictable inputs, truncated to 128 bits.
+///
+/// The load-bearing input is `std::collections::hash_map::RandomState`, whose
+/// keys the standard library seeds from the platform's own secure generator
+/// (`getrandom` on Linux, `BCryptGenRandom` on Windows). A `RandomState`'s keys
+/// cannot be read back, but hashing under it is keyed, so hashing two known
+/// salts exports two key-dependent words. The standard library does not promise
+/// that hasher is *cryptographic*, which is why it is not asked to be the whole
+/// answer: wall-clock nanoseconds, the process id, and the address of a heap
+/// allocation (ASLR) are mixed in beside it, and SHA-256 over the four is what
+/// the token actually is. Even discounting the seeded keys entirely, what
+/// remains is well past what a page that can only probe the port a few thousand
+/// times a second could ever enumerate — and that page is the whole threat
+/// model here.
+fn mint_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut digest = Sha256::new();
+    for salt in ["vilan-hmr-token-0", "vilan-hmr-token-1"] {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write(salt.as_bytes());
+        digest.update(hasher.finish().to_le_bytes());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    digest.update(nanos.to_le_bytes());
+    digest.update(std::process::id().to_le_bytes());
+    let allocation = Box::new(0u8);
+    digest.update((Box::as_ref(&allocation) as *const u8 as usize).to_le_bytes());
+    let mut token = String::with_capacity(TOKEN_HEX_LEN);
+    for byte in digest.finalize().iter().take(TOKEN_HEX_LEN / 2) {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
+}
+
+/// One browser leg's bundle, with the shim's port, this run's token, the build
+/// version, and the leg's own bundle name embedded (the last so a `swap` event
+/// can fetch `/bundle/<leg>.js`, hmr.md §3).
+///
+/// The token rides here and nowhere else on the browser side (backlog E93): the
+/// bundle reaches the page over the page's OWN origin, which is exactly the
+/// property that keeps a hostile page from reading it.
+pub fn instrument(bundle: &str, port: u16, token: &str, version: u64, leg: &str) -> String {
     let shim = SHIM
         .replace("__VILAN_HMR_PORT__", &port.to_string())
+        .replace("__VILAN_HMR_TOKEN__", token)
         .replace("__VILAN_HMR_VERSION__", &version.to_string())
         .replace("__VILAN_HMR_BUNDLE__", leg);
     format!("{shim}\n{bundle}")
@@ -138,6 +219,11 @@ impl Clients {
 /// not a service to shut down cleanly.
 pub struct DevChannel {
     port: u16,
+    /// This run's token (backlog E93), minted at [`DevChannel::bind`] and
+    /// required on every route. Shared with the accept loop's per-connection
+    /// threads; never written anywhere but the instrumented bundle and the Node
+    /// child's environment, and never printed.
+    token: Arc<str>,
     version: Arc<AtomicU64>,
     clients: Arc<Clients>,
 }
@@ -150,15 +236,18 @@ impl DevChannel {
     pub fn bind(port: u16, dist: PathBuf) -> std::io::Result<DevChannel> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let port = listener.local_addr()?.port();
+        let token: Arc<str> = Arc::from(mint_token());
         let version = Arc::new(AtomicU64::new(0));
         let clients: Arc<Clients> = Arc::new(Clients::default());
         {
+            let token = token.clone();
             let version = version.clone();
             let clients = clients.clone();
-            std::thread::spawn(move || serve(listener, clients, version, dist));
+            std::thread::spawn(move || serve(listener, clients, version, dist, token));
         }
         Ok(DevChannel {
             port,
+            token,
             version,
             clients,
         })
@@ -175,6 +264,14 @@ impl DevChannel {
     /// The bound port (the actual one when `0` was requested).
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// This run's token (backlog E93) — for the two places that legitimately
+    /// need it: [`instrument`], which bakes it into each browser bundle, and the
+    /// Node child's `VILAN_HMR_TOKEN`, which is how `std::watch::force_refresh()`
+    /// reaches `POST /refresh`.
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     /// This build's version — the counter embedded in the browser shim.
@@ -253,24 +350,49 @@ fn escape_json(text: &str) -> String {
 /// The accept loop: one thread per connection (fine for a localhost dev tool).
 /// A request-shaped route answers and the thread ends; an SSE connection keeps
 /// its thread for as long as the browser is there ([`serve_events`]).
-fn serve(listener: TcpListener, clients: Arc<Clients>, version: Arc<AtomicU64>, dist: PathBuf) {
+fn serve(
+    listener: TcpListener,
+    clients: Arc<Clients>,
+    version: Arc<AtomicU64>,
+    dist: PathBuf,
+    token: Arc<str>,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let clients = clients.clone();
         let version = version.clone();
         let dist = dist.clone();
-        std::thread::spawn(move || handle(stream, clients, version, dist));
+        let token = token.clone();
+        std::thread::spawn(move || handle(stream, clients, version, dist, &token));
     }
 }
 
-/// Handles one connection: parse the request line, ignore headers, route.
-fn handle(mut stream: TcpStream, clients: Arc<Clients>, version: Arc<AtomicU64>, dist: PathBuf) {
+/// Handles one connection: parse the request line, check this run's token,
+/// ignore the remaining headers, route.
+///
+/// The token gate (backlog E93) sits **above the routing**, not inside each
+/// route, and that placement is the point: there is no way to add a fifth route
+/// that forgets it, and no request reaches the artifact reader, the client
+/// registry, or the broadcast without having presented it first. The traversal
+/// guard is unchanged and still runs underneath — a valid token buys the artifact
+/// routes' `<name>.<ext>` discipline, not a path of the caller's choosing.
+fn handle(
+    mut stream: TcpStream,
+    clients: Arc<Clients>,
+    version: Arc<AtomicU64>,
+    dist: PathBuf,
+    token: &str,
+) {
     let Some(request_line) = read_request_head(&mut stream) else {
         return;
     };
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
+    let (path, presented) = split_target(parts.next().unwrap_or(""));
+    if !token_matches(token, presented) {
+        respond_403(&mut stream);
+        return;
+    }
     if method == "POST" && path == "/refresh" {
         // `std::watch::force_refresh()`'s target (`dev-refresh.md` §5
         // item 2): a `reload` event, one-shot, to every connected browser.
@@ -369,6 +491,58 @@ fn wait_for_disconnect(stream: &TcpStream) {
     }
 }
 
+/// Splits a request target into its path and the value of its `token` query
+/// parameter (backlog E93). Every other parameter is ignored, and a target with
+/// no query at all yields `None` — which [`token_matches`] refuses exactly as it
+/// refuses a wrong one.
+///
+/// **Why the query string and not a header.** `EventSource` — the browser API
+/// the shim's `/events` connection *is* — cannot set request headers, full stop,
+/// so the SSE route has no choice. Given that, putting the other three in a
+/// header would buy nothing and cost the thing that matters most for a security
+/// check: one path, one parser, one place to get it wrong. A query parameter is
+/// no weaker here either. The token is not a bearer credential loose on the
+/// internet — it is loopback-only, it lives one `run --watch` process long, and
+/// the URLs carrying it are built inside the shim and inside `force_refresh`,
+/// never typed, linked, or logged. The attacker in the model is a page that
+/// cannot read the token at all; where in the request it would have gone is
+/// beside the point to them.
+fn split_target(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('?') {
+        None => (target, None),
+        Some((path, query)) => (
+            path,
+            query
+                .split('&')
+                .find_map(|parameter| parameter.strip_prefix("token=")),
+        ),
+    }
+}
+
+/// Whether `presented` is this run's token. Absent, empty, short, long, or
+/// simply wrong are one answer — `false` — and the caller renders all of them as
+/// the same [`respond_403`].
+///
+/// The comparison runs over the whole token rather than stopping at the first
+/// differing byte, so a caller cannot walk a guess in one character at a time off
+/// response timing. The length check above it is not a leak: [`TOKEN_HEX_LEN`] is
+/// a compile-time constant every shipped shim carries in the clear.
+fn token_matches(expected: &str, presented: Option<&str>) -> bool {
+    let Some(presented) = presented else {
+        return false;
+    };
+    let expected = expected.as_bytes();
+    let presented = presented.as_bytes();
+    if expected.len() != presented.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (mine, theirs) in expected.iter().zip(presented) {
+        difference |= mine ^ theirs;
+    }
+    difference == 0
+}
+
 /// Reads the whole HTTP request head (through the blank `\r\n\r\n` line) and
 /// returns its first line (`GET /path HTTP/1.1`); the rest is ignored. Draining
 /// the head matters: leaving unread request bytes in the socket buffer makes the
@@ -438,6 +612,23 @@ pub fn is_safe_asset_name(name: &str, ext: &str) -> bool {
     let suffix = format!(".{ext}");
     // A bare `.js`/`.css` with no stem isn't a real artifact name either.
     name.ends_with(&suffix) && name.len() > suffix.len()
+}
+
+/// The token gate's refusal (backlog E93): one status, no body, and the same
+/// bytes for every way of failing it.
+///
+/// `403` rather than `401` — there is no challenge to issue and no scheme to
+/// name, so a `WWW-Authenticate` header would be a fiction; the request is simply
+/// forbidden. Rather than `404` too: pretending the routes are not there would be
+/// a lie the fixed default port already contradicts, and it would make a real
+/// mistake (a stale bundle from a previous run) indistinguishable from a typo.
+/// Nothing here says *why* — not whether a token was presented, not whether it
+/// was the right length, not how far it matched.
+fn respond_403(stream: &mut TcpStream) {
+    let response = "HTTP/1.1 403 Forbidden\r\n\
+         Content-Length: 0\r\n\
+         Access-Control-Allow-Origin: *\r\n\r\n";
+    let _ = stream.write_all(response.as_bytes());
 }
 
 fn respond_404(stream: &mut TcpStream) {
@@ -813,18 +1004,22 @@ mod tests {
     /// run never pays it — every wait returns the moment its count holds.
     const REGISTRY_LIVENESS: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// Opens one SSE connection the way a browser's `EventSource` does and
-    /// reads through the `connected` hello, so the server has finished
+    /// Opens one SSE connection the way a browser's `EventSource` does —
+    /// presenting this run's token, as every route now requires (backlog E93) —
+    /// and reads through the `connected` hello, so the server has finished
     /// registering it by the time this returns.
-    fn connect_sse(port: u16) -> TcpStream {
+    fn connect_sse(channel: &DevChannel) -> TcpStream {
         let mut stream =
-            TcpStream::connect(("127.0.0.1", port)).expect("connect to the dev channel");
+            TcpStream::connect(("127.0.0.1", channel.port())).expect("connect to the dev channel");
         stream
             .set_read_timeout(Some(REGISTRY_LIVENESS))
             .expect("set a read timeout");
-        stream
-            .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .expect("send the SSE request");
+        write!(
+            stream,
+            "GET /events?token={} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            channel.token()
+        )
+        .expect("send the SSE request");
         // The head, then the hello frame's `\n\n` terminator.
         let mut received = Vec::new();
         let mut chunk = [0u8; 512];
@@ -874,7 +1069,7 @@ mod tests {
         // Three generations of browser, so the claim is "returns to zero every
         // time", not "was zero once".
         for generation in 0..3 {
-            let connections: Vec<TcpStream> = (0..4).map(|_| connect_sse(channel.port())).collect();
+            let connections: Vec<TcpStream> = (0..4).map(|_| connect_sse(&channel)).collect();
             // Registration first — otherwise the count below could be zero
             // because nothing was ever registered.
             assert_client_count(
@@ -898,7 +1093,7 @@ mod tests {
         // registry it now indexes by id still fans out.
         let channel =
             DevChannel::bind(0, PathBuf::from("dist")).expect("bind an ephemeral dev channel");
-        let mut browser = connect_sse(channel.port());
+        let mut browser = connect_sse(&channel);
         assert_client_count(&channel, 1, "one live browser");
 
         channel.bump_version();
@@ -912,6 +1107,294 @@ mod tests {
             "the live browser should have received the pushed event: {pushed:?}"
         );
         assert_client_count(&channel, 1, "still one live browser after a push");
+    }
+
+    // --- The per-run token gate (backlog E93) --------------------------------
+
+    /// A `dist/` with one browser bundle and its sidecar, for the artifact
+    /// routes to actually serve. Returned with a live channel bound on it.
+    fn channel_with_dist(tag: &str) -> (DevChannel, PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dist = std::env::temp_dir().join(format!(
+            "vilan_hmr_token_{tag}_{}_{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dist);
+        std::fs::create_dir_all(&dist).expect("create a dist directory");
+        std::fs::write(dist.join("client.js"), "// bundle bytes\n").expect("write a bundle");
+        std::fs::write(dist.join("client.css"), ".a{color:red}\n").expect("write a sidecar");
+        let channel = DevChannel::bind(0, dist.clone()).expect("bind an ephemeral dev channel");
+        (channel, dist)
+    }
+
+    /// One raw request against the dev channel, returning the WHOLE response —
+    /// status line, headers, and body. A refusal has to be checked in full, not
+    /// by its body alone, which is empty either way.
+    fn raw_request(port: u16, method: &str, target: &str) -> String {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).expect("connect to the dev channel");
+        stream
+            .set_read_timeout(Some(REGISTRY_LIVENESS))
+            .expect("set a read timeout");
+        write!(
+            stream,
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+        )
+        .expect("send the request");
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Every route, in the one place a test can name them all, as
+    /// `(method, path)`. Adding a route to [`handle`] without adding it here is
+    /// the omission these pins exist to catch.
+    const ROUTES: [(&str, &str); 4] = [
+        ("GET", "/events"),
+        ("GET", "/bundle/client.js"),
+        ("GET", "/asset/client.css"),
+        ("POST", "/refresh"),
+    ];
+
+    #[test]
+    fn every_route_answers_a_request_carrying_this_runs_token() {
+        // The happy path, route by route: the token the shim would have been
+        // given is the token the channel accepts. `/events` is checked through
+        // `connect_sse`, which reads all the way through the hello — anything
+        // less than a real registration would hang there rather than pass.
+        let (channel, dist) = channel_with_dist("happy");
+        let token = channel.token().to_string();
+
+        let browser = connect_sse(&channel);
+        assert_client_count(
+            &channel,
+            1,
+            "GET /events with the token registers a browser",
+        );
+        drop(browser);
+
+        let bundle = raw_request(
+            channel.port(),
+            "GET",
+            &format!("/bundle/client.js?token={token}"),
+        );
+        assert!(
+            bundle.starts_with("HTTP/1.1 200 OK") && bundle.ends_with("// bundle bytes\n"),
+            "GET /bundle/<leg>.js with the token should serve the bundle: {bundle:?}"
+        );
+
+        let asset = raw_request(
+            channel.port(),
+            "GET",
+            &format!("/asset/client.css?token={token}"),
+        );
+        assert!(
+            asset.starts_with("HTTP/1.1 200 OK") && asset.ends_with(".a{color:red}\n"),
+            "GET /asset/<leg>.css with the token should serve the sidecar: {asset:?}"
+        );
+
+        let refresh = raw_request(channel.port(), "POST", &format!("/refresh?token={token}"));
+        assert!(
+            refresh.starts_with("HTTP/1.1 204 No Content"),
+            "POST /refresh with the token should broadcast and answer 204: {refresh:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[test]
+    fn every_route_refuses_a_missing_or_wrong_token_with_the_same_bare_403() {
+        // The refusal, route by route and for every way of failing the gate.
+        // Byte-identical across all of them is the assertion that matters: a
+        // caller learns that it did not present this run's token and nothing
+        // else — not whether it presented one, not whether it was the right
+        // length, not how far it matched, and not whether the route or the
+        // artifact behind it exists.
+        let (channel, dist) = channel_with_dist("refusal");
+        let real = channel.token().to_string();
+        let wrong: String = real
+            .chars()
+            .map(|digit| if digit == '0' { '1' } else { '0' })
+            .collect();
+        let attempts = [
+            ("no query at all", String::new()),
+            ("an empty token", "?token=".to_string()),
+            ("another parameter but no token", "?nope=1".to_string()),
+            (
+                "a wrong token of the right length",
+                format!("?token={wrong}"),
+            ),
+            (
+                "a short token",
+                format!("?token={}", &real[..real.len() - 1]),
+            ),
+            ("a long token", format!("?token={real}0")),
+            (
+                "the right token as some other parameter",
+                format!("?bearer={real}"),
+            ),
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        for (method, path) in ROUTES {
+            for (what, query) in &attempts {
+                let response = raw_request(channel.port(), method, &format!("{path}{query}"));
+                assert_eq!(
+                    response,
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\
+                     Access-Control-Allow-Origin: *\r\n\r\n",
+                    "{method} {path} with {what} must be refused with a bare 403"
+                );
+                seen.push(response);
+            }
+        }
+        assert!(
+            seen.windows(2).all(|pair| pair[0] == pair[1]),
+            "every refusal must be byte-identical — a difference is the leak"
+        );
+        // And nothing got through: no browser was registered by any of the
+        // refused `/events` attempts.
+        assert_client_count(&channel, 0, "a refused /events registers no browser");
+
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[test]
+    fn the_traversal_guard_still_holds_behind_the_token_gate() {
+        // The gate sits ABOVE the routing, so a valid token is the only way to
+        // reach the artifact reader at all — and reaching it buys the same
+        // `<name>.<ext>` discipline as before, not a path of the caller's
+        // choosing. Both halves are asserted: without the token a traversal is
+        // a 403 (it never reaches the guard), with the token it is the guard's
+        // own 404.
+        let (channel, dist) = channel_with_dist("traversal");
+        let token = channel.token().to_string();
+        // A real file one level up, so a working traversal would have something
+        // to hand back and an empty body cannot be mistaken for "nothing there".
+        let secret = dist.parent().unwrap().join("vilan_hmr_token_secret.js");
+        std::fs::write(&secret, "SECRET\n").expect("write the file a traversal would reach");
+
+        for target in [
+            "/bundle/../vilan_hmr_token_secret.js",
+            "/asset/../vilan_hmr_token_secret.js",
+            "/bundle/..%2fvilan_hmr_token_secret.js",
+            "/bundle/sub/client.js",
+            "/bundle/.js",
+        ] {
+            let refused = raw_request(channel.port(), "GET", target);
+            assert!(
+                refused.starts_with("HTTP/1.1 403 Forbidden"),
+                "{target} with no token is refused before the guard is consulted: {refused:?}"
+            );
+            let guarded = raw_request(channel.port(), "GET", &format!("{target}?token={token}"));
+            assert!(
+                guarded.starts_with("HTTP/1.1 404 Not Found"),
+                "{target} with the token must still hit the traversal guard: {guarded:?}"
+            );
+            assert!(
+                !guarded.contains("SECRET"),
+                "no traversal may serve bytes from outside dist: {guarded:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    #[test]
+    fn the_shim_carries_the_substituted_token_and_no_placeholder() {
+        // The delivery half: the legitimate page gets the token because it is
+        // baked into the bundle its own origin served it. A leftover placeholder
+        // would be a shim that asks for `__VILAN_HMR_TOKEN__` and is refused by
+        // every route.
+        let token = mint_token();
+        let instrumented = instrument("export const x = 1;\n", 35917, &token, 7, "client");
+        assert!(
+            instrumented.contains(&format!("var TOKEN = \"{token}\";")),
+            "the shim should carry this run's token"
+        );
+        for placeholder in [
+            "__VILAN_HMR_TOKEN__",
+            "__VILAN_HMR_PORT__",
+            "__VILAN_HMR_VERSION__",
+            "__VILAN_HMR_BUNDLE__",
+        ] {
+            assert!(
+                !instrumented.contains(placeholder),
+                "{placeholder} should have been substituted"
+            );
+        }
+        assert!(
+            instrumented.ends_with("export const x = 1;\n"),
+            "the app bundle should still follow the shim verbatim"
+        );
+    }
+
+    #[test]
+    fn a_token_is_128_hex_bits_and_differs_run_to_run() {
+        // "Per-run" is the whole claim: a token that repeated across runs would
+        // let a page that saw one dev session's bundle read the next one's.
+        let tokens: Vec<String> = (0..64).map(|_| mint_token()).collect();
+        for token in &tokens {
+            assert_eq!(token.len(), TOKEN_HEX_LEN, "a token is 128 bits of hex");
+            assert!(
+                token.chars().all(|digit| digit.is_ascii_hexdigit()),
+                "a token is hex, so it needs no URL escaping: {token}"
+            );
+        }
+        let mut distinct = tokens.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            tokens.len(),
+            "every minted token must differ — a repeat is a fixed secret"
+        );
+    }
+
+    #[test]
+    fn a_target_splits_into_its_path_and_its_token_parameter() {
+        assert_eq!(split_target("/events"), ("/events", None));
+        assert_eq!(split_target("/events?token=abc"), ("/events", Some("abc")));
+        assert_eq!(split_target("/events?token="), ("/events", Some("")));
+        // The parameter is found wherever it sits, and only under its own name.
+        assert_eq!(
+            split_target("/events?v=1&token=abc&w=2"),
+            ("/events", Some("abc"))
+        );
+        assert_eq!(split_target("/events?bearer=abc"), ("/events", None));
+        assert_eq!(split_target("/events?mytoken=abc"), ("/events", None));
+        // The path never keeps the query — the traversal guard must not have to
+        // reason about one.
+        assert_eq!(
+            split_target("/bundle/client.js?token=abc"),
+            ("/bundle/client.js", Some("abc"))
+        );
+    }
+
+    #[test]
+    fn only_the_exact_token_matches() {
+        // A literal rather than a minted one: these are exact-shape claims
+        // (case, prefix, length), and they should read the same on every run.
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(token_matches(token, Some(token)));
+        assert!(!token_matches(token, None));
+        assert!(!token_matches(token, Some("")));
+        assert!(!token_matches(token, Some(&token[..token.len() - 1])));
+        assert!(!token_matches(token, Some(&format!("{token}0"))));
+        // A guess that matches every character but the last is no closer than
+        // one that matches none.
+        assert!(!token_matches(
+            token,
+            Some("0123456789abcdef0123456789abcde0")
+        ));
+        assert!(!token_matches(
+            token,
+            Some("f0123456789abcdef0123456789abcde")
+        ));
+        // Hex, compared as bytes: a different case is a different token.
+        assert!(!token_matches(token, Some(&token.to_uppercase())));
     }
 
     fn leg(name: &str, is_browser: bool, bundle: &str, css: Option<&str>) -> LegArtifact {

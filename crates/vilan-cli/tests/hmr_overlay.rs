@@ -12,7 +12,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The dev-runtime shim, read from source so this test exercises exactly what
-/// ships. Its three placeholders are substituted the way `hmr::instrument` does.
+/// ships. Its four placeholders are substituted the way `hmr::instrument` does.
 const SHIM: &str = include_str!("../src/hmr_shim.js");
 
 fn temp_file(tag: &str) -> PathBuf {
@@ -28,8 +28,11 @@ fn temp_file(tag: &str) -> PathBuf {
 /// placeholders filled, plus the driver assertions. `check(cond, msg)` prints one
 /// `ok`/`FAIL` line each; the process exits non-zero on any failure.
 fn harness() -> String {
+    // Nothing here reaches the network — the overlay is pure DOM — so the port
+    // and the token are placeholders that only have to be substituted, not real.
     let shim = SHIM
         .replace("__VILAN_HMR_PORT__", "0")
+        .replace("__VILAN_HMR_TOKEN__", "00000000000000000000000000000000")
         .replace("__VILAN_HMR_VERSION__", "1")
         .replace("__VILAN_HMR_BUNDLE__", "client");
     format!(
