@@ -100,6 +100,42 @@ main();
 }
 
 #[test]
+fn read_dir_all_lists_every_entry_recursively_as_relative_paths() {
+    let dir = temp_project("read_dir_all");
+    write(&dir, "data/a.txt", "a");
+    write(&dir, "data/sub/c.txt", "c");
+    write(&dir, "data/sub/deep/d.txt", "d");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::fs::read_dir_all;
+
+fun main() {
+	let entries = read_dir_all("data");
+	print(entries.len());
+	for entry in entries.sort() {
+		print(entry);
+	}
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    // Five entries: three files by their RELATIVE paths, plus the two
+    // subdirectories as entries of their own — what the host's recursive
+    // `readdir` hands back. The probe sorts: the host order is not promised.
+    // This exact assertion is also the runtime probe of the host's
+    // `{ recursive: true }` support (kolt.local 019) — a node too old for the
+    // option (< 18.17) ignores it and lists `data` flat, failing loudly here.
+    assert_eq!(
+        stdout,
+        "5\na.txt\nsub\nsub/c.txt\nsub/deep\nsub/deep/d.txt\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stat_reports_size_mtime_and_kind_for_a_file_and_a_directory() {
     let dir = temp_project("stat_hit");
     write(&dir, "data/five.txt", "12345");

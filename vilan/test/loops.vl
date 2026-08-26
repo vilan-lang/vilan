@@ -1,42 +1,42 @@
-import std::{ print };
+import std::print;
 
 fun main() {
 	{
 		print("Basic loop with break");
-		
+
 		mut i = 0;
 		for {
 			if i >= 10 {
 				jump break;
 			}
-			
+
 			print(i);
 			i += 1;
 		}
 	}
-	
+
 	{
 		print("While loop with condition");
-		
+
 		mut i = 0;
 		for i < 10 {
 			print(i);
 			i += 1;
 		}
 	}
-	
+
 	{
 		print("Basic loop with continue and break");
-		
+
 		mut i = 0;
 		for {
 			print(i);
 			i += 1;
-			
+
 			if i < 10 {
 				jump continue;
 			}
-			
+
 			jump break;
 		}
 	}

@@ -17,7 +17,7 @@
 // the whole ceremony into one line.
 
 import pkg::fs;
-import pkg::io::panic;
+import pkg::io::{ panic, print };
 import pkg::json::{ JsonValue, coerce_bool, coerce_str };
 import pkg::option::Option::{ None, Some, self };
 import pkg::result::Result::{ Err, Ok, self };
@@ -179,8 +179,10 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 		let (url, file) = artifact;
 		match content_type_of(file) {
 			// Not served rather than guessed at: `serve_build` serves a build,
-			// not a directory. Nothing a vilan build emits lands here today.
-			None => {},
+			// not a directory. Nothing a vilan build emits lands here today —
+			// and when something does, the skip is SAID, not silent
+			// (kolt.local 022(b)): the drop stays, the warning names it.
+			None => print(i"warning: the `{build.leg}` build names {file}, whose extension `serve_build` has no content type for — the artifact is not served"),
 			Some(let content_type) => {
 				if !fs::exists(file) {
 					panic(i"the `{build.leg}` build names {file}, which is not on disk — rebuild the leg (`vilan build .`), and run the server from the project root");

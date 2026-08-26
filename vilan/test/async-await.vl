@@ -1,7 +1,7 @@
 // Async/await: an `async` extern (a promise-returning host function), implicit
 // await of an async function, and the explicit `async` (spawn) / `await` forms.
 // Output is deterministic (`sleep(0)`): first, second, third.
-import std::{ print };
+import std::print;
 
 [extern("node:timers/promises", "setTimeout")]
 async external fun sleep(ms: i32): void;

@@ -7039,9 +7039,11 @@ pub(crate) mod tests {
             document.diagnostics
         );
         let result = organized(&document).expect("a dead branch offers a shrink edit");
+        // The one survivor renders unbraced — `{ alpha }` IS `alpha`, the
+        // formatter's canonical spelling (kolt.local 005).
         assert_eq!(
             result,
-            "import pkg::helper::{ alpha };\nfun main() {\n\talpha();\n}\n",
+            "import pkg::helper::alpha;\nfun main() {\n\talpha();\n}\n",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7208,9 +7210,10 @@ pub(crate) mod tests {
             document.diagnostics
         );
         let result = organized(&document).expect("a dead branch offers a shrink edit");
+        // The surviving module leaf renders unbraced (kolt.local 005).
         assert_eq!(
             result,
-            "import std::{ math };\nfun main() {\n\tmath::min(1, 2);\n}\n",
+            "import std::math;\nfun main() {\n\tmath::min(1, 2);\n}\n",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
