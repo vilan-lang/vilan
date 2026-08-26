@@ -25,6 +25,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 <!-- family: tooling -->
 **`std::crypto`'s promoted primitives are documented.** `hmac_sha512` and `pbkdf2_sha512` shipped in std, but the misc page's crypto section still listed only `random_bytes`/`random_uuid`/`equals_constant_time` and sent readers off to "bind the host's sync primitives as externs … candidates for std promotion" — teaching a workaround for a need std now covers. The section lists both promoted functions and keeps the extern lesson for what it is still for: std's surface is async because WebCrypto is, so a path that must stay sync (the walkthrough's rpc dispatch hashes passwords inside a sync method) still binds Node's `pbkdf2Sync`, exactly as the walkthrough example does. Same sweep, same class: `content_type_of`'s doc comment no longer claims `std::fs` cannot read bytes — stale since `read_bytes` shipped.
 
+---
+
+<!-- family: tooling -->
+**The docs gate's heading-id twin can no longer drift from `std::markdown`'s rule.** The test-only reimplementation the keyword-hover deep links are checked against (`book_sync`'s `normalize_id`) lowercased ASCII-only and skipped the trim mdBook performs after dropping tags — both empirically wrong against mdBook v0.5.4 (`École Été` → `École-Été` where the renderer says `école-été`; an anchor-fronted heading kept the anchor's trailing space as a leading `-`), and both latent because no book heading exercises them today, which is exactly how a checking surface rots. The twin now trims after the tag drop and lowercases with the full Unicode fold, both shapes are pinned, and a differential gate holds the twin to the same `markdown_anchors.golden` (456 ids scraped from a real mdBook v0.5.4 build) that `std::markdown`'s `heading_id` already answers to — with both implementations reproducing one golden, neither can drift from the other over the book's ids without its own gate going red (B137, `proposal/markdown.md` §10.1).
+
 ## v0.36.0 — 2026-08-24
 
 <!-- family: breaking -->
