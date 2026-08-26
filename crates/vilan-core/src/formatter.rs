@@ -196,10 +196,31 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
     }
 }
 
+/// The canonical view of a branch for ordering and re-emission: a one-member
+/// brace set whose member is not `self` IS its member — `a::{ b }` and `a::b`
+/// spell the same import (kolt.local 005) — so the shared key and the token
+/// re-emission both see through the braces. Without this, the braced source
+/// and its collapsed reprint would sort a run differently (`BranchKey::Set`
+/// orders after `Path`) and the safety net would refuse the reprint. A lone
+/// `self` keeps its set: it only means something inside braces.
+fn unwrap_singleton_set<'branch, 'src>(
+    branch: &'branch TokenBranch<'src>,
+) -> &'branch TokenBranch<'src> {
+    let mut current = branch;
+    while let TokenBranch::Set(branches) = current {
+        match branches.as_slice() {
+            [only @ TokenBranch::Path(name, _)] if *name != "self" => current = only,
+            _ => break,
+        }
+    }
+    current
+}
+
 /// The order key for one import path — brace sets are sorted internally so equal
-/// paths, whatever their source branch order, produce equal keys.
+/// paths, whatever their source branch order, produce equal keys, and a
+/// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
-    match branch {
+    match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, None) => {
             BranchKey::Path((*name).to_string(), Box::new(BranchKey::End))
         }
@@ -215,9 +236,11 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
 }
 
 /// The canonical sort key for an import/use of `kind` importing `branch`:
-/// root-namespace rank first, then the path after the root.
+/// root-namespace rank first, then the path after the root. A one-member set
+/// ranks as its member ([`unwrap_singleton_set`]), so `import { a };` and its
+/// collapsed reprint `import a;` land in the same place.
 fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey {
-    let (root, rest) = match branch {
+    let (root, rest) = match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, child) => {
             let root = match *name {
                 "std" => RootRank::Std,
@@ -355,9 +378,12 @@ fn parse_import_statement<'src>(
     Some((kind, export, branch, next + 1))
 }
 
-/// Appends the canonical token form of an import path, brace sets sorted.
+/// Appends the canonical token form of an import path, brace sets sorted and a
+/// one-member set collapsed to its member ([`unwrap_singleton_set`], mirroring
+/// `print_import_branch` — kolt.local 005): the safety net must reduce the
+/// braced source and the collapsed reprint to the same canonical tokens.
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
-    match branch {
+    match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, child) => {
             out.push(Token::Ident(name));
             if let Some(child) = child {
@@ -1631,6 +1657,21 @@ impl<'src> Printer<'src> {
                 let inside_comment = self
                     .import_set_extent(&member_spans)
                     .is_some_and(|extent| self.comment_outside_elements(extent, &member_spans));
+                // A one-member set has a canonical unbraced spelling — `a::{ b }`
+                // IS `a::b` — so the braces collapse (kolt.local 005), recursively
+                // (`a::{ b::{ c } }` reaches `a::b::c`). Two exceptions keep the
+                // braces: `self`, which re-binds the namespace it sits in and only
+                // means that inside braces (`Option::{ self }` publishes
+                // `Option`), and a comment inside them, which is anchored to the
+                // set's split form. `emit_branch_tokens` mirrors this collapse so
+                // the safety net reduces both spellings to the same tokens.
+                if let [only] = order.as_slice() {
+                    if !inside_comment && !matches!(only, ImportBranch::Path("self", ..)) {
+                        self.split = split;
+                        self.print_import_branch(only, sort);
+                        return;
+                    }
+                }
                 if !order.is_empty() && (split != Split::Off || inside_comment) {
                     let open = self
                         .import_set_extent(&member_spans)
@@ -5850,6 +5891,76 @@ mod import_set_layout {
         );
     }
 
+    /// A one-member set has a canonical unbraced spelling (kolt.local 005):
+    /// `a::{ b }` IS `a::b`, so the braces collapse — and recursively, so a
+    /// chain of one-member sets reaches the plain path.
+    #[test]
+    fn a_one_member_set_collapses_to_the_unbraced_spelling() {
+        assert_construct("import std::json::Json;\n", "import std::json::Json;\n");
+        assert_construct("import std::json::{ Json };\n", "import std::json::Json;\n");
+        // A trailing comma changes nothing: it is trivia, not a second member.
+        assert_construct(
+            "import std::json::{ Json, };\n",
+            "import std::json::Json;\n",
+        );
+        // Recursion, both shapes: a one-member set around a multi-member set
+        // collapses to the inner set, and a chain of one-member sets collapses
+        // all the way down to the plain path.
+        assert_construct(
+            "import std::{ json::{ Decode, Encode } };\n",
+            "import std::json::{ Decode, Encode };\n",
+        );
+        assert_construct(
+            "import std::{ json::{ Json } };\n",
+            "import std::json::Json;\n",
+        );
+        // `use` shares the canonical form.
+        assert_construct(
+            "use pkg::shapes::{ Circle };\n",
+            "use pkg::shapes::Circle;\n",
+        );
+        // The run-order interaction `unwrap_singleton_set` exists for: the
+        // braced spelling must RANK where its collapsed form does
+        // (`BranchKey::Set` orders after `Path`), or the reprint orders the
+        // run differently than the net's canonicalization of the source and
+        // the whole file silently bails — the corpus's async-promise-all.vl
+        // shape, caught by exactly that bail.
+        assert_construct(
+            "import std::{ print };\nimport std::task::Task;\n",
+            "import std::print;\nimport std::task::Task;\n",
+        );
+    }
+
+    /// The exception: `self` re-binds the namespace it sits in and only means
+    /// that inside braces (`Option::{ self }` publishes `Option`) — there is no
+    /// unbraced spelling to collapse to, so a lone `self` keeps its braces.
+    #[test]
+    fn a_lone_self_keeps_its_braces() {
+        assert_construct(
+            "import std::option::Option::{ self };\n",
+            "import std::option::Option::{ self };\n",
+        );
+        assert_construct(
+            "import std::option::Option::{ self, };\n",
+            "import std::option::Option::{ self };\n",
+        );
+    }
+
+    /// The organize path rides the same printer, so pruning a set down to one
+    /// member renders the unbraced spelling too — Organize Imports can never
+    /// regenerate the braced form `fmt` collapses.
+    #[test]
+    fn organize_prunes_a_set_down_to_the_unbraced_spelling() {
+        assert_eq!(
+            organize("import std::rpc::{ Dispatcher, call };\n", &["call"]),
+            "import std::rpc::Dispatcher;\n"
+        );
+        assert_eq!(
+            organize("import std::json::{ Json };\n", &[]),
+            format("import std::json::{ Json };\n")
+        );
+    }
+
     /// The boundary: `import p::{ …, X };` is 18 columns around the padded name,
     /// so an 82-character name makes exactly the budget and 83 makes 101.
     #[test]
@@ -7089,13 +7200,14 @@ mod organize {
         );
     }
 
-    // A dead brace-set branch shrinks the set (`{ a, b }` → `{ a }`); the whole
-    // import survives because a live branch remains.
+    // A dead brace-set branch shrinks the set — down to the unbraced spelling
+    // when one member remains (`{ alpha, beta }` → `alpha`, kolt.local 005); the
+    // whole import survives because a live branch remains.
     #[test]
     fn a_dead_branch_shrinks_its_set() {
         assert_eq!(
             organize("import std::x::{ alpha, beta };\n", &["beta"]),
-            "import std::x::{ alpha };\n",
+            "import std::x::alpha;\n",
         );
         // The middle of three goes, leaving the two live ones in canonical order.
         assert_eq!(
@@ -7170,7 +7282,7 @@ mod organize {
     }
 
     // Sort and prune compose: the run reorders and the dead leaf disappears in one
-    // edit.
+    // edit — and the surviving one-member set renders unbraced.
     #[test]
     fn sort_and_prune_compose() {
         assert_eq!(
@@ -7178,7 +7290,7 @@ mod organize {
                 "import std::z;\nimport std::a::{ keep, drop };\n",
                 &["drop"],
             ),
-            "import std::a::{ keep };\nimport std::z;\n",
+            "import std::a::keep;\nimport std::z;\n",
         );
     }
 
