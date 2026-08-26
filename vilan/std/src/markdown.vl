@@ -172,11 +172,7 @@ fun same_char_line(trimmed: str, code: u32, minimum: i32, allow_spaces: bool): b
 /// A line that would be a setext underline or a thematic break — both outside
 /// the census grammar, both refused loudly by the block parser.
 fun is_rule_like(trimmed: str): bool {
-	same_char_line(trimmed, 45, 2, false)
-		|| same_char_line(trimmed, 45, 3, true)
-		|| same_char_line(trimmed, 61, 1, false)
-		|| same_char_line(trimmed, 42, 3, true)
-		|| same_char_line(trimmed, 95, 3, true)
+	same_char_line(trimmed, 45, 2, false) || same_char_line(trimmed, 45, 3, true) || same_char_line(trimmed, 61, 1, false) || same_char_line(trimmed, 42, 3, true) || same_char_line(trimmed, 95, 3, true)
 }
 
 // --- ATX headings ------------------------------------------------------------
@@ -254,14 +250,7 @@ fun is_ordered_item(trimmed: str): bool {
 /// Whether `line` opens a new block structure — what ends a paragraph.
 fun starts_structure(line: str): bool {
 	let trimmed = line.trim();
-	trimmed.is_empty()
-		|| trimmed.starts_with("```")
-		|| trimmed.starts_with("~~~")
-		|| heading_level(trimmed) > 0
-		|| is_rule_like(trimmed)
-		|| trimmed.starts_with(">")
-		|| list_item_content_offset(trimmed) > 0
-		|| trimmed.starts_with("|")
+	trimmed.is_empty() || trimmed.starts_with("```") || trimmed.starts_with("~~~") || heading_level(trimmed) > 0 || is_rule_like(trimmed) || trimmed.starts_with(">") || list_item_content_offset(trimmed) > 0 || trimmed.starts_with("|")
 }
 
 /// Whether `line` closes a fence opened at `indent`: the docs gate's rule —
@@ -290,13 +279,9 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 			for i + run < n && text.code_at(i + run) == 96 {
 				run += 1;
 			}
-			// (A bool flag, not `close is None`, in the loop condition: an
-			// `is` test there reads a stale copy of the subject — reported
-			// as a transformer finding with this build.)
 			mut close: Option<i32> = None;
 			mut cursor = i + run;
-			mut searching = true;
-			for searching && cursor < n {
+			for close is None && cursor < n {
 				if text.code_at(cursor) == 96 {
 					mut closing = 1;
 					for cursor + closing < n && text.code_at(cursor + closing) == 96 {
@@ -304,7 +289,6 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 					}
 					if closing == run {
 						close = Some(cursor);
-						searching = false;
 					} else {
 						cursor += closing;
 					}
@@ -368,10 +352,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 			}
 		} else if c == 95 {
 			// `_emphasis_`, only at a word boundary (never inside snake_case).
-			let open_ok = (i == 0 || !is_word_code(text.code_at(i - 1)))
-				&& i + 1 < n
-				&& text.code_at(i + 1) != 32
-				&& text.code_at(i + 1) != 9;
+			let open_ok = (i == 0 || !is_word_code(text.code_at(i - 1))) && i + 1 < n && text.code_at(i + 1) != 32 && text.code_at(i + 1) != 9;
 			mut close: Option<i32> = None;
 			if open_ok {
 				mut probe = index_of(text, "_", i + 1);
@@ -465,8 +446,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 				let escaped = text.substring(i + 1, i + 2);
 				ret Err(ParseError {
 					line = line,
-					message = "a backslash escape (\\" + escaped
-						+ ") — the census grammar's only escape is \\| inside a table cell",
+					message = "a backslash escape (\\" + escaped + ") — the census grammar's only escape is \\| inside a table cell",
 				});
 			}
 			i += 1;
@@ -495,8 +475,7 @@ fun parse_inline(text: str, line: i32): Result<List<Inline>, ParseError> {
 					} else if is_tag_shape(inner) {
 						ret Err(ParseError {
 							line = line,
-							message = "a raw HTML tag (<" + inner
-								+ ">) — the census grammar's only HTML passthrough is <a id=\"…\"></a>; wrap literal <…> text (a generic like List<T>) in backticks",
+							message = "a raw HTML tag (<" + inner + ">) — the census grammar's only HTML passthrough is <a id=\"…\"></a>; wrap literal <…> text (a generic like List<T>) in backticks",
 						});
 					} else {
 						i += 1;
@@ -532,9 +511,7 @@ fun is_tag_shape(inner: str): bool {
 	if (first >= 97 && first <= 122) || (first >= 65 && first <= 90) {
 		ret true;
 	}
-	first == 47 && n >= 2
-		&& ((inner.code_at(1) >= 97 && inner.code_at(1) <= 122)
-			|| (inner.code_at(1) >= 65 && inner.code_at(1) <= 90))
+	first == 47 && n >= 2 && ((inner.code_at(1) >= 97 && inner.code_at(1) <= 122) || (inner.code_at(1) >= 65 && inner.code_at(1) <= 90))
 }
 
 // --- the heading-id algorithm (mdBook v0.5.4, pinned — §3) -------------------
@@ -584,9 +561,7 @@ fun entity_length(text: str, i: i32): i32 {
 /// The whitespace set mdBook hyphenates (Rust `char::is_whitespace`, the
 /// forms a single line can carry).
 fun is_slug_whitespace(c: u32): bool {
-	c == 32 || c == 9 || c == 133 || c == 160 || c == 5760
-		|| (c >= 8192 && c <= 8202) || c == 8232 || c == 8233 || c == 8239
-		|| c == 8287 || c == 12288
+	c == 32 || c == 9 || c == 133 || c == 160 || c == 5760 || (c >= 8192 && c <= 8202) || c == 8232 || c == 8233 || c == 8239 || c == 8287 || c == 12288
 }
 
 /// The curated non-ASCII drop set: the punctuation and symbol planes prose
@@ -599,24 +574,20 @@ fun is_dropped_symbol(c: u32): bool {
 	// C1 controls; Latin-1 punctuation (¡ § « ­ ° · » ¿ …) minus its
 	// alphanumerics (ª ² ³ µ ¹ º ¼ ½ ¾); × ÷.
 	if c >= 128 && c <= 191 {
-		ret !(c == 170 || c == 178 || c == 179 || c == 181 || c == 185
-			|| c == 186 || c == 188 || c == 189 || c == 190);
+		ret !(c == 170 || c == 178 || c == 179 || c == 181 || c == 185 || c == 186 || c == 188 || c == 189 || c == 190);
 	}
-	c == 215 || c == 247
-		// General punctuation (– — ‘ ’ “ ” † ‡ • … ′ ″) and format controls;
-		// the whitespace part is handled by `is_slug_whitespace` first.
-		|| (c >= 8203 && c <= 8231) || (c >= 8240 && c <= 8286) || (c >= 8288 && c <= 8303)
-		// Currency, ™, arrows, math, technical, box drawing, geometry,
-		// symbols, dingbats.
-		|| (c >= 8352 && c <= 8399) || c == 8482 || (c >= 8592 && c <= 11263)
-		// Supplemental punctuation; CJK punctuation.
-		|| (c >= 11776 && c <= 11903) || (c >= 12289 && c <= 12351)
-		// Surrogates: non-BMP dropped (see the header contract).
-		|| (c >= 55296 && c <= 57343)
-		// Vertical/compat forms, small forms; fullwidth punctuation.
-		|| (c >= 65040 && c <= 65135) || (c >= 65281 && c <= 65295)
-		|| (c >= 65306 && c <= 65312) || (c >= 65339 && c <= 65344)
-		|| (c >= 65371 && c <= 65381)
+	c == 215 || c == 247 || (c >= 8203 && c <= 8231) || (c >= 8240 && c <= 8286) || (c >= 8288 && c <= 8303) || (c >= 8352 && c <= 8399) || c == 8482 || (c >= 8592 && c <= 11263) || (c >= 11776 && c <= 11903) || (c >= 12289 && c <= 12351) || (c >= 55296 && c <= 57343) || (c >= 65040 && c <= 65135) || (c >= 65281 && c <= 65295) || (c >= 65306 && c <= 65312) || (c >= 65339 && c <= 65344) || (c >= 65371 && c <= 65381)
+	// General punctuation (– — ‘ ’ “ ” † ‡ • … ′ ″) and format controls;
+	// the whitespace part is handled by `is_slug_whitespace` first.
+
+	// Currency, ™, arrows, math, technical, box drawing, geometry,
+	// symbols, dingbats.
+
+	// Supplemental punctuation; CJK punctuation.
+
+	// Surrogates: non-BMP dropped (see the header contract).
+
+	// Vertical/compat forms, small forms; fullwidth punctuation.
 }
 
 /// The mdBook v0.5.4 id of a heading's content, dedupe-free — the §3 base
@@ -933,11 +904,7 @@ fun parse_blocks(lines: List<str>, first_line: i32): Result<List<Block>, ParseEr
 					}
 				}
 				items.push(parse_blocks(body, item_first)!);
-				more = i < count
-					&& !is_blank(lines[i])
-					&& list_item_content_offset(lines[i].trim()) > 0
-					&& leading_spaces(lines[i]) <= 1
-					&& is_ordered_item(lines[i].trim()) == ordered;
+				more = i < count && !is_blank(lines[i]) && list_item_content_offset(lines[i].trim()) > 0 && leading_spaces(lines[i]) <= 1 && is_ordered_item(lines[i].trim()) == ordered;
 			}
 			blocks.push(Block::Items(ordered, items));
 		} else if trimmed.starts_with("|") && i + 1 < count && is_delimiter_row(lines[i + 1]) {
