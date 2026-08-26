@@ -1351,6 +1351,19 @@ impl BuildHooks {
     /// hook's output (and its TTY colors) reach the terminal as if run by hand;
     /// under `vilan build --stdout` that means a chatty hook shares the JS
     /// stream — redirect it in the command if that matters.
+    ///
+    /// The trust model is deliberate and **first-party** (E96, ruled
+    /// 2026-08-26; `proposal/build-trust.md`): a hook is code the developer
+    /// wrote in their own manifest, so it runs with their privileges and
+    /// environment — no sandbox, no allowlist, no timeout, no consent prompt —
+    /// the same trust `cargo build` and `npm run` already take. The echo below
+    /// is the whole honesty budget: the terminal always names what ran. A
+    /// first-run consent gate was proposed and **declined**; don't add one.
+    /// Only the addressed manifest contributes hooks ([`Project::hooks`]) — a
+    /// dependency's `[build] run` is never reached, which is what keeps this
+    /// tier first-party. When dependencies *can* carry hooks (kolt.local 027's
+    /// `vilan install`, the registry), that is the other tier: it does not run
+    /// by default and needs an explicit per-dependency opt-in in the manifest.
     fn run(&self) -> Result<(), String> {
         for command in &self.commands {
             eprintln!("{} {command}", paint::err(paint::Style::CYAN, "Running"));

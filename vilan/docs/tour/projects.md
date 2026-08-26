@@ -36,9 +36,11 @@ other name; the library it points at keeps its own.
 
 ## Pre-build commands and `default-entry`
 
-Two more keys matter once a project grows. `[build] run` names a
-command (or a list of them) to run before each build and each `--watch`
-round: an asset pipeline, a codegen sidecar. And
+Two more keys matter once a project grows. `[build] run` is a command
+line (or a list of them) for your shell, run before each build and each
+`--watch` round: an asset pipeline, a codegen sidecar. It runs with your
+privileges and Vilan doesn't prompt — the manifest is yours, and this is
+the trust `cargo build` and `npm run` already take. And
 `default-entry` names the entry `vilan run` should drive when a package
 has several. Both are covered in [the dev loop](../guide/dev-loop.md).
 
