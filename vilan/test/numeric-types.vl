@@ -3,10 +3,10 @@
 // truncating integer division, and explicit value-converting `as_*`
 // conversions (Rust-`as` semantics: truncate toward zero, fold two's-
 // complement into the target's width).
-import std::print;
 import std::debug::Debug;
 import std::json::Json;
 import std::operators::Div;
+import std::print;
 
 [derive(Json)]
 struct Packet {
@@ -66,6 +66,25 @@ fun main() {
 	print(doubled);
 	print(100i53 * 3i53);
 	print(5u16 < 6u16);
+
+	// Every integer type's bounds. The niladic-function spelling is the
+	// stopgap for `i32::MAX` — there is no associated-const mechanism to hang
+	// one on yet — and reports the TYPE's range, which is looser by one than
+	// the literal check on the signed side (`128i8` compiles, max is 127).
+	print(i8::max_value());
+	print(i8::min_value());
+	print(u8::max_value());
+	print(u8::min_value());
+	print(i16::max_value());
+	print(i16::min_value());
+	print(u16::max_value());
+	print(i32::max_value());
+	print(i32::min_value());
+	print(u32::max_value());
+	print(i53::max_value());
+	print(i53::min_value());
+	print(u53::max_value());
+	print(u53::min_value());
 
 	// The family carries Debug and Json like every scalar.
 	print(200u8.debug());

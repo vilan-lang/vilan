@@ -17921,6 +17921,150 @@ fn an_expected_type_literal_is_range_checked() {
     );
 }
 
+// --- Type bounds: `max_value()` / `min_value()` ---
+//
+// The niladic-function stopgap for `i32::MAX` (vilan has no associated-const
+// mechanism for one to hang on). A hand-transcribed bounds table is worth only
+// what cross-checks it, so the pins come in three layers: the sixteen values
+// spelled out, each value equal to the literal the compiler admits for that
+// type, and the analyzer's own out-of-range diagnostic naming the same two
+// numbers back.
+
+#[test]
+fn type_bounds_are_the_documented_per_type_ranges() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            print(i8::max_value());
+            print(i8::min_value());
+            print(u8::max_value());
+            print(u8::min_value());
+            print(i16::max_value());
+            print(i16::min_value());
+            print(u16::max_value());
+            print(u16::min_value());
+            print(i32::max_value());
+            print(i32::min_value());
+            print(u32::max_value());
+            print(u32::min_value());
+            print(i53::max_value());
+            print(i53::min_value());
+            print(u53::max_value());
+            print(u53::min_value());
+        }
+        main();
+        "#,
+        "127\n-128\n255\n0\n32767\n-32768\n65535\n0\n2147483647\n-2147483648\n\
+         4294967295\n0\n9007199254740992\n-9007199254740992\n9007199254740992\n0\n",
+    );
+}
+
+// Each bound is exactly the literal the compiler admits for that type — the
+// pin that makes the table trustworthy rather than merely transcribed.
+#[test]
+fn type_bounds_equal_the_literals_the_compiler_admits() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            print(i8::max_value() == 127i8);
+            print(i8::min_value() == -128i8);
+            print(u8::max_value() == 255u8);
+            print(u8::min_value() == 0u8);
+            print(i16::max_value() == 32767i16);
+            print(i16::min_value() == -32768i16);
+            print(u16::max_value() == 65535u16);
+            print(u16::min_value() == 0u16);
+            print(i32::max_value() == 2147483647i32);
+            print(i32::min_value() == -2147483648i32);
+            print(u32::max_value() == 4294967295u32);
+            print(u32::min_value() == 0u32);
+            print(i53::max_value() == 9007199254740992i53);
+            print(i53::min_value() == -9007199254740992i53);
+            print(u53::max_value() == 9007199254740992u53);
+            print(u53::min_value() == 0u53);
+        }
+        main();
+        "#,
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n\
+         true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+// The other direction: the analyzer's rendered range must read exactly
+// `min_value() ..= max_value()`. If a bound in `number.vl` and the `BOUNDS`
+// table in the analyzer ever drift apart, one of these two goes red.
+#[test]
+fn the_out_of_range_diagnostic_names_the_shipped_bounds() {
+    assert_fails_spanning(
+        "fun main() { let x = 129i8; }\nmain();\n",
+        "129i8",
+        "out of range for `i8` (-128 ..= 127)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 256u8; }\nmain();\n",
+        "256u8",
+        "out of range for `u8` (0 ..= 255)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 32769i16; }\nmain();\n",
+        "32769i16",
+        "out of range for `i16` (-32768 ..= 32767)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 65536u16; }\nmain();\n",
+        "65536u16",
+        "out of range for `u16` (0 ..= 65535)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 2147483649i32; }\nmain();\n",
+        "2147483649i32",
+        "out of range for `i32` (-2147483648 ..= 2147483647)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 4294967296u32; }\nmain();\n",
+        "4294967296u32",
+        "out of range for `u32` (0 ..= 4294967295)",
+    );
+}
+
+// The wide pair's window is the symmetric ±2^53 (spec/lexical.md), so one past
+// `u53::max_value()` is refused. `i53`'s counterpart is
+// `an_i53_literal_beyond_the_f64_window_errors` above.
+#[test]
+fn a_u53_literal_past_the_window_errors() {
+    assert_fails_spanning(
+        "fun main() { let x = 9007199254740993u53; }\nmain();\n",
+        "9007199254740993u53",
+        "use `BigInt` for larger values",
+    );
+}
+
+// The signed literal check admits the MAGNITUDE `2^(n-1)` so that the minimum
+// can be written as unary minus over a literal (`-128i8`) — numeric-types.md
+// §3's documented looseness. So `128i8` compiles while exceeding the type's
+// maximum: `max_value()` is the TYPE's bound, deliberately not "the largest
+// literal that compiles". Pinned so the pair is never "corrected" to match.
+#[test]
+fn the_signed_literal_looseness_reaches_one_past_max_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            print(128i8 > i8::max_value());
+            print(32768i16 > i16::max_value());
+            print(2147483648i32 > i32::max_value());
+        }
+        main();
+        "#,
+        "true\ntrue\ntrue\n",
+    );
+}
+
 // Integer division truncates toward zero (numeric-types.md §2) — both signs,
 // every width, the compound form, and generic `T: Div` dispatch; float and
 // BigInt division are untouched.

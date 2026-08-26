@@ -16,7 +16,8 @@ and random values (`std::random`). Literal syntax and conversion semantics:
 
 `i53`/`u53` are the **wide** integers, named for the precision they
 actually deliver: they are f64-backed on the JS backend, and every value
-in ±2^53 (JavaScript's safe-integer window) is exact. There is no `i64`:
+in ±2^53 (f64's exact-integer window, one past JavaScript's
+`Number.MAX_SAFE_INTEGER`) is exact. There is no `i64`:
 a type that silently loses precision past 2^53 would be lying about its
 width; for bigger integers use `BigInt`.
 
@@ -26,6 +27,51 @@ toward zero. No implicit width coercion; convert with `as_*`. Arithmetic
 that overflows a type's range is **undefined behavior**
 (spec [§7.2a](../spec/execution.md)): on JS it manifests as f64
 artifacts; a checked `add_safe` family is recorded future work.
+
+Because overflow is undefined, the boundary values have to be *askable*.
+Every integer type carries its two bounds as niladic functions:
+
+```vilan
+import std::print;
+
+fun main() {
+	print(i32::max_value());   // 2147483647
+	print(i32::min_value());   // -2147483648
+	print(u8::max_value());    // 255
+	print(i53::min_value());   // -9007199254740992
+}
+```
+
+| type | `min_value()` | `max_value()` |
+|---|---|---|
+| `i8` | `-128` | `127` |
+| `u8` | `0` | `255` |
+| `i16` | `-32768` | `32767` |
+| `u16` | `0` | `65535` |
+| `i32` | `-2147483648` | `2147483647` |
+| `u32` | `0` | `4294967295` |
+| `i53` | `-9007199254740992` | `9007199254740992` |
+| `u53` | `0` | `9007199254740992` |
+
+**This spelling is a stopgap.** vilan has no associated constants — there is
+no static-member mechanism for `i32::MAX` to hang on — so the bounds ship as
+functions rather than wait for that design. When it lands they become
+`i32::MAX`/`i32::MIN` and this pair enters a `[deprecated("steer")]` window
+that rewrites callers. The rename is scheduled, not a surprise: reach for
+`max_value()`/`min_value()` freely today.
+
+The pair reports the **type's** range, which is deliberately not the range of
+literals the compiler admits: `128i8` compiles, because the signed literal
+check tests the magnitude so that `-128i8` can be written at all, yet
+`i8::max_value()` is `127`. Trust the functions over the looseness.
+
+Floats have no pair, for two reasons that are worth stating rather than
+guessing at. `f64`'s finite bounds cannot be written as vilan literals at all
+— there is no exponent syntax, so `1.7976931348623157e308` is a parse error —
+and `min_value()` would have to silently pick between the most-negative finite
+(Rust's `f64::MIN`) and the smallest positive normal (C's `DBL_MIN`). That is
+a choice the eventual `f64::MIN` should make deliberately, not one this
+stopgap should prejudge. `BigInt` has no bounds by construction.
 
 ## Methods
 
