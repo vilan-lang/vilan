@@ -20,6 +20,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 <!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 
+---
+
+<!-- family: miscompile -->
+**An `is` test in a loop condition now reads its subject each iteration.** The transformer hoisted the condition's subject temp (`const $a = subject;`) into the enclosing block, before the `while` — one evaluation for the whole loop — so a body reassignment never reached the test: `for (found is None) && cursor < 3 { found = Some(cursor); … }` ran all three iterations where one is correct, and without the bounding conjunct the loop never ended, which is how it surfaced (the markdown spike port hung). `vilan check` was clean; the defect was codegen, live in released toolchains through v0.36.0. A loop condition that needs statements — an `is` subject temp and its materialized captures above all — now compiles to `while (true) { <prelude> if (!cond) break; <body> }`: the prelude re-runs per evaluation, each evaluation still reads its subject exactly once, and `jump continue` re-enters at the prelude; a statement-free condition emits byte-identically to before, and `if` position was never affected. `std::markdown`'s `parse_inline` drops the bool-flag workaround it shipped with. (`proposal/markdown.md` §10.7's finding, B136; pinned per loop form — the repro, the unbounded and `jump break` forms, nested loops, a condition binding, two tests in one condition, and a `Result` variant, beside the `if`-position control and a release-preset twin.)
+
 ## v0.36.0 — 2026-08-24
 
 <!-- family: breaking -->
