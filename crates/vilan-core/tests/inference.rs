@@ -8483,6 +8483,98 @@ fn operator_monomorphizes_on_generic_aggregate() {
 }
 
 #[test]
+fn b135_operator_at_all_native_binding_monomorphizes_an_explicit_eq_body() {
+    // B135, the OPERATOR half of B127's family: a conditional impl whose body
+    // calls the trait method EXPLICITLY, invoked through `==`/`!=` at an
+    // all-native binding. The operator path used to skip monomorphization
+    // for all-native bindings (assuming the body uses only operators on `T`,
+    // which lower native), so the explicit `.eq()` fell through to
+    // `PartialEq`'s bodyless requirement and tripped the emitter's
+    // never-silent check. The body REQUIRES the substitution, so the
+    // emission specializes.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T: PartialEq> with PartialEq {
+            fun eq(self, b: Pair<T>): bool {
+                self.a.eq(b.a) && self.b.eq(b.b)
+            }
+        }
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 9, b = 9 };
+            if x == y { print("xy-eq") } else { print("xy-neq") }
+            if x == z { print("xz-eq") } else { print("xz-neq") }
+            if x != z { print("xz-ne") } else { print("xz-not-ne") }
+        }
+        "#,
+        "xy-eq\nxz-neq\nxz-ne\n",
+    );
+}
+
+#[test]
+fn b135_operator_reaches_the_requirement_through_a_generic_helper() {
+    // The transitive shape: the operator body itself calls no requirement —
+    // a generic HELPER it calls does. The specialize-or-not decision walks
+    // the call graph, so the helper's `.eq()` still forces the instance.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::print;
+        struct Pair<T> { a: T, b: T }
+        fun both_equal<E: PartialEq>(p: E, q: E, r: E, s: E): bool {
+            p.eq(q) && r.eq(s)
+        }
+        impl Pair<type T: PartialEq> with PartialEq {
+            fun eq(self, b: Pair<T>): bool {
+                both_equal(self.a, b.a, self.b, b.b)
+            }
+        }
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 9, b = 9 };
+            if x == y { print("xy-eq") } else { print("xy-neq") }
+            if x == z { print("xz-eq") } else { print("xz-neq") }
+        }
+        "#,
+        "xy-eq\nxz-neq\n",
+    );
+}
+
+#[test]
+fn b135_operator_reaches_the_requirement_through_a_closure() {
+    // The closure shape: the requirement call hides inside a closure the
+    // body creates and calls through a variable — an `Indirect` edge in the
+    // call graph. The decision walks a node's LEXICAL closures too, so the
+    // hidden `.eq()` still forces the instance.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T: PartialEq> with PartialEq {
+            fun eq(self, b: Pair<T>): bool {
+                let check = |x: T, y: T| x.eq(y);
+                check(self.a, b.a) && check(self.b, b.b)
+            }
+        }
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 9, b = 9 };
+            if x == y { print("xy-eq") } else { print("xy-neq") }
+            if x == z { print("xz-eq") } else { print("xz-neq") }
+        }
+        "#,
+        "xy-eq\nxz-neq\n",
+    );
+}
+
+#[test]
 fn single_level_container_from_json_roundtrip_runs() {
     // A single-level `List<i32>` decode: `from_json` calls `from_json_value`, whose
     // element type comes only from the enclosing `List<i32>` instantiation — the

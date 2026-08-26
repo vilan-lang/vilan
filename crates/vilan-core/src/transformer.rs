@@ -2,6 +2,7 @@ use crate::analyzer::{
     BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
     Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
+use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -1483,6 +1484,12 @@ struct Transformer<'src> {
     // result is a runtime `TypeError`. Collected here and turned into a hard
     // compile error at assembly, so the class cannot recur silently.
     bodyless_emissions: Vec<Id>,
+    // B135: memo for `reaches_bare_requirement` — whether a function's body,
+    // transitively through the program call graph, contains a dispatch that
+    // would fall through to a bodyless trait requirement if emitted without a
+    // substitution. Keyed by the queried root only (the walk's per-query
+    // visited set keeps cycles finite without poisoning other roots).
+    bare_requirement_memo: HashMap<Id, bool>,
     // Never-silent guard (B68, affine-moves.md §9.4): `drop(x)` sink calls whose
     // argument type did not resolve at the rewrite. Such a call lowers to the
     // bare argument — indistinguishable from the legitimate data no-op — so a
@@ -1705,6 +1712,7 @@ impl<'src> Transformer<'src> {
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
+            bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
             chunk_members: HashMap::default(),
             chunk_count: 0,
@@ -3804,16 +3812,22 @@ impl<'src> Transformer<'src> {
                 // An overloaded operator (`a + b` where `a`'s type implements
                 // `Add`) compiles to the trait method call `add(a, b)`. On a generic
                 // receiver (`Option<Point> ==`) the method is monomorphized against
-                // the recorded type-arg substitution so its body specializes.
+                // the recorded type-arg substitution so its body specializes — when
+                // the site requires it (`operator_instance_required`, B135): an
+                // all-native binding whose body needs no substitution keeps the
+                // shared generic emission.
                 if let Some(&method_id) = self.program.binary_op_dispatch.get(&id) {
-                    let name = if let Some(substitution) =
-                        self.program.method_call_substitution.get(&id)
-                    {
-                        let substitution = substitution.clone();
-                        self.emit_instance(method_id, &substitution)
-                    } else {
-                        self.ensure_function_emitted(method_id);
-                        self.ng.name_for(method_id)
+                    let substitution = self.program.method_call_substitution.get(&id).cloned();
+                    let name = match substitution {
+                        Some(substitution)
+                            if self.operator_instance_required(method_id, &substitution) =>
+                        {
+                            self.emit_instance(method_id, &substitution)
+                        }
+                        _ => {
+                            self.ensure_function_emitted(method_id);
+                            self.ng.name_for(method_id)
+                        }
                     };
                     let call = js::Node::Call(Box::new(js::Node::Local(name)), vec![lhs, rhs]);
                     // `a != b` dispatches to `eq` and negates — the impl provides
@@ -7262,6 +7276,106 @@ impl<'src> Transformer<'src> {
                         .is_some_and(|enum_| enum_.backing.is_some())
             }
             _ => false,
+        }
+    }
+
+    /// Whether the operator method at this site must be EMITTED AS AN
+    /// INSTANCE against `substitution`, or may share the generic emission
+    /// (B135). A non-native binding always specializes — the body's element
+    /// comparisons must dispatch to the bound type's own impls. An all-native
+    /// binding shares the generic emission (its operators on `T` lower to
+    /// native JS — the std `Option`/`Result`/`List` idiom, and the shape the
+    /// corpus goldens pin) UNLESS the body transitively contains a call that
+    /// needs the substitution to resolve at all — an explicit `.eq()` on a
+    /// `T`-typed value, which absent a substitution falls through to the
+    /// trait's bodyless requirement and trips the never-silent check.
+    fn operator_instance_required(
+        &mut self,
+        method_id: Id,
+        substitution: &HashMap<TypeId, TypeId>,
+    ) -> bool {
+        for &bound in substitution.values() {
+            let resolved = self.resolve_type_id(bound);
+            if !self.compares_natively(resolved) {
+                return true;
+            }
+        }
+        self.reaches_bare_requirement(method_id)
+    }
+
+    /// Whether `function_id`'s body — transitively, through the calls and
+    /// lexical closures the program's call graph records — contains a
+    /// dispatch that, emitted WITHOUT a substitution, falls through to a
+    /// BODYLESS trait requirement (`assemble`'s never-silent ICE, B135).
+    /// The walk follows resolved calls into their bodies, descends into
+    /// every lexical closure (a hidden `.eq()` in a closure invoked through
+    /// a variable still counts — its call edge is `Indirect`), treats a
+    /// dispatch falling back to a trait DEFAULT body as a walk into that
+    /// body, and stops at externs and variant constructors. Operator uses of
+    /// `T` contribute nothing here — a binary expression records no call
+    /// edge, which is exactly what lets an operator-only body keep the
+    /// generic emission. Memoized per queried root; the per-query visited
+    /// set keeps cycles finite without poisoning other roots' answers.
+    fn reaches_bare_requirement(&mut self, function_id: Id) -> bool {
+        if let Some(&known) = self.bare_requirement_memo.get(&function_id) {
+            return known;
+        }
+        let program = self.program;
+        let graph = program.call_graph();
+        let mut visited: HashSet<Id> = HashSet::default();
+        let mut stack = vec![function_id];
+        let mut reaches = false;
+        'walk: while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(children) = graph.closure_children_of(node) {
+                stack.extend(children.iter().copied());
+            }
+            for call in graph.calls_of(node) {
+                match call.target {
+                    CallTarget::Function(callee) | CallTarget::Closure(callee) => {
+                        stack.push(callee);
+                    }
+                    CallTarget::External(_) | CallTarget::Variant(_) => {}
+                    // A call through a function/closure VALUE resolves to
+                    // whatever the value holds — never to a requirement.
+                    CallTarget::Indirect(IndirectReason::Value) => {}
+                    CallTarget::Indirect(
+                        IndirectReason::GenericMember | IndirectReason::TraitDispatch,
+                    ) => {
+                        let Some(fallback) = self.dispatch_fallback(call.call_id) else {
+                            continue;
+                        };
+                        if program
+                            .functions
+                            .get(&fallback)
+                            .is_some_and(|function| !function.has_body)
+                        {
+                            reaches = true;
+                            break 'walk;
+                        }
+                        stack.push(fallback);
+                    }
+                }
+            }
+        }
+        self.bare_requirement_memo.insert(function_id, reaches);
+        reaches
+    }
+
+    /// The function a dispatch-carrying call site emits when NO substitution
+    /// resolves it: a `for` loop's recorded `next`, or the `Expr::Local`
+    /// target its subject names — for `x.eq(y)` on a `T`-bounded receiver,
+    /// the trait's requirement itself.
+    fn dispatch_fallback(&self, call_id: Id) -> Option<Id> {
+        if let Some(&next_id) = self.program.for_each_next.get(&call_id) {
+            return Some(next_id);
+        }
+        let function_call = self.program.function_calls.get(&call_id)?;
+        match self.program.entity_map.get(&function_call.subject_id) {
+            Some(Expr::Local(target_id)) => Some(*target_id),
+            _ => None,
         }
     }
 

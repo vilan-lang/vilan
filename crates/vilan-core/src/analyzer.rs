@@ -31248,23 +31248,23 @@ impl<'src> Analyzer<'src> {
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {
                 self.binary_op_dispatch.insert(binary_id, method_id);
-                // Monomorphize the operator method against the operand's type args
-                // (`Option<Point> ==` binds the impl's `Option<T>` to `T = Point`) so
-                // a generic element comparison inside the body — e.g. `Option<T>::eq`'s
-                // `x == y` — dispatches to the concrete impl. Only needed when a bound
-                // type is a non-native aggregate; for all-native bindings (e.g.
-                // `Option<i32>`) the generic emission already lowers `==` to native JS.
+                // Record the operand's type-arg bindings whenever there are any
+                // (`Option<Point> ==` binds the impl's `Option<T>` to `T = Point`)
+                // — the same rule `resolve_method_call` applies to an explicit
+                // method call. Whether the emission actually SPECIALIZES against
+                // them is the transformer's decision (`operator_instance_required`,
+                // B135): an all-native binding whose body lowers to native JS
+                // keeps the shared generic emission, but a body that transitively
+                // calls a trait requirement explicitly needs the substitution, or
+                // the call falls through to the requirement's empty body and trips
+                // the emitter's never-silent check.
                 let impl_subject = impl_subject_id.get_type(self);
                 if let Some((_, bindings)) =
                     self.reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
+                    && !bindings.is_empty()
                 {
-                    let needs_specialization = bindings.iter().any(|(_, concrete)| {
-                        !self.is_native_operator_type(&concrete.get_type(self))
-                    });
-                    if needs_specialization {
-                        self.method_call_substitution
-                            .insert(binary_id, bindings.into_iter().collect());
-                    }
+                    self.method_call_substitution
+                        .insert(binary_id, bindings.into_iter().collect());
                 }
             } else if let Some((_member_id, impl_subject_id, trait_id, trait_arguments)) =
                 // Natives never dispatch — native JS IS their operator
