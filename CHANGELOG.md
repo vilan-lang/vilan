@@ -23,6 +23,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 ---
 
 <!-- family: tooling -->
+**The grammar word lists are generated, not copied.** `grammar_sync` graduates from gating the static grammars' word lists to generating them: the keyword, primitive-type, attribute-marker, numeric-suffix and operator fragments of the TextMate grammar and the book's highlight.js theme are now emitted from the compiler's exported tables (`KEYWORDS`, the newly exported `TWO_CHARACTER_OPERATORS`, `SCALAR_PRIMITIVE_NAMES`, `NUMERIC_SUFFIXES`, `KNOWN_ATTRIBUTE_MARKERS`) and byte-held in place on every suite run — a table changed without regenerating (`VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated`) is a red suite, not a reader's eye. The structural rules stay hand-written, and the same seam is where the tree-sitter grammar (backlog E62) will hang when its lane opens — born gated.
+
+---
+
+<!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 
 ---
