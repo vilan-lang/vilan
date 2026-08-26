@@ -84,6 +84,15 @@ fun main() {
 		.max_width(Length::calc("100% - 2rem"));
 	print(zeroed.class_list());
 
+	// `Color::var` is `Length::var`'s counterpart: the value is `var(--accent)`
+	// verbatim and NO `:root` line emits — the app owns the declaration. The
+	// golden shows `.alpha()` composing over it through the relative-colour
+	// form, the same as over a ramp token.
+	let accented = const style()
+		.background(Color::var("--accent"))
+		.border_color(Color::var("--accent").alpha(0.5));
+	print(accented.class_list());
+
 	// `size` writes the SAME two slots `width` and `height` write — the class
 	// list shows two classes for one call, and a later `height` narrows the
 	// square by the ordinary last-wins rule (three calls, two classes).

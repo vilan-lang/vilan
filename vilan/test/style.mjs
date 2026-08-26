@@ -146,6 +146,8 @@ console.log(class_list(framed));
 console.log("s1mnphwb");
 const zeroed = [ [ new Map([ [ "::inset", [ "::inset", [ "s1ucbaf9", "inset:0" ] ] ], [ "::min-width", [ "::min-width", [ "sitgfdt", "min-width:0" ] ] ], [ "::left", [ "::left", [ "s1ypvw5g", "left:clamp(120px, 30%, 185px)" ] ] ], [ "::max-width", [ "::max-width", [ "s63dg6q", "max-width:calc(100% - 2rem)" ] ] ] ]) ] ];
 console.log(class_list(zeroed));
+const accented = [ [ new Map([ [ "::background-color", [ "::background-color", [ "sumjtxl", "background-color:var(--accent)" ] ] ], [ "::border-color", [ "::border-color", [ "s1rhkqzm", "border-color:rgb(from var(--accent) r g b / 0.5)" ] ] ] ]) ] ];
+console.log(class_list(accented));
 const squared = [ [ new Map([ [ "::width", [ "::width", [ "s178h6ec", "width:1rem" ] ] ], [ "::height", [ "::height", [ "s22ylrq", "height:1rem" ] ] ] ]) ] ];
 console.log(class_list(squared));
 console.log("s178h6ec s22zdhz");

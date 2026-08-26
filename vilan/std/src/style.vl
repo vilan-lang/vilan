@@ -166,6 +166,17 @@ impl Color {
 		Color { css = value, root = "" }
 	}
 
+	/// The typed end of the dynamic-value channel for colours — `Length::var`'s
+	/// counterpart: renders `var({name})` and declares NOTHING (`root = ""`).
+	/// The app owns the custom property's declaration — its emitted theme
+	/// block, or `view.style_var(name, signal)` writing it at runtime.
+	/// `.alpha()` composes over it through the relative-colour form,
+	/// `rgb(from var(..) r g b / a)`, so a variable-backed colour
+	/// translucifies exactly like a ramp token.
+	fun var(name: str): Color {
+		Color { css = i"var({name})", root = "" }
+	}
+
 	fun gray(step: i32): Color {
 		ramp("gray", step, match step {
 			50 => "#f9fafb",

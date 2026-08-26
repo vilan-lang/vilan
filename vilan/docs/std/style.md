@@ -36,6 +36,7 @@ impl Color {
 	fun black(): Color
 	fun transparent(): Color
 	fun hex(value: str): Color     // "#663399"
+	fun var(name: str): Color      // a custom-property reference ("--accent"); the app declares it
 	fun gray(step: i32): Color     // ramps: 50…900
 	fun blue(step: i32): Color
 	fun red(step: i32): Color
@@ -57,6 +58,13 @@ so a ramp step stays a `var(--gray-900)` and keeps re-theming — which an
 8-digit hex could not do. Channels, alphas and the two-stop gradient
 minimum are checked during const evaluation, so a bad value stops the
 build naming itself.
+
+`Color::var` is `Length::var`'s counterpart — the typed end of the
+dynamic-value channel. It renders `var(--name)` and **declares nothing**:
+the app owns the custom property's declaration (its emitted theme block,
+or `view.style_var` writing it at runtime). `.alpha()` composes over it
+through the same relative-colour form, so a variable-backed colour
+translucifies exactly like a ramp token.
 
 `calc` wraps and `css` does not: `Length::calc(e)` is
 `Length::css("calc(" + e + ")")`. Write `calc` for arithmetic, `css` for a

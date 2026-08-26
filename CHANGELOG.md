@@ -22,6 +22,11 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ---
 
+<!-- family: feature -->
+**`Color::var(name)` — the typed spelling of a CSS-variable-backed colour.** `Length::var` has been the typed end of the dynamic-value channel since the core shipped; `Color` had no counterpart, so a variable-backed colour was spelled through `Color::hex("var(--x)")` — an undocumented abuse of an escape hatch named for hex literals — or by reaching past the constructor API into the struct literal. Same semantics as `Length::var`: the reference renders `var(--name)` and **declares nothing** — the app owns the custom-property declaration (its emitted theme block, or `view.style_var` writing it at runtime) — and `.alpha()` composes over it through the relative-colour form exactly as over a ramp token. Docs `std/style.md`. (kolt dogfood, item 012)
+
+---
+
 <!-- family: tooling -->
 **The walkthrough example spells its sentinel `-1`.** The four rpc bodies in its store (and the guide fence that mirrors one of them) answered an unauthenticated call with `0 - 1`, though prefix `-` has sat in the grammar's operator table all along — and a teaching surface teaches: the first downstream refactor written against the example carried the long spelling verbatim into its own service. Swept to `-1`; the guide and the example stay mirrored, and the fence gate and example builds hold.
 

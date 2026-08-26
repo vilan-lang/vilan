@@ -26575,6 +26575,41 @@ fn a_height_after_size_narrows_by_last_wins() {
     );
 }
 
+/// `Color::var` is `Length::var`'s counterpart (item 012): the typed spelling
+/// of a CSS-variable-backed colour. It declares NOTHING — no `:root` line
+/// emits, the app owns the custom property's declaration — and `.alpha()`
+/// composes over it through the relative-colour form, like over a ramp token.
+#[test]
+fn color_var_references_without_declaring() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style()
+                .background(Color::var("--accent"))
+                .border_color(Color::var("--accent").alpha(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:var(--accent)}",
+        "{border-color:rgb(from var(--accent) r g b / 0.5)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+    assert!(
+        !lines.iter().any(|line| line.starts_with(":root{--accent")),
+        "Color::var must not declare the property: {lines:?}"
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the
