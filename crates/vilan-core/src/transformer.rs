@@ -691,6 +691,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_is_null",
         "__db_close",
         "__fs_stat",
+        "__fs_read_dir_all",
         "__local_get",
         "__session_get",
         "__router_path",
@@ -955,6 +956,19 @@ fn helper_source(name: &str) -> &'static str {
              \t\tif (error && error.code === \"ENOENT\") return [ 1 ];\n\
              \t\tthrow error;\n\
              \t}\n\
+             }"
+        }
+        // `std::fs::read_dir_all` (kolt.local 019): `fs.promises.readdir`
+        // under `{ recursive: true }` — an option-object argument the extern
+        // binding forms cannot spell, so the call lives here (the same reason
+        // `__fs_stat` does). No `try`/`catch`: a missing or unreadable
+        // directory throws host-side, matching `read_dir`'s posture. The
+        // dynamic `import` is self-contained on purpose, and Node caches
+        // module resolution, so a hot loop does not re-resolve it per call.
+        "__fs_read_dir_all" => {
+            "async function __fs_read_dir_all(path) {\n\
+             \tconst fsPromises = await import(\"node:fs/promises\");\n\
+             \treturn await fsPromises.readdir(path, { recursive: true });\n\
              }"
         }
         // Cryptographically random bytes.

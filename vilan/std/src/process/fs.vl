@@ -48,13 +48,28 @@ fun read_file_to_str(path: str): str {
 /// Lists a directory's immediate entries by NAME ONLY (files and
 /// subdirectories alike, not path-joined — join with `path` yourself), in
 /// whatever order the host filesystem hands them back (NOT guaranteed
-/// alphabetical or otherwise stable across platforms). Deliberately flat for
-/// v1 (F13): no recursion, and no dirent-kind distinction — a caller that
-/// needs to know file vs. directory calls `stat` per entry. Throws host-side
-/// on a missing or unreadable directory, matching `read_file_to_str`'s
-/// posture above.
+/// alphabetical or otherwise stable across platforms). Deliberately flat
+/// (F13): no recursion here — `read_dir_all` below walks the whole tree in
+/// one call — and no dirent-kind distinction: a caller that needs to know
+/// file vs. directory calls `stat` per entry. Throws host-side on a missing
+/// or unreadable directory, matching `read_file_to_str`'s posture above.
 [extern("node:fs/promises", "readdir")]
 async external fun read_dir(path: str): List<str>;
+
+/// Lists EVERY entry under `path` — files and subdirectories alike, however
+/// deep — as paths RELATIVE to `path` (`"sub/c.txt"`, joined with the host's
+/// own separator, so backslashes on Windows), in whatever order the host's
+/// traversal hands them back (NOT guaranteed depth-first, alphabetical, or
+/// stable across platforms — `read_dir`'s honesty, recursively). No
+/// dirent-kind distinction here either: a subdirectory is one more entry, and
+/// a caller that needs file vs. directory still calls `stat`. Rides
+/// `readdir`'s `{ recursive: true }` option — an option object the extern
+/// binding forms cannot spell, so the call is host-side glue
+/// (`__fs_read_dir_all`, `transformer.rs`, the same seam as `__fs_stat`).
+/// Throws host-side on a missing or unreadable directory, matching
+/// `read_dir`.
+[extern("__fs_read_dir_all")]
+async external fun read_dir_all(path: str): List<str>;
 
 // --- stat --------------------------------------------------------------
 

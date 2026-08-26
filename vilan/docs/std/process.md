@@ -177,7 +177,8 @@ fun read_file_to_str_sync(path: str): str       // sync, UTF-8 — blocks the ev
 fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
 fun write_file(path: str, contents: str)        // async
-fun read_dir(path: str): List<str>              // async, entry NAMES, flat (v1)
+fun read_dir(path: str): List<str>              // async, entry NAMES, flat
+fun read_dir_all(path: str): List<str>          // async, RELATIVE paths, the whole tree
 fun stat(path: str): Option<Stat>               // async — None if `path` doesn't exist; every other failure throws
 struct Stat {
     size: i32,
@@ -186,14 +187,23 @@ struct Stat {
 }
 ```
 
-`read_bytes`, `read_dir`, and `read_file_to_str` throw host-side on any
-failure, missing path included — the same posture `read_file_to_str` always
-had. `stat` alone is a non-throwing probe: it exists to let a caller ask
-"is this here yet, and what does it look like" (a poller's use case), so a
-missing path is `None`, not a thrown exception. Prefer the async read; the
-sync one exists for a read that must complete inside a callback that cannot
-suspend — `serve_build`'s dev-mode revalidation is the case it was added
-for.
+`read_bytes`, `read_dir`, `read_dir_all`, and `read_file_to_str` throw
+host-side on any failure, missing path included — the same posture
+`read_file_to_str` always had. `stat` alone is a non-throwing probe: it
+exists to let a caller ask "is this here yet, and what does it look like"
+(a poller's use case), so a missing path is `None`, not a thrown exception.
+Prefer the async read; the sync one exists for a read that must complete
+inside a callback that cannot suspend — `serve_build`'s dev-mode
+revalidation is the case it was added for.
+
+Two directory listings, one honesty policy. `read_dir` is deliberately
+flat: immediate entry *names*, not path-joined, no file-vs-directory
+distinction. `read_dir_all` walks the whole tree in one call — every entry
+under the path, files and subdirectories alike, as paths *relative* to it,
+joined with the host's own separator — riding the host `readdir`'s
+`recursive` option. Neither promises an order (sort the list if order
+matters), and neither says which entries are directories: a caller that
+needs the kind calls `stat` per entry.
 
 Three reads, three different questions. `read_bytes` is the true binary
 read: the host hands back a `Buffer`, which binds straight to `Bytes` with
