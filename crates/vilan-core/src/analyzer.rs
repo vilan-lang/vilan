@@ -26136,6 +26136,103 @@ impl<'src> Analyzer<'src> {
     /// method's own generics, wire the call, and spawn a `MethodArgCheck` (plus a
     /// `SlotUnification` for `push`/`run`). Defers while the receiver is
     /// unresolved or an unknown closure parameter.
+    /// An integer written as a literal, including the negative form — `-1` is
+    /// `Unary('-')` over `Number("1")`, not a signed literal, and there is no
+    /// folding in the walk. A fractional literal is not one.
+    fn literal_integer(&self, expr_id: Id) -> Option<i64> {
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Number(whole, None, _)) => whole.parse::<i64>().ok(),
+            Some(Expr::Unary('-', operand)) => match self.expr_id_to_expr_map.get(operand) {
+                Some(Expr::Number(whole, None, _)) => whole.parse::<i64>().ok().map(|value| -value),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `s.substring(start, end)` with literal bounds (kolt.local 023). The rule
+    /// is `0 <= start <= end <= len`, refused — never clamped, never swapped.
+    /// JS's own `substring` clamps a negative to 0 and swaps an inverted pair,
+    /// so `s.substring(offset, -1)` silently returns the PREFIX, the complement
+    /// of the request; this tree refuses rather than guessing.
+    ///
+    /// The `start`/`end` halves are decidable from the literals alone, so they
+    /// are caught here rather than at runtime — the array-index precedent in
+    /// `resolve_subscript`. The `end <= len` half needs the receiver's length,
+    /// which only a string literal supplies; everything else is the emitted
+    /// `__substring` helper's business.
+    fn check_literal_substring_range(
+        &mut self,
+        subject_id: Id,
+        member_name: &str,
+        subject_type: &Type,
+        argument_ids: &[Id],
+    ) {
+        if member_name != "substring" || argument_ids.len() != 2 {
+            return;
+        }
+        let str_struct_id = self.primitive_struct_ids.get("str").copied();
+        if !matches!(subject_type, Type::Struct(id, _) if Some(*id) == str_struct_id) {
+            return;
+        }
+        let (Some(start), Some(end)) = (
+            self.literal_integer(argument_ids[0]),
+            self.literal_integer(argument_ids[1]),
+        ) else {
+            return;
+        };
+        let span_of = |analyzer: &Self, expr_id: Id| -> Span {
+            **analyzer.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN)
+        };
+        let rule = "the range must satisfy 0 <= start <= end <= len, and substring \
+                    never clamps or swaps";
+        let (span, msg, note) = if start < 0 {
+            (
+                span_of(self, argument_ids[0]),
+                format!("substring start {start} is negative — {rule}"),
+                "to drop a known affix use `strip_prefix`/`strip_suffix`",
+            )
+        } else if end < 0 {
+            (
+                span_of(self, argument_ids[1]),
+                format!("substring end {end} is negative — {rule}"),
+                "to drop a known affix use `strip_suffix`; for the rest of the \
+                 string pass `s.len()` as the end",
+            )
+        } else if start > end {
+            (
+                span_of(self, argument_ids[1]),
+                format!("substring end {end} is before its start {start} — {rule}"),
+                "swap the arguments if the range was written backwards",
+            )
+        } else {
+            // The receiver's length is known only for a plain string literal.
+            // Escapes are still raw source here, so a literal carrying one is
+            // left to the runtime helper rather than mismeasured.
+            let Some(Expr::String(text)) = self.expr_id_to_expr_map.get(&subject_id) else {
+                return;
+            };
+            if text.contains('\\') {
+                return;
+            }
+            let length = text.encode_utf16().count() as i64;
+            if end <= length {
+                return;
+            }
+            (
+                span_of(self, argument_ids[1]),
+                format!("substring end {end} is past the length {length} of this string — {rule}"),
+                "for the rest of the string pass `s.len()` as the end",
+            )
+        };
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: Some(Note::here(span, note.to_string())),
+            span,
+            msg,
+        });
+    }
+
     fn resolve_method_call(
         &mut self,
         id: Id,
@@ -26591,6 +26688,15 @@ impl<'src> Analyzer<'src> {
                 if !substitution.is_empty() {
                     self.method_call_substitution.insert(id, substitution);
                 }
+                // `substring`'s range rule, decided here when the bounds are
+                // literals — every deferral path above has already returned, so
+                // this runs once. The runtime helper refuses the rest.
+                self.check_literal_substring_range(
+                    subject_id,
+                    member_name,
+                    &subject_type,
+                    argument_ids,
+                );
                 self.constraints.push(Constraint::MethodArgCheck {
                     call_id: id,
                     member_id,

@@ -1478,6 +1478,17 @@ impl<'a> Interpreter<'a> {
                     Err(index_out_of_bounds(length, index))
                 }
             }
+            // The checked slice, matching the emitted `__substring` helper: a
+            // range outside `0 <= start <= end <= len` is a panic (`Thrown`),
+            // so a const-time violation fails the build with the same message a
+            // runtime one prints.
+            "__substring" => {
+                let text = expect_str(&take(0))?;
+                let start = expect_number(&take(1))?;
+                let end = expect_number(&take(2))?;
+                let out = substring_checked(&text, start, end)?;
+                Ok(Value::Str(Rc::from(out.as_str())))
+            }
             "__map_get" => {
                 let map = expect_map(&take(0))?;
                 let key = Key::of(&take(1))?;
@@ -1976,28 +1987,17 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Array(Rc::new(RefCell::new(parts))))
             }
             "substring" => {
-                // JS substring: clamp to [0, len] in UTF-16 units, swap if
-                // start > end.
-                let units: Vec<u16> = s.encode_utf16().collect();
-                let len = units.len() as f64;
-                let index_of = |value: Value<'a>| -> Result<usize, Failure> {
-                    let n = match value {
-                        Value::Undefined => len,
-                        other => to_number(&other)?,
-                    };
-                    let n = if n.is_nan() { 0.0 } else { n };
-                    Ok(n.clamp(0.0, len) as usize)
-                };
-                let mut start = index_of(argument(0))?;
-                let mut end = if arguments.len() > 1 {
-                    index_of(argument(1))?
+                // Vilan's rule, NOT JS's: no clamping and no swapping. Emitted
+                // code routes through the `__substring` helper, so this arm is
+                // reached only by a host string carrying the method directly —
+                // it must still refuse, or the two paths would disagree.
+                let start = to_number(&argument(0))?;
+                let end = if arguments.len() > 1 {
+                    to_number(&argument(1))?
                 } else {
-                    units.len()
+                    s.encode_utf16().count() as f64
                 };
-                if start > end {
-                    std::mem::swap(&mut start, &mut end);
-                }
-                str_result(String::from_utf16_lossy(&units[start..end]))
+                str_result(substring_checked(&s, start, end)?)
             }
             other => Err(Failure::unsupported(format!("the string method `{other}`"))),
         }
@@ -2496,6 +2496,31 @@ fn index_out_of_bounds(length: usize, index: f64) -> Failure {
         FailureKind::Thrown,
         format!("index out of bounds: the length is {length} but the index is {index}"),
     )
+}
+
+/// `str.substring(start, end)` under the one rule the emitted `__substring`
+/// helper enforces: `0 <= start <= end <= len`, in UTF-16 code units, refused
+/// otherwise. Const eval and the runtime must agree here — this arm used to
+/// reproduce JS's clamp-and-swap faithfully, which is exactly the silent
+/// reinterpretation the ban removes, so it now refuses in the same words.
+fn substring_checked(text: &str, start: f64, end: f64) -> Result<String, Failure> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let length = units.len();
+    let whole = start.fract() == 0.0 && end.fract() == 0.0;
+    if whole && 0.0 <= start && start <= end && end <= length as f64 {
+        return Ok(String::from_utf16_lossy(
+            &units[start as usize..end as usize],
+        ));
+    }
+    Err(Failure::new(
+        FailureKind::Thrown,
+        format!(
+            "substring out of range: the length is {length} but the range is {start}..{end} \
+             — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop \
+             a known affix use strip_prefix/strip_suffix, and for the rest of the string pass \
+             s.len() as the end"
+        ),
+    ))
 }
 
 fn expect_str(value: &Value) -> Result<Rc<str>, Failure> {
