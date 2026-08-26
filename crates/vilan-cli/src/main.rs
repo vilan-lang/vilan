@@ -361,6 +361,40 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
 /// How often the watcher polls for changes.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
+/// The build inputs `const asset::read` pulled in, recorded per compile —
+/// misses included, because a file that was not there is still a dependency
+/// whose APPEARANCE must trigger a round exactly as a change to it would.
+/// The watcher's snapshot polls these alongside its `.vl` scan; process-global
+/// because the recording compile runs several opaque call frames below the
+/// watch loop's action closure. Accumulative across rounds: a path a later
+/// round no longer reads stays watched, which costs at most one round whose
+/// legs then verify by content and skip.
+static CONST_INPUT_PATHS: std::sync::Mutex<BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// Records a compile's `asset::read` inputs for the watcher.
+fn record_const_inputs(inputs: &[(PathBuf, Option<u64>)]) {
+    if inputs.is_empty() {
+        return;
+    }
+    let mut paths = CONST_INPUT_PATHS.lock().unwrap();
+    paths.extend(inputs.iter().map(|(path, _)| path.clone()));
+}
+
+/// [`scan_vl`] plus the recorded `asset::read` inputs: the full watched set.
+/// A recorded path that does not exist stays out of the map — its later
+/// appearance inserts an entry, which is exactly the snapshot difference that
+/// fires a round.
+fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
+    let mut files = scan_vl(roots);
+    for path in CONST_INPUT_PATHS.lock().unwrap().iter() {
+        if let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) {
+            files.insert(path.clone(), modified);
+        }
+    }
+    files
+}
+
 /// Runs `action` once and returns its exit code (no `--watch`, `roots` is `None`),
 /// or — under `--watch` — re-runs it on every change to a `.vl` file under `roots`.
 fn run_or_watch(roots: Option<Vec<PathBuf>>, mut action: impl FnMut() -> ExitCode) -> ExitCode {
@@ -467,11 +501,22 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
     // this window, widened by suite load; a human saving during the initial
     // build hit the same swallowed edit. Cost of this order: an edit during
     // the initial build causes one extra round — which is the correct behavior.
-    let mut snapshot = scan_vl(roots);
+    let started = SystemTime::now();
+    let mut snapshot = watch_snapshot(roots);
     action();
+    // The first build just revealed which `asset::read` inputs exist — paths
+    // the baseline could not contain. Seed them in with E20's rule intact: an
+    // input whose mtime predates the build joins the baseline (no spurious
+    // round), one modified at or after the build's start does NOT, so the
+    // next poll sees it and fires the round that re-reads it.
+    for (path, modified) in watch_snapshot(roots) {
+        if !snapshot.contains_key(&path) && modified < started {
+            snapshot.insert(path, modified);
+        }
+    }
     loop {
         std::thread::sleep(WATCH_POLL_INTERVAL);
-        let next = scan_vl(roots);
+        let next = watch_snapshot(roots);
         if next != snapshot {
             snapshot = next;
             eprintln!(
@@ -2773,6 +2818,11 @@ fn compile_to_js(
             &vilan_core::options::BuildOptions::default(),
         );
 
+        // Every file `const asset::read` touched is a build input: hand the
+        // set to the watcher so a change to one — or the appearance of one
+        // that was missing — triggers a round exactly as a `.vl` edit does.
+        record_const_inputs(&program.const_input_files);
+
         // The `const` INFERENCE sweep (const-eval.md §9) — THE ONE CALL SITE.
         // It lives here, on the CLI's build path, and not beside the explicit
         // pass inside `analyze_source`, because the language server and the
@@ -2960,16 +3010,24 @@ fn compile_to_js(
                 // (by re-hashing, never by mtime) to skip a leg whose sources
                 // didn't change (backlog E12, half b).
                 Ok(javascript) => {
-                    output = Some((
-                        javascript,
-                        program.const_assets.clone(),
-                        program
-                            .sources
-                            .iter()
-                            .cloned()
-                            .zip(program.source_hashes.iter().copied())
-                            .collect::<Vec<_>>(),
-                    ))
+                    output =
+                        Some((
+                            javascript,
+                            program.const_assets.clone(),
+                            program
+                                .sources
+                                .iter()
+                                .cloned()
+                                .zip(program.source_hashes.iter().copied())
+                                // `const asset::read` inputs are sources to the
+                                // skip decision too: the leg recompiles when one
+                                // changes. A missing input (`None` hash) cannot
+                                // reach here — a missed read fails the compile.
+                                .chain(program.const_input_files.iter().filter_map(
+                                    |(path, hash)| hash.map(|hash| (path.clone(), hash)),
+                                ))
+                                .collect::<Vec<_>>(),
+                        ))
                 }
                 Err(error) => {
                     overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
@@ -3748,6 +3806,40 @@ mod tests {
         let after_js = scan_vl(&roots);
         fs::write(dir.join("c.js"), "// also generated\n").unwrap();
         assert_eq!(scan_vl(&roots), after_js, "a new `.js` is not a change");
+    }
+
+    #[test]
+    fn watch_snapshot_includes_recorded_const_inputs() {
+        // `const asset::read` inputs are build inputs (K13 step 2): once a
+        // compile records one, the watcher polls it beside the `.vl` scan —
+        // and a recorded-but-missing input joins the snapshot the moment it
+        // APPEARS, which is the round trigger for "the file the build wanted
+        // now exists".
+        let dir = env::temp_dir().join(format!("vilan-watch-input-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("page.md");
+        let missing = dir.join("not-yet.md");
+        fs::write(&present, "# page\n").unwrap();
+        record_const_inputs(&[(present.clone(), Some(1)), (missing.clone(), None)]);
+        let roots = vec![dir.clone()];
+        let snapshot = watch_snapshot(&roots);
+        assert!(
+            snapshot.contains_key(&present),
+            "a recorded input joins the watched set: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key(&missing),
+            "a missing input stays out until it appears"
+        );
+        fs::write(&missing, "# here now\n").unwrap();
+        let next = watch_snapshot(&roots);
+        assert!(
+            next.contains_key(&missing),
+            "an appearing input is a snapshot change"
+        );
+        assert_ne!(next, snapshot);
+        let _ = fs::remove_dir_all(&dir);
 
         let _ = fs::remove_dir_all(&dir);
     }

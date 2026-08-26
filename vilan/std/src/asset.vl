@@ -6,3 +6,15 @@
 
 [extern("__emit_asset")]
 external fun emit(kind: str, line: str): void;
+
+// Compile-time build inputs (proposal/docs-port.md §3.3, markdown.md §7 —
+// the read direction of the channel above): `read(path)` returns the file's
+// text. The path must be relative and resolves against the package root (the
+// same base imports resolve under), never the process working directory; a
+// path that is absolute, escapes the root, or names no readable file is a
+// compile error at the `const` expression. Every file read becomes a tracked
+// build input: a change to it invalidates the compile that read it.
+// Compile-time-only, exactly like `emit`.
+
+[extern("__read_asset")]
+external fun read(path: str): str;

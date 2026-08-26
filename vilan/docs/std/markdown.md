@@ -11,7 +11,12 @@ versioned with the toolchain until a package registry exists.
 The parser is pure computation — no I/O, no platform types — so it runs
 on any target, and every type it produces is const-eligible by
 construction (`str`, `i32`, `bool`, `List`, structs, enums; no `Shared`,
-no `View`, no closures).
+no `View`, no closures). That eligibility is exercisable: with the
+compile-time file channel, `const parse(asset::read("pages/intro.md"))`
+parses a page during compilation — within the const fuel budget even
+for the book's largest page — and ships the `Doc` as plain data in the
+output, with the read file tracked as a build input
+([std::asset](misc.md#stdasset)).
 
 ## Parsing
 

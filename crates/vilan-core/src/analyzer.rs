@@ -2712,6 +2712,7 @@ pub struct Analyzer<'src> {
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
     asset_emit_fn_id: Option<Id>,
+    asset_read_fn_id: Option<Id>,
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
@@ -3259,6 +3260,7 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
             asset_emit_fn_id: None,
+            asset_read_fn_id: None,
             const_exprs: Vec::new(),
             option_enum_id: None,
             result_enum_id: None,
@@ -32748,6 +32750,9 @@ pub struct Program<'src> {
     pub drop_fn_id: Option<Id>,
     /// `std::asset::emit` — the const-only compile-time effect (const-eval.md).
     pub asset_emit_fn_id: Option<Id>,
+    /// `std::asset::read` — the channel's input direction (docs-port.md §3.3):
+    /// const-only exactly like `emit`.
+    pub asset_read_fn_id: Option<Id>,
     /// `const`-marked expression ids in walk order (const-eval.md §1).
     pub const_exprs: Vec<Id>,
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
@@ -32756,6 +32761,17 @@ pub struct Program<'src> {
     /// `(kind, line)` pairs `asset::emit` accumulated during const evaluation;
     /// the build deduplicates, orders, and writes them beside the output.
     pub const_assets: Vec<(String, String)>,
+    /// Every file `asset::read` touched during const evaluation, resolved, with
+    /// the content hash it read (`None` for a file that could not be read —
+    /// still a dependency: its APPEARANCE must invalidate as surely as a
+    /// change). These are build inputs exactly as the `.vl` sources are; watch
+    /// mode and the per-leg reuse check consume them so a changed input is
+    /// seen. Filled by `post_analysis_passes`.
+    pub const_input_files: Vec<(PathBuf, Option<u64>)>,
+    /// The package root the entry resolved under — the base `asset::read`
+    /// paths resolve against (never the process working directory), the same
+    /// base module imports resolve under.
+    pub pkg_root: PathBuf,
     // The `std::context` `Context` intrinsics (if `context.vl` loaded): the
     // `new`/`run`/`get` method ids. The context threading pass keys off these to
     // find context bindings and their `run`/`get` sites; the transformer lowers
@@ -35835,7 +35851,7 @@ fn analyze_inner<'src>(
                 false,
             );
         }
-        return analyze_over_world(world, nodes, std, platform, workspace);
+        return analyze_over_world(world, nodes, std, pkg_root, platform, workspace);
     }
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
@@ -36783,14 +36799,18 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
     }
-    // Remember `asset::emit` — the const-only compile-time effect
-    // (const-eval.md §2-3); the const pass enforces that no runtime call
-    // path reaches it.
+    // Remember `asset::emit` and `asset::read` — the const-only compile-time
+    // channel, output and input direction (const-eval.md §2-3, docs-port.md
+    // §3.3); the const pass enforces that no runtime call path reaches either.
     if let Some(asset_scope_id) = module_scopes.get("asset") {
         analyzer.asset_emit_fn_id = analyzer
             .scopes
             .get(asset_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("emit").copied());
+        analyzer.asset_read_fn_id = analyzer
+            .scopes
+            .get(asset_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("read").copied());
     }
     // Remember the std `Option`/`Result` enums and the `Try` trait: `expr!`
     // dispatches the std pair by identity and user types through `Try`
@@ -37104,7 +37124,7 @@ fn analyze_inner<'src>(
             false,
         );
     }
-    analyze_over_world(world, nodes, std, platform, workspace)
+    analyze_over_world(world, nodes, std, pkg_root, platform, workspace)
 }
 
 /// The entry tail: walks the entry over a resolved [`World`], builds,
@@ -37115,6 +37135,7 @@ fn analyze_over_world<'src>(
     world: World<'src>,
     nodes: &'src Spanned<NodeList<'src>>,
     std: &PackageSpec,
+    pkg_root: &Path,
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
@@ -37874,9 +37895,12 @@ fn analyze_over_world<'src>(
         panic_fn_id: analyzer.panic_fn_id,
         drop_fn_id: analyzer.drop_fn_id,
         asset_emit_fn_id: analyzer.asset_emit_fn_id,
+        asset_read_fn_id: analyzer.asset_read_fn_id,
         const_exprs: analyzer.const_exprs.clone(),
         const_results: HashMap::default(),
         const_assets: Vec::new(),
+        const_input_files: Vec::new(),
+        pkg_root: pkg_root.to_path_buf(),
         context_new_fn_id,
         context_run_fn_id,
         context_get_fn_id,
