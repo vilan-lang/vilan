@@ -36,12 +36,14 @@ impl Color {
 	fun black(): Color
 	fun transparent(): Color
 	fun hex(value: str): Color     // "#663399"
+	fun var(name: str): Color      // a custom-property reference ("--accent"); the app declares it
 	fun gray(step: i32): Color     // ramps: 50…900
 	fun blue(step: i32): Color
 	fun red(step: i32): Color
 	fun green(step: i32): Color
 
 	fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color  // a literal, 0-255 / 0.0-1.0
+	fun oklch(lightness: f64, chroma: f64, hue: f64): Color  // perceptual: 0.0-1.0 / 0.0-0.5 / degrees
 	fun alpha(self, value: f64): Color   // THIS colour at that alpha
 }
 
@@ -57,6 +59,23 @@ so a ramp step stays a `var(--gray-900)` and keeps re-theming — which an
 8-digit hex could not do. Channels, alphas and the two-stop gradient
 minimum are checked during const evaluation, so a bad value stops the
 build naming itself.
+
+`oklch` is the perceptual literal — hold a hue angle and step the
+lightness, and the steps look even across hues, which is what deriving a
+palette wants and what `rgba` cannot promise. Lightness takes the CSS
+**number** form (0.0–1.0, not a percentage), chroma runs 0.0–0.5 (0 is
+achromatic; sRGB tops out near 0.37), and the hue angle is degrees in its
+canonical 0–360 turn — angles wrap in CSS, so one colour keeps one
+spelling and one class. All three ranges are checked during const
+evaluation, and `.alpha()` composes over the result like over any other
+colour.
+
+`Color::var` is `Length::var`'s counterpart — the typed end of the
+dynamic-value channel. It renders `var(--name)` and **declares nothing**:
+the app owns the custom property's declaration (its emitted theme block,
+or `view.style_var` writing it at runtime). `.alpha()` composes over it
+through the same relative-colour form, so a variable-backed colour
+translucifies exactly like a ramp token.
 
 `calc` wraps and `css` does not: `Length::calc(e)` is
 `Length::css("calc(" + e + ")")`. Write `calc` for arithmetic, `css` for a
@@ -111,6 +130,7 @@ Layout:
 | `padding_top`, `padding_right`, `padding_bottom`, `padding_left` | `Length` — one edge |
 | `margin_top`, `margin_right`, `margin_bottom`, `margin_left` | `Length` — one edge |
 | `width`, `height`, `min_width`, `max_width`, `min_height`, `max_height` | `Length` |
+| `size` | `Length` — width *and* height, the square case (`size(Length::rem(1.0))` for an icon box); writes the same two slots, so mixing with `width`/`height` is last-wins |
 | `top`, `right`, `bottom`, `left`, `inset` | `Length` |
 | `overflow` | `Overflow` |
 
@@ -181,6 +201,7 @@ fun disabled(self, inner: Style): Style
 fun first(self, inner: Style): Style      // :first-child
 fun last(self, inner: Style): Style       // :last-child
 fun dark(self, inner: Style): Style       // :root[data-theme="dark"] ancestor
+fun attribute(self, name: str, value: str, inner: Style): Style  // .sX[name="value"] — the element itself
 fun pseudo(self, name: str, inner: Style): Style
 
 fun sm(self, inner: Style): Style          // breakpoints (min-width):
@@ -192,25 +213,40 @@ fun media(self, min_width: str, inner: Style): Style
 
 ### Stacking
 
-The three condition axes nest **outside-in, in the order the selector
-nests them** — media, then dark, then the pseudo-class:
+The four condition axes nest **outside-in, in the order the selector
+nests them** — media, then dark, then the attribute, then the
+pseudo-class:
 
 ```vilan,fragment
 style().md(style().dark(style().hover(style().opacity(0.8))))
 // @media (min-width: 768px){:root[data-theme="dark"] .sX:hover{opacity:0.8}}
+
+style().md(style().dark(style().attribute("data-open", "true", style().hover(style().opacity(0.8)))))
+// @media (min-width: 768px){:root[data-theme="dark"] .sX[data-open="true"]:hover{opacity:0.8}}
 ```
 
 Every other order is a compile-time-evaluation panic naming the fix
 (`hover(dark(..))` says to write `dark(hover(..))`), and no axis can wrap
-itself — one media, one dark, one pseudo-class per slot. Media rules emit
-in ascending min-width order, so a chain like `.sm(x).lg(y)` is
-mobile-first: the widest matching breakpoint wins.
+itself — one media, one dark, one attribute, one pseudo-class per slot.
+Media rules emit in ascending min-width order, so a chain like
+`.sm(x).lg(y)` is mobile-first: the widest matching breakpoint wins.
+
+`attribute` conditions on the element **itself** — `.sX[data-open="true"]`
+— where `dark` is the ancestor form. It is the general spelling of state
+carried in markup: `data-state`, `data-open`, `aria-expanded` — any
+attribute rides, `aria-*` included, and the value matches exactly. The
+app owns *setting* the attribute on the element; the style only selects
+on it. Name and value refuse quotes, spaces and `:` at const time (they
+delimit the machinery underneath), and a styling hook is a single token
+in practice.
 
 `dark` is an ancestor selector, so a composed `dark(hover(..))` rule is
 more specific than either `dark(..)` or `hover(..)` alone and wins
-against both. Between an *un*composed `dark(x)` and `hover(y)` on the
-same property the two are equally specific and dark wins, so use
-`dark(hover(..))` when a dark theme needs its own hover.
+against both — and the same holds along the attribute axis:
+`attribute(.., hover(..))` outranks both of its parts. Between an
+*un*composed `dark(x)` and `hover(y)` on the same property the two are
+equally specific and dark wins, so use `dark(hover(..))` when a dark
+theme needs its own hover.
 
 ## Runtime-legal operations
 

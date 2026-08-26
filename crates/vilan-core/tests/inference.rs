@@ -26526,6 +26526,475 @@ fn the_two_value_padding_sites_compose_from_the_axis_methods() {
     );
 }
 
+// --- W11 style dogfood: size / Color::var / Color::oklch / attribute ----------
+// Cycle 29's kolt-dogfood additions (kolt.local tracker items 010-013). Same
+// pin idioms as A8/A22/A23 above: table-shaped declarations through
+// `collected_assets`, refusals through `failure_diagnostics`, rendered class
+// lists through `assert_compiles_and_runs`.
+
+/// `size` is the sizing pair's axis shorthand (`padding_x`'s pattern): one
+/// value into the two slots `width` and `height` already own — two classes,
+/// not a new property (item 011).
+#[test]
+fn size_writes_the_width_and_height_slots() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Length };
+        fun s(): Style {
+            style().size(Length::rem(1.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in ["{width:1rem}", "{height:1rem}"] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// Because they are the SAME slots, a later `height` narrows the square by
+/// the ordinary last-wins rule: three calls, two classes.
+#[test]
+fn a_height_after_size_narrows_by_last_wins() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Length };
+        fun main() {
+            let squared = const style().size(Length::rem(1.0)).height(Length::rem(2.0));
+            print(squared.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// `Color::var` is `Length::var`'s counterpart (item 012): the typed spelling
+/// of a CSS-variable-backed colour. It declares NOTHING — no `:root` line
+/// emits, the app owns the custom property's declaration — and `.alpha()`
+/// composes over it through the relative-colour form, like over a ramp token.
+#[test]
+fn color_var_references_without_declaring() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style()
+                .background(Color::var("--accent"))
+                .border_color(Color::var("--accent").alpha(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:var(--accent)}",
+        "{border-color:rgb(from var(--accent) r g b / 0.5)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+    assert!(
+        !lines.iter().any(|line| line.starts_with(":root{--accent")),
+        "Color::var must not declare the property: {lines:?}"
+    );
+}
+
+/// `Color::oklch` (item 013): the perceptual literal, emitted in the CSS
+/// number form — space-joined components, the hue a bare degree count — with
+/// `.alpha()` composing through the relative form like over any colour.
+#[test]
+fn oklch_emits_the_number_form() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style()
+                .background(Color::oklch(0.62, 0.19, 313.0))
+                .color(Color::oklch(0.97, 0.02, 340.0).alpha(0.8))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:oklch(0.62 0.19 313)}",
+        "{color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The three range refusals, per case like `rgba`'s channels: lightness is
+/// the CSS NUMBER form (0.0-1.0), not the percentage.
+#[test]
+fn an_oklch_lightness_outside_the_unit_range_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(62.0, 0.19, 313.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch lightness 62 is outside 0.0-1.0")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_oklch_chroma_outside_its_range_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(0.62, 0.7, 313.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch chroma 0.7 is outside 0.0-0.5")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// Angles wrap in CSS, so admitting 700 beside 340 would mint two classes
+/// for one colour — the canonical turn is required.
+#[test]
+fn an_oklch_hue_outside_the_canonical_turn_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(0.62, 0.19, 700.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch hue 700 is outside 0.0-360.0")),
+        "{diagnostics:#?}"
+    );
+}
+
+// `Style::attribute(name, value, inner)` (item 010): a condition on the
+// element ITSELF — `.sX[data-open="true"]` — where dark's hardcoded ancestor
+// is the one ancestor form. Its own slot in the condition axis, between dark
+// and the pseudo-class: `md(dark(attribute(.., hover(..))))`. The pins mirror
+// the dark×pseudo set: composition on each axis pair, the full stack, the
+// ordering refusals naming the fix, the const validation, per-(condition,
+// property) merge, and the ssr leg.
+
+#[test]
+fn an_attribute_condition_selects_on_the_element_itself() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            // Starts with '.' — no ancestor, and the base cascade band (B35).
+            line.starts_with('.') && line.contains("[data-open=\"true\"]{opacity:0.5}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The attribute suffix sits between the class and the pseudo-class, the
+/// outside-in order of the call: `attribute(.., hover(..))`.
+#[test]
+fn an_attribute_condition_wraps_a_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().hover(style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with('.') && line.contains("[data-open=\"true\"]:hover{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// dark's ancestor composes over an attribute-conditioned style through the
+/// same generic path it composes over a pseudo-class — dark() unchanged.
+#[test]
+fn dark_wraps_an_attribute_condition() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().dark(style().attribute("data-open", "true", style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with(":root[data-theme=\"dark\"] .")
+                && line.contains("[data-open=\"true\"]{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// All four axes at once, outside-in: media, dark, attribute, pseudo. The
+/// composed line still starts with '@', so B35's media ordering sees it.
+#[test]
+fn all_four_condition_axes_compose_outside_in() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().md(style().dark(style().attribute(
+                "data-open",
+                "true",
+                style().hover(style().opacity(0.8)),
+            )))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@media (min-width: 768px){:root[data-theme=\"dark\"] .")
+                && line.ends_with("[data-open=\"true\"]:hover{opacity:0.8}}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The four ordering refusals, each naming the fix — the dark×pseudo
+/// refusal set extended to the new axis.
+#[test]
+fn an_attribute_cannot_wrap_a_media_conditioned_style() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().md(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("nest conditions as md(attribute(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_cannot_wrap_dark() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().dark(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("dark(attribute(..)), not attribute(dark(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_pseudo_class_cannot_wrap_an_attribute_condition() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().hover(style().attribute("data-open", "true", style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message
+                .contains("attribute(.., hover(..)), not hover(attribute(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_cannot_wrap_an_attribute_condition() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute(
+                "data-open",
+                "true",
+                style().attribute("data-side", "left", style().background(Color::gray(700))),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already attribute-conditioned")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The name and value fences: the characters that delimit the slot key, the
+/// condition grammar, and the selector's own quoting are refused at const
+/// time, like every other validation in the module.
+#[test]
+fn an_attribute_name_with_a_delimiter_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data open", "true", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("an attribute name cannot contain ' '")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_value_with_a_quote_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "tr\"ue", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("an attribute value cannot contain '\"'")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The slot key carries the attribute condition, so last-wins merge stays
+/// per-(condition, property): the same attribute and property override to
+/// one class; two values of one attribute are two conditions and coexist.
+#[test]
+fn attribute_slots_merge_per_condition_and_property() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style };
+        fun main() {
+            let togged = const style()
+                .attribute("data-open", "true", style().opacity(0.5))
+                .attribute("data-open", "true", style().opacity(1.0));
+            print(togged.class_list().split(" ").len());
+            let sided = const style()
+                .attribute("data-side", "left", style().opacity(0.5))
+                .attribute("data-side", "right", style().opacity(1.0));
+            print(sided.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+/// The ssr leg: an attribute-conditioned style reaches `styled` like any
+/// other — the class attribute carries the attribute class beside the base
+/// class, and the rules were already in the build-time stylesheet.
+#[test]
+fn ssr_renders_attribute_conditioned_classes() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Color };
+        import std::ui::{ view, render };
+        fun main() {
+            let disclosure = const style()
+                .color(Color::gray(700))
+                .attribute("data-open", "true", style().color(Color::gray(900)));
+            print(render(view("div").styled(disclosure)));
+        }
+        main();
+        "#,
+        "<div class=\"s1hbtfg8 sjt5x3g\"></div>\n",
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the

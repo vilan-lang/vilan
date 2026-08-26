@@ -17,6 +17,26 @@ proposal/releases.md §7.2 step 3 defines the four.
 
 ## Unreleased
 
+<!-- family: feature -->
+**`Style.size(value)` — width and height in one call.** The sizing pair was the one multi-property group in `std::style` without an axis shorthand — `padding_x`/`padding_y`, `margin_x`/`margin_y`, and `inset` all have one — and the square case is the measured demand: an icon box spells `width(Length::rem(1.0)).height(Length::rem(1.0))` today. One arity only, deliberately: `size` writes the same two slots `width` and `height` write, so a later `height` narrows the square under the ordinary last-wins rule, and the rectangle keeps its `width(w).height(h)` spelling — the no-multi-value-shorthand rule of `proposal/ui-styling.md` §0bis.5. Docs `std/style.md`. (kolt dogfood, item 011)
+
+---
+
+<!-- family: feature -->
+**`Color::var(name)` — the typed spelling of a CSS-variable-backed colour.** `Length::var` has been the typed end of the dynamic-value channel since the core shipped; `Color` had no counterpart, so a variable-backed colour was spelled through `Color::hex("var(--x)")` — an undocumented abuse of an escape hatch named for hex literals — or by reaching past the constructor API into the struct literal. Same semantics as `Length::var`: the reference renders `var(--name)` and **declares nothing** — the app owns the custom-property declaration (its emitted theme block, or `view.style_var` writing it at runtime) — and `.alpha()` composes over it through the relative-colour form exactly as over a ramp token. Docs `std/style.md`. (kolt dogfood, item 012)
+
+---
+
+<!-- family: feature -->
+**`Color::oklch(lightness, chroma, hue)` — the perceptual colour literal.** "oklch" had zero hits in the whole tree while the design language derives its palette by hand along stated hue angles — exactly the workflow the space exists to serve: hold a hue, step the lightness, and the steps look even across hues, which rgb cannot promise. The CSS **number** form: lightness 0.0–1.0 (not a percentage), chroma 0.0–0.5 (0 is achromatic; sRGB tops out near 0.37), hue in degrees in its canonical 0–360 turn — angles wrap in CSS, and a class name is a content hash, so admitting `700` beside `340` would mint two classes for one colour. All three ranges are validated during const evaluation like `rgba`'s channels, and `.alpha()` composes over the result through the relative-colour form. `oklab` is deliberately not shipped alongside: its signed a/b axes are a different validation and a different authoring model, and the palette workflow asks for the polar form. Docs `std/style.md`. (kolt dogfood, item 013)
+
+---
+
+<!-- family: feature -->
+**`Style::attribute(name, value, inner)` — selecting on `data-*`/`aria-*` state, a fourth condition axis.** The machinery existed hardcoded for exactly one case — `dark()` emits `:root[data-theme="dark"] .sX` — so state carried in markup (`data-open`, `data-state`, `aria-expanded`) had no styled spelling and apps emitted those rules by hand through `asset::emit`. `attribute` is the generalization, with two deliberate differences from `dark`: it conditions on the element **itself** (`.sX[data-open="true"]` — dark's ancestor stays the one ancestor form), and it takes its **own slot** in the condition axis, between dark and the pseudo-class — `md(dark(attribute(.., hover(..))))` — so a dark theme still composes with an element's state, which a shared slot would have refused. The slot key carries the attribute condition, so last-wins merge stays per-(condition, property): two values of one attribute are two conditions and coexist, the same value overrides. Every wrong nesting is a const-eval refusal naming the fix, mirroring dark's; names and values refuse quotes, spaces and `:` at const time (they delimit the slot key, the condition grammar, and the selector's own quoting). Every pre-existing class name is byte-identical — the condition grammar grew a token, not a field. `dark()` itself is untouched; whether it becomes sugar for one attribute condition is item 014's question, now sharpened. Docs `std/style.md`. (kolt dogfood, item 010)
+
+---
+
 <!-- family: tooling -->
 **CI runs on a read-only token, and every Windows FFI `unsafe` site carries its `SAFETY:` label.** Two tidies from the first recurring codebase audit (N16, security dimension). `ci.yml` never writes anything, but declared no `permissions:` and so inherited whatever the repository default grants — it now claims `contents: read` explicitly, the narrowing `release.yml` has always done per job. And the seven sound-but-unlabeled `unsafe` sites in `vilan-cli`'s Windows console/job-object FFI (`paint.rs`, `job.rs`) now state their safety arguments in the workspace's `SAFETY:` convention, which every other `unsafe` site already follows — the audit verified each argument against the code; no behavior changes.
 
