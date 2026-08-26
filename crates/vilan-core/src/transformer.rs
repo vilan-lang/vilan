@@ -4215,8 +4215,18 @@ impl<'src> Transformer<'src> {
             Expr::For(condition, body) => {
                 // Every loop compiles to a `while`; an absent condition is an
                 // infinite loop, i.e. `while (true)`.
+                //
+                // The condition is walked into its own prelude, NOT into the
+                // enclosing block: a condition that needs statements — an `is`
+                // subject temp and its materialized captures above all — must
+                // run them on EVERY evaluation, and the enclosing block runs
+                // them once, before the loop. That was B136's stale-subject
+                // miscompile (`proposal/markdown.md` §10.7): a body
+                // reassignment never reached the condition's `is` test, so the
+                // loop read the wrong branch — or never ended.
+                let mut prelude = Vec::new();
                 let t_condition = condition
-                    .and_then(|condition| self.walk_entity(condition, block))
+                    .and_then(|condition| self.walk_entity(condition, &mut prelude))
                     .unwrap_or(js::Node::Bool(true));
                 // A loop body owning resource locals drops them each iteration
                 // (destruction.md §7); `jump break`/`continue` leave through the
@@ -4225,7 +4235,26 @@ impl<'src> Transformer<'src> {
                 // A loop is a statement with no value: emit it into the block
                 // and yield void, so a loop as a block's tail isn't treated as
                 // the block's result.
-                block.push(js::Node::While(Box::new(t_condition), t_body));
+                if prelude.is_empty() {
+                    // A statement-free condition sits in the `while` head as
+                    // before — the common case, byte-identical emission.
+                    block.push(js::Node::While(Box::new(t_condition), t_body));
+                } else {
+                    // `while (true) { <prelude> if (!cond) break; <body> }`.
+                    // The prelude re-runs per iteration (each evaluation still
+                    // reads its subject exactly once, into a fresh per-
+                    // iteration temp the captures alias), and a `continue` in
+                    // the body re-enters at the prelude — `jump` has no labeled
+                    // form, so no jump can skip past the test.
+                    let mut loop_body = prelude;
+                    loop_body.push(js::Node::If(js::IfBranch::If(
+                        Box::new(js::Node::Unary('!', Box::new(t_condition))),
+                        vec![js::Node::Break],
+                        None,
+                    )));
+                    loop_body.extend(t_body);
+                    block.push(js::Node::While(Box::new(js::Node::Bool(true)), loop_body));
+                }
                 js::Node::Void
             }
             Expr::ForEach(iterable_id, item_id, body) => {

@@ -64603,3 +64603,213 @@ fn markdown_refuses_a_lazy_list_continuation() {
         "line 2: a lazy list continuation — indent the line under its item (two spaces) or separate it from the list with a blank line",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B136 — an `is` test in a loop CONDITION must read the subject as of THIS
+// iteration. The transformer hoisted the subject temp (`const $a = subject;`)
+// into the enclosing block, BEFORE the `while`, so a body reassignment never
+// reached the condition: `proposal/markdown.md` §10.7's repro printed 3 where
+// 1 is correct, and the unbounded form looped forever. `if` position was
+// always fine — the hazard is exactly the re-evaluated condition position.
+// The fix walks the condition into its own prelude and, when that prelude is
+// non-empty, emits `while (true) { <prelude> if (!cond) break; <body> }`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b136_an_is_in_a_loop_condition_reads_the_current_subject() {
+    // The §10.7 minimal repro, verbatim: the first iteration sets `found`,
+    // so the second condition evaluation must see `Some` and stop at 1.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            mut cursor = 0;
+            for (found is None) && cursor < 3 {
+                found = Some(cursor);
+                cursor += 1;
+            }
+            print(cursor);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_an_unbounded_is_condition_loop_terminates() {
+    // §10.7's "with no bounding conjunct: infinite loop" — no second
+    // conjunct caps the trip count, so ONLY a re-evaluated `is` can end the
+    // loop. Before the fix this hung (the spike port's surfacing symptom);
+    // the budget is generous because it only guards against the hang.
+    assert_runs_within(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            for found is None {
+                found = Some(7);
+            }
+            print(1);
+        }
+        "#,
+        "1\n",
+        std::time::Duration::from_secs(10),
+    );
+}
+
+#[test]
+fn b136_a_jump_break_bounded_is_condition_loop_exits_on_reassignment() {
+    // The infinite-loop shape a program would actually write, bounded by a
+    // `jump break` safety valve: the reassignment must end the loop at 1;
+    // the stale hoist rode the valve to 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            mut cursor = 0;
+            for found is None {
+                if cursor >= 3 {
+                    jump break;
+                }
+                found = Some(cursor);
+                cursor += 1;
+            }
+            print(cursor);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_nested_loops_each_reevaluate_their_is_condition() {
+    // Each level owns a hoist; both were stale (the inner one refreshed only
+    // per OUTER iteration). One inner pass and one outer pass is correct.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut outer: Option<i32> = None;
+            mut n = 0;
+            for outer is None && n < 10 {
+                mut inner: Option<i32> = None;
+                for inner is None && n < 10 {
+                    inner = Some(1);
+                    n += 1;
+                }
+                outer = Some(1);
+            }
+            print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_a_loop_condition_is_binding_reads_the_current_payload() {
+    // A BINDING pattern in the condition: the capture (`let v`) reads the
+    // subject temp's payload slot, so a stale temp froze `v` at 3 and the
+    // countdown never reached `None` (hang). Re-evaluating the prelude
+    // rebinds the capture each iteration: 3+2+1+0 = 6.
+    assert_runs_within(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut next: Option<i32> = Some(3);
+            mut sum = 0;
+            for next is Some(let v) {
+                sum += v;
+                if v == 0 {
+                    next = None;
+                } else {
+                    next = Some(v - 1);
+                }
+            }
+            print(sum);
+        }
+        "#,
+        "6\n",
+        std::time::Duration::from_secs(10),
+    );
+}
+
+#[test]
+fn b136_two_is_tests_in_one_condition_both_reevaluate() {
+    // Two subjects, two hoists in one condition — both must move inside.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut a: Option<i32> = None;
+            mut b: Option<i32> = None;
+            mut n = 0;
+            for a is None && b is None && n < 10 {
+                a = Some(1);
+                b = Some(2);
+                n += 1;
+            }
+            print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_a_result_is_condition_reevaluates() {
+    // §10.9 asked the fix lane to pin a `Result` variant beside the repro:
+    // same shape over `Err`, with a binding to boot.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::result::Result::{ Ok, Err, self };
+        fun main() {
+            mut state: Result<i32, str> = Err("pending");
+            mut n = 0;
+            for state is Err(let _reason) && n < 5 {
+                state = Ok(n);
+                n += 1;
+            }
+            print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_an_is_in_an_if_inside_a_loop_stays_fresh() {
+    // Control: `if` position was never wrong (§10.7 — "the same expression
+    // in an `if` is fine"), and the fix must not disturb it. The `if` sees
+    // `None` only on the first pass, so `found` pins to 0.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            mut n = 0;
+            for n < 3 {
+                if found is None {
+                    found = Some(n);
+                }
+                n += 1;
+            }
+            match found {
+                Some(let v) => print(v),
+                None => print(-1),
+            };
+        }
+        "#,
+        "0\n",
+    );
+}

@@ -362,3 +362,30 @@ fun main() {
         "the fusing junction takes exactly one space:\n{emitted}"
     );
 }
+
+#[test]
+fn a_loop_condition_is_reevaluates_under_release() {
+    // B136 (`proposal/markdown.md` §10.7): an `is` in a loop condition
+    // compiled against a subject temp hoisted BEFORE the `while`, so body
+    // reassignments never reached the condition — 3 where 1 is correct. The
+    // fix moves the condition's prelude inside a `while (true)` head; this
+    // pin holds it under both release configurations too.
+    assert_release_matches_debug(
+        r#"
+import std::print;
+
+import std::option::Option::{ None, Some, self };
+
+fun main() {
+	mut found: Option<i32> = None;
+	mut cursor = 0;
+	for (found is None) && cursor < 3 {
+		found = Some(cursor);
+		cursor += 1;
+	}
+	print(cursor);
+}
+"#,
+        "1\n",
+    );
+}
