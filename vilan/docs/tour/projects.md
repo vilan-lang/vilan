@@ -25,13 +25,14 @@ never reaches the network.
 
 ## Reserved names
 
-Three names are refused wherever a manifest names a package: `std`,
-`pkg`, and `macro_std`. They are the import roots the toolchain owns —
-`std::` is always the standard library, `pkg::` is always your own
-package, `macro_std::` is always the macro world's std — so a dependency
-declared under one of them could only shadow the root or vanish behind
-it. The dependency key is yours to choose, so pick any other name; the
-library it points at keeps its own.
+Four names are refused wherever a manifest names a package: `std`,
+`pkg`, `macro_std`, and `vilan`. The first three are the import roots
+the toolchain owns — `std::` is always the standard library, `pkg::` is
+always your own package, `macro_std::` is always the macro world's std —
+so a dependency declared under one of them could only shadow the root or
+vanish behind it. `vilan` is the language's own name, held for official
+packages to come. The dependency key is yours to choose, so pick any
+other name; the library it points at keeps its own.
 
 ## Pre-build commands and `default-entry`
 

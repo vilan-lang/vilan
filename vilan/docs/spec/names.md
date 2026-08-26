@@ -27,7 +27,8 @@ though std has one: `pkg::ui` is always the package's own module,
 `pkg::` never reaches a std module.) The root names themselves are
 **reserved**: a manifest may not declare a dependency — or a
 `[package] name` — as `std`, `pkg`, or `macro_std` (§11.4), so no
-package can shadow a root or vanish behind one. A module name that
+package can shadow a root or vanish behind one; `vilan`, the language's
+own name, is reserved alongside them (§11.4). A module name that
 resolves both as `name.vl` and `name/lib.vl` is an **ambiguity error**.
 
 A module name must match the on-disk directory entry **byte for byte**: a
