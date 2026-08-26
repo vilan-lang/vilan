@@ -20,8 +20,8 @@ import pkg::fs;
 import pkg::io::panic;
 import pkg::json::{ JsonValue, coerce_bool, coerce_str };
 import pkg::option::Option::{ None, Some, self };
-import pkg::watch::is_watching;
 import pkg::result::Result::{ Err, Ok, self };
+import pkg::watch::is_watching;
 
 /// What one browser leg's build emitted, as the build itself knows it.
 struct LegBuild {
@@ -130,12 +130,7 @@ fun require_build(leg: str): LegBuild {
 /// toolchain writes. Checked rather than coerced: `coerce_str` over an absent
 /// field yields the string `"undefined"`, which would become a route.
 fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, BuildError> {
-	if !manifest.has_field("leg")
-		|| !manifest.has_field("entry")
-		|| !manifest.has_field("styles")
-		|| !manifest.has_field("classic_script")
-		|| !manifest.has_field("chunks")
-	{
+	if !manifest.has_field("leg") || !manifest.has_field("entry") || !manifest.has_field("styles") || !manifest.has_field("classic_script") || !manifest.has_field("chunks") {
 		ret Err(BuildError::Unreadable(path));
 	}
 	let styles = manifest.field("styles");
@@ -147,7 +142,11 @@ fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, B
 		leg = coerce_str(manifest.field("leg")),
 		dist = dist,
 		bundle = coerce_str(manifest.field("entry")),
-		styles = if styles.is_null() { None } else { Some(coerce_str(styles)) },
+		styles = if styles.is_null() {
+			None
+		} else {
+			Some(coerce_str(styles))
+		},
 		chunks = chunks,
 		classic_script = coerce_bool(manifest.field("classic_script")),
 	})
@@ -238,7 +237,8 @@ fun asset_body(asset: BuildAsset): str {
 /// A BUILD and not a directory (`fullstack-dx.md` §5.10): it covers exactly the
 /// kinds a vilan build emits, and an extension it does not name is not served
 /// rather than guessed at. (A directory server would need traversal, caching
-/// and binary reads — and `std::fs` cannot read bytes at all today.)
+/// and guessed content types — deliberately out of scope here, even though
+/// `std::fs` reads bytes now via `read_bytes`.)
 fun content_type_of(file: str): Option<str> {
 	if file.ends_with(".js") || file.ends_with(".mjs") {
 		Some("text/javascript")

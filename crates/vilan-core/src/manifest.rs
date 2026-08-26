@@ -1367,7 +1367,7 @@ fn split_needs_a_browser_leg(key: &str, declared: &str) -> String {
 /// `[library] name = "std"`, likewise macro_std), a context-free validation
 /// cannot tell the owner from an impostor, and a library's own name — unlike
 /// a dependency key — never binds an import root.
-fn reserved_package_name(name: &str) -> Option<&'static str> {
+pub(crate) fn reserved_package_name(name: &str) -> Option<&'static str> {
     match name {
         "std" => Some("the standard library owns it"),
         "pkg" => Some("it always means the importing package's own modules"),

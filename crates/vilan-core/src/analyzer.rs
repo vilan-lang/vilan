@@ -31248,23 +31248,23 @@ impl<'src> Analyzer<'src> {
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {
                 self.binary_op_dispatch.insert(binary_id, method_id);
-                // Monomorphize the operator method against the operand's type args
-                // (`Option<Point> ==` binds the impl's `Option<T>` to `T = Point`) so
-                // a generic element comparison inside the body — e.g. `Option<T>::eq`'s
-                // `x == y` — dispatches to the concrete impl. Only needed when a bound
-                // type is a non-native aggregate; for all-native bindings (e.g.
-                // `Option<i32>`) the generic emission already lowers `==` to native JS.
+                // Record the operand's type-arg bindings whenever there are any
+                // (`Option<Point> ==` binds the impl's `Option<T>` to `T = Point`)
+                // — the same rule `resolve_method_call` applies to an explicit
+                // method call. Whether the emission actually SPECIALIZES against
+                // them is the transformer's decision (`operator_instance_required`,
+                // B135): an all-native binding whose body lowers to native JS
+                // keeps the shared generic emission, but a body that transitively
+                // calls a trait requirement explicitly needs the substitution, or
+                // the call falls through to the requirement's empty body and trips
+                // the emitter's never-silent check.
                 let impl_subject = impl_subject_id.get_type(self);
                 if let Some((_, bindings)) =
                     self.reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
+                    && !bindings.is_empty()
                 {
-                    let needs_specialization = bindings.iter().any(|(_, concrete)| {
-                        !self.is_native_operator_type(&concrete.get_type(self))
-                    });
-                    if needs_specialization {
-                        self.method_call_substitution
-                            .insert(binary_id, bindings.into_iter().collect());
-                    }
+                    self.method_call_substitution
+                        .insert(binary_id, bindings.into_iter().collect());
                 }
             } else if let Some((_member_id, impl_subject_id, trait_id, trait_arguments)) =
                 // Natives never dispatch — native JS IS their operator
@@ -35712,7 +35712,9 @@ pub fn analyze<'src>(
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
-    analyze_inner(
+    let (sanitized, refusals) = drop_reserved_dependency_edges(workspace);
+    let workspace = sanitized.as_ref().unwrap_or(workspace);
+    let mut program = analyze_inner(
         nodes,
         entry_source,
         std,
@@ -35721,7 +35723,74 @@ pub fn analyze<'src>(
         platform,
         workspace,
         true,
-    )
+    );
+    for refusal in refusals {
+        program.diagnostics.push(refusal);
+        program.diagnostic_sources.push(SourceId(0));
+    }
+    program
+}
+
+/// The dependency-edge names the analyzer refuses to register (E88, defensive
+/// since L12). `std` and `pkg` are the world's own import roots: a manifest
+/// declaring either as a dependency key is refused before analysis
+/// ([`crate::manifest::reserved_package_name`], L12), and a [`Workspace`]
+/// built programmatically — wasm, embedders, tests — is held to the same rule
+/// here, at the one funnel every entry path passes through. Pre-refusal the
+/// analyzer bound a `std` edge OVER the standard library
+/// (`resolve_import_root` checks dependency edges first) while the IDE's
+/// completion answered the stdlib and the macro world's `scope_for` did too —
+/// one name, three resolvers, two answers. The offending edge is reported and
+/// DROPPED rather than made fatal: `std::`/`pkg::` keep meaning the roots
+/// they always name, the program still analyzes, and every resolver agrees by
+/// construction because the shape no longer exists past this point.
+/// `macro_std` stays a legal EDGE name at this layer — the macro world itself
+/// stages the macro standard library as one (`macros.rs` builds that
+/// workspace), and it collides with no regular-world root; user manifests
+/// remain refused by L12.
+fn drop_reserved_dependency_edges(workspace: &Workspace) -> (Option<Workspace>, Vec<Error>) {
+    fn refused_root(name: &str) -> bool {
+        matches!(name, "std" | "pkg")
+    }
+    let refusal = |name: &str| {
+        let reason = crate::manifest::reserved_package_name(name)
+            .expect("a refused edge name is a reserved package name");
+        Error {
+            trace: Vec::new(),
+            note: None,
+            span: EMPTY_SPAN,
+            msg: format!(
+                "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
+                 `macro_std` are all reserved); this workspace staged a dependency \
+                 edge named `{name}` — the edge is ignored and `{name}::` keeps \
+                 meaning the root it always names; rename the dependency"
+            ),
+        }
+    };
+    let mut refusals: Vec<Error> = Vec::new();
+    for (name, _) in &workspace.entry_dependencies {
+        if refused_root(name) {
+            refusals.push(refusal(name));
+        }
+    }
+    for spec in &workspace.packages {
+        for (name, _) in &spec.dependencies {
+            if refused_root(name) {
+                refusals.push(refusal(name));
+            }
+        }
+    }
+    if refusals.is_empty() {
+        return (None, refusals);
+    }
+    let mut sanitized = workspace.clone();
+    sanitized
+        .entry_dependencies
+        .retain(|(name, _)| !refused_root(name));
+    for spec in &mut sanitized.packages {
+        spec.dependencies.retain(|(name, _)| !refused_root(name));
+    }
+    (Some(sanitized), refusals)
 }
 
 /// `analyze` with the cache switchable: the derive/macro hoist's fallback —
