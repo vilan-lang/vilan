@@ -157,9 +157,24 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 
 ```vilan,fragment
 fun emit(kind: str, line: str)   // compile-time only: append to a build asset
+fun read(path: str): str         // compile-time only: read a project file
 ```
 
-Callable only from `const` evaluation: it's how `std::style` writes the
-CSS file (`emit("css", rule)`). A browser build with emissions produces
+Both callable only from `const` evaluation — a runtime call path to
+either is a compile error. `emit` is how `std::style` writes the CSS
+file (`emit("css", rule)`). A browser build with emissions produces
 `<entry>.css` beside `<entry>.js` (beside `<entry>.mjs` on a process
 target).
+
+`read` is the channel's input direction: it returns a project file's
+text at build time, so its result can fold into the output —
+`const markdown::parse(asset::read("pages/intro.md"))` bakes a parsed
+page into the bundle as plain data. The path is **relative to the
+package root** (the base imports resolve under, never the process
+working directory); an absolute path or one that escapes the root is
+refused. Every file read becomes a **tracked build input**: `--watch`
+re-runs when one changes (or when a previously missing one appears),
+and an unchanged-source round still recompiles a leg whose read inputs
+changed. A missing file is a compile error at the `const` expression.
+Reads charge the const fuel budget per byte, so the budget bounds input
+size exactly as it bounds computation.

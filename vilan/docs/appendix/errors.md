@@ -616,14 +616,23 @@ draft's next push already does.
 **"`asset::emit` outside a `const` expression"**
 Styles (and other build assets) are constructed at compile time. Build
 the `Style` in a `const` (`let card = const style()…`); select and merge
-already-built styles at runtime.
+already-built styles at runtime. The channel's input direction,
+`asset::read`, is compile-time-only the same way.
 → [Styling](../guide/styling.md), [Macros & const](../tour/macros-and-const.md)
 
 **"… is compile-time-only; evaluate this call inside a `const` expression"**
 The same rule, caught statically: some function on this call path reaches
-`asset::emit`, and the call itself sits in runtime code. The span is the
-outermost runtime crossing — the call that leaves ordinary code and enters
-style-building territory — so wrap *that* call in a `const`.
+`asset::emit` or `asset::read`, and the call itself sits in runtime code.
+The span is the outermost runtime crossing — the call that leaves ordinary
+code and enters compile-time territory — so wrap *that* call in a `const`.
+
+**"cannot read `…` (resolved against the package root to `…`): …"**
+A `const asset::read(path)` found no readable file. Paths are relative
+to the **package root** — the directory imports resolve under, never the
+directory the compiler happens to run from — and the message shows where
+the resolution landed. An absolute path, or one that escapes the package
+root (`../…`), is refused before any read: the file channel reads the
+project, so the build can track every input it depends on.
 
 **"… is compile-time-only; call it directly inside a `const` expression — a
 compile-time-only function has no runtime value form"**

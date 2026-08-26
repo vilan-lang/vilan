@@ -24770,6 +24770,277 @@ fn an_indirect_call_rooted_in_const_stays_legal() {
     assert_eq!(assets, vec![("css".to_string(), ".a{}".to_string())]);
 }
 
+// --- K13 step 2: the const input channel — `asset::read` -----------------------
+// The channel's input direction (docs-port.md §3.3, markdown.md §7): const
+// code reads a project file at build time. Paths resolve against the package
+// root; the file becomes a tracked build input on `program.const_input_files`;
+// a miss is a clean diagnostic at the read site; and `read` is const-only
+// under exactly the machinery that colors `emit`.
+
+/// A clean analysis with an EXPLICIT package root — the `asset::read` pins
+/// point it at a fixture directory (or at the real book) — returning the
+/// folded const values and the recorded read inputs.
+fn const_reads(
+    source: &str,
+    root: &Path,
+) -> (
+    Vec<vilan_core::interpreter::ConstValue>,
+    Vec<(PathBuf, Option<u64>)>,
+) {
+    let source = source.to_string();
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            let program = program.expect("a clean analysis leaves a program");
+            (
+                program.const_results.values().cloned().collect::<Vec<_>>(),
+                program.const_input_files.clone(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn a_const_read_parses_the_books_largest_page_within_budget() {
+    // THE step-2 workload (docs-port.md §2.1 located the wall; this is the
+    // wall coming down): const code reads the book's REAL largest page —
+    // `docs/spec/memory.md`, the golden fixtures' heaviest — and runs
+    // `std::markdown::parse` over it inside const evaluation, within the
+    // measured-and-raised fuel budget (2,001,457 fuel measured at the raise;
+    // this pin goes red if the page or the parser ever outgrows the budget,
+    // which is exactly the honest signal to re-measure). The read lands on
+    // `const_input_files` with a content hash: the file is a tracked build
+    // input, not an untracked ambient dependency.
+    let book_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    let (values, inputs) = const_reads(
+        r#"
+        import std::asset;
+        import std::markdown;
+        import std::result::Result::{ Err, Ok };
+        fun block_count(): i32 {
+            match markdown::parse(asset::read("docs/spec/memory.md")) {
+                Ok(let doc) => doc.blocks.len()
+                Err(let error) => 0 - 1
+            }
+        }
+        fun main() {
+            let _blocks = const block_count();
+        }
+        main();
+        "#,
+        &book_root,
+    );
+    assert_eq!(values.len(), 1, "one folded const: {values:?}");
+    assert!(
+        matches!(values[0], vilan_core::interpreter::ConstValue::Number(n) if n > 0.0),
+        "the page must parse to a positive block count at compile time: {values:?}"
+    );
+    assert_eq!(inputs.len(), 1, "one tracked input: {inputs:?}");
+    assert!(
+        inputs[0].0.ends_with("docs/spec/memory.md") && inputs[0].1.is_some(),
+        "the read must be recorded as a hashed build input: {inputs:?}"
+    );
+}
+
+#[test]
+fn a_missing_read_is_a_clean_diagnostic_at_the_read_site() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("vilan-k13-definitely-missing.md");
+        }
+        main();
+        "#,
+        r#"asset::read("vilan-k13-definitely-missing.md")"#,
+        "cannot read `vilan-k13-definitely-missing.md`",
+    );
+}
+
+#[test]
+fn an_absolute_read_path_is_refused() {
+    // Refused lexically, before any filesystem look: the channel reads THE
+    // PROJECT, so the build can track every input it depends on.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("/etc/hostname");
+        }
+        main();
+        "#,
+        "`asset::read` paths are relative to the package root; `/etc/hostname` is absolute",
+    );
+}
+
+#[test]
+fn a_read_path_escaping_the_package_root_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("../outside.md");
+        }
+        main();
+        "#,
+        "`asset::read` paths resolve inside the package root; `../outside.md` escapes it",
+    );
+}
+
+#[test]
+fn a_runtime_read_is_rejected() {
+    // The const-only bit, same machinery as `emit`'s (const-eval.md §2).
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = asset::read("page.md");
+        }
+        main();
+        "#,
+        r#"asset::read("page.md")"#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_runtime_call_reaching_read_is_rejected_at_the_boundary() {
+    // The R-fixpoint names WHICH builtin the path reaches — a read-reaching
+    // function says `asset::read`, not `asset::emit`.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun page(): str {
+            asset::read("page.md")
+        }
+        fun main() {
+            let _text = page();
+        }
+        main();
+        "#,
+        "`page` (it reaches `asset::read`) is compile-time-only",
+    );
+}
+
+#[test]
+fn a_function_reaching_read_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun page(): str {
+            asset::read("page.md")
+        }
+        fun apply(f: || str): str {
+            f()
+        }
+        fun main() {
+            let _text = apply(page);
+        }
+        main();
+        "#,
+        "no runtime value form",
+    );
+}
+
+#[test]
+fn a_changed_input_is_seen_by_the_next_analysis() {
+    // The invalidation pin: analyze, EDIT THE FILE, analyze again in the same
+    // process — the second analysis must fold the new content. Nothing in the
+    // pipeline (the parse cache, the base cache, the shared const world) may
+    // serve the first read's value for the second analysis; if any cache ever
+    // keys const results without the read inputs, this goes red.
+    let dir = std::env::temp_dir().join(format!("vilan-const-read-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("note.txt");
+        }
+        main();
+        "#;
+    std::fs::write(dir.join("note.txt"), "one").unwrap();
+    let (first, _) = const_reads(source, &dir);
+    assert_eq!(
+        first,
+        vec![vilan_core::interpreter::ConstValue::Str("one".to_string())]
+    );
+    std::fs::write(dir.join("note.txt"), "two").unwrap();
+    let (second, inputs) = const_reads(source, &dir);
+    assert_eq!(
+        second,
+        vec![vilan_core::interpreter::ConstValue::Str("two".to_string())],
+        "the edited input must be seen — a stale read is a correctness bug"
+    );
+    assert!(
+        inputs.len() == 1 && inputs[0].1.is_some(),
+        "the re-read is recorded too: {inputs:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
+    // Reads charge fuel per byte, so the budget bounds input size exactly as
+    // it bounds computation — without this, a read was one fuel tick and the
+    // budget bounded nothing about it.
+    let dir = std::env::temp_dir().join(format!("vilan-const-read-fuel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Comfortably past the explicit fuel budget in bytes.
+    std::fs::write(dir.join("huge.txt"), "a".repeat(17_000_000)).unwrap();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("huge.txt");
+        }
+        main();
+        "#
+    .to_string();
+    let root = dir.clone();
+    let messages = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            errors
+                .into_iter()
+                .map(|error| error.msg)
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        messages.iter().any(|message| message
+            .contains("did not finish within the compile-time budget")
+            && message.contains("the fuel budget was exhausted")),
+        "an oversized read must be a budget miss, with the remedy-naming \
+         diagnostic intact: {messages:#?}"
+    );
+}
+
 // --- A8: std::style — typed atomic styles, compiled ---------------------------
 // The styling system riding const evaluation and the asset channel
 // (proposal/ui-styling.md): builder-chain construction inside `const`, atomic

@@ -215,15 +215,27 @@ impl ConstValue {
     }
 }
 
+/// The compile-time file channel's input direction (docs-port.md §3.3):
+/// `asset::read`'s host. The interpreter knows nothing about paths or
+/// filesystems — the caller (the const pass) supplies resolution, the actual
+/// read, and the build-input recording behind this one method; `Err` is the
+/// complete, user-facing reason a read did not happen.
+pub trait AssetReader {
+    fn read(&self, path: &str) -> Result<String, String>;
+}
+
 /// Everything one const evaluation produced. The result is what the caller
-/// wants; the other three are the interpreter's OBSERVABLE EFFECT channels,
-/// and which of them a caller may ignore is exactly what separates the two
-/// const forms (const-eval.md §9.2).
+/// wants; assets/stdout/exited are the interpreter's OBSERVABLE EFFECT
+/// channels, and which of them a caller may ignore is exactly what separates
+/// the two const forms (const-eval.md §9.2). `fuel_used` is the run's
+/// measured cost — what the `VILAN_PHASE_TIMING` fuel line reports, so the
+/// budget constant can be sized against real workloads instead of estimates.
 struct ConstRun {
     value: ConstValue,
     assets: Vec<(String, String)>,
     stdout: String,
     exited: Option<i32>,
+    fuel_used: u64,
 }
 
 /// Evaluates one const site against the pass's SHARED world (const-eval.md
@@ -240,34 +252,52 @@ fn run_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
     allow_assets: bool,
+    reader: Option<&'a dyn AssetReader>,
 ) -> Result<ConstRun, Failure> {
     check_reach(&site.imports, &site.helpers)?;
     let mut interpreter = Interpreter::new(limits, allow_assets);
+    interpreter.reader = reader;
     let value = interpreter.run_const_site(site);
     // Either arm of `value` is owned plain data (`ConstValue` / `Failure`), and
     // so is everything below — nothing borrows a scope-held `Value` past this
     // point, so the run's scopes and their closure cycles are torn down here,
     // on the error paths as much as the success one (leak-soak.md §7.8).
     interpreter.clear_scopes();
+    let fuel_used = limits.fuel - interpreter.fuel;
     Ok(ConstRun {
         value: value?,
         assets: interpreter.assets,
         stdout: interpreter.stdout,
         exited: interpreter.exited,
+        fuel_used,
     })
 }
 
+/// What [`eval_const`] hands back: the plain-data result, the asset lines the
+/// run emitted, and the fuel it consumed (the budget instrument — read back by
+/// the const pass for the `VILAN_PHASE_TIMING` line).
+pub struct ConstOutcome {
+    pub value: ConstValue,
+    pub assets: Vec<(String, String)>,
+    pub fuel_used: u64,
+}
+
 /// The EXPLICIT `const` form (const-eval.md §1): the asset channel is live —
-/// this is the one context where `asset::emit` runs (§3) — and stdout and
-/// `process::exit` are DISCARDED. That is the contract, not an oversight: the
-/// user asked for this computation to happen at compile time, and printing is
-/// part of the computation that moved.
+/// this is the one context where `asset::emit` and `asset::read` run (§3,
+/// docs-port.md §3.3) — and stdout and `process::exit` are DISCARDED. That is
+/// the contract, not an oversight: the user asked for this computation to
+/// happen at compile time, and printing is part of the computation that moved.
 pub fn eval_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
-) -> Result<(ConstValue, Vec<(String, String)>), Failure> {
-    let run = run_const(site, limits, true)?;
-    Ok((run.value, run.assets))
+    reader: Option<&'a dyn AssetReader>,
+) -> Result<ConstOutcome, Failure> {
+    let run = run_const(site, limits, true, reader)?;
+    Ok(ConstOutcome {
+        value: run.value,
+        assets: run.assets,
+        fuel_used: run.fuel_used,
+    })
 }
 
 /// The INFERRED form (const-eval.md §9.2): the same evaluator under tighter
@@ -281,7 +311,10 @@ pub fn eval_const<'a>(
 ///   silently change a working program's output when someone switched preset.
 ///   The caller turns the refusal into a silent fallback like any other.
 pub fn eval_inferred<'a>(site: &'a ConstSite<'a>, limits: Limits) -> Result<ConstValue, Failure> {
-    let run = run_const(site, limits, false)?;
+    // No reader either: `asset::read` is const-only, so a fold that reaches it
+    // was already refused statically — and the closed channel keeps that true
+    // by construction even for a path the static check cannot see.
+    let run = run_const(site, limits, false, None)?;
     if !run.stdout.is_empty() {
         return Err(Failure::unsupported(
             "output during evaluation (an inferred fold must be observably silent)",
@@ -540,6 +573,11 @@ struct Interpreter<'a> {
     /// `asset::emit` is live only under `eval_const`; anywhere else it is a
     /// capability miss.
     allow_assets: bool,
+    /// `asset::read`'s host (docs-port.md §3.3) — present only under
+    /// `eval_const` with a project to read from. `None` with `allow_assets`
+    /// set means the context has no file channel (the wasm playground outside
+    /// its overlay); the read then fails as a clean capability miss.
+    reader: Option<&'a dyn AssetReader>,
     /// The per-run scope registry (leak-soak.md §7.8): every scope this run
     /// created, weakly held. A hoisted or expression-position function is a
     /// `Value::Closure` whose `env` is the scope holding it — a reference
@@ -562,6 +600,7 @@ impl<'a> Interpreter<'a> {
             exited: None,
             assets: Vec::new(),
             allow_assets,
+            reader: None,
             scopes: Vec::new(),
         }
     }
@@ -695,6 +734,23 @@ impl<'a> Interpreter<'a> {
             ));
         }
         self.fuel -= 1;
+        Ok(())
+    }
+
+    /// A bulk charge for work proportional to data, not to evaluated nodes —
+    /// `asset::read` pays one unit per byte read, so fuel bounds the bytes a
+    /// const evaluation can pull in exactly as it bounds the nodes it can
+    /// run. Draining to zero here still completes the current operation; the
+    /// NEXT node's `charge` reports the exhaustion.
+    fn charge_amount(&mut self, amount: u64) -> Result<(), Failure> {
+        if self.fuel < amount {
+            self.fuel = 0;
+            return Err(Failure::new(
+                FailureKind::Fuel,
+                "the fuel budget was exhausted".to_string(),
+            ));
+        }
+        self.fuel -= amount;
         Ok(())
     }
 
@@ -1357,6 +1413,31 @@ impl<'a> Interpreter<'a> {
                 let line = expect_str(&take(1))?;
                 self.assets.push((kind.to_string(), line.to_string()));
                 Ok(Value::Undefined)
+            }
+            // `asset::read` — the channel's input direction (docs-port.md
+            // §3.3): live only under `eval_const`, like `emit`; resolution,
+            // the read itself, and the build-input recording all live behind
+            // the caller's `AssetReader`. A context with the channel open but
+            // no filesystem (the wasm playground outside its overlay) has no
+            // reader and refuses cleanly. The bytes read are charged as fuel,
+            // so the budget bounds input size exactly as it bounds work.
+            "__read_asset" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::read` outside a `const` expression",
+                    ));
+                }
+                let path = expect_str(&take(0))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported("the project's files (`asset::read`)"));
+                };
+                match reader.read(&path) {
+                    Ok(text) => {
+                        self.charge_amount(text.len() as u64)?;
+                        Ok(Value::Str(text.into()))
+                    }
+                    Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
+                }
             }
             // The checked subscripts, matching the emitted `__at*` helpers: an
             // out-of-bounds index is a panic (`Thrown`), so a macro-time

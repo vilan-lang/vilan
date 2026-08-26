@@ -685,11 +685,12 @@ pub fn post_analysis_passes(
     // transform time, failures are ordinary diagnostics. Runs here so
     // `check`, the LSP, and every build path agree.
     let phase_const_start = PhaseClock::now();
-    let (const_results, const_assets, const_errors) =
+    let (const_results, const_assets, const_errors, const_input_files) =
         const_eval::evaluate(program, options, &call_graph);
     let phase_const = phase_const_start.elapsed();
     program.const_results = const_results;
     program.const_assets = const_assets;
+    program.const_input_files = const_input_files;
     for (error, source) in const_errors {
         program.push_diagnostic(error, source);
     }
@@ -726,7 +727,7 @@ pub fn post_analysis_passes(
             "[vilan phase] post-passes {:.1}ms call-graph {:.1}ms async-infer {:.1}ms \
              view-suspensions {:.1}ms async-drops {:.1}ms context-drops {:.1}ms \
              platform-color {:.1}ms const-eval {:.1}ms const-lower {:.1}ms \
-             const-interp {:.1}ms init-order {:.1}ms",
+             const-interp {:.1}ms const-fuel-max {} init-order {:.1}ms",
             milliseconds(phase_post_start.elapsed()),
             milliseconds(phase_graph),
             milliseconds(phase_async),
@@ -737,6 +738,7 @@ pub fn post_analysis_passes(
             milliseconds(phase_const),
             milliseconds(const_lower),
             milliseconds(const_interp),
+            const_eval::max_fuel_used(),
             milliseconds(phase_init),
         );
     }
