@@ -5858,6 +5858,85 @@ pub(crate) mod tests {
         );
     }
 
+    // --- kolt.local 001: the cursor-context classifier, its open faces ------
+    //
+    // One recurring class: completion decides what to offer from the cursor's
+    // surroundings, and that decision is blind to the TRIVIA around the dot.
+    // E66 and E67 above fixed two earlier faces of the same classifier; the
+    // item asks for one cursor-context model rather than more symptom patches,
+    // so each face is pinned by name and the general fix un-ignores them
+    // together.
+    //
+    // The prelude is E66's on purpose: the same `Point` (field `x`, method
+    // `twin`) the fixed faces resolve against, so a red here is the CLASSIFIER
+    // and not the type resolution E66 already closed.
+    //
+    // Note the class cuts BOTH ways, which is the item's real point — the same
+    // blindness offers nothing where it should offer members, and offers the
+    // whole scope where it should offer nothing.
+
+    // (a) The `.` starts the next line — the ordinary way a long method chain
+    // is written. Observed: no candidates at all.
+    #[test]
+    #[ignore = "kolt.local 001: member completion does not fire when the `.` starts the next line (the classifier is blind to trivia between receiver and dot)"]
+    fn member_completion_fires_when_the_dot_starts_the_next_line() {
+        let labels = call_receiver_completions("\tlet p = make();\n\tp\n\t\t.|\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+    }
+
+    // (a, second shape) The same trivia blindness on ONE line: a space between
+    // the receiver and the dot. Observed: the classifier does not read this as
+    // a member position at all and offers the entire scope — 80 candidates,
+    // every type and keyword in it — where it should offer three members. Found
+    // while pinning the face above; it is the same fault, so it rides the same
+    // fix.
+    #[test]
+    #[ignore = "kolt.local 001: a space before the `.` is not read as a member position — the classifier offers the whole scope instead of the receiver's members"]
+    fn member_completion_fires_when_a_space_precedes_the_dot() {
+        let labels = call_receiver_completions("\tlet p = make();\n\tp . |\n");
+        assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+        assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+        assert!(
+            !labels.contains(&"str".to_string()),
+            "a member position offers members, not the scope: {labels:?}"
+        );
+    }
+
+    // (b) Between two dots (`a.|.b`). The item lists this as a third open face;
+    // it does NOT reproduce — every shape tried (a call receiver, a trailing
+    // dot, a field or a method after the cursor, a partial name before it)
+    // resolves the members correctly. Pinned GREEN rather than dropped, so the
+    // face is covered by name and a regression is caught: what follows the
+    // cursor must not change what the cursor IS.
+    #[test]
+    fn member_completion_fires_between_two_dots() {
+        for body in [
+            "\tlet p = make();\n\tp.|.twin();\n",
+            "\tlet p = make();\n\tp.|.x;\n",
+            "\tmake().|.twin();\n",
+        ] {
+            let labels = call_receiver_completions(body);
+            assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
+            assert!(labels.contains(&"twin".to_string()), "methods: {labels:?}");
+        }
+    }
+
+    // (c) The same classifier failing the other way: inside a string body there
+    // is no code position, so there is nothing to offer. Observed: the whole
+    // scope, functions included.
+    #[test]
+    #[ignore = "kolt.local 001: function suggestions appear inside a string body — the classifier over-triggers where there is no code position"]
+    fn no_completion_inside_a_string_body() {
+        let labels = call_receiver_completions("\tlet caption = \"make |\";\n");
+        for function in ["make", "echo", "find", "twin"] {
+            assert!(
+                !labels.contains(&function.to_string()),
+                "`{function}` is code, and the cursor is inside a string: {labels:?}"
+            );
+        }
+    }
+
     // --- E67: an element's opening tag (editing-dx.md §18) ------------------
 
     /// The prelude the element-head pins share.
