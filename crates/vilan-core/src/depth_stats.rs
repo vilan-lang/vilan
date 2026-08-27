@@ -59,6 +59,8 @@ thread_local! {
         const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
     static PEAK_BYTES: [Cell<usize>; FAMILY_COUNT] =
         const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
+    static CALLS: [Cell<u64>; FAMILY_COUNT] =
+        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
     static BASELINE_SP: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -126,6 +128,10 @@ pub(crate) fn note(family: usize, depth: usize) {
     if !enabled() {
         return;
     }
+    CALLS.with(|calls| {
+        let cell = &calls[family];
+        cell.set(cell.get().saturating_add(1));
+    });
     PEAK.with(|peaks| {
         let peak = &peaks[family];
         if depth > peak.get() {
@@ -147,6 +153,7 @@ pub(crate) fn reset() {
     }
     PEAK.with(|peaks| peaks.iter().for_each(|cell| cell.set(0)));
     PEAK_BYTES.with(|bytes| bytes.iter().for_each(|cell| cell.set(0)));
+    CALLS.with(|calls| calls.iter().for_each(|cell| cell.set(0)));
     BASELINE_SP.with(|cell| cell.set(approximate_sp()));
 }
 
@@ -164,13 +171,15 @@ pub(crate) fn report() {
     }
     let peaks = PEAK.with(|peaks| peaks.each_ref().map(Cell::get));
     let bytes = PEAK_BYTES.with(|bytes| bytes.each_ref().map(Cell::get));
+    let calls = CALLS.with(|calls| calls.each_ref().map(Cell::get));
     let mut line = String::from("[vilan depth]");
     for family in 0..FAMILY_COUNT {
         line.push_str(&format!(
-            " {} {} {:.2}MiB",
+            " {} {} {:.2}MiB x{}",
             FAMILY_NAMES[family],
             peaks[family],
             bytes[family] as f64 / (1024.0 * 1024.0),
+            calls[family],
         ));
     }
     eprintln!("{line}");

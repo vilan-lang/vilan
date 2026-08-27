@@ -52,6 +52,8 @@
 //! `resource`-misplaced steer). Ugly-but-reproduced behaviours are recorded for
 //! the S4/S5 error-quality pass, not fixed. The differential is the referee.
 
+use std::cell::Cell;
+
 use crate::lexing;
 use crate::node::{
     BackingLiteral, BinaryOp, Closure, Convention, ElementBody, ElementChild, ElementHeadItem,
@@ -359,6 +361,31 @@ struct Parser<'a, 'src> {
     /// enclosing parse path that produced it survives — chumsky's "errors on the
     /// successful branch are kept" behavior.
     errors: Vec<ParseError>,
+    /// Per token position, whether an assignment operator is still REACHABLE as
+    /// the operator of an assignment whose place starts there: one occurs later
+    /// at the same bracket depth, before the enclosing bracket group closes and
+    /// before a `;` ends the statement.
+    ///
+    /// [`Parser::parse_assignment`] speculatively parses a whole precedence
+    /// chain to discover whether an assignment operator follows it, and throws
+    /// that chain away when none does. Because it is tried before the operator
+    /// tower — which then parses the SAME text again — every expression that
+    /// re-enters `parse_expression` inside a bracket pays for its own subtree
+    /// TWICE, once per level: `C(n) = 2·C(n-1)`, i.e. 2^n for nested
+    /// parentheses or array literals. `(1 + (1 + …))` at 20 levels took 9.0s in
+    /// the parser alone (B140), which is why nested arithmetic looked like an
+    /// analyzer bug — the analyzer's own phases stayed flat.
+    ///
+    /// A place is a BALANCED token run, so its operator is always at the same
+    /// bracket depth the place started at; if no such operator is reachable the
+    /// attempt cannot succeed and is skipped, and the tower's parse is the only
+    /// one. Computed once per parse in one backward pass, read in O(1).
+    ///
+    /// `,` is deliberately NOT a barrier even though it separates arguments:
+    /// generic arguments (`::<A, B>`) put a comma at bracket depth zero inside
+    /// a place, so barring it there would skip a real assignment. Missing a
+    /// barrier only costs a declined attempt; a wrong one loses a parse.
+    assignment_reachable: Vec<bool>,
     /// The farthest point any attempt reached before it could not proceed — the
     /// location and (curated) expectations for the top-level decline diagnostic.
     /// The standard recursive-descent heuristic: a speculative alternative that
@@ -509,6 +536,83 @@ fn is_known_attribute_marker(name: &str) -> bool {
     KNOWN_ATTRIBUTE_MARKERS.contains(&name)
 }
 
+thread_local! {
+    /// How many atoms ([`Parser::parse_atom`]) this thread's parser has entered
+    /// — the parser's unit of real work, and what speculative re-parsing
+    /// multiplies. See [`atom_parse_count`].
+    static ATOM_PARSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The number of expression atoms this thread's parser has entered — an
+/// instrumentation probe (B140), not a behavior surface, in the shape of
+/// [`crate::formatter::buffer_parse_count`]: monotonic, read as a snapshot
+/// difference around the work under test.
+///
+/// It exists because the cost this pins is INVISIBLE to wall-clock at the sizes
+/// a test may use and astronomical just past them. `parse_assignment` used to
+/// parse a whole precedence chain speculatively and discard it, so every
+/// bracket level parsed its own subtree twice and the atom count doubled per
+/// level; `(1 + (1 + …))` at 20 levels cost 9.0s in the parser alone. A wall
+/// ceiling would catch that, but it would NOT catch a regression to merely
+/// quadratic — which this counter does, because the count is compared against a
+/// line in the nesting depth rather than against a clock. Counting is
+/// unconditional (one thread-local increment per atom, noise against a parse)
+/// so the pin needs no environment plumbing: a `OnceLock`-cached switch would
+/// have to be set before the process's first parse.
+pub fn atom_parse_count() -> u64 {
+    ATOM_PARSES.with(Cell::get)
+}
+
+/// Whether `symbol` is one of the six assignment operators `parse_assignment`
+/// accepts after a place.
+fn is_assignment_operator(symbol: &str) -> bool {
+    matches!(symbol, "=" | "+=" | "-=" | "*=" | "/=" | "%=")
+}
+
+/// The [`Parser::assignment_reachable`] table: for every token position, whether
+/// an assignment operator follows it at the SAME bracket depth, within the same
+/// bracket group and the same `;`-terminated statement.
+///
+/// One backward pass with a stack of per-depth flags. Read right-to-left a
+/// CLOSING bracket opens a deeper region (push a fresh flag) and an OPENING one
+/// ends it (pop); a `;` clears the current depth's flag because no place may
+/// span a statement terminator; an assignment operator sets it. The answer for a
+/// position is the flag standing after that position's own token is folded in,
+/// which makes the table conservative at the operator itself (a place is never
+/// empty, so that entry only costs a declined attempt).
+fn assignment_reachable(tokens: &[Spanned<Token<'_>>]) -> Vec<bool> {
+    // One past the end so a cursor sitting at EOF reads `false` without a bounds
+    // check at every call site.
+    let mut table = vec![false; tokens.len() + 1];
+    let mut depths: Vec<bool> = vec![false];
+    for (index, (token, _span)) in tokens.iter().enumerate().rev() {
+        match token {
+            Token::Ctrl(')' | ']' | '}') => depths.push(false),
+            Token::Ctrl('(' | '[' | '{') => {
+                depths.pop();
+                // Unbalanced source (the parser still runs on a recovered tree):
+                // never leave the stack empty.
+                if depths.is_empty() {
+                    depths.push(false);
+                }
+            }
+            Token::Ctrl(';') => {
+                if let Some(flag) = depths.last_mut() {
+                    *flag = false;
+                }
+            }
+            Token::Op(symbol) if is_assignment_operator(symbol) => {
+                if let Some(flag) = depths.last_mut() {
+                    *flag = true;
+                }
+            }
+            _ => {}
+        }
+        table[index] = depths.last().copied().unwrap_or(false);
+    }
+    table
+}
+
 impl<'a, 'src> Parser<'a, 'src> {
     fn new(
         tokens: &'a [Spanned<Token<'src>>],
@@ -521,6 +625,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             source,
             eoi: source.len(),
             errors: Vec::new(),
+            assignment_reachable: assignment_reachable(tokens),
             farthest_failure: None,
             context_stack: Vec::new(),
             preserve_paren_groups,
@@ -1976,6 +2081,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// in expression position (the bare-name alternative always wins), matching the
     /// chumsky choice, so it is omitted.
     fn parse_atom(&mut self) -> Option<Spanned<Node<'src>>> {
+        ATOM_PARSES.with(|count| count.set(count.get().saturating_add(1)));
         if let Some(literal) = self.parse_literal() {
             return Some(literal);
         }
@@ -2723,6 +2829,13 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// assignment operator follows the place, so an ordinary expression is left to
     /// the operator tower.
     fn parse_assignment(&mut self) -> Option<Spanned<Node<'src>>> {
+        // No assignment operator is reachable from here, so the speculative
+        // place parse below could only ever be thrown away — and throwing it
+        // away is what makes nested expressions exponential (the
+        // `assignment_reachable` field doc has the measurement).
+        if !self.assignment_reachable[self.position.min(self.tokens.len())] {
+            return None;
+        }
         self.attempt(|parser| {
             let start = parser.position;
             let deref = parser.eat_op("*");
