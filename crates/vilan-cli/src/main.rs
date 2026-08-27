@@ -960,7 +960,23 @@ fn hmr_round(
     }
 
     match &decision.push {
-        Some(hmr::Push::Swap) => channel.push("swap", None),
+        // The swap carries this round's COMPLETE browser stylesheet set. A swap
+        // re-evaluates the bundle without reloading the document (hmr.md §3),
+        // so without this nothing in the round refreshes the page's stylesheets
+        // — a round that changed a bundle AND its sidecar dropped the sidecar,
+        // and a sidecar that appeared or vanished had no way to reach the page
+        // at all (kolt.local 007). `state.legs` is this round's legs (assigned
+        // above), so an absent name is the round's own statement that it emits
+        // no stylesheet for that leg.
+        Some(hmr::Push::Swap) => {
+            let sheets: Vec<String> = state
+                .legs
+                .iter()
+                .filter(|leg| leg.is_browser && leg.css.is_some())
+                .map(|leg| format!("{}.css", leg.name))
+                .collect();
+            channel.push_swap(&sheets);
+        }
         Some(hmr::Push::Css(assets)) => {
             for asset in assets {
                 channel.push_css(asset);
@@ -2601,6 +2617,7 @@ fn write_chunks(
     // build that wrote a manifest where this one will not (a leg retargeted off
     // the browser) is, and the sweep takes it.
     sweep_stale_chunks(output_js, chunks, is_browser);
+    sweep_stale_sidecar(output_js, styles);
     for chunk in chunks {
         let path = directory.join(&chunk.file);
         if let Err(error) = fs::write(&path, &chunk.source) {
@@ -2725,6 +2742,35 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], write
                 entry.path().display()
             );
         }
+    }
+}
+
+/// Removes `<leg>.css` when this build wrote none — the style sidecar's half of
+/// the doctrine [`sweep_stale_chunks`] already enforces for chunks: the leg's
+/// dist namespace belongs to its LAST build (`bundle-splitting.md` §S3, item 4).
+/// `styles` is what [`write_assets`] just wrote for this leg, so `None` means
+/// the source stopped emitting `css` — and a sidecar that outlives the source
+/// that emitted it is exactly the lie a `chunks.json` outliving its chunks is:
+/// the manifest beside it says `"styles": null` while the file sits there, a
+/// server probing the filesystem finds a stylesheet the build did not produce,
+/// and under `--watch` the dev channel keeps serving it (kolt.local 007 — the
+/// browser then RE-INJECTS the deleted stylesheet, which is resurrection, not
+/// staleness). A failed removal is reported and otherwise ignored, exactly as
+/// the chunk sweep treats a stray.
+fn sweep_stale_sidecar(output_js: &std::path::Path, styles: Option<&str>) {
+    if styles.is_some() {
+        return;
+    }
+    let sidecar = output_js.with_extension("css");
+    if !sidecar.is_file() {
+        return;
+    }
+    if let Err(error) = fs::remove_file(&sidecar) {
+        eprintln!(
+            "{} cannot remove the stale stylesheet {}: {error}",
+            paint::warning_prefix(),
+            sidecar.display()
+        );
     }
 }
 

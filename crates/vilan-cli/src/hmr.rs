@@ -285,10 +285,29 @@ impl DevChannel {
     }
 
     /// Pushes one round event to every connected client. `message` is carried
-    /// only by `error` events; `swap`/`reload` carry neither a message nor an
-    /// asset. A `css` event names its sidecar — use [`DevChannel::push_css`].
+    /// only by `error` events; `reload` carries neither a message nor an asset.
+    /// A `css` event names its sidecar — use [`DevChannel::push_css`]; a `swap`
+    /// declares the round's stylesheet set — use [`DevChannel::push_swap`].
     pub fn push(&self, kind: &str, message: Option<&str>) {
         self.broadcast(&event_json(kind, self.version(), message, None));
+    }
+
+    /// Pushes a `swap` event carrying `sheets` — the round's COMPLETE browser
+    /// stylesheet set (`["client.css"]`, or `[]` when this round emits none).
+    ///
+    /// A swap re-evaluates the bundle; it does not reload the document
+    /// (hmr.md §3), so nothing else in the round would refresh the page's
+    /// stylesheets — which is why a round that changes a bundle AND its sidecar
+    /// used to drop the sidecar on the floor, and why a sidecar that appeared or
+    /// vanished (a presence transition, [`classify`]) has no other way to reach
+    /// the page. The set is complete rather than a delta so the shim can
+    /// RECONCILE against it: a name present is fetched and applied, and its own
+    /// leg's sidecar being ABSENT is the authoritative statement that this round
+    /// emits no stylesheet for it. That statement comes from the round, never
+    /// from a failed fetch — a 404 stays ambiguous and stays governed by the
+    /// never-reload discipline (warn, change nothing).
+    pub fn push_swap(&self, sheets: &[String]) {
+        self.broadcast(&swap_event_json(self.version(), sheets));
     }
 
     /// Pushes a `css` hot-swap event naming the changed sidecar file
@@ -325,6 +344,19 @@ pub fn event_json(kind: &str, version: u64, message: Option<&str>, asset: Option
     }
     body.push('}');
     body
+}
+
+/// A `swap` event's JSON body: `{"kind":"swap","version":N,"sheets":[..]}`,
+/// where `sheets` is the round's complete browser stylesheet set
+/// ([`DevChannel::push_swap`]). Always present, `[]` included — an empty set is
+/// a statement ("this round emits no stylesheet"), not an omission.
+pub fn swap_event_json(version: u64, sheets: &[String]) -> String {
+    let names = sheets
+        .iter()
+        .map(|sheet| format!("\"{}\"", escape_json(sheet)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"kind\":\"swap\",\"version\":{version},\"sheets\":[{names}]}}")
 }
 
 /// Escapes a string for embedding in a JSON string literal (the diagnostic text
@@ -705,12 +737,17 @@ pub fn round_forces_full(first_round: bool, prior_failed: bool, manifest_changed
 /// What the browser is told changed this round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Push {
-    /// A browser bundle changed — reload (S1) / state-preserving swap (S2).
+    /// The leg's browser OUTPUT SET changed — a new bundle, or a stylesheet
+    /// sidecar that appeared or vanished. Reload (S1) / state-preserving swap
+    /// (S2), and the event carries the round's stylesheet set so the shim
+    /// reconciles the page's sheets with it ([`DevChannel::push_swap`]).
     Swap,
-    /// Only CSS sidecar(s) changed — hot-swap those stylesheets, no reload. The
-    /// payload names the changed sidecar files (`client.css`), so the shim bumps
-    /// only the matching `<link>`s (hmr.md §2); a multi-browser-leg workspace
-    /// thus refreshes exactly the stylesheet that changed.
+    /// No bundle changed and no sidecar appeared or vanished, but the TEXT of a
+    /// stylesheet the page already loads is different — hot-swap those
+    /// stylesheets, no reload. The payload names the changed sidecar files
+    /// (`client.css`), so the shim refreshes only the matching sheets
+    /// (hmr.md §2); a multi-browser-leg workspace thus refreshes exactly the
+    /// stylesheet that changed.
     Css(Vec<String>),
 }
 
@@ -732,9 +769,17 @@ pub struct RoundDecision {
 ///   the client legs); a server-only change pushes nothing — K6 reconnect carries
 ///   the client across the restart;
 /// - **browser bundle changed** → `swap`, and a version bump;
-/// - **no bundle changed but a browser CSS sidecar changed** → `css`, naming the
-///   changed sidecars;
+/// - **no bundle changed, but a browser CSS sidecar's TEXT changed** → `css`,
+///   naming the changed sidecars;
+/// - **no bundle changed, but a browser CSS sidecar APPEARED or VANISHED** →
+///   `swap`, and a version bump — a presence transition changes what the page
+///   must load, which is a browser-output change, not the in-place replacement
+///   of a loaded sheet's text that a `css` push describes (kolt.local 007);
 /// - **nothing changed** → nothing, no restart.
+///
+/// The css axis is therefore classified by TRANSITION (`None`→`Some`,
+/// `Some`→`Some'`, `Some`→`None`), never by a bare `old.css != leg.css` bit:
+/// that bit conflates all three, and two of the three are not hot-swaps.
 ///
 /// `server_leg` is the ONE Node leg this `run --watch` executes (A15 entry
 /// selection): a non-selected Node leg's bundle change drives no restart, because
@@ -760,10 +805,15 @@ pub fn classify(
     let is_server = |name: &str| server_leg == Some(name);
     let mut server_changed = false;
     let mut browser_changed = false;
-    // The changed browser CSS sidecars, named for the `css` event so the shim
-    // bumps exactly the matching `<link>`s (a node leg's CSS, if any, is not
-    // linked by the page, so only browser sidecars participate).
+    // The browser CSS sidecars whose TEXT changed, named for the `css` event so
+    // the shim refreshes exactly the matching sheets (a node leg's CSS, if any,
+    // is not linked by the page, so only browser sidecars participate). A
+    // sidecar that appeared or vanished is NOT one of these — see below.
     let mut changed_css: Vec<String> = Vec::new();
+    // A browser leg whose sidecar appeared or vanished this round. Folded into
+    // `browser_changed` after the loop below rather than inside it, because
+    // `note_bundle_change` holds that flag mutably for the loop's duration.
+    let mut css_presence_changed = false;
     let mut note_bundle_change = |leg: &LegArtifact| {
         if leg.is_browser {
             browser_changed = true;
@@ -777,19 +827,38 @@ pub fn classify(
                 if old.bundle != leg.bundle {
                     note_bundle_change(leg);
                 }
-                if old.css != leg.css && leg.is_browser {
-                    changed_css.push(format!("{}.css", leg.name));
+                if leg.is_browser {
+                    match (&old.css, &leg.css) {
+                        // TEXT CHANGED — the page already loads this sheet and
+                        // the bytes behind it differ. The one transition a `css`
+                        // push describes completely: replace the text in place.
+                        (Some(before), Some(now)) if before != now => {
+                            changed_css.push(format!("{}.css", leg.name));
+                        }
+                        // PRESENCE CHANGED — the sheet appeared (a first-ever
+                        // stylesheet) or vanished. What changed is the SET of
+                        // this leg's browser outputs, not the text of a loaded
+                        // sheet, so it is a browser-output change like any
+                        // other: `swap`, with the version bump that carries.
+                        // (A `css` push naming a vanished sidecar would be
+                        // worse than useless — there is no current text to push
+                        // at all, and the shim would re-apply whatever last
+                        // round left on disk.)
+                        (None, Some(_)) | (Some(_), None) => css_presence_changed = true,
+                        // Absent both rounds, or byte-identical: nothing.
+                        _ => {}
+                    }
                 }
             }
-            // A newly-appearing leg is a change of its class.
+            // A newly-appearing leg is a change of its class — a browser leg
+            // thus swaps, which already subsumes whatever sidecar it brought
+            // with it (there is no previous round of this leg to hot-swap).
             None => {
                 note_bundle_change(leg);
-                if leg.css.is_some() && leg.is_browser {
-                    changed_css.push(format!("{}.css", leg.name));
-                }
             }
         }
     }
+    browser_changed |= css_presence_changed;
     // A leg that vanished between rounds is likewise a change of its class.
     for old in previous {
         if !next.iter().any(|leg| leg.name == old.name) {
@@ -1461,6 +1530,10 @@ mod tests {
         );
     }
 
+    /// kolt.local 007's matrix, **classifier layer**, cell (changed):
+    /// `Some` -> `Some'`. The page already loads this sheet and the bytes
+    /// behind it differ — the one transition a `css` push describes
+    /// completely, and the only one that stays a `css` push.
     #[test]
     fn css_only_change_pushes_css_without_restart() {
         let previous = round("s0", "c0", Some(".a{}"));
@@ -1499,10 +1572,15 @@ mod tests {
     /// browser cannot patch this in place" — `swap`, carrying the version bump
     /// every other browser-output change carries.
     ///
-    /// TODAY: `Push::Css(["client.css"])` with no bump — the classifier's css
-    /// line only asks `old.css != leg.css`, never whether either side is `None`.
+    /// FIXED (Order 15): the css axis is classified by TRANSITION, not by a
+    /// bare `old.css != leg.css` bit — that bit conflated all three transitions
+    /// and two of them are not hot-swaps. The `swap` this now pushes carries
+    /// the round's stylesheet set ([`DevChannel::push_swap`]), which is how the
+    /// new sheet reaches a page that has no `<link>` for it.
+    ///
+    /// kolt.local 007's matrix, **classifier layer**, cell (new):
+    /// `None` -> `Some`.
     #[test]
-    #[ignore = "kolt.local 007 (open): a first-ever stylesheet is still classified as a `css` hot-swap, and the shim has no `<link>` to supersede — the push lands nowhere"]
     fn a_first_ever_stylesheet_is_not_a_css_hot_swap() {
         let previous = round("s0", "c0", None);
         let next = round("s0", "c0", Some(".a{}"));
@@ -1538,9 +1616,16 @@ mod tests {
     /// a stylesheet hot-swap — `swap` plus the bump. A `css` push naming a
     /// sidecar this round did not produce is never right, whatever is on disk.
     ///
-    /// TODAY: `Push::Css(["client.css"])` with no bump.
+    /// FIXED (Order 15) at both ends: the classifier pushes `swap` declaring
+    /// the round's stylesheet set — which no longer names `client.css`, so the
+    /// shim withdraws the page's copy — and `main.rs`'s `sweep_stale_sidecar`
+    /// deletes `dist/client.css`, so there are no stale bytes left to serve
+    /// either (pinned end to end by `tests/hmr.rs`'s
+    /// `a_removed_stylesheet_leaves_no_sidecar_and_declares_none`).
+    ///
+    /// kolt.local 007's matrix, **classifier layer**, cell (removed):
+    /// `Some` -> `None`.
     #[test]
-    #[ignore = "kolt.local 007 (open): a removed stylesheet is still classified as a `css` hot-swap of a sidecar main.rs never deletes, so the browser re-injects the stale bytes"]
     fn a_removed_stylesheet_is_not_a_css_hot_swap() {
         let previous = round("s0", "c0", Some(".a{}"));
         let next = round("s0", "c0", None);
@@ -1551,6 +1636,96 @@ mod tests {
                 push: Some(Push::Swap),
                 bump_version: true,
             }
+        );
+    }
+
+    /// kolt.local 007's matrix, **classifier layer**, cell (absent both
+    /// rounds): a browser leg that has never emitted a stylesheet says nothing
+    /// about stylesheets. The empty cell, pinned so the transition match can
+    /// never grow a fourth arm that fires on `(None, None)`.
+    #[test]
+    fn a_leg_that_never_had_a_stylesheet_pushes_nothing() {
+        let previous = round("s0", "c0", None);
+        let next = round("s0", "c0", None);
+        assert_eq!(
+            classify(&previous, &next, Some("server")),
+            RoundDecision {
+                restart_server: false,
+                push: None,
+                bump_version: false,
+            }
+        );
+    }
+
+    /// kolt.local 007's matrix, **classifier layer**, the leg axis: only
+    /// BROWSER sidecars participate. A node leg's css is not linked by any
+    /// page, so its appearing is neither a `css` push nor a `swap` — the
+    /// browser's output set did not change.
+    #[test]
+    fn a_node_legs_stylesheet_transition_is_no_browser_push() {
+        let previous = vec![
+            leg("server", false, "s0", None),
+            leg("client", true, "c0", Some(".a{}")),
+        ];
+        let next = vec![
+            leg("server", false, "s0", Some(".server{}")),
+            leg("client", true, "c0", Some(".a{}")),
+        ];
+        assert_eq!(
+            classify(&previous, &next, Some("server")),
+            RoundDecision {
+                restart_server: false,
+                push: None,
+                bump_version: false,
+            }
+        );
+    }
+
+    /// kolt.local 007's matrix, **classifier layer**, cell (a leg appears): a
+    /// browser leg with no previous round has no loaded sheet to hot-swap, so
+    /// its whole output — bundle and sidecar alike — arrives as one `swap`,
+    /// which the reconcile then carries the sidecar in. (The rank rule already
+    /// made this cell `swap`; it is pinned so the transition match cannot
+    /// quietly acquire a leg-appears arm of its own.)
+    #[test]
+    fn a_new_browser_leg_swaps_and_names_no_sidecar() {
+        let previous = vec![leg("server", false, "s0", None)];
+        let next = vec![
+            leg("server", false, "s0", None),
+            leg("client", true, "c0", Some(".a{}")),
+        ];
+        assert_eq!(
+            classify(&previous, &next, Some("server")),
+            RoundDecision {
+                restart_server: false,
+                push: Some(Push::Swap),
+                bump_version: true,
+            }
+        );
+    }
+
+    /// A `swap` event declares the round's COMPLETE browser stylesheet set, so
+    /// the shim can reconcile against it (hmr.md §2 amendment): a swap
+    /// re-evaluates the bundle without reloading the document, so nothing else
+    /// in the round would refresh the page's stylesheets.
+    #[test]
+    fn a_swap_event_declares_the_rounds_stylesheet_set() {
+        assert_eq!(
+            swap_event_json(7, &["client.css".to_string(), "admin.css".to_string()]),
+            "{\"kind\":\"swap\",\"version\":7,\"sheets\":[\"client.css\",\"admin.css\"]}"
+        );
+    }
+
+    /// The removal cell's wire half: an EMPTY set is a statement, not an
+    /// omission — "this round emits no stylesheet" — and it is the only thing
+    /// that tells the shim to withdraw the page's copy. A failed fetch never
+    /// says that (it stays governed by the never-reload discipline), so the
+    /// field must always be present, `[]` included.
+    #[test]
+    fn a_swap_that_emits_no_stylesheet_declares_an_empty_set() {
+        assert_eq!(
+            swap_event_json(9, &[]),
+            "{\"kind\":\"swap\",\"version\":9,\"sheets\":[]}"
         );
     }
 
@@ -1582,15 +1757,26 @@ mod tests {
         );
     }
 
+    /// kolt.local 007's matrix, **classifier layer**, the rank rule: when the
+    /// browser bundle AND its css both change, the event is `swap`, not `css`.
+    ///
+    /// The reason recorded here in S1 — "a reload subsumes the stylesheet
+    /// refresh" — died when S2 made a swap a MODULE swap rather than a document
+    /// reload: nothing about re-evaluating a bundle refreshes a stylesheet. So
+    /// the swap must carry the round's stylesheet set with it, and this cell
+    /// pins the rank only; `hmr_css_matrix.rs`'s `swap: declares` cells pin
+    /// that the css actually lands.
     #[test]
     fn a_bundle_change_outranks_a_simultaneous_css_change() {
-        // When the browser bundle AND its css both change, the event is `swap`
-        // (a reload subsumes the stylesheet refresh), not `css`.
         let previous = round("s0", "c0", Some(".a{}"));
         let next = round("s0", "c1", Some(".b{}"));
         assert_eq!(
-            classify(&previous, &next, Some("server")).push,
-            Some(Push::Swap)
+            classify(&previous, &next, Some("server")),
+            RoundDecision {
+                restart_server: false,
+                push: Some(Push::Swap),
+                bump_version: true,
+            }
         );
     }
 
