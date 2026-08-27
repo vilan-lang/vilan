@@ -33,6 +33,14 @@ import pkg::ws::{ WsEvent, WsParser, binary_frame, close_frame, pong_frame, text
 
 external struct Hash;
 
+/// Synchronous, and the one place in std where the usual claim for a sync
+/// binding is actually TRUE: the handshake runs inside `upgrade_handler`, whose
+/// type is `|NodeRequest, NodeSocket, Bytes| void` (`std::http`) — a plain
+/// closure, not an `async` one — so `accept_socket` and everything it calls
+/// genuinely cannot suspend. `std::crypto` is "async where the host is"
+/// (WebCrypto's `subtle.digest` returns a promise); this binding diverges from
+/// that on purpose, because the non-async upgrade channel leaves it no choice.
+/// If that channel ever goes `async`, this is the reason to revisit.
 [extern("node:crypto", "createHash")]
 external fun create_hash(algorithm: str): Hash;
 

@@ -172,9 +172,8 @@ side: [Services & RPC](../guide/services.md) and the
 ## std::fs
 
 ```vilan,fragment
-fun exists(path: str): bool                     // sync
+fun exists(path: str): bool                     // sync — the one blocking call here
 fun read_file_to_str(path: str): str            // async, UTF-8
-fun read_file_to_str_sync(path: str): str       // sync, UTF-8 — blocks the event loop
 fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
 fun write_file(path: str, contents: str)        // async
@@ -193,9 +192,16 @@ host-side on any failure, missing path included — the same posture
 `read_file_to_str` always had. `stat` alone is a non-throwing probe: it
 exists to let a caller ask "is this here yet, and what does it look like"
 (a poller's use case), so a missing path is `None`, not a thrown exception.
-Prefer the async read; the sync one exists for a read that must complete
-inside a callback that cannot suspend — `serve_build`'s dev-mode
-revalidation is the case it was added for.
+
+There is no synchronous read. There used to be one, justified by a caller
+that could not suspend; no such caller existed, so it is gone. Async *is*
+the calling convention here — `read_file_to_str(path)` is implicitly
+awaited and reads like a plain call — so a sync variant buys a caller
+nothing and costs the event loop the length of the read. `exists` is the
+module's one blocking call, and it blocks for a different reason:
+`node:fs/promises` has no `exists`, and syncness is the only thing
+separating it from `stat(path).is_some()`. It is sized for a boot-time
+branch; on a request path, call `stat`.
 
 Two directory listings, one honesty policy. `read_dir` is deliberately
 flat: immediate entry *names*, not path-joined, no file-vs-directory
