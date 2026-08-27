@@ -391,6 +391,40 @@ fn check_reach(imports: &[String], helpers: &[&'static str]) -> Result<(), Failu
     Ok(())
 }
 
+/// `asset::emit`'s kind is an output-path segment, so it must BE one (E94).
+///
+/// The kind names the file the build writes beside its JavaScript —
+/// `write_assets` does `output_js.with_extension(kind)` — so a kind carrying a
+/// separator or `..` is not a kind at all, it is a path, and it directs the
+/// write somewhere the build never chose. This is the write-direction twin of
+/// `asset::read`'s escape fence (`const_eval::ProjectReader::read`), and it is
+/// deliberately the same shape: lexical, total, and taken before anything
+/// touches the filesystem, so the refusal is as deterministic as the channel it
+/// guards. One rule covers both shapes an audit found — `../evil` and `a/b` —
+/// because they are the same mistake: a kind names ONE file.
+///
+/// Deliberately NOT a charset allowlist. The rule is structural (one `Normal`
+/// component, no separator of either platform's flavour), which refuses every
+/// path a kind could become while leaving every kind a real `emit` passes
+/// untouched.
+fn check_emit_kind(kind: &str) -> Result<(), Failure> {
+    let one_segment = !kind.is_empty() && !kind.contains('/') && !kind.contains('\\') && {
+        let mut components = std::path::Path::new(kind).components();
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+    };
+    if one_segment {
+        return Ok(());
+    }
+    Err(Failure::new(
+        FailureKind::Thrown,
+        format!(
+            "`asset::emit` kinds name one file beside the build output; \
+             `{kind}` is not one path segment — pass a bare kind like `css`"
+        ),
+    ))
+}
+
 /// Runs one function of a transformed program — the macro-expansion entry
 /// (macro-engine.md §3). Executes the program's top level first (hoisting its
 /// functions, initializing module-level globals), then calls `entry` with the
@@ -1411,6 +1445,8 @@ impl<'a> Interpreter<'a> {
                 }
                 let kind = expect_str(&take(0))?;
                 let line = expect_str(&take(1))?;
+                // The kind becomes a filename (E94) — fenced before it is kept.
+                check_emit_kind(&kind)?;
                 self.assets.push((kind.to_string(), line.to_string()));
                 Ok(Value::Undefined)
             }
