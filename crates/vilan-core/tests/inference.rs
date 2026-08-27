@@ -28138,6 +28138,358 @@ fn a_runtime_declare_is_rejected() {
     );
 }
 
+// --- K2b: typed values in `raw` (proposal/css-block.md §6, slice S1) ---------
+// `Style::raw` and `Declarations::raw` are generic over `CssValue` — a `str`
+// is a verbatim CSS value, a `Length`/`Color` is a value that may be a THEME
+// TOKEN, and a token owes the sheet the `:root` line that defines it. Before
+// the widening the only way to get a token into `raw` was to reach for its
+// `.css` field, which hands over the text and throws the line away: the
+// emitted stylesheet then referenced a custom property nothing declared.
+
+#[test]
+fn raw_carries_a_length_tokens_root_line() {
+    // The fix, on the `Style` side. `space(4)` renders `var(--space-4)`, and
+    // the declaration of `--space-4` lands beside it.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().raw("padding", space(4));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--space-4:1rem}".to_string())),
+        "the spacing token's :root line is missing: {assets:?}"
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.contains("padding:var(--space-4)")),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn raw_carries_a_color_tokens_root_line() {
+    // The same, for a ramp step — the other half of `CssValue`'s token arm.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ style, Color };
+        let _outlined = const style().raw("outline-color", Color::gray(50));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--gray-50:#f9fafb}".to_string())),
+        "the ramp token's :root line is missing: {assets:?}"
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.contains("outline-color:var(--gray-50)")),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn the_css_field_route_declares_no_token() {
+    // The hazard the widening removes, pinned as the contrast it is. A `.css`
+    // field access hands over a `str`; a `str` carries no token, so the sheet
+    // gets `var(--space-4)` with nothing declaring it. This is not a bug in
+    // `raw` — it is what asking for the text alone MEANS — and it is exactly
+    // why `raw` had to grow the typed spelling above.
+    let css = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().raw("padding", space(4).css);
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains("padding:var(--space-4)"), "{css}");
+    assert!(
+        !css.contains("--space-4:"),
+        "the text-only route cannot declare the token it references:\n{css}"
+    );
+}
+
+#[test]
+fn raw_and_with_length_mint_the_same_rule() {
+    // The widening is not a second channel: `raw` at the `Length`
+    // instantiation IS `with_length`, so the two spellings produce one rule,
+    // one class name and one token line — byte for byte.
+    let through_raw = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().raw("scroll-margin-top", space(4));
+        fun main() {}
+        main();
+        "##,
+    );
+    let through_with_length = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().with_length("scroll-margin-top", space(4));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(through_raw, through_with_length, "{through_raw}");
+}
+
+#[test]
+fn raw_with_a_str_declares_nothing() {
+    // The instantiation every existing call site uses. Widening must be
+    // INVISIBLE here: the rule alone, no token line, no empty line from an
+    // unguarded emit.
+    let css = style_css(
+        r##"
+        import std::style::{ style };
+        let _flex = const style().raw("display", "flex");
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, ".sbiovxm{display:flex}\n", "{css}");
+}
+
+#[test]
+fn raw_with_an_untokened_length_declares_nothing() {
+    // `Length::px` is a literal, not a token: its `root` is "", and an empty
+    // root must not reach the channel as a blank line.
+    let css = style_css(
+        r##"
+        import std::style::{ style, Length };
+        let _wide = const style().raw("scroll-padding", Length::px(37.0));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, ".susg4iv{scroll-padding:37px}\n", "{css}");
+}
+
+#[test]
+fn a_typed_raw_keeps_its_conditions_and_its_family() {
+    // `raw` reaches the sheet through `rule` like every property method, so
+    // the widened value composes with the condition combinators and with
+    // last-wins across a FAMILY: the `padding` shorthand written here clears
+    // the `padding-left` longhand it covers, and the hover variant is its own
+    // slot.
+    let css = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _card = const style()
+            .padding_left(space(2))
+            .raw("padding", space(4))
+            .hover(style().raw("padding", space(6)));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains("*.s1ufvr2{padding:var(--space-4)}"), "{css}");
+    assert!(css.contains(":hover{padding:var(--space-6)}"), "{css}");
+    assert!(
+        css.contains(":root{--space-4:1rem}")
+            && css.contains(":root{--space-6:1.5rem}")
+            && css.contains(":root{--space-2:0.5rem}"),
+        "every token spent in the chain declares itself:\n{css}"
+    );
+}
+
+#[test]
+fn a_non_css_value_in_raw_names_the_trait() {
+    // The bound's failure shape, the `Slot`/`AttrValue` precedent: the type,
+    // the trait, and a secondary span at the declaration.
+    assert_fails_with(
+        r##"
+        import std::style::{ style };
+        let _bad = const style().raw("z-index", 3);
+        fun main() {}
+        main();
+        "##,
+        "'i32' does not implement trait 'CssValue'",
+    );
+}
+
+#[test]
+fn a_declaration_blocks_raw_carries_a_length_token() {
+    // The fix on the `Declarations` side — the surface whose whole job is
+    // custom properties, where a dangling `var()` is likeliest.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations, space };
+        fun tokens() {
+            declare(":root", declarations().raw("--pad", space(6)));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains(":root{--space-6:1.5rem}"), "{css}");
+    assert!(
+        css.contains("@layer vilan{:root{--pad:var(--space-6)}}"),
+        "{css}"
+    );
+}
+
+#[test]
+fn a_declaration_blocks_raw_carries_a_color_token() {
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations, Color };
+        fun tokens() {
+            declare(":root", declarations().raw("--brand", Color::gray(50)));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains(":root{--gray-50:#f9fafb}"), "{css}");
+    assert!(
+        css.contains("@layer vilan{:root{--brand:var(--gray-50)}}"),
+        "{css}"
+    );
+}
+
+#[test]
+fn a_declaration_blocks_str_raw_declares_nothing() {
+    // The instantiation the existing call sites use: the block's line alone.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun reset() {
+            declare("*", declarations().raw("box-sizing", "border-box"));
+        }
+        let _reset = const reset();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, "@layer vilan{*{box-sizing:border-box}}\n", "{css}");
+}
+
+#[test]
+fn a_declaration_chain_carries_its_tokens_rather_than_emitting_them() {
+    // The `Gradient` shape, and the reason `Declarations` stayed usable
+    // outside a `const` expression: the chain ACCUMULATES the `:root` lines it
+    // owes and `declare` puts them on the sheet. A chain that is never
+    // declared reaches the sheet with nothing — including its tokens.
+    let assets = collected_assets(
+        r##"
+        import std::print;
+        import std::style::{ declarations, space };
+        fun main() {
+            let dropped = declarations().raw("--pad", space(6));
+            print(dropped.text);
+        }
+        main();
+        "##,
+    );
+    assert!(
+        assets.is_empty(),
+        "an undeclared chain emits nothing: {assets:?}"
+    );
+}
+
+#[test]
+fn a_declaration_chain_builds_outside_a_const_expression() {
+    // The corollary, pinned in its own right: building the chain is ordinary
+    // runtime code — only `declare` is const-only. Routing the token lines
+    // through the VALUE is what keeps that true; an `emit` inside `raw` would
+    // have made every declaration chain, `str` ones included, compile-time-only.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::style::{ declarations, space, Color };
+        fun main() {
+            let block = declarations()
+                .raw("box-sizing", "border-box")
+                .raw("--pad", space(6))
+                .raw("--brand", Color::gray(50));
+            print(block.text);
+        }
+        main();
+        "##,
+        "box-sizing:border-box;--pad:var(--space-6);--brand:var(--gray-50)\n",
+    );
+}
+
+#[test]
+fn a_non_css_value_in_a_declaration_names_the_trait() {
+    assert_fails_with(
+        r##"
+        import std::style::{ declare, declarations };
+        fun tokens() {
+            declare(":root", declarations().raw("--z", 3));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+        "'i32' does not implement trait 'CssValue'",
+    );
+}
+
+#[test]
+fn a_typed_declaration_value_is_checked_like_a_str_one() {
+    // `check_declaration` guards the RESOLVED text, so the line-granular
+    // channel's rules reach a typed value too — a `Length::css` carrying a
+    // newline is refused exactly as the `str` spelling is.
+    assert_run_panics(
+        r##"
+        import std::style::{ declare, declarations, Length };
+        fun tokens() {
+            declare(":root", declarations().raw("--pad", Length::css("1rem\n2rem")));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+        "cannot contain a newline",
+    );
+}
+
+#[test]
+#[ignore = "pre-existing: the const-only capability check follows call edges and \
+            cannot follow a bounded generic's trait dispatch, so an `emit` reached \
+            only through an impl escapes it and reaches the emitted JS as a live \
+            `__emit_asset` with no runtime binding. Un-ignore when const_eval's \
+            check_const_only learns generic dispatch. Found while designing \
+            `CssValue` (proposal/css-block.md §6); it is why the trait describes a \
+            value rather than emitting for it."]
+fn emit_reached_through_a_bounded_generic_is_const_only() {
+    assert_fails_with(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        fun render<V: Emitter>(value: V): str {
+            value.text()
+        }
+        fun main() {
+            print(render(Token { css = "var(--p)" }));
+        }
+        main();
+        "##,
+        "compile-time-only",
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the

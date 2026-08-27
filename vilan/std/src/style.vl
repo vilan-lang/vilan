@@ -425,6 +425,64 @@ impl Gradient {
 	}
 }
 
+/// Something that can be the VALUE of a declaration
+/// (proposal/css-block.md §6) — the type-directed half of `raw`, the
+/// `Slot`/`AttrValue` precedent on the style side. A `str` is a complete CSS
+/// value written verbatim; a `Length` or a `Color` is a value that may be a
+/// THEME TOKEN, and a token carries a `:root` line the sheet needs beside the
+/// reference to it.
+///
+/// The trait only DESCRIBES a value — its text, and the `:root` line its
+/// token needs. Putting the line on the sheet belongs to the surface that
+/// writes the sheet (`Style::raw`, `Declarations::raw`), not to the impl.
+/// That is the honest split — `Length` and `Color` are plain data — and it is
+/// also the safe one: `emit` is the compile-time channel, and the const-only
+/// capability check follows CALL EDGES, which it cannot do through a bounded
+/// generic's trait dispatch. An `emit` inside an impl here would escape the
+/// check and reach the emitted JS as a live `__emit_asset` with no runtime
+/// binding.
+trait CssValue {
+	/// The declaration's value text, exactly as it renders into CSS.
+	fun css_text(self): str;
+
+	/// The `:root` line declaring this value's theme token, or `""` when the
+	/// value declares nothing.
+	fun css_root(self): str;
+}
+
+/// A complete CSS value, written verbatim. Declares no token.
+impl str with CssValue {
+	fun css_text(self): str {
+		self
+	}
+
+	fun css_root(self): str {
+		""
+	}
+}
+
+/// A length — a token's identity plus the `:root` line that defines it.
+impl Length with CssValue {
+	fun css_text(self): str {
+		self.css
+	}
+
+	fun css_root(self): str {
+		self.root
+	}
+}
+
+/// A color — `Length`'s twin, same token discipline.
+impl Color with CssValue {
+	fun css_text(self): str {
+		self.css
+	}
+
+	fun css_root(self): str {
+		self.root
+	}
+}
+
 // --- keyword properties ---------------------------------------------------------
 
 enum Display {
@@ -717,23 +775,27 @@ impl Style {
 		Style { rules = rules }
 	}
 
-	/// The escape hatch: any property, any value, atomic like the rest.
-	fun raw(self, property: str, value: str): Style {
-		self.rule("", "", property, property + ":" + value)
+	/// The escape hatch: any property, any value, atomic like the rest. The
+	/// value is any `CssValue` — a verbatim `str`, or a `Length`/`Color`
+	/// whose theme token carries its own `:root` line onto the sheet, so
+	/// `.raw("padding", space(4))` is never a dangling `var()`.
+	fun raw<V: CssValue>(self, property: str, value: V): Style {
+		let root = value.css_root();
+		if root != "" {
+			emit("css", root);
+		}
+		self.rule("", "", property, property + ":" + value.css_text())
 	}
 
+	/// An untyped property with a `Length` value. Exactly `raw` at that
+	/// instantiation, kept for the spelling the surface has always had.
 	fun with_length(self, property: str, value: Length): Style {
-		if value.root != "" {
-			emit("css", value.root);
-		}
-		self.rule("", "", property, property + ":" + value.css)
+		self.raw(property, value)
 	}
 
+	/// `with_length`'s twin for colors.
 	fun with_color(self, property: str, value: Color): Style {
-		if value.root != "" {
-			emit("css", value.root);
-		}
-		self.rule("", "", property, property + ":" + value.css)
+		self.raw(property, value)
 	}
 
 	// --- layout ---
@@ -1341,50 +1403,55 @@ impl Style with Add {
 struct Declarations {
 	// `property:value` pairs, `;`-joined; "" while empty.
 	text: str,
+	// The `:root` lines of the theme tokens spent in those declarations,
+	// carried on the value and put on the sheet by `declare` — the `Gradient`
+	// shape. A chain builds no sheet lines of its own, which is what keeps the
+	// whole surface usable outside a `const` expression.
+	roots: List<str>,
 }
 
 /// Opens a declaration chain — `style()`'s counterpart on the text side of
 /// the channel. Nothing reaches the stylesheet until `declare` puts the chain
-/// under a selector (except a token's own `:root` line, which every value
-/// carries onto the sheet the moment it is used, exactly as it does in a
-/// `Style`).
+/// under a selector — a token's `:root` line included: the chain accumulates
+/// the lines it owes and `declare` puts them there with the block.
 fun declarations(): Declarations {
-	Declarations { text = "" }
+	Declarations { text = "", roots = [] }
 }
 
 impl Declarations {
-	/// Any property, any value — `Style::raw`'s counterpart, and the spelling
-	/// for the two things this surface exists for: a custom property
+	/// Any property, any `CssValue` — `Style::raw`'s counterpart, and the
+	/// spelling for the two things this surface exists for: a custom property
 	/// (`--color-ink`) and a plain CSS property under a selector no class
-	/// names.
-	fun raw(self, property: str, value: str): Declarations {
-		check_declaration(property, value);
-		let pair = property + ":" + value;
+	/// names. A `Length` or `Color` value carries its own `:root` token line
+	/// onto the sheet, so a token spent here is never a dangling `var()`.
+	fun raw<V: CssValue>(self, property: str, value: V): Declarations {
+		let text = value.css_text();
+		check_declaration(property, text);
+		mut roots = self.roots;
+		let root = value.css_root();
+		if root != "" {
+			roots.push(root);
+		}
+		let pair = property + ":" + text;
 		Declarations {
 			text = if self.text == "" {
 				pair
 			} else {
 				self.text + ";" + pair
 			},
+			roots = roots,
 		}
 	}
 
-	/// A `Color`-valued declaration. Carries the colour's own `:root` token
-	/// line onto the sheet the way a `Style` property does, so a ramp token
-	/// spent here is never a dangling `var()`.
+	/// A `Color`-valued declaration. Exactly `raw` at that instantiation,
+	/// kept for the spelling the surface has always had.
 	fun color(self, property: str, value: Color): Declarations {
-		if value.root != "" {
-			emit("css", value.root);
-		}
-		self.raw(property, value.css)
+		self.raw(property, value)
 	}
 
-	/// A `Length`-valued declaration — `color`'s twin, same token discipline.
+	/// A `Length`-valued declaration — `color`'s twin.
 	fun length(self, property: str, value: Length): Declarations {
-		if value.root != "" {
-			emit("css", value.root);
-		}
-		self.raw(property, value.css)
+		self.raw(property, value)
 	}
 }
 
@@ -1425,6 +1492,12 @@ fun declare(selector: str, body: Declarations) {
 	check_selector(selector);
 	if body.text == "" {
 		panic(i"the declaration block for \"{selector}\" declares nothing — add a declaration with .raw(..), .color(..) or .length(..), or drop the block");
+	}
+	// The tokens the block spent, declared beside it — a ramp step or a
+	// spacing step used here is never a dangling `var()`. The channel dedups
+	// by line, so a token the styles already emitted costs nothing.
+	for root in body.roots {
+		emit("css", root);
 	}
 	emit("css", "@layer vilan{" + selector + "{" + body.text + "}}");
 }
