@@ -60,6 +60,9 @@
 :root{--space-3:0.75rem}
 :root{--space-4:1rem}
 :root{--space-6:1.5rem}
+@layer vilan{*{box-sizing:border-box}}
+@layer vilan{:root{--brand:var(--gray-50);--pad:var(--space-4)}}
+@layer vilan{[data-theme="iron-dark"]{--color-ink:#fafafa;--color-ground:#161616}}
 @media (min-width: 640px){*.sl8ru5a{padding:var(--space-2)}}
 @media (min-width: 768px){:root[data-theme="dark"] .s1pifanf[data-open="true"]:hover{color:var(--gray-50)}}
 @media (min-width: 768px){:root[data-theme="dark"] .s8ahr6b:hover{background-color:var(--gray-50)}}

@@ -162,7 +162,10 @@ fun read(path: str): str         // compile-time only: read a project file
 
 Both callable only from `const` evaluation — a runtime call path to
 either is a compile error. `emit` is how `std::style` writes the CSS
-file (`emit("css", rule)`). A browser build with emissions produces
+file (`emit("css", rule)`). Reach for it directly only for a shape std
+has no spelling for: a whole declaration block under a selector you
+choose is `std::style::declare`, which builds the line — and the layer
+around it — for you. A browser build with emissions produces
 `<entry>.css` beside `<entry>.js` (beside `<entry>.mjs` on a process
 target).
 

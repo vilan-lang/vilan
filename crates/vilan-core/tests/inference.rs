@@ -27502,6 +27502,422 @@ fn ssr_renders_attribute_conditioned_classes() {
     );
 }
 
+// --- kolt.local 032: the declaration block (std::style::declare) ---------------
+// The generic form of the escape hatch apps were hand-rolling: a set of
+// declarations under an author-chosen selector, straight into the const-only
+// CSS channel. It mints NO class, produces no `Style`, touches no slot key and
+// rehashes nothing — the atomic system is untouched, which is what keeps this
+// beside `Style` rather than inside it.
+//
+// ORDERING RULING. Every block emits inside one cascade layer, `@layer vilan`.
+// Unlayered styles beat layered ones whatever their specificity, so a `Style`
+// always outranks a declaration block and the block's position in the sheet's
+// lexical sort decides nothing — which is why B35's `@media` comparator is
+// untouched here rather than extended (the layer line carries no `min-width`,
+// so it sorts as an ordinary non-media line).
+//
+// VALIDATION. The channel is line-granular, so a newline in a selector or a
+// declaration SPLITS the rule into two independently-deduped, independently
+// sorted lines; braces are `declare`'s own; and an at-rule is refused because a
+// group at-rule holds rules, not declarations.
+
+#[test]
+fn a_declaration_block_emits_its_selector_and_declarations() {
+    // THE EXHIBIT, in std: kolt's theme.vl emitted
+    // `[data-theme="{id}"]{{variables_css}}` by hand and then flattened its own
+    // multi-line declarations with `.replace(";\n--", ";--")`. `declare` builds
+    // the one line, so the surgery has nothing left to do.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ declare, declarations, Color };
+        fun theme(id: str) {
+            declare(
+                i"[data-theme=\"{id}\"]",
+                declarations()
+                    .color("--color-ink", Color::hex("#fafafa"))
+                    .color("--color-ground", Color::hex("#161616")),
+            );
+        }
+        let _theme = const theme("iron-dark");
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&(
+            "css".to_string(),
+            "@layer vilan{[data-theme=\"iron-dark\"]{--color-ink:#fafafa;--color-ground:#161616}}"
+                .to_string()
+        )),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_declaration_block_mints_no_class() {
+    // The whole sheet, for a program whose only styling IS a declaration
+    // block: one line, no class band at all. Nothing was hashed, so there is
+    // nothing for a slot key or a class name to be.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun reset() {
+            declare("*", declarations().raw("box-sizing", "border-box"));
+        }
+        let _reset = const reset();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, "@layer vilan{*{box-sizing:border-box}}\n", "{css}");
+}
+
+#[test]
+fn a_declaration_block_leaves_the_atomic_sheet_byte_identical() {
+    // The invariant this item lives or dies by. The same styled program, with
+    // and without a declaration block: strip the block's own lines and the two
+    // stylesheets are equal BYTE FOR BYTE — same class names, same rules, same
+    // order. A declaration block adds; it never moves anything.
+    const STYLED: &str = r##"
+        import std::style::{ style, space, Color, Style };
+        fun card(): Style {
+            style().padding(space(4)).color(Color::gray(700)).hover(style().color(Color::gray(900)))
+        }
+        let _card = const card();
+        "##;
+    let without = style_css(&format!("{STYLED}\nfun main() {{}}\nmain();\n"));
+    let with = style_css(&format!(
+        r##"{STYLED}
+        import std::style::{{ declare, declarations }};
+        fun theme() {{
+            declare(":root", declarations().raw("--color-ink", "#fafafa"));
+        }}
+        let _theme = const theme();
+        fun main() {{}}
+        main();
+        "##
+    ));
+    let stripped = with
+        .lines()
+        .filter(|line| !line.starts_with("@layer vilan{"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    assert_eq!(without, stripped, "with the block:\n{with}");
+    assert!(
+        with.contains("@layer vilan{:root{--color-ink:#fafafa}}"),
+        "the block must actually be there:\n{with}"
+    );
+}
+
+#[test]
+fn a_declaration_block_is_layered_and_a_style_rule_is_not() {
+    // The ordering ruling, read off the sheet: the block is inside
+    // `@layer vilan`, the atomic rules are unlayered, and unlayered wins the
+    // cascade against any layer regardless of specificity — so the author's
+    // chosen selector can never out-specify a view's own style.
+    let css = style_css(
+        r##"
+        import std::style::{ style, declare, declarations, Color, Style };
+        fun s(): Style {
+            style().color(Color::hex("#111111"))
+        }
+        fun over() {
+            declare("#app div.card", declarations().raw("color", "#eeeeee"));
+        }
+        let _s = const s();
+        let _over = const over();
+        fun main() {}
+        main();
+        "##,
+    );
+    for line in css.lines() {
+        if line.contains("--") && line.starts_with(':') {
+            continue;
+        }
+        let layered = line.starts_with("@layer vilan{");
+        assert_eq!(
+            layered,
+            line.contains("#app div.card"),
+            "exactly the declaration block is layered:\n{css}"
+        );
+    }
+}
+
+#[test]
+fn the_declaration_layer_does_not_disturb_the_media_sort() {
+    // B35, unchanged and unextended. `media_min_width` reads an
+    // `@media (min-width: ` prefix that `@layer vilan{` does not carry, so the
+    // layer line sorts as an ordinary non-media line and every media block
+    // still lands after it in ascending min-width order.
+    let css = style_css(
+        r##"
+        import std::style::{ style, space, declare, declarations, Style };
+        fun s(): Style {
+            style().sm(style().padding(space(2))).lg(style().padding(space(3)))
+        }
+        fun theme() {
+            declare(":root", declarations().raw("--color-ink", "#fafafa"));
+        }
+        let _s = const s();
+        let _theme = const theme();
+        fun main() {}
+        main();
+        "##,
+    );
+    let layer_at = css.find("@layer vilan{").expect("the layer line");
+    let small_at = css
+        .find("@media (min-width: 640px){")
+        .expect("the sm block");
+    let large_at = css
+        .find("@media (min-width: 1024px){")
+        .expect("the lg block");
+    assert!(
+        layer_at < small_at && small_at < large_at,
+        "the layer sorts as a non-media line and the min-width order survives:\n{css}"
+    );
+}
+
+#[test]
+fn a_token_spent_in_a_declaration_block_declares_itself() {
+    // `.color`/`.length` carry the value's own `:root` line onto the sheet
+    // exactly as a `Style` property does, so a ramp or spacing token spent in a
+    // block is never a dangling `var()`. That line stays UNLAYERED, like every
+    // other token line — the two channels agree rather than one shadowing the
+    // other.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ declare, declarations, space, Color };
+        fun tokens() {
+            declare(
+                ":root",
+                declarations().color("--brand", Color::gray(50)).length("--pad", space(4)),
+            );
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--gray-50:#f9fafb}".to_string()))
+            && assets.contains(&("css".to_string(), ":root{--space-4:1rem}".to_string())),
+        "{assets:?}"
+    );
+    assert!(
+        assets.contains(&(
+            "css".to_string(),
+            "@layer vilan{:root{--brand:var(--gray-50);--pad:var(--space-4)}}".to_string()
+        )),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn declarations_keep_their_authoring_order() {
+    // A declaration block is CASCADE text: reordering its links would change
+    // what it means, where reordering a `style()` chain's links cannot (each
+    // link owns a slot). The links join in authoring order here, and the
+    // formatter's canonical style-chain sort never reaches a `declarations()`
+    // chain — it fires only on a run rooted at the literal `style ( )` tokens
+    // (`starts_style_builder`), pinned in `vilan-cli/tests/style_chain_order.rs`.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(
+                "body",
+                declarations()
+                    .raw("z-index", "1")
+                    .raw("box-sizing", "border-box")
+                    .raw("display", "block"),
+            );
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        css.contains("{z-index:1;box-sizing:border-box;display:block}"),
+        "{css}"
+    );
+}
+
+/// A data URI carries a `;` (`url("data:image/svg+xml;base64,…")`), so a value
+/// keeps its semicolons on purpose — the fences are exactly the characters that
+/// break the CHANNEL (a newline) or the BLOCK (a brace), and nothing else.
+#[test]
+fn a_data_uri_value_keeps_its_semicolon() {
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(
+                "body",
+                declarations().raw("background-image", "url(\"data:image/svg+xml;base64,AAA\")"),
+            );
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        css.contains("@layer vilan{body{background-image:url(\"data:image/svg+xml;base64,AAA\")}}"),
+        "{css}"
+    );
+}
+
+#[test]
+fn a_declaration_block_selector_cannot_contain_a_newline() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root\n:host", declarations().raw("--color-ink", "#fafafa"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics.iter().any(|(message, _)| message
+            .contains("selector cannot contain a newline")
+            && message.contains("line-granular")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_declaration_block_selector_cannot_contain_a_brace() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root{color:red}", declarations().raw("--color-ink", "#fafafa"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics.iter().any(
+            |(message, _)| message.contains("selector cannot contain '{'")
+                && message.contains("declare writes the block's braces")
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
+/// A group at-rule holds RULES, not declarations, so `@media (…){color:red}`
+/// would be invalid CSS the moment the surface admitted it — and the surface's
+/// meaning would start depending on the first byte of its argument.
+#[test]
+fn a_declaration_block_selector_cannot_be_an_at_rule() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare("@media (prefers-color-scheme: light)", declarations().raw("--color-ink", "#111111"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("selector cannot be an at-rule")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_declaration_block_with_no_declarations_is_rejected() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root", declarations());
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("declares nothing")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The property owns the `:` that separates it from its value and the `;` that
+/// separates it from the next declaration, so it may carry neither.
+#[test]
+fn a_declaration_property_cannot_carry_its_own_separator() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root", declarations().raw("color:red", "1"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics.iter().any(
+            |(message, _)| message.contains("property cannot contain ':'")
+                && message.contains("pass the value as the second argument")
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_blank_declaration_value_is_rejected() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root", declarations().raw("--color-ink", ""));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("the value for \"--color-ink\"")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// `declare` reaches `asset::emit`, so it inherits the const-only bit with no
+/// new machinery — the diagnostic names `declare` and the channel it reaches.
+#[test]
+fn a_runtime_declare_is_rejected() {
+    assert_fails_spanning(
+        r##"
+        import std::style::{ declare, declarations };
+        fun main() {
+            declare(":root", declarations().raw("--color-ink", "#fafafa"));
+        }
+        main();
+        "##,
+        r##"declare(":root", declarations().raw("--color-ink", "#fafafa"))"##,
+        "compile-time-only",
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the
