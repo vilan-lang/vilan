@@ -142,8 +142,11 @@ fun read_dir(path: str): List<str>          // async — entry names, flat
 fun stat(path: str): Option<Stat>           // async — None if the path isn't there
 ```
 
-`read_bytes` is what serves an image, a font or a favicon: the host's
-buffer binds to `Bytes` with no decode in between. `read_dir` lists a
+`read_bytes` reads a file with no decode in between — the host's buffer
+binds straight to `Bytes` — which is what anything that is not text needs.
+An image, a font or a favicon that your *build* emits no longer needs it:
+`serve_build` reads and serves those as bytes itself (below). `read_bytes`
+is for the binary file the build did not write. `read_dir` lists a
 directory's immediate entries by name — flat and unordered, so call `stat`
 per entry when you need file-vs-directory. `stat` reads `size`,
 `modified_at_ms` (epoch millis) and `is_directory`, and is the one read
@@ -154,7 +157,8 @@ for a caller asking "is this here yet". Full signatures:
 What a server does *not* read by hand any more is its own build.
 `serve_build` knows the bundle's name, the stylesheet's, and every chunk's,
 so the boot reads and the content-type table that used to live here are
-gone.
+gone — including for binary artifacts, which it reads and serves byte for
+byte under a content type generated from the `mime-db` registry data.
 
 ## The process: `std::process`
 

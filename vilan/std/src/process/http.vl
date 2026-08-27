@@ -519,9 +519,16 @@ fun respond_from_build(
 /// One artifact's response: its extension's content type, and the bytes the
 /// dev-mode freshness policy says to serve right now (`asset_body` — the
 /// boot-time copy, or a fresh read while watching).
+///
+/// `body_bytes`, not `body`: the artifact goes out as the build wrote it. This
+/// is the leg that makes the content-type table honest — a table that can name
+/// `image/png` over a text body would be describing bytes that no longer exist
+/// (kolt.local 030). It is also why every `text/*` row in that table spells its
+/// charset: a raw-byte body carries no encoding of its own, so an unspelled
+/// `text/css` is decoded by the browser's default and not by utf8.
 fun asset_response(asset: BuildAsset): Response {
 	Response::builder()
 		.set_header("Content-Type", asset.content_type)
-		.body(asset_body(asset))
+		.body_bytes(asset_body(asset))
 		.build()
 }
