@@ -66828,3 +66828,464 @@ fn b139_a_recorded_return_is_never_served_under_a_callers_bindings() {
 fn b139_the_caller_shaped_return_plant_runs_at_both_instantiations() {
     assert_compiles_and_runs(CALLER_SHAPED_RETURN_PLANT, "1\nhi\n2\nbye\n");
 }
+
+// --- `std::path` (kolt.local 017) --------------------------------------------
+//
+// The module is free functions over `str`, POSIX-shaped (`/` only, on every
+// platform), and colorless — the three forks the item filed, settled in
+// `vilan/std/src/path.vl`'s header. What follows is one pin per case rather
+// than one per function: the edges that bite are trailing separators, `.` and
+// `..`, the absolute/relative split between `join` and `resolve`, and the
+// dotfile rule in `extname`, and each of those is where a hand-rolled version
+// goes wrong.
+//
+// Answers were differentialled against node's `path.posix` over a 34-case
+// table before they were pinned. They agree case for case with TWO deliberate
+// divergences, both pinned below so they cannot drift back by accident:
+// `normalize` drops a trailing separator where node keeps it, and
+// `dirname("a//b")` is `"a"` where node leaves the dangling `"a/"`.
+
+#[test]
+fn path_normalize_collapses_separators_and_resolves_dot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("a//b/./c"));
+            print(path::normalize("a/b/../c"));
+            print(path::normalize("./a"));
+            print(path::normalize(""));
+            print(path::normalize("."));
+            print(path::normalize("/"));
+            print(path::normalize("//"));
+        }
+        main();
+        "#,
+        "a/b/c\na/c\na\n.\n.\n/\n/\n",
+    );
+}
+
+#[test]
+fn path_normalize_drops_a_trailing_separator_where_node_keeps_it() {
+    // The one divergence from `path.posix.normalize`, and the point of the
+    // function: two spellings of one path must compare equal, and node's
+    // "a/b" / "a/b/" do not — which is how a cache or an asset map ends up
+    // with two entries for one file.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("a/b/"));
+            print(path::normalize("/a/b/"));
+            print(path::normalize("a/"));
+            print(path::normalize("/"));
+            print(path::normalize("a/b") == path::normalize("a/b/"));
+        }
+        main();
+        "#,
+        "a/b\n/a/b\na\n/\ntrue\n",
+    );
+}
+
+#[test]
+fn path_normalize_stops_at_an_absolute_root_but_keeps_a_relative_climb() {
+    // A `..` above the root is dropped (the root's parent is the root); a
+    // leading `..` on a relative path is kept, because it names something.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("/../a"));
+            print(path::normalize("/a/../../.."));
+            print(path::normalize("../a"));
+            print(path::normalize("a/../../b"));
+            print(path::normalize(".."));
+        }
+        main();
+        "#,
+        "/a\n/\n../a\n../b\n..\n",
+    );
+}
+
+#[test]
+fn path_functions_never_fold_case() {
+    // `windows-support.md` §5 enforces case-EXACT module resolution precisely
+    // so that `import foo` cannot resolve `Foo.vl` on NTFS. A path module that
+    // decided `Foo` and `foo` were the same path would hand that back, so
+    // every comparison here is byte-for-byte and `normalize` preserves the
+    // case it was given.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            print(path::normalize("Foo/../BAR"));
+            print(path::basename("/a/README.md"));
+            print(path::starts_with("/A/b", "/a"));
+            match path::relative("/A", "/a") {
+                Some(let answer) => print(answer),
+                None => print("none"),
+            }
+        }
+        main();
+        "#,
+        "BAR\nREADME.md\nfalse\n../a\n",
+    );
+}
+
+#[test]
+fn path_join_does_not_reset_on_an_absolute_second_argument_but_resolve_does() {
+    // The split that decides what each verb is for. `join` is textual; the
+    // caller asking "…unless the second is already absolute" is asking about
+    // REFERENCES and wants `resolve`. A `join` that silently discarded its
+    // first argument would be a traversal primitive wearing a concatenation's
+    // name.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("/a", "/b"));
+            print(path::resolve("/a", "/b"));
+            print(path::join("/a", "b"));
+            print(path::resolve("/a", "b"));
+        }
+        main();
+        "#,
+        "/a/b\n/b\n/a/b\n/a/b\n",
+    );
+}
+
+#[test]
+fn path_join_treats_an_empty_side_as_nothing() {
+    // `join("", "b")` must not become absolute — the empty base contributes
+    // no separator, it contributes nothing at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("", "b"));
+            print(path::join("a", ""));
+            print(path::join("", ""));
+            print(path::join("a", "../b"));
+            print(path::join("a", ".."));
+        }
+        main();
+        "#,
+        "b\na\n.\nb\n.\n",
+    );
+}
+
+#[test]
+fn path_join_all_folds_left_and_answers_the_empty_list() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            let parts: List<str> = ["a", "b", "c"];
+            print(path::join_all(parts));
+            let nothing: List<str> = [];
+            print(path::join_all(nothing));
+            let climbing: List<str> = ["/a", "..", "b"];
+            print(path::join_all(climbing));
+        }
+        main();
+        "#,
+        "a/b/c\n.\n/b\n",
+    );
+}
+
+#[test]
+fn path_basename_ignores_trailing_separators_and_the_root_has_none() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::basename("/a/b.txt"));
+            print(path::basename("/a/b/"));
+            print(path::basename("a"));
+            print(path::basename("/"));
+            print(path::basename(""));
+            print(path::basename("a/.."));
+        }
+        main();
+        "#,
+        "b.txt\nb\na\n\n\n..\n",
+    );
+}
+
+#[test]
+fn path_dirname_stops_at_the_root_and_answers_dot_without_a_separator() {
+    // `dirname("a//b")` is the second divergence from node, which answers
+    // `"a/"` — a parent path carrying a dangling separator, which then has to
+    // be normalized away by whoever receives it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::dirname("/a/b.txt"));
+            print(path::dirname("/a"));
+            print(path::dirname("/"));
+            print(path::dirname("a"));
+            print(path::dirname(""));
+            print(path::dirname("a/b/"));
+            print(path::dirname("a//b"));
+            print(path::dirname("/../a"));
+        }
+        main();
+        "#,
+        "/a\n/\n/\n.\n.\na\na\n/..\n",
+    );
+}
+
+#[test]
+fn path_extname_gives_a_dotfile_no_extension() {
+    // The landmine this module exists to defuse. `.gitignore` is a hidden
+    // file, not a file of type "gitignore": the leading dot marks it, it does
+    // not name a type. `.` and `..` likewise have none. (node's
+    // `path.extname` answers the same way and hand-rolled versions rarely do.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::extname(".gitignore"));
+            print(path::extname("a/.gitignore"));
+            print(path::extname("."));
+            print(path::extname(".."));
+            print(path::extname(".a.b"));
+        }
+        main();
+        "#,
+        "\n\n\n\n.b\n",
+    );
+}
+
+#[test]
+fn path_extname_reads_the_last_dot_of_the_last_component() {
+    // A dot in a DIRECTORY name is invisible from here — the question is
+    // about the file — and a trailing dot is an empty extension spelled ".".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::extname("index.html"));
+            print(path::extname("a.b.c"));
+            print(path::extname("noext"));
+            print(path::extname("file."));
+            print(path::extname("a.b/c"));
+            print(path::extname("/a/b/"));
+        }
+        main();
+        "#,
+        ".html\n.c\n\n.\n\n\n",
+    );
+}
+
+#[test]
+fn path_stem_and_extname_cut_the_basename_in_two() {
+    // `stem(p) + extname(p) == basename(p)` for every p, including the
+    // degenerate spellings — the invariant that makes the pair safe to use
+    // together instead of re-deriving the split at each call site.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun holds(candidate: str): bool {
+            path::stem(candidate) + path::extname(candidate) == path::basename(candidate)
+        }
+        fun main() {
+            print(path::stem("/a/b.txt"));
+            print(path::stem(".gitignore"));
+            print(path::stem("file."));
+            print(path::stem("a/b/"));
+            print(holds("/a/b.txt"));
+            print(holds(".gitignore"));
+            print(holds("file."));
+            print(holds("..."));
+            print(holds("/"));
+        }
+        main();
+        "#,
+        "b\n.gitignore\nfile\nb\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn path_starts_with_compares_components_where_the_str_verb_compares_text() {
+    // The answer to "do `str::strip_prefix`/`starts_with` suffice for paths":
+    // they do not, and the first two lines are the proof. `/a/bc` starts with
+    // the TEXT `/a/b` and is not inside the DIRECTORY `/a/b`. Deriving an
+    // asset key by cutting a textual prefix is the same mistake, which is what
+    // kolt.local 023 filed.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print("/a/bc".starts_with("/a/b"));
+            print(path::starts_with("/a/bc", "/a/b"));
+            print(path::starts_with("/a/b/c", "/a/b"));
+            print(path::starts_with("/a/b", "/a/b"));
+            print(path::starts_with("/a/b", "/a/"));
+            print(path::starts_with("/a/b", "/"));
+            print(path::starts_with("a/b", "/a"));
+            print(path::starts_with("/a", "/a/b"));
+        }
+        main();
+        "#,
+        "true\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn path_relative_inverts_resolve() {
+    // `resolve(from, relative(from, to))` is `normalize(to)` — the property
+    // that makes the pair usable for rebasing a whole tree of paths.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun step(from: str, to: str) {
+            match path::relative(from, to) {
+                Some(let hop) => print(path::resolve(from, hop) == path::normalize(to)),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            print(path::relative("/a/b", "/a/c").unwrap_or("none"));
+            print(path::relative("/a/b", "/a/b/c").unwrap_or("none"));
+            print(path::relative("/a/b", "/a/b").unwrap_or("none"));
+            print(path::relative("/", "/a").unwrap_or("none"));
+            print(path::relative("/a", "/").unwrap_or("none"));
+            step("/a/b", "/x/y");
+            step("a/b", "a/b/c/d");
+            step("/a/b/", "/a/b/c/");
+        }
+        main();
+        "#,
+        "../c\nc\n.\na\n..\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn path_relative_is_none_where_there_is_no_lexical_answer() {
+    // Two cases, both real: the two sides disagree about being absolute (no
+    // working directory here to bridge them), or `from` still begins with `..`
+    // after the common prefix comes off (climbing out of an unknown place, so
+    // what is above it is unknown too). An `Option` for `strip_prefix`'s
+    // reason — "no answer" and "the answer is `.`" are different.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun show(from: str, to: str) {
+            match path::relative(from, to) {
+                Some(let hop) => print(hop),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            show("/a/b", "b");
+            show("b", "/a/b");
+            show("../a", "b");
+            show("a", "../b");
+        }
+        main();
+        "#,
+        "none\nnone\nnone\n../../b\n",
+    );
+}
+
+#[test]
+fn std_path_is_colorless_and_serves_a_browser_build() {
+    // The coloring call, verified rather than assumed. `std::fs` and friends
+    // are seeded `@process` by living in `src/process` (`std/vilan.toml`'s
+    // `[library.layer.process]`), and a browser build that reaches one is
+    // refused. `std::path` is in the base `root` layer and has no host call
+    // in it, so it serves both — which is the point: a browser router and an
+    // SSR render manipulate the same `/`-separated strings, and a
+    // `@process`-colored path module would have put that shared half out of
+    // reach of half the program.
+    assert_compiles_browser(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("/assets", "app.css"));
+            print(path::basename("/assets/app.css"));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn path_arithmetic_folds_under_const() {
+    // Pure vilan with no host call, so it is const-evaluable — the property a
+    // build-time consumer (bundled-asset paths, kolt.local 029) needs, and one
+    // a `node:path` binding could never have had.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            let folded = const path::join("dist", "../dist/app.js");
+            print(folded);
+        }
+        main();
+        "#,
+    )
+    .expect("expected a clean compile");
+    assert!(
+        js.contains("const folded = \"dist/app.js\";"),
+        "expected the join to fold to a literal at compile time, got:\n{js}"
+    );
+}
+
+#[test]
+fn path_strip_prefix_cuts_only_where_starts_with_agrees() {
+    // The path sibling of `str::strip_prefix` (Order 12), and the last line is
+    // why it had to exist: the `str` verb answers `Some("c")` for a path that
+    // is not inside the prefix at all. `starts_with` tests, this one cuts —
+    // and it is a different question from `relative`, which always has an
+    // answer for two paths under one root and will climb with `..` to reach
+    // it. Cutting the whole of a path gives `Some(".")`, matching `relative`'s
+    // answer for a path to itself.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun show(path: str, prefix: str) {
+            match path::strip_prefix(path, prefix) {
+                Some(let rest) => print(rest),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            show("/srv/site/css/app.css", "/srv/site");
+            show("/a/bc", "/a/b");
+            show("/a/b", "/a/b");
+            show("/a/b", "/a/b/");
+            show("/a/b", "/");
+            show("a/b/c", "a");
+            show("a/b", "/a");
+            show("/A/b", "/a");
+            print("/a/bc".strip_prefix("/a/b").unwrap_or("?"));
+        }
+        main();
+        "#,
+        "css/app.css\nnone\n.\n.\na/b\nb/c\nnone\nnone\nc\n",
+    );
+}
