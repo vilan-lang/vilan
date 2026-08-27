@@ -229,28 +229,58 @@ side: [Services & RPC](../guide/services.md) and the
 ## std::fs
 
 ```vilan,fragment
-fun exists(path: str): bool                     // sync — the one blocking call here
+// reading
 fun read_file_to_str(path: str): str            // async, UTF-8
 fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
+fun exists(path: str): bool                     // sync — the one blocking call here
+fun stat(path: str): Option<Stat>               // async — None if `path` doesn't exist; every other failure throws
+
+// writing
 fun write_file(path: str, contents: str)        // async
+fun write_bytes(path: str, contents: Bytes)     // async — the binary write, `read_bytes`'s mirror
 fun write_atomic(path: str, contents: str)      // async — temp sibling + rename, never a torn file
+fun write_bytes_atomic(path: str, contents: Bytes)  // async — the byte twin of `write_atomic`
+fun append(path: str, contents: str)            // async — extends, never truncates
+fun update(path: str, revise: |str| str)        // async — read, revise, replace atomically
+fun copy(from: str, to: str)                    // async — file copy; the source survives
 fun rename(from: str, to: str)                  // async — move/replace; atomic within one filesystem
+fun remove(path: str)                           // async — deletes a FILE
+
+// directories
 fun read_dir(path: str): List<str>              // async, entry NAMES, flat
 fun read_dir_all(path: str): List<str>          // async, RELATIVE paths, the whole tree
-fun stat(path: str): Option<Stat>               // async — None if `path` doesn't exist; every other failure throws
+fun scan_dir(path: str): List<Entry>            // async, flat, WITH each entry's kind
+fun create_dir(path: str)                       // async — one level; EEXIST if it's already there
+fun create_dir_all(path: str)                   // async — the whole chain; idempotent
+fun remove_dir(path: str)                       // async — must be empty
+fun remove_dir_all(path: str)                   // async — the whole tree; a missing path is a no-op
+fun copy_dir(from: str, to: str)                // async — the whole tree, merged into `to`
+
 struct Stat {
     size: i32,
     modified_at_ms: f64,   // epoch milliseconds
     is_directory: bool,
 }
+
+struct Entry {
+    name: str,
+    is_directory: bool,
+    is_file: bool,
+    is_symlink: bool,
+}
 ```
 
-`read_bytes`, `read_dir`, `read_dir_all`, and `read_file_to_str` throw
-host-side on any failure, missing path included — the same posture
-`read_file_to_str` always had. `stat` alone is a non-throwing probe: it
-exists to let a caller ask "is this here yet, and what does it look like"
-(a poller's use case), so a missing path is `None`, not a thrown exception.
+Everything here throws host-side on any failure, missing path included —
+the same posture `read_file_to_str` always had — with exactly two
+exceptions, both non-throwing because a missing path already satisfies
+what the call *means*. `stat` is a probe: it exists to let a caller ask "is
+this here yet, and what does it look like" (a poller's use case), so a
+missing path is `None`. `remove_dir_all` means "make sure this is gone",
+which a path that was never there already is, so removing something absent
+is a no-op. Any *other* failure of either — a permissions error, a busy
+directory — still throws. If you need to know whether a thing was there,
+`stat` before you act.
 
 There is no synchronous read. There used to be one, justified by a caller
 that could not suspend; no such caller existed, so it is gone. Async *is*
@@ -262,14 +292,40 @@ module's one blocking call, and it blocks for a different reason:
 separating it from `stat(path).is_some()`. It is sized for a boot-time
 branch; on a request path, call `stat`.
 
-Two directory listings, one honesty policy. `read_dir` is deliberately
+Three directory listings, one honesty policy. `read_dir` is deliberately
 flat: immediate entry *names*, not path-joined, no file-vs-directory
 distinction. `read_dir_all` walks the whole tree in one call — every entry
 under the path, files and subdirectories alike, as paths *relative* to it,
-joined with the host's own separator — riding the host `readdir`'s
-`recursive` option. Neither promises an order (sort the list if order
-matters), and neither says which entries are directories: a caller that
-needs the kind calls `stat` per entry.
+joined with the host's own separator. `scan_dir` is `read_dir` with the
+kinds: flat again, but each entry arrives as an `Entry` that already knows
+whether it is a file, a directory or a symlink, so the thousand `stat`
+calls a thousand-entry directory used to cost are gone — the host had that
+information all along and `read_dir` threw it away. None of the three
+promises an order; sort the list if order matters.
+
+`Entry` carries three booleans rather than a kind enum, because a host
+directory entry has *nine* kinds — file, directory, symlink, FIFO, socket,
+block device, character device, unknown — and an enum would have to either
+model five nobody will ever meet or carry a catch-all meaning "one of five
+things I did not model". Three booleans answer the three questions people
+actually ask, and an entry that is none of the three reads back with all
+three `false`, which is true rather than wrong. The kinds do not follow
+symlinks: a link to a directory is `is_symlink = true` with
+`is_directory = false`, which is what stops a recursive walker from
+following a loop it cannot see. `stat` *does* follow, so that is how you
+ask what a link points at.
+
+Making and unmaking directories comes in a strict form and a forgiving one,
+and the pairing is deliberate. `create_dir` makes exactly one level and
+fails with `EEXIST` if something is already there — which makes it the only
+way this module can claim a name exclusively — while `create_dir_all` makes
+every missing level and succeeds when the whole chain already exists, so
+"make sure this place exists before I write into it" never fails for having
+already run. `remove_dir` refuses a directory that is not empty;
+`remove_dir_all` takes the tree and everything under it. `copy_dir` copies
+a tree into `to`, creating it if needed: files already there with a
+counterpart in the source are overwritten and files with no counterpart are
+left alone, so it is a merge, not a mirror.
 
 Three reads, three different questions. `read_bytes` is the true binary
 read: the host hands back a `Buffer`, which binds straight to `Bytes` with
@@ -298,6 +354,61 @@ crashed run can strand a `<path>.<uuid>.tmp` file beside the target;
 `vilan` has no `try`/`catch` to sweep it up. `rename` is the primitive
 underneath, and it is also how you move a file: the destination is
 replaced if it exists, and the source stops existing.
+
+Bytes go out as well as in. `write_bytes` is `read_bytes`'s mirror and it
+was missing for a while, which meant a program could read a favicon and
+could not write one back: `writeFile` was bound once, typed for `str`. It
+takes `Bytes` and the bytes reach the file unchanged — no encode, no
+decode, no replacement character. That is not a small promise. A text round
+trip through UTF-8 turned kolt's 483-byte favicon into 853 bytes served,
+one U+FFFD for every byte that was not a legal sequence, and that is the
+failure `write_bytes` exists to make unrepresentable.
+`write_bytes_atomic` is the same call with `write_atomic`'s temp-sibling
+discipline, for an image or a font a running server is reading.
+
+`append` extends a file and never truncates it, creating it if it is not
+there — the right call for a log, the wrong one for a store, because an
+append is not atomic and a crash partway through leaves a partial line.
+`update(path, revise)` is the read-modify-write every JSON store and every
+config rewrite is made of, with the write half already atomic: the file is
+read as UTF-8, handed to your closure, and what comes back is written
+through `write_atomic`. It is not a lock, and the difference is worth
+knowing before you rely on it — two processes calling `update` on one path
+can still interleave read-read-write-write, and the second write wins
+whole. `update` closes the *tearing* window, not the *racing* one; closing
+that would need advisory locking, which the host has no access to. For a
+single writer — a store, a cache, a config — it is the complete answer.
+`revise` is a plain value-returning closure, so it is asyncness-polymorphic:
+a revision that awaits makes that `update` await too, with nothing to
+write at either the declaration or the call site.
+
+`copy` duplicates a file and the source survives, which is the whole
+difference from `rename`; an occupied destination is replaced. `remove`
+deletes a *file* and refuses a directory — the split is the host's, and
+`remove_dir`/`remove_dir_all` are the other side of it. There is no
+synchronous variant of any of these, and none was asked for: a sync variant
+of an async operation has to name the caller that cannot suspend, and in
+this module there is exactly one such caller in the whole language — a
+module-level `let`, which cannot await — so the bar is a name, not a
+category.
+
+Reading a build's assets, rewriting one, and putting the result somewhere
+new is the shape most of this is for:
+
+```vilan,norun
+import std::fs::{ create_dir_all, read_bytes, scan_dir, update, write_bytes_atomic };
+
+fun main() {
+	create_dir_all("dist/assets");
+	for entry in scan_dir("assets") {
+		if entry.is_file {
+			write_bytes_atomic(i"dist/assets/{entry.name}", read_bytes(i"assets/{entry.name}"));
+		}
+	}
+	update("dist/manifest.json", |text| i"{text}\n");
+}
+main();
+```
 
 ## std::build
 
