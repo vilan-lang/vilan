@@ -119,17 +119,36 @@ function, which hands you only a fallback and no builder to install on.
 
 Three details are decisions, not defaults. The route shape is
 `/<file name>`, which is what every shell already asks for, so adopting it
-moves no HTML. Content types come from a short fixed table (`.js`/`.mjs`,
-`.css`, `.json`, `.html`); anything else is not served, because
-`serve_build` serves a *build*, not a directory — and the skip is said, not
-silent: boot prints a warning naming the artifact it will not serve. And an
-artifact the build named but did not write **stops the server at boot**,
-naming the file and the leg, rather than 404ing for the life of the process.
+moves no HTML. Content types come from a table generated from
+[`mime-db`](https://github.com/jshttp/mime-db) — the registry aggregate
+vite's own mime lookup is generated from — covering what a build emits and
+what a page it serves loads as a whole sub-resource: scripts, styles and
+markup, json and the web manifest, images, fonts and wasm. An extension
+outside it is still not served, because `serve_build` serves a *build*, not
+a directory — and the skip is said, not silent: boot prints a warning naming
+the artifact it will not serve. And an artifact the build named but did not
+write **stops the server at boot**, naming the file and the leg, rather than
+404ing for the life of the process.
+
+Artifacts are served as **bytes**, exactly as the build wrote them — a
+favicon or a font arrives byte for byte, which a table alone would not
+achieve. That is also why every `text/*` row spells `; charset=utf-8`: a raw
+body carries no encoding of its own, so an unspelled `text/css` would be
+decoded by whatever the browser defaults to. `application/json` and its
+`+json` relatives take no charset, being utf8 by spec, and `.webmanifest` is
+served `application/manifest+json` because Chrome rejects a manifest under
+any other type.
+
+Audio and video are deliberately absent from the table. `serve_build` writes
+a whole body and honours no `Range` header, so a browser could not seek in
+anything it served; a row for `.mp4` would type a response that does not
+work. Media belongs behind the static file server §5.10 defers, not here.
 
 Freshness is its dev-mode policy: under `vilan run --watch`
 ([`is_watching`](#stdwatch)) each asset is re-read per request, so a
 rebuild is served without a restart; otherwise the copy read at boot is
-served from memory.
+served from memory. Both halves read bytes, so a watch never serves a
+freshly decoded — and freshly corrupted — copy of a binary artifact.
 
 A **streaming** response holds the connection open: once the status and
 headers are written, `on_open` receives the live `ResponseStream` and

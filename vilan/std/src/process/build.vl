@@ -16,6 +16,7 @@
 // `std::http`'s `ServerBuilder::serve_build` is its first consumer, and turns
 // the whole ceremony into one line.
 
+import pkg::bytes::Bytes;
 import pkg::fs;
 import pkg::io::{ panic, print };
 import pkg::json::{ JsonValue, coerce_bool, coerce_str };
@@ -159,11 +160,20 @@ struct BuildAsset {
 	url: str,
 	/// Where it lives on disk — `dist/client.js`.
 	file: str,
-	/// What its extension implies (`content_type_of`).
+	/// What its extension implies, ready to send — including the charset on a
+	/// `text/*` type, which a raw-byte body needs and cannot supply itself
+	/// (`content_type_of`).
 	content_type: str,
 	/// The bytes read at boot. What is served outside a watch, and what makes a
 	/// missing artifact a boot-time failure rather than a 404 per request.
-	content: str,
+	///
+	/// `Bytes`, not `str`: an artifact is whatever the build wrote, and a UTF-8
+	/// decode is lossy over every one of them that is not text. While this was a
+	/// `str` the content type was a promise the pipeline could not keep — the
+	/// table could name `image/png` for a file it had already destroyed. kolt
+	/// measured the damage on its own favicon: 483 bytes on disk, 853 after the
+	/// read (kolt.local 030).
+	content: Bytes,
 }
 
 /// Read every artifact `build` names, ONCE, at boot — the list
@@ -179,9 +189,11 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 		let (url, file) = artifact;
 		match content_type_of(file) {
 			// Not served rather than guessed at: `serve_build` serves a build,
-			// not a directory. Nothing a vilan build emits lands here today —
-			// and when something does, the skip is SAID, not silent
-			// (kolt.local 022(b)): the drop stays, the warning names it.
+			// not a directory (`content_type_of`). Reaching this arm now takes
+			// a genuinely foreign extension — an archive, a database, a
+			// document — since the table covers what a build emits and what
+			// the page it serves loads. The drop stays; the skip is SAID, not
+			// silent (kolt.local 022(b)), and the warning names the artifact.
 			None => print(i"warning: the `{build.leg}` build names {file}, whose extension `serve_build` has no content type for — the artifact is not served"),
 			Some(let content_type) => {
 				if !fs::exists(file) {
@@ -191,7 +203,7 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 					url = url,
 					file = file,
 					content_type = content_type,
-					content = fs::read_file_to_str(file),
+					content = fs::read_bytes(file),
 				});
 			},
 		}
@@ -225,40 +237,101 @@ fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 /// This makes the SERVER's copies fresh. The dev channel's push half (the css
 /// and js hot-swaps) is untouched and remains the way a browser is told.
 ///
-/// The re-read is the ordinary async `read_file_to_str`, awaited before the
-/// response is built. Nothing on this path forbids suspending: `serve_build`'s
-/// handler is reached from `respond_from_build`, which is `async` because it
-/// awaits the app's own handler, and the node callback in `Server::start`
-/// already suspends on `read_request_bytes` before a byte is written. A
-/// synchronous read here bought nothing, and it once justified its own
-/// existence in `std::fs` by claiming this caller could not suspend.
-fun asset_body(asset: BuildAsset): str {
+/// The re-read is the ordinary async `read_bytes`, awaited before the response
+/// is built. Nothing on this path forbids suspending: `serve_build`'s handler is
+/// reached from `respond_from_build`, which is `async` because it awaits the
+/// app's own handler, and the node callback in `Server::start` already suspends
+/// on `read_request_bytes` before a byte is written. A synchronous read here
+/// bought nothing, and it once justified its own existence in `std::fs` by
+/// claiming this caller could not suspend.
+///
+/// Both halves read the same way they store: `Bytes` out, decoded by nobody. A
+/// watch that re-read as text would have served a fresh CORRUPTION of every
+/// binary artifact, and differed from the boot copy in exactly the bytes a
+/// `.png` is made of.
+fun asset_body(asset: BuildAsset): Bytes {
 	if is_watching() {
-		fs::read_file_to_str(asset.file)
+		fs::read_bytes(asset.file)
 	} else {
 		asset.content
 	}
 }
 
-/// The content type `file`'s extension implies, or `None` for an extension
-/// this table does not name.
+/// The content type `file`'s extension implies, or `None` for an extension this
+/// table does not name.
 ///
-/// The table is fixed, short, and not user-facing, because `serve_build` serves
-/// A BUILD and not a directory (`fullstack-dx.md` §5.10): it covers exactly the
-/// kinds a vilan build emits, and an extension it does not name is not served
-/// rather than guessed at. (A directory server would need traversal, caching
-/// and guessed content types — deliberately out of scope here, even though
-/// `std::fs` reads bytes now via `read_bytes`.)
+/// The table is GENERATED, and its rows are not a judgement about what this
+/// language is CAPABLE of serving. That distinction is the correction. The
+/// fence here used to read as a capability claim — no vilan program could read
+/// a binary file at all, so `serve_build` naming `image/png` would have been a
+/// promise it could not keep. That stopped being true: `read_bytes`, `Bytes`
+/// and `body_bytes` all exist, and `BuildAsset` above now carries bytes end to
+/// end (kolt.local 030). Reasoning from the old premise is what left this
+/// module unable to type the artifacts kolt had to hand-roll a static layer for.
+///
+/// What survives is the SCOPE claim, which was always the real one:
+/// `serve_build` serves A BUILD and not a directory (`fullstack-dx.md` §5.10).
+/// A directory server needs traversal, `Range`, caching and conditional
+/// requests — none of which is here, and none of which is bought by knowing
+/// more extensions. So the rows cover what a build emits and what a page it
+/// serves loads as a WHOLE sub-resource, and an extension outside that is still
+/// not served rather than guessed at — the `_ => None` arm, unchanged in
+/// meaning. Audio and video are deliberately absent for the same reason stated
+/// positively: a body served whole, with no `Range`, is one a browser cannot
+/// seek in, so a row for `.mp4` would type a response that does not work.
+///
+/// The rows are derived from `mime-db` — the IANA/Apache/nginx aggregate that
+/// vite's `mrmime` is generated from — via
+/// `crates/vilan-core/tests/mime-table.tsv`, and regenerated and gated by
+/// `crates/vilan-core/tests/mime_table_sync.rs`. Nothing here is typed from
+/// memory, which is the only way a table this shape does not rot.
+///
+/// A `text/*` row spells `charset=utf-8`; nothing else carries a charset. Both
+/// halves are load-bearing. The body goes out as raw bytes (`asset_response`),
+/// so an unspelled `text/css` is decoded by whatever the browser defaults to
+/// rather than as utf8 — while `application/json` and its `+json` relatives are
+/// utf8 BY SPEC, and naming a charset on those is the error, not the fix.
+/// `.webmanifest` earns a row of its own for a third reason: Chrome rejects a
+/// manifest served as anything but `application/manifest+json`.
 fun content_type_of(file: str): Option<str> {
-	if file.ends_with(".js") || file.ends_with(".mjs") {
-		Some("text/javascript")
-	} else if file.ends_with(".css") {
-		Some("text/css")
-	} else if file.ends_with(".json") {
-		Some("application/json")
-	} else if file.ends_with(".html") {
-		Some("text/html")
-	} else {
-		None
+	// The extension is lowercased first: `FAVICON.PNG` is one file to the build
+	// that wrote it, so it is one row to the table that types it.
+	match file.split(".").last().unwrap_or("").to_lowercase_ascii() {
+		// GENERATED(mime-table): from crates/vilan-core/tests/mime-table.tsv, itself derived from
+		// mime-db 1.54.0 — regenerate: VILAN_REGENERATE_MIME_TABLE=1 cargo test -p vilan-core --test mime_table_sync
+		// markup and code
+		"css" => Some("text/css; charset=utf-8"),
+		"htm" => Some("text/html; charset=utf-8"),
+		"html" => Some("text/html; charset=utf-8"),
+		"js" => Some("text/javascript; charset=utf-8"),
+		"map" => Some("application/json"),
+		"mjs" => Some("text/javascript; charset=utf-8"),
+		// data and text
+		"csv" => Some("text/csv; charset=utf-8"),
+		"json" => Some("application/json"),
+		"txt" => Some("text/plain; charset=utf-8"),
+		"webmanifest" => Some("application/manifest+json"),
+		"xml" => Some("application/xml"),
+		// images
+		"apng" => Some("image/apng"),
+		"avif" => Some("image/avif"),
+		"bmp" => Some("image/bmp"),
+		"gif" => Some("image/gif"),
+		"ico" => Some("image/x-icon"),
+		"jpeg" => Some("image/jpeg"),
+		"jpg" => Some("image/jpeg"),
+		"png" => Some("image/png"),
+		"svg" => Some("image/svg+xml"),
+		"webp" => Some("image/webp"),
+		// fonts
+		"otf" => Some("font/otf"),
+		"ttf" => Some("font/ttf"),
+		"woff" => Some("font/woff"),
+		"woff2" => Some("font/woff2"),
+		// other browser-native
+		"pdf" => Some("application/pdf"),
+		"wasm" => Some("application/wasm"),
+		// END GENERATED(mime-table)
+		_ => None,
 	}
 }

@@ -122,6 +122,17 @@ Rust workspace, five crates, plus the language's own tree:
   keyword-hover deep links to the book's headings and
   `docs/appendix/editor.md` to the server's code-action titles, capabilities
   and settings (D18/D19).
+- **`serve_build`'s content-type table is GENERATED too** — the third fragment in
+  this tree that must never be hand-edited. The rows in `content_type_of`
+  (`vilan/std/src/process/build.vl`) sit between `GENERATED(mime-table)` markers
+  and are generated from `crates/vilan-core/tests/mime-table.tsv`, itself derived
+  from the `mime-db` registry data by `scripts/regen-mime-table.py`.
+  `crates/vilan-core/tests/mime_table_sync.rs` byte-holds the arms to the dataset
+  on every suite run and gates the charset rule, the curated extension list, the
+  §5.10 fence and the provenance. To add an extension: add it to `CURATED` in the
+  script AND in the gate (both, deliberately — neither may move alone), refresh
+  the dataset, then
+  `VILAN_REGENERATE_MIME_TABLE=1 cargo test -p vilan-core --test mime_table_sync`.
 - **A post-`analyze()` pass must be wired into BOTH pipelines** — `lib.rs`'s
   `analyze_source` (tests + LSP) *and* the CLI's duplicated sequence in
   `crates/vilan-cli/src/main.rs` — and verified with a CLI probe, not only an
