@@ -368,27 +368,34 @@ fn a_resource_that_is_already_in_place_is_not_copied_over_itself() {
 /// per-leg skip is the const channel's build-input record of the bundled file.
 /// A workspace, so the source (`src/static/note.txt`) and the copy
 /// (`dist/static/note.txt`) are two different paths and the second can be
-/// watched without the first being the same file.
+/// watched without the first being the same file — and a BROWSER leg beside
+/// the server, so the round runs under HMR (`activate_hmr` needs one), which
+/// is the watch path that carries a leg's resources across a per-leg skip.
 #[test]
 fn a_watch_round_recopies_a_changed_resource() {
     let dir = temp_project("watch");
     write(
         &dir,
         "vilan.toml",
-        "[package]\nname = \"bundled\"\n\n[entry.server]\n",
+        "[package]\nname = \"bundled\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
     );
     write(&dir, "src/static/note.txt", "round one\n");
     write(
         &dir,
-        "src/server.vl",
+        "src/client.vl",
         "import std::asset::bundle;\n\
-         import std::io::print;\n\
+         import std::ui::{ mount_root, view };\n\
          \n\
          let note = const bundle(\"static/note.txt\");\n\
          \n\
          fun main() {\n\
-         \tprint(note);\n\
+         \tlet _root = mount_root(\"app\", || view(\"a\").attr(\"href\", note));\n\
          }\n",
+    );
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
     );
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", "--watch", dir.to_str().expect("utf-8 temp path")])

@@ -913,9 +913,12 @@ fn hmr_round(
         // The leg's bundled resources ride every round, including a SKIPPED
         // one: `next` carries the previous round's artifact verbatim, so the
         // copy is idempotent and `dist/` never loses an asset to a round that
-        // recompiled nothing. A round that recompiled BECAUSE an asset changed
-        // recopies the new bytes here, which is what makes `asset_body`'s
-        // watch-mode re-read see them (`dev-refresh.md` §5, item 1).
+        // recompiled nothing. The copy reads the SOURCE, so a round TRIGGERED
+        // by an edited resource carries the new bytes whether or not the leg
+        // recompiled — which is what makes `asset_body`'s watch-mode re-read
+        // see them (`dev-refresh.md` §5, item 1). The trigger itself is the
+        // build-input record `record_const_inputs` hands the watcher; without
+        // it no round fires and `dist/` keeps the first round's copy forever.
         let assets = write_bundled(&dist, &leg.bundled, &reserved).unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
         let _ = write_chunks(
