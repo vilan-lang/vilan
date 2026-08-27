@@ -12,6 +12,7 @@
 // an exception it throws. Any other `stat` failure still throws.
 
 import pkg::bytes::Bytes;
+import pkg::crypto::random_uuid;
 import pkg::option::Option::{ None, Some, self };
 
 /// Reads a file, decoded as text under `encoding` (a `node:fs` encoding name —
@@ -53,6 +54,38 @@ external fun exists(path: str): bool;
 /// implicitly await it.
 fun read_file_to_str(path: str): str {
 	read_file_encoded(path, "utf8")
+}
+
+// --- atomic replace ------------------------------------------------------
+
+/// Renames (moves) `from` to `to`, replacing `to` if it already exists.
+/// WITHIN one filesystem this is atomic: a reader of `to` sees either the old
+/// file or the new one, never a mix. ACROSS filesystems the host raises
+/// `EXDEV` and nothing moves — which is why `write_atomic` below keeps its
+/// temporary a SIBLING of its target rather than putting it in a temp dir.
+[extern("node:fs/promises", "rename")]
+async external fun rename(from: str, to: str): void;
+
+/// Writes `contents` to `path` atomically: into a uniquely-named sibling
+/// first, then `rename` over the target. A crash at any point leaves either
+/// the previous file intact or the complete new one — never the truncated
+/// half-write a plain `write_file` leaves behind, which is how a JSON store
+/// silently loses everything on the next boot that reads it back and finds it
+/// corrupt (proposal/filesystem.md §2 traces that failure end to end).
+///
+/// ATOMIC, NOT DURABLE. After a power loss the rename may not have reached the
+/// device. Durability needs `fsync`, which the host exposes only on an open
+/// file handle — std has no handle type yet (proposal/filesystem.md §5.2).
+///
+/// The temporary is uniquely named because concurrent writers must not share
+/// one, so a crash can leave a `<path>.<uuid>.tmp` file behind: `vilan` has no
+/// `try`/`catch` to clean it up on the failing path. That is the right trade —
+/// a stray temporary is recoverable by hand, a torn target is not.
+fun write_atomic(path: str, contents: str) {
+	let unique = random_uuid();
+	let temporary = i"{path}.{unique}.tmp";
+	write_file(temporary, contents);
+	rename(temporary, path);
 }
 
 /// Lists a directory's immediate entries by NAME ONLY (files and

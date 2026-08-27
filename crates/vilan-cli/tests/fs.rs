@@ -254,3 +254,130 @@ main();
     assert_eq!(stdout, "hello, fs\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- atomic replace (kolt.local 031, proposal/filesystem.md §10) ----------
+
+#[test]
+fn write_atomic_creates_a_file_that_did_not_exist() {
+    let dir = temp_project("atomic_create");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/keep.txt", "sibling");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::fs::{ read_file_to_str, write_atomic };
+
+fun main() {
+	write_atomic("data/store.json", "[{\"id\":1}]");
+	print(read_file_to_str("data/store.json"));
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(stdout, "[{\"id\":1}]\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_atomic_replaces_an_existing_file_and_leaves_no_temporary_behind() {
+    // The temporary is a uniquely-named SIBLING, so a successful replace must
+    // leave the target's directory holding exactly what it held before plus
+    // nothing: a leaked `.<uuid>.tmp` here would mean the rename never ran.
+    let dir = temp_project("atomic_replace");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/store.json", "[{\"id\":1}]");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::fs::{ read_file_to_str, write_atomic };
+
+fun main() {
+	write_atomic("data/store.json", "[]");
+	print(read_file_to_str("data/store.json"));
+	write_atomic("data/store.json", "[{\"id\":2}]");
+	print(read_file_to_str("data/store.json"));
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(stdout, "[]\n[{\"id\":2}]\n");
+
+    let mut left: Vec<String> = std::fs::read_dir(dir.join("data"))
+        .expect("the data directory survives")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["store.json".to_string()],
+        "two atomic replaces must leave the target alone, with no `.tmp` sibling stranded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_atomic_throws_host_side_when_the_target_directory_does_not_exist() {
+    // The temporary is a SIBLING of the target, never a system temp file — so
+    // a target whose directory is missing fails at the write of the temporary,
+    // keeping `write_file`'s throwing posture rather than half-succeeding.
+    let dir = temp_project("atomic_missing_dir");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::fs::write_atomic;
+
+fun main() {
+	write_atomic("nothing/here/store.json", "[]");
+}
+main();
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "probe.vl"])
+        .current_dir(&dir)
+        .output()
+        .expect("run vilan");
+    assert!(
+        !output.status.success(),
+        "write_atomic into a missing directory should throw host-side, not succeed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ENOENT"),
+        "expected the host ENOENT to surface; stderr was:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rename_moves_a_file_and_replaces_an_existing_destination() {
+    // Both halves matter to `write_atomic`: the source stops existing, and an
+    // occupied destination is REPLACED rather than refused — the latter is the
+    // whole reason a temp-sibling-plus-rename is an atomic replace at all.
+    let dir = temp_project("rename");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/from.txt", "new contents");
+    write(&dir, "data/to.txt", "old contents");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::fs::{ exists, read_file_to_str, rename };
+
+fun main() {
+	rename("data/from.txt", "data/to.txt");
+	print(exists("data/from.txt"));
+	print(read_file_to_str("data/to.txt"));
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(stdout, "false\nnew contents\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

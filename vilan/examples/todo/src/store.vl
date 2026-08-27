@@ -100,12 +100,17 @@ fun boot(): TodoStore {
 	store
 }
 
-// One JSON frame at rest, riding the same codec seam as the wire. (The write
-// is fire-and-forget; rapid changes could land out of order — fine for a
+// One JSON frame at rest, riding the same codec seam as the wire. `write_atomic`
+// rather than `write_file`, because `load` below reads this file back at boot
+// and treats a decode failure as an empty list: a plain write that dies partway
+// leaves torn JSON, the next boot reads it as `[]`, and the subscription below
+// then persists that `[]` over the only surviving evidence — the whole list,
+// gone silently. Atomic replace breaks that chain at its first step. (The write
+// is still fire-and-forget; rapid changes could land out of order — fine for a
 // demo, a real app would serialize its writes.)
 fun persist(list: List<Todo>) {
 	match encode(json_codec(), list) {
-		Frame::Text(let text) => fs::write_file(storage, text),
+		Frame::Text(let text) => fs::write_atomic(storage, text),
 		Frame::Binary(let _bytes) => {},
 	}
 }
