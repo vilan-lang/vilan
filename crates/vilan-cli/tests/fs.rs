@@ -135,6 +135,40 @@ main();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The other half of N25's fix, and the half a Linux machine can actually
+/// prove: normalizing the host separator must NOT touch a backslash that is
+/// part of a NAME. `\` is a legal filename byte on Unix, so an unconditional
+/// rewrite in `__fs_read_dir_all` would corrupt a real file to fix a problem
+/// Unix does not have — which is what the first attempt at this fix did. The
+/// glue is gated on `path.sep` instead, so this file survives here and the
+/// Windows separator is still normalized there.
+#[cfg(unix)]
+#[test]
+fn a_backslash_in_a_name_survives_read_dir_all() {
+    let dir = temp_project("read_dir_all_backslash");
+    write(&dir, "data/od\\d.txt", "odd");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::fs::read_dir_all;
+
+fun main() {
+	for entry in read_dir_all("data").sort() {
+		print(entry);
+	}
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "od\\d.txt\n",
+        "a backslash in a NAME is not a separator"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn stat_reports_size_mtime_and_kind_for_a_file_and_a_directory() {
     let dir = temp_project("stat_hit");
@@ -927,8 +961,7 @@ main();
     );
     let stdout = run_ok(&dir, "probe.vl");
     assert_eq!(
-        stdout,
-        "2\na.txt dir=false file=true link=false\nsub dir=true file=false link=false\n",
+        stdout, "2\na.txt dir=false file=true link=false\nsub dir=true file=false link=false\n",
         "a file and a directory must be told apart by the scan itself"
     );
     let _ = std::fs::remove_dir_all(&dir);

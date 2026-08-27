@@ -22,6 +22,13 @@ than a band: ..."). Two entries tripped this in one cycle before it was
 written down.
 -->
 
+## Unreleased
+
+<!-- family: tooling -->
+**`fs::read_dir_all` hands back `/`-separated entries on Windows, like everywhere else.** node's recursive `readdir` joins nested entries with the *platform* separator, so a Windows entry arrived as `sub\c.txt` — one component to `std::path`, which is `/`-shaped by ruling because a separator-aware path module would make every derived cache key, asset url and golden host-dependent (kolt.local 017). This was the last red test on the Windows CI leg, and it was a real behavioural split rather than a test artefact: the same program listed a directory differently on two hosts. Normalized in the glue rather than in `read_dir_all`, so the whole language stays on one path shape and the one place a host hands back a joined path is the one place that fixes it. **Gated on `path.sep`, deliberately, and this is the interesting half:** a backslash is a *legal filename byte* on Unix, so an unconditional rewrite would corrupt a real file to fix a problem Unix does not have. On Windows a filename cannot contain one, so the split is unambiguous exactly where it runs. Pinned in both directions — the recursive listing's shape, and a Unix name containing a backslash surviving untouched, the latter proven by planting the unconditional form and watching `od\d.txt` become `od/d.txt`. (backlog N25)
+
+---
+
 ## v0.37.0 — 2026-08-27
 
 > **Upgrade if you are on v0.36.0 or earlier: this release fixes two

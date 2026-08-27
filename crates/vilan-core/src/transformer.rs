@@ -982,10 +982,27 @@ fn helper_source(name: &str) -> &'static str {
         // directory throws host-side, matching `read_dir`'s posture. The
         // dynamic `import` is self-contained on purpose, and Node caches
         // module resolution, so a hot loop does not re-resolve it per call.
+        // Entries come back `/`-separated on every host. node's recursive
+        // `readdir` joins with the PLATFORM separator, so on Windows a nested
+        // entry arrived as `sub\\c.txt` — one component to `std::path`, which
+        // is POSIX-shaped by ruling (kolt.local 017: a separator-aware path
+        // module would make every derived cache key, asset url and golden
+        // host-dependent). Normalizing here rather than in `read_dir_all`
+        // keeps the whole language on one path shape, and this is the only
+        // place in std where a host hands back a joined path.
+        //
+        // Gated on `path.sep`, NOT unconditional: a backslash is a LEGAL
+        // filename byte on Linux, so rewriting it there would corrupt a real
+        // name to fix a problem that platform does not have. On Windows a
+        // filename cannot contain one, so splitting is unambiguous exactly
+        // where it runs. (backlog N25)
         "__fs_read_dir_all" => {
             "async function __fs_read_dir_all(path) {\n\
              \tconst fsPromises = await import(\"node:fs/promises\");\n\
-             \treturn await fsPromises.readdir(path, { recursive: true });\n\
+             \tconst nodePath = await import(\"node:path\");\n\
+             \tconst entries = await fsPromises.readdir(path, { recursive: true });\n\
+             \tif (nodePath.sep === \"/\") return entries;\n\
+             \treturn entries.map((entry) => entry.split(nodePath.sep).join(\"/\"));\n\
              }"
         }
         // Cryptographically random bytes.
