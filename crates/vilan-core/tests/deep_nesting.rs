@@ -11,6 +11,16 @@
 //! unoptimized and overflowed exactly this spawn before the bound existed,
 //! while the bounded walk stops near 18 MiB. Growing this spawn to make a
 //! failure pass again would make the pin vacuous.
+//!
+//! The file grew past that one bound, because the recursive families that can
+//! reach the stack cliff share the worker and the argument. It now pins, in
+//! order: the phase-1 walk's bound (B138); the return-inference chain's bound,
+//! its COST — a line in the chain's length, in both source orders — and the
+//! flattening the recorded answer buys when the callee is defined first (all
+//! B139); and the parser's own bound, which does not exist yet and is
+//! `#[ignore]`d until it does (B142). The cost pins live here rather than in a
+//! file of their own so that the chain plants have ONE definition: a plant
+//! copied into a second file is a plant that drifts.
 
 use std::path::{Path, PathBuf};
 

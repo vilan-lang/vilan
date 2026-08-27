@@ -23,8 +23,8 @@
 //! `buffer_parse_count` probe shape (E83), for the same reason.
 //!
 //! The worker stack is the deep-nesting convention, not a margin claim: the
-//! parser is not depth-bounded (B139's residual), and these depths are chosen
-//! to measure cost, not to probe the depth cliff.
+//! parser is not depth-bounded (B142, filed as B139's residual), and these
+//! depths are chosen to measure cost, not to probe the depth cliff.
 
 use vilan_core::parsing;
 

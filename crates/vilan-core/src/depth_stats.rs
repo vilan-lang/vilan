@@ -26,10 +26,10 @@
 //! * `pattern` — [`DepthFrame`] in `resolve_pattern`: pattern nesting.
 //! * `parse` — [`DepthFrame`] in `parsing::Parser::parse_atom`: the parser's
 //!   own recursion, which runs BEFORE any of the above and is not depth-bounded
-//!   (B139's residual). It was added when the arithmetic-nesting plants showed
-//!   the parser overflowing a stack the analyzer's bounded walk fits in
-//!   comfortably — measuring it is what lets the stack margins be argued from
-//!   the WHOLE pipeline rather than from the analyzer alone.
+//!   (B142, filed as B139's residual). It was added when the arithmetic-nesting
+//!   plants showed the parser overflowing a stack the analyzer's bounded walk
+//!   fits in comfortably — measuring it is what lets the stack margins be
+//!   argued from the WHOLE pipeline rather than from the analyzer alone.
 //!
 //! Bytes are a stack-pointer high-water mark: [`reset`] anchors the address of
 //! a local at analysis start, and a new peak records how far below that anchor
