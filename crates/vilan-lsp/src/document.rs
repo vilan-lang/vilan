@@ -759,8 +759,9 @@ impl Document {
     pub fn analyze(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
         // The pipeline recurses deeply (chumsky), and macro-world compiles NEST
         // a full analysis inside the analysis — run the whole thing on a
-        // dedicated big-stack thread, like the CLI's compiler thread (256 MiB,
-        // whose measured rationale lives at its `COMPILER_STACK_SIZE`; B138).
+        // dedicated big-stack thread, like the CLI's compiler thread (128 MiB,
+        // whose measured rationale lives at its `COMPILER_STACK_SIZE`, and
+        // which covers this nesting explicitly; B138/B139/B142).
         // Callers stay synchronous (the LSP already wraps this in
         // spawn_blocking).
         //
@@ -774,7 +775,7 @@ impl Document {
         let std_dir = std_dir.to_path_buf();
         let entry_path = entry_path.to_path_buf();
         std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
+            .stack_size(128 * 1024 * 1024)
             .spawn(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     Self::analyze_on_this_thread(&text, &std_dir, &entry_path)

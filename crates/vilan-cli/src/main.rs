@@ -183,23 +183,32 @@ fn main() -> ExitCode {
     // work on a worker with a generous stack, as rustc and other compilers do;
     // the reservation is virtual address space, so it costs nothing unless used.
     //
-    // The margin is measured now, not folklore (B138/B139,
-    // `VILAN_DEPTH_STATS`): a realistic server program's analysis peaks under
-    // 1 MiB of stack even unoptimized, and every family the ANALYZER recurses
-    // on is depth-bounded — the phase-1 expression walk at ~36 KiB per nesting
-    // level (500 levels, ~18 MiB worst case) and the cross-function
-    // return-inference chain at ~12.8 KiB per call link (500 links, ~6.4 MiB),
-    // each refusing with a diagnostic rather than overflowing.
+    // The margin is measured, not folklore, and every recursive family behind
+    // it is BOUNDED now (B138/B139/B142, `VILAN_DEPTH_STATS`) — which is what
+    // brought this number down from 256 MiB:
     //
-    // What keeps the number at 256 MiB is now ONE path, named precisely: the
-    // PARSER recurses once per level of source nesting at ~71.8 KiB per level
-    // unoptimized — twice the expression walk's frame, the deepest consumer in
-    // the pipeline — and has no depth limit at all. It also runs FIRST, so it
-    // reaches the cliff before either analyzer bound can refuse: this
-    // reservation covers roughly 3,600 levels of nesting unoptimized, and past
-    // that a file dies with no diagnostic. Shrink it only when the parser is
-    // bounded too.
-    const COMPILER_STACK_SIZE: usize = 256 * 1024 * 1024;
+    //   * the PARSER, at 500 levels of nesting. The deepest consumer in the
+    //     pipeline and the one that runs first, so before B142 it reached the
+    //     cliff before either analyzer bound could refuse. Measured through
+    //     this binary on the worst plant (5000 nested parentheses): peak depth
+    //     501, 35.2 MiB unoptimized, ~10 MiB optimized.
+    //   * the phase-1 expression walk, ~36 KiB per level (500 levels, ~18 MiB).
+    //   * the return-inference chain, ~12.8 KiB per call link (500, ~6.4 MiB).
+    //
+    // Each refuses with a diagnostic rather than overflowing, and the phases
+    // run in SEQUENCE — the parse has unwound before analysis starts — so the
+    // worst case is the largest of them, not their sum: ~35 MiB unoptimized.
+    // Real code is nowhere near it: all 211 corpus entries peak at 23 parser
+    // levels against a bound of 500, and a realistic analysis peaks under 1 MiB.
+    //
+    // 128 MiB is ~3.6x that measured worst case, and the headroom is not idle.
+    // A macro-world compile NESTS a full pipeline inside the running analysis
+    // (see `Document::analyze` in vilan-lsp), so a deep walk carrying a deep
+    // nested parse inside it composes to roughly 53 MiB; this covers that with
+    // room over. Bounding the parser is what made the number finite at all —
+    // before B142 there was no worst case to size anything against, and the
+    // margin was standing in for a bound that did not exist.
+    const COMPILER_STACK_SIZE: usize = 128 * 1024 * 1024;
     std::thread::Builder::new()
         .stack_size(COMPILER_STACK_SIZE)
         .spawn(run_cli)
