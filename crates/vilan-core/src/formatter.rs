@@ -510,7 +510,7 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
 // alone, never of the link's position in the chain. So the emitted CSS is
 // byte-identical across any permutation, and the surviving slot map is
 // identical across a permutation that respects the two rules above.
-// `crates/vilan-core/tests/style_chain_order.rs` proves both over a corpus, by
+// `crates/vilan-cli/tests/style_chain_order.rs` proves both over a corpus, by
 // building each chain in source and in sorted order and diffing the CSS.
 //
 // `Style + Style` operands are deliberately out of scope: that merge's order is
