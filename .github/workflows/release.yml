@@ -204,24 +204,32 @@ jobs:
       # a mismatch between the two fails in the browser, not in this job.
       - name: wasm-bindgen
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
-      # The 64 MiB `-zstack-size` is the compiler's stack inside the page's
-      # linear memory. Measured (B138/B139, `VILAN_DEPTH_STATS`): a realistic
-      # analysis peaks well under 1 MiB optimized, and every family the
-      # ANALYZER recurses on is now depth-bounded — the expression walk near
-      # 2.3 MiB and the return-inference chain near 1.1 MiB at native-release
-      # frame sizes, ~3.4 MiB together.
+      # The 16 MiB `-zstack-size` is the compiler's stack inside the page's
+      # linear memory — and unlike a native thread's reservation, this is
+      # memory the visitor's browser actually commits, so it is sized rather
+      # than guessed.
       #
-      # What holds the number here is no longer the analyzer: it is the PARSER,
-      # which recurses once per level of source nesting at ~20.3 KiB per level
-      # optimized — 4x the bounded expression walk's per-level cost, and the
-      # single deepest consumer in the pipeline — with no depth limit at all.
-      # It also runs FIRST, so it reaches the cliff before any analyzer bound
-      # can refuse: 64 MiB is roughly 3,200 levels of nesting, and past that a
-      # file dies without a diagnostic. Shrink this only when the parser is
-      # bounded too; until then the headroom is what stands in for that bound.
+      # Every recursive family in the pipeline is depth-bounded now
+      # (B138/B139/B142): the parser at 500 levels of nesting, the phase-1
+      # expression walk at 500, the return-inference chain at 500 links. That
+      # is what gives a finite worst case to size against, where before there
+      # was none.
+      #
+      # Measured HERE rather than extrapolated from native frame sizes, because
+      # this profile differs from `release` (opt-level="z" + fat LTO): the
+      # `wasm-release` artifact was built at a range of `-zstack-size` values
+      # and run under node against the same pathological plants the parser's
+      # own pins use. 8 MiB compiles every one of them, including the two worst
+      # (5000 nested parentheses, 5000 nested calls); 4 MiB traps on those two
+      # and passes the rest. The real need therefore sits between 4 and 8 MiB,
+      # and 16 MiB is at least 2x the size proven sufficient.
+      #
+      # This was 64 MiB while the parser was unbounded, where the headroom was
+      # standing in for a bound that did not exist. It does now, and the 48 MiB
+      # given back is linear memory the page no longer reserves.
       - name: Build
         run: |
-          RUSTFLAGS="-C link-arg=-zstack-size=67108864" \
+          RUSTFLAGS="-C link-arg=-zstack-size=16777216" \
             cargo build -p vilan-wasm --profile wasm-release \
               --target wasm32-unknown-unknown
           wasm-bindgen --target web --out-dir pkg \

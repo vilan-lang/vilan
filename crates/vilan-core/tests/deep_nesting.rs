@@ -17,10 +17,10 @@
 //! order: the phase-1 walk's bound (B138); the return-inference chain's bound,
 //! its COST — a line in the chain's length, in both source orders — and the
 //! flattening the recorded answer buys when the callee is defined first (all
-//! B139); and the parser's own bound, which does not exist yet and is
-//! `#[ignore]`d until it does (B142). The cost pins live here rather than in a
-//! file of their own so that the chain plants have ONE definition: a plant
-//! copied into a second file is a plant that drifts.
+//! B139); and the PARSER's own bound, one pin per door into a nested grammar
+//! (B142). The cost pins live here rather than in a file of their own so that
+//! the chain plants have ONE definition: a plant copied into a second file is a
+//! plant that drifts.
 
 use std::path::{Path, PathBuf};
 
@@ -104,24 +104,27 @@ fn a_5000_deep_expression_is_refused_cleanly() {
     );
 }
 
-/// The PARSER has no depth bound (backlog B142), and it is the pipeline's
-/// deepest stack consumer: `VILAN_DEPTH_STATS`'s `parse` family measures
-/// `Parser::parse_atom` at ~71.8 KiB per level of source nesting unoptimized
-/// (~20.3 KiB optimized) — twice the bounded phase-1 walk's frame unoptimized,
-/// four times it optimized — with no limit at all.
+/// The PARSER is bounded too (B142), and it is the pipeline's deepest stack
+/// consumer: `VILAN_DEPTH_STATS`'s `parse` family measured it at ~71.8 KiB per
+/// level of source nesting unoptimized (~20.3 KiB optimized) — twice the
+/// bounded phase-1 walk's frame unoptimized, four times it optimized.
 ///
-/// It also runs FIRST, so it reaches the stack cliff before either analyzer
-/// bound can refuse: `a_5000_deep_expression_is_refused_cleanly` above only
-/// works because a METHOD CHAIN is flat to the parser and deep only to the
-/// walk. Nest the source syntactically instead — 5000 parentheses re-enter
-/// `parse_atom` once per level — and the file dies with no diagnostic at all,
-/// which is the one outcome the depth work exists to prevent.
+/// It also runs FIRST, so before the bound it reached the stack cliff before
+/// either analyzer bound could refuse: `a_5000_deep_expression_is_refused_cleanly`
+/// above only works because a METHOD CHAIN is flat to the parser and deep only
+/// to the walk. Nest the source syntactically instead — 5000 parentheses
+/// re-enter the expression grammar once per level — and the file used to die
+/// with no diagnostic at all, which is the one outcome the depth work exists to
+/// prevent.
 ///
-/// This asserts the behaviour B142 WILL have: the same three claims the walk's
-/// bound already satisfies, on the same 64 MiB worker (which must NOT grow —
-/// see the module comment).
+/// This is the END-TO-END leg: the same three claims the walk's bound satisfies,
+/// asserted through `analyze_source` so the parser's refusal is shown to survive
+/// the whole pipeline and arrive as a diagnostic. `every_nesting_door_is_refused_cleanly`
+/// is the exhaustive per-door leg, and parses directly. Both share the 64 MiB
+/// worker, which must NOT grow — see the module comment; the bounded parse of
+/// this very plant measures 35.2 MiB unoptimized, so the margin is real but not
+/// large.
 #[test]
-#[ignore = "B142: the parser has no depth bound, so nested parentheses overflow the stack before any analyzer bound can refuse"]
 fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
     let source = format!(
         "fun main() {{\n\tlet x = {}1{};\n}}\n",
@@ -349,4 +352,278 @@ fn a_callee_first_return_chain_costs_a_line_in_its_length() {
     // caller-first case on purpose: two claims, two tests, so a failure in one
     // order still reports the other.
     assert_linear_in_chain_length(undeclared_return_chain_callee_first, "a callee-first chain");
+}
+
+// ---------------------------------------------------------------------------
+// The parser's own bound (B142) — one pin per DOOR.
+// ---------------------------------------------------------------------------
+
+/// Parses `source` on the same 64 MiB worker, WITHOUT analyzing it. The door
+/// table below is a claim about the parser alone, and parsing it directly keeps
+/// the plants off std's analysis cost — twenty-one 5000-level plants through
+/// `analyze_source` would dominate this binary's runtime for no added claim.
+/// `a_5000_deep_parenthesized_expression_is_refused_cleanly` is the end-to-end
+/// leg that proves the refusal survives the whole pipeline.
+fn parse_on_64_mib(source: String) -> (bool, Vec<String>) {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (tree, errors) = vilan_core::parsing::parse(leaked);
+            (
+                tree.is_some(),
+                errors.iter().map(vilan_core::parsing::render).collect(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked — the depth bound must refuse, never overflow")
+}
+
+/// Every door by which source can nest one level deeper, planted `levels` deep.
+///
+/// **Why a table and not one bound in `parse_atom`.** The instrument was first
+/// hung on `parse_atom`, and a bound there would have looked right: the
+/// bracketed forms all re-enter it. It would have covered the first four rows
+/// here and nothing else. The block-bearing forms and the prefixes reach a
+/// nested expression through `parse_secondary` without touching an atom; and
+/// past the expression grammar there are five more recursive grammars — types,
+/// binders/patterns, items, import paths and elements — each a closed cycle
+/// that reaches no expression rule at all. Measured before the bound existed,
+/// `fun a() { fun a() { .. } }` at 5000 levels overflowed this very worker with
+/// no diagnostic, which is the one outcome the depth work exists to prevent.
+///
+/// So the plants live in a table: a door that stops being covered is a row that
+/// goes red, and a door added to the grammar later is a row somebody has to
+/// think about adding. Every row was confirmed to overflow or hang WITHOUT the
+/// bound before being written down here.
+fn nesting_doors(levels: usize) -> Vec<(&'static str, String)> {
+    let n = levels;
+    vec![
+        // The expression grammar's bracketed forms — the four `parse_atom`
+        // would have covered.
+        (
+            "parenthesis",
+            format!(
+                "fun main() {{\n\tlet x = {}1{};\n}}\n",
+                "(".repeat(n),
+                ")".repeat(n)
+            ),
+        ),
+        (
+            "array literal",
+            format!(
+                "fun main() {{\n\tlet x = {}1{};\n}}\n",
+                "[".repeat(n),
+                "]".repeat(n)
+            ),
+        ),
+        (
+            "call arguments",
+            format!(
+                "fun main() {{\n\tlet x = f{}1{};\n}}\n",
+                "(f".repeat(n),
+                ")".repeat(n)
+            ),
+        ),
+        (
+            "index",
+            format!(
+                "fun main() {{\n\tlet x = a{}1{};\n}}\n",
+                "[a".repeat(n),
+                "]".repeat(n)
+            ),
+        ),
+        // Reached through `parse_secondary` without an atom.
+        (
+            "block",
+            format!(
+                "fun main() {{\n\tlet x = {}1{};\n}}\n",
+                "{ ".repeat(n),
+                "; }".repeat(n)
+            ),
+        ),
+        (
+            "closure body",
+            format!("fun main() {{\n\tlet x = {}1;\n}}\n", "|| ".repeat(n)),
+        ),
+        (
+            "struct literal",
+            format!(
+                "fun main() {{\n\tlet x = {}1{};\n}}\n",
+                "S { f = ".repeat(n),
+                " }".repeat(n)
+            ),
+        ),
+        // The prefixes, which recurse into themselves.
+        (
+            "unary prefix",
+            format!("fun main() {{\n\tlet x = {}1;\n}}\n", "!".repeat(n)),
+        ),
+        (
+            "`const` prefix",
+            format!("fun main() {{\n\tlet x = {}1;\n}}\n", "const ".repeat(n)),
+        ),
+        // The type grammar — a closed cycle that reaches no expression rule.
+        (
+            "reference type",
+            format!("fun f(a: {}i64) {{\n\tvoid\n}}\n", "& ".repeat(n)),
+        ),
+        (
+            "array type",
+            format!(
+                "fun f(a: {}i64{}) {{\n\tvoid\n}}\n",
+                "[".repeat(n),
+                "; 1]".repeat(n)
+            ),
+        ),
+        (
+            "tuple type",
+            format!(
+                "fun f(a: {}i64{}) {{\n\tvoid\n}}\n",
+                "(".repeat(n),
+                ")".repeat(n)
+            ),
+        ),
+        (
+            "generic argument",
+            format!(
+                "fun f(a: {}i64{}) {{\n\tvoid\n}}\n",
+                "L<".repeat(n),
+                ">".repeat(n)
+            ),
+        ),
+        // Binders and patterns — the second closed cycle.
+        (
+            "array binder",
+            format!(
+                "fun main() {{\n\tlet {}a{} = void;\n}}\n",
+                "[".repeat(n),
+                "]".repeat(n)
+            ),
+        ),
+        (
+            "match pattern",
+            format!(
+                "fun main() {{\n\tmatch x {{\n\t\t{}a{} => 1,\n\t}}\n}}\n",
+                "S(".repeat(n),
+                ")".repeat(n)
+            ),
+        ),
+        // Items — the cycle that closes through `parse_statement`, and the one
+        // that actually overflowed this worker.
+        (
+            "nested `fun`",
+            format!("{}\n{}\n", "fun a() {".repeat(n), "}".repeat(n)),
+        ),
+        (
+            "nested `mod`",
+            format!("{}\n{}\n", "mod a {".repeat(n), "}".repeat(n)),
+        ),
+        (
+            "`export` chain",
+            format!("{}fun f() {{\n\tvoid\n}}\n", "export ".repeat(n)),
+        ),
+        // Import paths and elements.
+        ("import path", format!("use {}a;\n", "a::".repeat(n))),
+        (
+            "import set",
+            format!("use {}a{};\n", "a::{".repeat(n), "}".repeat(n)),
+        ),
+        (
+            "element",
+            format!(
+                "fun main() {{\n\tlet x = {}{};\n}}\n",
+                "<a>".repeat(n),
+                "</a>".repeat(n)
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn every_nesting_door_is_refused_cleanly() {
+    for (door, source) in nesting_doors(5000) {
+        let (produced, messages) = parse_on_64_mib(source);
+        assert!(
+            produced,
+            "{door}: a too-deeply-nested source must still produce a tree (the \
+             refusal is a diagnostic, not an abort)"
+        );
+        let refusals: Vec<&String> = messages
+            .iter()
+            .filter(|message| message.contains("nests more than 500 levels deep"))
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "{door}: the bound must refuse ONCE per parse — 5000 levels past a \
+             500-level bound would otherwise report 4500 times — got: {messages:#?}"
+        );
+    }
+}
+
+/// The bound must be invisible from real code, and the margin has to be read
+/// against THIS counter rather than the instrument's earlier placement: types,
+/// patterns, items, import paths and elements all draw on the same counter now,
+/// so one level of source nesting can spend more than one level of it.
+///
+/// Swept over all 211 compilable corpus entries, `VILAN_DEPTH_STATS`'s `parse`
+/// family peaks at 23 with a median of 14. Fifty is past every corpus file and
+/// far short of the bound.
+#[test]
+fn realistic_parse_nesting_is_nowhere_near_the_bound() {
+    for (door, source) in nesting_doors(50) {
+        let (produced, messages) = parse_on_64_mib(source);
+        assert!(produced, "{door}: 50 levels must parse normally");
+        let refusals: Vec<&String> = messages
+            .iter()
+            .filter(|message| message.contains("nests more than 500 levels deep"))
+            .collect();
+        assert!(
+            refusals.is_empty(),
+            "{door}: 50 levels is past every corpus file and must be nowhere \
+             near the bound, got: {messages:#?}"
+        );
+    }
+}
+
+/// The FORMATTER parses in its own mode (`parse_preserving_groups`, which
+/// records every `(…)` as a node instead of dissolving it), and that mode is a
+/// second entry into the same `parse_with` — so it must carry the same bound.
+/// Pinned separately because it is a separate public entry point: a bound
+/// wired into `parse` alone would leave `vilan fmt` overflowing on a file
+/// `vilan build` refuses cleanly.
+#[test]
+fn the_formatters_parse_mode_is_bounded_too() {
+    let source = format!(
+        "fun main() {{\n\tlet x = {}1{};\n}}\n",
+        "(".repeat(5000),
+        ")".repeat(5000)
+    );
+    let (produced, messages) = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (tree, errors) = vilan_core::parsing::parse_preserving_groups(leaked);
+            (
+                tree.is_some(),
+                errors
+                    .iter()
+                    .map(vilan_core::parsing::render)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the formatter's parse mode must refuse, never overflow");
+    assert!(produced, "group-preserving mode must still produce a tree");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("nests more than 500 levels deep"))
+            .count(),
+        1,
+        "group-preserving mode must carry the same bound, got: {messages:#?}"
+    );
 }

@@ -2,9 +2,9 @@
 //! analyzer's recursive families actually goes, and what that depth costs in
 //! stack bytes — measured, not estimated.
 //!
-//! The stack margins around the compiler (the CLI's and LSP's 256 MiB worker
-//! spawns, the wasm build's 64 MiB `-zstack-size`) were sized by incident, not
-//! by measurement: the v0.36.0 gate SIGABRT'd when a modest server program's
+//! The stack margins around the compiler (the CLI's and LSP's worker spawns,
+//! the wasm build's `-zstack-size`) were sized by incident, not by
+//! measurement: the v0.36.0 gate SIGABRT'd when a modest server program's
 //! analysis outgrew libtest's ~2 MiB worker (commit 0fb5e5f0). This module is
 //! the `VILAN_PHASE_TIMING` treatment for that blindness — set
 //! `VILAN_DEPTH_STATS` and every top-level analysis prints one stderr line
@@ -24,12 +24,16 @@
 //! * `expr-walk` — [`DepthFrame`] in `walk_expr_node`: the phase-1 source
 //!   walk, whose depth is the program's syntactic nesting.
 //! * `pattern` — [`DepthFrame`] in `resolve_pattern`: pattern nesting.
-//! * `parse` — [`DepthFrame`] in `parsing::Parser::parse_atom`: the parser's
-//!   own recursion, which runs BEFORE any of the above and is not depth-bounded
-//!   (B142, filed as B139's residual). It was added when the arithmetic-nesting
-//!   plants showed the parser overflowing a stack the analyzer's bounded walk
-//!   fits in comfortably — measuring it is what lets the stack margins be
-//!   argued from the WHOLE pipeline rather than from the analyzer alone.
+//! * `parse` — [`DepthFrame`] in `parsing::Parser::parse_nested_as`: the
+//!   parser's own recursion, which runs BEFORE any of the above. It was added
+//!   when the arithmetic-nesting plants showed the parser overflowing a stack
+//!   the analyzer's bounded walk fits in comfortably — measuring it is what
+//!   lets the stack margins be argued from the WHOLE pipeline rather than from
+//!   the analyzer alone, and it is bounded now too (B142,
+//!   `Parser::NESTING_DEPTH_LIMIT`). The counter sits on the shared funnel
+//!   rather than on `parse_atom`, so it counts every nesting grammar — types,
+//!   patterns, items, import paths and elements as well as expressions — which
+//!   is why its depths read higher than the `parse_atom` placement's did.
 //!
 //! Bytes are a stack-pointer high-water mark: [`reset`] anchors the address of
 //! a local at analysis start, and a new peak records how far below that anchor
@@ -57,8 +61,7 @@ pub(crate) const EXPR_WALK: usize = 2;
 pub(crate) const PATTERN: usize = 3;
 pub(crate) const PARSE: usize = 4;
 pub(crate) const FAMILY_COUNT: usize = 5;
-const FAMILY_NAMES: [&str; FAMILY_COUNT] =
-    ["infer", "type-walk", "expr-walk", "pattern", "parse"];
+const FAMILY_NAMES: [&str; FAMILY_COUNT] = ["infer", "type-walk", "expr-walk", "pattern", "parse"];
 
 thread_local! {
     static CURRENT: [Cell<usize>; FAMILY_COUNT] =

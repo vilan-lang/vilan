@@ -338,6 +338,10 @@ fn parse_with(
         })
         .collect();
     errors.append(&mut parser.errors);
+    // The depth bound's refusal (B142), which was held off `parser.errors` so
+    // that `attempt` could not roll it back — see `Parser::nesting_refusal`. It
+    // sorts into place with the rest below.
+    errors.extend(parser.nesting_refusal.take());
     // A stable, span-ordered diagnostic list (diagnostics-standard.md C1): lexer
     // errors and recovered-region errors interleave by where they occur.
     errors.sort_by_key(|error| (error.span.start, error.span.end));
@@ -408,6 +412,28 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
+    /// How many levels of SOURCE NESTING are open, against
+    /// [`Parser::NESTING_DEPTH_LIMIT`] (B142) — the parser's own bound, the
+    /// companion to the analyzer's `WALK_DEPTH_LIMIT` and `RETURN_DEPTH_LIMIT`.
+    /// Counted by [`Parser::parse_nested_as`], the one funnel every nesting
+    /// grammar descends through: expressions, types, binders and patterns,
+    /// items, import paths and elements all draw on this single counter, so it
+    /// bounds the parser's TOTAL recursion depth rather than any one family's.
+    nesting_depth: usize,
+    /// The nesting bound's diagnostic, held aside rather than pushed into
+    /// `errors` — set once and never overwritten, so a 5000-deep nest reports
+    /// ONCE and not 4500 times. [`parse_with`] folds it into the error list at
+    /// the end.
+    ///
+    /// Held aside because it must survive [`Parser::attempt`], which truncates
+    /// `errors` when a branch declines. Refusing hands the enclosing rule a
+    /// stand-in where it wanted an operand, so that rule's `)` is missing
+    /// and it declines — and the refusal would be rolled back with it, leaving
+    /// a file that was refused for depth reporting only a puzzled "expected
+    /// `)`". This is exactly `farthest_failure`'s argument, and it is kept the
+    /// same way: how deep the input actually went is a fact about the INPUT, not
+    /// a claim by whichever branch happened to be exploring when it got there.
+    nesting_refusal: Option<ParseError>,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -630,6 +656,8 @@ impl<'a, 'src> Parser<'a, 'src> {
             context_stack: Vec::new(),
             preserve_paren_groups,
             in_member_body: false,
+            nesting_depth: 0,
+            nesting_refusal: None,
         }
     }
 
@@ -830,6 +858,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         if result.is_none() {
             self.position = start;
             self.errors.truncate(error_count);
+            // `nesting_refusal` is deliberately NOT restored: like
+            // `farthest_failure`, it records how deep the input went, which no
+            // backtrack un-does. See the field.
         }
         result
     }
@@ -1421,6 +1452,29 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// expression attempt (an expression carries the block-bearing forms and the
     /// bare block already), exactly as S2 did.
     fn parse_statement(&mut self) -> Option<Spanned<Node<'src>>> {
+        // Item nesting is its own recursive grammar and reaches no expression
+        // rule (B142): `fun a() { fun a() { .. } }`, `mod`, `impl`, `trait` and
+        // chained `export` all close their cycle back through here.
+        //
+        // The stand-in CONSUMES a token, which the other funnels' does not, and
+        // that is what keeps the refusal linear here: `parse_program` and
+        // `parse_block_clean` loop on a `Some`, so a success that consumed
+        // nothing would spin forever, while declining sends all 500 open frames
+        // back through their remaining alternatives — measured, `fun a() { .. }`
+        // at 505 levels went from 9 ms to not finishing in 25 s. One token per
+        // refusal makes each turn of those loops O(1) and strictly advancing.
+        self.parse_nested_as(
+            Self::ITEM_NESTING_REFUSAL,
+            |parser, span| {
+                parser.bump();
+                Some((Node::Error, span))
+            },
+            Self::parse_statement_inner,
+        )
+    }
+
+    /// [`Parser::parse_statement`]'s body, past the depth bound.
+    fn parse_statement_inner(&mut self) -> Option<Spanned<Node<'src>>> {
         if let Some(item) = self.attempt(Self::parse_derived_item) {
             return Some(item);
         }
@@ -1495,6 +1549,178 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     // --- Expressions ---------------------------------------------------------
 
+    /// How deep the parser will descend into nested source before it refuses
+    /// (B142), the companion to the analyzer's `WALK_DEPTH_LIMIT` and
+    /// `RETURN_DEPTH_LIMIT` and chosen the same way: a large multiple of the
+    /// deepest realistic nesting. `VILAN_DEPTH_STATS`'s `parse` family, swept
+    /// over all 211 compilable corpus entries (std, every `vilan/test` fixture,
+    /// the examples, the benchmarks and `macro_std`), peaks at **23** levels in
+    /// the deepest single file with a median of 14 — so 500 is 21.7x the worst
+    /// realistic case.
+    ///
+    /// That multiple reads lower than B138's 25x, and the reason is the counter,
+    /// not the margin: B138 measured a counter that only ever counted expression
+    /// levels, and the same corpus peaks at 15 there — 33x. This counter
+    /// aggregates six grammars (below), so its levels are finer-grained than
+    /// source nesting. In SOURCE terms the headroom is the larger figure; 21.7x
+    /// is the conservative way to state it, so it is the one stated.
+    ///
+    /// It is deliberately the SAME number as `WALK_DEPTH_LIMIT`, though the two
+    /// are complementary rather than redundant. The parser runs first and its
+    /// counter climbs faster, so for SYNTACTIC nesting the parser always refuses
+    /// first; the walk's bound covers what is deep to the walk but flat to the
+    /// parser (a method chain — see `a_5000_deep_expression_is_refused_cleanly`).
+    /// Sharing the number means a writer who flattens far enough for one has
+    /// flattened far enough for the other, rather than fixing a program twice.
+    ///
+    /// **What the bound buys.** A finite worst case where there was none, which
+    /// is what the stack margins are sized from: measured through the CLI on the
+    /// worst plant (5000 nested parentheses), a bounded parse peaks at depth 501
+    /// and **35.2 MiB** unoptimized, ~10 MiB optimized, against no ceiling at all
+    /// before. And because the parser will not descend past this, it cannot
+    /// BUILD a tree deeper than it either — so every later walk over the AST is
+    /// bounded by construction rather than by a bound of its own.
+    ///
+    /// **One counter for every grammar, not one per grammar.** What the stack
+    /// margin needs bounded is the parser's TOTAL recursion depth, not any single
+    /// family's — six per-family counters of 500 would admit 3000 nested frames
+    /// between them, which is no bound at all for the purpose. So types,
+    /// patterns, items, import paths, elements and expressions all draw on
+    /// [`Parser::nesting_depth`], and 500 is a hard ceiling on nested parser
+    /// frames of any kind. The cost is that one level of SOURCE nesting can spend
+    /// more than one level of the counter (a nested block spends one for the
+    /// expression and one for the statement inside it), which is why the sweep
+    /// above is re-measured against this counter rather than inherited from the
+    /// instrument's earlier `parse_atom` placement.
+    const NESTING_DEPTH_LIMIT: usize = 500;
+
+    /// The nesting bound's diagnostics, one per grammar. All six share the
+    /// "nests more than 500 levels deep" spine — it is one bound, and the phase-1
+    /// walk's twin (`analyzer::Analyzer::walk_expr_node`) words it the same way —
+    /// and each steers toward the flattening that actually applies to the
+    /// construct that was too deep. `ParseErrorReason::Rule` takes a
+    /// `&'static str` and so cannot interpolate, which is why the limit is
+    /// spelled out; `the_refusals_spell_out_the_limit` pins the text to the
+    /// constant so the two cannot drift apart.
+    const NESTING_REFUSAL: &'static str = "this expression nests more than 500 levels deep, \
+         which parsing refuses; lift inner expressions into `let` bindings to flatten it";
+
+    /// [`Parser::NESTING_REFUSAL`] for the type grammar. Vilan has no type alias,
+    /// so the flattening on offer is a named `struct`, not a shorthand.
+    const TYPE_NESTING_REFUSAL: &'static str = "this type nests more than 500 levels deep, \
+         which parsing refuses; name the inner shape as a `struct` and refer to it to flatten it";
+
+    /// [`Parser::NESTING_REFUSAL`] for the binder/pattern grammar.
+    const PATTERN_NESTING_REFUSAL: &'static str = "this pattern nests more than 500 levels deep, \
+         which parsing refuses; match the outer shape and destructure the rest inside the arm";
+
+    /// [`Parser::NESTING_REFUSAL`] for the item/statement grammar — nested `fun`,
+    /// `mod`, `impl`, `trait` and chained `export`.
+    const ITEM_NESTING_REFUSAL: &'static str = "this declaration nests more than 500 levels \
+         deep, which parsing refuses; lift the inner declarations out to the top level";
+
+    /// [`Parser::NESTING_REFUSAL`] for the `import`/`use` path grammar.
+    const IMPORT_NESTING_REFUSAL: &'static str = "this import path nests more than 500 levels \
+         deep, which parsing refuses; split it into separate declarations";
+
+    /// [`Parser::NESTING_REFUSAL`] for the element grammar.
+    const ELEMENT_NESTING_REFUSAL: &'static str = "this element nests more than 500 levels deep, \
+         which parsing refuses; lift inner elements into components of their own";
+
+    /// One level deeper into a nested grammar, against
+    /// [`Parser::NESTING_DEPTH_LIMIT`] — the parser's own depth bound (B142).
+    /// `stand_in` builds what the grammar hands back for a subtree it refuses to
+    /// descend into — a value, or `None` to decline; `refusal` is the sentence
+    /// that explains why.
+    ///
+    /// **Why the guard is not in `parse_atom`.** `parse_atom` is where the depth
+    /// instrument was first hung, and it is the obvious site because the
+    /// bracketed forms — `(..)`, `[..]`, a call's arguments, an index — all
+    /// re-enter it once per level. But it is not the only door, and that turned
+    /// out to be true far past the expression grammar. Within expressions, the
+    /// BLOCK-BEARING forms (`{ .. }`, `if`, `for`, `match`, a closure body) reach
+    /// a nested expression through [`Parser::parse_secondary`] without ever
+    /// touching an atom, and so do the unary prefixes and the `const` prefix,
+    /// which recurse into themselves. Measured, `{ { .. 1; } }` nesting parses in
+    /// LINEAR time and reaches the stack cliff exactly like a parenthesis chain
+    /// does.
+    ///
+    /// Beyond expressions there are five more recursive grammars in this file,
+    /// each a closed cycle that reaches no expression rule at all, so no bound
+    /// placed anywhere in the expression grammar could see them: types
+    /// ([`Parser::parse_type`], the sole caller of `parse_type_atom`),
+    /// binders/patterns, items ([`Parser::parse_statement`] — nested `fun`,
+    /// `mod`, `impl`, `trait`, and `export` chaining), import paths, and nested
+    /// elements. These are not theoretical: `fun a() { fun a() { .. } }` at 5000
+    /// levels overflowed a 64 MiB worker with no diagnostic at all, which is
+    /// precisely the outcome B142 exists to prevent. Each of those funnels calls
+    /// through here too, so the counter is the whole of the parser's recursion
+    /// rather than the whole of one grammar's.
+    ///
+    /// **Why a stand-in and never `None`.** Declining hands the enclosing rule a
+    /// failed alternative to backtrack over and re-try, and 500 open frames each
+    /// re-descending through their remaining alternatives is a time bomb, not
+    /// just a lost diagnostic: declining from [`Parser::parse_statement`] took
+    /// `fun a() { .. }` at 505 levels from 9 ms to not finishing in 25 seconds. A
+    /// stand-in is a parse that SUCCEEDED with a hole in it, which is the
+    /// existing recovery contract (the `recover_delimited` arms in `parse_atom`
+    /// produce exactly this), and it costs the enclosing frame nothing to accept.
+    ///
+    /// **Which stand-ins consume.** [`Parser::parse_statement`] and
+    /// [`Parser::parse_element`] advance the parser by one token as they refuse;
+    /// the other four do not. The difference is whether the caller LOOPS on a
+    /// `Some`: `parse_program` and `parse_block_clean` push the statement and
+    /// `continue`, and the element child loop does the same, so a success that
+    /// consumed nothing would spin there forever. One token per refusal makes
+    /// each turn of those loops strictly advancing, and the loop drains what is
+    /// left of the nest linearly. [`Parser::comma_list`] — the loop the other
+    /// four funnels sit under — needs no such help: with no `,` following the
+    /// item, it breaks.
+    fn parse_nested_as<T>(
+        &mut self,
+        refusal: &'static str,
+        stand_in: impl FnOnce(&mut Self, Span) -> Option<T>,
+        body: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PARSE);
+        self.nesting_depth += 1;
+        let parsed = if self.nesting_depth > Self::NESTING_DEPTH_LIMIT {
+            let span = self.refuse_nesting(refusal);
+            stand_in(self, span)
+        } else {
+            body(self)
+        };
+        self.nesting_depth -= 1;
+        parsed
+    }
+
+    /// [`Parser::parse_nested_as`] for the grammars whose stand-in is a
+    /// [`Node::Error`] — expressions and types.
+    fn parse_nested(
+        &mut self,
+        refusal: &'static str,
+        body: impl FnOnce(&mut Self) -> Option<Spanned<Node<'src>>>,
+    ) -> Option<Spanned<Node<'src>>> {
+        self.parse_nested_as(refusal, |_, span| Some((Node::Error, span)), body)
+    }
+
+    /// The refusal itself: ONE steering diagnostic per parse (a 5000-deep nest
+    /// would otherwise report 4500 times — `walk_depth_refused`'s twin, spelled
+    /// as an `Option` being filled rather than a flag beside a push). The span is
+    /// the token the parser stopped at, which is inside the nest and as close to
+    /// the offending depth as the parser can point. Returns it so each grammar
+    /// can build its own stand-in around it.
+    fn refuse_nesting(&mut self, refusal: &'static str) -> Span {
+        let span = self.here_span();
+        self.nesting_refusal.get_or_insert_with(|| ParseError {
+            span,
+            reason: ParseErrorReason::Rule(refusal),
+            context: Vec::new(),
+            hint: None,
+        });
+        span
+    }
+
     /// A full expression: the weak-precedence `const` prefix, else the secondary
     /// grammar (with struct literals admitted as operands). `condition_expression`
     /// is the sibling for condition positions and has NO `const` (§H.1).
@@ -1502,7 +1728,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is(&Token::Const) {
             let start = self.position;
             self.bump();
-            let inner = self.parse_expression()?;
+            // `const const .. 1` recurses HERE, not through `parse_secondary`,
+            // so it carries its own nesting level (B142).
+            let inner = self.parse_nested(Self::NESTING_REFUSAL, Self::parse_expression)?;
             return Some((Node::Const(Box::new(inner)), self.span_from(start)));
         }
         self.parse_secondary(false)
@@ -1523,6 +1751,13 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// each recurse with their own mode (full expressions for values/bodies,
     /// conditions for nested heads), so it is not threaded into them.
     fn parse_secondary(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        self.parse_nested(Self::NESTING_REFUSAL, |parser| {
+            parser.parse_secondary_inner(no_struct)
+        })
+    }
+
+    /// [`Parser::parse_secondary`]'s body, past the depth bound.
+    fn parse_secondary_inner(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
         match self.peek() {
             // A closure literal (`|params| body`, `|| body`) — always tried before
             // the tower, so a leading `||` is never a logical-or (which needs a left
@@ -1780,17 +2015,27 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// themselves: `!`, prefix `-`, `await`, `async` (a block or any unary), `&` /
     /// `&mut` (take a view), `*` (deref). Falls through to the postfix chain.
     fn parse_unary(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
+        // Each prefix recurses into `parse_unary` DIRECTLY, without passing
+        // through `parse_secondary`, so every one of them takes its own level
+        // of the nesting counter (B142). Without that, `!!!..!1` — measured at
+        // ~14.1 KiB per `!` unoptimized — would still be unbounded.
         let start = self.position;
         if self.eat_op("!") {
-            let inner = self.parse_unary(no_struct)?;
+            let inner = self.parse_nested(Self::NESTING_REFUSAL, |parser| {
+                parser.parse_unary(no_struct)
+            })?;
             return Some((Node::Unary('!', Box::new(inner)), self.span_from(start)));
         }
         if self.eat_op("-") {
-            let inner = self.parse_unary(no_struct)?;
+            let inner = self.parse_nested(Self::NESTING_REFUSAL, |parser| {
+                parser.parse_unary(no_struct)
+            })?;
             return Some((Node::Unary('-', Box::new(inner)), self.span_from(start)));
         }
         if self.eat(&Token::Await) {
-            let inner = self.parse_unary(no_struct)?;
+            let inner = self.parse_nested(Self::NESTING_REFUSAL, |parser| {
+                parser.parse_unary(no_struct)
+            })?;
             return Some((Node::Await(Box::new(inner)), self.span_from(start)));
         }
         if self.eat(&Token::Async) {
@@ -1798,20 +2043,26 @@ impl<'a, 'src> Parser<'a, 'src> {
             let inner = if self.peek_is_ctrl('{') {
                 self.parse_block_as_expression()?
             } else {
-                self.parse_unary(no_struct)?
+                self.parse_nested(Self::NESTING_REFUSAL, |parser| {
+                    parser.parse_unary(no_struct)
+                })?
             };
             return Some((Node::Async(Box::new(inner)), self.span_from(start)));
         }
         if self.eat_op("&") {
             let mutable = self.eat(&Token::Mut);
-            let inner = self.parse_unary(no_struct)?;
+            let inner = self.parse_nested(Self::NESTING_REFUSAL, |parser| {
+                parser.parse_unary(no_struct)
+            })?;
             return Some((
                 Node::Reference(mutable, Box::new(inner)),
                 self.span_from(start),
             ));
         }
         if self.eat_op("*") {
-            let inner = self.parse_unary(no_struct)?;
+            let inner = self.parse_nested(Self::NESTING_REFUSAL, |parser| {
+                parser.parse_unary(no_struct)
+            })?;
             return Some((Node::Dereference(Box::new(inner)), self.span_from(start)));
         }
         self.parse_member_accessor(no_struct)
@@ -2082,7 +2333,6 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// chumsky choice, so it is omitted.
     fn parse_atom(&mut self) -> Option<Spanned<Node<'src>>> {
         ATOM_PARSES.with(|count| count.set(count.get().saturating_add(1)));
-        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PARSE);
         if let Some(literal) = self.parse_literal() {
             return Some(literal);
         }
@@ -2362,6 +2612,22 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// seen; the caller wraps the whole parse in `attempt`, so a decline here
     /// leaves only its farthest-failure note behind.
     fn parse_element(&mut self) -> Option<Spanned<Node<'src>>> {
+        // Only the OUTERMOST element arrives through `parse_atom`; every nested
+        // child re-enters here directly, so element nesting needs its own level
+        // (B142). Its stand-in consumes for the same reason `parse_statement`'s
+        // does — the element child loop pushes and continues.
+        self.parse_nested_as(
+            Self::ELEMENT_NESTING_REFUSAL,
+            |parser, span| {
+                parser.bump();
+                Some((Node::Error, span))
+            },
+            Self::parse_element_inner,
+        )
+    }
+
+    /// [`Parser::parse_element`]'s body, past the depth bound.
+    fn parse_element_inner(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect_ctrl('<')?;
         let (tag, tag_tokens) = self.parse_element_name()?;
@@ -2922,6 +3188,19 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (`(a, b)`, ≥2), or a fixed-array binder (`[a, b, c]`, ≥1). Nests recursively.
     /// Bindings are parsed immutable; `let`/`mut` stamps mutability separately.
     fn parse_binder(&mut self) -> Option<Spanned<Pattern<'src>>> {
+        // Binders nest without touching an expression rule (B142): `let [[[a]]]`
+        // recurses here through `comma_list`. `Pattern::Wildcard` is the stand-in
+        // — it matches anything and binds nothing, which is what a subtree the
+        // parser declined to read is worth.
+        self.parse_nested_as(
+            Self::PATTERN_NESTING_REFUSAL,
+            |_, span| Some((Pattern::Wildcard, span)),
+            Self::parse_binder_inner,
+        )
+    }
+
+    /// [`Parser::parse_binder`]'s body, past the depth bound.
+    fn parse_binder_inner(&mut self) -> Option<Spanned<Pattern<'src>>> {
         let start = self.position;
         if self.peek_is_ctrl('(') {
             return self.attempt(|parser| {
@@ -2954,6 +3233,17 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// A match/`is` pattern: `_`, `let x` / `mut x` (a binder), a literal (`"quit"`,
     /// `42`), a tuple (`(a, b)`, ≥2), or a variant (`Some(let x)`, `Enum::Variant`).
     fn parse_pattern(&mut self) -> Option<Spanned<Pattern<'src>>> {
+        // `S(S(S(..)))` in a match arm — the other half of the pattern grammar's
+        // cycle, and counted for the same reason as `parse_binder` (B142).
+        self.parse_nested_as(
+            Self::PATTERN_NESTING_REFUSAL,
+            |_, span| Some((Pattern::Wildcard, span)),
+            Self::parse_pattern_inner,
+        )
+    }
+
+    /// [`Parser::parse_pattern`]'s body, past the depth bound.
+    fn parse_pattern_inner(&mut self) -> Option<Spanned<Pattern<'src>>> {
         let start = self.position;
         // `let x` / `mut x` — a binder, stamped mutable per the keyword.
         if self.peek_is(&Token::Let) || self.peek_is(&Token::Mut) {
@@ -3041,6 +3331,18 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// A type, with the optional `context` clause suffix (`Type context name` /
     /// `context (a, b)`).
     fn parse_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        // The type grammar is a closed cycle that reaches no expression rule at
+        // all (B142) — `& & & ..`, `[[..; 1]; 1]`, `L<L<..>>`, `((..))`, closure
+        // types and bounds all come back through here, and `parse_type_atom` has
+        // this as its only caller, so this is the type grammar's single door. It
+        // is reachable from a bounded expression too, through a call's generic
+        // arguments, which is why one level of expression nesting cannot stand in
+        // for it.
+        self.parse_nested(Self::TYPE_NESTING_REFUSAL, Self::parse_type_inner)
+    }
+
+    /// [`Parser::parse_type`]'s body, past the depth bound.
+    fn parse_type_inner(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let inner = self.parse_type_atom()?;
         if let Some(contexts) = self.parse_context_clause() {
@@ -4040,6 +4342,19 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// optional `:: continuation`) is tried before a brace set, matching the chumsky
     /// `path.clone().or(set)`.
     fn parse_namespace_path(&mut self) -> Option<ImportBranch<'src>> {
+        // `use a::a::a::..;` and `use a::{a::{..}};` recurse here once per `::`
+        // or brace, reaching no expression rule (B142). An empty set is the
+        // stand-in: a branch that imports nothing, which is what a path the
+        // parser declined to read leads to.
+        self.parse_nested_as(
+            Self::IMPORT_NESTING_REFUSAL,
+            |_, _| Some(ImportBranch::Set(Vec::new())),
+            Self::parse_namespace_path_inner,
+        )
+    }
+
+    /// [`Parser::parse_namespace_path`]'s body, past the depth bound.
+    fn parse_namespace_path_inner(&mut self) -> Option<ImportBranch<'src>> {
         if let Some(path) = self.attempt(Self::parse_namespace_single_path) {
             return Some(path);
         }
@@ -4560,6 +4875,36 @@ mod tests {
     //! §H.1 condition mode, and the type forms.
 
     use super::*;
+
+    /// Every nesting refusal must spell out the limit it enforces, and spell out
+    /// the SAME one (B142). `ParseErrorReason::Rule` takes a `&'static str`, so
+    /// unlike the analyzer's twin — which interpolates `WALK_DEPTH_LIMIT` into a
+    /// `format!` — these six sentences carry the number as literal text. Nothing
+    /// but this test stops `NESTING_DEPTH_LIMIT` from being retuned while the
+    /// diagnostics keep quoting the old figure, which would be a compiler
+    /// telling a writer to flatten to a depth it no longer enforces.
+    #[test]
+    fn the_refusals_spell_out_the_limit() {
+        let limit = Parser::NESTING_DEPTH_LIMIT.to_string();
+        for refusal in [
+            Parser::NESTING_REFUSAL,
+            Parser::TYPE_NESTING_REFUSAL,
+            Parser::PATTERN_NESTING_REFUSAL,
+            Parser::ITEM_NESTING_REFUSAL,
+            Parser::IMPORT_NESTING_REFUSAL,
+            Parser::ELEMENT_NESTING_REFUSAL,
+        ] {
+            assert!(
+                refusal.contains(&format!("nests more than {limit} levels deep")),
+                "the refusal must quote NESTING_DEPTH_LIMIT ({limit}) on the \
+                 shared spine, got: {refusal}"
+            );
+            assert!(
+                refusal.contains("which parsing refuses"),
+                "the refusal must say who refused, got: {refusal}"
+            );
+        }
+    }
 
     /// Parse `source` as a bare expression, asserting a clean full-consumption
     /// parse. Spans are at their natural source offsets (no wrapper).
