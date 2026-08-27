@@ -2165,7 +2165,12 @@ impl Document {
             .filter(|_| self.diagnostics.is_empty() && !self.is_stale());
         let edits = match prunable_program {
             Some(program) => {
-                let keep = |leaf_span: Span| self.import_leaf_is_used(program, leaf_span);
+                // Computed once for the whole pass: which byte ranges belong to
+                // the file's import list, so a reference written there is not
+                // mistaken for the file using the import.
+                let import_spans = vilan_core::formatter::import_statement_spans(source);
+                let keep =
+                    |leaf_span: Span| self.import_leaf_is_used(program, leaf_span, &import_spans);
                 vilan_core::formatter::organize_import_runs(source, &keep)
             }
             None => vilan_core::formatter::organize_import_runs(source, &|_| true),
@@ -2202,9 +2207,14 @@ impl Document {
     ///    directly to the shared definition Id, so that tally aggregates uses
     ///    across every file and reads ~0 for type-only imports.
     ///  - (C) Struct constructors (`Point { .. }`) — the initializer map.
-    fn import_leaf_is_used(&self, program: &Program, leaf_span: Span) -> bool {
+    fn import_leaf_is_used(
+        &self,
+        program: &Program,
+        leaf_span: Span,
+        import_spans: &[Span],
+    ) -> bool {
         let entry = SourceId(0);
-        let Some(def_id) = program
+        let Some(definition_id) = program
             .type_references
             .iter()
             .find_map(|(source, span, definition, _)| {
@@ -2212,42 +2222,68 @@ impl Document {
             })
             .flatten()
         else {
+            // The leaf binds nothing this analysis recorded — keep it, since
+            // pruning on no evidence is how a green build gets broken.
             return true;
         };
-        // (A) Type / trait references in this file, beyond this import's own
-        // leaf — or anywhere in code generated from it, where there is no leaf to
-        // exclude: those spans index a template, so comparing them to this file's
-        // offsets is meaningless and any reference among them is a real use.
-        let referenced_as_type =
-            program
-                .type_references
+        let definition = Definition::Entity(definition_id);
+
+        // A reference written by the file's IMPORT LIST is not the file using
+        // anything: an import path's segments resolve to the same definitions
+        // its leaves bind, so counting them let an import justify itself.
+        let written_in_an_import = |span: Span| {
+            import_spans
                 .iter()
-                .any(|(source, span, definition, _)| {
-                    *definition == Some(def_id)
-                        && if *source == DERIVED_SOURCE {
-                            true
-                        } else {
-                            *source == entry && *span != leaf_span
-                        }
-                });
-        if referenced_as_type {
+                .any(|statement| statement.start <= span.start && span.end <= statement.end)
+        };
+        let used_here = |occurrence: &crate::references::Occurrence| match occurrence.source {
+            // Derive-generated code indexes a template, so its offsets are not
+            // this file's and there is no import list to exclude — any reference
+            // among them is a real use.
+            DERIVED_SOURCE => true,
+            source => source == entry && !written_in_an_import(occurrence.span),
+        };
+
+        // (1) The file's own code names the definition — as a type, as a value,
+        // as a constructor, as a method callee, as an enum variant. One question
+        // now, because the reference index answers all of those from one table.
+        if self
+            .reference_index
+            .occurrences_of(definition)
+            .any(used_here)
+        {
             return true;
         }
-        // (B) Value references in this file (or generated from it).
-        let referenced_as_value = program.entity_map.iter().any(|(use_id, expr)| {
-            expr_references_definition(expr, def_id)
-                && self.use_in_entry_or_generated(program, *use_id)
-        });
-        if referenced_as_value {
-            return true;
+
+        // (2) A whole-module import brings more than its own name: every `impl`
+        // in that module's file arrives with it. So a method call whose
+        // implementation lives there IS a use of the import, even though the
+        // module name is never written — and pruning it breaks the build, which
+        // is the over-pruning half of kolt.local 004. The accounting is the
+        // analyzer's own provenance: did this file resolve anything DECLARED in
+        // the file this import reaches into?
+        if matches!(
+            crate::references::kind_of(program, definition),
+            Some(crate::references::DefinitionKind::Module)
+        ) {
+            if let Some(home) = program.source_of(definition_id) {
+                // A module whose file is this one brings nothing new, and would
+                // otherwise match every local declaration and never prune.
+                if home != entry {
+                    return self
+                        .reference_index
+                        .occurrences_in(entry)
+                        .any(|occurrence| {
+                            !written_in_an_import(occurrence.span)
+                                && crate::references::declaration_source(
+                                    program,
+                                    occurrence.definition,
+                                ) == Some(home)
+                        });
+                }
+            }
         }
-        // (C) Struct constructors reference the type through the initializer map.
-        program
-            .struct_initializer_to_def
-            .iter()
-            .any(|(initializer_id, struct_id)| {
-                *struct_id == def_id && self.use_in_entry_or_generated(program, *initializer_id)
-            })
+        false
     }
 
     /// Whether a use site belongs to the entry file or to code generated from it
@@ -6944,6 +6980,166 @@ pub(crate) mod tests {
             text.replace_range(span.into_range(), &replacement);
         }
         Some(text)
+    }
+
+    // kolt.local 004, the OVER-pruning half: a module import whose only
+    // contribution is an `impl` the file calls a method from. The module's name
+    // is never written, so a syntactic notion of "used" saw nothing and removed
+    // the import — and the file stopped building.
+    #[test]
+    fn organize_keeps_a_module_import_whose_impl_method_is_used() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled()\n}\n",
+            ),
+            (
+                "helper.vl",
+                "impl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+            ),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "the import is what brings `doubled` — organize must leave it alone",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // kolt.local 004, the UNDER-pruning half: an import path's own segments
+    // resolve to the definitions its leaves bind, so counting them as usage let
+    // an import justify its own existence. `Result::{ self }` could never be
+    // pruned, however unused, because the `Result` segment in the path counted
+    // as a use of `Result`.
+    #[test]
+    fn organize_prunes_an_import_nothing_but_its_own_path_references() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::result::Result::{ self, Err, Ok };\n\nfun main(): i32 {\n\t1\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program"
+        );
+        let organized_text = organized(&document).expect("the whole import is unused");
+        assert!(
+            !organized_text.contains("import"),
+            "nothing in the file uses Result, Ok or Err, but the import survived:\n{organized_text}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One build-preservation case: a workspace whose entry file has imports
+    /// organize must act on. `entry` is the first file.
+    struct OrganizeCase {
+        label: &'static str,
+        files: &'static [(&'static str, &'static str)],
+    }
+
+    // THE pin kolt.local 004 asked for: an organize pass must never break a
+    // green build. Each case starts green, organize is required to actually
+    // change the text (a no-op case would pass vacuously and prove nothing), and
+    // the organized text must analyze green again. This is the assertion that
+    // makes the usage model's two directions safe at once — over-pruning shows
+    // up here as a diagnostic, under-pruning as an unchanged text.
+    #[test]
+    fn organizing_never_breaks_a_green_build() {
+        let cases = [
+            OrganizeCase {
+                label: "a module import reached only through an impl method",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::zebra;\nimport pkg::helper;\n\nfun main(): i32 {\n\tlet n = 2;\n\tn.doubled() + zebra::three()\n}\n",
+                    ),
+                    (
+                        "helper.vl",
+                        "impl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n",
+                    ),
+                    ("zebra.vl", "fun three(): i32 {\n\t3\n}\n"),
+                ],
+            },
+            OrganizeCase {
+                label: "a genuinely unused module import beside a used one",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::unused;\nimport pkg::zebra;\n\nfun main(): i32 {\n\tzebra::three()\n}\n",
+                    ),
+                    ("zebra.vl", "fun three(): i32 {\n\t3\n}\n"),
+                    ("unused.vl", "fun nothing(): i32 {\n\t0\n}\n"),
+                ],
+            },
+            OrganizeCase {
+                label: "a brace set with a used and an unused leaf",
+                files: &[
+                    (
+                        "main.vl",
+                        "import pkg::shapes::{ Square, Circle };\n\nfun main(): i32 {\n\tlet c = Circle { radius = 2 };\n\tc.radius\n}\n",
+                    ),
+                    (
+                        "shapes.vl",
+                        "struct Circle {\n\tradius: i32,\n}\n\nstruct Square {\n\tside: i32,\n}\n",
+                    ),
+                ],
+            },
+            OrganizeCase {
+                label: "an unused enum-variant import beside a used one",
+                files: &[(
+                    "main.vl",
+                    "import std::result::Result::{ self, Err, Ok };\n\nfun main(): Result<i32, str> {\n\tOk(1)\n}\n",
+                )],
+            },
+            OrganizeCase {
+                label: "a shuffled run where every leaf is used",
+                files: &[(
+                    "main.vl",
+                    "import std::print;\nimport std::result::Result::{ self, Ok };\n\nfun main(): Result<i32, str> {\n\tprint(\"hi\");\n\tOk(1)\n}\n",
+                )],
+            },
+        ];
+
+        for case in cases {
+            let (dir, document) = analyze_workspace(case.files);
+            assert!(
+                document.diagnostics.is_empty(),
+                "{}: the pin needs a GREEN starting program, got {:?}",
+                case.label,
+                document
+                    .diagnostics
+                    .iter()
+                    .map(|e| &e.msg)
+                    .collect::<Vec<_>>(),
+            );
+            let Some(organized_text) = organized(&document) else {
+                panic!(
+                    "{}: organize made no edit, so this case proves nothing",
+                    case.label,
+                );
+            };
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // Re-analyze the ORGANIZED text in the same workspace.
+            let mut files: Vec<(&str, &str)> = case.files.to_vec();
+            files[0] = (case.files[0].0, organized_text.as_str());
+            let (dir, reanalyzed) = analyze_workspace(&files);
+            assert!(
+                reanalyzed.diagnostics.is_empty(),
+                "{}: organizing BROKE the build:\n--- organized ---\n{}\n--- errors ---\n{:?}",
+                case.label,
+                organized_text,
+                reanalyzed
+                    .diagnostics
+                    .iter()
+                    .map(|e| &e.msg)
+                    .collect::<Vec<_>>(),
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // A shuffled top-level run sorts into canonical order; both imports are used,

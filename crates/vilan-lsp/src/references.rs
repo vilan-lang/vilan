@@ -555,6 +555,13 @@ impl ReferenceIndex {
         self.dropped.get(&definition).copied().unwrap_or(0)
     }
 
+    /// Every occurrence in `source`, in source order.
+    pub fn occurrences_in(&self, source: SourceId) -> impl Iterator<Item = &Occurrence> {
+        self.occurrences
+            .iter()
+            .filter(move |row| row.source == source)
+    }
+
     /// Every row, for the invariant pins.
     #[cfg(test)]
     pub fn rows(&self) -> &[Occurrence] {
@@ -631,6 +638,16 @@ pub fn kind_of(program: &Program, definition: Definition) -> Option<DefinitionKi
                 _ => None,
             }
         }
+    }
+}
+
+/// The file a definition is DECLARED in — the provenance the organize-imports
+/// usage model needs: "did this file resolve anything that lives in the module
+/// this import reaches into?"
+pub fn declaration_source(program: &Program, definition: Definition) -> Option<SourceId> {
+    match definition {
+        Definition::Entity(id) => program.source_of(id),
+        Definition::Field(struct_id, _) => program.source_of(struct_id),
     }
 }
 
