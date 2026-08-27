@@ -13,6 +13,13 @@ the line above its bold head - an HTML comment reading `family: breaking`,
 below show the spelling). `scripts/cut-release.sh` orders the section by it at
 the cut and REFUSES an entry that carries none, rather than guessing.
 proposal/releases.md §7.2 step 3 defines the four.
+
+ONE BOLD HEAD PER ENTRY. The script reads every line that STARTS with `**` as
+a new entry head, so a bold sub-head inside an entry body is read as an entry
+carrying no family marker, and the whole section is refused. Sub-heads read
+naturally as inlined lead-ins instead ("Ordering is settled by a layer rather
+than a band: ..."). Two entries tripped this in one cycle before it was
+written down.
 -->
 
 ## Unreleased
