@@ -25168,6 +25168,39 @@ fn a_missing_read_is_a_clean_diagnostic_at_the_read_site() {
 fn an_absolute_read_path_is_refused() {
     // Refused lexically, before any filesystem look: the channel reads THE
     // PROJECT, so the build can track every input it depends on.
+    //
+    // The path is per-platform because `is_absolute` is (N26): a POSIX
+    // `/etc/hostname` is NOT absolute to Windows, which wants a drive prefix,
+    // so hardcoding it tested the sibling `escapes it` arm there and asserted
+    // this arm's wording against it. Both arms refuse on both platforms — the
+    // POSIX spelling reaches Windows' escape check as a `RootDir` component —
+    // so what was wrong was the pin, not the fence. This one names THIS arm on
+    // each platform, and `a_posix_absolute_path_is_refused_on_every_platform`
+    // below holds the property that does not vary.
+    let absolute = if cfg!(windows) { r"C:\Windows\system.ini" } else { "/etc/hostname" };
+    assert_fails_with(
+        &format!(
+            r#"
+        import std::asset;
+        fun main() {{
+            let _text = const asset::read("{}");
+        }}
+        main();
+        "#,
+            absolute.replace('\\', "\\\\")
+        ),
+        &format!("`asset::read` paths are relative to the package root; `{absolute}` is absolute"),
+    );
+}
+
+#[test]
+fn a_posix_absolute_path_is_refused_on_every_platform() {
+    // The invariant the platform-split pin above must not lose: a POSIX
+    // absolute path never reads the host filesystem, whatever the host thinks
+    // "absolute" means. On Linux the first arm refuses it; on Windows the
+    // component scan does, because `/` parses as a `RootDir` that is neither
+    // `Normal` nor `CurDir`. Asserting the shared half of both messages keeps
+    // this true on both without asserting either arm's wording.
     assert_fails_with(
         r#"
         import std::asset;
@@ -25176,7 +25209,7 @@ fn an_absolute_read_path_is_refused() {
         }
         main();
         "#,
-        "`asset::read` paths are relative to the package root; `/etc/hostname` is absolute",
+        "package root",
     );
 }
 
@@ -67812,15 +67845,22 @@ fn a_missing_bundle_is_still_a_tracked_build_input() {
 
 #[test]
 fn an_absolute_bundle_path_is_refused() {
+    // Per-platform for the reason `an_absolute_read_path_is_refused` records
+    // (N26). This pin was modelled on that one and inherited its defect with
+    // it, which is how one bad pin became two.
+    let absolute = if cfg!(windows) { r"C:\Windows\system.ini" } else { "/etc/hostname" };
     assert_fails_with(
-        r#"
+        &format!(
+            r#"
         import std::asset;
-        fun main() {
-            let _url = const asset::bundle("/etc/hostname");
-        }
+        fun main() {{
+            let _url = const asset::bundle("{}");
+        }}
         main();
         "#,
-        "`asset::bundle` paths are relative to the package root; `/etc/hostname` is absolute",
+            absolute.replace('\\', "\\\\")
+        ),
+        &format!("`asset::bundle` paths are relative to the package root; `{absolute}` is absolute"),
     );
 }
 
