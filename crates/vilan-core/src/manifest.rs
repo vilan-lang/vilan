@@ -216,6 +216,30 @@ pub enum Dependency {
 /// distinguishes once, for both validation and resolution.
 pub enum DependencySource<'declaration> {
     /// A local directory, relative to the declaring manifest.
+    ///
+    /// **Deliberately not containment-checked, and this is the decision, not an
+    /// oversight (E95).** `[entry.<name>] path` is refused when it is absolute
+    /// or carries `..`; a dependency `path` is not, and the asymmetry is on
+    /// purpose. An entry path names a file *inside the package being built* —
+    /// it is resolved against `root` and its name becomes `dist/<name>.js`, so
+    /// climbing out of the package is meaningless there and the guard is a
+    /// well-formedness rule, not a security boundary. A dependency path names
+    /// *another package*, and pointing outside the declaring directory is the
+    /// whole point of the form: `common = { path = "../common" }` is what
+    /// every workspace, every monorepo, and this repo's own
+    /// `examples/fullstack` legs are spelled as. A `..` guard here would refuse
+    /// the correct spelling of the common case.
+    ///
+    /// The security argument for adding one anyway does not survive the ruled
+    /// trust model (`proposal/build-trust.md` §2, RULED 2026-08-26): the
+    /// manifest is the developer's own file, and building a project already
+    /// runs its `[build] run` hooks with the developer's full privileges, no
+    /// sandbox and no prompt. Against a manifest that can execute arbitrary
+    /// shell, a rule about which *directory* it may name reads a package it was
+    /// free to run code from anyway — it buys nothing and, worse, advertises a
+    /// containment property the trust model explicitly declines to offer.
+    /// Tier 1 is trusted; the tier that is not is dependency-authored build
+    /// code (§3), whose enforcement point is the registry (D5), not this path.
     Path(&'declaration Path),
     /// One immutable point of one repository, materialized into the git cache
     /// and then treated exactly like a path dependency.
@@ -664,6 +688,12 @@ impl Manifest {
                 }
             }
             if let Some(path) = &entry.path {
+                // Well-formedness, NOT containment: an entry is a file inside
+                // the package being built, and its name becomes `dist/<name>.js`,
+                // so a path that climbs out names nothing this build can emit.
+                // A dependency `path` gets no such rule ON PURPOSE — see
+                // `DependencySource::Path` for why the asymmetry is the
+                // decision (E95).
                 let escapes = path.is_absolute()
                     || path
                         .components()
@@ -3131,6 +3161,29 @@ mod tests {
                 .validate()
                 .iter()
                 .any(|e| e.contains("free of `..`"))
+        );
+    }
+
+    #[test]
+    fn a_dependency_path_may_leave_the_declaring_directory() {
+        // E95's decision, pinned so it cannot be "fixed" into the entry rule by
+        // an auditor who sees only the asymmetry. A dependency `path` names
+        // ANOTHER package, and `../` is how every workspace spells that — this
+        // repo's own `examples/fullstack` legs are `common = { path =
+        // "../common" }`. The trust model behind the choice is
+        // `proposal/build-trust.md` §2: the manifest is the developer's own
+        // file, and it may already run arbitrary shell through `[build] run`,
+        // so a containment rule on the directory it names would buy nothing
+        // and advertise a guarantee the ruling declines to make. The entry
+        // pin above is the sibling that DOES refuse `..`, for a different
+        // reason: an entry is a file inside the package being built.
+        let manifest = parse(
+            "[package]\nname = \"app\"\n\n[dependencies]\ncommon = { path = \"../common\" }\n",
+        );
+        assert!(
+            manifest.validate().is_empty(),
+            "a `..` dependency path is the normal spelling, not an error: {:?}",
+            manifest.validate()
         );
     }
 
