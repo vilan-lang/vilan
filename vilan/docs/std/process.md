@@ -178,6 +178,8 @@ fun read_file_to_str_sync(path: str): str       // sync, UTF-8 — blocks the ev
 fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
 fun write_file(path: str, contents: str)        // async
+fun write_atomic(path: str, contents: str)      // async — temp sibling + rename, never a torn file
+fun rename(from: str, to: str)                  // async — move/replace; atomic within one filesystem
 fun read_dir(path: str): List<str>              // async, entry NAMES, flat
 fun read_dir_all(path: str): List<str>          // async, RELATIVE paths, the whole tree
 fun stat(path: str): Option<Stat>               // async — None if `path` doesn't exist; every other failure throws
@@ -216,6 +218,23 @@ not UTF-8; `read_file_to_str` is a one-line call to it. (It was called
 `read_file_bytes` until v0.34.0, which is the name that made the rename
 worth doing: it promised bytes and returned a decoded string. No alias was
 kept.)
+
+One write that cannot tear. `write_file` truncates the target and then
+fills it, so a process that dies partway through leaves a half-written
+file — and a store that reads itself back at boot then finds corrupt data
+where its state used to be. `write_atomic` writes to a uniquely-named
+sibling and `rename`s it over the target instead: a crash leaves either the
+previous file intact or the complete new one, never a mix. Use it for
+anything the program reads back later — a JSON store, a cache, a config
+the app rewrites. Atomic is not durable, though: after a *power* loss the
+rename may not have reached the device, and closing that last gap needs
+`fsync`, which the host exposes only on an open file handle — std has no
+handle type yet. The temporary is a sibling because a rename across
+filesystems is not atomic and would fail outright, which also means a
+crashed run can strand a `<path>.<uuid>.tmp` file beside the target;
+`vilan` has no `try`/`catch` to sweep it up. `rename` is the primitive
+underneath, and it is also how you move a file: the destination is
+replaced if it exists, and the source stops existing.
 
 ## std::build
 
