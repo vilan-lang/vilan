@@ -652,7 +652,7 @@ fn depth_stats_env_var_prints_the_depth_line() {
         stderr.contains("[vilan depth]"),
         "VILAN_DEPTH_STATS=1 printed no depth line; stderr was: {stderr}"
     );
-    for family in ["infer", "type-walk", "expr-walk", "pattern"] {
+    for family in ["infer", "type-walk", "expr-walk", "pattern", "parse"] {
         assert!(
             stderr.contains(family),
             "the depth line must name the `{family}` family; stderr was: {stderr}"

@@ -77,17 +77,28 @@ fn assert_linear_in_depth(plant: fn(usize) -> String, label: &str) {
     }
 }
 
-#[test]
-fn nested_expressions_cost_a_line_in_their_depth() {
-    // The parser is not depth-bounded (B139), so the plants run on the
-    // deep-nesting worker rather than libtest's ~2 MiB thread.
+/// Runs one plant's sweep on the deep-nesting worker: the parser is not
+/// depth-bounded (B142), so the plants cannot run on libtest's ~2 MiB thread.
+///
+/// One plant per call, and therefore one plant per `#[test]`: the two shapes are
+/// two distinct cases, and running both inside a single test function meant an
+/// arithmetic failure short-circuited the list shape, which was then never
+/// reported at all.
+fn sweep_on_worker(plant: fn(usize) -> String, label: &'static str) {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(|| {
-            assert_linear_in_depth(nested_arithmetic, "nested arithmetic");
-            assert_linear_in_depth(nested_lists, "nested list literals");
-        })
+        .spawn(move || assert_linear_in_depth(plant, label))
         .expect("spawn worker")
         .join()
         .expect("worker panicked");
+}
+
+#[test]
+fn nested_arithmetic_costs_a_line_in_its_depth() {
+    sweep_on_worker(nested_arithmetic, "nested arithmetic");
+}
+
+#[test]
+fn nested_list_literals_cost_a_line_in_their_depth() {
+    sweep_on_worker(nested_lists, "nested list literals");
 }

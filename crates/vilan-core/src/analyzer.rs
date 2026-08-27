@@ -37,6 +37,67 @@ thread_local! {
     /// the active recursion path, so a cyclic mapping terminates.
     static RESOLVING_GENERICS: std::cell::RefCell<HashSet<(u8, TypeId)>> =
         std::cell::RefCell::new(HashSet::default());
+    /// How many type inferences ([`Analyzer::infer_type_inner`]) this thread has
+    /// entered — the analyzer's unit of real work, and what a re-derived call
+    /// chain multiplies. See [`inference_entry_count`].
+    static INFERENCE_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Times a RECORDED return answer was served to an ask that carried a
+    /// caller's generic bindings — which must never happen. See
+    /// [`return_records_served_under_substitution`].
+    static RECORDS_SERVED_UNDER_SUBSTITUTION: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The number of type inferences this thread's analyzer has entered — an
+/// instrumentation probe (B139), not a behavior surface, in the shape of
+/// [`crate::parsing::atom_parse_count`] (B140) and
+/// [`crate::formatter::buffer_parse_count`] (E83): monotonic, read as a snapshot
+/// difference around the work under test.
+///
+/// It exists because B139's TIME half is otherwise evidenced only by a prose
+/// measurement and a green suite, which is not a pin. Before the recorded-answer
+/// fast path in [`Analyzer::infer_function_returns`], every link of an
+/// undeclared-return call chain re-derived every link beneath it, so the chain
+/// cost a CURVE in its length — 390 984 inference entries for 500 links against
+/// 14 730 after. A wall-clock ceiling generous enough to be stable would
+/// separate that from linear, but it would NOT catch a regression to merely
+/// QUADRATIC, and quadratic is exactly what the removal of one gate returns
+/// here. Comparing the count against a LINE in the chain's length catches both.
+///
+/// Counting is unconditional (one thread-local increment per inference, noise
+/// against the surrounding work) for the reason `atom_parse_count` is: the
+/// `VILAN_DEPTH_STATS` counter beside it is behind a `OnceLock`-cached switch
+/// that would have to be set before the process's first analysis, which a test
+/// binary sharing a process with other tests cannot promise.
+pub fn inference_entry_count() -> u64 {
+    INFERENCE_ENTRIES.with(std::cell::Cell::get)
+}
+
+/// How many times this thread served a RECORDED return answer to an ask that
+/// carried a caller's generic bindings. **This number must always be zero**, and
+/// a test asserts that it is — the whole point of the probe.
+///
+/// `inferred_return_types` is keyed by FUNCTION ALONE, but an answer is recorded
+/// whenever the inference that produced it was exact, INCLUDING when that
+/// inference ran under a caller's substitution: measured over the inference
+/// suite, 1 157 records are written under a non-empty substitution context, and
+/// one generic enum's slot receives six different instantiations in a single
+/// run. Those records are one caller's answer sitting in a slot the next caller
+/// would read. The empty-substitution guard on the read in
+/// [`Analyzer::infer_function_returns`] is what keeps them from being served
+/// across callers, and it is the only thing that does.
+///
+/// So the probe counts what the guard forbids, and the pin asserts the count
+/// stays zero. The increment below is unreachable while the guard stands — that
+/// unreachability IS the claim, and deleting the guard makes it reachable
+/// immediately (925 serves over the same suite). A behavioural pin was tried
+/// first and does not exist: with the guard deleted the whole inference suite,
+/// the docs gate, and the byte-identical corpus are all unchanged, because a
+/// wrongly-served answer is re-substituted downstream before it reaches
+/// codegen. That makes this the honest pin — it fails on deletion, and it does
+/// not pretend a miscompile is reachable today.
+pub fn return_records_served_under_substitution() -> u64 {
+    RECORDS_SERVED_UNDER_SUBSTITUTION.with(std::cell::Cell::get)
 }
 
 /// Marks one generic constraint id as being resolved (for a given operation) while a
@@ -22169,6 +22230,7 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> Type {
+        INFERENCE_ENTRIES.with(|count| count.set(count.get().saturating_add(1)));
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::INFER);
         // `exprs_seen` guards against infinite recursion through a genuine cycle
         // (an expression whose type depends on itself). It tracks the current
@@ -23727,6 +23789,14 @@ impl<'src> Analyzer<'src> {
         if substitution_context.is_empty()
             && let Some(type_id) = self.inferred_return_types.get(&function_id).copied()
         {
+            // Unreachable while the guard above stands, and that is exactly what
+            // `return_records_served_under_substitution` pins: delete the
+            // `is_empty()` and this counts every caller-shaped answer handed to
+            // the wrong caller.
+            if !substitution_context.is_empty() {
+                RECORDS_SERVED_UNDER_SUBSTITUTION
+                    .with(|count| count.set(count.get().saturating_add(1)));
+            }
             return ReturnInference {
                 type_: self.get_type_by_type_id(type_id),
                 disagreements: Vec::new(),

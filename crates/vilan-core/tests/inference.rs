@@ -66641,3 +66641,120 @@ fn stripping_a_whole_match_is_some_empty_not_none() {
         "some:\nsome:\n",
     );
 }
+
+// --- B139: the recorded return answer is the FUNCTION's, never a caller's ----
+//
+// `infer_function_returns` serves `inferred_return_types` to skip re-deriving a
+// chain (B139's TIME half, pinned for cost in `tests/deep_nesting.rs`). That
+// record is keyed by FUNCTION ALONE, while an answer is recorded whenever the
+// inference that produced it was exact — including when it ran under a caller's
+// substitution. So the map genuinely does collect caller-shaped answers: over
+// this suite, 1 157 records are written under a non-empty substitution context,
+// and one generic enum's slot receives six different instantiations in a single
+// run. The `substitution_context.is_empty()` guard on the READ is the only
+// thing standing between those records and the next caller, and nothing named
+// it until this pin.
+
+/// The number of recorded return answers served to an ask carrying a caller's
+/// generic bindings while `source` compiles, read on the worker the compile runs
+/// on — the probe is thread-local, like the analyzer's other counters.
+fn records_served_under_substitution(source: &str) -> u64 {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let before = vilan_core::analyzer::return_records_served_under_substitution();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                program.is_some() && errors.is_empty(),
+                "the plant must analyze cleanly, got: {errors:#?}"
+            );
+            vilan_core::analyzer::return_records_served_under_substitution() - before
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// The shapes that put caller-shaped answers into the record in the first place,
+/// each instantiated at TWO types so a shared slot would be read across
+/// bindings: a generic impl method with an undeclared return, a static hung off
+/// a trait (the `b102`/`i5` shape whose records this suite was measured on), and
+/// a plain generic function.
+const CALLER_SHAPED_RETURN_PLANT: &str = r#"
+        import std::print;
+
+        trait Producer<T> {
+            fun produce(self): T;
+        }
+
+        struct Holder<T> {
+            item: T,
+        }
+
+        impl Holder<type T> with Producer<T> {
+            fun produce(self) {
+                self.item
+            }
+        }
+
+        impl Producer<type T> {
+            fun of(item: T): Holder<T> {
+                Holder { item }
+            }
+        }
+
+        fun echo<T>(value: T) {
+            value
+        }
+
+        fun main() {
+            let ints = Producer::of(1);
+            let strs = Producer::of("hi");
+            print(ints.produce());
+            print(strs.produce());
+            print(echo(2));
+            print(echo("bye"));
+        }
+        "#;
+
+/// A recorded answer is NEVER served to an ask that carries a caller's generic
+/// bindings — the correctness half of B139's memo.
+///
+/// Non-vacuous, and provably so: deleting `substitution_context.is_empty()` from
+/// the read in `infer_function_returns` turns this red immediately (925 serves
+/// across this suite, 4 of them answers that differ from the correct one).
+///
+/// This asserts the guard rather than a wrong-typed program on purpose. A
+/// behavioural pin was attempted first and does not exist today: with the guard
+/// deleted, all 2 596 inference tests, the docs gate, and the byte-identical
+/// corpus are unchanged, because a wrongly-served answer is re-substituted
+/// downstream before it can reach codegen. The hazard is real — the records are
+/// caller-shaped — but only this guard makes it unreachable, so this is what
+/// there is to pin.
+#[test]
+fn b139_a_recorded_return_is_never_served_under_a_callers_bindings() {
+    assert_eq!(
+        records_served_under_substitution(CALLER_SHAPED_RETURN_PLANT),
+        0,
+        "a recorded return answer was served to an ask carrying a caller's \
+         generic bindings — the record is keyed by function alone, so that \
+         answer belongs to a DIFFERENT caller (B139)"
+    );
+}
+
+/// The plant is not vacuous either: it really does compile and run, and really
+/// does instantiate each generic shape at two distinct types. A plant that
+/// stopped exercising the shape would make the pin above pass for free.
+#[test]
+fn b139_the_caller_shaped_return_plant_runs_at_both_instantiations() {
+    assert_compiles_and_runs(CALLER_SHAPED_RETURN_PLANT, "1\nhi\n2\nbye\n");
+}
