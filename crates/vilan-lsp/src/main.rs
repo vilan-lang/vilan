@@ -8,6 +8,7 @@ mod document;
 mod line_index;
 mod manifest_completion;
 mod publish;
+mod references;
 mod uri;
 
 use std::collections::HashMap;

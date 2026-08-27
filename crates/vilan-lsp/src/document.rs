@@ -19,6 +19,7 @@ use vilan_core::{
 };
 
 use crate::line_index::LineIndex;
+use crate::references::{Definition, DefinitionKind, ReferenceIndex};
 use vilan_ide::{
     Analysis, BOOK_BASE, Completion, ImportRoots, KEYWORD_DOCS, keyword_lexeme,
     source_call_subject, span_of,
@@ -255,19 +256,6 @@ pub fn hash_text(text: &str) -> u64 {
     hasher.finish()
 }
 
-/// What a use site ultimately refers to — the key for find-references / rename.
-#[derive(Clone, Copy, PartialEq)]
-enum Target {
-    /// A `let`/`mut` local or a parameter, by its binding id.
-    Binding(Id),
-    /// A struct field, by owning struct id and field index.
-    Field(Id, usize),
-    /// A method, by its function id (call sites carry a precise member span).
-    Method(Id),
-    /// A struct/enum/trait definition, by its id (uses live in `type_references`).
-    Type(Id),
-}
-
 /// A kind of declaration, for the document outline.
 pub enum SymbolKind {
     Function,
@@ -405,6 +393,11 @@ pub struct Document {
     /// `(start, end, id)` for every entry-file entity with a real span, used to
     /// find the innermost entity under a cursor.
     entity_spans: Vec<(usize, usize, Id)>,
+    /// Every identifier occurrence in the analyzed program, keyed by the
+    /// definition it names — the one table find-references and rename both read
+    /// (see `crate::references`). Computed with the analysis so a query is a
+    /// lookup rather than a scan of the whole entity map.
+    reference_index: ReferenceIndex,
     /// Salvage tail retention (B38): the PREVIOUS analysis's semantic tokens
     /// for the byte-identical, line-aligned common suffix of the old and new
     /// analyzed texts, already shifted into the new text's coordinates.
@@ -748,6 +741,7 @@ impl Document {
             text: text.to_string(),
             text_hash: hash_text(text),
             entity_spans: Vec::new(),
+            reference_index: ReferenceIndex::default(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
             platform_requirements: HashMap::default(),
@@ -824,6 +818,12 @@ impl Document {
             .map(vilan_ide::entity_spans)
             .unwrap_or_default();
 
+        // The identifier-occurrence table the reference queries read.
+        let reference_index = program
+            .as_ref()
+            .map(ReferenceIndex::build)
+            .unwrap_or_default();
+
         // `diagnostics` = the entry's own lex/parse errors, then the program's
         // (see `analyze_source`) — so the source list is an entry-attributed
         // prefix followed by the program's per-diagnostic attribution.
@@ -873,6 +873,7 @@ impl Document {
             text: text.to_string(),
             text_hash,
             entity_spans,
+            reference_index,
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
             platform_requirements,
@@ -1208,6 +1209,7 @@ impl Document {
             live_edits: _,
             text_hash,
             entity_spans,
+            reference_index,
             platform_requirements,
             manifest_problem,
             import_roots,
@@ -1225,6 +1227,7 @@ impl Document {
         self.warning_sources = warning_sources;
         self.text_hash = text_hash;
         self.entity_spans = entity_spans;
+        self.reference_index = reference_index;
         self.platform_requirements = platform_requirements;
         self.manifest_problem = manifest_problem;
         self.import_roots = import_roots;
@@ -1962,23 +1965,44 @@ impl Document {
         }
     }
 
-    /// All references to the symbol under `offset` (including its declaration).
+    /// All references to the symbol under `offset` (including its declaration),
+    /// as `(file, span)` with each span covering exactly the identifier.
+    ///
+    /// Answered from the reference index: the cursor is resolved by looking
+    /// `offset` up in the *same* identifier-occurrence table the answer is drawn
+    /// from, so resolution and enumeration cannot disagree — a symbol kind the
+    /// index can find is necessarily one it can also enumerate. An empty result
+    /// means the cursor is not on an identifier, and nothing else.
     pub fn references(&self, offset: usize) -> Vec<(SourceId, Span)> {
-        let Some(program) = self.program.as_ref() else {
+        let Some((definition, _)) = self.reference_target(offset) else {
             return Vec::new();
         };
-        // Resolve a target from the entity under the cursor, falling back to a
-        // type reference (a type *use* is not an entity) and then to a struct
-        // field declaration (whose name has no entity of its own).
-        let target = self
-            .entity_at(offset)
-            .and_then(|id| self.target_of(program, id))
-            .or_else(|| self.type_reference_target(program, offset))
-            .or_else(|| self.field_decl_at(program, offset));
-        let Some(target) = target else {
-            return Vec::new();
-        };
-        self.occurrences(program, target)
+        self.reference_index
+            .occurrences_of(definition)
+            .map(|occurrence| (occurrence.source, occurrence.span))
+            .collect()
+    }
+
+    /// The definition the identifier under `offset` names, with its kind — the
+    /// shared front half of find-references and rename.
+    pub fn reference_target(&self, offset: usize) -> Option<(Definition, DefinitionKind)> {
+        let program = self.program.as_ref()?;
+        let occurrence = self.reference_index.at(SourceId(0), offset)?;
+        let kind = crate::references::kind_of(program, occurrence.definition)?;
+        Some((occurrence.definition, kind))
+    }
+
+    /// The reference index, for the invariant pins.
+    #[cfg(test)]
+    pub(crate) fn reference_index(&self) -> &ReferenceIndex {
+        &self.reference_index
+    }
+
+    /// How many references to `definition` the index knows it is missing: use
+    /// sites whose recorded span could not be proven to cover an identifier.
+    /// Non-zero means an edit set over this definition would be incomplete.
+    pub fn unindexed_references(&self, definition: Definition) -> usize {
+        self.reference_index.dropped_for(definition)
     }
 
     /// The "Organize Imports" edits (WO-2): the top-level import runs sorted into
@@ -2285,194 +2309,6 @@ impl Document {
             }
         }
         changed.then(|| (Span::from(0..self.text.len()), working))
-    }
-
-    /// A struct/enum/trait target when the cursor is on a type *use* (e.g.
-    /// `Option` in `Option<T>`), which lives in `type_references` rather than as
-    /// an entity.
-    fn type_reference_target(&self, program: &Program, offset: usize) -> Option<Target> {
-        let (definition, _) = self.type_reference_at(program, offset)?;
-        let definition = definition?;
-        if program.structs.contains_key(&definition)
-            || program.enums.contains_key(&definition)
-            || program.traits.contains_key(&definition)
-        {
-            Some(Target::Type(definition))
-        } else {
-            None
-        }
-    }
-
-    /// The struct field whose declaration name contains `offset`, if any (field
-    /// names in a declaration carry no entity, so they need a positional probe).
-    fn field_decl_at(&self, program: &Program, offset: usize) -> Option<Target> {
-        for (struct_id, struct_definition) in &program.structs {
-            if program.source_of(*struct_id) != Some(SourceId(0)) {
-                continue;
-            }
-            for (index, field) in struct_definition.fields.iter().enumerate() {
-                let range = field.name_span.into_range();
-                if range.start <= offset && offset < range.end {
-                    return Some(Target::Field(*struct_id, index));
-                }
-            }
-        }
-        None
-    }
-
-    /// What a use site refers to, for find-references / rename.
-    fn target_of(&self, program: &Program, id: Id) -> Option<Target> {
-        match program.entity_map.get(&id)? {
-            Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding) => {
-                Some(Target::Binding(*binding))
-            }
-            Expr::Field(_, struct_id, index) => Some(Target::Field(*struct_id, *index)),
-            // The cursor is on a function/method declaration name.
-            Expr::Function(function_id) => Some(Target::Method(*function_id)),
-            // The cursor is on a type declaration name or a constructor.
-            Expr::Struct(struct_id) => Some(Target::Type(*struct_id)),
-            Expr::Enum(enum_id) => Some(Target::Type(*enum_id)),
-            Expr::Trait(trait_id) => Some(Target::Type(*trait_id)),
-            Expr::StructInitializer(initializer_id, _) => program
-                .struct_initializer_to_def
-                .get(initializer_id)
-                .map(|struct_id| Target::Type(*struct_id)),
-            Expr::Call(call_id) => {
-                // A method call carries a member span, and its wired subject is a
-                // `Local` pointing at the resolved method function (see
-                // `wire_method_call`).
-                if !program.member_name_spans.contains_key(&id) {
-                    return None;
-                }
-                let subject = program.function_calls.get(call_id)?.subject_id;
-                match program.entity_map.get(&subject)? {
-                    Expr::Local(function_id) | Expr::Function(function_id)
-                        if program.functions.contains_key(function_id) =>
-                    {
-                        Some(Target::Method(*function_id))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Every occurrence (declaration + uses) of a target, as `(file, span)`,
-    /// each span covering exactly the identifier to rename.
-    fn occurrences(&self, program: &Program, target: Target) -> Vec<(SourceId, Span)> {
-        let mut spans: Vec<(SourceId, Span)> = Vec::new();
-        let mut push = |id: Id, span: Span| {
-            if let Some(source) = program.source_of(id) {
-                spans.push((source, span));
-            }
-        };
-
-        match target {
-            Target::Binding(binding) => {
-                // The declaration name span: a variable carries it explicitly; a
-                // parameter/capture's `span_map` entry is already the name.
-                let decl_span = program
-                    .variables
-                    .get(&binding)
-                    .map(|variable| variable.name_span)
-                    .or_else(|| span_of(program, binding));
-                if let Some(span) = decl_span {
-                    push(binding, span);
-                }
-                for (use_id, expr) in &program.entity_map {
-                    let refers = matches!(
-                        expr,
-                        Expr::Local(other) | Expr::Variable(other) | Expr::Parameter(other)
-                        if *other == binding
-                    );
-                    if refers && *use_id != binding {
-                        if let Some(span) = span_of(program, *use_id) {
-                            push(*use_id, span);
-                        }
-                    }
-                }
-            }
-            Target::Field(struct_id, index) => {
-                if let Some(field) = program
-                    .structs
-                    .get(&struct_id)
-                    .and_then(|s| s.fields.get(index))
-                {
-                    push(struct_id, field.name_span);
-                }
-                for (use_id, expr) in &program.entity_map {
-                    if let Expr::Field(_, other_struct, other_index) = expr {
-                        if *other_struct == struct_id && *other_index == index {
-                            if let Some(span) = program.member_name_spans.get(use_id) {
-                                push(*use_id, *span);
-                            }
-                        }
-                    }
-                }
-            }
-            Target::Method(function_id) => {
-                if let Some(function) = program.functions.get(&function_id) {
-                    push(function_id, function.name_span);
-                }
-                for (use_id, expr) in &program.entity_map {
-                    let Expr::Call(call_id) = expr else {
-                        continue;
-                    };
-                    // A method call site carries a member span and a wired subject
-                    // that is a `Local` pointing at the method function.
-                    let Some(member_span) = program.member_name_spans.get(use_id) else {
-                        continue;
-                    };
-                    let Some(call) = program.function_calls.get(call_id) else {
-                        continue;
-                    };
-                    let refers = matches!(
-                        program.entity_map.get(&call.subject_id),
-                        Some(Expr::Local(other)) | Some(Expr::Function(other)) if *other == function_id
-                    );
-                    if refers {
-                        push(*use_id, *member_span);
-                    }
-                }
-            }
-            Target::Type(type_id) => {
-                // The declaration's name span.
-                let name_span = program
-                    .structs
-                    .get(&type_id)
-                    .map(|s| s.name_span)
-                    .or_else(|| program.enums.get(&type_id).map(|e| e.name_span))
-                    .or_else(|| program.traits.get(&type_id).map(|t| t.name_span));
-                if let Some(span) = name_span {
-                    push(type_id, span);
-                }
-                // Every type-position use is recorded in `type_references`.
-                for (source, span, definition, _label) in &program.type_references {
-                    if *definition == Some(type_id) {
-                        spans.push((*source, *span));
-                    }
-                }
-                // Constructor uses (`Point { .. }`) aren't type references; the
-                // name leads the initializer span.
-                if let Some(structure) = program.structs.get(&type_id) {
-                    for (initializer_id, struct_id) in &program.struct_initializer_to_def {
-                        if *struct_id != type_id {
-                            continue;
-                        }
-                        if let (Some(initializer_span), Some(source)) = (
-                            span_of(program, *initializer_id),
-                            program.source_of(*initializer_id),
-                        ) {
-                            let start = initializer_span.into_range().start;
-                            let name_span: Span = (start..start + structure.name.len()).into();
-                            spans.push((source, name_span));
-                        }
-                    }
-                }
-            }
-        }
-        spans
     }
 
     /// The outline of the entry file: functions, structs (with their fields),
