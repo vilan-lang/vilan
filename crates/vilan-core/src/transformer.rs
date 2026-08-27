@@ -684,6 +684,9 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__hmr_active",
         "__hmac_sha512",
         "__pbkdf2_sha512",
+        "__sha256",
+        "__sha384",
+        "__sha512",
         "__random_bytes",
         "__db_run",
         "__db_all",
@@ -896,6 +899,19 @@ fn helper_source(name: &str) -> &'static str {
              \tconst imported = await crypto.subtle.importKey(\"raw\", password, \"PBKDF2\", false, [ \"deriveBits\" ]);\n\
              \treturn new Uint8Array(await crypto.subtle.deriveBits({ name: \"PBKDF2\", salt, iterations, hash: \"SHA-512\" }, imported, bits));\n\
              }"
+        }
+        // Unkeyed content digests (kolt.local 024) via `crypto.subtle.digest`.
+        // Async because WebCrypto is — the std::crypto stance (`std/misc.md`);
+        // a path that cannot suspend binds the host primitive as an extern
+        // instead, so there is deliberately no sync twin here.
+        "__sha256" => {
+            "async function __sha256(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-256\", data));\n}"
+        }
+        "__sha384" => {
+            "async function __sha384(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-384\", data));\n}"
+        }
+        "__sha512" => {
+            "async function __sha512(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-512\", data));\n}"
         }
         // Web Storage glue (std::storage): a missing key reads null; flatten to "".
         "__local_get" => {

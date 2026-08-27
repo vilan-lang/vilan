@@ -17,6 +17,24 @@ async external fun hmac_sha512(key: Bytes, data: Bytes): Bytes;
 [extern("__pbkdf2_sha512")]
 async external fun pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: i32, bits: i32): Bytes;
 
+/// SHA-256 of `data` — an unkeyed content digest, for naming bytes by their
+/// content: an asset fingerprint, a cache validator, a dedup key. Pair with
+/// `Bytes::to_hex` for the hex form those are written as.
+///
+/// NOT a password primitive (`pbkdf2_sha512` is — a raw digest is far too
+/// fast to hash a password with), and not `std::hash`, which is the Map/Set
+/// canonical-key mechanism and makes no avalanche promise at all.
+[extern("__sha256")]
+async external fun sha256(data: Bytes): Bytes;
+
+/// SHA-384 of `data` — `sha256`'s wider sibling, same shape and same uses.
+[extern("__sha384")]
+async external fun sha384(data: Bytes): Bytes;
+
+/// SHA-512 of `data` — `sha256`'s widest sibling, same shape and same uses.
+[extern("__sha512")]
+async external fun sha512(data: Bytes): Bytes;
+
 /// `length` cryptographically random bytes.
 [extern("__random_bytes")]
 external fun random_bytes(length: i32): Bytes;
