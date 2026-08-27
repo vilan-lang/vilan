@@ -124,6 +124,9 @@ the server is the canonical use).
 fun random_bytes(length: i32): Bytes        // cryptographically secure
 fun random_uuid(): str
 fun equals_constant_time(a: Bytes, b: Bytes): bool   // timing-safe compare
+async fun sha256(data: Bytes): Bytes         // unkeyed content digests
+async fun sha384(data: Bytes): Bytes
+async fun sha512(data: Bytes): Bytes
 async fun hmac_sha512(key: Bytes, data: Bytes): Bytes
 async fun pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: i32, bits: i32): Bytes
 ```
@@ -133,6 +136,26 @@ password-hashing primitive — store the salt beside the derived hash and
 compare with `equals_constant_time`; `hmac_sha512` signs raw byte
 messages (for tokens, `std::jwt` below is the shaped surface). Neither
 needs an extern any more.
+
+The `sha*` family are **unkeyed content digests** — for naming bytes by
+their content (an asset fingerprint, a cache validator, a dedup key), and
+paired with `Bytes::to_hex` for the hex those are written as:
+
+```vilan
+import std::crypto::sha256;
+import std::bytes::encode_utf8;
+import std::print;
+
+async fun main() {
+	let hex = sha256(encode_utf8("body { color: red }")).to_hex();
+	print(hex.substring(0, 8));   // 925e8741 — an asset fingerprint
+}
+main();
+```
+
+Do not reach for them for passwords — a raw digest is far too fast, and
+`pbkdf2_sha512` is the primitive for that. They are also not `std::hash`,
+which is the Map/Set canonical-key mechanism and promises no avalanche.
 
 The std surface is **async** because WebCrypto is. On a path that must
 stay sync — the walkthrough's rpc dispatch hashes passwords inside a

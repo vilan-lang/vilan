@@ -27555,6 +27555,56 @@ fn hmac_sha512_matches_the_rfc_vector() {
 }
 
 #[test]
+fn the_unkeyed_digests_match_their_published_vectors() {
+    // kolt.local 024. The vectors are FIPS 180-4's one-block message sample
+    // ("abc") for each of the three widths — a digest pin is only worth
+    // anything against a value published independently of this implementation.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::crypto::{ sha256, sha384, sha512 };
+        import std::bytes::encode_utf8;
+        async fun main() {
+            print(sha256(encode_utf8("abc")).to_hex());
+            print(sha384(encode_utf8("abc")).to_hex());
+            print(sha512(encode_utf8("abc")).to_hex());
+        }
+        main();
+        "#,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n\
+         cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7\n\
+         ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\n",
+    );
+}
+
+#[test]
+fn sha256_digests_the_empty_input_and_mints_a_fingerprint_prefix() {
+    // The empty input is the digest's other published edge (FIPS 180-4), and
+    // it is the one a naive "hash the bytes I read" path most easily gets
+    // wrong by returning "" instead. The second line is kolt's actual demand
+    // case (024's exhibit): an asset fingerprint is the first eight hex digits
+    // of the file's sha256 — which nothing in the language could produce, so
+    // kolt's names were minted out of band and `is_fingerprinted` could only
+    // RECOGNIZE the shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::crypto::sha256;
+        import std::bytes::encode_utf8;
+        async fun main() {
+            let empty = sha256(encode_utf8("")).to_hex();
+            print(empty);
+            let hex = sha256(encode_utf8("body { color: red }")).to_hex();
+            print(hex.substring(0, 8));
+        }
+        main();
+        "#,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+         925e8741\n",
+    );
+}
+
+#[test]
 fn a_jwt_round_trips_signs_and_verifies() {
     assert_compiles_and_runs(
         r#"
