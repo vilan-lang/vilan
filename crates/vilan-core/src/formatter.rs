@@ -944,6 +944,26 @@ fn prune_import_branch<'src>(
     }
 }
 
+/// The source spans of every TOP-LEVEL `import` / `use` / re-export statement.
+///
+/// The organize-imports usage model needs to tell a reference written by the
+/// file's own CODE from one written by its import list. An import path's
+/// segments resolve to the very definitions its leaves bind, so a model that
+/// counts every reference alike lets an import justify its own existence and it
+/// can then never be pruned — which is what kept an unused `Result::{ self }`
+/// alive forever (kolt.local 004). Returns an empty list when the source does
+/// not parse, which the caller reads as "decide nothing".
+pub fn import_statement_spans(source: &str) -> Vec<Span> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| import_kind_and_branch(&item.0).is_some())
+        .map(|item| item.1)
+        .collect()
+}
+
 /// Organizes a file's *top-level* import runs: sorts each into canonical order
 /// (the shared [`import_sort_key`], identical to `vilan fmt`) and, per `keep`,
 /// prunes unused leaves. Returns one [`ImportRunEdit`] per run whose canonical

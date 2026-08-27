@@ -2267,6 +2267,7 @@ pub struct Analyzer<'src> {
     // The span of the member identifier in a field access or method call (`.x`),
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
+    struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     // The file currently being walked, so type references (which aren't entities)
     // can be tagged with their source for the language server.
     current_source_id: SourceId,
@@ -3168,6 +3169,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
+            struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
@@ -29430,6 +29432,17 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
             };
+            // The key names the field, so it is a reference to it — recorded
+            // here because this is the only point where the name has been
+            // resolved to a field index (see `struct_initializer_field_spans`).
+            if let Some(source) = self.source_of_id(initializer_id) {
+                self.struct_initializer_field_spans.push((
+                    source,
+                    *field_name_span,
+                    struct_id,
+                    struct_field_index,
+                ));
+            }
             let struct_field_type = struct_field.type_id.get_type(self);
             // Infer the value against the declared field type so that, e.g., an
             // integer literal is treated as `f64` when the field is `f64`.
@@ -33111,6 +33124,16 @@ pub struct Program<'src> {
     // Use-site identifier spans for field accesses / method calls (`.x`), keyed
     // by the access expr id — drives rename and go-to-definition on members.
     pub member_name_spans: HashMap<Id, Span>,
+    /// Use-site identifier spans for struct-initializer field KEYS: `(file, name
+    /// span, owning struct id, field index)`, one per `x` in `Point { x = 1 }`.
+    ///
+    /// A field ACCESS (`p.x`) records its span in `member_name_spans`, but an
+    /// initializer key is not an access and so had nowhere to record. Without
+    /// it, renaming a struct field misses every construction site and silently
+    /// emits a partial edit that breaks the build (kolt.local 002). May contain
+    /// repeats — a deferred initializer constraint is re-run, and each run
+    /// records again — so a consumer deduplicates by `(file, span)`.
+    pub struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     // Maps a struct initializer expr id to the struct definition it constructs,
     // so go-to-definition on `Point { .. }` reaches the `struct` declaration.
     pub struct_initializer_to_def: HashMap<Id, Id>,
@@ -38241,6 +38264,7 @@ fn analyze_over_world<'src>(
         layer_platforms,
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,
+        struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         type_references,
         expr_types,
