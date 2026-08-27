@@ -1,0 +1,71 @@
+// A postfix applied directly to an implicitly-awaited call (backlog B141).
+// Every helper here awaits, so every call to one is awaited on the caller's
+// behalf — the async transparency the language promises. The emitter renders an
+// await as `await (<operand>)`, which parenthesises the OPERAND; a postfix binds
+// TIGHTER than the `await` unary, so the whole await-expression needs parens of
+// its own or the postfix steals it: `await (f()).x` is `await ((f()).x)`, which
+// reads the member off the PROMISE and yields `undefined` with no diagnostic.
+// This program is the byte-level gate on those parentheses. Output is
+// deterministic (`sleep(0)`).
+import std::print;
+import std::time::sleep;
+
+struct Row { id: i32, name: str }
+
+struct Boxed { n: i32 }
+
+impl Boxed {
+	fun doubled(self): i32 { self.n * 2 }
+}
+
+fun fetch_row(): Row {
+	sleep(0);
+	Row { id = 7, name = "seven" }
+}
+
+fun fetch_list(): List<i32> {
+	sleep(0);
+	[10, 20, 30]
+}
+
+fun fetch_num(): i32 {
+	sleep(0);
+	5
+}
+
+fun fetch_maker(): || i32 {
+	sleep(0);
+	|| 99
+}
+
+fun main() {
+	// A field read straight off the awaited call — B141's headline shape.
+	print(fetch_row().id); // 7
+	// A built-in method: `.len()` lowers to `.length`, so it is the field shape.
+	print(fetch_list().len()); // 3
+	// Calling the closure the awaited call returned. This one never went
+	// silent — it threw `is not a function`.
+	print(fetch_maker()()); // 99
+	// Two postfix links off one await.
+	print(fetch_row().name.len()); // 5
+	// An EXPLICIT await under a postfix: the written parens are not the ones
+	// that reach the output, so this needed the same fix.
+	let pending = async fetch_row();
+	print((await pending).id); // 7
+
+	// Correct BEFORE the fix, and pinned so they cannot regress silently. Both
+	// escape by landing the await in argument position, where it is
+	// parenthesised for free: a subscript goes through the checked `__at`
+	// helper, and a user method lowers to a free function.
+	print(fetch_list()[0]); // 10
+	print(Boxed { n = 21 }.doubled()); // 42
+
+	// The counter-case: `await` binds tighter than every binary operator, so an
+	// await in operand position takes no parens and must not acquire any.
+	print(fetch_num() + 1); // 6
+
+	// The control: binding first was always correct, which is why the rest of
+	// this corpus — which binds — never saw B141.
+	let row = fetch_row();
+	print(row.id); // 7
+}
