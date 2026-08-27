@@ -325,9 +325,17 @@ impl Server {
 		let upgrade_handler = self.upgrade_handler;
 		let node_server = node_create_server(|node_request, node_response| {
 			// Collect the full request body (as BYTES — it may be binary)
-			// before dispatching: the handler is called indirectly and so
-			// can't suspend, so it receives the body ready rather than as a
-			// stream.
+			// before dispatching: `Request` carries a READY body rather than a
+			// stream, so every handler sees one shape and none has to drive a
+			// reader to get at the bytes.
+			//
+			// This await is also the proof that nothing downstream of it is
+			// synchronous: the callback suspends HERE, before a byte is
+			// written, and `request_handler` is `async` and awaited on the next
+			// line. Said out loud because the comment this replaces claimed the
+			// opposite — "the handler is called indirectly and so can't
+			// suspend" — and a synchronous file read in `std::fs` was justified
+			// by that claim for the length of its life.
 			let content = read_request_bytes(node_request);
 			let response = request_handler(Request { node = node_request, content = content });
 			node_response.set_status_code(response.status);

@@ -133,9 +133,8 @@ An rpc app adds `.with_service(Service::new(protocol))` to the same chain
 ## Files: `std::fs`
 
 ```vilan,fragment
-fun exists(path: str): bool                 // sync — boot code can branch on it
+fun exists(path: str): bool                 // sync — the module's one blocking call
 fun read_file_to_str(path: str): str        // async (implicitly awaited), UTF-8
-fun read_file_to_str_sync(path: str): str   // sync — for a callback that can't suspend
 fun read_file_encoded(path: str, encoding: str): str   // async — any host encoding
 fun read_bytes(path: str): Bytes            // async — the true binary read
 fun write_file(path: str, contents: str)    // async

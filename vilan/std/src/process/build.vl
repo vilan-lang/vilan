@@ -191,7 +191,7 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 					url = url,
 					file = file,
 					content_type = content_type,
-					content = fs::read_file_to_str_sync(file),
+					content = fs::read_file_to_str(file),
 				});
 			},
 		}
@@ -224,9 +224,17 @@ fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 ///
 /// This makes the SERVER's copies fresh. The dev channel's push half (the css
 /// and js hot-swaps) is untouched and remains the way a browser is told.
+///
+/// The re-read is the ordinary async `read_file_to_str`, awaited before the
+/// response is built. Nothing on this path forbids suspending: `serve_build`'s
+/// handler is reached from `respond_from_build`, which is `async` because it
+/// awaits the app's own handler, and the node callback in `Server::start`
+/// already suspends on `read_request_bytes` before a byte is written. A
+/// synchronous read here bought nothing, and it once justified its own
+/// existence in `std::fs` by claiming this caller could not suspend.
 fun asset_body(asset: BuildAsset): str {
 	if is_watching() {
-		fs::read_file_to_str_sync(asset.file)
+		fs::read_file_to_str(asset.file)
 	} else {
 		asset.content
 	}

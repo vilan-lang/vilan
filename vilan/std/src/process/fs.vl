@@ -34,8 +34,18 @@ async external fun read_bytes(path: str): Bytes;
 [extern("node:fs/promises", "writeFile")]
 async external fun write_file(path: str, contents: str): void;
 
-/// Whether a path exists on disk (`node:fs` `existsSync` — synchronous, so boot
-/// code can branch on it directly).
+/// Whether a path exists on disk (`node:fs` `existsSync`).
+///
+/// The one synchronous binding in this module, and NOT for the reason a sync
+/// function usually claims: no caller of it cannot suspend. Its callers in
+/// `std::build` (`build_of`, `load_build`) are both async and await their file
+/// reads a line or two later. It is synchronous because `node:fs/promises` has
+/// no `exists` at all — `existsSync` is the whole operation in one call — and
+/// because syncness is the ONLY thing that separates it from
+/// `stat(path).is_some()`, which is right below, is async, and is what to reach
+/// for on a request path. The cost is one blocking stat (node implements
+/// `existsSync` as exactly that): affordable for a boot-time branch, not for a
+/// per-request one.
 [extern("node:fs", "existsSync")]
 external fun exists(path: str): bool;
 
@@ -116,20 +126,4 @@ fun stat(path: str): Option<Stat> {
 		Some(let raw) => Some(Stat { size = raw.size(), modified_at_ms = raw.mtime_ms(), is_directory = raw.is_directory() }),
 		None => None,
 	}
-}
-
-/// The synchronous read (`node:fs` `readFileSync`) — for a read that must
-/// complete inside a callback that cannot suspend.
-///
-/// Prefer `read_file_to_str`: this one blocks the event loop for the length of
-/// the read, which is the wrong trade for anything on a server's hot path. It
-/// exists because a synchronous request handler has no other option, and
-/// `serve_build`'s dev-mode revalidation is exactly that — a re-read per
-/// request, under `run --watch` only, of a file the build just wrote.
-[extern("node:fs", "readFileSync")]
-external fun read_file_bytes_sync(path: str, encoding: str): str;
-
-/// Reads a UTF-8 text file to a string, synchronously. See `read_file_bytes_sync`.
-fun read_file_to_str_sync(path: str): str {
-	read_file_bytes_sync(path, "utf8")
 }
