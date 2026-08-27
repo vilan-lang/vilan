@@ -1042,4 +1042,179 @@ fun main(): i32 {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- Rename: the per-symbol-kind matrix -----------------------------
+    // kolt.local 002 asked for exactly this list — fields, static methods,
+    // instance methods, enum variants, modules, type params, locals — and for
+    // rename to be a thin layer over the same index find-references reads,
+    // rather than a second mechanism that can disagree with it.
+
+    use crate::document::{RenameRefusal, is_identifier};
+
+    /// The rename edit set, rendered as the text each span currently covers, so
+    /// a wrong span shows up as the wrong word rather than as a number.
+    fn rename_at(document: &Document, offset: usize) -> Result<Vec<&'static str>, RenameRefusal> {
+        let mut spans = document.rename_edits(offset, "renamed")?;
+        spans.sort_by_key(|(source, span)| (source.0, span.start));
+        Ok(spans
+            .into_iter()
+            .map(|(_, span)| {
+                MATRIX
+                    .get(span.into_range())
+                    .expect("inside the entry text")
+            })
+            .collect())
+    }
+
+    // Rename must rewrite exactly what find-references reports — no more (a
+    // partial or duplicated set is what the client rejected with "Rename failed
+    // to apply edits") and no less (a missing site breaks the build).
+    #[test]
+    fn a_rename_rewrites_exactly_what_find_references_reports() {
+        let (dir, document) = matrix();
+        for (label, offset) in [
+            ("a struct", at("struct Point", 7)),
+            ("a struct field", at("\tx: i32", 1)),
+            ("an instance method", at("fun sum", 4)),
+            ("a static method", at("fun origin", 4)),
+            ("a static call", at("Point::origin", 7)),
+            ("a free function", at("fun helper", 4)),
+            ("an enum", at("enum Shape", 5)),
+            ("an enum variant", at("\tDot,", 1)),
+            ("a variant in a pattern", at("Shape::Dot =>", 7)),
+            ("a local", at("let total", 4)),
+            ("a parameter", at("value: i32", 0)),
+        ] {
+            let renamed = rename_at(&document, offset).unwrap_or_else(|refusal| {
+                panic!("renaming {label} refused: {}", refusal.message())
+            });
+            assert_eq!(
+                renamed,
+                references_at(&document, offset),
+                "renaming {label} must rewrite exactly the references",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Every edit rewrites an identifier, never a declaration or a whole path.
+    // Renaming a static method used to replace the entire `fun … { … }`.
+    #[test]
+    fn every_rename_edit_replaces_one_identifier() {
+        let (dir, document) = matrix();
+        for (label, offset, expected) in [
+            ("a static method", at("Point::origin", 7), "origin"),
+            ("a free function", at("helper(total)", 1), "helper"),
+            ("a variant", at("Shape::Dot;", 7), "Dot"),
+            ("a field", at("Point { x = 1", 8), "x"),
+        ] {
+            for text in rename_at(&document, offset).expect("a rename") {
+                assert_eq!(text, expected, "renaming {label} touched {text:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // No two edits may address the same range: an overlapping `WorkspaceEdit` is
+    // rejected wholesale by the client, which is the "Rename failed to apply
+    // edits" the item reported for struct fields.
+    #[test]
+    fn a_rename_never_emits_the_same_span_twice() {
+        let (dir, document) = matrix();
+        for offset in [
+            at("struct Point", 7),
+            at("enum Shape", 5),
+            at("\tx: i32", 1),
+            at("Point { x = 1", 1),
+        ] {
+            let spans = document.rename_edits(offset, "renamed").expect("a rename");
+            let mut seen = std::collections::HashSet::new();
+            for (source, span) in &spans {
+                assert!(
+                    seen.insert((source.0, *span)),
+                    "{span:?} is emitted twice by the rename at {offset}",
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Rename: the refusals -------------------------------------------
+
+    #[test]
+    fn a_rename_refuses_a_name_that_is_not_an_identifier() {
+        let (dir, document) = matrix();
+        let offset = at("let total", 4);
+        for bad in ["", "2nd", "has space", "has-hyphen", "fun", "struct"] {
+            let refusal = document
+                .rename_edits(offset, bad)
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(refusal, RenameRefusal::InvalidName(bad.to_string()));
+        }
+        // And the valid spellings are not refused.
+        for good in ["total2", "_total", "totalCount", "TOTAL"] {
+            assert!(document.rename_edits(offset, good).is_ok(), "{good:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_identifier_check_matches_the_lexer_keywords() {
+        assert!(is_identifier("value"));
+        assert!(is_identifier("_"));
+        assert!(!is_identifier(""));
+        assert!(!is_identifier("1a"));
+        // Every keyword the lexer knows is refused as a new name, so the check
+        // cannot drift from the language.
+        for (keyword, _) in vilan_core::lexing::KEYWORDS {
+            assert!(
+                !is_identifier(keyword),
+                "{keyword} must not be renameable-to"
+            );
+        }
+    }
+
+    // A rename reached through an import must not rewrite the library it reached
+    // into. The old handler would hand the client edits for files under
+    // `$VILAN_STD` without a word.
+    #[test]
+    fn a_rename_refuses_to_edit_the_standard_library() {
+        let source = "import std::print;\n\nfun main() {\n\tprint(\"hello\");\n}\n";
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a clean program: {:?}",
+            document.diagnostics,
+        );
+        let offset = source.find("print(").expect("the call") + 1;
+        let refusal = document
+            .rename_edits(offset, "renamed")
+            .expect_err("renaming a std function must be refused");
+        assert!(
+            matches!(
+                refusal,
+                RenameRefusal::NotOwned {
+                    origin: "the standard library",
+                    ..
+                }
+            ),
+            "expected a not-owned refusal, got {refusal:?}",
+        );
+        assert!(
+            refusal.message().contains("does not own"),
+            "the refusal must say why: {}",
+            refusal.message(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_off_any_identifier_reports_nothing_to_rename() {
+        let (dir, document) = matrix();
+        assert_eq!(
+            document.rename_edits(at("value + 1", 6), "renamed"),
+            Err(RenameRefusal::NotAnIdentifier),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
