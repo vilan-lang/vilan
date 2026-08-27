@@ -25194,6 +25194,78 @@ fn a_read_path_escaping_the_package_root_is_refused() {
     );
 }
 
+// --- E94: `asset::emit`'s kind is an output-path segment, and must be one ---
+//
+// The read fence above is lexical and TOTAL: `asset::read` refuses an absolute
+// path, and refuses any component that is not `Normal`/`CurDir`, before any
+// filesystem look. `asset::emit`'s kind gets none of that, and it is the same
+// kind of thing — the kind becomes a filename beside the build output
+// (`write_assets`: `output_js.with_extension(kind)`), so a kind carrying `..`
+// or a separator directs a write out of `dist/` entirely. One rule covers both
+// shapes, because both are the same mistake: a kind names ONE file, so it must
+// be a single path segment. Backlog E94.
+
+/// The wording the fix should use, mirroring the read fence's shape ("`…` paths
+/// resolve inside the package root; `…` escapes it") for the write direction.
+const EMIT_KIND_REFUSAL: &str = "`asset::emit` kinds name one file beside the build output";
+
+#[test]
+#[ignore = "E94: `asset::emit`'s kind is not sanitized, so `../evil` becomes an output-path segment that escapes dist/"]
+fn an_emit_kind_escaping_the_output_directory_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("../evil", "x");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+        EMIT_KIND_REFUSAL,
+    );
+}
+
+#[test]
+#[ignore = "E94: `asset::emit`'s kind is not sanitized, so a bare separator like `a/b` becomes a nested output path"]
+fn an_emit_kind_carrying_a_separator_is_refused() {
+    // Not an escape, but the same mistake: `a/b` is two segments, so it names a
+    // file in a directory the build never made. Refused by the same rule.
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("a/b", "x");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+        EMIT_KIND_REFUSAL,
+    );
+}
+
+#[test]
+fn a_legitimate_emit_kind_is_untouched() {
+    // The green negative: the fence must refuse the two shapes above and
+    // NOTHING else — an ordinary kind is what every real `emit` passes, and a
+    // rule that refused it would be worse than the hole it closes.
+    assert_compiles(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("css", ".a{color:red}");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+    );
+}
+
 #[test]
 fn a_runtime_read_is_rejected() {
     // The const-only bit, same machinery as `emit`'s (const-eval.md §2).

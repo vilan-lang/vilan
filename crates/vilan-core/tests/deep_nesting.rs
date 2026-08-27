@@ -94,6 +94,55 @@ fn a_5000_deep_expression_is_refused_cleanly() {
     );
 }
 
+/// The PARSER has no depth bound (backlog B142), and it is the pipeline's
+/// deepest stack consumer: `VILAN_DEPTH_STATS`'s `parse` family measures
+/// `Parser::parse_atom` at ~71.8 KiB per level of source nesting unoptimized
+/// (~20.3 KiB optimized) — twice the bounded phase-1 walk's frame unoptimized,
+/// four times it optimized — with no limit at all.
+///
+/// It also runs FIRST, so it reaches the stack cliff before either analyzer
+/// bound can refuse: `a_5000_deep_expression_is_refused_cleanly` above only
+/// works because a METHOD CHAIN is flat to the parser and deep only to the
+/// walk. Nest the source syntactically instead — 5000 parentheses re-enter
+/// `parse_atom` once per level — and the file dies with no diagnostic at all,
+/// which is the one outcome the depth work exists to prevent.
+///
+/// This asserts the behaviour B142 WILL have: the same three claims the walk's
+/// bound already satisfies, on the same 64 MiB worker (which must NOT grow —
+/// see the module comment).
+#[test]
+#[ignore = "B142: the parser has no depth bound, so nested parentheses overflow the stack before any analyzer bound can refuse"]
+fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
+    let source = format!(
+        "fun main() {{\n\tlet x = {}1{};\n}}\n",
+        "(".repeat(5000),
+        ")".repeat(5000)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_64_mib(source);
+    assert!(
+        produced,
+        "a too-deeply-nested expression must still produce a program (the \
+         refusal is a diagnostic, not an abort)"
+    );
+    let refusals: Vec<&String> = messages
+        .iter()
+        .filter(|msg| msg.contains("nests more than 500 levels deep"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the parser's bound must refuse ONCE per parse with a steering \
+         diagnostic, got: {messages:#?}"
+    );
+    assert!(
+        refusals[0].contains("lift inner expressions into `let` bindings"),
+        "the refusal must steer toward the flattening fix, got: {}",
+        refusals[0]
+    );
+}
+
 #[test]
 fn realistic_nesting_is_nowhere_near_the_bound() {
     // Twenty levels is the deepest any realistic fixture measures (both
