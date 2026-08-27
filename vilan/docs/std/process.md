@@ -68,6 +68,7 @@ impl Request {
 	fun method(self): str
 	fun body(self): str      // the body as text
 	fun bytes(self): Bytes   // the same body raw (binary POSTs)
+	fun header(self, name: str): Option<str>   // a request header, case-insensitive
 }
 impl Response {
 	fun builder(): ResponseBuilder
@@ -86,6 +87,43 @@ impl ResponseStream {
 	fun on_close(self, handler: || void)   // the client went away
 }
 ```
+
+`Request::header` reads one header off the request, which is what a
+conditional request needs — the validator arrives as `If-None-Match`, and
+the response side (`code(304)` + `set_header`) could already express the
+answer:
+
+```vilan,norun
+import std::http::{ Response, Server };
+import std::option::Option::{ None, Some, self };
+
+fun main() {
+	Server::builder()
+		.on_request(|request| {
+			let tag = "\"v1\"";
+			match request.header("If-None-Match") {
+				Some(let seen) => if seen == tag {
+					ret Response::builder().code(304).build();
+				},
+				None => {}
+			}
+			Response::builder().set_header("ETag", tag).body("hello").build()
+		})
+		.build()
+		.start();
+}
+```
+
+Header names are **case-insensitive**: node lowercases every name it parses
+off the wire, and `header` lowers `name` to match, so the casing you write
+and the casing the client sent are both irrelevant. `None` means the request
+did not carry the header, which stays distinct from `Some("")` for one sent
+empty. A header the client **repeated** reads back joined with `", "` — the
+list form ordinary headers already define — so nothing is silently dropped,
+but nothing is split for you either; `set-cookie` is node's one unjoined
+header and arrives comma-joined without the space, which a cookie value's
+own commas make unsafe to split, so repeated `set-cookie` is not readable
+through this accessor.
 
 `ServerBuilder::port(0)` asks the OS for a free port instead of guessing
 one, and the `Server` handed to `on_start` carries the port it actually

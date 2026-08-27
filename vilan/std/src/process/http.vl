@@ -8,7 +8,7 @@
 
 import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
-import pkg::json::JsonValue;
+import pkg::json::{ JsonValue, coerce_str };
 import pkg::option::Option::{ None, Some, self };
 import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
 
@@ -154,6 +154,40 @@ impl Request {
 	/// codec's POST).
 	fun bytes(self): Bytes {
 		self.content
+	}
+
+	/// The value of a named request header, or `None` when the request did
+	/// not carry it.
+	///
+	/// Header names are case-insensitive, and node lowercases every name it
+	/// parses off the wire, so `name` is lowered to match: `header("If-None-Match")`
+	/// and `header("if-none-match")` ask the same question, whatever casing the
+	/// client actually sent. `None` means ABSENT, distinctly from `Some("")`
+	/// for a header sent with an empty value — the distinction a conditional
+	/// request needs.
+	///
+	/// A header the client REPEATED reads back as node presents it: joined
+	/// with `", "`, which is the list form ordinary headers already define,
+	/// so `X-Dup: one` then `X-Dup: two` reads `Some("one, two")`. This
+	/// accessor never silently drops a repeat — but it does not split them
+	/// either. The one header node does not join is `set-cookie`, which it
+	/// keeps as an array and which therefore arrives here comma-joined
+	/// WITHOUT the space; a cookie value may itself contain a comma, so that
+	/// string is not safely splittable. Reading repeated `set-cookie` values
+	/// wants a list-returning accessor, which this deliberately is not
+	/// (`set-cookie` is a response header, so on a request it is degenerate).
+	///
+	/// Presence is `has_field` (`Object.hasOwn`) rather than a null test: an
+	/// absent header is a MISSING property, which `is_null`'s strict
+	/// `=== null` does not catch — and hasOwn also keeps an inherited name
+	/// (`header("constructor")`) from reading back as a header.
+	fun header(self, name: str): Option<str> {
+		let lowered = name.to_lowercase_ascii();
+		let headers = self.node.headers();
+		if !headers.has_field(lowered) {
+			ret None;
+		}
+		Some(coerce_str(headers.field(lowered)))
 	}
 }
 
