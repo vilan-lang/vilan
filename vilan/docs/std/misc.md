@@ -181,10 +181,11 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 ```vilan,fragment
 fun emit(kind: str, line: str)   // compile-time only: append to a build asset
 fun read(path: str): str         // compile-time only: read a project file
+fun bundle(path: str): str       // compile-time only: carry a file into the build
 ```
 
-Both callable only from `const` evaluation — a runtime call path to
-either is a compile error. `emit` is how `std::style` writes the CSS
+All three callable only from `const` evaluation — a runtime call path
+to any of them is a compile error. `emit` is how `std::style` writes the CSS
 file (`emit("css", rule)`). Reach for it directly only for a shape std
 has no spelling for: a whole declaration block under a selector you
 choose is `std::style::declare`, which builds the line — and the layer
@@ -204,3 +205,35 @@ and an unchanged-source round still recompiles a leg whose read inputs
 changed. A missing file is a compile error at the `const` expression.
 Reads charge the const fuel budget per byte, so the budget bounds input
 size exactly as it bounds computation.
+
+`bundle` is the output direction for whole **files**, where `emit` is
+the output direction for lines. It tells the build to carry a
+non-code resource — an icon, a font, a webmanifest — into the output
+directory unchanged, and evaluates to the url the copy answers on:
+
+```vilan,fragment
+let icon = const asset::bundle("static/icon.svg");   // "/static/icon.svg"
+```
+
+**The path is the name.** It resolves against the package root exactly
+as `read`'s does, it is `/`-separated on every host, and the copy keeps
+it — so `static/icon.svg` becomes `dist/static/icon.svg`, served at
+`/static/icon.svg`. A subdirectory survives, two different files can
+never claim one output name, and nothing is renamed behind your back;
+where a resource lands in the build is decided by where you put the
+file. A backslash, an absolute path, one that escapes the root, or one
+that names no readable file is a compile error at the `const`
+expression. A name a leg's own build owns — `client.js`, `client.css`,
+`client.chunks.json`, a route chunk — fails the build rather than
+overwriting it.
+
+Bundled files are tracked build inputs like read ones, so `--watch`
+recopies an edited resource. They are **not** charged by size: their
+bytes never enter the program, so the fuel budget bounds build work
+rather than how large a resource may be.
+
+This is what lets a built app need nothing but `dist/`. A browser leg's
+build manifest lists what it bundled, so
+[`serve_build`](web.md#stdhttp) serves every one of them with no route
+of your own — reachability stays the compiler's, and a resource no
+`const` names is never copied and does not ship.

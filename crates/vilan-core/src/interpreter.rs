@@ -48,6 +48,10 @@ impl Default for Limits {
     }
 }
 
+/// What one `asset::bundle` call costs: a stat plus a whole-file read, priced
+/// as work rather than as bytes (the `__bundle_asset` arm says why).
+const BUNDLE_FUEL: u64 = 4_096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// The fuel budget ran out — the macro-loop backstop.
@@ -215,13 +219,19 @@ impl ConstValue {
     }
 }
 
-/// The compile-time file channel's input direction (docs-port.md §3.3):
-/// `asset::read`'s host. The interpreter knows nothing about paths or
-/// filesystems — the caller (the const pass) supplies resolution, the actual
-/// read, and the build-input recording behind this one method; `Err` is the
-/// complete, user-facing reason a read did not happen.
+/// The compile-time file channel's project half: `asset::read`'s host
+/// (docs-port.md §3.3) and `asset::bundle`'s (kolt.local 029). The interpreter
+/// knows nothing about paths or filesystems — the caller (the const pass)
+/// supplies resolution, the actual read, and the build-input recording behind
+/// these methods; `Err` is the complete, user-facing reason it did not happen.
 pub trait AssetReader {
     fn read(&self, path: &str) -> Result<String, String>;
+
+    /// Registers `path` as a file the build must CARRY, and returns the url the
+    /// bundled copy answers on. The bytes never enter the program — a font and
+    /// a favicon ride this the same way a `.txt` does — so the reader reads
+    /// them only to hash them as a build input.
+    fn bundle(&self, path: &str) -> Result<String, String>;
 }
 
 /// Everything one const evaluation produced. The result is what the caller
@@ -1472,6 +1482,36 @@ impl<'a> Interpreter<'a> {
                         self.charge_amount(text.len() as u64)?;
                         Ok(Value::Str(text.into()))
                     }
+                    Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
+                }
+            }
+            // `asset::bundle` — the channel's OUTPUT direction for whole
+            // FILES (kolt.local 029), as against `emit`'s output direction for
+            // lines. Const-only exactly like its two siblings, and behind the
+            // same `AssetReader`: registering the file, hashing it as a build
+            // input, and minting its url all live in the caller. No fuel is
+            // charged for the file's SIZE — unlike `read`, whose bytes become a
+            // `str` the const program then computes over, these bytes never
+            // enter the program at all, so a size charge would bound how large
+            // an asset may be rather than how much work a build does. The
+            // charge below charges a flat per-call cost for the I/O instead:
+            // ~3,900 distinct files fit the explicit budget, which bounds a
+            // const function looping over paths without capping any one file.
+            "__bundle_asset" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::bundle` outside a `const` expression",
+                    ));
+                }
+                let path = expect_str(&take(0))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(
+                        "the project's files (`asset::bundle`)",
+                    ));
+                };
+                self.charge_amount(BUNDLE_FUEL)?;
+                match reader.bundle(&path) {
+                    Ok(url) => Ok(Value::Str(url.into())),
                     Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
                 }
             }

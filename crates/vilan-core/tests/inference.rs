@@ -67289,3 +67289,392 @@ fn path_strip_prefix_cuts_only_where_starts_with_agrees() {
         "css/app.css\nnone\n.\n.\na/b\nb/c\nnone\nnone\nc\n",
     );
 }
+
+// --- kolt.local 029: the const output channel for FILES — `asset::bundle` ------
+// `emit`'s sibling on the other axis. `emit` accumulates LINES into one
+// generated file; `bundle` carries an EXISTING file through unchanged, so a
+// built app needs nothing but `dist/`. Same const-only bit, same package-root
+// resolution, same build-input record — the three properties `asset::read`
+// already had, now pointing the other way.
+
+/// A clean analysis with an explicit package root, returning the folded const
+/// values, the recorded build inputs, and the files registered for bundling.
+fn const_bundles(
+    source: &str,
+    root: &Path,
+) -> (
+    Vec<vilan_core::interpreter::ConstValue>,
+    Vec<(PathBuf, Option<u64>)>,
+    Vec<(PathBuf, String)>,
+) {
+    let source = source.to_string();
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            let program = program.expect("a clean analysis leaves a program");
+            (
+                program.const_results.values().cloned().collect::<Vec<_>>(),
+                program.const_input_files.clone(),
+                program.const_bundled_files.clone(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// The book's own tree, used as a package root: the pins below bundle files
+/// that really exist rather than staging a fixture for each one.
+fn bundle_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan")
+}
+
+#[test]
+fn a_const_bundle_registers_the_file_and_folds_to_its_url() {
+    let (values, inputs, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("docs/SUMMARY.md");
+        }
+        main();
+        "#,
+        &bundle_root(),
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/docs/SUMMARY.md".to_string()
+        )],
+        "the call folds to the url its bundled copy answers on"
+    );
+    assert_eq!(bundled.len(), 1, "one registered file: {bundled:?}");
+    assert_eq!(
+        bundled[0].1, "docs/SUMMARY.md",
+        "the path IS the name — the subdirectory survives: {bundled:?}"
+    );
+    assert!(
+        bundled[0].0.ends_with("docs/SUMMARY.md"),
+        "resolved against the package root: {bundled:?}"
+    );
+    assert_eq!(inputs.len(), 1, "one tracked input: {inputs:?}");
+    assert!(
+        inputs[0].1.is_some(),
+        "a bundled file is a HASHED build input, exactly as a read one is — \
+         that record is what makes an edited resource drive a watch round: \
+         {inputs:?}"
+    );
+}
+
+#[test]
+fn a_file_bundled_twice_is_registered_once() {
+    // Two call sites, one file: the copy is idempotent, so the registry must
+    // not name it twice (a duplicate would put it in the manifest twice and
+    // make `serve_build` install two identical routes).
+    let (_, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _one = const asset::bundle("docs/SUMMARY.md");
+            let _two = const asset::bundle("./docs/SUMMARY.md");
+        }
+        main();
+        "#,
+        &bundle_root(),
+    );
+    assert_eq!(
+        bundled.len(),
+        1,
+        "one file, one registration — and `./` normalizes to the same name: {bundled:?}"
+    );
+    assert_eq!(bundled[0].1, "docs/SUMMARY.md");
+}
+
+#[test]
+fn a_missing_bundle_is_a_clean_diagnostic_at_the_call_site() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("vilan-029-definitely-missing.png");
+        }
+        main();
+        "#,
+        r#"asset::bundle("vilan-029-definitely-missing.png")"#,
+        "cannot bundle `vilan-029-definitely-missing.png`",
+    );
+}
+
+#[test]
+fn a_missing_bundle_is_still_a_tracked_build_input() {
+    // A file that was not there is still a dependency: its APPEARANCE must
+    // invalidate the compile that failed on it, exactly as a change to a
+    // present one does. The analysis fails, so the record is read off the
+    // program the failing analysis left rather than through `const_bundles`.
+    let root = bundle_root();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("vilan-029-definitely-missing.png");
+        }
+        main();
+        "#
+    .to_string();
+    let inputs = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, _errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            program
+                .map(|program| program.const_input_files.clone())
+                .unwrap_or_default()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(
+        inputs.iter().any(
+            |(path, hash)| path.ends_with("vilan-029-definitely-missing.png") && hash.is_none()
+        ),
+        "the miss must be recorded, unhashed: {inputs:?}"
+    );
+}
+
+#[test]
+fn an_absolute_bundle_path_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("/etc/hostname");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths are relative to the package root; `/etc/hostname` is absolute",
+    );
+}
+
+#[test]
+fn a_bundle_path_escaping_the_package_root_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("../outside.png");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths resolve inside the package root; `../outside.png` escapes it",
+    );
+}
+
+#[test]
+fn a_backslash_in_a_bundle_path_is_refused() {
+    // POSIX-only, for the reason `std::path` is (kolt.local 017): the name is
+    // derived OUTPUT — a url, a manifest row, a golden — and a separator-aware
+    // rule would make every one of them host-dependent. `\` is refused rather
+    // than translated, so a path that means two things on two hosts means
+    // nothing on either.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("static\\logo.png");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths are `/`-separated on every host",
+    );
+}
+
+#[test]
+fn a_bundle_path_naming_no_file_is_refused() {
+    // `"."` and `""` resolve to the package root itself, which is a directory
+    // and not a resource. Refused by name rather than by the read failing, so
+    // the message says what is wrong instead of reporting an OS error.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle(".");
+        }
+        main();
+        "#,
+        "`asset::bundle` needs a file inside the package root; `.` names none",
+    );
+}
+
+#[test]
+fn a_runtime_bundle_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = asset::bundle("logo.png");
+        }
+        main();
+        "#,
+        r#"asset::bundle("logo.png")"#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_runtime_call_reaching_bundle_is_rejected_at_the_boundary() {
+    // The R-fixpoint names WHICH builtin the path reaches — a bundle-reaching
+    // function says `asset::bundle`, not `asset::emit`.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun icon(): str {
+            asset::bundle("logo.png")
+        }
+        fun main() {
+            let _url = icon();
+        }
+        main();
+        "#,
+        "`icon` (it reaches `asset::bundle`) is compile-time-only",
+    );
+}
+
+#[test]
+fn a_function_reaching_bundle_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun icon(): str {
+            asset::bundle("logo.png")
+        }
+        fun apply(f: || str): str {
+            f()
+        }
+        fun main() {
+            let _url = apply(icon);
+        }
+        main();
+        "#,
+        "no runtime value form",
+    );
+}
+
+#[test]
+fn a_changed_bundled_file_is_seen_by_the_next_analysis() {
+    // The invalidation pin, `asset::read`'s sibling: analyze, EDIT THE FILE,
+    // analyze again in the same process — the second analysis must record the
+    // new hash. If any cache ever keys const results without the bundled
+    // inputs, a `--watch` round stops recopying an edited resource and the dev
+    // loop serves last round's bytes forever.
+    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("static")).unwrap();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("static/note.txt");
+        }
+        main();
+        "#;
+    std::fs::write(dir.join("static/note.txt"), "one").unwrap();
+    let (values, first, bundled) = const_bundles(source, &dir);
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/static/note.txt".to_string()
+        )]
+    );
+    assert_eq!(bundled.len(), 1);
+    std::fs::write(dir.join("static/note.txt"), "two").unwrap();
+    let (_, second, _) = const_bundles(source, &dir);
+    assert_ne!(
+        first[0].1, second[0].1,
+        "the edited resource must re-hash to a different input record — a \
+         stale hash is a resource that stops being recopied: {first:?} {second:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bundled_file_is_not_charged_by_its_size() {
+    // Deliberately unlike `asset::read`, whose bytes become a `str` the const
+    // program then computes over: a bundled file's bytes never enter the
+    // program, so charging fuel by size would bound how large an asset may be
+    // rather than how much work a build does. A file comfortably past the
+    // explicit fuel budget in bytes bundles fine.
+    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-fuel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("huge.bin"), "a".repeat(17_000_000)).unwrap();
+    let (values, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("huge.bin");
+        }
+        main();
+        "#,
+        &dir,
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/huge.bin".to_string()
+        )],
+        "a 17 MB resource is a build output, not a compile-time computation"
+    );
+    assert_eq!(bundled.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_builds_content_type_reads_the_extension_through_path_extname() {
+    // `content_type_of` used to be `file.split(".").last()` — a hand-rolled
+    // `extname` carrying `extname`'s classic bug: a DOTFILE's leading dot read
+    // as a type. `dist/.css` is a hidden file with no extension, and typing it
+    // `text/css` would serve a file the table has no row for. It now goes
+    // through `path::extname` (kolt.local 017), which answers `""` there.
+    //
+    // The subdirectory cases below are newly reachable: a bundled resource
+    // keeps its package-relative path (kolt.local 029), so `content_type_of`
+    // now sees paths with directories in them for the first time.
+    assert_compiles_and_runs(
+        r#"
+        import std::build::content_type_of;
+        import std::io::print;
+        import std::option::Option::{ None, Some };
+        fun name(file: str): str {
+            match content_type_of(file) {
+                Some(let content_type) => content_type
+                None => "none"
+            }
+        }
+        fun main() {
+            print(name("dist/static/logo.png"));
+            print(name("dist/.css"));
+            print(name("dist/vendor.d/README"));
+            print(name("dist/FAVICON.ICO"));
+            print(name("dist/a.b/c.woff2"));
+        }
+        main();
+        "#,
+        "image/png\nnone\nnone\nimage/x-icon\nfont/woff2\n",
+    );
+}

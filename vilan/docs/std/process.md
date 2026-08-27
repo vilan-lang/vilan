@@ -146,18 +146,20 @@ fun main() {
 `serve_build` is the one call that replaces the boot reads and the
 content-type table a full-stack server used to write by hand. It takes a
 [`LegBuild`](#stdbuild) and installs one route per artifact at
-`/<file name>` — the bundle, the style sidecar if the leg emitted one, and
-every route chunk — in front of `on_request`, whatever order the chain was
-written in. So the app's catch-all still answers every path the build does
+`/<name>` — the bundle, the style sidecar if the leg emitted one, every
+route chunk, and every resource the leg bundled with
+[`const asset::bundle`](misc.md#stdasset) — in front of `on_request`,
+whatever order the chain was written in. So the app's catch-all still answers every path the build does
 not claim, and a leg that gains `split = true` gains its chunk routes with
 no server edit. It is the one way a server serves its build: an rpc app
 that wants it puts its service on the same chain with `with_service`
 ([below](#stdrpc_server)) rather than reaching for a `serve_*` boot
 function, which hands you only a fallback and no builder to install on.
 
-Three details are decisions, not defaults. The route shape is
-`/<file name>`, which is what every shell already asks for, so adopting it
-moves no HTML. Content types come from a table generated from
+Three details are decisions, not defaults. The route shape is `/<name>`,
+which is what every shell already asks for, so adopting it moves no HTML —
+and a bundled resource keeps its package-relative path, so a subdirectory
+survives into the url rather than being flattened onto the site root. Content types come from a table generated from
 [`mime-db`](https://github.com/jshttp/mime-db) — the registry aggregate
 vite's own mime lookup is generated from — covering what a build emits and
 what a page it serves loads as a whole sub-resource: scripts, styles and
@@ -423,6 +425,7 @@ struct LegBuild {
 	styles: Option<str>,    // `client.css`, or None if the leg compiled no styles
 	chunks: List<str>,      // route chunks, empty unless the leg splits
 	classic_script: bool,   // true exactly when it splits
+	assets: List<str>,      // resources `const asset::bundle` carried in
 }
 
 fun build_of(leg: str): Result<LegBuild, BuildError>   // async
@@ -439,6 +442,13 @@ serve, so it stops with the error's message instead of starting.
 `LegBuild::artifacts()` gives `(url, file)` pairs — `("/client.js",
 "dist/client.js")` — in serving order. `std::http`'s
 [`serve_build`](#stdhttp-the-server) is the consumer that makes them routes.
+
+`assets` is what makes a built app need nothing but `dist/`: every
+non-code resource the leg named with
+[`const asset::bundle`](misc.md#stdasset), by its package-relative path, so
+`static/icon.svg` is served at `/static/icon.svg` from
+`dist/static/icon.svg`. A build written before bundling existed carries no
+`assets` field and reads as a build with none, which is what it was.
 
 ## std::document
 

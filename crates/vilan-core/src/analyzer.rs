@@ -2775,6 +2775,7 @@ pub struct Analyzer<'src> {
     panic_fn_id: Option<Id>,
     asset_emit_fn_id: Option<Id>,
     asset_read_fn_id: Option<Id>,
+    asset_bundle_fn_id: Option<Id>,
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
@@ -3334,6 +3335,7 @@ impl<'src> Analyzer<'src> {
             panic_fn_id: None,
             asset_emit_fn_id: None,
             asset_read_fn_id: None,
+            asset_bundle_fn_id: None,
             const_exprs: Vec::new(),
             walk_depth: 0,
             walk_depth_refused: false,
@@ -33068,6 +33070,9 @@ pub struct Program<'src> {
     /// `std::asset::read` — the channel's input direction (docs-port.md §3.3):
     /// const-only exactly like `emit`.
     pub asset_read_fn_id: Option<Id>,
+    /// `std::asset::bundle` — the channel's output direction for whole FILES
+    /// (kolt.local 029): const-only exactly like its two siblings.
+    pub asset_bundle_fn_id: Option<Id>,
     /// `const`-marked expression ids in walk order (const-eval.md §1).
     pub const_exprs: Vec<Id>,
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
@@ -33083,6 +33088,11 @@ pub struct Program<'src> {
     /// mode and the per-leg reuse check consume them so a changed input is
     /// seen. Filled by `post_analysis_passes`.
     pub const_input_files: Vec<(PathBuf, Option<u64>)>,
+    /// Every file `asset::bundle` registered during const evaluation, as
+    /// (resolved source, the name it takes in the output directory) — the
+    /// build OUTPUTS a build must copy so `dist/` is self-sufficient
+    /// (kolt.local 029). Filled by `post_analysis_passes`.
+    pub const_bundled_files: Vec<(PathBuf, String)>,
     /// The package root the entry resolved under — the base `asset::read`
     /// paths resolve against (never the process working directory), the same
     /// base module imports resolve under.
@@ -37202,9 +37212,10 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
     }
-    // Remember `asset::emit` and `asset::read` — the const-only compile-time
-    // channel, output and input direction (const-eval.md §2-3, docs-port.md
-    // §3.3); the const pass enforces that no runtime call path reaches either.
+    // Remember `asset::emit`, `asset::read` and `asset::bundle` — the
+    // const-only compile-time channel: lines out, text in, and whole files out
+    // (const-eval.md §2-3, docs-port.md §3.3, kolt.local 029); the const pass
+    // enforces that no runtime call path reaches any of them.
     if let Some(asset_scope_id) = module_scopes.get("asset") {
         analyzer.asset_emit_fn_id = analyzer
             .scopes
@@ -37214,6 +37225,10 @@ fn analyze_inner<'src>(
             .scopes
             .get(asset_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("read").copied());
+        analyzer.asset_bundle_fn_id = analyzer
+            .scopes
+            .get(asset_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("bundle").copied());
     }
     // Remember the std `Option`/`Result` enums and the `Try` trait: `expr!`
     // dispatches the std pair by identity and user types through `Try`
@@ -38299,10 +38314,12 @@ fn analyze_over_world<'src>(
         drop_fn_id: analyzer.drop_fn_id,
         asset_emit_fn_id: analyzer.asset_emit_fn_id,
         asset_read_fn_id: analyzer.asset_read_fn_id,
+        asset_bundle_fn_id: analyzer.asset_bundle_fn_id,
         const_exprs: analyzer.const_exprs.clone(),
         const_results: HashMap::default(),
         const_assets: Vec::new(),
         const_input_files: Vec::new(),
+        const_bundled_files: Vec::new(),
         pkg_root: pkg_root.to_path_buf(),
         context_new_fn_id,
         context_run_fn_id,

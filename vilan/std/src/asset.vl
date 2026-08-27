@@ -18,3 +18,32 @@ external fun emit(kind: str, line: str): void;
 
 [extern("__read_asset")]
 external fun read(path: str): str;
+
+// Compile-time build outputs, whole FILES (kolt.local 029 — `emit`'s sibling
+// on the other axis: `emit` accumulates LINES into one generated file, this
+// carries an existing file through unchanged). `bundle(path)` tells the build
+// to copy the file into the output directory beside the compiled JS, and
+// returns the url its copy answers on: `bundle("static/logo.png")` writes
+// `dist/static/logo.png` and evaluates to `"/static/logo.png"`.
+//
+// The path is the name. It is relative and resolves against the package root
+// (the same base imports and `read` resolve under), it is `/`-separated on
+// every host, and the copy keeps it — so a subdirectory survives, two
+// different files can never claim one output name, and nothing is renamed
+// behind your back. Where a resource lands in `dist/` is therefore decided by
+// where you put the file. A path that is absolute, escapes the root, or names
+// no readable file is a compile error at the `const` expression.
+//
+// The file becomes a tracked build input exactly as `read`'s does: change it
+// and the compile that named it is invalidated, so `run --watch` recopies it.
+// Reachability stays the compiler's — a file no `const` names is not copied,
+// so it does not ship.
+//
+// A browser leg's build manifest lists what it bundled, which is what makes
+// `serve_build` serve these with no route of your own
+// (`std::http::ServerBuilder::serve_build`).
+//
+// Compile-time-only, exactly like `emit` and `read`.
+
+[extern("__bundle_asset")]
+external fun bundle(path: str): str;

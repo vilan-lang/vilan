@@ -7,5 +7,6 @@
 		{ "arm": "Route::Home", "tag": 0, "file": "app.Route_Home.js" },
 		{ "arm": "Route::Docs(..)", "tag": 1, "file": "app.Route_Docs.js" },
 		{ "arm": "Route::NotFound", "tag": 2, "file": "app.Route_NotFound.js" }
-	]
+	],
+	"assets": []
 }
