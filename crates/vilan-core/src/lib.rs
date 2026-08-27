@@ -453,6 +453,17 @@ fn analyze_source_unfenced(
     // with every diagnostic (lexer and parser, span-ordered). Analysis below runs
     // on the salvaged tree, so a mid-edit source still yields a partial program
     // rather than nothing (frontend.md §3 S4/S5 — the LSP-facing improvement).
+    // The depth instrument (B138) anchors per top-level analysis; a macro world
+    // is a nested analysis on the same thread whose depths belong to the outer
+    // run, so it must not re-anchor. It anchors HERE rather than inside
+    // `analyze` so the parser's own recursion — which runs first and is not
+    // depth-bounded (B139) — is inside the measured window: the pipeline's
+    // stack need is the deepest point ANY phase reaches, and leaving the first
+    // phase out of the instrument is what let a nesting depth the analyzer
+    // handles comfortably overflow the stack before analysis began.
+    if !macros::in_macro_world() {
+        depth_stats::begin();
+    }
     let (tree, parse_errors) = parsing::parse(source);
     let mut diagnostics: Vec<Error> = parse_errors
         .iter()
@@ -749,6 +760,23 @@ pub fn post_analysis_passes(
     // in-analyze phase line guards).
     if !macros::in_macro_world() {
         depth_stats::report();
+    }
+}
+
+/// Anchor the `VILAN_DEPTH_STATS` instrument for an analysis a front end is
+/// about to drive itself.
+///
+/// [`analyze_source`] anchors around its own parse and needs no help. The CLI
+/// parses the entry file itself and hands the tree to `analyze`, so without
+/// this its parse — the pipeline's FIRST recursion, and the one that is not
+/// depth-bounded (B139) — would fall outside the measured window and the depth
+/// line would report the parser as three levels deep whatever the file nests.
+/// Anchoring is idempotent within an analysis and released by the report at the
+/// end of `post_analysis_passes`, so calling this before a parse that `analyze`
+/// will later be handed is correct, and calling it redundantly is harmless.
+pub fn begin_depth_stats() {
+    if !macros::in_macro_world() {
+        depth_stats::begin();
     }
 }
 

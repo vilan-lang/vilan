@@ -2721,6 +2721,10 @@ pub struct Analyzer<'src> {
     // analysis, not one per refused sibling subtree.
     walk_depth: usize,
     walk_depth_refused: bool,
+    // Whether the return-inference depth bound already refused once this
+    // analysis (B139) — one diagnostic, not one per link of the chain and not
+    // one per constraint-resolution pass over it.
+    return_depth_refused: bool,
     // `!`'s std fast-path identities and the `Try` trait, resolved by name from
     // their std modules after loading (like `panic_fn_id`).
     option_enum_id: Option<Id>,
@@ -3153,6 +3157,7 @@ impl<'src> Analyzer<'src> {
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
+            return_depth_refused: false,
             inferred_return_types: HashMap::default(),
             closure_held_targets: HashMap::default(),
             warnings: Vec::new(),
@@ -23634,12 +23639,62 @@ impl<'src> Analyzer<'src> {
     /// one is then inexact (built on an unfinished neighbour) and is not
     /// recorded; that function's own `FunctionReturns` constraint computes it
     /// top-level and records then.
+    /// The return-inference chain's depth bound (B139), the companion to
+    /// [`Self::WALK_DEPTH_LIMIT`]. A link costs ~12.8 KiB unoptimized, ~2 KiB
+    /// optimized, so 500 links caps this family near 6.4 MiB — the same order
+    /// as the walk's own bounded worst case, and 25x deeper than any realistic
+    /// chain of functions that all decline to declare a return type (every
+    /// fixture in the corpus peaks in single digits). Chains this long are
+    /// generated code; the diagnostic names the fix.
+    const RETURN_DEPTH_LIMIT: usize = 500;
+
     fn infer_function_returns(
         &mut self,
         function_id: Id,
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnInference {
+        // The chain's depth bound (B139). Return inference recurses once per
+        // CALL LINK — reading `f`'s return reads `g`'s, whose tail calls `h`,
+        // and so on — carrying an inference frame measured at ~12.8 KiB per
+        // link unoptimized, so a long chain of unannotated returns is an
+        // unbounded stack cost that `return_inference_stack` did not bound: it
+        // guards CYCLES, not depth. A 500-link chain cost 6.26 MiB before this.
+        //
+        // Past the bound the answer is `never`, exactly as a re-entrant ask is
+        // answered and for the same reason — it constrains nothing — and every
+        // frame beneath the truncation is marked inexact so no partial answer
+        // is RECORDED as if it were whole. The steer is the real fix: a
+        // declared return type ends the chain, because a declared return is
+        // read straight off the signature and never inferred.
+        if self.return_inference_stack.len() >= Self::RETURN_DEPTH_LIMIT {
+            for (_, exact) in self.return_inference_stack.iter_mut() {
+                *exact = false;
+            }
+            if !self.return_depth_refused {
+                self.return_depth_refused = true;
+                let span = self
+                    .functions
+                    .get(&function_id)
+                    .map(|function| function.name_span)
+                    .unwrap_or(EMPTY_SPAN);
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "inferring this function's return type needs a chain of more than {} \
+                         calls, which analysis refuses; declare a return type on one \
+                         of them to end the chain",
+                        Self::RETURN_DEPTH_LIMIT
+                    ),
+                });
+            }
+            return ReturnInference {
+                type_: Type::Never,
+                disagreements: Vec::new(),
+            };
+        }
         if let Some(position) = self
             .return_inference_stack
             .iter()
@@ -23650,6 +23705,28 @@ impl<'src> Analyzer<'src> {
             }
             return ReturnInference {
                 type_: Type::Never,
+                disagreements: Vec::new(),
+            };
+        }
+        // The recorded answer, when there is one, IS this computation's result:
+        // it is only written for an EXACT inference (§ below) of a resolved
+        // type, so recomputing it walks the same evidence to the same place.
+        // Without this the walk is quadratic in a call chain's length — every
+        // link's own `FunctionReturns` constraint re-derives every link beneath
+        // it, which measured 379k inference entries for a 500-function chain
+        // against 15.8k for a 100-function one (B139).
+        //
+        // Only with an EMPTY substitution: the record is keyed by function
+        // alone, so an answer shaped by a caller's generic bindings is that
+        // caller's, not the function's, and must not be served to the next one.
+        // Disagreements are deliberately not recorded and not replayed — they
+        // are diagnostics belonging to the pass that first derived them, and
+        // the recorded answer is by construction one nothing disagreed with.
+        if substitution_context.is_empty()
+            && let Some(type_id) = self.inferred_return_types.get(&function_id).copied()
+        {
+            return ReturnInference {
+                type_: self.get_type_by_type_id(type_id),
                 disagreements: Vec::new(),
             };
         }
@@ -35985,11 +36062,14 @@ fn analyze_inner<'src>(
     // `VILAN_PHASE_TIMING` asks. The marks are unconditional — three
     // `Instant::now()` calls are noise next to an analysis.
     let phase_analyze_start = crate::PhaseClock::now();
-    // The depth instrument (B138) anchors per top-level analysis, like the
-    // marks above; a macro world is a nested analysis on the same thread whose
-    // depths belong to the outer run, so it must not re-anchor.
+    // The depth instrument (B138) anchors per top-level analysis, like the marks
+    // above. `begin` is idempotent within an analysis so the CLI — which parses
+    // itself and calls `analyze` directly — anchors here, while `analyze_source`
+    // has already anchored around its own parse (B139: the parser recurses
+    // first and is not depth-bounded). A macro world is a nested analysis on the
+    // same thread whose depths belong to the outer run, so it must not anchor.
     if !crate::macros::in_macro_world() {
-        crate::depth_stats::reset();
+        crate::depth_stats::begin();
     }
     // The base cache (S3c): a WORLD — everything up to and including the
     // pre-entry `resolve_world` — is a pure function of the loaded files'

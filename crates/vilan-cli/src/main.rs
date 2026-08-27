@@ -183,15 +183,22 @@ fn main() -> ExitCode {
     // work on a worker with a generous stack, as rustc and other compilers do;
     // the reservation is virtual address space, so it costs nothing unless used.
     //
-    // The margin is measured now, not folklore (B138, `VILAN_DEPTH_STATS`): a
-    // realistic server program's analysis peaks under 1 MiB of stack even
-    // unoptimized, and the deepest recursion — the phase-1 expression walk at
-    // ~36 KiB per nesting level unoptimized — is depth-bounded at 500 levels
-    // (~18 MiB worst case, then a clean diagnostic). What keeps the number at
-    // 256 MiB is the paths a bound does not yet cap: cross-function
-    // return-inference chains cost ~12.5 KiB per call link unoptimized, so this
-    // reservation holds chains past 20,000 calls. Shrink it only when those
-    // paths are bounded too.
+    // The margin is measured now, not folklore (B138/B139,
+    // `VILAN_DEPTH_STATS`): a realistic server program's analysis peaks under
+    // 1 MiB of stack even unoptimized, and every family the ANALYZER recurses
+    // on is depth-bounded — the phase-1 expression walk at ~36 KiB per nesting
+    // level (500 levels, ~18 MiB worst case) and the cross-function
+    // return-inference chain at ~12.8 KiB per call link (500 links, ~6.4 MiB),
+    // each refusing with a diagnostic rather than overflowing.
+    //
+    // What keeps the number at 256 MiB is now ONE path, named precisely: the
+    // PARSER recurses once per level of source nesting at ~71.8 KiB per level
+    // unoptimized — twice the expression walk's frame, the deepest consumer in
+    // the pipeline — and has no depth limit at all. It also runs FIRST, so it
+    // reaches the cliff before either analyzer bound can refuse: this
+    // reservation covers roughly 3,600 levels of nesting unoptimized, and past
+    // that a file dies with no diagnostic. Shrink it only when the parser is
+    // bounded too.
     const COMPILER_STACK_SIZE: usize = 256 * 1024 * 1024;
     std::thread::Builder::new()
         .stack_size(COMPILER_STACK_SIZE)
@@ -2815,6 +2822,11 @@ fn compile_to_js(
     // already lift-rewritten and `'static`; the handwritten frontend runs only
     // when the cache misses (a non-clean file), recovering a tree and naming its
     // diagnostics in a single fast-and-rich pass.
+    // The depth instrument (B138) anchors before the FIRST recursion of the
+    // pipeline, which on this path is the entry's own parse — here, or in the
+    // clean-parse cache below — rather than anything inside `analyze` (B139
+    // added the parser to the instrument, and it is the family with no bound).
+    vilan_core::begin_depth_stats();
     let cached = vilan_core::parse_clean_cached(&src);
 
     // Analyzer and codegen diagnostics, collected as `(source, span, message)`
