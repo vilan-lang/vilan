@@ -25194,6 +25194,78 @@ fn a_read_path_escaping_the_package_root_is_refused() {
     );
 }
 
+// --- E94: `asset::emit`'s kind is an output-path segment, and must be one ---
+//
+// The read fence above is lexical and TOTAL: `asset::read` refuses an absolute
+// path, and refuses any component that is not `Normal`/`CurDir`, before any
+// filesystem look. `asset::emit`'s kind gets none of that, and it is the same
+// kind of thing — the kind becomes a filename beside the build output
+// (`write_assets`: `output_js.with_extension(kind)`), so a kind carrying `..`
+// or a separator directs a write out of `dist/` entirely. One rule covers both
+// shapes, because both are the same mistake: a kind names ONE file, so it must
+// be a single path segment. Backlog E94.
+
+/// The wording the fix should use, mirroring the read fence's shape ("`…` paths
+/// resolve inside the package root; `…` escapes it") for the write direction.
+const EMIT_KIND_REFUSAL: &str = "`asset::emit` kinds name one file beside the build output";
+
+#[test]
+#[ignore = "E94: `asset::emit`'s kind is not sanitized, so `../evil` becomes an output-path segment that escapes dist/"]
+fn an_emit_kind_escaping_the_output_directory_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("../evil", "x");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+        EMIT_KIND_REFUSAL,
+    );
+}
+
+#[test]
+#[ignore = "E94: `asset::emit`'s kind is not sanitized, so a bare separator like `a/b` becomes a nested output path"]
+fn an_emit_kind_carrying_a_separator_is_refused() {
+    // Not an escape, but the same mistake: `a/b` is two segments, so it names a
+    // file in a directory the build never made. Refused by the same rule.
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("a/b", "x");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+        EMIT_KIND_REFUSAL,
+    );
+}
+
+#[test]
+fn a_legitimate_emit_kind_is_untouched() {
+    // The green negative: the fence must refuse the two shapes above and
+    // NOTHING else — an ordinary kind is what every real `emit` passes, and a
+    // rule that refused it would be worse than the hole it closes.
+    assert_compiles(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("css", ".a{color:red}");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+    );
+}
+
 #[test]
 fn a_runtime_read_is_rejected() {
     // The const-only bit, same machinery as `emit`'s (const-eval.md §2).
@@ -66640,4 +66712,121 @@ fn stripping_a_whole_match_is_some_empty_not_none() {
         "#,
         "some:\nsome:\n",
     );
+}
+
+// --- B139: the recorded return answer is the FUNCTION's, never a caller's ----
+//
+// `infer_function_returns` serves `inferred_return_types` to skip re-deriving a
+// chain (B139's TIME half, pinned for cost in `tests/deep_nesting.rs`). That
+// record is keyed by FUNCTION ALONE, while an answer is recorded whenever the
+// inference that produced it was exact — including when it ran under a caller's
+// substitution. So the map genuinely does collect caller-shaped answers: over
+// this suite, 1 157 records are written under a non-empty substitution context,
+// and one generic enum's slot receives six different instantiations in a single
+// run. The `substitution_context.is_empty()` guard on the READ is the only
+// thing standing between those records and the next caller, and nothing named
+// it until this pin.
+
+/// The number of recorded return answers served to an ask carrying a caller's
+/// generic bindings while `source` compiles, read on the worker the compile runs
+/// on — the probe is thread-local, like the analyzer's other counters.
+fn records_served_under_substitution(source: &str) -> u64 {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let before = vilan_core::analyzer::return_records_served_under_substitution();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                program.is_some() && errors.is_empty(),
+                "the plant must analyze cleanly, got: {errors:#?}"
+            );
+            vilan_core::analyzer::return_records_served_under_substitution() - before
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// The shapes that put caller-shaped answers into the record in the first place,
+/// each instantiated at TWO types so a shared slot would be read across
+/// bindings: a generic impl method with an undeclared return, a static hung off
+/// a trait (the `b102`/`i5` shape whose records this suite was measured on), and
+/// a plain generic function.
+const CALLER_SHAPED_RETURN_PLANT: &str = r#"
+        import std::print;
+
+        trait Producer<T> {
+            fun produce(self): T;
+        }
+
+        struct Holder<T> {
+            item: T,
+        }
+
+        impl Holder<type T> with Producer<T> {
+            fun produce(self) {
+                self.item
+            }
+        }
+
+        impl Producer<type T> {
+            fun of(item: T): Holder<T> {
+                Holder { item }
+            }
+        }
+
+        fun echo<T>(value: T) {
+            value
+        }
+
+        fun main() {
+            let ints = Producer::of(1);
+            let strs = Producer::of("hi");
+            print(ints.produce());
+            print(strs.produce());
+            print(echo(2));
+            print(echo("bye"));
+        }
+        "#;
+
+/// A recorded answer is NEVER served to an ask that carries a caller's generic
+/// bindings — the correctness half of B139's memo.
+///
+/// Non-vacuous, and provably so: deleting `substitution_context.is_empty()` from
+/// the read in `infer_function_returns` turns this red immediately (925 serves
+/// across this suite, 4 of them answers that differ from the correct one).
+///
+/// This asserts the guard rather than a wrong-typed program on purpose. A
+/// behavioural pin was attempted first and does not exist today: with the guard
+/// deleted, all 2 596 inference tests, the docs gate, and the byte-identical
+/// corpus are unchanged, because a wrongly-served answer is re-substituted
+/// downstream before it can reach codegen. The hazard is real — the records are
+/// caller-shaped — but only this guard makes it unreachable, so this is what
+/// there is to pin.
+#[test]
+fn b139_a_recorded_return_is_never_served_under_a_callers_bindings() {
+    assert_eq!(
+        records_served_under_substitution(CALLER_SHAPED_RETURN_PLANT),
+        0,
+        "a recorded return answer was served to an ask carrying a caller's \
+         generic bindings — the record is keyed by function alone, so that \
+         answer belongs to a DIFFERENT caller (B139)"
+    );
+}
+
+/// The plant is not vacuous either: it really does compile and run, and really
+/// does instantiate each generic shape at two distinct types. A plant that
+/// stopped exercising the shape would make the pin above pass for free.
+#[test]
+fn b139_the_caller_shaped_return_plant_runs_at_both_instantiations() {
+    assert_compiles_and_runs(CALLER_SHAPED_RETURN_PLANT, "1\nhi\n2\nbye\n");
 }

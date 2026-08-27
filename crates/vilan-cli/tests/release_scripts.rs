@@ -792,3 +792,254 @@ fn both_scripts_are_committed_executable() {
         assert!(mode & 0o111 != 0, "scripts/{script} is not executable");
     }
 }
+
+// --- The installer's checksum step (backlog §L item 15, the "S half") ------
+//
+// `scripts/install.sh` downloads a release tarball, verifies it against the
+// release's `sha256sums.txt`, and only then unpacks it into the install
+// directory. Nothing else in the tree runs that script, and the branch that
+// decides whether verification happens AT ALL is chosen by what `command -v`
+// finds on PATH — so the two pins below give the script a PATH of their own
+// and vary exactly that one thing.
+//
+// Neither pin reaches the network, and both run the script's `main` end to
+// end (it is invoked unconditionally on the last line, so there is no honest
+// way to source the file and call `checksum` alone). Hermetic instead by
+// construction: the fixture's PATH is a directory holding symlinks to the
+// real tools the script looks up, a `curl` shim that writes the two
+// "downloads" from local data, and a `tar` shim that plants the two binaries
+// extraction would have produced. Nothing outside the fixture is read or
+// written, and the install directory is redirected with `$VILAN_INSTALL_DIR`.
+
+/// The tools `scripts/install.sh` resolves through PATH beyond the two the
+/// fixture shims. They are symlinked into the fixture's own `bin/` so the
+/// scrubbed PATH is still a working environment — which is what makes the
+/// ABSENCE of a sha256 tool from it deliberate rather than incidental.
+const INSTALLER_TOOLS: [&str; 6] = ["uname", "mktemp", "grep", "rm", "mkdir", "chmod"];
+
+/// The fixture's `curl`: no network. It writes whatever the installer asked
+/// for at the path the installer named — the tarball as a few bytes of
+/// stand-in text, and `sha256sums.txt` either with that stand-in's true
+/// digest or with a placeholder that cannot match it, per
+/// `$VILAN_FIXTURE_SUMS`.
+const CURL_SHIM: &str = r#"#!/bin/sh
+set -eu
+out=""
+url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+dir="${out%/*}"
+case "$url" in
+    *sha256sums.txt)
+        asset=""
+        for candidate in "$dir"/vilan-*.tar.gz; do asset="${candidate##*/}"; done
+        if [ "$VILAN_FIXTURE_SUMS" = real ]; then
+            if command -v sha256sum > /dev/null 2>&1; then
+                (cd "$dir" && sha256sum "$asset") > "$out"
+            else
+                (cd "$dir" && shasum -a 256 "$asset") > "$out"
+            fi
+        else
+            printf '%s  %s\n' \
+                0000000000000000000000000000000000000000000000000000000000000000 \
+                "$asset" > "$out"
+        fi
+        ;;
+    *) printf 'a stand-in for the release tarball\n' > "$out" ;;
+esac
+"#;
+
+/// The fixture's `tar`: unpacks nothing, plants the two executables the
+/// installer expects to find after extraction so `main` can run to its end.
+const TAR_SHIM: &str = r#"#!/bin/sh
+set -eu
+dest="."
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -C) dest="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '#!/bin/sh\necho vilan 9.9.9 fixture\n' > "$dest/vilan"
+printf '#!/bin/sh\necho vilan-lsp 9.9.9 fixture\n' > "$dest/vilan-lsp"
+"#;
+
+/// The first entry of the TEST process's PATH holding `name` — the fixture's
+/// own PATH is built out of what this finds.
+fn locate(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whichever sha256 checker this machine has, if it has one at all — the same
+/// two names, in the same order, `checksum()` itself looks for.
+fn sha256_tool() -> Option<PathBuf> {
+    locate("sha256sum").or_else(|| locate("shasum"))
+}
+
+/// A scratch tree holding a copy of `scripts/install.sh` and the PATH it will
+/// be run with. `sha256_tool` is the one variable: `Some` links that checker
+/// into the fixture PATH, `None` leaves the script with no way to verify what
+/// it downloaded.
+struct Installer {
+    root: PathBuf,
+    bin: PathBuf,
+}
+
+impl Installer {
+    fn new(name: &str, sha256_tool: Option<&Path>) -> Installer {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "vilan-install-script-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("create the fixture PATH");
+        fs::create_dir_all(root.join("home")).expect("create the scratch home");
+        fs::create_dir_all(root.join("scripts")).expect("create scripts/");
+        fs::copy(
+            repository_root().join("scripts").join("install.sh"),
+            root.join("scripts").join("install.sh"),
+        )
+        .expect("copy install.sh into the fixture");
+
+        for tool in INSTALLER_TOOLS {
+            let real = locate(tool).unwrap_or_else(|| panic!("no `{tool}` on this machine's PATH"));
+            symlink(real, bin.join(tool)).expect("link a real tool into the fixture PATH");
+        }
+        if let Some(tool) = sha256_tool {
+            let linked = tool.file_name().expect("the checker's own name");
+            symlink(tool, bin.join(linked)).expect("link the sha256 tool into the fixture PATH");
+        }
+        write_shim(&bin.join("curl"), CURL_SHIM);
+        write_shim(&bin.join("tar"), TAR_SHIM);
+        Installer { root, bin }
+    }
+
+    /// Runs the copied installer and returns `(exit ok, stdout+stderr)`.
+    /// `correct_sums` decides what the fixture's `curl` puts in
+    /// `sha256sums.txt`: the download's true digest, or a placeholder that
+    /// cannot match it.
+    fn run(&self, correct_sums: bool) -> (bool, String) {
+        // `/bin/sh` by absolute path: the child's PATH is the fixture's, and
+        // the point of this fixture is that nothing else on the machine is
+        // reachable from inside the script.
+        let output = Command::new("/bin/sh")
+            .arg("scripts/install.sh")
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", &self.bin)
+            .env("HOME", self.root.join("home"))
+            .env("TMPDIR", &self.root)
+            .env(
+                "VILAN_INSTALL_DIR",
+                self.installed().parent().expect("bin/"),
+            )
+            .env(
+                "VILAN_FIXTURE_SUMS",
+                if correct_sums { "real" } else { "bogus" },
+            )
+            .output()
+            .expect("run scripts/install.sh");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        (output.status.success(), text)
+    }
+
+    /// Where a completed install would leave the compiler.
+    fn installed(&self) -> PathBuf {
+        self.root.join("install").join("vilan")
+    }
+}
+
+impl Drop for Installer {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn write_shim(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, body).expect("write a fixture shim");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make the shim executable");
+}
+
+/// The green side of item 15: with a checker on PATH the verification is
+/// real. The correct digest lets the install through to its end, and a
+/// digest that does not match the bytes stops it — which is what proves the
+/// comparison is actually performed rather than merely reached.
+#[test]
+fn the_installer_verifies_the_download_when_a_sha256_tool_is_present() {
+    let Some(tool) = sha256_tool() else {
+        // A host with neither `sha256sum` nor `shasum` is the world the
+        // ignored pin below describes, not this one's; there is nothing here
+        // to verify with.
+        return;
+    };
+    let installer = Installer::new("verified", Some(&tool));
+
+    let (ok, report) = installer.run(true);
+    assert!(ok, "a matching checksum did not install:\n{report}");
+    assert!(
+        report.contains("installed vilan 9.9.9"),
+        "the install must run past the checksum step to its end:\n{report}"
+    );
+    assert!(
+        !report.contains("skipping"),
+        "a verified install must not claim anything was skipped:\n{report}"
+    );
+    assert!(installer.installed().exists(), "nothing was installed");
+
+    // The same run against a digest that cannot match: refused, by name.
+    let installer = Installer::new("mismatched", Some(&tool));
+    let (ok, report) = installer.run(false);
+    assert!(!ok, "a mismatched checksum installed anyway:\n{report}");
+    assert!(
+        report.contains("checksum mismatch for vilan-"),
+        "the refusal must name the asset it could not verify:\n{report}"
+    );
+    assert!(
+        !installer.installed().exists(),
+        "a refused install must leave nothing behind:\n{report}"
+    );
+}
+
+/// Item 15's S half, unfixed: `checksum()` treats "no sha256 tool on PATH" as
+/// a reason to SKIP verification rather than as a reason to stop. It says so
+/// on stdout through `say()` — no `install:` prefix, no stderr, exit 0 — and
+/// the download is unpacked unverified, which is the whole of the defect: the
+/// one machine that cannot check the bytes is the one that installs them
+/// blind. An installer that cannot verify must refuse, and must not offer
+/// "skipping" as an outcome on either stream.
+#[ignore = "L15: install.sh warns and installs unverified when no sha256 tool is on PATH; it must refuse instead"]
+#[test]
+fn the_installer_refuses_when_no_sha256_tool_can_verify_the_download() {
+    let installer = Installer::new("unverifiable", None);
+    let (ok, report) = installer.run(false);
+
+    assert!(
+        !ok,
+        "install.sh exited 0 with no way to verify what it downloaded:\n{report}"
+    );
+    assert!(
+        report.contains("install: ") && report.contains("sha256"),
+        "the refusal must say, in install's own voice, that it has no sha256 \
+         tool to verify with:\n{report}"
+    );
+    assert!(
+        !report.contains("skipping"),
+        "skipping verification is not an outcome the installer may offer:\n{report}"
+    );
+    assert!(
+        !installer.installed().exists(),
+        "an unverified archive was installed:\n{report}"
+    );
+}

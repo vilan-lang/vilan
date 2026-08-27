@@ -1626,6 +1626,341 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
     }
     outcome.unwrap();
 }
+// --- kolt.local 007, face one: a stylesheet that is NEW this session ---------
+
+/// [`client_source`]'s sibling for a css *presence* transition. The `const`
+/// initializer still folds to `1`, so the emitted browser bundle is byte-
+/// identical whichever `asset_kind` is passed (verified with two `vilan build`s:
+/// `dist/client.js` diffs clean) — only the compile-time `emit`'s asset KIND
+/// moves. `"txt"` therefore compiles a leg with NO stylesheet at all
+/// (`dist/client.css` absent, the build manifest's `"styles": null`), and
+/// `"css"` compiles the SAME bundle WITH one, so a watch round between the two
+/// is a clean css-only round whose sidecar goes `None` -> `Some`: the
+/// first-ever stylesheet of the session.
+fn presence_client_source(asset_kind: &str) -> String {
+    format!(
+        "import std::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"{asset_kind}\", \".added{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"a\");\n}}\n"
+    )
+}
+
+/// A server shaped like the real idiom `dev-loop.md` documents: it decides the
+/// page's markup ONCE, at boot, and serves that snapshot for the life of the
+/// process. Here the boot-time decision is the one that matters to kolt.local
+/// 007 — whether to render a `<link>` for the client leg's style sidecar, which
+/// `fs::exists` answers (the module's one blocking call, "sized for a
+/// boot-time branch"). Booted in a round that emitted no stylesheet, the page
+/// it serves carries the app's own hand-written `theme.css` and NOTHING for
+/// `client.css`; and since a css-only round never restarts this server
+/// (hmr.md §6, `classify`), it never will.
+///
+/// That is the cause behind the item's question — "a style that is new this
+/// round may have nothing to supersede: where does it land?" — made real
+/// rather than stubbed: the document genuinely lacks the `<link>`, because the
+/// process that rendered it predates the stylesheet.
+fn boot_rendered_page_server_source() -> String {
+    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::print;\nimport std::process;\n\n\
+     fun main() {\n\
+     \tlet sidecar = if fs::exists(\"dist/client.css\") { \"<link rel=\\\"stylesheet\\\" href=\\\"/client.css\\\">\" } else { \"\" };\n\
+     \tlet page = i\"<!doctype html><head><link rel=\\\"stylesheet\\\" href=\\\"/theme.css\\\">{sidecar}</head><body><script src=\\\"/client.js\\\"></script></body>\";\n\
+     \tServer::builder()\n\
+     \t\t.port(0)\n\
+     \t\t.on_request(|request| {\n\
+     \t\t\tmatch request.path() {\n\
+     \t\t\t\t\"/\" => Response::builder().set_header(\"Content-Type\", \"text/html\").body(page).build(),\n\
+     \t\t\t\t\"/shutdown\" => {\n\
+     \t\t\t\t\tprocess::exit(0);\n\
+     \t\t\t\t\tResponse::builder().body(\"\").build()\n\
+     \t\t\t\t}\n\
+     \t\t\t\t_ => Response::builder().code(404).body(\"\").build(),\n\
+     \t\t\t}\n\
+     \t\t})\n\
+     \t\t.on_start(|server| print(i\"css-server-up {server.port()}\"))\n\
+     \t\t.build()\n\
+     \t\t.start();\n\
+     }\n"
+        .to_string()
+}
+
+/// [`CSS_HARNESS_TEMPLATE`]'s twin for the cell it does not reach: the `<link>`
+/// is **absent**. Same node DOM stub, same REAL shipped shim fetched from the
+/// REAL dev channel, but the stub document is the one
+/// [`boot_rendered_page_server_source`] actually served this round — one
+/// hand-written `theme.css` sheet and no `client.css` link at all.
+/// `__SERVER_PORT__` is that server's port, substituted before writing.
+///
+/// The existing harness covers (link present, asset present) and (link present,
+/// asset missing). This is (link ABSENT, asset present): the stylesheet exists
+/// and the dev channel serves it, and the page has nowhere to put it.
+const NEW_STYLESHEET_HARNESS_TEMPLATE: &str = r#"import fs from "node:fs";
+
+class StubLink {
+    constructor(href) { this.href = href; this.rel = "stylesheet"; this.disabled = false; }
+}
+class StyleHost {
+    constructor() { this.children = []; }
+    appendChild(el) { this.children.push(el); return el; }
+}
+class StubStyle {
+    constructor(tag) { this.tagName = tag; this._text = ""; }
+    set textContent(t) { this._text = t; }
+    get textContent() { return this._text; }
+}
+
+// The document the server rendered at boot, when the client leg emitted no
+// stylesheet: the app's own hand-written sheet, and NO <link> for client.css.
+const themeLink = new StubLink("http://127.0.0.1:__SERVER_PORT__/theme.css");
+const head = new StyleHost();
+
+globalThis.window = globalThis;
+globalThis.document = {
+    querySelectorAll: (selector) =>
+        selector === 'link[rel="stylesheet"]' ? [themeLink] : [],
+    createElement: (tag) => new StubStyle(tag),
+    getElementById: () => null,
+    head,
+    documentElement: head,
+};
+globalThis.location = { reload: () => { globalThis.__reloaded = true; } };
+
+let failures = 0;
+function check(condition, message) {
+    if (condition) { console.log("ok   - " + message); }
+    else { failures += 1; console.error("FAIL - " + message); }
+}
+
+await import("./bundleA.mjs");
+const hmr = globalThis.window.__VILAN_HMR__;
+check(!!hmr, "the shim installed the singleton");
+
+const added = fs.readFileSync("dist/client.css", "utf8");
+check(added.length > 0, "harness sanity: this round wrote a first-ever dist/client.css");
+
+// The event the round actually pushed, replayed through the REAL handler.
+await hmr.handleEvent({ kind: "css", version: hmr.version, asset: "client.css" });
+
+// THE PIN. `bumpStylesheets` walks link[rel="stylesheet"], matches on the
+// asset's basename, finds nothing, and returns undefined — so today no <style>
+// is injected and no request ever reaches the dev channel. A stylesheet the
+// dev channel is serving must still reach the page: with no <link> to
+// supersede, the fresh sheet is appended to <head> on its own.
+check(
+    head.children.some((element) => element.textContent === added),
+    "the first-ever stylesheet reaches the page as a <style> carrying dist/client.css",
+);
+check(
+    head.children.length <= 1,
+    "healing a link-less sheet injects at most one <style>, not a stack",
+);
+check(themeLink.disabled === false, "the app's unrelated hand-written sheet stays enabled");
+check(!globalThis.__reloaded, "healing a first-ever stylesheet still never reloads the page");
+
+// The verdict travels on stdout, not only the exit code — see the tolerance at
+// the call site (node's Windows shutdown race).
+console.log(failures === 0 ? "css harness verdict: PASS" : "css harness verdict: FAIL");
+process.exit(failures === 0 ? 0 : 1);
+"#;
+
+/// kolt.local 007, face one ("newly **added** css styles do not HMR
+/// correctly"), pinned end to end — the apply-layer half of the two classifier
+/// cells in `hmr.rs` (`a_first_ever_stylesheet_is_not_a_css_hot_swap`,
+/// `a_removed_stylesheet_is_not_a_css_hot_swap`).
+///
+/// `a_css_push_heals_a_boot_time_stale_server_route` covers the cells where the
+/// `<link>` is PRESENT: the asset changed (the sheet is superseded with fresh
+/// bytes) and the asset is missing (404 → the never-reload discipline keeps the
+/// old sheet). It never reaches the cell the item actually asks about — the
+/// `<link>` **absent** — because its client leg emits css from round 1, so the
+/// page always has one.
+///
+/// Here it does not. Round 1's client emits a `txt` asset and no stylesheet, so
+/// the server boots, probes `dist/client.css`, finds nothing, and renders a page
+/// with only its own `theme.css`. The edit then switches the compile-time emit
+/// to `css` — the bundle stays byte-identical, so the round is css-only — and
+/// the CLI pushes `{"kind":"css","asset":"client.css"}` for a stylesheet the
+/// document has no `<link>` for. The server is not restarted by a css round, so
+/// the page never gains one either. `bumpStylesheets` walks the links, matches
+/// none, injects nothing, and returns `undefined`: the styles are invisible
+/// until the developer reloads by hand. That is the item's "may have nothing to
+/// supersede — where does it land?", answered: nowhere.
+///
+/// CORRECT: a `css` push whose sidecar the dev channel is serving must reach
+/// the page. With a `<link>` to supersede the shim disables it and shadows it
+/// with a `<style>` (hmr.md's 2026-08-10 appendix); with none, the same
+/// `<style>` is simply appended to `<head>` on its own — once, updated in place
+/// on a later event, and without touching the sheets the page already has.
+///
+/// This half stands whatever the classifier does. `css` is BROADCAST to every
+/// connected client, so a tab that loaded the page before the stylesheet existed
+/// receives the same event as one that loaded after — the apply layer must
+/// handle a link-less document regardless. (If the classifier cells land first
+/// and a presence transition starts pushing `swap`, the round-level
+/// `expect_event("css")` below moves with them; the harness half, which drives
+/// `handleEvent` directly, does not.)
+#[test]
+#[ignore = "kolt.local 007 (open): a `css` push for a stylesheet the page has no `<link>` for is dropped — the shim matches zero links and injects nothing, so newly added styles never reach the browser"]
+fn a_first_ever_stylesheet_reaches_a_page_that_has_no_link_for_it() {
+    let dir = temp_project("css_new_sheet");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/client.vl", &presence_client_source("txt"));
+    write(&dir, "src/server.vl", &boot_rendered_page_server_source());
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    // E60: this server outlives rounds by design, so it must die by the
+    // harness's hand — killing the watcher only orphans its node grandchild.
+    // The port escapes the assertion closure so cleanup runs red or green.
+    let page_server_port = std::cell::Cell::new(None::<u16>);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let dev_port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        assert!(
+            wait_for_file(&dir.join("dist/client.js"), deadline),
+            "round 1 should have written dist/client.js"
+        );
+        let server_port = wait_for_css_server_port(&lines, deadline)
+            .expect("the boot-rendered-page server should announce `css-server-up <port>`");
+        page_server_port.set(Some(server_port));
+
+        // Round 1 emitted a `txt` asset and no stylesheet at all.
+        assert!(
+            !dir.join("dist/client.css").exists(),
+            "round 1's client leg must emit no stylesheet — the point of this test"
+        );
+
+        // The document the browser loaded: the app's own sheet, no client.css.
+        let boot_page = String::from_utf8_lossy(&http_get(server_port, "/")).into_owned();
+        assert!(
+            boot_page.contains("href=\"/theme.css\""),
+            "the boot-rendered page should carry the app's own sheet: {boot_page}"
+        );
+        assert!(
+            !boot_page.contains("client.css"),
+            "the boot-rendered page must have NO <link> for the sidecar that did \
+             not exist yet: {boot_page}"
+        );
+
+        let token = dev_token(&dir, "client", deadline);
+        let mut sse = SseClient::connect(dev_port, &token);
+
+        // The edit that ADDS the first-ever stylesheet. Only the compile-time
+        // emit's asset kind changes, so the browser bundle is byte-identical
+        // and the round is css-only.
+        write(&dir, "src/client.vl", &presence_client_source("css"));
+        let css_event = sse.expect_event("css", deadline);
+        assert!(
+            css_event.contains("\"asset\":\"client.css\""),
+            "the round should name the newly-added sidecar: {css_event}"
+        );
+        assert!(
+            wait_for_file(&dir.join("dist/client.css"), deadline),
+            "the round should have written the new dist/client.css"
+        );
+
+        // The cause, confirmed directly: a css-only round never restarts the
+        // server, so the page it serves STILL has no <link> for the sheet.
+        let after_page = String::from_utf8_lossy(&http_get(server_port, "/")).into_owned();
+        assert!(
+            !after_page.contains("client.css"),
+            "a css-only round must not restart the server — the document never \
+             gains the missing <link>: {after_page}"
+        );
+
+        // The dev channel, meanwhile, is serving the new stylesheet happily —
+        // so this is not the 404/never-reload path, it is a healthy push with
+        // nowhere to land.
+        let dev_channel_css = dev_get(dev_port, "/asset/client.css", &token);
+        assert_eq!(
+            dev_channel_css,
+            b".added{color:red}\n".to_vec(),
+            "the dev channel should serve the newly-added stylesheet"
+        );
+
+        // The bundle the browser actually runs, fetched exactly as a real page's
+        // <script> origin would fetch it.
+        let bundle_a = dev_get(dev_port, "/bundle/client.js", &token);
+        assert!(
+            String::from_utf8_lossy(&bundle_a).contains("window.__VILAN_HMR__"),
+            "the served bundle should carry the dev-runtime shim"
+        );
+        std::fs::write(dir.join("bundleA.mjs"), &bundle_a).unwrap();
+
+        let harness =
+            NEW_STYLESHEET_HARNESS_TEMPLATE.replace("__SERVER_PORT__", &server_port.to_string());
+        std::fs::write(dir.join("harness.mjs"), harness).unwrap();
+
+        let run = Command::new("node")
+            .arg("harness.mjs")
+            .current_dir(&dir)
+            .output()
+            .expect("run node harness");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        // Windows only: node's own shutdown race, not a harness failure — the
+        // same tolerance `a_css_push_heals_a_boot_time_stale_server_route`
+        // documents at length (nodejs/node#56645 / #58091). The stdout verdict
+        // sentinel is the truth on that path.
+        let windows_teardown_abort = cfg!(windows)
+            && stdout.contains("css harness verdict: PASS")
+            && stderr.contains("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)")
+            && stderr.contains("async.c");
+        assert!(
+            run.status.success() || windows_teardown_abort,
+            "new-stylesheet harness failed:\n{stdout}\n{stderr}"
+        );
+    }));
+
+    support::kill_watcher(&mut watcher);
+    // The server survives the watcher by design, so ask it to exit and — on the
+    // green path only, so a red run's own panic is never masked — assert it
+    // actually died. Each poll RE-SENDS /shutdown: a request that lands exits
+    // the process within milliseconds, and a connect that refuses is the death
+    // witness.
+    if let Some(port) = page_server_port.get() {
+        let start = Instant::now();
+        let dead = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Err(_) => break true,
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    let _ = stream.write_all(
+                        b"GET /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    );
+                    if start.elapsed() > support::WATCH_LIVENESS {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        if outcome.is_ok() {
+            assert!(
+                dead,
+                "the boot-rendered-page server must exit on /shutdown — \
+                 an orphan here is E60's leak returning"
+            );
+        }
+    }
+    if outcome.is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    outcome.unwrap();
+}
 
 // --- dev-refresh.md §5 item 2: `std::watch::force_refresh()` -------------------
 
