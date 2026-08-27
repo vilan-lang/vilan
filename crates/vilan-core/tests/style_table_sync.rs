@@ -103,10 +103,16 @@ fn declared_methods(source: &str) -> Vec<(String, Vec<String>)> {
                 if let Some(method) = current.take() {
                     methods.push(method);
                 }
+                // A generic method (`raw<V: CssValue>`) is named by its
+                // IDENTIFIER: the parameter list is part of the signature, not
+                // of the name the tables and the formatter match on.
                 let name = trimmed["fun ".len()..]
                     .split('(')
                     .next()
                     .expect("a `fun` header names something")
+                    .split('<')
+                    .next()
+                    .expect("splitting a name always yields a first part")
                     .to_string();
                 let takes_self = trimmed
                     .split_once('(')

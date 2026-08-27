@@ -184,10 +184,21 @@ too, since the family is a fact about the CSS property.
 Escape hatches:
 
 ```vilan,fragment
-fun raw(self, property: str, value: str): Style
+fun raw<V: CssValue>(self, property: str, value: V): Style
 fun with_length(self, property: str, value: Length): Style
 fun with_color(self, property: str, value: Color): Style
 ```
+
+`CssValue` is what a declaration's value may be: a `str` (a complete CSS
+value, verbatim), a `Length`, or a `Color`. A `Length` or `Color` that is a
+theme token — `space(4)`, `Color::blue(300)` — carries its own `:root`
+declaration onto the stylesheet, so `.raw("padding", space(4))` is never a
+dangling `var()`. `with_length` and `with_color` are `raw` at those two value
+types, kept for the spelling the surface has always had.
+
+Pass the value, not its text: `space(4).css` is the string
+`var(--space-4)` with the declaration left behind, and a `str` carries no
+token.
 
 ## Conditions
 
@@ -260,14 +271,16 @@ fun declarations(): Declarations                 // opens a declaration chain
 fun declare(selector: str, body: Declarations)   // puts the block in the stylesheet
 
 impl Declarations {
-    fun raw(self, property: str, value: str): Declarations
-    fun color(self, property: str, value: Color): Declarations     // carries the token's :root line
+    fun raw<V: CssValue>(self, property: str, value: V): Declarations
+    fun color(self, property: str, value: Color): Declarations     // `raw` at that value type
     fun length(self, property: str, value: Length): Declarations   // likewise
 }
 ```
 
-Like `style()`, this is compile-time-only — `declare` reaches
-`std::asset::emit`, so it belongs inside a `const` expression:
+`declare` is compile-time-only — it reaches `std::asset::emit`, so it belongs
+inside a `const` expression. Building the chain is ordinary code: a
+`Declarations` value accumulates the token lines it owes and `declare` puts
+them on the sheet with the block.
 
 ```vilan
 import std::style::{ Color, declare, declarations, space };
@@ -293,9 +306,11 @@ That emits one line into the build's stylesheet:
 @layer vilan{[data-theme="iron-dark"]{--color-ink:#fafafa;--color-ground:#161616;--gap:var(--space-4)}}
 ```
 
-A `Color` or `Length` spent in a block carries its own `:root` token line
-onto the sheet exactly as a `Style` property does, so a ramp or spacing
-token used here is never a dangling `var()`.
+A `Color` or `Length` spent in a block — through `raw`, `color` or `length`,
+which are one method — carries its own `:root` token line onto the sheet
+exactly as a `Style` property does, so a ramp or spacing token used here is
+never a dangling `var()`. The line lands when `declare` does: a chain that is
+never declared reaches the stylesheet with nothing.
 
 ### Ordering
 
