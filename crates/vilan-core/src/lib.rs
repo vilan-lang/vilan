@@ -308,6 +308,18 @@ pub fn content_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// [`content_hash`] over bytes — what a build input that is not text is keyed
+/// on (`asset::bundle`'s files: a font, a favicon, a `.wasm`). Deliberately
+/// NOT comparable with `content_hash` of the same file decoded: the two are
+/// change detectors for different channels and are never mixed in one map.
+pub fn content_hash_bytes(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The handle to an entry tree `analyze_source_reclaimable` leaked: the
 /// `Program` it returned borrows this tree for `'static`, and the owner that
 /// drops that program may give the tree back (`Leaked::reclaim`, `unsafe`,
@@ -697,13 +709,13 @@ pub fn post_analysis_passes(
     // transform time, failures are ordinary diagnostics. Runs here so
     // `check`, the LSP, and every build path agree.
     let phase_const_start = PhaseClock::now();
-    let (const_results, const_assets, const_errors, const_input_files) =
-        const_eval::evaluate(program, options, &call_graph);
+    let evaluated = const_eval::evaluate(program, options, &call_graph);
     let phase_const = phase_const_start.elapsed();
-    program.const_results = const_results;
-    program.const_assets = const_assets;
-    program.const_input_files = const_input_files;
-    for (error, source) in const_errors {
+    program.const_results = evaluated.results;
+    program.const_assets = evaluated.assets;
+    program.const_input_files = evaluated.input_files;
+    program.const_bundled_files = evaluated.bundled;
+    for (error, source) in evaluated.errors {
         program.push_diagnostic(error, source);
     }
     // The last pass to want it by reference is done, so the graph moves onto

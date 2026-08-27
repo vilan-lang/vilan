@@ -129,7 +129,14 @@ struct Compared {
 /// inference sweep the way `vilan build` does — after analysis, gated on the
 /// resolved options — so what this gate reads is the release path a user gets,
 /// not an approximation of it.
-fn build_both_ways(source: String) -> Result<Compared, String> {
+/// A corpus program's package root is the corpus DIRECTORY, not the process
+/// working directory. Every runner over the corpus has to say so: a corpus
+/// program may name a project file — `const asset::bundle` carries a resource
+/// beside it into the build (kolt.local 029), and `const asset::read` would
+/// read one — and the const channel resolves those against the package root.
+/// Compiled under `.`, such a program fails to find a file that is right there
+/// beside it.
+fn build_both_ways(source: String, root: PathBuf) -> Result<Compared, String> {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
@@ -137,7 +144,7 @@ fn build_both_ways(source: String) -> Result<Compared, String> {
             let (program, errors) = analyze_source(
                 leaked,
                 &std_spec(),
-                Path::new("."),
+                &root,
                 Path::new("test.vl"),
                 Some(Platform::default()),
                 &Workspace::default(),
@@ -209,12 +216,13 @@ fn the_release_preset_is_observationally_neutral_over_the_corpus() {
         let workers: Vec<_> = programs
             .chunks(programs.len().div_ceil(8).max(1))
             .map(|chunk| {
+                let corpus = &corpus;
                 scope.spawn(move || {
                     let mut failures = Vec::new();
                     let mut ran = 0usize;
                     for (name, path) in chunk {
                         let source = std::fs::read_to_string(path).expect("read corpus file");
-                        let compared = match build_both_ways(source) {
+                        let compared = match build_both_ways(source, corpus.clone()) {
                             Ok(compared) => compared,
                             Err(error) => {
                                 failures.push(format!("{name}: {error}"));

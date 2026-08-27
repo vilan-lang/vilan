@@ -172,8 +172,9 @@ fn first_difference_reports_a_strict_prefix() {
 #[test]
 fn every_corpus_golden_is_byte_identical() {
     let corpus = corpus_dir();
-    // A full copy: corpus programs may import sibling modules, and building
-    // in place would overwrite the goldens under comparison.
+    // A full copy: corpus programs may import sibling modules — and may bundle
+    // sibling RESOURCES — and building in place would overwrite the goldens
+    // under comparison.
     let work = std::env::temp_dir().join(format!("vilan_corpus_gate_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).expect("create corpus work dir");
@@ -186,11 +187,18 @@ fn every_corpus_golden_is_byte_identical() {
         let Some(extension) = path.extension() else {
             continue;
         };
-        if extension == "vl" {
-            std::fs::copy(&path, work.join(name)).expect("copy corpus source");
-            if path.with_extension(GOLDEN_EXTENSION).is_file() {
-                programs.push(name.to_string());
-            }
+        // Goldens stay put; everything else is staged. Non-`.vl` files are
+        // staged because a corpus program may DEPEND on one:
+        // `const asset::bundle` names a resource relative to the package root,
+        // which for a bare corpus file is the directory it is copied into
+        // (kolt.local 029). A resource that did not travel would fail the
+        // build rather than diverge a golden.
+        if extension == GOLDEN_EXTENSION || extension == "css" {
+            continue;
+        }
+        std::fs::copy(&path, work.join(name)).expect("stage a corpus file");
+        if extension == "vl" && path.with_extension(GOLDEN_EXTENSION).is_file() {
+            programs.push(name.to_string());
         }
     }
     programs.sort();

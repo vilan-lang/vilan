@@ -37,22 +37,26 @@ error inside `const` ("`now()` is not const-evaluable"), not a deferred
 runtime call: the answer would not be a constant.
 
 The deliberate exception is the **compile-time file channel**,
-`std::asset`, callable **only** during const evaluation, in both
-directions. `emit(kind, content)` is the output direction: it declares
-a build asset (the styling system's CSS, for example) that the build
-writes beside the output. `read(path)` is the input direction: it
+`std::asset`, callable **only** during const evaluation, in three
+directions. `emit(kind, content)` is the output direction for lines: it
+declares a build asset (the styling system's CSS, for example) that the
+build writes beside the output. `read(path)` is the input direction: it
 returns a project file's text so the result of parsing or transforming
-it can fold into the output. A `read` path is relative to the
-**package root** (the base imports resolve under — never the process
-working directory), may not be absolute or escape that root, and the
-file becomes a **tracked build input**: a change to it invalidates
-every build product that read it, exactly as editing a source file
-would, and a missing file is a compile error at the `const`
-expression. The channel keeps const evaluation deterministic *per
-build-input closure*: same sources and same read files, same output —
-`emit` same files out, `read` same values in.
+it can fold into the output. `bundle(path)` is the output direction for
+whole files: it tells the build to carry a non-code resource into the
+output directory unchanged, and evaluates to the url the copy answers
+on. Every path here is relative to the **package root** (the base
+imports resolve under — never the process working directory), may not
+be absolute or escape that root, and the file becomes a **tracked build
+input**: a change to it invalidates every build product that named it,
+exactly as editing a source file would, and a missing file is a compile
+error at the `const` expression. The channel keeps const evaluation
+deterministic *per build-input closure*: same sources and same project
+files, same output — `emit` same lines out, `read` same values in,
+`bundle` same files carried.
 
-A function that reaches `emit` or `read` is **compile-time-only**,
+A function that reaches `emit`, `read` or `bundle` is
+**compile-time-only**,
 transitively, and the compiler enforces that statically. A call from
 runtime code into compile-time-only territory is an error at the
 outermost crossing — the call that leaves ordinary code. Because a
@@ -68,7 +72,9 @@ lifts entirely — the interpreter makes the call, so
 
 Const evaluation is total by construction of the budget: each run is
 bounded by the interpreter's **fuel** (steps; an `asset::read` charges
-one per byte read, so fuel bounds input size too) and **depth**
+one per byte read, so fuel bounds input size too — an `asset::bundle`
+charges a flat cost instead, since its bytes never enter the program
+and a size charge would cap resources rather than work) and **depth**
 (nesting). Exhausting either, or panicking during evaluation, is a
 compile error carrying the const expression's span; a budget failure
 says so, rather than reading as a program error. A runaway `const`

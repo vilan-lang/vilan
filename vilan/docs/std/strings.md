@@ -102,6 +102,12 @@ fun main() {
 }
 ```
 
+**On a path, cut with [`std::path`](paths.md), not with these.** `strip_prefix`
+and `starts_with` compare text, and text is the wrong unit for a path:
+`"/a/bc".starts_with("/a/b")` is `true` while `/a/bc` is not inside `/a/b`.
+`path::starts_with` and `path::relative` compare components, and
+`path::basename`/`path::extname` cut the affixes a filename actually has.
+
 `str` also implements `PartialEq`/`Ord` (lexicographic `==`, `<`) and
 `Default` (`""`).
 

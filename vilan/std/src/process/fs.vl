@@ -187,9 +187,12 @@ fun update(path: str, revise: |str| str) {
 }
 
 /// Lists a directory's immediate entries by NAME ONLY (files and
-/// subdirectories alike, not path-joined — join with `path` yourself), in
-/// whatever order the host filesystem hands them back (NOT guaranteed
-/// alphabetical or otherwise stable across platforms). Deliberately flat
+/// subdirectories alike, NOT path-joined — an entry is a bare name, and what
+/// addresses it is `path::join(directory, name)`), in whatever order the host
+/// filesystem hands them back (NOT guaranteed alphabetical or otherwise
+/// stable across platforms). Until kolt.local 017 this comment read "join
+/// with `path` yourself" and named a module that did not exist; `std::path`
+/// is now that module. Deliberately flat
 /// (F13): no recursion here — `read_dir_all` below walks the whole tree in
 /// one call — and no dirent-kind distinction: a caller that needs to know
 /// file vs. directory calls `scan_dir`, which gets the kind back from the same
@@ -208,10 +211,15 @@ async external fun read_dir(path: str): List<str>;
 /// deliberately no recursive `scan_dir`: the host DOES combine `recursive`
 /// with `withFileTypes`, but a `Dirent` from that call carries only a BASENAME
 /// plus a separate `parentPath`, so making it useful means joining the two —
-/// path work this module has no business doing (kolt.local 017 owns it, and
-/// proposal/filesystem.md §9's seam is that `std::fs` produces and consumes
-/// plain `str` paths and takes no position on how they are built). Rides
-/// `readdir`'s `{ recursive: true }` option — an option object the extern
+/// path work this module has no business doing (`std::path` owns it as of
+/// kolt.local 017, and proposal/filesystem.md §9's seam holds: `std::fs`
+/// produces and consumes plain `str` paths and takes no position on how they
+/// are built). One honesty note now that a path module exists: the entries
+/// above carry the HOST separator, so on Windows they are backslash-joined
+/// and `std::path` — which is `/`-only on every platform, by design — will
+/// read such an entry as a single component. Splitting a Windows
+/// `read_dir_all` result is the caller's problem until someone needs it.
+/// Rides `readdir`'s `{ recursive: true }` option — an option object the extern
 /// binding forms cannot spell, so the call is host-side glue
 /// (`__fs_read_dir_all`, `transformer.rs`, the same seam as `__fs_stat`).
 /// Throws host-side on a missing or unreadable directory, matching

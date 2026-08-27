@@ -136,6 +136,66 @@ fn phase_add(
 struct ProjectReader {
     root: PathBuf,
     inputs: RefCell<Vec<(PathBuf, Option<u64>)>>,
+    /// Every file `asset::bundle` registered, as (resolved source, the name it
+    /// takes in the output directory). Insertion-ordered and deduplicated by
+    /// name, so bundling one file from two call sites registers it once.
+    bundled: RefCell<Vec<(PathBuf, String)>>,
+}
+
+/// The package-relative name a bundled file takes in the output directory —
+/// the requested path with `./` segments dropped, `/`-joined whatever the host
+/// separator is, or the reason it is not a name at all.
+///
+/// The path IS the name (kolt.local 029). Nothing is renamed behind the
+/// author's back, two different files can never claim one name, and a
+/// subdirectory survives — which is what the vilan-website's
+/// `playground/editor.js` needs and a basename rule would have flattened onto
+/// the site root. Where a resource lands in `dist/` is therefore a layout
+/// decision the author makes by putting the file somewhere, not a policy the
+/// compiler applies.
+///
+/// POSIX-shaped, exactly as `std::path` is (kolt.local 017): the emitted name
+/// is derived output — a url, a manifest row, a golden — and a separator-aware
+/// rule would make every one of them host-dependent. `\` is refused rather
+/// than translated, so a path that means two things on two hosts means nothing
+/// on either.
+fn bundled_name(path: &str) -> Result<String, String> {
+    if path.contains('\\') {
+        return Err(format!(
+            "`asset::bundle` paths are `/`-separated on every host; `{path}` contains a backslash"
+        ));
+    }
+    let requested = Path::new(path);
+    if requested.is_absolute() {
+        return Err(format!(
+            "`asset::bundle` paths are relative to the package root; `{path}` is absolute"
+        ));
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for component in requested.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => match part.to_str() {
+                Some(part) => parts.push(part),
+                None => {
+                    return Err(format!(
+                        "`asset::bundle` paths must be valid text; `{path}` is not"
+                    ));
+                }
+            },
+            _ => {
+                return Err(format!(
+                    "`asset::bundle` paths resolve inside the package root; `{path}` escapes it"
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!(
+            "`asset::bundle` needs a file inside the package root; `{path}` names none"
+        ));
+    }
+    Ok(parts.join("/"))
 }
 
 impl interpreter::AssetReader for ProjectReader {
@@ -176,27 +236,68 @@ impl interpreter::AssetReader for ProjectReader {
             }
         }
     }
+
+    /// Registers `path` as a file the build carries, and answers with the url
+    /// its bundled copy is served at — `/` + the name, so the value is exactly
+    /// what an `<img src>` and `serve_build`'s route table both want.
+    ///
+    /// The file's BYTES are read here and thrown away. They are read because a
+    /// bundled file is a build input like any other — a change to it must
+    /// invalidate the compile that named it, and this tree decides that by
+    /// content and never by mtime — and thrown away because nothing downstream
+    /// wants them: the CLI copies the file itself, so holding a font in the
+    /// `Program` would buy nothing. A miss is an ERROR and not a recorded
+    /// absence: `read`'s miss can be a legitimate answer to ask about, but a
+    /// build cannot carry a file that is not there.
+    fn bundle(&self, path: &str) -> Result<String, String> {
+        let name = bundled_name(path)?;
+        let resolved = self.root.join(&name);
+        // Recorded before the read succeeds, exactly as `read` records its
+        // misses: a file that was not there is still a dependency, and its
+        // APPEARANCE must invalidate the compile that failed on it.
+        match std::fs::read(&resolved) {
+            Ok(bytes) => {
+                self.inputs
+                    .borrow_mut()
+                    .push((resolved, Some(crate::content_hash_bytes(&bytes))));
+            }
+            Err(error) => {
+                self.inputs.borrow_mut().push((resolved.clone(), None));
+                return Err(format!(
+                    "cannot bundle `{path}` (resolved against the package root to `{}`): {error}",
+                    resolved.display()
+                ));
+            }
+        }
+        let mut bundled = self.bundled.borrow_mut();
+        if !bundled.iter().any(|(_, existing)| *existing == name) {
+            bundled.push((self.root.join(&name), name.clone()));
+        }
+        Ok(format!("/{name}"))
+    }
 }
 
 /// Takes the analysis tail's shared call graph rather than building its own
 /// (E35). This pass writes nothing to the program at all — it takes `&Program`
 /// and RETURNS its results for the caller to store — so the graph it is handed
 /// is bit-for-bit the one it used to build.
-pub fn evaluate(
-    program: &Program,
-    options: &BuildOptions,
-    graph: &CallGraph,
-) -> (
-    HashMap<Id, ConstValue>,
-    Vec<(String, String)>,
-    // Each failure with the file its span indexes into (backlog E16): the pass
-    // walks the whole program, so a `const` in a module reports in that module.
-    Vec<(Error, SourceId)>,
-    // Every file `asset::read` touched, resolved, with the content hash it
-    // read (`None` for a miss) — the build inputs the caller must treat as it
-    // treats the `.vl` sources (watch them; key reuse on them).
-    Vec<(PathBuf, Option<u64>)>,
-) {
+pub struct Evaluated {
+    pub results: HashMap<Id, ConstValue>,
+    pub assets: Vec<(String, String)>,
+    /// Each failure with the file its span indexes into (backlog E16): the pass
+    /// walks the whole program, so a `const` in a module reports in that module.
+    pub errors: Vec<(Error, SourceId)>,
+    /// Every file `asset::read` read or `asset::bundle` registered, resolved,
+    /// with the content hash it saw (`None` for a miss) — the build inputs the
+    /// caller must treat as it treats the `.vl` sources (watch them; key reuse
+    /// on them).
+    pub input_files: Vec<(PathBuf, Option<u64>)>,
+    /// Every file `asset::bundle` registered, as (resolved source, the name it
+    /// takes in the output directory) — the build OUTPUTS the caller copies.
+    pub bundled: Vec<(PathBuf, String)>,
+}
+
+pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) -> Evaluated {
     // Reset the phase buckets FIRST, before any early return, so the timing
     // line never reports a previous analysis's accumulation.
     PHASE_LOWER.with(|cell| cell.set(std::time::Duration::ZERO));
@@ -206,11 +307,18 @@ pub fn evaluate(
     // transformer's entity lookups (used to lower the const world) assume
     // a clean program, exactly as `transform` itself does.
     if !program.diagnostics.is_empty() {
-        return (HashMap::default(), Vec::new(), Vec::new(), Vec::new());
+        return Evaluated {
+            results: HashMap::default(),
+            assets: Vec::new(),
+            errors: Vec::new(),
+            input_files: Vec::new(),
+            bundled: Vec::new(),
+        };
     }
     let reader = ProjectReader {
         root: program.pkg_root.clone(),
         inputs: RefCell::new(Vec::new()),
+        bundled: RefCell::new(Vec::new()),
     };
     let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(program, Mode::Explicit, HashSet::default(), Some(&reader));
@@ -229,7 +337,16 @@ pub fn evaluate(
     let mut inputs = reader.inputs.into_inner();
     inputs.sort();
     inputs.dedup();
-    (results, assets, errors, inputs)
+    Evaluated {
+        results,
+        assets,
+        errors,
+        input_files: inputs,
+        // Insertion order, NOT sorted: a build log that names the files in the
+        // order the program asked for them reads as the program does, and the
+        // registry is already deduplicated by name.
+        bundled: reader.bundled.into_inner(),
+    }
 }
 
 /// The INFERENCE sweep (const-eval.md §9): fold every `let`/`mut` initializer
@@ -895,8 +1012,8 @@ impl<'p, 'src> State<'p, 'src> {
     }
 
     /// The const-only capability check (const-eval.md §2): no RUNTIME call
-    /// path may reach the compile-time channel — `asset::emit` or
-    /// `asset::read`. R = the functions/closures that reach one through call
+    /// path may reach the compile-time channel — `asset::emit`, `asset::read`
+    /// or `asset::bundle`. R = the functions/closures that reach one through call
     /// sites OUTSIDE `const` subtrees; roots (`main`, top-level initializers)
     /// never join R — a root's call into R is the offending boundary,
     /// reported at that call site.
@@ -909,12 +1026,17 @@ impl<'p, 'src> State<'p, 'src> {
     /// carries a live `__emit_asset`/`__read_asset` call with no runtime
     /// binding.
     fn check_const_only(&mut self, graph: &CallGraph) {
-        // The const-only set: the channel's two directions, in a fixed order
-        // so an R-member reaching both is NAMED for the same one every run.
-        let const_only: Vec<Id> = [self.program.asset_emit_fn_id, self.program.asset_read_fn_id]
-            .into_iter()
-            .flatten()
-            .collect();
+        // The const-only set: the channel's three directions, in a fixed order
+        // so an R-member reaching more than one is NAMED for the same one every
+        // run.
+        let const_only: Vec<Id> = [
+            self.program.asset_emit_fn_id,
+            self.program.asset_read_fn_id,
+            self.program.asset_bundle_fn_id,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if const_only.is_empty() {
             return;
         }
@@ -1130,14 +1252,18 @@ impl<'p, 'src> State<'p, 'src> {
     }
 
     /// How a const-only callee names itself in a diagnostic: the builtin
-    /// itself (`asset::emit` / `asset::read`), or the R-member that reaches
-    /// one — named for the builtin `reaches` recorded for it.
+    /// itself (`asset::emit` / `asset::read` / `asset::bundle`), or the
+    /// R-member that reaches one — named for the builtin `reaches` recorded
+    /// for it.
     fn const_only_name(&self, callee: Id, reaches: &HashMap<Id, Id>) -> String {
         if Some(callee) == self.program.asset_emit_fn_id {
             return "`asset::emit`".to_string();
         }
         if Some(callee) == self.program.asset_read_fn_id {
             return "`asset::read`".to_string();
+        }
+        if Some(callee) == self.program.asset_bundle_fn_id {
+            return "`asset::bundle`".to_string();
         }
         let via = self.builtin_name(callee, reaches);
         self.program
@@ -1154,6 +1280,7 @@ impl<'p, 'src> State<'p, 'src> {
     fn builtin_name(&self, member: Id, reaches: &HashMap<Id, Id>) -> &'static str {
         match reaches.get(&member) {
             Some(&builtin) if Some(builtin) == self.program.asset_read_fn_id => "asset::read",
+            Some(&builtin) if Some(builtin) == self.program.asset_bundle_fn_id => "asset::bundle",
             _ => "asset::emit",
         }
     }

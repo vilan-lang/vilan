@@ -315,6 +315,15 @@ std/option-result.md h1 option--result-reference
 std/option-result.md h2 optiont
 std/option-result.md h2 resultt-e
 std/option-result.md h2 idioms
+std/paths.md h1 paths-reference
+std/paths.md h2 there-is-no-path-type-deliberately
+std/paths.md h2 the-separator-is--on-every-platform
+std/paths.md h2 normalize-is-canonical-which-means-the-trailing-separator-goes
+std/paths.md h2 join-concatenates-resolve-follows-a-reference
+std/paths.md h2 extname-a-dotfile-has-no-extension
+std/paths.md h2 starts_with-compares-components-strstarts_with-compares-text
+std/paths.md h2 relative-inverts-resolve
+std/paths.md h2 url-paths-are-out-and-the-seam-is-the-query-string
 std/process.md h1 process-modules-reference
 std/process.md h2 stddb-sqlite
 std/process.md h2 stdhttp-the-server

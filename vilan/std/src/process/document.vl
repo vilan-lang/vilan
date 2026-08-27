@@ -37,6 +37,7 @@ import pkg::build::LegBuild;
 import pkg::fs;
 import pkg::io::panic;
 import pkg::option::Option::{ None, Some, self };
+import pkg::path;
 import pkg::result::Result::{ Err, Ok, self };
 import pkg::ui;
 import pkg::ui::{ View, escape_attribute, escape_text };
@@ -685,10 +686,15 @@ fun is_local(url: str): bool {
 /// The file name `url` addresses: its last path segment, without the query
 /// string or fragment a cache-buster adds (`/client.js?v=2` is `client.js`,
 /// which is also how `serve_build` routes it).
+///
+/// This is `std::path`'s URL seam in two lines: the query and the fragment are
+/// URL grammar and get cut here, and what is left is an ordinary `/`-separated
+/// path that `basename` already knows how to read. It used to index the last
+/// element of a `split("/")`, which differs on a trailing separator —
+/// `"/assets/"` was `""` and is now `"assets"` — the answer a directory URL
+/// deserves either way, since neither can name a file this build emitted.
 fun file_name_of(url: str): str {
-	let path = url.split("?")[0].split("#")[0];
-	let segments = path.split("/");
-	segments[segments.len() - 1]
+	path::basename(url.split("?")[0].split("#")[0])
 }
 
 /// Whether `file` is in this leg's own namespace — the `<leg>.` prefix its

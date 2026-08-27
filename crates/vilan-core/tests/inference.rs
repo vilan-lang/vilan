@@ -66828,3 +66828,853 @@ fn b139_a_recorded_return_is_never_served_under_a_callers_bindings() {
 fn b139_the_caller_shaped_return_plant_runs_at_both_instantiations() {
     assert_compiles_and_runs(CALLER_SHAPED_RETURN_PLANT, "1\nhi\n2\nbye\n");
 }
+
+// --- `std::path` (kolt.local 017) --------------------------------------------
+//
+// The module is free functions over `str`, POSIX-shaped (`/` only, on every
+// platform), and colorless — the three forks the item filed, settled in
+// `vilan/std/src/path.vl`'s header. What follows is one pin per case rather
+// than one per function: the edges that bite are trailing separators, `.` and
+// `..`, the absolute/relative split between `join` and `resolve`, and the
+// dotfile rule in `extname`, and each of those is where a hand-rolled version
+// goes wrong.
+//
+// Answers were differentialled against node's `path.posix` over a 34-case
+// table before they were pinned. They agree case for case with TWO deliberate
+// divergences, both pinned below so they cannot drift back by accident:
+// `normalize` drops a trailing separator where node keeps it, and
+// `dirname("a//b")` is `"a"` where node leaves the dangling `"a/"`.
+
+#[test]
+fn path_normalize_collapses_separators_and_resolves_dot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("a//b/./c"));
+            print(path::normalize("a/b/../c"));
+            print(path::normalize("./a"));
+            print(path::normalize(""));
+            print(path::normalize("."));
+            print(path::normalize("/"));
+            print(path::normalize("//"));
+        }
+        main();
+        "#,
+        "a/b/c\na/c\na\n.\n.\n/\n/\n",
+    );
+}
+
+#[test]
+fn path_normalize_drops_a_trailing_separator_where_node_keeps_it() {
+    // The one divergence from `path.posix.normalize`, and the point of the
+    // function: two spellings of one path must compare equal, and node's
+    // "a/b" / "a/b/" do not — which is how a cache or an asset map ends up
+    // with two entries for one file.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("a/b/"));
+            print(path::normalize("/a/b/"));
+            print(path::normalize("a/"));
+            print(path::normalize("/"));
+            print(path::normalize("a/b") == path::normalize("a/b/"));
+        }
+        main();
+        "#,
+        "a/b\n/a/b\na\n/\ntrue\n",
+    );
+}
+
+#[test]
+fn path_normalize_stops_at_an_absolute_root_but_keeps_a_relative_climb() {
+    // A `..` above the root is dropped (the root's parent is the root); a
+    // leading `..` on a relative path is kept, because it names something.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("/../a"));
+            print(path::normalize("/a/../../.."));
+            print(path::normalize("../a"));
+            print(path::normalize("a/../../b"));
+            print(path::normalize(".."));
+        }
+        main();
+        "#,
+        "/a\n/\n../a\n../b\n..\n",
+    );
+}
+
+#[test]
+fn path_functions_never_fold_case() {
+    // `windows-support.md` §5 enforces case-EXACT module resolution precisely
+    // so that `import foo` cannot resolve `Foo.vl` on NTFS. A path module that
+    // decided `Foo` and `foo` were the same path would hand that back, so
+    // every comparison here is byte-for-byte and `normalize` preserves the
+    // case it was given.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            print(path::normalize("Foo/../BAR"));
+            print(path::basename("/a/README.md"));
+            print(path::starts_with("/A/b", "/a"));
+            match path::relative("/A", "/a") {
+                Some(let answer) => print(answer),
+                None => print("none"),
+            }
+        }
+        main();
+        "#,
+        "BAR\nREADME.md\nfalse\n../a\n",
+    );
+}
+
+#[test]
+fn path_join_does_not_reset_on_an_absolute_second_argument_but_resolve_does() {
+    // The split that decides what each verb is for. `join` is textual; the
+    // caller asking "…unless the second is already absolute" is asking about
+    // REFERENCES and wants `resolve`. A `join` that silently discarded its
+    // first argument would be a traversal primitive wearing a concatenation's
+    // name.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("/a", "/b"));
+            print(path::resolve("/a", "/b"));
+            print(path::join("/a", "b"));
+            print(path::resolve("/a", "b"));
+        }
+        main();
+        "#,
+        "/a/b\n/b\n/a/b\n/a/b\n",
+    );
+}
+
+#[test]
+fn path_join_treats_an_empty_side_as_nothing() {
+    // `join("", "b")` must not become absolute — the empty base contributes
+    // no separator, it contributes nothing at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("", "b"));
+            print(path::join("a", ""));
+            print(path::join("", ""));
+            print(path::join("a", "../b"));
+            print(path::join("a", ".."));
+        }
+        main();
+        "#,
+        "b\na\n.\nb\n.\n",
+    );
+}
+
+#[test]
+fn path_join_all_folds_left_and_answers_the_empty_list() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            let parts: List<str> = ["a", "b", "c"];
+            print(path::join_all(parts));
+            let nothing: List<str> = [];
+            print(path::join_all(nothing));
+            let climbing: List<str> = ["/a", "..", "b"];
+            print(path::join_all(climbing));
+        }
+        main();
+        "#,
+        "a/b/c\n.\n/b\n",
+    );
+}
+
+#[test]
+fn path_basename_ignores_trailing_separators_and_the_root_has_none() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::basename("/a/b.txt"));
+            print(path::basename("/a/b/"));
+            print(path::basename("a"));
+            print(path::basename("/"));
+            print(path::basename(""));
+            print(path::basename("a/.."));
+        }
+        main();
+        "#,
+        "b.txt\nb\na\n\n\n..\n",
+    );
+}
+
+#[test]
+fn path_dirname_stops_at_the_root_and_answers_dot_without_a_separator() {
+    // `dirname("a//b")` is the second divergence from node, which answers
+    // `"a/"` — a parent path carrying a dangling separator, which then has to
+    // be normalized away by whoever receives it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::dirname("/a/b.txt"));
+            print(path::dirname("/a"));
+            print(path::dirname("/"));
+            print(path::dirname("a"));
+            print(path::dirname(""));
+            print(path::dirname("a/b/"));
+            print(path::dirname("a//b"));
+            print(path::dirname("/../a"));
+        }
+        main();
+        "#,
+        "/a\n/\n/\n.\n.\na\na\n/..\n",
+    );
+}
+
+#[test]
+fn path_extname_gives_a_dotfile_no_extension() {
+    // The landmine this module exists to defuse. `.gitignore` is a hidden
+    // file, not a file of type "gitignore": the leading dot marks it, it does
+    // not name a type. `.` and `..` likewise have none. (node's
+    // `path.extname` answers the same way and hand-rolled versions rarely do.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::extname(".gitignore"));
+            print(path::extname("a/.gitignore"));
+            print(path::extname("."));
+            print(path::extname(".."));
+            print(path::extname(".a.b"));
+        }
+        main();
+        "#,
+        "\n\n\n\n.b\n",
+    );
+}
+
+#[test]
+fn path_extname_reads_the_last_dot_of_the_last_component() {
+    // A dot in a DIRECTORY name is invisible from here — the question is
+    // about the file — and a trailing dot is an empty extension spelled ".".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::extname("index.html"));
+            print(path::extname("a.b.c"));
+            print(path::extname("noext"));
+            print(path::extname("file."));
+            print(path::extname("a.b/c"));
+            print(path::extname("/a/b/"));
+        }
+        main();
+        "#,
+        ".html\n.c\n\n.\n\n\n",
+    );
+}
+
+#[test]
+fn path_stem_and_extname_cut_the_basename_in_two() {
+    // `stem(p) + extname(p) == basename(p)` for every p, including the
+    // degenerate spellings — the invariant that makes the pair safe to use
+    // together instead of re-deriving the split at each call site.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun holds(candidate: str): bool {
+            path::stem(candidate) + path::extname(candidate) == path::basename(candidate)
+        }
+        fun main() {
+            print(path::stem("/a/b.txt"));
+            print(path::stem(".gitignore"));
+            print(path::stem("file."));
+            print(path::stem("a/b/"));
+            print(holds("/a/b.txt"));
+            print(holds(".gitignore"));
+            print(holds("file."));
+            print(holds("..."));
+            print(holds("/"));
+        }
+        main();
+        "#,
+        "b\n.gitignore\nfile\nb\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn path_starts_with_compares_components_where_the_str_verb_compares_text() {
+    // The answer to "do `str::strip_prefix`/`starts_with` suffice for paths":
+    // they do not, and the first two lines are the proof. `/a/bc` starts with
+    // the TEXT `/a/b` and is not inside the DIRECTORY `/a/b`. Deriving an
+    // asset key by cutting a textual prefix is the same mistake, which is what
+    // kolt.local 023 filed.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print("/a/bc".starts_with("/a/b"));
+            print(path::starts_with("/a/bc", "/a/b"));
+            print(path::starts_with("/a/b/c", "/a/b"));
+            print(path::starts_with("/a/b", "/a/b"));
+            print(path::starts_with("/a/b", "/a/"));
+            print(path::starts_with("/a/b", "/"));
+            print(path::starts_with("a/b", "/a"));
+            print(path::starts_with("/a", "/a/b"));
+        }
+        main();
+        "#,
+        "true\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn path_relative_inverts_resolve() {
+    // `resolve(from, relative(from, to))` is `normalize(to)` — the property
+    // that makes the pair usable for rebasing a whole tree of paths.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun step(from: str, to: str) {
+            match path::relative(from, to) {
+                Some(let hop) => print(path::resolve(from, hop) == path::normalize(to)),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            print(path::relative("/a/b", "/a/c").unwrap_or("none"));
+            print(path::relative("/a/b", "/a/b/c").unwrap_or("none"));
+            print(path::relative("/a/b", "/a/b").unwrap_or("none"));
+            print(path::relative("/", "/a").unwrap_or("none"));
+            print(path::relative("/a", "/").unwrap_or("none"));
+            step("/a/b", "/x/y");
+            step("a/b", "a/b/c/d");
+            step("/a/b/", "/a/b/c/");
+        }
+        main();
+        "#,
+        "../c\nc\n.\na\n..\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn path_relative_is_none_where_there_is_no_lexical_answer() {
+    // Two cases, both real: the two sides disagree about being absolute (no
+    // working directory here to bridge them), or `from` still begins with `..`
+    // after the common prefix comes off (climbing out of an unknown place, so
+    // what is above it is unknown too). An `Option` for `strip_prefix`'s
+    // reason — "no answer" and "the answer is `.`" are different.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun show(from: str, to: str) {
+            match path::relative(from, to) {
+                Some(let hop) => print(hop),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            show("/a/b", "b");
+            show("b", "/a/b");
+            show("../a", "b");
+            show("a", "../b");
+        }
+        main();
+        "#,
+        "none\nnone\nnone\n../../b\n",
+    );
+}
+
+#[test]
+fn std_path_is_colorless_and_serves_a_browser_build() {
+    // The coloring call, verified rather than assumed. `std::fs` and friends
+    // are seeded `@process` by living in `src/process` (`std/vilan.toml`'s
+    // `[library.layer.process]`), and a browser build that reaches one is
+    // refused. `std::path` is in the base `root` layer and has no host call
+    // in it, so it serves both — which is the point: a browser router and an
+    // SSR render manipulate the same `/`-separated strings, and a
+    // `@process`-colored path module would have put that shared half out of
+    // reach of half the program.
+    assert_compiles_browser(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("/assets", "app.css"));
+            print(path::basename("/assets/app.css"));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn path_arithmetic_folds_under_const() {
+    // Pure vilan with no host call, so it is const-evaluable — the property a
+    // build-time consumer (bundled-asset paths, kolt.local 029) needs, and one
+    // a `node:path` binding could never have had.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            let folded = const path::join("dist", "../dist/app.js");
+            print(folded);
+        }
+        main();
+        "#,
+    )
+    .expect("expected a clean compile");
+    assert!(
+        js.contains("const folded = \"dist/app.js\";"),
+        "expected the join to fold to a literal at compile time, got:\n{js}"
+    );
+}
+
+#[test]
+fn path_strip_prefix_cuts_only_where_starts_with_agrees() {
+    // The path sibling of `str::strip_prefix` (Order 12), and the last line is
+    // why it had to exist: the `str` verb answers `Some("c")` for a path that
+    // is not inside the prefix at all. `starts_with` tests, this one cuts —
+    // and it is a different question from `relative`, which always has an
+    // answer for two paths under one root and will climb with `..` to reach
+    // it. Cutting the whole of a path gives `Some(".")`, matching `relative`'s
+    // answer for a path to itself.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun show(path: str, prefix: str) {
+            match path::strip_prefix(path, prefix) {
+                Some(let rest) => print(rest),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            show("/srv/site/css/app.css", "/srv/site");
+            show("/a/bc", "/a/b");
+            show("/a/b", "/a/b");
+            show("/a/b", "/a/b/");
+            show("/a/b", "/");
+            show("a/b/c", "a");
+            show("a/b", "/a");
+            show("/A/b", "/a");
+            print("/a/bc".strip_prefix("/a/b").unwrap_or("?"));
+        }
+        main();
+        "#,
+        "css/app.css\nnone\n.\n.\na/b\nb/c\nnone\nnone\nc\n",
+    );
+}
+
+// --- kolt.local 029: the const output channel for FILES — `asset::bundle` ------
+// `emit`'s sibling on the other axis. `emit` accumulates LINES into one
+// generated file; `bundle` carries an EXISTING file through unchanged, so a
+// built app needs nothing but `dist/`. Same const-only bit, same package-root
+// resolution, same build-input record — the three properties `asset::read`
+// already had, now pointing the other way.
+
+/// A clean analysis with an explicit package root, returning the folded const
+/// values, the recorded build inputs, and the files registered for bundling.
+fn const_bundles(
+    source: &str,
+    root: &Path,
+) -> (
+    Vec<vilan_core::interpreter::ConstValue>,
+    Vec<(PathBuf, Option<u64>)>,
+    Vec<(PathBuf, String)>,
+) {
+    let source = source.to_string();
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            let program = program.expect("a clean analysis leaves a program");
+            (
+                program.const_results.values().cloned().collect::<Vec<_>>(),
+                program.const_input_files.clone(),
+                program.const_bundled_files.clone(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// The book's own tree, used as a package root: the pins below bundle files
+/// that really exist rather than staging a fixture for each one.
+fn bundle_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan")
+}
+
+#[test]
+fn a_const_bundle_registers_the_file_and_folds_to_its_url() {
+    let (values, inputs, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("docs/SUMMARY.md");
+        }
+        main();
+        "#,
+        &bundle_root(),
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/docs/SUMMARY.md".to_string()
+        )],
+        "the call folds to the url its bundled copy answers on"
+    );
+    assert_eq!(bundled.len(), 1, "one registered file: {bundled:?}");
+    assert_eq!(
+        bundled[0].1, "docs/SUMMARY.md",
+        "the path IS the name — the subdirectory survives: {bundled:?}"
+    );
+    assert!(
+        bundled[0].0.ends_with("docs/SUMMARY.md"),
+        "resolved against the package root: {bundled:?}"
+    );
+    assert_eq!(inputs.len(), 1, "one tracked input: {inputs:?}");
+    assert!(
+        inputs[0].1.is_some(),
+        "a bundled file is a HASHED build input, exactly as a read one is — \
+         that record is what makes an edited resource drive a watch round: \
+         {inputs:?}"
+    );
+}
+
+#[test]
+fn a_file_bundled_twice_is_registered_once() {
+    // Two call sites, one file: the copy is idempotent, so the registry must
+    // not name it twice (a duplicate would put it in the manifest twice and
+    // make `serve_build` install two identical routes).
+    let (_, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _one = const asset::bundle("docs/SUMMARY.md");
+            let _two = const asset::bundle("./docs/SUMMARY.md");
+        }
+        main();
+        "#,
+        &bundle_root(),
+    );
+    assert_eq!(
+        bundled.len(),
+        1,
+        "one file, one registration — and `./` normalizes to the same name: {bundled:?}"
+    );
+    assert_eq!(bundled[0].1, "docs/SUMMARY.md");
+}
+
+#[test]
+fn a_missing_bundle_is_a_clean_diagnostic_at_the_call_site() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("vilan-029-definitely-missing.png");
+        }
+        main();
+        "#,
+        r#"asset::bundle("vilan-029-definitely-missing.png")"#,
+        "cannot bundle `vilan-029-definitely-missing.png`",
+    );
+}
+
+#[test]
+fn a_missing_bundle_is_still_a_tracked_build_input() {
+    // A file that was not there is still a dependency: its APPEARANCE must
+    // invalidate the compile that failed on it, exactly as a change to a
+    // present one does. The analysis fails, so the record is read off the
+    // program the failing analysis left rather than through `const_bundles`.
+    let root = bundle_root();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("vilan-029-definitely-missing.png");
+        }
+        main();
+        "#
+    .to_string();
+    let inputs = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, _errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            program
+                .map(|program| program.const_input_files.clone())
+                .unwrap_or_default()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(
+        inputs.iter().any(
+            |(path, hash)| path.ends_with("vilan-029-definitely-missing.png") && hash.is_none()
+        ),
+        "the miss must be recorded, unhashed: {inputs:?}"
+    );
+}
+
+#[test]
+fn an_absolute_bundle_path_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("/etc/hostname");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths are relative to the package root; `/etc/hostname` is absolute",
+    );
+}
+
+#[test]
+fn a_bundle_path_escaping_the_package_root_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("../outside.png");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths resolve inside the package root; `../outside.png` escapes it",
+    );
+}
+
+#[test]
+fn a_backslash_in_a_bundle_path_is_refused() {
+    // POSIX-only, for the reason `std::path` is (kolt.local 017): the name is
+    // derived OUTPUT — a url, a manifest row, a golden — and a separator-aware
+    // rule would make every one of them host-dependent. `\` is refused rather
+    // than translated, so a path that means two things on two hosts means
+    // nothing on either.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("static\\logo.png");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths are `/`-separated on every host",
+    );
+}
+
+#[test]
+fn a_bundle_path_naming_no_file_is_refused() {
+    // `"."` and `""` resolve to the package root itself, which is a directory
+    // and not a resource. Refused by name rather than by the read failing, so
+    // the message says what is wrong instead of reporting an OS error.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle(".");
+        }
+        main();
+        "#,
+        "`asset::bundle` needs a file inside the package root; `.` names none",
+    );
+}
+
+#[test]
+fn a_runtime_bundle_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = asset::bundle("logo.png");
+        }
+        main();
+        "#,
+        r#"asset::bundle("logo.png")"#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_runtime_call_reaching_bundle_is_rejected_at_the_boundary() {
+    // The R-fixpoint names WHICH builtin the path reaches — a bundle-reaching
+    // function says `asset::bundle`, not `asset::emit`.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun icon(): str {
+            asset::bundle("logo.png")
+        }
+        fun main() {
+            let _url = icon();
+        }
+        main();
+        "#,
+        "`icon` (it reaches `asset::bundle`) is compile-time-only",
+    );
+}
+
+#[test]
+fn a_function_reaching_bundle_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun icon(): str {
+            asset::bundle("logo.png")
+        }
+        fun apply(f: || str): str {
+            f()
+        }
+        fun main() {
+            let _url = apply(icon);
+        }
+        main();
+        "#,
+        "no runtime value form",
+    );
+}
+
+#[test]
+fn a_changed_bundled_file_is_seen_by_the_next_analysis() {
+    // The invalidation pin, `asset::read`'s sibling: analyze, EDIT THE FILE,
+    // analyze again in the same process — the second analysis must record the
+    // new hash. If any cache ever keys const results without the bundled
+    // inputs, a `--watch` round stops recopying an edited resource and the dev
+    // loop serves last round's bytes forever.
+    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("static")).unwrap();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("static/note.txt");
+        }
+        main();
+        "#;
+    std::fs::write(dir.join("static/note.txt"), "one").unwrap();
+    let (values, first, bundled) = const_bundles(source, &dir);
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/static/note.txt".to_string()
+        )]
+    );
+    assert_eq!(bundled.len(), 1);
+    std::fs::write(dir.join("static/note.txt"), "two").unwrap();
+    let (_, second, _) = const_bundles(source, &dir);
+    assert_ne!(
+        first[0].1, second[0].1,
+        "the edited resource must re-hash to a different input record — a \
+         stale hash is a resource that stops being recopied: {first:?} {second:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bundled_file_is_not_charged_by_its_size() {
+    // Deliberately unlike `asset::read`, whose bytes become a `str` the const
+    // program then computes over: a bundled file's bytes never enter the
+    // program, so charging fuel by size would bound how large an asset may be
+    // rather than how much work a build does. A file comfortably past the
+    // explicit fuel budget in bytes bundles fine.
+    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-fuel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("huge.bin"), "a".repeat(17_000_000)).unwrap();
+    let (values, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("huge.bin");
+        }
+        main();
+        "#,
+        &dir,
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/huge.bin".to_string()
+        )],
+        "a 17 MB resource is a build output, not a compile-time computation"
+    );
+    assert_eq!(bundled.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_builds_content_type_reads_the_extension_through_path_extname() {
+    // `content_type_of` used to be `file.split(".").last()` — a hand-rolled
+    // `extname` carrying `extname`'s classic bug: a DOTFILE's leading dot read
+    // as a type. `dist/.css` is a hidden file with no extension, and typing it
+    // `text/css` would serve a file the table has no row for. It now goes
+    // through `path::extname` (kolt.local 017), which answers `""` there.
+    //
+    // The subdirectory cases below are newly reachable: a bundled resource
+    // keeps its package-relative path (kolt.local 029), so `content_type_of`
+    // now sees paths with directories in them for the first time.
+    assert_compiles_and_runs(
+        r#"
+        import std::build::content_type_of;
+        import std::io::print;
+        import std::option::Option::{ None, Some };
+        fun name(file: str): str {
+            match content_type_of(file) {
+                Some(let content_type) => content_type
+                None => "none"
+            }
+        }
+        fun main() {
+            print(name("dist/static/logo.png"));
+            print(name("dist/.css"));
+            print(name("dist/vendor.d/README"));
+            print(name("dist/FAVICON.ICO"));
+            print(name("dist/a.b/c.woff2"));
+        }
+        main();
+        "#,
+        "image/png\nnone\nnone\nimage/x-icon\nfont/woff2\n",
+    );
+}

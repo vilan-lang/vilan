@@ -695,6 +695,14 @@ pub struct LegArtifact {
     pub script_extension: &'static str,
     pub bundle: String,
     pub css: Option<String>,
+    /// The files `const asset::bundle` registered for this leg: (resolved
+    /// source, the name it takes in `dist/`). Carried on the artifact so a
+    /// SKIPPED round — which reuses the previous artifact verbatim — still
+    /// re-copies them, and so a round that recompiled because a resource
+    /// changed copies the new bytes. Not part of the classifier: the browser is
+    /// told nothing, because `asset_body` re-reads under a watch and every
+    /// request is already fresh (`dev-refresh.md` §5, item 1).
+    pub bundled: Vec<(PathBuf, String)>,
     /// The sources this artifact was compiled from — each loaded file's path
     /// mapped to the `content_hash` of the text the compiler actually consumed
     /// (`Program.source_hashes`). Covers the entry plus every std/package
@@ -1473,6 +1481,10 @@ mod tests {
             script_extension: if is_browser { "js" } else { "mjs" },
             bundle: bundle.to_string(),
             css: css.map(str::to_string),
+            // The classifier reads `bundle`/`css` and nothing else, so a
+            // fixture leg carries no resources: what it bundled cannot change
+            // a round's decision, by design.
+            bundled: Vec::new(),
             sources: BTreeMap::new(),
         }
     }

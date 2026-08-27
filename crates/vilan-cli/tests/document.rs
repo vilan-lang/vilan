@@ -197,6 +197,7 @@ fun main() {
 				styles = styles,
 				chunks = if splits { ["client.Route_Home.js"] } else { [] },
 				classic_script = splits,
+				assets = [],
 			};
 			let (checked, found) = check_every_document(build);
 			documents = documents + checked;
@@ -248,6 +249,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 
 	let generated = Document::of(build).title("Notes");
@@ -571,6 +573,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let _page = Document::of(unstyled).head("<link rel=\"stylesheet\" href=\"/client.css\" />").html();
 }
@@ -608,6 +611,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let _page = Document::of(build).head("<!--").html();
 }
@@ -644,6 +648,7 @@ fun main() {
 		styles = None,
 		chunks = ["client.Route_Home.js"],
 		classic_script = true,
+		assets = [],
 	};
 	let _page = Document::of(split).body("<script type=\"module\" src=\"/client.js\"></script>").html();
 }
@@ -679,6 +684,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	print(Document::of(build).title("Notes").head("<link rel=\"icon\" href=\"/favicon.ico\" />").body("<noscript>needs JavaScript</noscript>").html());
 }
@@ -716,6 +722,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	print(Document::of(build)
 		.title("Notes")
@@ -764,6 +771,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let shell = "<!doctype html>\n<html lang=\"en\">\n\t<head>\n\t\t<meta charset=\"utf-8\" />\n\t\t<link rel=\"stylesheet\" href=\"/client.css\" />\n\t</head>\n\t<body>\n\t\t<div id=\"app\"></div>\n\t\t<script type=\"module\" src=\"/client.js\"></script>\n\t</body>\n</html>\n";
 	match Document::from_shell(shell, build) {
@@ -814,6 +822,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	print("===DESCRIBED===");
 	print(Document::of(build).title("Notes").description("A tidy list.").html());
@@ -884,6 +893,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	print("===PAGE===");
 	print(Document::of(build).title("Notes").html());
@@ -1109,6 +1119,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let shell = "<!doctype html><html><head></head><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>";
 	match Document::from_shell(shell, unstyled) {
@@ -1161,6 +1172,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let shell = "<!doctype html><html><head><link rel=\"stylesheet\" href=\"/client.css\"></head><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>";
 	match Document::from_shell(shell, build) {
@@ -1219,6 +1231,7 @@ fun main() {
 		styles = Some("client.css"),
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let shell = "<!doctype html>\n<html lang=\"en\">\n\t<head>\n\t\t<link rel=\"stylesheet\" href=\"/client.css\" />\n\t</head>\n\t<body>\n\t\t<div id=\"app\"></div>\n\t\t<script type=\"module\" src=\"/client.js\"></script>\n\t</body>\n</html>\n";
 	match Document::from_shell(shell, build) {
@@ -1291,6 +1304,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let shell = "<!doctype html><html><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></html>";
 	match Document::from_shell(shell, build) {
@@ -1337,6 +1351,7 @@ fun main() {
 		styles = None,
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	};
 	let shell = "<!doctype html><html><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>";
 	match Document::from_shell(shell, build) {

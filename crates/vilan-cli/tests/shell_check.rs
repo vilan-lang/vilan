@@ -366,6 +366,7 @@ fun leg(styles: Option<str>): LegBuild {
 		styles = styles,
 		chunks = [],
 		classic_script = false,
+		assets = [],
 	}
 }
 

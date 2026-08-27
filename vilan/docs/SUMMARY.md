@@ -34,6 +34,7 @@
 - [Collections](std/collections.md)
 - [Option & Result](std/option-result.md)
 - [Strings](std/strings.md)
+- [Paths](std/paths.md)
 - [Numbers](std/numbers.md)
 - [Core traits](std/traits.md)
 - [Cells](std/cells.md)
