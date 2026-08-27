@@ -25177,7 +25177,11 @@ fn an_absolute_read_path_is_refused() {
     // so what was wrong was the pin, not the fence. This one names THIS arm on
     // each platform, and `a_posix_absolute_path_is_refused_on_every_platform`
     // below holds the property that does not vary.
-    let absolute = if cfg!(windows) { r"C:\Windows\system.ini" } else { "/etc/hostname" };
+    let absolute = if cfg!(windows) {
+        r"C:\Windows\system.ini"
+    } else {
+        "/etc/hostname"
+    };
     assert_fails_with(
         &format!(
             r#"
@@ -67848,19 +67852,35 @@ fn an_absolute_bundle_path_is_refused() {
     // Per-platform for the reason `an_absolute_read_path_is_refused` records
     // (N26). This pin was modelled on that one and inherited its defect with
     // it, which is how one bad pin became two.
-    let absolute = if cfg!(windows) { r"C:\Windows\system.ini" } else { "/etc/hostname" };
+    //
+    // The Windows spelling is FORWARD-slashed, and that is not cosmetic:
+    // `bundled_name` refuses a backslash BEFORE it tests for absolute, because
+    // a bundled name is `/`-separated on every host and a backslash is refused
+    // rather than translated. So a Windows-NATIVE `C:\...` path never reaches
+    // the arm this pin is named for - it is caught one check earlier, which is
+    // exactly what happened when this pin was first repaired and Windows CI
+    // stayed red on it. `C:/...` is absolute to Windows all the same (a prefix
+    // plus a root), so it reaches the arm. The backslash check has its own pin,
+    // `a_backslash_in_a_bundle_path_is_refused`, and this one must not
+    // accidentally re-test it.
+    let absolute = if cfg!(windows) {
+        "C:/Windows/system.ini"
+    } else {
+        "/etc/hostname"
+    };
     assert_fails_with(
         &format!(
             r#"
         import std::asset;
         fun main() {{
-            let _url = const asset::bundle("{}");
+            let _url = const asset::bundle("{absolute}");
         }}
         main();
-        "#,
-            absolute.replace('\\', "\\\\")
+        "#
         ),
-        &format!("`asset::bundle` paths are relative to the package root; `{absolute}` is absolute"),
+        &format!(
+            "`asset::bundle` paths are relative to the package root; `{absolute}` is absolute"
+        ),
     );
 }
 
