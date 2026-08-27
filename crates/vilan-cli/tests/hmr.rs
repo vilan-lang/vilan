@@ -1738,11 +1738,11 @@ check(added.length > 0, "harness sanity: this round wrote a first-ever dist/clie
 // The event the round actually pushed, replayed through the REAL handler.
 await hmr.handleEvent({ kind: "css", version: hmr.version, asset: "client.css" });
 
-// THE PIN. `bumpStylesheets` walks link[rel="stylesheet"], matches on the
-// asset's basename, finds nothing, and returns undefined — so today no <style>
-// is injected and no request ever reaches the dev channel. A stylesheet the
-// dev channel is serving must still reach the page: with no <link> to
-// supersede, the fresh sheet is appended to <head> on its own.
+// THE PIN. The old `bumpStylesheets` walked link[rel="stylesheet"], matched on
+// the asset's basename, found nothing, and returned undefined — no <style>
+// injected, no request ever reaching the dev channel. A stylesheet the dev
+// channel is serving must still reach the page: with no <link> to supersede,
+// the fresh sheet is appended to <head> on its own.
 check(
     head.children.some((element) => element.textContent === added),
     "the first-ever stylesheet reaches the page as a <style> carrying dist/client.css",
@@ -1789,15 +1789,22 @@ process.exit(failures === 0 ? 0 : 1);
 /// `<style>` is simply appended to `<head>` on its own — once, updated in place
 /// on a later event, and without touching the sheets the page already has.
 ///
-/// This half stands whatever the classifier does. `css` is BROADCAST to every
+/// This half stands whatever the classifier does. A push is BROADCAST to every
 /// connected client, so a tab that loaded the page before the stylesheet existed
 /// receives the same event as one that loaded after — the apply layer must
-/// handle a link-less document regardless. (If the classifier cells land first
-/// and a presence transition starts pushing `swap`, the round-level
-/// `expect_event("css")` below moves with them; the harness half, which drives
-/// `handleEvent` directly, does not.)
+/// handle a link-less document regardless.
+///
+/// FIXED (Order 15) at both layers, and the round-level half MOVED WITH THE
+/// CLASSIFIER exactly as this pin's original text said it would: a presence
+/// transition is no longer a `css` hot-swap, so the round now pushes `swap`
+/// DECLARING the round's stylesheet set — and the harness half below still
+/// drives the `css` handler directly, because a link-less document must be
+/// handled on that path too (a later round that changes this same sheet pushes
+/// `css` to a tab whose page still has no `<link>` for it). The apply rule is
+/// one rule with two triggers: with a `<link>` to supersede the shim disables it
+/// and shadows it; with none, the same `<style>` joins `<head>` on its own.
+/// Every cell of the matrix is pinned in `tests/hmr_css_matrix.rs`.
 #[test]
-#[ignore = "kolt.local 007 (open): a `css` push for a stylesheet the page has no `<link>` for is dropped — the shim matches zero links and injects nothing, so newly added styles never reach the browser"]
 fn a_first_ever_stylesheet_reaches_a_page_that_has_no_link_for_it() {
     let dir = temp_project("css_new_sheet");
     write(
@@ -1860,25 +1867,32 @@ fn a_first_ever_stylesheet_reaches_a_page_that_has_no_link_for_it() {
 
         // The edit that ADDS the first-ever stylesheet. Only the compile-time
         // emit's asset kind changes, so the browser bundle is byte-identical
-        // and the round is css-only.
+        // and the ONLY thing this round changed is the stylesheet's presence.
         write(&dir, "src/client.vl", &presence_client_source("css"));
-        let css_event = sse.expect_event("css", deadline);
+        // The classification: a sidecar that APPEARED is a browser-output
+        // change, not the in-place replacement of a loaded sheet's text — so
+        // `swap`, declaring the round's stylesheet set (`hmr.rs`'s
+        // `a_first_ever_stylesheet_is_not_a_css_hot_swap` pins the decision;
+        // this pins the event that reaches the wire).
+        let swap_event = sse.expect_event("swap", deadline);
         assert!(
-            css_event.contains("\"asset\":\"client.css\""),
-            "the round should name the newly-added sidecar: {css_event}"
+            swap_event.contains("\"sheets\":[\"client.css\"]"),
+            "the round should declare the newly-added sidecar: {swap_event}"
         );
         assert!(
             wait_for_file(&dir.join("dist/client.css"), deadline),
             "the round should have written the new dist/client.css"
         );
 
-        // The cause, confirmed directly: a css-only round never restarts the
-        // server, so the page it serves STILL has no <link> for the sheet.
+        // The cause, confirmed directly: a round that changed no server bundle
+        // never restarts the server — `swap` or `css` alike — so the page it
+        // serves STILL has no <link> for the sheet. This is why the apply layer
+        // has to handle a link-less document: nothing else ever will.
         let after_page = String::from_utf8_lossy(&http_get(server_port, "/")).into_owned();
         assert!(
             !after_page.contains("client.css"),
-            "a css-only round must not restart the server — the document never \
-             gains the missing <link>: {after_page}"
+            "a client-only round must not restart the server — the document \
+             never gains the missing <link>: {after_page}"
         );
 
         // The dev channel, meanwhile, is serving the new stylesheet happily —
@@ -1956,6 +1970,113 @@ fn a_first_ever_stylesheet_reaches_a_page_that_has_no_link_for_it() {
             );
         }
     }
+    if outcome.is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    outcome.unwrap();
+}
+
+/// kolt.local 007's WORST finding, pinned end to end: **removing a stylesheet
+/// used to reassert it.**
+///
+/// `main.rs`'s dist writer only ever wrote `dist/<leg>.css` inside
+/// `if let Some(css)`, and the one thing that deleted anything
+/// (`sweep_stale_chunks`) matched only `<leg>.<arm>.js` and `<leg>.chunks.json`
+/// — so a round that stopped emitting a stylesheet left the PREVIOUS round's
+/// sidecar on disk. The classifier then announced `css` for it (its css line
+/// asked only `old.css != leg.css`), the shim fetched `/asset/client.css`, got a
+/// healthy **200** carrying those stale bytes, and injected them as a `<style>`
+/// superseding the `<link>`. Deleting a stylesheet re-applied it, and nothing
+/// looked wrong anywhere: no 404, no warning, no failed round.
+///
+/// Fixed at both ends, and this pin holds both:
+///
+/// - `sweep_stale_sidecar` — the leg's dist namespace belongs to its LAST build
+///   (`bundle-splitting.md` §S3 item 4), the sidecar included — so
+///   `dist/client.css` is gone and the dev channel 404s it. There are no stale
+///   bytes to serve, to anyone, ever again.
+/// - the classifier — a presence transition is a `swap` declaring the round's
+///   stylesheet set, which no longer names `client.css`. That empty declaration
+///   is what tells the browser to withdraw its copy (pinned per cell in
+///   `tests/hmr_css_matrix.rs`), and it comes from the ROUND, never from a
+///   failed fetch: a 404 stays governed by the never-reload discipline.
+#[test]
+fn a_removed_stylesheet_leaves_no_sidecar_and_declares_none() {
+    let dir = temp_project("css_removed");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    // Round 1 emits a stylesheet; the edit below switches the compile-time emit
+    // to a `txt` asset, so the bundle stays byte-identical and the ONLY thing
+    // the round changes is the stylesheet's presence.
+    write(&dir, "src/client.vl", &presence_client_source("css"));
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+    );
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        let sidecar = dir.join("dist/client.css");
+        assert!(
+            wait_for_file(&sidecar, deadline),
+            "round 1 should have written dist/client.css"
+        );
+        let token = dev_token(&dir, "client", deadline);
+        assert_eq!(
+            dev_get(port, "/asset/client.css", &token),
+            b".added{color:red}\n".to_vec(),
+            "round 1's sidecar should be served by the dev channel"
+        );
+        let mut sse = SseClient::connect(port, &token);
+
+        // The edit that REMOVES the stylesheet.
+        write(&dir, "src/client.vl", &presence_client_source("txt"));
+
+        let swap_event = sse.expect_event("swap", deadline);
+        assert!(
+            swap_event.contains("\"sheets\":[]"),
+            "the round must DECLARE that it emits no stylesheet — an empty set is \
+             the statement that withdraws the page's copy: {swap_event}"
+        );
+
+        // The resurrection fix: the sidecar is gone from disk, so the dev
+        // channel has nothing stale left to hand anybody.
+        let start = Instant::now();
+        while sidecar.exists() && start.elapsed() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !sidecar.exists(),
+            "a round that emits no stylesheet must leave none behind — \
+             {} survived the round that stopped emitting it",
+            sidecar.display()
+        );
+        let head = http_get_head(port, &format!("/asset/client.css?token={token}"));
+        assert!(
+            head.starts_with("HTTP/1.1 404"),
+            "the dev channel must no longer serve the removed stylesheet: {head}"
+        );
+    }));
+
+    support::kill_watcher(&mut watcher);
     if outcome.is_ok() {
         let _ = std::fs::remove_dir_all(&dir);
     }
