@@ -7723,6 +7723,41 @@ impl Formatter {
         }
     }
 
+    /// Renders the SUBJECT of a postfix — a call's callee, a `.member`, an
+    /// `[index]` — parenthesizing when the subject binds looser than the postfix
+    /// does. Member access and call are JS's tightest-binding forms, so a
+    /// subject that is not an atom, a literal or another postfix gets its
+    /// operand stolen unless it is wrapped: `await (f()).x` parses as
+    /// `await ((f()).x)`, reading the member off the PROMISE rather than the
+    /// value, which is a silent wrong answer (B141).
+    ///
+    /// This is `operand`'s counterpart on the other side of the precedence
+    /// question. `operand` asks whether a child survives unwrapped in
+    /// BINARY-OPERAND position, where the danger is a child that binds too
+    /// loosely to hold together; this asks whether it survives in
+    /// POSTFIX-SUBJECT position, where the danger is the same but the threshold
+    /// is the highest one JS has, so the test is a flat "is this a postfix or an
+    /// atom" rather than a numeric comparison.
+    fn postfix_subject(&self, node: &js::Node, level: usize) -> String {
+        let rendered = self.node(node, "", level);
+        let wrap = matches!(
+            node,
+            // `await` is a unary prefix: every postfix binds tighter than it.
+            js::Node::Await(_)
+                | js::Node::Unary(_, _)
+                | js::Node::Binary(_, _, _)
+                // JS parses an assignment greedily, as `operand` also notes.
+                | js::Node::Assignment(_, _)
+                // A closure called directly must be parenthesised: `(() => …)()`.
+                | js::Node::Closure(_)
+        );
+        if wrap {
+            format!("({rendered})")
+        } else {
+            rendered
+        }
+    }
+
     /// Renders one JavaScript node at block-nesting `level` (used to indent the
     /// bodies of any nested blocks). It emits no leading indent of its own — a
     /// statement's indent is added by `sequence`, an expression is rendered inline
@@ -7799,13 +7834,7 @@ impl Formatter {
                 format!("throw {}{}", self.node(value, "", level), terminator)
             }
             js::Node::Call(subject, args) => {
-                let s_subject = self.node(subject, "", level);
-                // A closure called directly must be parenthesised: `(() => …)()`.
-                let s_subject = if matches!(&**subject, js::Node::Closure(_)) {
-                    format!("({s_subject})")
-                } else {
-                    s_subject
-                };
+                let s_subject = self.postfix_subject(subject, level);
                 let s_args = args
                     .iter()
                     .map(|x| self.node(x, "", level))
@@ -7881,11 +7910,11 @@ impl Formatter {
                 )
             }
             js::Node::Property(subject, member) => {
-                let s_subject = self.node(subject, "", level);
+                let s_subject = self.postfix_subject(subject, level);
                 format!("{}.{}{}", s_subject, member, terminator)
             }
             js::Node::PropertyIndex(subject, member) => {
-                let s_subject = self.node(subject, "", level);
+                let s_subject = self.postfix_subject(subject, level);
                 let s_member = self.node(member, "", level);
                 format!("{}[{}]{}", s_subject, s_member, terminator)
             }

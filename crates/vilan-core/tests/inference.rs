@@ -9508,6 +9508,156 @@ fn sync_method_through_generic_bound_is_not_made_async() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// B141: a postfix applied to an `await` must parenthesise the await.
+//
+// The emitter rendered an await as the prefix form `await (<operand>)` — it
+// parenthesised the OPERAND but never the whole await-expression — and the
+// postfix arms rendered their subject with no parens of their own. Member
+// access and call bind TIGHTER than the `await` unary, so `await (f()).x`
+// parsed as `await ((f()).x)`: the property was read off the PROMISE and the
+// program silently got `undefined`, with a clean `vilan check` and exit 0.
+//
+// These pin the shape class, one per postfix form, by RUNNING the emitted
+// program and asserting the value — the miscompile is invisible to
+// `assert_compiles`, which is exactly how it survived into released
+// toolchains. Every helper below awaits, so every call to it is implicitly
+// awaited; the async transparency the language promises is precisely the
+// inline spelling these pin.
+
+/// The shared preamble: async helpers whose calls are implicitly awaited.
+const AWAIT_POSTFIX_PRELUDE: &str = r#"
+        import std::print;
+        [extern("Promise.resolve")]
+        async external fun resolved(value: i32): i32;
+        struct Row { id: i32, name: str }
+        struct Boxed { n: i32 }
+        impl Boxed { fun doubled(self): i32 { self.n * 2 } }
+        fun fetch_row(): Row { resolved(0); Row { id = 7, name = "seven" } }
+        fun fetch_list(): List<i32> { resolved(0); [10, 20, 30] }
+        fun fetch_num(): i32 { resolved(0); 5 }
+        fun fetch_boxed(): Boxed { resolved(0); Boxed { n = 21 } }
+        fun fetch_maker(): || i32 { resolved(0); || 99 }
+"#;
+
+fn await_postfix_program(body: &str) -> String {
+    format!("{AWAIT_POSTFIX_PRELUDE}        fun main() {{ {body} }}")
+}
+
+#[test]
+fn a_field_off_an_implicitly_awaited_call_reads_the_value() {
+    // B141's headline shape. Emitted `await (fetch_row())[0]` — `undefined`.
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_row().id);"), "7\n");
+}
+
+#[test]
+fn a_method_off_an_implicitly_awaited_call_reads_the_value() {
+    // A built-in method lowers to a `.length` property access, so it is the
+    // field shape again: emitted `await (fetch_list()).length` — `undefined`.
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_list().len());"), "3\n");
+}
+
+#[test]
+fn a_call_of_an_implicitly_awaited_callable_invokes_the_value() {
+    // Calling the closure an async function returned. Emitted
+    // `await (fetch_maker())()` — which is `await ((fetch_maker())())`, a call
+    // of the PROMISE: this shape did not go silent, it threw
+    // `TypeError: fetch_maker(...) is not a function`. Not in B141's original
+    // probe; found widening the class from "postfix" to "call as well".
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_maker()());"), "99\n");
+}
+
+#[test]
+fn a_postfix_chain_off_an_implicitly_awaited_call_reads_the_value() {
+    // Two postfix links off one await (`.name` then `.len()`). Threw
+    // `Cannot read properties of undefined` — the first link already had the
+    // promise, so the second had `undefined`.
+    assert_compiles_and_runs(
+        &await_postfix_program("print(fetch_row().name.len());"),
+        "5\n",
+    );
+}
+
+#[test]
+fn a_field_off_an_explicitly_awaited_task_reads_the_value() {
+    // The bug was NOT confined to the implicit await: a hand-written
+    // `(await pending).id` — parens and all — emitted `await (pending)[0]` and
+    // read `undefined`. The user's own parentheses were dropped, then the
+    // subject was re-rendered without them. Also outside B141's original probe.
+    assert_compiles_and_runs(
+        &await_postfix_program("let pending = async fetch_row(); print((await pending).id);"),
+        "7\n",
+    );
+}
+
+#[test]
+fn a_subscript_off_an_implicitly_awaited_call_reads_the_value() {
+    // This shape was already CORRECT before the fix — but only by accident:
+    // `__at()` wraps the await in a call ARGUMENT, which parenthesises it for
+    // free. Pinned so it cannot regress silently if that helper is ever
+    // inlined to a bare `[..]`, which would put the await straight back into
+    // postfix-subject position.
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_list()[0]);"), "10\n");
+}
+
+#[test]
+fn a_user_method_off_an_implicitly_awaited_call_reads_the_value() {
+    // The other accident: a user method lowers to a FREE function call, so the
+    // await lands in argument position and is parenthesised for free. Pinned
+    // for the same reason as the subscript.
+    assert_compiles_and_runs(
+        &await_postfix_program("print(fetch_boxed().doubled());"),
+        "42\n",
+    );
+}
+
+#[test]
+fn binding_an_awaited_call_before_a_postfix_reads_the_value() {
+    // The CONTROL: the bound spelling was always correct, which is why std and
+    // the whole corpus — which bind — never saw B141. If this ever goes red the
+    // failure is somewhere else entirely.
+    assert_compiles_and_runs(
+        &await_postfix_program(
+            "let row = fetch_row(); let l = fetch_list(); print(row.id); print(l.len());",
+        ),
+        "7\n3\n",
+    );
+}
+
+#[test]
+fn an_await_in_operand_position_is_not_gratuitously_parenthesised() {
+    // The counter-pin for the fix's blast radius. `await` binds TIGHTER than
+    // every binary operator, so an await in operand position needs no parens
+    // and must not acquire any — the fix is context-aware, not a blanket
+    // `(await x)`. Pinned on the emitted bytes because that is the property at
+    // risk: a blanket wrap would still run correctly and move every golden.
+    let js = compile(&await_postfix_program(
+        "print(fetch_num() + 1); print(fetch_num() > 3);",
+    ))
+    .expect("compiles");
+    assert!(
+        js.contains("await (fetch_num()) + 1") && js.contains("await (fetch_num()) > 3"),
+        "an await in binary-operand position must stay unwrapped:\n{js}"
+    );
+    assert!(
+        !js.contains("(await (fetch_num()))"),
+        "an await in binary-operand position must not be wrapped:\n{js}"
+    );
+}
+
+#[test]
+fn a_postfix_off_an_await_is_parenthesised_in_the_emitted_js() {
+    // The structural twin of the execution pins: the emitted bytes, so a
+    // regression is legible as `await (f()).x` rather than only as a wrong
+    // number. `(await (…))[0]` — the inner parens are the await's own operand
+    // parens, the outer are the fix.
+    let js = compile(&await_postfix_program("print(fetch_row().id);")).expect("compiles");
+    assert!(
+        js.contains("(await (fetch_row()))[0]"),
+        "the await must be parenthesised under a postfix:\n{js}"
+    );
+}
+
 #[test]
 fn generic_element_serialized_in_a_closure_through_a_bounded_method() {
     // A closure passed to a generic method (`feed.each(|T| ..)`) on a parameterized-bound
