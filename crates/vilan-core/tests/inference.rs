@@ -25210,7 +25210,6 @@ fn a_read_path_escaping_the_package_root_is_refused() {
 const EMIT_KIND_REFUSAL: &str = "`asset::emit` kinds name one file beside the build output";
 
 #[test]
-#[ignore = "E94: `asset::emit`'s kind is not sanitized, so `../evil` becomes an output-path segment that escapes dist/"]
 fn an_emit_kind_escaping_the_output_directory_is_refused() {
     assert_fails_with(
         r#"
@@ -25228,7 +25227,6 @@ fn an_emit_kind_escaping_the_output_directory_is_refused() {
 }
 
 #[test]
-#[ignore = "E94: `asset::emit`'s kind is not sanitized, so a bare separator like `a/b` becomes a nested output path"]
 fn an_emit_kind_carrying_a_separator_is_refused() {
     // Not an escape, but the same mistake: `a/b` is two segments, so it names a
     // file in a directory the build never made. Refused by the same rule.

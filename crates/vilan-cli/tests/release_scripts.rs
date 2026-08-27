@@ -1012,14 +1012,11 @@ fn the_installer_verifies_the_download_when_a_sha256_tool_is_present() {
     );
 }
 
-/// Item 15's S half, unfixed: `checksum()` treats "no sha256 tool on PATH" as
-/// a reason to SKIP verification rather than as a reason to stop. It says so
-/// on stdout through `say()` — no `install:` prefix, no stderr, exit 0 — and
-/// the download is unpacked unverified, which is the whole of the defect: the
-/// one machine that cannot check the bytes is the one that installs them
-/// blind. An installer that cannot verify must refuse, and must not offer
-/// "skipping" as an outcome on either stream.
-#[ignore = "L15: install.sh warns and installs unverified when no sha256 tool is on PATH; it must refuse instead"]
+/// Item 15's S half: `checksum()` fails CLOSED. "No sha256 tool on PATH" is a
+/// reason to stop, never a reason to SKIP verification — the one machine that
+/// cannot check the bytes is exactly the one that must not install them blind.
+/// The refusal speaks in `install:`'s own voice on stderr with a non-zero exit,
+/// and "skipping" is not an outcome the installer may offer on either stream.
 #[test]
 fn the_installer_refuses_when_no_sha256_tool_can_verify_the_download() {
     let installer = Installer::new("unverifiable", None);
