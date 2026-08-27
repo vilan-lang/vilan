@@ -68,7 +68,17 @@ Where the cursor is decides what is offered.
   `match … { }`), which sort last.
 - **After `.`** offers the receiver's fields and methods; **after `?.`**
   offers the *lifted* element's, so an `Option<Profile>` offers `Profile`'s
-  members.
+  members. What counts as "after `.`" ignores the whitespace and comments
+  around it, so a chain written down the page (`items`, then `.filter(f)` on
+  the next line) completes at each link; and what follows the cursor never
+  changes the answer, so completing *between* two links works too.
+  The methods include the ones the receiver's type inherits as **trait
+  defaults** — `xs.iter().` offers the whole `Iterator` surface, not the one
+  method `ListIterator`'s own `impl` block writes out, and a type that
+  implements `Ord` offers `min`/`max`/`clamp` with the comparisons its
+  supertraits provide.
+- **Inside a string or a comment** nothing is offered. A caption is text, not
+  code, and a `.` in one is not a member access.
 - **After `::`** offers an enum's variants and statics, a struct's statics,
   or a module's members — and only when the name on the left is actually
   **in scope**. It used to match that name against every type the compiler
