@@ -1475,6 +1475,85 @@ mod tests {
         );
     }
 
+    /// kolt.local 007, face one ("newly **added** css styles do not HMR
+    /// correctly"), pinned at the layer that decides it.
+    ///
+    /// A browser leg whose css goes `None` -> `Some` is the FIRST-EVER
+    /// stylesheet of the session: the previous round emitted no sidecar, so the
+    /// document the app's own server rendered carries no `<link>` for
+    /// `client.css` at all. A `css` push is defined only where the `<link>`
+    /// idiom already holds — hmr.md §2 says so in as many words ("Requires the
+    /// `<link>` idiom; an app that inlines its CSS gets a full `swap` instead")
+    /// — and the shim implements exactly that: `bumpStylesheets` walks
+    /// `link[rel="stylesheet"]` and matches on the asset's basename, so with no
+    /// matching link it walks zero elements, injects no `<style>`, and returns
+    /// `undefined`. The round is announced and nothing applies it; the
+    /// never-reload discipline then guarantees nothing ever will, so the new
+    /// styles stay invisible until the developer reloads by hand. That is the
+    /// item's "may have nothing to supersede — where does it land?", answered:
+    /// nowhere.
+    ///
+    /// CORRECT: a css *presence* transition is not a stylesheet hot-swap. It
+    /// changes what the document must LOAD, not what an already-loaded sheet
+    /// says, so it belongs to the class the design already reserves for "the
+    /// browser cannot patch this in place" — `swap`, carrying the version bump
+    /// every other browser-output change carries.
+    ///
+    /// TODAY: `Push::Css(["client.css"])` with no bump — the classifier's css
+    /// line only asks `old.css != leg.css`, never whether either side is `None`.
+    #[test]
+    #[ignore = "kolt.local 007 (open): a first-ever stylesheet is still classified as a `css` hot-swap, and the shim has no `<link>` to supersede — the push lands nowhere"]
+    fn a_first_ever_stylesheet_is_not_a_css_hot_swap() {
+        let previous = round("s0", "c0", None);
+        let next = round("s0", "c0", Some(".a{}"));
+        assert_eq!(
+            classify(&previous, &next, Some("server")),
+            RoundDecision {
+                restart_server: false,
+                push: Some(Push::Swap),
+                bump_version: true,
+            }
+        );
+    }
+
+    /// kolt.local 007's *removed* cell — the third column of the matrix the item
+    /// asks for ("asset new / changed / removed") and the mirror of the cell
+    /// above. This one is worse than a push that lands nowhere: it lands, and it
+    /// lands on stale bytes.
+    ///
+    /// A browser leg whose css goes `Some` -> `None` emitted no stylesheet this
+    /// round. `main.rs`'s dist writer only writes `dist/<leg>.css` inside
+    /// `if let Some(css) = &leg.css` and has NO `else` branch, and
+    /// `sweep_stale_chunks` (the one thing that does delete) only ever removes
+    /// `<leg>.<arm>.js` chunks and `<leg>.chunks.json` — so the PREVIOUS round's
+    /// `dist/client.css` survives on disk untouched. The classifier meanwhile
+    /// announces `css` for `client.css`, the shim fetches
+    /// `/asset/client.css` from the dev channel, gets a healthy 200 carrying
+    /// those stale bytes, and injects them as a `<style>` that supersedes the
+    /// `<link>`. Deleting a stylesheet therefore *reasserts* it, and the fetch
+    /// never fails, so the never-reload discipline is not even the thing hiding
+    /// it — the round looks entirely successful.
+    ///
+    /// CORRECT: as above, a presence transition is a browser-output change, not
+    /// a stylesheet hot-swap — `swap` plus the bump. A `css` push naming a
+    /// sidecar this round did not produce is never right, whatever is on disk.
+    ///
+    /// TODAY: `Push::Css(["client.css"])` with no bump.
+    #[test]
+    #[ignore = "kolt.local 007 (open): a removed stylesheet is still classified as a `css` hot-swap of a sidecar main.rs never deletes, so the browser re-injects the stale bytes"]
+    fn a_removed_stylesheet_is_not_a_css_hot_swap() {
+        let previous = round("s0", "c0", Some(".a{}"));
+        let next = round("s0", "c0", None);
+        assert_eq!(
+            classify(&previous, &next, Some("server")),
+            RoundDecision {
+                restart_server: false,
+                push: Some(Push::Swap),
+                bump_version: true,
+            }
+        );
+    }
+
     #[test]
     fn server_and_client_change_restarts_and_swaps() {
         let previous = round("s0", "c0", Some(".a{}"));
