@@ -5878,7 +5878,6 @@ pub(crate) mod tests {
     // (a) The `.` starts the next line — the ordinary way a long method chain
     // is written. Observed: no candidates at all.
     #[test]
-    #[ignore = "kolt.local 001: member completion does not fire when the `.` starts the next line (the classifier is blind to trivia between receiver and dot)"]
     fn member_completion_fires_when_the_dot_starts_the_next_line() {
         let labels = call_receiver_completions("\tlet p = make();\n\tp\n\t\t.|\n");
         assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
@@ -5892,7 +5891,6 @@ pub(crate) mod tests {
     // while pinning the face above; it is the same fault, so it rides the same
     // fix.
     #[test]
-    #[ignore = "kolt.local 001: a space before the `.` is not read as a member position — the classifier offers the whole scope instead of the receiver's members"]
     fn member_completion_fires_when_a_space_precedes_the_dot() {
         let labels = call_receiver_completions("\tlet p = make();\n\tp . |\n");
         assert!(labels.contains(&"x".to_string()), "fields: {labels:?}");
@@ -5926,7 +5924,6 @@ pub(crate) mod tests {
     // is no code position, so there is nothing to offer. Observed: the whole
     // scope, functions included.
     #[test]
-    #[ignore = "kolt.local 001: function suggestions appear inside a string body — the classifier over-triggers where there is no code position"]
     fn no_completion_inside_a_string_body() {
         let labels = call_receiver_completions("\tlet caption = \"make |\";\n");
         for function in ["make", "echo", "find", "twin"] {
@@ -5935,6 +5932,258 @@ pub(crate) mod tests {
                 "`{function}` is code, and the cursor is inside a string: {labels:?}"
             );
         }
+    }
+
+    // 001's context matrix. The item asks for one cursor-context model and a
+    // matrix that pins each class, so that the next regression is caught by the
+    // class it belongs to rather than by whichever face happens to be reported.
+    // Three rows, one per class of the taxonomy, each asserting what the class
+    // MEANS rather than which branch answered it.
+
+    // A member position is a member position whatever TRIVIA surrounds the dot
+    // and whatever FOLLOWS the cursor. Every row here is the same position.
+    #[test]
+    fn the_context_matrix_reads_every_member_position() {
+        for body in [
+            "\tlet p = make();\n\tp.|\n",
+            "\tlet p = make();\n\tp .|\n",
+            "\tlet p = make();\n\tp. |\n",
+            "\tlet p = make();\n\tp . |\n",
+            "\tlet p = make();\n\tp\n\t\t.|\n",
+            "\tlet p = make();\n\tp\t\t.  |\n",
+            "\tlet p = make();\n\tp // the point\n\t\t.|\n",
+            "\tlet p = make();\n\tp.|.twin();\n",
+            "\tlet p = make();\n\tp.|x;\n",
+            "\tmake()\n\t\t.|\n",
+            "\tmake() .|\n",
+        ] {
+            let labels = call_receiver_completions(body);
+            assert!(
+                labels.contains(&"x".to_string()) && labels.contains(&"twin".to_string()),
+                "a member position offers the receiver's members ({body:?}): {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"str".to_string()) && !labels.contains(&"echo".to_string()),
+                "…and nothing from scope ({body:?}): {labels:?}"
+            );
+        }
+    }
+
+    // Text is not code. A string's body and a comment are the same answer, and
+    // the answer is nothing at all — no scope, no keywords, no snippets.
+    #[test]
+    fn the_context_matrix_offers_nothing_where_there_is_no_code() {
+        for body in [
+            "\tlet caption = \"make |\";\n",
+            "\tlet caption = \"|\";\n",
+            "\tlet caption = \"a.| b\";\n",
+            "\tlet caption = i\"make | now\";\n",
+            "\t// make |\n",
+            "\tlet p = make(); // make |\n",
+            "\tlet p = make();\n\tp.twin(); // p.|\n",
+        ] {
+            let labels = call_receiver_completions(body);
+            assert!(
+                labels.is_empty(),
+                "there is no code position here ({body:?}): {labels:?}"
+            );
+        }
+    }
+
+    // The boundaries the two rows above must not swallow. A cursor ON a
+    // delimiter is code; an interpolation HOLE is code inside a literal; a `//`
+    // inside a string opens no comment; and an ordinary expression position
+    // still offers everything in scope.
+    #[test]
+    fn the_context_matrix_keeps_an_expression_position() {
+        for body in [
+            "\tma|\n",
+            "\tlet caption = \"hi\";\n\tma|\n",
+            "\tlet caption = i\"now {ma|}\";\n",
+            "\tlet caption = \"http://example.com\"; ma|\n",
+            "\tlet caption = \"hi\"|;\n",
+            "\tlet p = make(); // a note\n\tma|\n",
+        ] {
+            let labels = call_receiver_completions(body);
+            assert!(
+                labels.contains(&"make".to_string()),
+                "an expression position offers the scope ({body:?}): {labels:?}"
+            );
+        }
+    }
+
+    // --- kolt.local 033: the inherited trait defaults ----------------------
+    //
+    // Member RESOLUTION, not 001's cursor CONTEXT: the cursor is read
+    // correctly and the answer is short. `push_methods` gathered only
+    // `implementation.declarations` — what an impl block itself declares — so
+    // every method a trait provides with a DEFAULT BODY was invisible on every
+    // implementing type.
+    //
+    // The rule the gatherer now mirrors is the analyzer's own
+    // (`inherited_default_candidates`): a trait's default-bodied instance
+    // methods are inherited onto the concrete surface, `[trait_only]` ones are
+    // not, supertraits count, and the impl's own declaration wins the name.
+
+    /// A trait with one required member and one default-bodied member, an impl
+    /// that takes the default, and an impl that OVERRIDES it — the four pins
+    /// below all read this one program.
+    const TRAIT_DEFAULT_PRELUDE: &str = "trait Greeter {\n\
+         \tfun name(self): str;\n\
+         \tfun greet(self): str { self.name() }\n\
+         }\n\
+         struct Polite { }\n\
+         impl Polite with Greeter { fun name(self): str { \"polite\" } }\n\
+         struct Loud { }\n\
+         impl Loud with Greeter {\n\
+         \tfun name(self): str { \"loud\" }\n\
+         \tfun greet(self): str { \"LOUD\" }\n\
+         }\n";
+
+    // 033, the owner's shape: `list.iter().` offered `next` and nothing else —
+    // one method of fifteen, because `impl ListIterator<type T> with
+    // Iterator<T>` declares exactly `next` and the other fourteen are
+    // `trait Iterator<T>`'s defaults.
+    #[test]
+    fn member_completion_offers_a_traits_inherited_defaults() {
+        let labels = completions_at_cursor(
+            "fun main() {\n\tlet xs: List<i32> = List::new();\n\txs.iter().|\n}\n",
+        );
+        for adapter in [
+            "map",
+            "filter",
+            "take",
+            "skip",
+            "enumerate",
+            "zip",
+            "chain",
+            "to_list",
+            "fold",
+            "for_each",
+            "count",
+            "any",
+            "all",
+            "rev",
+        ] {
+            assert!(
+                labels.contains(&adapter.to_string()),
+                "`{adapter}` is an inherited `Iterator` default: {labels:?}"
+            );
+        }
+    }
+
+    // 033: the required member is NOT a default, so it reaches the list the way
+    // it always did — through the impl that must declare it. The contrast is the
+    // point: the fix adds the trait's defaults without disturbing this.
+    #[test]
+    fn member_completion_still_offers_a_requirement_from_its_impl() {
+        let labels = completions_at_cursor(
+            "fun main() {\n\tlet xs: List<i32> = List::new();\n\txs.iter().|\n}\n",
+        );
+        assert!(
+            labels.contains(&"next".to_string()),
+            "`next` has no default body and comes from the impl: {labels:?}"
+        );
+        let labels = completions_at_cursor(&format!(
+            "{TRAIT_DEFAULT_PRELUDE}fun main() {{\n\tlet p = Polite {{ }};\n\tp.|\n}}\n"
+        ));
+        assert_eq!(
+            labels.iter().filter(|label| *label == "name").count(),
+            1,
+            "the requirement, once, from the impl that declares it: {labels:?}"
+        );
+    }
+
+    // 033: `Ord` is the std case that is not an iterator — a type implementing
+    // it offers `min`/`max`/`clamp`, and through the SUPERTRAITS (`Ord with Eq
+    // + PartialOrd`) the comparisons a reader expects to find with them.
+    #[test]
+    fn member_completion_offers_the_ord_defaults_and_its_supertraits() {
+        let labels = completions_at_cursor(
+            "import std::compare::{ Eq, Ord, PartialEq, PartialOrd };\n\
+             struct Version { major: i32 }\n\
+             impl Version with PartialEq {\n\
+             \tfun eq(self, b: Version): bool { self.major == b.major }\n\
+             }\n\
+             impl Version with Eq { }\n\
+             impl Version with PartialOrd {\n\
+             \tfun compare(self, b: Version): i32 { self.major - b.major }\n\
+             }\n\
+             impl Version with Ord { }\n\
+             fun main() {\n\tlet v = Version { major = 1 };\n\tv.|\n}\n",
+        );
+        for default in ["min", "max", "clamp"] {
+            assert!(
+                labels.contains(&default.to_string()),
+                "`{default}` is an `Ord` default: {labels:?}"
+            );
+        }
+        for inherited in ["ne", "lt", "le", "gt", "ge"] {
+            assert!(
+                labels.contains(&inherited.to_string()),
+                "`{inherited}` reaches `Ord` through a supertrait: {labels:?}"
+            );
+        }
+    }
+
+    // 033: an impl that OVERRIDES a default offers that member exactly ONCE —
+    // the naive union offers it twice, from the impl and from the trait.
+    #[test]
+    fn member_completion_offers_an_overridden_default_exactly_once() {
+        let overriding = completions_at_cursor(&format!(
+            "{TRAIT_DEFAULT_PRELUDE}fun main() {{\n\tlet l = Loud {{ }};\n\tl.|\n}}\n"
+        ));
+        assert_eq!(
+            overriding.iter().filter(|label| *label == "greet").count(),
+            1,
+            "the override, once: {overriding:?}"
+        );
+        let inheriting = completions_at_cursor(&format!(
+            "{TRAIT_DEFAULT_PRELUDE}fun main() {{\n\tlet p = Polite {{ }};\n\tp.|\n}}\n"
+        ));
+        assert_eq!(
+            inheriting.iter().filter(|label| *label == "greet").count(),
+            1,
+            "the inherited default, once: {inheriting:?}"
+        );
+    }
+
+    // 033's companion finding, pinned so it stays a finding. Hover and
+    // go-to-definition do NOT share completion's blind spot, and the reason is
+    // structural rather than lucky: they read the target the ANALYZER already
+    // resolved at the call site (`wire_method_call` records the TRAIT's own
+    // declaration id behind the call, whichever tier resolved it), so an
+    // inherited default hovers as the trait's signature and jumps to the
+    // trait's default body. Completion is the one surface that cannot borrow
+    // that answer, because it must speak for a member not yet typed — which is
+    // why it was the only surface with the hole.
+    #[test]
+    fn hover_and_definition_reach_an_inherited_trait_default() {
+        let source = format!(
+            "{TRAIT_DEFAULT_PRELUDE}fun main() {{\n\tlet p = Polite {{ }};\n\tp.greet();\n}}\n"
+        );
+        let call = source.rfind("greet").expect("the call site") + 2;
+        let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
+        let hover = document
+            .hover(call)
+            .expect("hovering an inherited default should answer");
+        assert!(
+            hover.contains("fun greet(self): str"),
+            "the trait's own signature: {hover}"
+        );
+        let (_, span) = document
+            .definition(call)
+            .expect("go-to-definition on an inherited default should answer");
+        assert_eq!(
+            source.get(span.into_range()),
+            Some("greet"),
+            "the name it lands on"
+        );
+        assert_eq!(
+            span.into_range().start,
+            source.find("fun greet").expect("the trait's default body") + "fun ".len(),
+            "the DEFAULT BODY in the trait, since `impl Polite with Greeter` declares none"
+        );
     }
 
     // --- E67: an element's opening tag (editing-dx.md §18) ------------------

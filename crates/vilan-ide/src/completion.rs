@@ -589,6 +589,125 @@ fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
     (name > 0).then_some(start + 1 + name)
 }
 
+/// What the cursor is IN — the classification [`Analysis::completion`]
+/// dispatches on, and the general answer to kolt.local 001.
+///
+/// The engine used to read the two bytes immediately before the cursor and
+/// dispatch on them. That made it blind along two axes at once, and every face
+/// the owner reported was one of them: TRIVIA (a `.` that started the next line
+/// was not a member position, and a space before the `.` turned one into a bare
+/// scope position offering all eighty names in scope), and the difference
+/// between CODE and TEXT (a string body was not distinguished from an
+/// expression, so a caption offered every function in scope). Asking the
+/// question once, in one place, is what stops the next face being a fourth
+/// patch — the three earlier faces (E66's call receiver, E67's element head)
+/// each arrived as their own branch of the same byte-pair dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorContext {
+    /// Not a code position at all — inside a string literal's body, or inside a
+    /// `//` comment. Nothing is offered.
+    NoCode,
+    /// A macro name: `[Na…` at an item position, or inside `[derive(…)`.
+    MacroName,
+    /// Inside an element's opening tag (E67). `chain` is the `.` that commits
+    /// the head item to the chain form rather than to an attribute.
+    ElementHead { chain: bool },
+    /// Inside an import path (E57) — names come from the package tree.
+    ImportPath,
+    /// A member position: after a `.`, whatever trivia surrounds it and whatever
+    /// follows the cursor. `receiver_end` is one past the receiver's last byte
+    /// (which is where the pre-001 dispatch simply assumed the `.` was), and
+    /// `lifted` marks the `?.` form (proposal/try-and-lift.md §5).
+    Member { receiver_end: usize, lifted: bool },
+    /// A `::` path position; `path_start` is the first `:`.
+    Path { path_start: usize },
+    /// An ordinary expression position: the names in scope.
+    Expression,
+}
+
+/// The member context at `start` — the cursor with the partial identifier being
+/// typed scanned off — or `None` when the cursor is not after a `.`.
+///
+/// Read in TOKEN space, which is the whole of what makes it trivia-blind: the
+/// lexer already knows that whitespace and `//` comments are not significant, so
+/// asking it for "the last thing that ended before here" needs no second notion
+/// of trivia to drift from the first. The receiver is likewise the token before
+/// the `.` rather than the byte before it, which is what lets a chain be written
+/// down the page (`p\n\t\t.|`).
+fn member_context(tokens: &[(Token, Span)], start: usize) -> Option<CursorContext> {
+    let dot = tokens
+        .iter()
+        .rposition(|(_, span)| span.into_range().end <= start)?;
+    if !matches!(tokens[dot].0, Token::Ctrl('.')) {
+        return None;
+    }
+    let before = dot.checked_sub(1)?;
+    // `?.` lexes as two tokens (`lexing.rs`: "`.` splits `?.`/`..` apart"), so
+    // the lifted form is the `?` sitting between the receiver and the dot.
+    let lifted = matches!(tokens[before].0, Token::Op("?"));
+    let receiver = if lifted {
+        before.checked_sub(1)?
+    } else {
+        before
+    };
+    Some(CursorContext::Member {
+        receiver_end: tokens[receiver].1.into_range().end,
+        lifted,
+    })
+}
+
+/// Whether `offset` (LIVE space) is TEXT rather than code — inside a string
+/// literal's body, or inside a `//` comment. Both are the same answer to
+/// completion (nothing at all), and neither was visible to the byte-pair
+/// dispatch that preceded the context model.
+///
+/// A string is read off the lexer's own tokens, so there is no second notion of
+/// where one ends. The NARROWEST containing token decides, which is what keeps
+/// an interpolation HOLE a code position: `i"…"`'s wrapper tokens all carry the
+/// whole literal's span while the hole's tokens carry their own
+/// (`lexing.rs::emit_interpolated`), so the narrowest span containing the cursor
+/// is the hole's where the cursor is in one and the literal's where it is not.
+/// A cursor exactly ON a delimiter is outside — containment is strict, so
+/// `|"a"` and `"a"|` are both code.
+fn in_no_code_position(text: &str, tokens: &[(Token, Span)], offset: usize) -> bool {
+    let mut narrowest: Option<usize> = None;
+    let mut narrowest_is_string = false;
+    for (token, span) in tokens {
+        let range = span.into_range();
+        if range.start >= offset || offset >= range.end {
+            continue;
+        }
+        let width = range.end - range.start;
+        let is_string = matches!(token, Token::String(_) | Token::MultilineString(_));
+        match narrowest {
+            Some(best) if best < width => {}
+            Some(best) if best == width => narrowest_is_string |= is_string,
+            _ => {
+                narrowest = Some(width);
+                narrowest_is_string = is_string;
+            }
+        }
+    }
+    narrowest_is_string || in_line_comment(text, tokens, offset)
+}
+
+/// Whether `offset` sits after a `//` on its own line. A comment leaves no
+/// token to read — the lexer discards it as trivia — so this is the one place
+/// the classifier scans bytes for itself, and the token spans are still what
+/// rule out a `//` that is inside a string (`"http://…"` opens no comment).
+fn in_line_comment(text: &str, tokens: &[(Token, Span)], offset: usize) -> bool {
+    let cursor = offset.min(text.len());
+    let line_start = text[..cursor].rfind('\n').map(|at| at + 1).unwrap_or(0);
+    text[line_start..cursor].match_indices("//").any(|(at, _)| {
+        let position = line_start + at;
+        !tokens.iter().any(|(token, span)| {
+            matches!(token, Token::String(_) | Token::MultilineString(_))
+                && span.into_range().start < position
+                && position < span.into_range().end
+        })
+    })
+}
+
 impl<'a, 'src> Analysis<'a, 'src> {
     /// Completion candidates at `offset` — a LIVE-space offset (the caller
     /// converts an LSP `Position` through `line_index`, never `analyzed_offset`:
@@ -615,62 +734,52 @@ impl<'a, 'src> Analysis<'a, 'src> {
         while start > 0 && is_identifier_byte(bytes[start - 1]) {
             start -= 1;
         }
-        // `[Na|` at an item position (the line holds only the attribute so
-        // far) and `[derive(Na|` complete registered macro names — the last
-        // piece of the macro-LSP tail. Macro names are always bare, so they
-        // bypass the call-suppression below.
-        if start >= 1 && bytes[start - 1] == b'[' {
-            let line_start = text[..start - 1].rfind('\n').map(|at| at + 1).unwrap_or(0);
-            if text[line_start..start - 1].trim().is_empty() {
-                return self.macro_name_completions();
-            }
+        let (tokens, _errors) = tokenize(text);
+        let context = self.cursor_context(text, &tokens, offset, start);
+        match context {
+            // Text, not code (kolt.local 001): a name here is a caption or a
+            // note, and every candidate would be wrong.
+            CursorContext::NoCode => return Vec::new(),
+            // Macro names are always bare, so they bypass the call-suppression
+            // below.
+            CursorContext::MacroName => return self.macro_name_completions(),
+            CursorContext::ElementHead { chain } => return self.element_head_completions(chain),
+            _ => {}
         }
-        if start >= 1 && bytes[start - 1] == b'(' && text[..start - 1].ends_with("[derive") {
-            return self.macro_name_completions();
-        }
-        // An element's opening tag is its own world too (E67): between `<div`
-        // and `>` the desugar takes an attribute, an `on:event(…)` or a
-        // `.method(…)` chain link — and nothing that is merely in scope. The
-        // check runs from `start` (the head item being typed), and the `.`
-        // just before it is the same disambiguator the grammar uses.
-        if self.in_element_head(start) {
-            return self.element_head_completions(start >= 1 && bytes[start - 1] == b'.');
-        }
-        // An import path is its own world (E57): a name there is being reached
-        // FOR THE FIRST TIME, so none of the in-scope machinery below applies —
-        // candidates come from the package tree, and the head of the path names
-        // an origin (`std`, `pkg`, a dependency), which is not an entity at all.
-        // This check routes the GATHERING; the shaping post-pass below is the
-        // separate, older use of it.
-        let in_import = in_import_path(text, offset);
-        let mut candidates = if in_import {
-            self.import_completions(text, offset)
-        } else if start >= 1 && bytes[start - 1] == b'.' {
+        // An import path takes names from the package tree, and it also shapes
+        // the post-pass below (no snippets, no call-shaped insertion).
+        let in_import = context == CursorContext::ImportPath;
+        let mut candidates = match context {
+            CursorContext::ImportPath => self.import_completions(text, offset),
             // `a?.` completes on the LIFTED element (`Option<Profile>` offers
             // Profile's members — proposal/try-and-lift.md §5).
-            if start >= 2 && bytes[start - 2] == b'?' {
-                self.lifted_member_completions(start - 2)
-            } else {
-                self.member_completions(start - 1)
+            CursorContext::Member {
+                receiver_end,
+                lifted: true,
+            } => self.lifted_member_completions(receiver_end),
+            CursorContext::Member {
+                receiver_end,
+                lifted: false,
+            } => self.member_completions(receiver_end),
+            CursorContext::Path { path_start } => self.code_path_completions(text, path_start),
+            _ => {
+                // An ordinary expression position: the cursor's own scope,
+                // resolved in ANALYZED space (E52) — `path_completions` needs
+                // no such conversion, since it answers by NAME across the whole
+                // program rather than by scope containment.
+                let mut scope_candidates = self.scope_completions(self.to_analyzed_offset(offset));
+                // E54c: importable-but-unimported names, LABELED and
+                // edit-carrying (E53's rule stands — nothing here is silent).
+                // Only at this bare scope position; a `.`/`::` receiver is
+                // already resolved to something in scope, so there is nothing to
+                // import there.
+                let in_scope: HashSet<&str> = scope_candidates
+                    .iter()
+                    .map(|candidate| candidate.label.as_str())
+                    .collect();
+                scope_candidates.extend(self.auto_import_completions(&in_scope));
+                scope_candidates
             }
-        } else if start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':' {
-            self.code_path_completions(text, start - 2)
-        } else {
-            // No member/path trigger: the cursor's own scope, resolved in
-            // ANALYZED space (E52) — `path_completions` needs no such
-            // conversion, since it answers by NAME across the whole program
-            // rather than by scope containment.
-            let mut scope_candidates = self.scope_completions(self.to_analyzed_offset(offset));
-            // E54c: importable-but-unimported names, LABELED and edit-carrying
-            // (E53's rule stands — nothing here is silent). Only at this bare
-            // scope position; a `.`/`::` receiver is already resolved to
-            // something in scope, so there is nothing to import there.
-            let in_scope: HashSet<&str> = scope_candidates
-                .iter()
-                .map(|candidate| candidate.label.as_str())
-                .collect();
-            scope_candidates.extend(self.auto_import_completions(&in_scope));
-            scope_candidates
         };
         // A call-shaped insertion is wrong when the callee is already
         // parenthesized — the char right after the cursor is `(`, so the user
@@ -694,6 +803,77 @@ impl<'a, 'src> Analysis<'a, 'src> {
         candidates
     }
 
+    /// What the cursor is IN — the one classification every completion path
+    /// consults (kolt.local 001).
+    ///
+    /// `offset` is the cursor and `start` is the cursor with the partial
+    /// identifier being typed scanned off; both are LIVE space (see
+    /// [`Self::completion`]), and `tokens` is the live text's lexis. The order
+    /// below is a precedence, not a sequence of guesses: text outranks every
+    /// syntactic trigger, the two worlds that suppress scope entirely
+    /// (an element head, an import path) outrank the ordinary triggers, and the
+    /// bare expression position is what is left.
+    ///
+    /// Trivia is the axis this used to be blind to. The member test reads TOKEN
+    /// space, so the lexer's own notion of what is significant decides where the
+    /// receiver and the `.` are — `p.`, `p .`, `p\n\t.` and `p // note\n.` are
+    /// one position, and what FOLLOWS the cursor never enters the question at
+    /// all (`a.|.b` is the `a.` position).
+    fn cursor_context(
+        &self,
+        text: &str,
+        tokens: &[(Token<'_>, Span)],
+        offset: usize,
+        start: usize,
+    ) -> CursorContext {
+        let bytes = text.as_bytes();
+        // Text, not code. First, because every trigger below reads characters
+        // that mean nothing inside one: a `.` in a caption is not a member
+        // access, and a name in a comment is prose.
+        if in_no_code_position(text, tokens, offset) {
+            return CursorContext::NoCode;
+        }
+        // `[Na|` at an item position (the line holds only the attribute so far)
+        // and `[derive(Na|` complete registered macro names — the last piece of
+        // the macro-LSP tail.
+        if start >= 1 && bytes[start - 1] == b'[' {
+            let line_start = text[..start - 1].rfind('\n').map(|at| at + 1).unwrap_or(0);
+            if text[line_start..start - 1].trim().is_empty() {
+                return CursorContext::MacroName;
+            }
+        }
+        if start >= 1 && bytes[start - 1] == b'(' && text[..start - 1].ends_with("[derive") {
+            return CursorContext::MacroName;
+        }
+        // An element's opening tag is its own world (E67): between `<div` and
+        // `>` the desugar takes an attribute, an `on:event(…)` or a `.method(…)`
+        // chain link — and nothing that is merely in scope. The check runs from
+        // `start` (the head item being typed), and the `.` just before it is the
+        // same disambiguator the grammar uses.
+        if self.in_element_head(tokens, start) {
+            return CursorContext::ElementHead {
+                chain: start >= 1 && bytes[start - 1] == b'.',
+            };
+        }
+        // An import path is its own world too (E57): a name there is being
+        // reached FOR THE FIRST TIME, so none of the in-scope machinery applies
+        // — candidates come from the package tree, and the head of the path
+        // names an origin (`std`, `pkg`, a dependency), which is not an entity
+        // at all.
+        if in_import_path(text, offset) {
+            return CursorContext::ImportPath;
+        }
+        if let Some(member) = member_context(tokens, start) {
+            return member;
+        }
+        if start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':' {
+            return CursorContext::Path {
+                path_start: start - 2,
+            };
+        }
+        CursorContext::Expression
+    }
+
     /// Whether `offset` (LIVE space — see [`Self::completion`]) sits in an
     /// element's OPENING TAG, where the desugar takes an attribute, an
     /// `on:event(…)`, or a `.method(…)` chain link (element-syntax.md §2–4).
@@ -707,15 +887,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// flattened `<…>` error node spans the arguments too.
     ///
     /// The token walk reads the LIVE buffer, like the rest of completion's
-    /// dispatch: the character being typed is live by nature.
-    fn in_element_head(&self, offset: usize) -> bool {
+    /// dispatch: the character being typed is live by nature. `tokens` is that
+    /// buffer's lexis, tokenized once by [`Self::cursor_context`] and shared
+    /// with the member test.
+    fn in_element_head(&self, tokens: &[(Token<'_>, Span)], offset: usize) -> bool {
         let text = self.live.text();
         let Some(tag_end) = self.open_tag_end(text, offset) else {
             return false;
         };
-        let (tokens, _errors) = tokenize(text);
         let mut depth = 0usize;
-        for (token, span) in &tokens {
+        for (token, span) in tokens {
             let range = span.into_range();
             if range.start < tag_end {
                 continue;
@@ -829,10 +1010,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .collect()
     }
 
-    /// Fields and methods of the receiver value ending just before the `.` at
-    /// `dot_offset` (LIVE space — see `completion`).
-    fn member_completions(&self, dot_offset: usize) -> Vec<Completion> {
-        let Some(type_id) = self.receiver_nominal_id(dot_offset) else {
+    /// Fields and methods of the receiver value ending at `receiver_end` —
+    /// one past its last byte, LIVE space, as [`CursorContext::Member`] found
+    /// it. Not "one before the `.`": the two coincide only where no trivia
+    /// separates the receiver from the dot (kolt.local 001).
+    fn member_completions(&self, receiver_end: usize) -> Vec<Completion> {
+        let Some(type_id) = self.receiver_nominal_id(receiver_end) else {
             return Vec::new();
         };
         self.nominal_member_completions(type_id)
@@ -855,16 +1038,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
     }
 
     /// Members of the ELEMENT under a lifted chain (`a?.` on an
-    /// `Option<Profile>` offers Profile's members): the receiver ends just
-    /// before the `?` at `question_offset` (LIVE space — see `completion`);
+    /// `Option<Profile>` offers Profile's members): the receiver ends at
+    /// `receiver_end` (LIVE space, as [`CursorContext::Member`] found it) and
     /// its container's first type argument is the element.
-    fn lifted_member_completions(&self, question_offset: usize) -> Vec<Completion> {
+    fn lifted_member_completions(&self, receiver_end: usize) -> Vec<Completion> {
         let program = self.program;
         // A bare name (`p?.`): the binding's declared container type. The NAME
         // comes off the live text, but resolving it is a `program` lookup, so
         // it converts to ANALYZED space first (E52).
-        if let Some(name) = identifier_ending_at(self.live.text(), question_offset) {
-            let analyzed_offset = self.to_analyzed_offset(question_offset);
+        if let Some(name) = identifier_ending_at(self.live.text(), receiver_end) {
+            let analyzed_offset = self.to_analyzed_offset(receiver_end);
             let binding = self
                 .binding_in_scope(name, analyzed_offset)
                 .or_else(|| self.same_file_variable(name, analyzed_offset));
@@ -902,7 +1085,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // `entity_at` also takes the ANALYZED offset (E52). A CALL receiver is
         // resolved structurally (E66); the rendered label is the fallback for
         // whatever that cannot type.
-        question_offset
+        receiver_end
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
@@ -917,18 +1100,19 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .unwrap_or_default()
     }
 
-    /// The nominal struct/enum id of the receiver value ending just before the `.`
-    /// at `dot_offset` (LIVE space — see `completion`).
-    fn receiver_nominal_id(&self, dot_offset: usize) -> Option<Id> {
+    /// The nominal struct/enum id of the receiver value ending at
+    /// `receiver_end` — one past its last byte, LIVE space (see
+    /// [`CursorContext::Member`]).
+    fn receiver_nominal_id(&self, receiver_end: usize) -> Option<Id> {
         // A bare name (`p.`): resolve through scope, or — when the cursor's own
         // statement failed to parse and dropped its local scope — the nearest
         // same-file binding of that name, then read its declared type. Robust while
         // the buffer is mid-edit, which is exactly when completion fires. The
-        // NAME comes off the live text (`dot_offset` is where it is), but
+        // NAME comes off the live text (`receiver_end` is where it ends), but
         // resolving that name against a scope is a `program` lookup, so it
         // converts to ANALYZED space first (E52).
-        if let Some(name) = identifier_ending_at(self.live.text(), dot_offset) {
-            let analyzed_offset = self.to_analyzed_offset(dot_offset);
+        if let Some(name) = identifier_ending_at(self.live.text(), receiver_end) {
+            let analyzed_offset = self.to_analyzed_offset(receiver_end);
             let binding = self
                 .binding_in_scope(name, analyzed_offset)
                 .or_else(|| self.same_file_variable(name, analyzed_offset));
@@ -943,7 +1127,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // with the thing being constructed (`Some(1)` -> `enum Option`), which
         // is right here, but a plain call with the CALLEE's signature
         // (`make()` -> `fn make(): Point`), which never names a type at all.
-        dot_offset
+        receiver_end
             .checked_sub(1)
             .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
@@ -1411,24 +1595,136 @@ impl<'a, 'src> Analysis<'a, 'src> {
         None
     }
 
-    /// Appends `type_id`'s impl methods, restricted to either instance methods
+    /// Appends `type_id`'s methods, restricted to either instance methods
     /// (`want_self`, for `value.`) or static/associated ones (for `Type::`). A
     /// `value.default()` (a static method with no `self`) would not type-check, so
     /// member completion must not offer it.
+    ///
+    /// Two sources, in precedence order: the members the type's impl blocks
+    /// DECLARE, then the default-bodied trait methods those impls INHERIT
+    /// (kolt.local 033). Reading only the first left every default invisible on
+    /// every implementing type — `list.iter().` offered `next` and nothing
+    /// else, because `impl ListIterator<type T> with Iterator<T>` declares
+    /// exactly that one member and `trait Iterator<T>`'s other fourteen are
+    /// defaults. One name is offered ONCE: a declaration wins its name outright,
+    /// which is what makes an impl that overrides a default offer the override
+    /// rather than both.
     fn push_methods(&self, type_id: Id, want_self: bool, items: &mut Vec<Completion>) {
         let program = self.program;
+        let mut offered: HashSet<&str> = HashSet::new();
         for implementation in &program.implementations {
-            if self.impl_subject_id(implementation) == Some(type_id) {
-                for (name, member_id) in &implementation.declarations {
-                    if self.is_self_method(*member_id) == want_self {
-                        items.push(self.entity_completion(
-                            name.to_string(),
-                            *member_id,
-                            CompletionKind::Method,
-                        ));
+            if self.impl_subject_id(implementation) != Some(type_id) {
+                continue;
+            }
+            for (name, member_id) in &implementation.declarations {
+                if self.is_self_method(*member_id) == want_self && offered.insert(name) {
+                    items.push(self.entity_completion(
+                        name.to_string(),
+                        *member_id,
+                        CompletionKind::Method,
+                    ));
+                }
+            }
+        }
+        if want_self {
+            self.push_inherited_defaults(type_id, &mut offered, items);
+        }
+    }
+
+    /// Appends the trait defaults `type_id` inherits: for every impl of the
+    /// type, every default-bodied INSTANCE method its traits (and their
+    /// supertraits) declare and the impls themselves do not — `offered`
+    /// carrying the names already spoken for.
+    ///
+    /// The admission rule is the analyzer's own
+    /// (`Analyzer::inherited_default_candidates`), so the popup and the call
+    /// site agree on what the concrete type provides: a member with no default
+    /// body is never inherited (conformance forces the impl to declare it, and
+    /// the pass above already found it there), a `[trait_only]` default stays
+    /// off the concrete surface (`proposal/transport-rpc.md` §3.2), and a
+    /// static has no inherited path onto a value at all.
+    fn push_inherited_defaults(
+        &self,
+        type_id: Id,
+        offered: &mut HashSet<&'src str>,
+        items: &mut Vec<Completion>,
+    ) {
+        let program = self.program;
+        for implementation in &program.implementations {
+            if self.impl_subject_id(implementation) != Some(type_id) {
+                continue;
+            }
+            for trait_id in &implementation.trait_ids {
+                for home_id in self.trait_with_supertraits(*trait_id) {
+                    let Some(home) = program.traits.get(&home_id) else {
+                        continue;
+                    };
+                    for (name, member_id) in &home.declarations {
+                        if self.member_has_default_body(*member_id)
+                            && !self.declaration_is_trait_only(*member_id)
+                            && self.is_self_method(*member_id)
+                            && offered.insert(name)
+                        {
+                            items.push(self.entity_completion(
+                                name.to_string(),
+                                *member_id,
+                                CompletionKind::Method,
+                            ));
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// `trait_id` plus its transitive supertraits — a trait's full interface
+    /// includes everything its supertraits declare (`trait Ord with Eq +
+    /// PartialOrd` reaches `PartialOrd`'s `lt`/`le`/`gt`/`ge`).
+    fn trait_with_supertraits(&self, trait_id: Id) -> Vec<Id> {
+        let program = self.program;
+        let mut result = Vec::new();
+        let mut pending = vec![trait_id];
+        while let Some(id) = pending.pop() {
+            if result.contains(&id) {
+                continue;
+            }
+            result.push(id);
+            let Some(trait_) = program.traits.get(&id) else {
+                continue;
+            };
+            for supertrait in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) = program.type_id_to_type_map.get(supertrait)
+                {
+                    pending.push(*super_id);
+                }
+            }
+        }
+        result
+    }
+
+    /// Whether a trait member has a source-provided body — a DEFAULT method,
+    /// which an impl of the trait may inherit rather than supply itself.
+    fn member_has_default_body(&self, member_id: Id) -> bool {
+        let program = self.program;
+        match program.entity_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => program
+                .functions
+                .get(function_id)
+                .is_some_and(|function| function.has_body),
+            _ => false,
+        }
+    }
+
+    /// Whether a trait member is marked `[trait_only]` — reachable through a
+    /// bound, never on the concrete type's own member surface.
+    fn declaration_is_trait_only(&self, member_id: Id) -> bool {
+        let program = self.program;
+        match program.entity_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => program
+                .functions
+                .get(function_id)
+                .is_some_and(|function| function.trait_only),
+            _ => false,
         }
     }
 
