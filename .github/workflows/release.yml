@@ -200,12 +200,20 @@ jobs:
       - name: wasm-bindgen
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
       # The 64 MiB `-zstack-size` is the compiler's stack inside the page's
-      # linear memory. Measured (B138, `VILAN_DEPTH_STATS`): a realistic
-      # analysis peaks well under 1 MiB optimized, and the depth-bounded
-      # expression walk caps near 2.3 MiB at native-release frame sizes; the
-      # headroom above that exists for the not-yet-bounded return-inference
-      # chains (~2 KiB per call link optimized — 64 MiB holds chains past
-      # 30,000 calls). Shrink it only when those chains are bounded too.
+      # linear memory. Measured (B138/B139, `VILAN_DEPTH_STATS`): a realistic
+      # analysis peaks well under 1 MiB optimized, and every family the
+      # ANALYZER recurses on is now depth-bounded — the expression walk near
+      # 2.3 MiB and the return-inference chain near 1.1 MiB at native-release
+      # frame sizes, ~3.4 MiB together.
+      #
+      # What holds the number here is no longer the analyzer: it is the PARSER,
+      # which recurses once per level of source nesting at ~20.3 KiB per level
+      # optimized — 4x the bounded expression walk's per-level cost, and the
+      # single deepest consumer in the pipeline — with no depth limit at all.
+      # It also runs FIRST, so it reaches the cliff before any analyzer bound
+      # can refuse: 64 MiB is roughly 3,200 levels of nesting, and past that a
+      # file dies without a diagnostic. Shrink this only when the parser is
+      # bounded too; until then the headroom is what stands in for that bound.
       - name: Build
         run: |
           RUSTFLAGS="-C link-arg=-zstack-size=67108864" \

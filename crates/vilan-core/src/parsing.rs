@@ -2082,6 +2082,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// chumsky choice, so it is omitted.
     fn parse_atom(&mut self) -> Option<Spanned<Node<'src>>> {
         ATOM_PARSES.with(|count| count.set(count.get().saturating_add(1)));
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PARSE);
         if let Some(literal) = self.parse_literal() {
             return Some(literal);
         }

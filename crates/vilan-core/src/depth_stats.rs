@@ -24,6 +24,12 @@
 //! * `expr-walk` — [`DepthFrame`] in `walk_expr_node`: the phase-1 source
 //!   walk, whose depth is the program's syntactic nesting.
 //! * `pattern` — [`DepthFrame`] in `resolve_pattern`: pattern nesting.
+//! * `parse` — [`DepthFrame`] in `parsing::Parser::parse_atom`: the parser's
+//!   own recursion, which runs BEFORE any of the above and is not depth-bounded
+//!   (B139's residual). It was added when the arithmetic-nesting plants showed
+//!   the parser overflowing a stack the analyzer's bounded walk fits in
+//!   comfortably — measuring it is what lets the stack margins be argued from
+//!   the WHOLE pipeline rather than from the analyzer alone.
 //!
 //! Bytes are a stack-pointer high-water mark: [`reset`] anchors the address of
 //! a local at analysis start, and a new peak records how far below that anchor
@@ -49,19 +55,23 @@ pub(crate) const INFER: usize = 0;
 pub(crate) const TYPE_WALK: usize = 1;
 pub(crate) const EXPR_WALK: usize = 2;
 pub(crate) const PATTERN: usize = 3;
-pub(crate) const FAMILY_COUNT: usize = 4;
-const FAMILY_NAMES: [&str; FAMILY_COUNT] = ["infer", "type-walk", "expr-walk", "pattern"];
+pub(crate) const PARSE: usize = 4;
+pub(crate) const FAMILY_COUNT: usize = 5;
+const FAMILY_NAMES: [&str; FAMILY_COUNT] =
+    ["infer", "type-walk", "expr-walk", "pattern", "parse"];
 
 thread_local! {
     static CURRENT: [Cell<usize>; FAMILY_COUNT] =
-        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
+        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
     static PEAK: [Cell<usize>; FAMILY_COUNT] =
-        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
+        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
     static PEAK_BYTES: [Cell<usize>; FAMILY_COUNT] =
-        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
+        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
     static CALLS: [Cell<u64>; FAMILY_COUNT] =
-        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
+        const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
     static BASELINE_SP: Cell<usize> = const { Cell::new(0) };
+    /// Whether an analysis is currently anchored — see [`begin`].
+    static ANCHORED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Whether `VILAN_DEPTH_STATS` asks for the per-analysis depth line (any value
@@ -142,15 +152,25 @@ pub(crate) fn note(family: usize, depth: usize) {
     });
 }
 
-/// Zeroes the peaks and anchors the stack baseline. The top-level analysis
-/// calls this once at its start; macro worlds must not (their depths belong to
-/// the outer run — the guard is at the call site). `CURRENT` is left alone:
-/// it is RAII-balanced, and zeroing it here would corrupt any counted frame
-/// legitimately still open on this thread.
-pub(crate) fn reset() {
-    if !enabled() {
+/// Anchors this analysis: zeroes the peaks and takes the stack baseline, but
+/// only for the FIRST caller — [`report`] releases the anchor again.
+///
+/// There are two pipelines into an analysis: `analyze_source` (the LSP, wasm,
+/// the test harnesses) parses and then calls `analyze`, while the CLI calls
+/// `analyze` itself with a tree it parsed. Both must anchor, and whichever runs
+/// first must WIN: the parser recurses before `analyze` is entered, so an
+/// unconditional re-anchor inside `analyze` would zero the parse family's peak
+/// on exactly the pipeline that can see it. Macro worlds must not anchor at all
+/// (their depths belong to the outer run) — the guard stays at the call sites,
+/// beside the phase marks.
+///
+/// `CURRENT` is left alone: it is RAII-balanced, and zeroing it here would
+/// corrupt any counted frame legitimately still open on this thread.
+pub(crate) fn begin() {
+    if !enabled() || ANCHORED.with(Cell::get) {
         return;
     }
+    ANCHORED.with(|anchored| anchored.set(true));
     PEAK.with(|peaks| peaks.iter().for_each(|cell| cell.set(0)));
     PEAK_BYTES.with(|bytes| bytes.iter().for_each(|cell| cell.set(0)));
     CALLS.with(|calls| calls.iter().for_each(|cell| cell.set(0)));
@@ -169,6 +189,7 @@ pub(crate) fn report() {
     if !enabled() {
         return;
     }
+    ANCHORED.with(|anchored| anchored.set(false));
     let peaks = PEAK.with(|peaks| peaks.each_ref().map(Cell::get));
     let bytes = PEAK_BYTES.with(|bytes| bytes.each_ref().map(Cell::get));
     let calls = CALLS.with(|calls| calls.each_ref().map(Cell::get));
