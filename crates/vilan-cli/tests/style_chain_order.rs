@@ -567,3 +567,38 @@ fn the_map_canonicalization_still_sees_a_real_change() {
         "a changed declaration must survive the canonicalization"
     );
 }
+
+/// The sort's boundary, on the far side of which reordering would be WRONG
+/// (kolt.local 032). A `style()` chain may be permuted because each link owns a
+/// slot and `Style::rule` emits the rule AT THE CALL, independent of position —
+/// which is what the two headline tests above prove. A `declarations()` chain is
+/// the opposite: its links are cascade TEXT, joined in authoring order into one
+/// block, so permuting them changes what the block declares.
+///
+/// What defends it is the root gate — `starts_style_builder` requires the
+/// literal `style ( )` token run — and this pin is what keeps that from being an
+/// accident. The fixture is TOKEN TEXT rather than a compiling program, because
+/// the sort is a token pass and the gate is the whole subject: the two chains
+/// below carry the SAME link names in the same non-canonical order, so the
+/// `style()` one must permute and the `declarations()` one must not. If the two
+/// ever agree, the gate has gone.
+#[test]
+fn a_declarations_chain_is_never_reordered_by_the_style_chain_sort() {
+    let links = ".padding(space(4)).display(Display::Flex)";
+    let permuted = |root: &str| {
+        let source = format!("let s = const {root}(){links};\n");
+        let (tokens, errors) = vilan_core::lexing::tokenize(&source);
+        assert!(errors.is_empty(), "the {root} fixture did not lex");
+        let plain: Vec<Token> = tokens.into_iter().map(|(token, _)| token).collect();
+        vilan_core::formatter::sort_style_chains(plain.clone()) != plain
+    };
+    assert!(
+        permuted("style"),
+        "the fixture must be out of canonical order, or this pin passes for the wrong reason"
+    );
+    assert!(
+        !permuted("declarations"),
+        "the style-chain sort reached a `declarations()` chain — its links are cascade text \
+         joined in authoring order, so permuting them changes what the block declares."
+    );
+}

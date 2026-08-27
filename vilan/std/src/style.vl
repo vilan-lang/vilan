@@ -1323,3 +1323,176 @@ impl Style with Add {
 		Style { rules = rules }
 	}
 }
+
+// --- declaration blocks -----------------------------------------------------------
+
+/// A set of CSS declarations carrying NO slot key, no class name and no
+/// `Style` — the body `declare` puts under an author-chosen selector. Built
+/// like a style chain, but each link appends TEXT: nothing here is hashed, so
+/// nothing here can mint a class name or move one.
+///
+/// This is the other door into the const-only CSS channel, and it is
+/// deliberately narrow. `Style` is how you dress an ELEMENT — atomic, merged
+/// by record update, cascade-free by construction. A declaration block is how
+/// you declare something the element model cannot reach: a theme's custom
+/// properties under `[data-theme="…"]`, a `:root` token table, a reset's
+/// `box-sizing`. Reach for `Style` first; reach for this when the thing being
+/// styled is a selector rather than a view.
+struct Declarations {
+	// `property:value` pairs, `;`-joined; "" while empty.
+	text: str,
+}
+
+/// Opens a declaration chain — `style()`'s counterpart on the text side of
+/// the channel. Nothing reaches the stylesheet until `declare` puts the chain
+/// under a selector (except a token's own `:root` line, which every value
+/// carries onto the sheet the moment it is used, exactly as it does in a
+/// `Style`).
+fun declarations(): Declarations {
+	Declarations { text = "" }
+}
+
+impl Declarations {
+	/// Any property, any value — `Style::raw`'s counterpart, and the spelling
+	/// for the two things this surface exists for: a custom property
+	/// (`--color-ink`) and a plain CSS property under a selector no class
+	/// names.
+	fun raw(self, property: str, value: str): Declarations {
+		check_declaration(property, value);
+		let pair = property + ":" + value;
+		Declarations {
+			text = if self.text == "" {
+				pair
+			} else {
+				self.text + ";" + pair
+			},
+		}
+	}
+
+	/// A `Color`-valued declaration. Carries the colour's own `:root` token
+	/// line onto the sheet the way a `Style` property does, so a ramp token
+	/// spent here is never a dangling `var()`.
+	fun color(self, property: str, value: Color): Declarations {
+		if value.root != "" {
+			emit("css", value.root);
+		}
+		self.raw(property, value.css)
+	}
+
+	/// A `Length`-valued declaration — `color`'s twin, same token discipline.
+	fun length(self, property: str, value: Length): Declarations {
+		if value.root != "" {
+			emit("css", value.root);
+		}
+		self.raw(property, value.css)
+	}
+}
+
+/// Puts `body`'s declarations under `selector`, as one line of CSS text in
+/// the build's stylesheet. It mints NO class, produces no `Style`, touches no
+/// slot key and rehashes nothing — the atomic system is untouched, and a
+/// build that never calls `declare` emits a byte-identical sheet.
+///
+/// It is the escape hatch apps were hand-rolling through `asset::emit`, with
+/// the line surgery removed: the channel appends a LINE, dedups by line and
+/// sorts by line, so a hand-rolled block had to flatten its own declarations
+/// with a string `replace`. `declare` builds the one line itself.
+///
+/// **Ordering.** The block emits inside one cascade layer, `@layer vilan`,
+/// and that IS the ordering rule — there is no band to reason about and no
+/// dependence on where the line lands in the sheet's sort. Unlayered styles
+/// beat layered ones in the cascade whatever their specificity, so **a
+/// `Style` always wins over a declaration block**, and a block can never
+/// reach in and out-specify a view's own rules. That keeps the system's
+/// cascade-free promise intact for everything a `Style` spells, and weakens
+/// it only among blocks an author opted into, where ordinary CSS rules apply
+/// (specificity first, then the sheet's own deterministic line order).
+///
+/// The other face of the same rule: a declaration block cannot override an
+/// UNLAYERED declaration either — including std's own `:root` token lines
+/// (`--space-4`, `--gray-50`) and any hand-written CSS the page loads
+/// unlayered. Declare your own custom properties and read them with
+/// `Color::var` / `Length::var`; that is the recipe the estate already uses,
+/// and it composes with this one exactly.
+///
+/// ```vilan,fragment
+/// const declare(i"[data-theme=\"{id}\"]", declarations()
+///     .color("--color-ink", Color::hex("#fafafa"))
+///     .color("--color-ground", Color::hex("#161616")))
+/// // @layer vilan{[data-theme="iron-dark"]{--color-ink:#fafafa;--color-ground:#161616}}
+/// ```
+fun declare(selector: str, body: Declarations) {
+	check_selector(selector);
+	if body.text == "" {
+		panic(i"the declaration block for \"{selector}\" declares nothing — add a declaration with .raw(..), .color(..) or .length(..), or drop the block");
+	}
+	emit("css", "@layer vilan{" + selector + "{" + body.text + "}}");
+}
+
+/// What a declaration block's SELECTOR must avoid, in the const-time-refusal
+/// style the rest of this module validates in.
+///
+/// A NEWLINE is the structural one: the asset channel is line-granular, so a
+/// newline does not indent the rule, it SPLITS it into two lines that then
+/// dedup and sort independently of each other — which is exactly the tax the
+/// hand-rolled hatch paid with `.replace(";\n--", ";--")`, and refusing it
+/// here is what lets the tax be deleted rather than moved.
+///
+/// A BRACE is the other: the block's braces are `declare`'s to write, and a
+/// selector carrying one either closes the rule early or opens a nested one.
+/// Refusing both braces outright is stronger than requiring them balanced,
+/// and a selector never legitimately contains one.
+///
+/// An AT-RULE is refused by design, not by omission. This surface puts
+/// DECLARATIONS under a selector; a conditional group rule (`@media`,
+/// `@supports`) holds RULES, so `@media (…){color:red}` would be invalid CSS
+/// the moment it were admitted, and the surface's meaning would depend on the
+/// first byte of its argument. `@font-face` — the one at-rule that does hold
+/// declarations — is a separate spelling and is left to its own item.
+/// Everything else a selector needs rides: quotes, brackets, `:`, `>`, `~`,
+/// `,` and spaces are all legal here, which is what makes
+/// `[data-theme="iron-dark"]` and `:root` say what they mean.
+fun check_selector(selector: str) {
+	check_not_blank("a declaration block's selector", selector);
+	for banned in ["\n", "\r"] {
+		if selector.contains(banned) {
+			panic(i"a declaration block's selector cannot contain a newline (got \"{selector}\") — the CSS channel is line-granular, so write the selector on one line");
+		}
+	}
+	for banned in ["{", "}"] {
+		if selector.contains(banned) {
+			panic(i"a declaration block's selector cannot contain '{banned}' (got \"{selector}\") — declare writes the block's braces, so pass the selector alone");
+		}
+	}
+	if selector.trim().starts_with("@") {
+		panic(i"a declaration block's selector cannot be an at-rule (got \"{selector}\") — declare puts declarations under a SELECTOR, and a group at-rule holds rules, not declarations; write the inner selector instead");
+	}
+}
+
+/// What one declaration must avoid. The property name owns the `:` that
+/// separates it from its value and the `;` that separates it from the next
+/// declaration, so it may carry neither; both halves refuse newlines (the
+/// line-granular channel) and braces (the block's own).
+///
+/// A `;` in the VALUE stays legal, deliberately: a data URI carries one
+/// (`url("data:image/svg+xml;base64,…")`), and refusing it would refuse the
+/// inline-asset spelling the estate actually writes.
+fun check_declaration(property: str, value: str) {
+	check_not_blank("a declaration's property", property);
+	check_not_blank(i"the value for \"{property}\"", value);
+	for banned in ["\n", "\r"] {
+		if property.contains(banned) || value.contains(banned) {
+			panic(i"the declaration \"{property}\" cannot contain a newline — the CSS channel is line-granular, so write the declaration on one line");
+		}
+	}
+	for banned in ["{", "}"] {
+		if property.contains(banned) || value.contains(banned) {
+			panic(i"the declaration \"{property}\" cannot contain '{banned}' — declare writes the block's braces");
+		}
+	}
+	for banned in [":", ";"] {
+		if property.contains(banned) {
+			panic(i"a declaration's property cannot contain '{banned}' (got \"{property}\") — it separates the property from its value and from the next declaration; pass the value as the second argument");
+		}
+	}
+}

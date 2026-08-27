@@ -1,5 +1,16 @@
 import std::print;
-import std::style::{ Color, Display, Gradient, Length, RadialExtent, Style, space, style };
+import std::style::{
+	Color,
+	Display,
+	Gradient,
+	Length,
+	RadialExtent,
+	Style,
+	declarations,
+	declare,
+	space,
+	style,
+};
 
 // Typed atomic styles (proposal/ui-styling.md): construction inside `const`
 // via the builder chain; atomic rules and theme vars flow through the asset
@@ -14,7 +25,31 @@ fun card_style(): Style {
 		.hover(style().background(Color::gray(100)))
 }
 
+// A declaration block (kolt.local 032): declarations under a selector the
+// AUTHOR chose, minting no class and touching no slot key. Every line it adds
+// to the golden is an addition — the class names above are byte-identical
+// without it. Each block sits inside `@layer vilan`, which is the whole
+// ordering rule: unlayered styles outrank layered ones whatever their
+// specificity, so a `Style` always wins against a block and the block's
+// position in the sheet's sort decides nothing.
+fun declaration_blocks() {
+	// The exhibit this surface was cut from — kolt's theme.vl emitted this
+	// shape by hand and then flattened its own multi-line declarations with a
+	// string `replace`, because the channel appends a LINE.
+	declare("[data-theme=\"iron-dark\"]", declarations()
+		.raw("--color-ink", "#fafafa")
+		.raw("--color-ground", "#161616"));
+	// A reset is a pile of declaration blocks, and the layer is what makes one
+	// safe to ship beside atomic rules.
+	declare("*", declarations().raw("box-sizing", "border-box"));
+	// A token spent in a block carries its own `:root` line exactly as a
+	// `Style` property does — and here that line is one the styles above
+	// already emitted, so it DEDUPS: the golden grows by the block alone.
+	declare(":root", declarations().color("--brand", Color::gray(50)).length("--pad", space(4)));
+}
+
 fun main() {
+	let _blocks = const declaration_blocks();
 	let card = const card_style();
 	let active = const style().padding(space(6));
 	print(card.class_list());

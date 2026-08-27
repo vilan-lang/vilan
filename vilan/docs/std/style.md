@@ -248,6 +248,91 @@ against both — and the same holds along the attribute axis:
 equally specific and dark wins, so use `dark(hover(..))` when a dark
 theme needs its own hover.
 
+## Declaration blocks
+
+`Style` dresses an *element*. A **declaration block** puts a set of
+declarations under a selector **you** choose — a theme's custom properties
+under `[data-theme="…"]`, a `:root` token table, a reset's `box-sizing` —
+minting no class, producing no `Style` and touching no slot key.
+
+```vilan,fragment
+fun declarations(): Declarations                 // opens a declaration chain
+fun declare(selector: str, body: Declarations)   // puts the block in the stylesheet
+
+impl Declarations {
+    fun raw(self, property: str, value: str): Declarations
+    fun color(self, property: str, value: Color): Declarations     // carries the token's :root line
+    fun length(self, property: str, value: Length): Declarations   // likewise
+}
+```
+
+Like `style()`, this is compile-time-only — `declare` reaches
+`std::asset::emit`, so it belongs inside a `const` expression:
+
+```vilan
+import std::style::{ Color, declare, declarations, space };
+
+fun theme(id: str) {
+    declare(
+        i"[data-theme=\"{id}\"]",
+        declarations()
+            .color("--color-ink", Color::hex("#fafafa"))
+            .color("--color-ground", Color::hex("#161616"))
+            .length("--gap", space(4)),
+    );
+}
+
+let _iron = const theme("iron-dark");
+
+fun main() {}
+```
+
+That emits one line into the build's stylesheet:
+
+```text
+@layer vilan{[data-theme="iron-dark"]{--color-ink:#fafafa;--color-ground:#161616;--gap:var(--space-4)}}
+```
+
+A `Color` or `Length` spent in a block carries its own `:root` token line
+onto the sheet exactly as a `Style` property does, so a ramp or spacing
+token used here is never a dangling `var()`.
+
+### Ordering
+
+Every block emits inside one cascade layer, `@layer vilan`, and that is the
+whole ordering rule. Unlayered styles beat layered ones whatever their
+specificity, so **a `Style` always wins against a declaration block**: a
+block cannot reach in and out-specify a view's own rules, however specific
+the selector it names, and where its line lands in the stylesheet's sort
+decides nothing. Among blocks, ordinary CSS applies — specificity first,
+then the sheet's own deterministic line order.
+
+The other face of the same rule: a block cannot override an **unlayered**
+declaration either, which includes std's own token lines (`--space-4`,
+`--gray-50`) and any hand-written CSS the page loads. Declare your own
+custom properties and read them back with `Color::var` / `Length::var` —
+that composes exactly, and it is what a theme wants anyway.
+
+### Refusals
+
+Checked at const time, each naming its fix:
+
+- a selector that is blank, carries a **newline** — the asset channel is
+  line-granular, so a newline does not indent the rule, it splits it into
+  two independently deduplicated and sorted lines — or carries a **brace**,
+  which is `declare`'s to write;
+- a selector that is an **at-rule**: `declare` puts declarations under a
+  selector, and a group at-rule (`@media`, `@supports`) holds rules, not
+  declarations;
+- a block with **no declarations**;
+- a property carrying `:` or `;`, the two separators it owns, or a blank
+  value. A `;` inside a *value* stays legal, so a data URI rides
+  (`url("data:image/svg+xml;base64,…")`).
+
+`vilan fmt` never reorders a `declarations()` chain. Its links are cascade
+text joined in authoring order, where a `style()` chain's links each own a
+slot and may be sorted freely.
+
 ## Runtime-legal operations
 
 Construction emits rules and therefore lives in `const`; these do not emit

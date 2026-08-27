@@ -357,6 +357,9 @@ std/style.md h2 constructors-and-values
 std/style.md h2 style-methods
 std/style.md h2 conditions
 std/style.md h3 stacking
+std/style.md h2 declaration-blocks
+std/style.md h3 ordering
+std/style.md h3 refusals
 std/style.md h2 runtime-legal-operations
 std/time.md h1 stdtime-reference
 std/time.md h2 instant
