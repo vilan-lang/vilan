@@ -1,0 +1,30 @@
+# Keeps the workflows' SHA-pinned actions moving (L14).
+#
+# Pinning every `uses:` to a commit SHA closes the hijacked-tag hole — a
+# mutable tag re-pointed at hostile code would otherwise execute in the
+# release path, holding the release token. But a pin with nothing tending it
+# is just a frozen dependency, and a frozen action stops receiving its own
+# security fixes: the pin and this file are one measure, not two.
+#
+# Dependabot reads the `# v4.2.2` comment beside each pin as the human-facing
+# version and rewrites BOTH the SHA and the comment when it opens a bump PR,
+# so the pins stay readable as they move.
+#
+# Actions only, on purpose. Cargo dependencies are governed by the lockfile
+# and the workspace's own review, and a second update stream over them is a
+# different decision from this one.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      # One PR for the routine bumps rather than one per action: the review
+      # that matters here is "did the pinned SHA move to something upstream
+      # actually tagged", and that reads better as a single diff.
+      actions:
+        patterns:
+          - "*"
