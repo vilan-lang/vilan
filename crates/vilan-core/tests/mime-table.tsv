@@ -1,0 +1,40 @@
+# The extension -> media type dataset `std::build`'s content-type table is
+# generated from. GENERATED FILE -- do not hand-edit.
+#
+# source:    mime-db 1.54.0 (https://github.com/jshttp/mime-db), MIT licensed.
+#            The IANA/Apache/nginx registries aggregated; the dataset vite's
+#            `mrmime` is generated from too.
+# refresh:   python3 scripts/regen-mime-table.py
+# consumer:  crates/vilan-core/tests/mime_table_sync.rs generates the vilan
+#            `match` arms in vilan/std/src/process/build.vl from these rows
+#            and fails when they drift. It also owns the charset rule: a
+#            `text/*` row is served `; charset=utf-8`, everything else bare.
+#
+# group	extension	media type	provenance
+markup and code	css	text/css	iana
+markup and code	htm	text/html	iana
+markup and code	html	text/html	iana
+markup and code	js	text/javascript	iana
+markup and code	map	application/json	iana
+markup and code	mjs	text/javascript	iana
+data and text	csv	text/csv	iana
+data and text	json	application/json	iana
+data and text	txt	text/plain	iana
+data and text	webmanifest	application/manifest+json	iana
+data and text	xml	application/xml	iana
+images	apng	image/apng	iana
+images	avif	image/avif	iana
+images	bmp	image/bmp	iana
+images	gif	image/gif	iana
+images	ico	image/x-icon	override: web reality over the vnd. registration
+images	jpeg	image/jpeg	iana
+images	jpg	image/jpeg	iana
+images	png	image/png	iana
+images	svg	image/svg+xml	iana
+images	webp	image/webp	iana
+fonts	otf	font/otf	iana
+fonts	ttf	font/ttf	iana
+fonts	woff	font/woff	iana
+fonts	woff2	font/woff2	iana
+other browser-native	pdf	application/pdf	iana
+other browser-native	wasm	application/wasm	iana

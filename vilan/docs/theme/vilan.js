@@ -17,18 +17,19 @@
 
 	hljs.registerLanguage("vilan", function (hljs) {
 		const KEYWORDS = {
-			keyword:
-				"async await borrows const else enum export external for fun if impl " +
-				"import in is jump let macro match mod mut own resource ret struct trait " +
-				"type use with",
+			// GENERATED(keyword-groups): lexing.rs KEYWORDS split by grammar_sync.rs's KEYWORD_ROLES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
+			keyword: "async await borrows const else enum export external for fun if impl import in is jump let macro match mod mut own resource ret struct trait type use with",
 			literal: "true false null void self Self",
+			// END GENERATED(keyword-groups)
 			built_in: "print panic assert",
 		};
 		const NUMBER = {
 			className: "number",
 			variants: [
-				{ begin: "\\b0x[0-9a-fA-F]+(?:[iu](?:8|16|32|53)|f32|f64|[fn])?" },
-				{ begin: "\\b\\d+(?:\\.\\d+)?(?:[iu](?:8|16|32|53)|f32|f64|[fn])?" },
+				// GENERATED(number-suffixes): type_.rs NUMERIC_SUFFIXES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
+				{ begin: "\\b0x[0-9a-fA-F]+(?:f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
+				{ begin: "\\b\\d+(?:\\.\\d+)?(?:f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
+				// END GENERATED(number-suffixes)
 			],
 		};
 		const PLAIN_STRING = {
@@ -70,7 +71,9 @@
 		// one — `[macro]` is a `vilan.toml` section, never a source attribute.
 		const ATTRIBUTE = {
 			className: "meta",
+			// GENERATED(attribute-markers): parsing.rs KNOWN_ATTRIBUTE_MARKERS — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
 			begin: "^\\s*\\[(?:derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b",
+			// END GENERATED(attribute-markers)
 			end: "\\]",
 		};
 		// `context` and `sync` are CONTEXTUAL: the lexer hands both back as

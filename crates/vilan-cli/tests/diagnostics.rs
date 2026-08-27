@@ -629,6 +629,55 @@ fn phase_timing_env_var_prints_the_post_pass_breakdown() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The B138 instrument: with `VILAN_DEPTH_STATS` set, every top-level
+/// analysis prints one stderr line with, per recursive family, the peak
+/// recursion depth and the stack consumed at that peak — the numbers the
+/// compiler's stack margins are sized against (the v0.36.0 incident, commit
+/// 0fb5e5f0, was sized by SIGABRT instead). Off by default, stderr-only,
+/// like the phase line beside it.
+#[test]
+fn depth_stats_env_var_prints_the_depth_line() {
+    let dir = temp_package(
+        "depthstats",
+        "import std::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_DEPTH_STATS", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[vilan depth]"),
+        "VILAN_DEPTH_STATS=1 printed no depth line; stderr was: {stderr}"
+    );
+    for family in ["infer", "type-walk", "expr-walk", "pattern", "parse"] {
+        assert!(
+            stderr.contains(family),
+            "the depth line must name the `{family}` family; stderr was: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("MiB"),
+        "each family carries the stack consumed at its peak, in MiB; \
+         stderr was: {stderr}"
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env_remove("VILAN_DEPTH_STATS");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("[vilan depth]"),
+        "the depth line must be off by default; stderr was: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The batch half of the blackout (`editing-dx.md` S6/§13.1, the P29 shape).
 ///
 /// `check`'s whole job is to answer questions about a file the user is still

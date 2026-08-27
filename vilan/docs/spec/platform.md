@@ -79,19 +79,26 @@ The manifest declares what a directory builds. Sections:
   `project = true` combines with no other key.
 - **`[build]`**: `run`, plus codegen options: `preset` (`"debug"` |
   `"release"`) and the per-feature overrides `indent`, `spaces`,
-  `debug-names`. Build options never change program semantics (§7.6),
-  only the emitted text. `run` is a command line (or a list of them)
-  executed through the host shell **before** each build (each `--watch`
-  round included), in the manifest's directory, in order; a non-zero
-  exit fails the build. `vilan check` builds nothing and runs none.
+  `debug-names`. The **codegen options** never change program semantics
+  (§7.6), only the emitted text; `run` is not one of them. `run` is a
+  command line (or a list of them) executed through the host shell
+  **before** each build (each `--watch` round included), in the
+  manifest's directory, in order; a non-zero exit fails the build. It
+  runs with the invoking user's privileges and environment — no
+  sandbox, no allowlist, no timeout, no prompt — and the implementation
+  prints each command before spawning it. Only the manifest being built
+  contributes hooks: a dependency's `[build] run` is never executed.
+  `vilan check` builds nothing and runs none.
 - **`[macro]`**: the compile-time interpreter budget: `fuel` (steps
   per macro/const run) and `depth` (nested expansion), §9.3/§10.4.
 
-`std`, `pkg`, and `macro_std` are **reserved package names**: they name
-the import roots themselves (§4.2), so a `[package] name` or a key in
-any `dependencies` table claiming one is a manifest error — a dependency
-under such a key could only shadow the root or be unreachable behind it.
-`[library] name` is exempt: the standard library itself is the
+`std`, `pkg`, `macro_std`, and `vilan` are **reserved package names**.
+The first three name the import roots themselves (§4.2), so a
+`[package] name` or a key in any `dependencies` table claiming one is a
+manifest error — a dependency under such a key could only shadow the
+root or be unreachable behind it. `vilan` is the language's own name,
+held for its official namespace; the same claim is refused in the same
+places. `[library] name` is exempt: the standard library itself is the
 `[library]` named `std` (likewise `macro_std`), and a library's own
 name, unlike a dependency key, never binds an import root.
 

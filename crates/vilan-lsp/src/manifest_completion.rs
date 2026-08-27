@@ -331,8 +331,9 @@ pub const TABLES: &[Table] = &[
             Key {
                 name: "run",
                 documentation: "Commands to run through the platform shell BEFORE each \
-                                build, in the manifest's directory. One bare, or several in \
-                                a list. A failure fails the build.",
+                                build, in the manifest's directory, with your own privileges \
+                                and no prompt. One bare, or several in a list. A failure \
+                                fails the build.",
                 values: ValueSet::Open,
             },
             Key {

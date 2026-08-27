@@ -835,7 +835,35 @@ impl f64 {
 	external fun trunc(self): f64;
 }
 
+// --- Type bounds ---
+//
+// `max_value()`/`min_value()` per integer type. vilan has no associated-const
+// or static-member mechanism, so `i8::MAX` has nothing to hang on; the ruling
+// (2026-08-26) was to take the niladic-function spelling now rather than wait
+// for that design. When it lands these become `i8::MAX`/`i8::MIN` and this
+// pair enters L4's `[deprecated("steer")]` window, which rewrites callers —
+// the rename is scheduled, not a surprise, so reach for these freely today.
+//
+// These are the TYPE's range, which is deliberately NOT the LITERAL admission
+// range: `128i8` compiles, because the signed literal check admits the
+// magnitude so that `-128i8` can be written at all (numeric-types.md §3), yet
+// `i8::max_value()` is 127. The wide pair is the symmetric ±2^53 window
+// (spec/lexical.md), one past `Number.MAX_SAFE_INTEGER`. Floats get no pair —
+// docs/std/numbers.md records why.
+
 impl i8 {
+	/// The largest `i8` — `127`. Stopgap spelling for `i8::MAX`; see the type
+	/// bounds note above.
+	fun max_value(): i8 {
+		127i8
+	}
+
+	/// The smallest `i8` — `-128`. Stopgap spelling for `i8::MIN`; see the type
+	/// bounds note above.
+	fun min_value(): i8 {
+		-128i8
+	}
+
 	[extern("Math.abs")]
 	external fun abs(self): i8;
 
@@ -901,6 +929,18 @@ impl i8 {
 }
 
 impl u8 {
+	/// The largest `u8` — `255`. Stopgap spelling for `u8::MAX`; see the type
+	/// bounds note above.
+	fun max_value(): u8 {
+		255u8
+	}
+
+	/// The smallest `u8` — `0`. Stopgap spelling for `u8::MIN`; see the type
+	/// bounds note above.
+	fun min_value(): u8 {
+		0u8
+	}
+
 	[extern("Math.pow")]
 	external fun pow(self, exponent: u8): u8;
 
@@ -963,6 +1003,18 @@ impl u8 {
 }
 
 impl i16 {
+	/// The largest `i16` — `32767`. Stopgap spelling for `i16::MAX`; see the
+	/// type bounds note above.
+	fun max_value(): i16 {
+		32767i16
+	}
+
+	/// The smallest `i16` — `-32768`. Stopgap spelling for `i16::MIN`; see the
+	/// type bounds note above.
+	fun min_value(): i16 {
+		-32768i16
+	}
+
 	[extern("Math.abs")]
 	external fun abs(self): i16;
 
@@ -1028,6 +1080,18 @@ impl i16 {
 }
 
 impl u16 {
+	/// The largest `u16` — `65535`. Stopgap spelling for `u16::MAX`; see the
+	/// type bounds note above.
+	fun max_value(): u16 {
+		65535u16
+	}
+
+	/// The smallest `u16` — `0`. Stopgap spelling for `u16::MIN`; see the type
+	/// bounds note above.
+	fun min_value(): u16 {
+		0u16
+	}
+
 	[extern("Math.pow")]
 	external fun pow(self, exponent: u16): u16;
 
@@ -1090,6 +1154,18 @@ impl u16 {
 }
 
 impl i32 {
+	/// The largest `i32` — `2147483647`. Stopgap spelling for `i32::MAX`; see
+	/// the type bounds note above.
+	fun max_value(): i32 {
+		2147483647i32
+	}
+
+	/// The smallest `i32` — `-2147483648`. Stopgap spelling for `i32::MIN`; see
+	/// the type bounds note above.
+	fun min_value(): i32 {
+		-2147483648i32
+	}
+
 	[extern("Number")]
 	external fun as_f64(self): f64;
 
@@ -1139,6 +1215,18 @@ impl i32 {
 }
 
 impl u32 {
+	/// The largest `u32` — `4294967295`. Stopgap spelling for `u32::MAX`; see
+	/// the type bounds note above.
+	fun max_value(): u32 {
+		4294967295u32
+	}
+
+	/// The smallest `u32` — `0`. Stopgap spelling for `u32::MIN`; see the type
+	/// bounds note above.
+	fun min_value(): u32 {
+		0u32
+	}
+
 	[extern("Number")]
 	external fun as_f64(self): f64;
 
@@ -1188,6 +1276,21 @@ impl u32 {
 }
 
 impl i53 {
+	/// The largest `i53` — `9007199254740992`, the top of the symmetric ±2^53
+	/// window (spec/lexical.md), one past `Number.MAX_SAFE_INTEGER`. Stopgap
+	/// spelling for `i53::MAX`; see the type bounds note above.
+	fun max_value(): i53 {
+		9007199254740992i53
+	}
+
+	/// The smallest `i53` — `-9007199254740992`. The window is symmetric: f64
+	/// carries a sign and magnitude, so the negative end does not reach one
+	/// further the way two's complement does. Stopgap spelling for `i53::MIN`;
+	/// see the type bounds note above.
+	fun min_value(): i53 {
+		-9007199254740992i53
+	}
+
 	[extern("Math.abs")]
 	external fun abs(self): i53;
 
@@ -1253,6 +1356,19 @@ impl i53 {
 }
 
 impl u53 {
+	/// The largest `u53` — `9007199254740992`, the top of the [0, 2^53] window
+	/// (spec/lexical.md), one past `Number.MAX_SAFE_INTEGER`. Stopgap spelling
+	/// for `u53::MAX`; see the type bounds note above.
+	fun max_value(): u53 {
+		9007199254740992u53
+	}
+
+	/// The smallest `u53` — `0`. Stopgap spelling for `u53::MIN`; see the type
+	/// bounds note above.
+	fun min_value(): u53 {
+		0u53
+	}
+
 	[extern("Math.pow")]
 	external fun pow(self, exponent: u53): u53;
 

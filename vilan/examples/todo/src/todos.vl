@@ -26,13 +26,13 @@ import pkg::todo::Todo;
 // `list-style` here, and nothing else since the value types landed.
 
 let shell = const style()
-	.max_width(Length::rem(32))
-	.margin_x(Length::auto())
 	.padding_x(space(4))
 	.padding_y(space(8))
+	.margin_x(Length::auto())
+	.max_width(Length::rem(32))
+	.font_family("system-ui, sans-serif")
 	.font_size(Length::px(16))
-	.line_height(1.5)
-	.font_family("system-ui, sans-serif");
+	.line_height(1.5);
 
 let row = const style().display(Display::Flex).gap(space(2));
 
@@ -44,14 +44,14 @@ let item = const style()
 	.align_items(AlignItems::Center)
 	.padding_y(space(1));
 
-let done_label = const style().opacity(0.5).text_decoration("line-through");
+let done_label = const style().text_decoration("line-through").opacity(0.5);
 
 let button = const style()
 	.padding_x(space(2))
 	.padding_y(space(1))
+	.background(Color::gray(50))
 	.radius(space(1))
 	.border(Length::px(1), Color::gray(300))
-	.background(Color::gray(50))
 	.cursor(Cursor::Pointer)
 	.hover(style().background(Color::gray(100)));
 

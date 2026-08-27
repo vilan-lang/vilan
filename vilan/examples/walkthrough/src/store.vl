@@ -91,7 +91,7 @@ impl NotesStore {
 				});
 				id
 			},
-			None => 0 - 1,
+			None => -1,
 		}
 	}
 
@@ -111,7 +111,7 @@ impl NotesStore {
 				}));
 				note_id
 			},
-			None => 0 - 1,
+			None => -1,
 		}
 	}
 
@@ -130,7 +130,7 @@ impl NotesStore {
 				}));
 				note_id
 			},
-			None => 0 - 1,
+			None => -1,
 		}
 	}
 
@@ -143,7 +143,7 @@ impl NotesStore {
 				self.notes.set_with(|list| list.filter(|note| note.id != note_id));
 				note_id
 			},
-			None => 0 - 1,
+			None => -1,
 		}
 	}
 }

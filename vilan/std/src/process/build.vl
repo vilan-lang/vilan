@@ -16,12 +16,14 @@
 // `std::http`'s `ServerBuilder::serve_build` is its first consumer, and turns
 // the whole ceremony into one line.
 
+import pkg::bytes::Bytes;
 import pkg::fs;
-import pkg::io::panic;
+import pkg::io::{ panic, print };
 import pkg::json::{ JsonValue, coerce_bool, coerce_str };
 import pkg::option::Option::{ None, Some, self };
-import pkg::watch::is_watching;
+import pkg::path;
 import pkg::result::Result::{ Err, Ok, self };
+import pkg::watch::is_watching;
 
 /// What one browser leg's build emitted, as the build itself knows it.
 struct LegBuild {
@@ -44,13 +46,28 @@ struct LegBuild {
 	/// when the leg splits, because chunk resolution reads
 	/// `document.currentScript`, which is `null` inside a module script.
 	classic_script: bool,
+	/// The non-code resources `const asset::bundle` carried into this build,
+	/// as their package-relative names — `static/logo.png` (kolt.local 029).
+	/// Empty for a leg that bundled none.
+	///
+	/// These are what let a built app need nothing but `dist/`. Before them a
+	/// server read its own `src/` at runtime, so shipping the build alone
+	/// shipped a program that 404s its own icon.
+	assets: List<str>,
 }
 
 impl LegBuild {
 	/// Every artifact this build emitted, as `(url, file)` pairs in serving
-	/// order: the bundle, the style sidecar if there is one, then the chunks.
-	/// The url is `/<file name>` — what every shell in this tree already asks
-	/// for, so adopting `serve_build` moves no shell.
+	/// order: the bundle, the style sidecar if there is one, the chunks, then
+	/// the bundled resources. The url is `/<name>` — what every shell in this
+	/// tree already asks for, so adopting `serve_build` moves no shell — and a
+	/// resource keeps its package-relative name, so `static/logo.png` is
+	/// served at `/static/logo.png` and read from `dist/static/logo.png`.
+	///
+	/// The file side is `path::join`ed rather than interpolated: a name may now
+	/// carry a subdirectory, and `join` normalizes the result where
+	/// `i"{dist}/{name}"` would have produced whatever the two sides happened
+	/// to spell (kolt.local 017/029).
 	fun artifacts(self): List<(str, str)> {
 		mut names = [self.bundle];
 		match self.styles {
@@ -60,9 +77,12 @@ impl LegBuild {
 		for chunk in self.chunks {
 			names.push(chunk);
 		}
+		for asset in self.assets {
+			names.push(asset);
+		}
 		mut artifacts: List<(str, str)> = [];
 		for name in names {
-			artifacts.push((i"/{name}", i"{self.dist}/{name}"));
+			artifacts.push((i"/{name}", path::join(self.dist, name)));
 		}
 		artifacts
 	}
@@ -102,13 +122,13 @@ fun build_of(leg: str): Result<LegBuild, BuildError> {
 	// from the project root — the two facts the hand-written `"dist/client.js"`
 	// already assumed, now assumed in exactly one place.
 	let dist = "dist";
-	let path = i"{dist}/{leg}.chunks.json";
-	if !fs::exists(path) {
-		ret Err(BuildError::NotBuilt(path));
+	let manifest_path = path::join(dist, i"{leg}.chunks.json");
+	if !fs::exists(manifest_path) {
+		ret Err(BuildError::NotBuilt(manifest_path));
 	}
-	match fs::read_file_to_str(path).try_parse_json() {
-		None => Err(BuildError::Unreadable(path)),
-		Some(let manifest) => read_manifest(dist, path, manifest),
+	match fs::read_file_to_str(manifest_path).try_parse_json() {
+		None => Err(BuildError::Unreadable(manifest_path)),
+		Some(let manifest) => read_manifest(dist, manifest_path, manifest),
 	}
 }
 
@@ -130,12 +150,7 @@ fun require_build(leg: str): LegBuild {
 /// toolchain writes. Checked rather than coerced: `coerce_str` over an absent
 /// field yields the string `"undefined"`, which would become a route.
 fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, BuildError> {
-	if !manifest.has_field("leg")
-		|| !manifest.has_field("entry")
-		|| !manifest.has_field("styles")
-		|| !manifest.has_field("classic_script")
-		|| !manifest.has_field("chunks")
-	{
+	if !manifest.has_field("leg") || !manifest.has_field("entry") || !manifest.has_field("styles") || !manifest.has_field("classic_script") || !manifest.has_field("chunks") {
 		ret Err(BuildError::Unreadable(path));
 	}
 	let styles = manifest.field("styles");
@@ -143,13 +158,30 @@ fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, B
 	for chunk in manifest.field("chunks").elements() {
 		chunks.push(coerce_str(chunk.field("file")));
 	}
+	// `assets` is read where present and defaults to empty — the ONE field
+	// this function does not require. A manifest written before bundling
+	// existed (kolt.local 029) is not unreadable: it truthfully describes a
+	// build that carried no resources, because under that toolchain none
+	// could be carried. Every other field predates any manifest on disk, so
+	// its absence really does mean "not one this toolchain wrote".
+	mut assets: List<str> = [];
+	if manifest.has_field("assets") {
+		for asset in manifest.field("assets").elements() {
+			assets.push(coerce_str(asset));
+		}
+	}
 	Ok(LegBuild {
 		leg = coerce_str(manifest.field("leg")),
 		dist = dist,
 		bundle = coerce_str(manifest.field("entry")),
-		styles = if styles.is_null() { None } else { Some(coerce_str(styles)) },
+		styles = if styles.is_null() {
+			None
+		} else {
+			Some(coerce_str(styles))
+		},
 		chunks = chunks,
 		classic_script = coerce_bool(manifest.field("classic_script")),
+		assets = assets,
 	})
 }
 
@@ -160,11 +192,20 @@ struct BuildAsset {
 	url: str,
 	/// Where it lives on disk — `dist/client.js`.
 	file: str,
-	/// What its extension implies (`content_type_of`).
+	/// What its extension implies, ready to send — including the charset on a
+	/// `text/*` type, which a raw-byte body needs and cannot supply itself
+	/// (`content_type_of`).
 	content_type: str,
 	/// The bytes read at boot. What is served outside a watch, and what makes a
 	/// missing artifact a boot-time failure rather than a 404 per request.
-	content: str,
+	///
+	/// `Bytes`, not `str`: an artifact is whatever the build wrote, and a UTF-8
+	/// decode is lossy over every one of them that is not text. While this was a
+	/// `str` the content type was a promise the pipeline could not keep — the
+	/// table could name `image/png` for a file it had already destroyed. kolt
+	/// measured the damage on its own favicon: 483 bytes on disk, 853 after the
+	/// read (kolt.local 030).
+	content: Bytes,
 }
 
 /// Read every artifact `build` names, ONCE, at boot — the list
@@ -180,8 +221,12 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 		let (url, file) = artifact;
 		match content_type_of(file) {
 			// Not served rather than guessed at: `serve_build` serves a build,
-			// not a directory. Nothing a vilan build emits lands here today.
-			None => {},
+			// not a directory (`content_type_of`). Reaching this arm now takes
+			// a genuinely foreign extension — an archive, a database, a
+			// document — since the table covers what a build emits and what
+			// the page it serves loads. The drop stays; the skip is SAID, not
+			// silent (kolt.local 022(b)), and the warning names the artifact.
+			None => print(i"warning: the `{build.leg}` build names {file}, whose extension `serve_build` has no content type for — the artifact is not served"),
 			Some(let content_type) => {
 				if !fs::exists(file) {
 					panic(i"the `{build.leg}` build names {file}, which is not on disk — rebuild the leg (`vilan build .`), and run the server from the project root");
@@ -190,7 +235,7 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 					url = url,
 					file = file,
 					content_type = content_type,
-					content = fs::read_file_to_str_sync(file),
+					content = fs::read_bytes(file),
 				});
 			},
 		}
@@ -223,32 +268,110 @@ fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 ///
 /// This makes the SERVER's copies fresh. The dev channel's push half (the css
 /// and js hot-swaps) is untouched and remains the way a browser is told.
-fun asset_body(asset: BuildAsset): str {
+///
+/// The re-read is the ordinary async `read_bytes`, awaited before the response
+/// is built. Nothing on this path forbids suspending: `serve_build`'s handler is
+/// reached from `respond_from_build`, which is `async` because it awaits the
+/// app's own handler, and the node callback in `Server::start` already suspends
+/// on `read_request_bytes` before a byte is written. A synchronous read here
+/// bought nothing, and it once justified its own existence in `std::fs` by
+/// claiming this caller could not suspend.
+///
+/// Both halves read the same way they store: `Bytes` out, decoded by nobody. A
+/// watch that re-read as text would have served a fresh CORRUPTION of every
+/// binary artifact, and differed from the boot copy in exactly the bytes a
+/// `.png` is made of.
+fun asset_body(asset: BuildAsset): Bytes {
 	if is_watching() {
-		fs::read_file_to_str_sync(asset.file)
+		fs::read_bytes(asset.file)
 	} else {
 		asset.content
 	}
 }
 
-/// The content type `file`'s extension implies, or `None` for an extension
-/// this table does not name.
+/// The content type `file`'s extension implies, or `None` for an extension this
+/// table does not name.
 ///
-/// The table is fixed, short, and not user-facing, because `serve_build` serves
-/// A BUILD and not a directory (`fullstack-dx.md` §5.10): it covers exactly the
-/// kinds a vilan build emits, and an extension it does not name is not served
-/// rather than guessed at. (A directory server would need traversal, caching
-/// and binary reads — and `std::fs` cannot read bytes at all today.)
+/// The table is GENERATED, and its rows are not a judgement about what this
+/// language is CAPABLE of serving. That distinction is the correction. The
+/// fence here used to read as a capability claim — no vilan program could read
+/// a binary file at all, so `serve_build` naming `image/png` would have been a
+/// promise it could not keep. That stopped being true: `read_bytes`, `Bytes`
+/// and `body_bytes` all exist, and `BuildAsset` above now carries bytes end to
+/// end (kolt.local 030). Reasoning from the old premise is what left this
+/// module unable to type the artifacts kolt had to hand-roll a static layer for.
+///
+/// What survives is the SCOPE claim, which was always the real one:
+/// `serve_build` serves A BUILD and not a directory (`fullstack-dx.md` §5.10).
+/// A directory server needs traversal, `Range`, caching and conditional
+/// requests — none of which is here, and none of which is bought by knowing
+/// more extensions. So the rows cover what a build emits and what a page it
+/// serves loads as a WHOLE sub-resource, and an extension outside that is still
+/// not served rather than guessed at — the `_ => None` arm, unchanged in
+/// meaning. Audio and video are deliberately absent for the same reason stated
+/// positively: a body served whole, with no `Range`, is one a browser cannot
+/// seek in, so a row for `.mp4` would type a response that does not work.
+///
+/// The rows are derived from `mime-db` — the IANA/Apache/nginx aggregate that
+/// vite's `mrmime` is generated from — via
+/// `crates/vilan-core/tests/mime-table.tsv`, and regenerated and gated by
+/// `crates/vilan-core/tests/mime_table_sync.rs`. Nothing here is typed from
+/// memory, which is the only way a table this shape does not rot.
+///
+/// A `text/*` row spells `charset=utf-8`; nothing else carries a charset. Both
+/// halves are load-bearing. The body goes out as raw bytes (`asset_response`),
+/// so an unspelled `text/css` is decoded by whatever the browser defaults to
+/// rather than as utf8 — while `application/json` and its `+json` relatives are
+/// utf8 BY SPEC, and naming a charset on those is the error, not the fix.
+/// `.webmanifest` earns a row of its own for a third reason: Chrome rejects a
+/// manifest served as anything but `application/manifest+json`.
 fun content_type_of(file: str): Option<str> {
-	if file.ends_with(".js") || file.ends_with(".mjs") {
-		Some("text/javascript")
-	} else if file.ends_with(".css") {
-		Some("text/css")
-	} else if file.ends_with(".json") {
-		Some("application/json")
-	} else if file.ends_with(".html") {
-		Some("text/html")
-	} else {
-		None
+	// The extension comes from `path::extname` (kolt.local 017), not from
+	// `file.split(".").last()`. The hand-rolled form was a copy of `extname`
+	// with `extname`'s two classic bugs in it: `.gitignore` typed as an
+	// extension named `gitignore`, and a dot in a DIRECTORY name read as the
+	// file's type — which stopped being hypothetical the moment a bundled
+	// resource could live in a subdirectory (kolt.local 029). The leading `.`
+	// is dropped here because the table's rows are spelled without it, and it
+	// is lowercased because `FAVICON.PNG` is one file to the build that wrote
+	// it, so it is one row to the table that types it.
+	let extension = path::extname(file);
+	match extension.strip_prefix(".").unwrap_or("").to_lowercase_ascii() {
+		// GENERATED(mime-table): from crates/vilan-core/tests/mime-table.tsv, itself derived from
+		// mime-db 1.54.0 — regenerate: VILAN_REGENERATE_MIME_TABLE=1 cargo test -p vilan-core --test mime_table_sync
+		// markup and code
+		"css" => Some("text/css; charset=utf-8"),
+		"htm" => Some("text/html; charset=utf-8"),
+		"html" => Some("text/html; charset=utf-8"),
+		"js" => Some("text/javascript; charset=utf-8"),
+		"map" => Some("application/json"),
+		"mjs" => Some("text/javascript; charset=utf-8"),
+		// data and text
+		"csv" => Some("text/csv; charset=utf-8"),
+		"json" => Some("application/json"),
+		"txt" => Some("text/plain; charset=utf-8"),
+		"webmanifest" => Some("application/manifest+json"),
+		"xml" => Some("application/xml"),
+		// images
+		"apng" => Some("image/apng"),
+		"avif" => Some("image/avif"),
+		"bmp" => Some("image/bmp"),
+		"gif" => Some("image/gif"),
+		"ico" => Some("image/x-icon"),
+		"jpeg" => Some("image/jpeg"),
+		"jpg" => Some("image/jpeg"),
+		"png" => Some("image/png"),
+		"svg" => Some("image/svg+xml"),
+		"webp" => Some("image/webp"),
+		// fonts
+		"otf" => Some("font/otf"),
+		"ttf" => Some("font/ttf"),
+		"woff" => Some("font/woff"),
+		"woff2" => Some("font/woff2"),
+		// other browser-native
+		"pdf" => Some("application/pdf"),
+		"wasm" => Some("application/wasm"),
+		// END GENERATED(mime-table)
+		_ => None,
 	}
 }

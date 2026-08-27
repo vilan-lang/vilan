@@ -75,13 +75,15 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
-/// nothing but trivia and the canonical import order. Two order-insensitivities
+/// nothing but trivia and the two canonical orders. Three order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
-/// (dropped), and the canonical ordering of a top-level import run (see the
-/// canonical-import-order section below). Everything else must match token for
-/// token, so the net still catches every *other* reordering.
+/// (dropped), the canonical ordering of a top-level import run (see the
+/// canonical-import-order section below), and the canonical ordering of a
+/// `style()` builder chain's links (see the canonical-style-chain-order section).
+/// Everything else must match token for token, so the net still catches every
+/// *other* reordering.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    sort_import_runs(&drop_trailing_commas(tokens))
+    sort_style_chains(sort_import_runs(&drop_trailing_commas(tokens)))
 }
 
 /// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
@@ -196,10 +198,31 @@ fn branch_from_ast<'src>(branch: &ImportBranch<'src>) -> TokenBranch<'src> {
     }
 }
 
+/// The canonical view of a branch for ordering and re-emission: a one-member
+/// brace set whose member is not `self` IS its member — `a::{ b }` and `a::b`
+/// spell the same import (kolt.local 005) — so the shared key and the token
+/// re-emission both see through the braces. Without this, the braced source
+/// and its collapsed reprint would sort a run differently (`BranchKey::Set`
+/// orders after `Path`) and the safety net would refuse the reprint. A lone
+/// `self` keeps its set: it only means something inside braces.
+fn unwrap_singleton_set<'branch, 'src>(
+    branch: &'branch TokenBranch<'src>,
+) -> &'branch TokenBranch<'src> {
+    let mut current = branch;
+    while let TokenBranch::Set(branches) = current {
+        match branches.as_slice() {
+            [only @ TokenBranch::Path(name, _)] if *name != "self" => current = only,
+            _ => break,
+        }
+    }
+    current
+}
+
 /// The order key for one import path — brace sets are sorted internally so equal
-/// paths, whatever their source branch order, produce equal keys.
+/// paths, whatever their source branch order, produce equal keys, and a
+/// one-member set keys as its member ([`unwrap_singleton_set`]).
 fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
-    match branch {
+    match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, None) => {
             BranchKey::Path((*name).to_string(), Box::new(BranchKey::End))
         }
@@ -215,9 +238,11 @@ fn branch_key(branch: &TokenBranch<'_>) -> BranchKey {
 }
 
 /// The canonical sort key for an import/use of `kind` importing `branch`:
-/// root-namespace rank first, then the path after the root.
+/// root-namespace rank first, then the path after the root. A one-member set
+/// ranks as its member ([`unwrap_singleton_set`]), so `import { a };` and its
+/// collapsed reprint `import a;` land in the same place.
 fn import_sort_key(kind: ImportKind, branch: &TokenBranch<'_>) -> ImportSortKey {
-    let (root, rest) = match branch {
+    let (root, rest) = match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, child) => {
             let root = match *name {
                 "std" => RootRank::Std,
@@ -355,9 +380,12 @@ fn parse_import_statement<'src>(
     Some((kind, export, branch, next + 1))
 }
 
-/// Appends the canonical token form of an import path, brace sets sorted.
+/// Appends the canonical token form of an import path, brace sets sorted and a
+/// one-member set collapsed to its member ([`unwrap_singleton_set`], mirroring
+/// `print_import_branch` — kolt.local 005): the safety net must reduce the
+/// braced source and the collapsed reprint to the same canonical tokens.
 fn emit_branch_tokens<'src>(branch: &TokenBranch<'src>, out: &mut Vec<Token<'src>>) {
-    match branch {
+    match unwrap_singleton_set(branch) {
         TokenBranch::Path(name, child) => {
             out.push(Token::Ident(name));
             if let Some(child) = child {
@@ -446,6 +474,414 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
     result
 }
 
+// --- Canonical style-chain order ---------------------------------------------
+//
+// `vilan fmt` canonicalizes the order of the `.name(…)` links in a `style()`
+// builder chain (kolt.local 006). The order is Tailwind CSS's category sequence
+// — layout, flexbox/grid, spacing, sizing, typography, backgrounds, borders,
+// effects, filters, tables, transitions/animation, transforms, interactivity,
+// svg, accessibility — with every CONDITION method after every property method,
+// in the axis order the selector nests them (media → dark → attribute →
+// pseudo): the same shape as Tailwind's plugin putting variant groups last.
+//
+// Two rules keep the reorder SEMANTICS-preserving, which is not optional: a
+// chain merges last-wins per property slot (`vilan/std/src/style.vl`).
+//
+//   * A method the table does not know is a BARRIER — a user `impl Style`
+//     extension (kolt's `paint_primary` writes colour AND background), or one
+//     of the escape hatches whose slot is an argument rather than a name
+//     (`raw`, `with_length`, `with_color`, `with_border`, `rule`). Links sort
+//     only within the runs BETWEEN barriers, and a barrier holds its position
+//     absolutely, so no known method can cross one. That is correct with zero
+//     knowledge of user code, and it degrades gracefully: an all-custom chain
+//     is left exactly as written.
+//   * Methods whose slots are ENTANGLED share a FAMILY and never move relative
+//     to each other — the same property (`line_height` / `line_height_length`),
+//     or a CSS shorthand over it (`padding` over `padding_x` over
+//     `padding_left`, `size` over `width` and `height`, `border` over
+//     `border_color`). `padding` then `padding_x` means something and the
+//     reverse means something else (`proposal/ui-styling.md` §0bis), so the
+//     sort key is the FAMILY's rank, never the method's, and the sort is
+//     stable. Only genuinely independent slots ever cross.
+//
+// What the reorder cannot change is the emitted stylesheet. `Style::rule` emits
+// its atomic rule at the call, and that rule's text — including its
+// content-hashed class name — is a function of the slot key and the declaration
+// alone, never of the link's position in the chain. So the emitted CSS is
+// byte-identical across any permutation, and the surviving slot map is
+// identical across a permutation that respects the two rules above.
+// `crates/vilan-cli/tests/style_chain_order.rs` proves both over a corpus, by
+// building each chain in source and in sorted order and diffing the CSS.
+//
+// `Style + Style` operands are deliberately out of scope: that merge's order is
+// semantic, and only the links inside one `style()` builder sort.
+
+/// Tailwind CSS's category sequence, in order — the canonical group order for a
+/// style chain. Categories with no `Style` method yet are kept so that a method
+/// added later lands in the right place rather than at the end.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum StyleCategory {
+    Layout,
+    FlexboxGrid,
+    Spacing,
+    Sizing,
+    Typography,
+    Backgrounds,
+    Borders,
+    Effects,
+    Filters,
+    Tables,
+    TransitionsAnimation,
+    Transforms,
+    Interactivity,
+    Svg,
+    Accessibility,
+}
+
+/// The four condition axes, in the order the selector nests them (and therefore
+/// the order the condition combinators require at the call site — see
+/// `render_rule` in `vilan/std/src/style.vl`).
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ConditionAxis {
+    Media,
+    Dark,
+    Attribute,
+    Pseudo,
+}
+
+/// One row of the canonical order table: a `Style` property method, the
+/// Tailwind category it belongs to, the slot FAMILY it shares with every method
+/// whose slots are entangled with its own, and the CSS properties it writes.
+///
+/// `properties` is not used by the sort — it is what lets
+/// `crates/vilan-core/tests/style_table_sync.rs` CHECK the `family` column
+/// against `style.vl`'s own shorthand table rather than trust it, instead of
+/// taking the column's word for it.
+#[doc(hidden)]
+pub struct StyleMethod {
+    pub name: &'static str,
+    pub category: StyleCategory,
+    pub family: &'static str,
+    pub properties: &'static [&'static str],
+}
+
+/// The canonical order table. Row order IS the canonical order: rows are grouped
+/// by [`StyleCategory`] in Tailwind's category sequence, and within a category
+/// they follow Tailwind's own property sequence. A family's rows are contiguous,
+/// and the family sorts at its FIRST row's position.
+///
+/// Every `fun name(self, …)` in `style.vl`'s `impl Style` appears here, in
+/// [`STYLE_CONDITION_METHODS`], or in [`STYLE_BARRIER_METHODS`] — gated by
+/// `crates/vilan-cli/tests/style_table_sync.rs`, so a new style method is a red
+/// test rather than a silently unsorted link.
+#[doc(hidden)]
+#[rustfmt::skip]
+pub const STYLE_PROPERTY_METHODS: &[StyleMethod] = &[
+    // --- layout ---
+    StyleMethod { name: "display",               category: StyleCategory::Layout,               family: "display",               properties: &["display"] },
+    StyleMethod { name: "overflow",              category: StyleCategory::Layout,               family: "overflow",              properties: &["overflow"] },
+    StyleMethod { name: "position",              category: StyleCategory::Layout,               family: "position",              properties: &["position"] },
+    // `inset` is the four offsets' shorthand (`family_longhands`), so the five
+    // sort as one unit at `inset`'s position.
+    StyleMethod { name: "inset",                 category: StyleCategory::Layout,               family: "inset",                 properties: &["inset"] },
+    StyleMethod { name: "top",                   category: StyleCategory::Layout,               family: "inset",                 properties: &["top"] },
+    StyleMethod { name: "right",                 category: StyleCategory::Layout,               family: "inset",                 properties: &["right"] },
+    StyleMethod { name: "bottom",                category: StyleCategory::Layout,               family: "inset",                 properties: &["bottom"] },
+    StyleMethod { name: "left",                  category: StyleCategory::Layout,               family: "inset",                 properties: &["left"] },
+    // --- flexbox & grid ---
+    // `flex-direction` shares a prefix with the `flex` shorthand and is NOT
+    // covered by it (`family_longhands` is deliberately not prefix-based), so
+    // it is its own family and may cross `flex`.
+    StyleMethod { name: "flex_direction",        category: StyleCategory::FlexboxGrid,          family: "flex-direction",        properties: &["flex-direction"] },
+    StyleMethod { name: "flex",                  category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex"] },
+    StyleMethod { name: "flex_shrink",           category: StyleCategory::FlexboxGrid,          family: "flex",                  properties: &["flex-shrink"] },
+    StyleMethod { name: "grid_template_columns", category: StyleCategory::FlexboxGrid,          family: "grid-template-columns", properties: &["grid-template-columns"] },
+    StyleMethod { name: "gap",                   category: StyleCategory::FlexboxGrid,          family: "gap",                   properties: &["gap"] },
+    StyleMethod { name: "justify_content",       category: StyleCategory::FlexboxGrid,          family: "justify-content",       properties: &["justify-content"] },
+    StyleMethod { name: "align_items",           category: StyleCategory::FlexboxGrid,          family: "align-items",           properties: &["align-items"] },
+    // --- spacing ---
+    StyleMethod { name: "padding",               category: StyleCategory::Spacing,              family: "padding",               properties: &["padding"] },
+    StyleMethod { name: "padding_x",             category: StyleCategory::Spacing,              family: "padding",               properties: &["padding-left", "padding-right"] },
+    StyleMethod { name: "padding_y",             category: StyleCategory::Spacing,              family: "padding",               properties: &["padding-top", "padding-bottom"] },
+    StyleMethod { name: "padding_top",           category: StyleCategory::Spacing,              family: "padding",               properties: &["padding-top"] },
+    StyleMethod { name: "padding_right",         category: StyleCategory::Spacing,              family: "padding",               properties: &["padding-right"] },
+    StyleMethod { name: "padding_bottom",        category: StyleCategory::Spacing,              family: "padding",               properties: &["padding-bottom"] },
+    StyleMethod { name: "padding_left",          category: StyleCategory::Spacing,              family: "padding",               properties: &["padding-left"] },
+    StyleMethod { name: "margin",                category: StyleCategory::Spacing,              family: "margin",                properties: &["margin"] },
+    StyleMethod { name: "margin_x",              category: StyleCategory::Spacing,              family: "margin",                properties: &["margin-left", "margin-right"] },
+    StyleMethod { name: "margin_y",              category: StyleCategory::Spacing,              family: "margin",                properties: &["margin-top", "margin-bottom"] },
+    StyleMethod { name: "margin_top",            category: StyleCategory::Spacing,              family: "margin",                properties: &["margin-top"] },
+    StyleMethod { name: "margin_right",          category: StyleCategory::Spacing,              family: "margin",                properties: &["margin-right"] },
+    StyleMethod { name: "margin_bottom",         category: StyleCategory::Spacing,              family: "margin",                properties: &["margin-bottom"] },
+    StyleMethod { name: "margin_left",           category: StyleCategory::Spacing,              family: "margin",                properties: &["margin-left"] },
+    // --- sizing ---
+    // `size` writes the same two slots `width` and `height` write, so the three
+    // are one family — Tailwind's width-before-height order survives inside it
+    // only where the source already had it.
+    StyleMethod { name: "width",                 category: StyleCategory::Sizing,               family: "size",                  properties: &["width"] },
+    StyleMethod { name: "height",                category: StyleCategory::Sizing,               family: "size",                  properties: &["height"] },
+    StyleMethod { name: "size",                  category: StyleCategory::Sizing,               family: "size",                  properties: &["width", "height"] },
+    StyleMethod { name: "min_width",             category: StyleCategory::Sizing,               family: "min-width",             properties: &["min-width"] },
+    StyleMethod { name: "max_width",             category: StyleCategory::Sizing,               family: "max-width",             properties: &["max-width"] },
+    StyleMethod { name: "min_height",            category: StyleCategory::Sizing,               family: "min-height",            properties: &["min-height"] },
+    StyleMethod { name: "max_height",            category: StyleCategory::Sizing,               family: "max-height",            properties: &["max-height"] },
+    // --- typography ---
+    StyleMethod { name: "font_family",           category: StyleCategory::Typography,           family: "font-family",           properties: &["font-family"] },
+    StyleMethod { name: "font_size",             category: StyleCategory::Typography,           family: "font-size",             properties: &["font-size"] },
+    StyleMethod { name: "font_weight",           category: StyleCategory::Typography,           family: "font-weight",           properties: &["font-weight"] },
+    StyleMethod { name: "letter_spacing",        category: StyleCategory::Typography,           family: "letter-spacing",        properties: &["letter-spacing"] },
+    StyleMethod { name: "line_height",           category: StyleCategory::Typography,           family: "line-height",           properties: &["line-height"] },
+    StyleMethod { name: "line_height_length",    category: StyleCategory::Typography,           family: "line-height",           properties: &["line-height"] },
+    StyleMethod { name: "text_align",            category: StyleCategory::Typography,           family: "text-align",            properties: &["text-align"] },
+    StyleMethod { name: "color",                 category: StyleCategory::Typography,           family: "color",                 properties: &["color"] },
+    StyleMethod { name: "text_decoration",       category: StyleCategory::Typography,           family: "text-decoration",       properties: &["text-decoration"] },
+    StyleMethod { name: "white_space",           category: StyleCategory::Typography,           family: "white-space",           properties: &["white-space"] },
+    // --- backgrounds ---
+    StyleMethod { name: "background",            category: StyleCategory::Backgrounds,          family: "background-color",      properties: &["background-color"] },
+    StyleMethod { name: "background_gradient",   category: StyleCategory::Backgrounds,          family: "background-image",      properties: &["background-image"] },
+    StyleMethod { name: "background_image",      category: StyleCategory::Backgrounds,          family: "background-image",      properties: &["background-image"] },
+    StyleMethod { name: "background_size",       category: StyleCategory::Backgrounds,          family: "background-size",       properties: &["background-size"] },
+    // --- borders ---
+    // `border-radius` is NOT covered by the `border` shorthand, so it is its own
+    // family; `border_color` IS covered by it, so it is not.
+    StyleMethod { name: "radius",                category: StyleCategory::Borders,              family: "border-radius",         properties: &["border-radius"] },
+    StyleMethod { name: "border",                category: StyleCategory::Borders,              family: "border",                properties: &["border"] },
+    StyleMethod { name: "border_none",           category: StyleCategory::Borders,              family: "border",                properties: &["border"] },
+    StyleMethod { name: "border_top",            category: StyleCategory::Borders,              family: "border",                properties: &["border-top"] },
+    StyleMethod { name: "border_right",          category: StyleCategory::Borders,              family: "border",                properties: &["border-right"] },
+    StyleMethod { name: "border_bottom",         category: StyleCategory::Borders,              family: "border",                properties: &["border-bottom"] },
+    StyleMethod { name: "border_left",           category: StyleCategory::Borders,              family: "border",                properties: &["border-left"] },
+    StyleMethod { name: "border_color",          category: StyleCategory::Borders,              family: "border",                properties: &["border-color"] },
+    // --- effects ---
+    StyleMethod { name: "box_shadow",            category: StyleCategory::Effects,              family: "box-shadow",            properties: &["box-shadow"] },
+    StyleMethod { name: "opacity",               category: StyleCategory::Effects,              family: "opacity",               properties: &["opacity"] },
+    // --- transitions & animation ---
+    StyleMethod { name: "transition",            category: StyleCategory::TransitionsAnimation, family: "transition",            properties: &["transition"] },
+    // --- transforms ---
+    StyleMethod { name: "transform",             category: StyleCategory::Transforms,           family: "transform",             properties: &["transform"] },
+    // --- interactivity ---
+    StyleMethod { name: "cursor",                category: StyleCategory::Interactivity,        family: "cursor",                properties: &["cursor"] },
+    StyleMethod { name: "user_select",           category: StyleCategory::Interactivity,        family: "user-select",           properties: &["user-select"] },
+];
+
+/// The condition combinators, each with the axis it writes. Every condition
+/// sorts after every property method; among themselves they sort by axis, and
+/// two conditions on the SAME axis keep their written order (which is what lets
+/// `media`'s arbitrary min-width sit among `sm`/`md`/`lg`/`xl` without the
+/// formatter having to read its argument).
+#[doc(hidden)]
+#[rustfmt::skip]
+pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
+    ("sm",        ConditionAxis::Media),
+    ("md",        ConditionAxis::Media),
+    ("lg",        ConditionAxis::Media),
+    ("xl",        ConditionAxis::Media),
+    ("media",     ConditionAxis::Media),
+    ("dark",      ConditionAxis::Dark),
+    ("attribute", ConditionAxis::Attribute),
+    ("hover",     ConditionAxis::Pseudo),
+    ("focus",     ConditionAxis::Pseudo),
+    ("active",    ConditionAxis::Pseudo),
+    ("disabled",  ConditionAxis::Pseudo),
+    ("first",     ConditionAxis::Pseudo),
+    ("last",      ConditionAxis::Pseudo),
+    ("pseudo",    ConditionAxis::Pseudo),
+];
+
+/// The `Style` methods that are barriers even though they ARE part of std: the
+/// slot they write is an argument, not the name, so the formatter cannot know
+/// it without evaluating the call. Listed rather than omitted so the
+/// table-completeness gate can tell "deliberately a barrier" from "forgotten".
+///
+/// `add` (the `+` operator's method) and `class_list` are here for the same
+/// reason a user extension is: `add` merges an arbitrary right-hand `Style`,
+/// and `class_list` ends the chain.
+#[doc(hidden)]
+pub const STYLE_BARRIER_METHODS: &[&str] = &[
+    "rule",
+    "raw",
+    "with_length",
+    "with_color",
+    "with_border",
+    "add",
+    "class_list",
+];
+
+/// A link's position in the canonical order. `Property` sorts before every
+/// `Condition`, which is conditions-last; a property carries its FAMILY's rank
+/// (the family's first row in [`STYLE_PROPERTY_METHODS`]) so that a stable sort
+/// can never separate two entangled slots, and a condition carries its axis.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum StyleLinkRank {
+    Property(usize),
+    Condition(ConditionAxis),
+}
+
+/// The canonical rank of a chain link called `name`, or `None` when the name is
+/// a BARRIER — an unknown method (a user `impl Style` extension) or one of
+/// [`STYLE_BARRIER_METHODS`].
+fn style_link_rank(name: &str) -> Option<StyleLinkRank> {
+    if let Some(method) = STYLE_PROPERTY_METHODS.iter().find(|row| row.name == name) {
+        let family_rank = STYLE_PROPERTY_METHODS
+            .iter()
+            .position(|row| row.family == method.family)
+            .expect("the row itself carries the family");
+        return Some(StyleLinkRank::Property(family_rank));
+    }
+    STYLE_CONDITION_METHODS
+        .iter()
+        .find(|(condition, _)| *condition == name)
+        .map(|(_, axis)| StyleLinkRank::Condition(*axis))
+}
+
+/// The canonical permutation of a `style()` chain's link `names`, or `None` when
+/// the chain is already canonical (so every caller can leave an unchanged chain
+/// on its existing code path, byte for byte).
+///
+/// Each maximal run of KNOWN links between barriers sorts on its own; a barrier
+/// keeps its index. The sort is stable, so links sharing a family — which share
+/// a rank — keep their written order.
+///
+/// This is the ONE implementation of the order: the printer permutes an AST
+/// spine with it and the safety net permutes a token slice with it, so the two
+/// cannot disagree about what canonical means.
+fn style_chain_permutation(names: &[&str]) -> Option<Vec<usize>> {
+    let mut order: Vec<usize> = (0..names.len()).collect();
+    let mut run_start = 0;
+    for index in 0..=names.len() {
+        let is_barrier = index == names.len() || style_link_rank(names[index]).is_none();
+        if is_barrier {
+            order[run_start..index]
+                .sort_by_key(|link| style_link_rank(names[*link]).expect("run holds known links"));
+            run_start = index + 1;
+        }
+    }
+    order
+        .iter()
+        .enumerate()
+        .any(|(at, link)| at != *link)
+        .then_some(order)
+}
+
+/// Whether the tokens at `index` open a `style()` builder — the bare call
+/// `style ( )`, not a method call `x.style()` and not a qualified `p::style()`.
+/// The AST side matches the same shape (a `Call` on a bare `Accessor("style")`
+/// with no arguments), which is what keeps the net and the printer in step.
+fn starts_style_builder(tokens: &[Token<'_>], index: usize) -> bool {
+    if !matches!(tokens.get(index), Some(Token::Ident("style"))) {
+        return false;
+    }
+    if matches!(
+        index.checked_sub(1).and_then(|before| tokens.get(before)),
+        Some(Token::Ctrl('.')) | Some(Token::Op("::"))
+    ) {
+        return false;
+    }
+    matches!(tokens.get(index + 1), Some(Token::Ctrl('(')))
+        && matches!(tokens.get(index + 2), Some(Token::Ctrl(')')))
+}
+
+/// One `.name(…)` link of a style chain, as it appears in the token stream: the
+/// method's name, and the token range spanning the whole link (its `.`, its
+/// name, and its balanced argument list).
+type StyleChainLink<'src> = (&'src str, std::ops::Range<usize>);
+
+/// The leading run of `.name(…)` links of the chain that begins at the
+/// `style ( )` at `index`.
+///
+/// The run stops at the first postfix that is not a plain method call —
+/// `.field`, `[i]`, `?`, `!`, a turbofish, a tuple index. Those glue to the link
+/// before them, and past one the receiver is no longer the `Style` this table
+/// describes, so nothing beyond is sorted and nothing crosses the boundary. The
+/// printer stops the run at exactly the same place (`Printer::style_sorted_links`),
+/// which is what keeps the net and the printer in step.
+fn style_chain_links<'src>(
+    tokens: &[Token<'src>],
+    index: usize,
+) -> Option<Vec<StyleChainLink<'src>>> {
+    let mut links = Vec::new();
+    let mut cursor = index + 3;
+    while matches!(tokens.get(cursor), Some(Token::Ctrl('.'))) {
+        // Anything but `. name (` ENDS the run rather than abandoning the
+        // chain: a `.field`, a tuple index or a turbofish glues to the link
+        // before it, and the links already collected still sort among
+        // themselves.
+        let Some(Token::Ident(name)) = tokens.get(cursor + 1) else {
+            break;
+        };
+        if !matches!(tokens.get(cursor + 2), Some(Token::Ctrl('('))) {
+            break;
+        }
+        let mut scan = cursor + 2;
+        let mut depth = 0usize;
+        loop {
+            match tokens.get(scan)? {
+                Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+                Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            scan += 1;
+        }
+        links.push((*name, cursor..scan + 1));
+        cursor = scan + 1;
+    }
+    Some(links)
+}
+
+/// Reorders the `.name(…)` links of every `style()` builder chain into the
+/// canonical order, so that a source chain and the printer's reordered reprint
+/// reduce to the same token sequence. Every other token keeps its position, so
+/// the safety net still catches every other reordering.
+///
+/// Nested chains — a condition's inner `style()` — are reached because the scan
+/// walks straight through a link's argument tokens after emitting the link.
+// `pub` (doc-hidden) only so the external corpus tripwire in
+// `tests/parse_differential.rs` mirrors the net's style-chain canonicalization
+// through this ONE implementation rather than a divergent copy — the same
+// "cannot disagree" guarantee [`sort_import_runs`] carries. Not part of the
+// supported API.
+#[doc(hidden)]
+pub fn sort_style_chains<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
+    let mut result: Vec<Token<'src>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        // A chain the order leaves alone reports no permutation and falls
+        // through to the passthrough below, token for token.
+        let permuted = if starts_style_builder(&tokens, index) {
+            style_chain_links(&tokens, index).and_then(|links| {
+                let names: Vec<&str> = links.iter().map(|(name, _)| *name).collect();
+                style_chain_permutation(&names).map(|order| (links, order))
+            })
+        } else {
+            None
+        };
+        if let Some((links, order)) = permuted {
+            result.extend_from_slice(&tokens[index..index + 3]);
+            for link in order {
+                // The link's own argument tokens are re-scanned by the
+                // recursion, which is what sorts a condition's inner chain.
+                let range = links[link].1.clone();
+                result.extend(sort_style_chains(tokens[range].to_vec()));
+            }
+            index = links
+                .last()
+                .map(|(_, range)| range.end)
+                .expect("a permutation implies at least two links");
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
 // --- Organize imports (the editor action) ------------------------------------
 //
 // The LSP "Organize Imports" source action both *sorts* a file's top-level
@@ -506,6 +942,26 @@ fn prune_import_branch<'src>(
             (!kept.is_empty()).then_some(ImportBranch::Set(kept))
         }
     }
+}
+
+/// The source spans of every TOP-LEVEL `import` / `use` / re-export statement.
+///
+/// The organize-imports usage model needs to tell a reference written by the
+/// file's own CODE from one written by its import list. An import path's
+/// segments resolve to the very definitions its leaves bind, so a model that
+/// counts every reference alike lets an import justify its own existence and it
+/// can then never be pruned — which is what kept an unused `Result::{ self }`
+/// alive forever (kolt.local 004). Returns an empty list when the source does
+/// not parse, which the caller reads as "decide nothing".
+pub fn import_statement_spans(source: &str) -> Vec<Span> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| import_kind_and_branch(&item.0).is_some())
+        .map(|item| item.1)
+        .collect()
 }
 
 /// Organizes a file's *top-level* import runs: sorts each into canonical order
@@ -1631,6 +2087,21 @@ impl<'src> Printer<'src> {
                 let inside_comment = self
                     .import_set_extent(&member_spans)
                     .is_some_and(|extent| self.comment_outside_elements(extent, &member_spans));
+                // A one-member set has a canonical unbraced spelling — `a::{ b }`
+                // IS `a::b` — so the braces collapse (kolt.local 005), recursively
+                // (`a::{ b::{ c } }` reaches `a::b::c`). Two exceptions keep the
+                // braces: `self`, which re-binds the namespace it sits in and only
+                // means that inside braces (`Option::{ self }` publishes
+                // `Option`), and a comment inside them, which is anchored to the
+                // set's split form. `emit_branch_tokens` mirrors this collapse so
+                // the safety net reduces both spellings to the same tokens.
+                if let [only] = order.as_slice() {
+                    if !inside_comment && !matches!(only, ImportBranch::Path("self", ..)) {
+                        self.split = split;
+                        self.print_import_branch(only, sort);
+                        return;
+                    }
+                }
                 if !order.is_empty() && (split != Split::Off || inside_comment) {
                     let open = self
                         .import_set_extent(&member_spans)
@@ -2399,6 +2870,74 @@ impl<'src> Printer<'src> {
         matches!(node, Node::MemberAccessor(_, member) if matches!(member.0, Node::Call(_, _, _)))
     }
 
+    /// The method name of a `.name(…)` call link, when the link is a plain
+    /// method call — no turbofish, and a bare name rather than a computed or
+    /// qualified callee. `None` for every other spine step.
+    fn call_link_name(step: &Spanned<Node<'src>>) -> Option<&'src str> {
+        let Node::MemberAccessor(_, member) = &step.0 else {
+            return None;
+        };
+        let Node::Call(callee, generic_arguments, _) = &member.0 else {
+            return None;
+        };
+        if generic_arguments.is_some() {
+            return None;
+        }
+        match callee.0 {
+            Node::Accessor(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Whether `node` is the `style()` builder that opens a sortable chain — the
+    /// bare, argument-less call, which is what the token-level
+    /// [`starts_style_builder`] recognizes too.
+    fn is_style_builder(node: &Node<'src>) -> bool {
+        matches!(
+            node,
+            Node::Call(callee, None, arguments)
+                if matches!(callee.0, Node::Accessor("style")) && arguments.0.is_empty()
+        )
+    }
+
+    /// `expr`'s chain links in the canonical order (see the
+    /// canonical-style-chain-order section), or `None` when the chain is not a
+    /// sortable `style()` builder or is already canonical — so an unchanged
+    /// chain stays on its existing code path, byte for byte.
+    ///
+    /// Only the LEADING run of `.name(…)` call links sorts. The run stops at the
+    /// first postfix that is not a plain method call — `.field`, `[i]`, `?`,
+    /// `!`, a turbofish — because those glue to the link before them and past
+    /// one the receiver is no longer the `Style` this table describes. The rest
+    /// of the spine is returned untouched, in place. The token-level
+    /// [`style_chain_links`] stops the run at exactly the same place.
+    ///
+    /// Refused outright: a chain with a comment anywhere inside it. A reordered
+    /// chain would carry its comments to the wrong link, and the comment cursor
+    /// only moves forward.
+    fn style_sorted_links<'ast>(
+        &self,
+        expr: &'ast Spanned<Node<'src>>,
+    ) -> Option<Vec<&'ast Spanned<Node<'src>>>> {
+        let (subject, spine) = Self::postfix_spine(expr);
+        if !Self::is_style_builder(&subject.0) {
+            return None;
+        }
+        let names: Vec<&str> = spine
+            .iter()
+            .map_while(|step| Self::call_link_name(step))
+            .collect();
+        let span = expr.1.into_range();
+        if self.has_comment_in(span.start, span.end) {
+            return None;
+        }
+        let order = style_chain_permutation(&names)?;
+        let mut links: Vec<&'ast Spanned<Node<'src>>> =
+            order.into_iter().map(|link| spine[link]).collect();
+        links.extend(&spine[names.len()..]);
+        Some(links)
+    }
+
     /// Whether `expr` is a postfix chain the split form breaks: two or more
     /// `.name(…)` call links. One link is not a chain — breaking it would buy a
     /// line and no clarity.
@@ -2418,8 +2957,38 @@ impl<'src> Printer<'src> {
     /// the caller's, so it glues to the last link. Only ever called for a chain
     /// [`Self::is_breakable_chain`] accepted, so the spine holds at least the
     /// two call links.
+    /// Prints a `style()` chain INLINE from an already-ordered link list — the
+    /// rendering the recursive `MemberAccessor` arm of [`Self::print_expr`]
+    /// produces, with the links taken from `links` instead of from the spine's
+    /// own nesting. Only the LAST link carries the caller's split permission,
+    /// exactly as only the outermost member does in the recursive form, so the
+    /// argument-tail descent reaches the same place.
+    fn print_inline_chain(
+        &mut self,
+        expr: &Spanned<Node<'src>>,
+        links: &[&Spanned<Node<'src>>],
+        split: Split,
+    ) {
+        let (subject, _) = Self::postfix_spine(expr);
+        self.print_postfix_subject(subject);
+        for (at, step) in links.iter().enumerate() {
+            self.split = if at + 1 == links.len() {
+                split
+            } else {
+                Split::Off
+            };
+            self.print_postfix_suffix(step);
+        }
+        self.split = Split::Off;
+    }
+
     fn print_split_chain(&mut self, expr: &Spanned<Node<'src>>) {
-        let (subject, spine) = Self::postfix_spine(expr);
+        let (subject, mut spine) = Self::postfix_spine(expr);
+        // A `style()` builder's links print in the canonical order, not the
+        // written one (kolt.local 006).
+        if let Some(sorted) = self.style_sorted_links(expr) {
+            spine = sorted;
+        }
         // The subject prints exactly as the innermost postfix would print it
         // inline — a `.member`/`[index]` subject through the lift-wrapping rule,
         // a `?`/`!` subject through the plain operand rule.
@@ -3126,6 +3695,15 @@ impl<'src> Printer<'src> {
                 || self.chain_has_spanning_seam(expr))
         {
             self.print_split_chain(expr);
+            return;
+        }
+        // A `style()` builder chain that the canonical order PERMUTES cannot go
+        // through the recursive `MemberAccessor` arm below, which prints the
+        // spine in its written order. It gets the same inline rendering, link by
+        // link, off the sorted spine. A chain the order leaves alone falls
+        // through untouched, so nothing else in the formatter moves.
+        if let Some(links) = self.style_sorted_links(expr) {
+            self.print_inline_chain(expr, &links, split);
             return;
         }
         match &expr.0 {
@@ -4963,8 +5541,8 @@ mod chain_splitting {
              \t.raw(\"font-family\", display_face)\n\
              \t.font_size(Length::px(32.0))\n\
              \t.raw(\"line-height\", \"48px\")\n\
-             \t.font_weight(600)\n\
              \t.margin(space(0))\n\
+             \t.font_weight(600)\n\
              \t+ reveal;\n",
         );
     }
@@ -4983,8 +5561,8 @@ mod chain_splitting {
              \t.raw(\"font-family\", display_face)\n\
              \t.font_size(Length::px(32.0))\n\
              \t.raw(\"line-height\", \"48px\")\n\
-             \t.font_weight(600)\n\
              \t.margin(space(0))\n\
+             \t.font_weight(600)\n\
              \t+ reveal);\n",
         );
     }
@@ -5850,6 +6428,76 @@ mod import_set_layout {
         );
     }
 
+    /// A one-member set has a canonical unbraced spelling (kolt.local 005):
+    /// `a::{ b }` IS `a::b`, so the braces collapse — and recursively, so a
+    /// chain of one-member sets reaches the plain path.
+    #[test]
+    fn a_one_member_set_collapses_to_the_unbraced_spelling() {
+        assert_construct("import std::json::Json;\n", "import std::json::Json;\n");
+        assert_construct("import std::json::{ Json };\n", "import std::json::Json;\n");
+        // A trailing comma changes nothing: it is trivia, not a second member.
+        assert_construct(
+            "import std::json::{ Json, };\n",
+            "import std::json::Json;\n",
+        );
+        // Recursion, both shapes: a one-member set around a multi-member set
+        // collapses to the inner set, and a chain of one-member sets collapses
+        // all the way down to the plain path.
+        assert_construct(
+            "import std::{ json::{ Decode, Encode } };\n",
+            "import std::json::{ Decode, Encode };\n",
+        );
+        assert_construct(
+            "import std::{ json::{ Json } };\n",
+            "import std::json::Json;\n",
+        );
+        // `use` shares the canonical form.
+        assert_construct(
+            "use pkg::shapes::{ Circle };\n",
+            "use pkg::shapes::Circle;\n",
+        );
+        // The run-order interaction `unwrap_singleton_set` exists for: the
+        // braced spelling must RANK where its collapsed form does
+        // (`BranchKey::Set` orders after `Path`), or the reprint orders the
+        // run differently than the net's canonicalization of the source and
+        // the whole file silently bails — the corpus's async-promise-all.vl
+        // shape, caught by exactly that bail.
+        assert_construct(
+            "import std::{ print };\nimport std::task::Task;\n",
+            "import std::print;\nimport std::task::Task;\n",
+        );
+    }
+
+    /// The exception: `self` re-binds the namespace it sits in and only means
+    /// that inside braces (`Option::{ self }` publishes `Option`) — there is no
+    /// unbraced spelling to collapse to, so a lone `self` keeps its braces.
+    #[test]
+    fn a_lone_self_keeps_its_braces() {
+        assert_construct(
+            "import std::option::Option::{ self };\n",
+            "import std::option::Option::{ self };\n",
+        );
+        assert_construct(
+            "import std::option::Option::{ self, };\n",
+            "import std::option::Option::{ self };\n",
+        );
+    }
+
+    /// The organize path rides the same printer, so pruning a set down to one
+    /// member renders the unbraced spelling too — Organize Imports can never
+    /// regenerate the braced form `fmt` collapses.
+    #[test]
+    fn organize_prunes_a_set_down_to_the_unbraced_spelling() {
+        assert_eq!(
+            organize("import std::rpc::{ Dispatcher, call };\n", &["call"]),
+            "import std::rpc::Dispatcher;\n"
+        );
+        assert_eq!(
+            organize("import std::json::{ Json };\n", &[]),
+            format("import std::json::{ Json };\n")
+        );
+    }
+
     /// The boundary: `import p::{ …, X };` is 18 columns around the padded name,
     /// so an 82-character name makes exactly the budget and 83 makes 101.
     #[test]
@@ -6705,14 +7353,14 @@ mod binary_operand_layout {
                       .font_size(Length::px(32.0)).margin(space(0)) + style().color(ink)\
                       .gap(space(4)));\n";
         assert_over_budget(source.trim_end());
-        assert!(columns("\t+ style().color(ink).gap(space(4)));") <= LINE_BUDGET);
+        assert!(columns("\t+ style().gap(space(4)).color(ink));") <= LINE_BUDGET);
         assert_construct(
             source,
             "let both = const (style()\n\
              \t.raw(\"font-family\", display_face)\n\
-             \t.font_size(Length::px(32.0))\n\
              \t.margin(space(0))\n\
-             \t+ style().color(ink).gap(space(4)));\n",
+             \t.font_size(Length::px(32.0))\n\
+             \t+ style().gap(space(4)).color(ink));\n",
         );
     }
 
@@ -6852,7 +7500,7 @@ mod binary_operand_layout {
             "the left-operand chain did not split:\n{once}"
         );
         assert!(
-            once.contains("\t.margin(space(0))\n\t+ reveal;\n"),
+            once.contains("\t.font_weight(600)\n\t+ reveal;\n"),
             "the left-operand continuation moved:\n{once}"
         );
         assert!(
@@ -7089,13 +7737,14 @@ mod organize {
         );
     }
 
-    // A dead brace-set branch shrinks the set (`{ a, b }` → `{ a }`); the whole
-    // import survives because a live branch remains.
+    // A dead brace-set branch shrinks the set — down to the unbraced spelling
+    // when one member remains (`{ alpha, beta }` → `alpha`, kolt.local 005); the
+    // whole import survives because a live branch remains.
     #[test]
     fn a_dead_branch_shrinks_its_set() {
         assert_eq!(
             organize("import std::x::{ alpha, beta };\n", &["beta"]),
-            "import std::x::{ alpha };\n",
+            "import std::x::alpha;\n",
         );
         // The middle of three goes, leaving the two live ones in canonical order.
         assert_eq!(
@@ -7170,7 +7819,7 @@ mod organize {
     }
 
     // Sort and prune compose: the run reorders and the dead leaf disappears in one
-    // edit.
+    // edit — and the surviving one-member set renders unbraced.
     #[test]
     fn sort_and_prune_compose() {
         assert_eq!(
@@ -7178,7 +7827,7 @@ mod organize {
                 "import std::z;\nimport std::a::{ keep, drop };\n",
                 &["drop"],
             ),
-            "import std::a::{ keep };\nimport std::z;\n",
+            "import std::a::keep;\nimport std::z;\n",
         );
     }
 
@@ -7545,5 +8194,407 @@ mod newlines {
         // understand is not one to rewrite, not even its line endings.
         let broken = crlf("fun main( {\n");
         assert_eq!(format(&broken), broken);
+    }
+}
+
+#[cfg(test)]
+mod style_chain_order {
+    //! kolt.local 006 — `vilan fmt` sorts the `.name(…)` links of a `style()`
+    //! builder chain into Tailwind CSS's category order, with the condition
+    //! combinators last in the axis order the selector nests them.
+    //!
+    //! The order is a ruling; the two rules that keep it SAFE are the design.
+    //! A chain merges last-wins per property slot, so (a) a method the table
+    //! does not know is a BARRIER that nothing crosses, and (b) methods whose
+    //! slots are entangled share a FAMILY and never move relative to each
+    //! other. Everything below either pins the ruling or pins one of those two
+    //! rules. `crates/vilan-core/tests/style_table_sync.rs` holds the table to
+    //! `vilan/std/src/style.vl`; `crates/vilan-cli/tests/style_chain_order.rs`
+    //! proves the reorder leaves the emitted CSS byte-identical.
+    use super::bailing_constructs::assert_construct;
+    use super::{
+        STYLE_BARRIER_METHODS, STYLE_CONDITION_METHODS, STYLE_PROPERTY_METHODS, format,
+        style_chain_permutation,
+    };
+
+    // --- The ruling: Tailwind's category order -------------------------------
+
+    /// One representative method per Tailwind category with a `Style` member,
+    /// written in exactly reverse category order, sorts into the sequence
+    /// itself: layout, flexbox/grid, spacing, sizing, typography, backgrounds,
+    /// borders, effects, transitions/animation, transforms, interactivity.
+    #[test]
+    fn the_canonical_order_is_tailwinds_category_sequence() {
+        assert_construct(
+            "let s = const style().user_select(UserSelect::None).transform(\"scale(2)\")\
+             .transition(\"all 1s\").opacity(0.5).border_none().background_size(\"cover\")\
+             .white_space(WhiteSpace::Nowrap).max_height(space(1)).margin(space(1))\
+             .gap(space(1)).display(Display::Flex);\n",
+            "let s = const style()\n\
+             \t.display(Display::Flex)\n\
+             \t.gap(space(1))\n\
+             \t.margin(space(1))\n\
+             \t.max_height(space(1))\n\
+             \t.white_space(WhiteSpace::Nowrap)\n\
+             \t.background_size(\"cover\")\n\
+             \t.border_none()\n\
+             \t.opacity(0.5)\n\
+             \t.transition(\"all 1s\")\n\
+             \t.transform(\"scale(2)\")\n\
+             \t.user_select(UserSelect::None);\n",
+        );
+    }
+
+    /// Inside one category the order is Tailwind's own property sequence —
+    /// `border-radius` before `border-width`, `background-color` before
+    /// `background-image`.
+    #[test]
+    fn within_a_category_the_order_is_tailwinds_property_sequence() {
+        assert_construct(
+            "let s = const style().border_none().radius(space(1));\n",
+            "let s = const style().radius(space(1)).border_none();\n",
+        );
+        assert_construct(
+            "let s = const style().background_image(\"url(t.png)\").background(ink());\n",
+            "let s = const style().background(ink()).background_image(\"url(t.png)\");\n",
+        );
+    }
+
+    // --- Conditions last, in axis order --------------------------------------
+
+    /// Every condition combinator sorts after every property method, however
+    /// early it was written.
+    #[test]
+    fn conditions_sort_after_every_property_method() {
+        assert_construct(
+            "let s = const style().hover(style().color(ink())).padding(space(2));\n",
+            "let s = const style().padding(space(2)).hover(style().color(ink()));\n",
+        );
+    }
+
+    /// Among themselves the conditions follow the axis order the selector nests
+    /// them in — media, dark, attribute, pseudo — which is the order the
+    /// combinators already require when they are NESTED (`style.vl`'s
+    /// `render_rule`). Written here in exactly the reverse.
+    #[test]
+    fn conditions_sort_in_the_axis_order_the_selector_nests() {
+        assert_construct(
+            "let s = const style().hover(a).attribute(\"data-open\", \"true\", b).dark(c).md(d);\n",
+            "let s = const style().md(d).dark(c).attribute(\"data-open\", \"true\", b).hover(a);\n",
+        );
+    }
+
+    /// Two conditions on the SAME axis keep their written order, which is what
+    /// lets `media`'s arbitrary min-width sit among `sm`/`md`/`lg`/`xl` without
+    /// the formatter having to read its argument.
+    #[test]
+    fn two_conditions_on_one_axis_keep_their_written_order() {
+        for chain in [
+            "let s = const style().lg(a).sm(b);\n",
+            "let s = const style().media(\"50rem\", a).sm(b);\n",
+            "let s = const style().focus(a).hover(b);\n",
+        ] {
+            assert_construct(chain, chain);
+        }
+    }
+
+    // --- The barrier rule ----------------------------------------------------
+
+    /// The load-bearing rule. A user `impl Style` extension can write ANY slots
+    /// — kolt's `paint_primary` writes colour AND background — and the
+    /// formatter cannot know which, so moving a known method across it could
+    /// silently change the rendered style. An unknown method therefore holds
+    /// its position absolutely and nothing crosses it.
+    #[test]
+    fn an_unknown_method_is_a_barrier_nothing_crosses() {
+        assert_construct(
+            "let s = const style().color(ink()).paint_primary().padding(space(2));\n",
+            "let s = const style().color(ink()).paint_primary().padding(space(2));\n",
+        );
+    }
+
+    /// The barrier cuts the chain into runs, and each run sorts on its own —
+    /// so the sort still does its work on both sides of a custom method.
+    #[test]
+    fn each_run_between_barriers_sorts_on_its_own() {
+        assert_construct(
+            "let s = const style().color(a).display(b).ghost().opacity(0.5).gap(c);\n",
+            "let s = const style().display(b).color(a).ghost().gap(c).opacity(0.5);\n",
+        );
+    }
+
+    /// Degrades gracefully: a chain of nothing but custom methods is left
+    /// exactly as written.
+    #[test]
+    fn an_all_custom_chain_is_left_alone() {
+        let chain = "let s = const style().paint_ink2().script_label().ghost();\n";
+        assert_construct(chain, chain);
+    }
+
+    /// The std escape hatches are barriers for the same reason a user extension
+    /// is: the slot they write is an ARGUMENT, not the method name, so the
+    /// formatter cannot know it without evaluating the call. `border_none()` IS
+    /// `raw("border", "none")`, and both live instances of the hazard the family
+    /// rules fixed had `raw` on one side.
+    #[test]
+    fn an_escape_hatch_whose_slot_is_an_argument_is_a_barrier() {
+        for hatch in [
+            "raw(\"left\", \"30%\")",
+            "with_length(\"gap\", space(1))",
+            "with_color(\"color\", ink())",
+        ] {
+            let chain = format!("let s = const style().color(a).{hatch}.padding(b);\n");
+            assert_construct(&chain, &chain);
+        }
+    }
+
+    // --- The family rule -----------------------------------------------------
+
+    /// `padding` then `padding_x` means something and the reverse means
+    /// something else (`proposal/ui-styling.md` §0bis), so the two never swap —
+    /// in EITHER written order, which is what proves the pin is about
+    /// preservation and not about one lucky direction.
+    #[test]
+    fn a_shorthand_and_its_longhand_keep_their_written_order() {
+        for chain in [
+            "let s = const style().padding(a).padding_x(b);\n",
+            "let s = const style().padding_x(b).padding(a);\n",
+            "let s = const style().margin_left(a).margin(b);\n",
+            "let s = const style().top(a).inset(b);\n",
+        ] {
+            assert_construct(chain, chain);
+        }
+    }
+
+    /// `size` writes the same two slots `width` and `height` write, so the three
+    /// are one family however they are spelled.
+    #[test]
+    fn size_never_crosses_width_or_height() {
+        for chain in [
+            "let s = const style().size(a).width(b);\n",
+            "let s = const style().height(a).size(b);\n",
+            "let s = const style().height(a).width(b);\n",
+        ] {
+            assert_construct(chain, chain);
+        }
+    }
+
+    /// `border-color` is one of the `border` shorthand's longhands, so
+    /// `border_color` is in the `border` family — even though Tailwind's own
+    /// sequence would put border-width ahead of border-color.
+    #[test]
+    fn border_color_never_crosses_the_border_shorthand() {
+        let chain = "let s = const style().border_color(a).border(w, c);\n";
+        assert_construct(chain, chain);
+    }
+
+    /// Two methods on the SAME property are trivially one family.
+    #[test]
+    fn two_methods_on_one_property_keep_their_written_order() {
+        for chain in [
+            "let s = const style().line_height_length(a).line_height(1.5);\n",
+            "let s = const style().background_image(a).background_gradient(g);\n",
+            "let s = const style().border_none().border(w, c);\n",
+        ] {
+            assert_construct(chain, chain);
+        }
+    }
+
+    /// The family rule is a floor, not a ceiling: independent slots inside one
+    /// family's category still sort. `border-radius` is deliberately NOT one of
+    /// the `border` shorthand's longhands (`family_longhands` is not
+    /// prefix-based), so `radius` is its own family and does cross `border`.
+    #[test]
+    fn independent_slots_still_sort_past_a_family() {
+        assert_construct(
+            "let s = const style().border(w, c).radius(r);\n",
+            "let s = const style().radius(r).border(w, c);\n",
+        );
+        // `flex-direction` shares a prefix with the `flex` shorthand and is not
+        // covered by it either.
+        assert_construct(
+            "let s = const style().flex(\"1\").flex_direction(FlexDirection::Row);\n",
+            "let s = const style().flex_direction(FlexDirection::Row).flex(\"1\");\n",
+        );
+    }
+
+    // --- Reach, and what the sort refuses ------------------------------------
+
+    /// A condition's inner `style()` is a chain of its own and sorts too.
+    #[test]
+    fn a_nested_chain_inside_a_condition_sorts() {
+        assert_construct(
+            "let s = const style().hover(style().color(a).display(b));\n",
+            "let s = const style().hover(style().display(b).color(a));\n",
+        );
+    }
+
+    /// Only a `style()` BUILDER sorts. A chain on any other subject is somebody
+    /// else's API, whose method names mean nothing to this table.
+    #[test]
+    fn a_chain_on_another_subject_is_left_alone() {
+        for chain in [
+            "let s = theme().color(a).display(b);\n",
+            "let s = base.color(a).display(b);\n",
+        ] {
+            assert_construct(chain, chain);
+        }
+    }
+
+    /// A postfix that is not a `.name(…)` call link ENDS the sortable run: the
+    /// links before it still sort among themselves, and nothing crosses it —
+    /// past one the receiver is no longer the `Style` this table describes.
+    #[test]
+    fn a_non_call_postfix_ends_the_run() {
+        assert_construct(
+            "let s = const style().color(a).display(b).rules;\n",
+            "let s = const style().display(b).color(a).rules;\n",
+        );
+        assert_construct(
+            "let s = style().color(a).display(b)!;\n",
+            "let s = style().display(b).color(a)!;\n",
+        );
+        // Nothing crosses it: `display` is stranded past the `.rules` boundary
+        // on a receiver this table knows nothing about, so it stays put.
+        let stranded = "let s = const style().color(a).rules.display(b);\n";
+        assert_construct(stranded, stranded);
+    }
+
+    /// A comment between two links would be carried to the wrong link by a
+    /// reorder — the comment cursor only moves forward — so a chain with a
+    /// comment anywhere inside it is left as written.
+    #[test]
+    fn a_chain_carrying_a_comment_is_left_alone() {
+        assert_construct(
+            "let s = const style()\n\t.color(a)\n\t// the box\n\t.display(b);\n",
+            "let s = const style()\n\t.color(a)\n\t// the box\n\t.display(b);\n",
+        );
+    }
+
+    /// `Style + Style` operands never reorder — that merge's order is semantic
+    /// (`style.vl`'s `add` replays the right side over the left). Only the links
+    /// INSIDE one builder sort.
+    #[test]
+    fn merge_operands_never_reorder() {
+        assert_construct(
+            "let s = const (style().color(a).display(b) + base);\n",
+            "let s = const (style().display(b).color(a) + base);\n",
+        );
+    }
+
+    // --- Idempotence ---------------------------------------------------------
+
+    /// Formatting twice equals formatting once. `assert_construct` checks this
+    /// per fixture; this pin checks it on the shape most likely to break it —
+    /// a long chain that both SORTS and SPLITS, where the second pass re-reads
+    /// an already-permuted spine.
+    #[test]
+    fn sorting_is_idempotent() {
+        let source = "let s = const style().hover(style().color(a)).user_select(UserSelect::None)\
+                      .paint_primary().opacity(0.5).padding_x(space(2)).padding(space(1))\
+                      .md(style().display(Display::Flex)).radius(space(1)).gap(space(4));\n";
+        let once = format(source);
+        assert_eq!(format(&once), once, "not idempotent: {source:?}");
+        assert_ne!(once, source, "fixture did not reorder, so it pins nothing");
+    }
+
+    // --- The permutation itself ----------------------------------------------
+
+    /// An already-canonical chain reports NO permutation, so it stays on the
+    /// formatter's existing code path byte for byte and this feature cannot
+    /// perturb a chain it has nothing to say about.
+    #[test]
+    fn a_canonical_chain_reports_no_permutation() {
+        assert_eq!(
+            style_chain_permutation(&["display", "padding", "color", "hover"]),
+            None
+        );
+        assert_eq!(style_chain_permutation(&["ghost", "paint_primary"]), None);
+        assert_eq!(style_chain_permutation(&[]), None);
+    }
+
+    // --- The table's own shape -----------------------------------------------
+
+    /// Row order IS the canonical order, so the table must be grouped by
+    /// category in Tailwind's sequence — otherwise a family's rank could put it
+    /// in the wrong category's band.
+    #[test]
+    fn the_table_is_grouped_by_category_in_tailwind_order() {
+        let mut seen = Vec::new();
+        for method in STYLE_PROPERTY_METHODS {
+            if seen.last() != Some(&method.category) {
+                assert!(
+                    !seen.contains(&method.category),
+                    "category {:?} is not contiguous — {} reopens it",
+                    method.category,
+                    method.name
+                );
+                assert!(
+                    seen.last().is_none_or(|last| *last < method.category),
+                    "category {:?} sorts before {:?} but is written after it",
+                    method.category,
+                    seen.last()
+                );
+                seen.push(method.category);
+            }
+        }
+    }
+
+    /// A family must be contiguous and live in ONE category: its rank is its
+    /// first row's index, so a family straddling a category boundary would drag
+    /// the later rows backwards out of their band.
+    #[test]
+    fn every_family_is_contiguous_and_lives_in_one_category() {
+        let mut seen: Vec<&str> = Vec::new();
+        for (at, method) in STYLE_PROPERTY_METHODS.iter().enumerate() {
+            if at > 0 && STYLE_PROPERTY_METHODS[at - 1].family == method.family {
+                assert_eq!(
+                    STYLE_PROPERTY_METHODS[at - 1].category,
+                    method.category,
+                    "family {:?} straddles two categories",
+                    method.family
+                );
+                continue;
+            }
+            assert!(
+                !seen.contains(&method.family),
+                "family {:?} is not contiguous — {} reopens it",
+                method.family,
+                method.name
+            );
+            seen.push(method.family);
+        }
+    }
+
+    /// One row per method, and no name claimed by two of the three tables — a
+    /// duplicate would make the rank silently depend on which row `find` reached
+    /// first.
+    #[test]
+    fn every_method_name_is_claimed_exactly_once() {
+        let mut names: Vec<&str> = STYLE_PROPERTY_METHODS.iter().map(|row| row.name).collect();
+        names.extend(STYLE_CONDITION_METHODS.iter().map(|(name, _)| *name));
+        names.extend(STYLE_BARRIER_METHODS);
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "a style method name is claimed by more than one row"
+        );
+    }
+
+    /// Every row names at least one CSS property — the column the family
+    /// partition is checked against in
+    /// `crates/vilan-core/tests/style_table_sync.rs`.
+    #[test]
+    fn every_property_row_names_its_slots() {
+        for method in STYLE_PROPERTY_METHODS {
+            assert!(
+                !method.properties.is_empty(),
+                "{} names no property",
+                method.name
+            );
+        }
     }
 }

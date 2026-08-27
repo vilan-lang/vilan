@@ -42,6 +42,13 @@ target() {
 }
 
 # Verifies $1 against the release's sha256sums.txt in the current directory.
+#
+# Fails CLOSED (L15): a machine with no sha256 tool is not a machine that may
+# install unverified bytes, it is a machine that cannot complete the install.
+# Skipping the check here would put the weakest verification on exactly the
+# host least able to notice — and an installer that sometimes verifies makes a
+# promise it does not keep. Every supported platform can satisfy this:
+# `sha256sum` ships with GNU coreutils, `shasum` with macOS and with perl.
 checksum() {
     line="$(grep " $1\$" sha256sums.txt)" || fail "sha256sums.txt has no entry for $1"
     if command -v sha256sum > /dev/null 2>&1; then
@@ -49,7 +56,7 @@ checksum() {
     elif command -v shasum > /dev/null 2>&1; then
         printf '%s\n' "$line" | shasum -a 256 -c - > /dev/null || fail "checksum mismatch for $1"
     else
-        say "warning: no sha256 tool found; skipping checksum verification"
+        fail "cannot verify $1: no sha256 tool on PATH. Install one (\`sha256sum\` from coreutils, or \`shasum\`) and re-run; nothing is installed unverified."
     fi
 }
 

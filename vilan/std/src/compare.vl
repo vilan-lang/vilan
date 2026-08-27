@@ -127,12 +127,14 @@ impl List<type T: PartialEq> {
 /// struct holding a `List` field can `[derive(PartialEq)]` — the shape that
 /// used to be refused.
 ///
-/// The elements compare with `==`, not `.eq()`, and that is load-bearing —
-/// the `Option`/`Result` idiom: an operator on a `T: PartialEq` operand
-/// rides the `OnConstraint` generic dispatch, which lowers to native JS at
-/// an all-native binding (`List<i32> == List<i32>` emits this body
-/// UNSPECIALIZED), where an explicit `.eq()` there would resolve to the
-/// trait's bodyless requirement and trip the emitter's never-silent check.
+/// The elements compare with `==`, not `.eq()` — the `Option`/`Result`
+/// idiom: an operator on a `T: PartialEq` operand rides the `OnConstraint`
+/// generic dispatch, which lowers to native JS at an all-native binding
+/// (`List<i32> == List<i32>` emits this body UNSPECIALIZED — one emission
+/// shared by every native element type). An explicit `.eq()` works too
+/// since B135 (the emitter specializes an operator method whenever its
+/// body requires the substitution), but would cost one instance per native
+/// binding where this spelling costs none.
 impl List<type T: PartialEq> with PartialEq {
 	fun eq(self, b: List<T>): bool {
 		if self.len() != b.len() {

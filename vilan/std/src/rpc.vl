@@ -578,10 +578,15 @@ fun route_socket_frame(frame: str, pending_settle: |i32, Frame| void, dispatch: 
 		let rest = frame.substring(2, frame.len());
 		let parts = rest.split(":");
 		let id_text = parts[0];
-		let reply = rest.substring(id_text.len() + 1, rest.len());
-		match id_text.parse_i32() {
-			Some(let request) => pending_settle(request, Frame::Text(reply)),
-			None => {},
+		// `r:<id>` with no second `:` is not this shape — it carries no reply
+		// at all, so it is ignored like any other unrecognized frame. (An
+		// EMPTY reply is still well-formed: `r:7:` splits to `["7", ""]`.)
+		if id_text.len() < rest.len() {
+			let reply = rest.substring(id_text.len() + 1, rest.len());
+			match id_text.parse_i32() {
+				Some(let request) => pending_settle(request, Frame::Text(reply)),
+				None => {},
+			}
 		}
 	} else if frame.starts_with("d:") {
 		dispatch(Frame::Text(frame.substring(2, frame.len())));

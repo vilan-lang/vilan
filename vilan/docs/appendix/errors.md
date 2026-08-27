@@ -256,6 +256,19 @@ The letters after the number aren't a type. If it says `i64` or `u64`:
 those were renamed to `i53`/`u53`.
 → [Values and types](../tour/values-and-types.md)
 
+**"substring start … is negative"**, **"substring end … is negative"**,
+**"substring end … is before its start …"**, **"substring end … is past the
+length … of this string"** (each continuing "— the range must satisfy
+`0 <= start <= end <= len`, and substring never clamps or swaps")
+`substring(start, end)` was written with literal bounds outside its rule, so
+it is refused here rather than at run time. The host's own `substring` would
+have *corrected* the call — clamping a negative to `0`, swapping an inverted
+pair — and returned a string that is not the one asked for; `s.substring(k, -1)`
+in JavaScript is `s[0..k]`, the prefix, not the suffix. Write `s.len()` for
+"to the end", and reach for `strip_prefix`/`strip_suffix` to drop a known
+affix. Non-literal bounds are checked at run time (below).
+→ [Strings](../std/strings.md)
+
 **"type of … could not be resolved"**
 Inference gave up somewhere upstream. This error is usually the *echo*
 of another one, so fix the first error in the list. When it appears
@@ -616,14 +629,23 @@ draft's next push already does.
 **"`asset::emit` outside a `const` expression"**
 Styles (and other build assets) are constructed at compile time. Build
 the `Style` in a `const` (`let card = const style()…`); select and merge
-already-built styles at runtime.
+already-built styles at runtime. The channel's input direction,
+`asset::read`, is compile-time-only the same way.
 → [Styling](../guide/styling.md), [Macros & const](../tour/macros-and-const.md)
 
 **"… is compile-time-only; evaluate this call inside a `const` expression"**
 The same rule, caught statically: some function on this call path reaches
-`asset::emit`, and the call itself sits in runtime code. The span is the
-outermost runtime crossing — the call that leaves ordinary code and enters
-style-building territory — so wrap *that* call in a `const`.
+`asset::emit` or `asset::read`, and the call itself sits in runtime code.
+The span is the outermost runtime crossing — the call that leaves ordinary
+code and enters compile-time territory — so wrap *that* call in a `const`.
+
+**"cannot read `…` (resolved against the package root to `…`): …"**
+A `const asset::read(path)` found no readable file. Paths are relative
+to the **package root** — the directory imports resolve under, never the
+directory the compiler happens to run from — and the message shows where
+the resolution landed. An absolute path, or one that escapes the package
+root (`../…`), is refused before any read: the file channel reads the
+project, so the build can track every input it depends on.
 
 **"… is compile-time-only; call it directly inside a `const` expression — a
 compile-time-only function has no runtime value form"**
@@ -711,8 +733,9 @@ static (`Point::new(…)`).
 ## Panics
 
 These are not compile errors — they are what the program prints when it
-stops at run time. Both exist because the alternative was a host-level
-message naming nothing you wrote.
+stops at run time. Each exists because the alternative was a host-level
+message naming nothing you wrote — or, worse, no message at all and a
+quietly wrong answer.
 
 **"… : … is not one of its values"** (e.g. `Align: "middle" is not one of its values`)
 An **exhaustive** `match` over a backed enum met a value outside its
@@ -726,6 +749,18 @@ answering with whichever variant happened to be last. A `match` with a
 `Enum::parse(text)` is the shape to reach for where an unrecognized value
 is one of the answers you expect: it returns `Option`.
 → [Data and traits](../tour/data-and-traits.md), [spec §5.2](../spec/types.md)
+
+**"substring out of range: the length is … but the range is …..…"**
+`substring(start, end)` was called with bounds outside `0 <= start <= end <=
+len`, computed rather than literal (a literal pair is refused at compile time
+instead). The rule is absolute: no clamping, no swapping, and an `end` past the
+length is an error rather than a truncation. This one is a panic *because* the
+host would not have raised anything — JavaScript's `substring` clamps a
+negative to `0` and swaps an inverted pair, so `s.substring(offset, -1)` there
+quietly yields `s[0..offset]`, the complement of the intended cut. Pass
+`s.len()` as the `end` to mean "the rest", and use
+`strip_prefix`/`strip_suffix` (which return `Option<str>`) to drop an affix.
+→ [Strings](../std/strings.md)
 
 **"mount: no element with id '…'"**
 `mount` or `mount_root` was given an id nothing on the page carries. The

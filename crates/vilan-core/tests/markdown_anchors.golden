@@ -315,6 +315,15 @@ std/option-result.md h1 option--result-reference
 std/option-result.md h2 optiont
 std/option-result.md h2 resultt-e
 std/option-result.md h2 idioms
+std/paths.md h1 paths-reference
+std/paths.md h2 there-is-no-path-type-deliberately
+std/paths.md h2 the-separator-is--on-every-platform
+std/paths.md h2 normalize-is-canonical-which-means-the-trailing-separator-goes
+std/paths.md h2 join-concatenates-resolve-follows-a-reference
+std/paths.md h2 extname-a-dotfile-has-no-extension
+std/paths.md h2 starts_with-compares-components-strstarts_with-compares-text
+std/paths.md h2 relative-inverts-resolve
+std/paths.md h2 url-paths-are-out-and-the-seam-is-the-query-string
 std/process.md h1 process-modules-reference
 std/process.md h2 stddb-sqlite
 std/process.md h2 stdhttp-the-server
@@ -347,6 +356,8 @@ std/rpc.md h2 server-plumbing-stdrpc_server-process-layer
 std/rpc.md h2 envelope--codec-layer
 std/strings.md h1 strings-reference
 std/strings.md h2 str
+std/strings.md h3 slicing-substring-refuses-it-does-not-correct
+std/strings.md h3 cutting-a-known-affix
 std/strings.md h2 display-user-facing-text
 std/strings.md h2 debug-developer-facing-text
 std/strings.md h2 into-conversions
@@ -355,6 +366,9 @@ std/style.md h2 constructors-and-values
 std/style.md h2 style-methods
 std/style.md h2 conditions
 std/style.md h3 stacking
+std/style.md h2 declaration-blocks
+std/style.md h3 ordering
+std/style.md h3 refusals
 std/style.md h2 runtime-legal-operations
 std/time.md h1 stdtime-reference
 std/time.md h2 instant

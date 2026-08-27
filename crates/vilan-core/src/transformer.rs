@@ -2,6 +2,7 @@ use crate::analyzer::{
     BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
     Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
+use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -683,6 +684,9 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__hmr_active",
         "__hmac_sha512",
         "__pbkdf2_sha512",
+        "__sha256",
+        "__sha384",
+        "__sha512",
         "__random_bytes",
         "__db_run",
         "__db_all",
@@ -691,6 +695,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_is_null",
         "__db_close",
         "__fs_stat",
+        "__fs_read_dir_all",
         "__local_get",
         "__session_get",
         "__router_path",
@@ -895,6 +900,19 @@ fn helper_source(name: &str) -> &'static str {
              \treturn new Uint8Array(await crypto.subtle.deriveBits({ name: \"PBKDF2\", salt, iterations, hash: \"SHA-512\" }, imported, bits));\n\
              }"
         }
+        // Unkeyed content digests (kolt.local 024) via `crypto.subtle.digest`.
+        // Async because WebCrypto is — the std::crypto stance (`std/misc.md`);
+        // a path that cannot suspend binds the host primitive as an extern
+        // instead, so there is deliberately no sync twin here.
+        "__sha256" => {
+            "async function __sha256(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-256\", data));\n}"
+        }
+        "__sha384" => {
+            "async function __sha384(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-384\", data));\n}"
+        }
+        "__sha512" => {
+            "async function __sha512(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-512\", data));\n}"
+        }
         // Web Storage glue (std::storage): a missing key reads null; flatten to "".
         "__local_get" => {
             "function __local_get(key) {\n\treturn localStorage.getItem(key) ?? \"\";\n}"
@@ -957,6 +975,19 @@ fn helper_source(name: &str) -> &'static str {
              \t}\n\
              }"
         }
+        // `std::fs::read_dir_all` (kolt.local 019): `fs.promises.readdir`
+        // under `{ recursive: true }` — an option-object argument the extern
+        // binding forms cannot spell, so the call lives here (the same reason
+        // `__fs_stat` does). No `try`/`catch`: a missing or unreadable
+        // directory throws host-side, matching `read_dir`'s posture. The
+        // dynamic `import` is self-contained on purpose, and Node caches
+        // module resolution, so a hot loop does not re-resolve it per call.
+        "__fs_read_dir_all" => {
+            "async function __fs_read_dir_all(path) {\n\
+             \tconst fsPromises = await import(\"node:fs/promises\");\n\
+             \treturn await fsPromises.readdir(path, { recursive: true });\n\
+             }"
+        }
         // Cryptographically random bytes.
         "__random_bytes" => {
             "function __random_bytes(length) {\n\treturn crypto.getRandomValues(new Uint8Array(length));\n}"
@@ -983,6 +1014,17 @@ fn helper_source(name: &str) -> &'static str {
             "function __at_view(list, index) {\n\
              \tif (index >= 0 && index < list.length) return [ list, index ];\n\
              \tthrow \"index out of bounds: the length is \" + list.length + \" but the index is \" + index;\n\
+             }"
+        }
+        // `str.substring(start, end)` — the checked slice. The native JS method
+        // clamps a negative to 0 and SWAPS an inverted pair, so `s.substring(k,
+        // -1)` quietly returns `s[0..k]`, the complement of the request; and it
+        // clamps `end` past the length rather than saying so. One rule replaces
+        // all three guesses: `0 <= start <= end <= len`, refused otherwise.
+        "__substring" => {
+            "function __substring(text, start, end) {\n\
+             \tif (0 <= start && start <= end && end <= text.length) return text.substring(start, end);\n\
+             \tthrow \"substring out of range: the length is \" + text.length + \" but the range is \" + start + \"..\" + end + \" — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end\";\n\
              }"
         }
         // `List.pop(): Option<T>` — removes and returns the last element (no clone:
@@ -1483,6 +1525,12 @@ struct Transformer<'src> {
     // result is a runtime `TypeError`. Collected here and turned into a hard
     // compile error at assembly, so the class cannot recur silently.
     bodyless_emissions: Vec<Id>,
+    // B135: memo for `reaches_bare_requirement` — whether a function's body,
+    // transitively through the program call graph, contains a dispatch that
+    // would fall through to a bodyless trait requirement if emitted without a
+    // substitution. Keyed by the queried root only (the walk's per-query
+    // visited set keeps cycles finite without poisoning other roots).
+    bare_requirement_memo: HashMap<Id, bool>,
     // Never-silent guard (B68, affine-moves.md §9.4): `drop(x)` sink calls whose
     // argument type did not resolve at the rewrite. Such a call lowers to the
     // bare argument — indistinguishable from the legitimate data no-op — so a
@@ -1705,6 +1753,7 @@ impl<'src> Transformer<'src> {
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
+            bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
             chunk_members: HashMap::default(),
             chunk_count: 0,
@@ -3804,16 +3853,22 @@ impl<'src> Transformer<'src> {
                 // An overloaded operator (`a + b` where `a`'s type implements
                 // `Add`) compiles to the trait method call `add(a, b)`. On a generic
                 // receiver (`Option<Point> ==`) the method is monomorphized against
-                // the recorded type-arg substitution so its body specializes.
+                // the recorded type-arg substitution so its body specializes — when
+                // the site requires it (`operator_instance_required`, B135): an
+                // all-native binding whose body needs no substitution keeps the
+                // shared generic emission.
                 if let Some(&method_id) = self.program.binary_op_dispatch.get(&id) {
-                    let name = if let Some(substitution) =
-                        self.program.method_call_substitution.get(&id)
-                    {
-                        let substitution = substitution.clone();
-                        self.emit_instance(method_id, &substitution)
-                    } else {
-                        self.ensure_function_emitted(method_id);
-                        self.ng.name_for(method_id)
+                    let substitution = self.program.method_call_substitution.get(&id).cloned();
+                    let name = match substitution {
+                        Some(substitution)
+                            if self.operator_instance_required(method_id, &substitution) =>
+                        {
+                            self.emit_instance(method_id, &substitution)
+                        }
+                        _ => {
+                            self.ensure_function_emitted(method_id);
+                            self.ng.name_for(method_id)
+                        }
                     };
                     let call = js::Node::Call(Box::new(js::Node::Local(name)), vec![lhs, rhs]);
                     // `a != b` dispatches to `eq` and negates — the impl provides
@@ -4215,8 +4270,18 @@ impl<'src> Transformer<'src> {
             Expr::For(condition, body) => {
                 // Every loop compiles to a `while`; an absent condition is an
                 // infinite loop, i.e. `while (true)`.
+                //
+                // The condition is walked into its own prelude, NOT into the
+                // enclosing block: a condition that needs statements — an `is`
+                // subject temp and its materialized captures above all — must
+                // run them on EVERY evaluation, and the enclosing block runs
+                // them once, before the loop. That was B136's stale-subject
+                // miscompile (`proposal/markdown.md` §10.7): a body
+                // reassignment never reached the condition's `is` test, so the
+                // loop read the wrong branch — or never ended.
+                let mut prelude = Vec::new();
                 let t_condition = condition
-                    .and_then(|condition| self.walk_entity(condition, block))
+                    .and_then(|condition| self.walk_entity(condition, &mut prelude))
                     .unwrap_or(js::Node::Bool(true));
                 // A loop body owning resource locals drops them each iteration
                 // (destruction.md §7); `jump break`/`continue` leave through the
@@ -4225,7 +4290,26 @@ impl<'src> Transformer<'src> {
                 // A loop is a statement with no value: emit it into the block
                 // and yield void, so a loop as a block's tail isn't treated as
                 // the block's result.
-                block.push(js::Node::While(Box::new(t_condition), t_body));
+                if prelude.is_empty() {
+                    // A statement-free condition sits in the `while` head as
+                    // before — the common case, byte-identical emission.
+                    block.push(js::Node::While(Box::new(t_condition), t_body));
+                } else {
+                    // `while (true) { <prelude> if (!cond) break; <body> }`.
+                    // The prelude re-runs per iteration (each evaluation still
+                    // reads its subject exactly once, into a fresh per-
+                    // iteration temp the captures alias), and a `continue` in
+                    // the body re-enters at the prelude — `jump` has no labeled
+                    // form, so no jump can skip past the test.
+                    let mut loop_body = prelude;
+                    loop_body.push(js::Node::If(js::IfBranch::If(
+                        Box::new(js::Node::Unary('!', Box::new(t_condition))),
+                        vec![js::Node::Break],
+                        None,
+                    )));
+                    loop_body.extend(t_body);
+                    block.push(js::Node::While(Box::new(js::Node::Bool(true)), loop_body));
+                }
                 js::Node::Void
             }
             Expr::ForEach(iterable_id, item_id, body) => {
@@ -5508,7 +5592,18 @@ impl<'src> Transformer<'src> {
             Intrinsic::StrReplace => native_method(&mut args, "replaceAll"),
             Intrinsic::StrRepeat => native_method(&mut args, "repeat"),
             Intrinsic::StrSplit => native_method(&mut args, "split"),
-            Intrinsic::StrSubstring => native_method(&mut args, "substring"),
+            // NOT `native_method`: JS `substring` clamps negatives to 0 and
+            // SWAPS an inverted pair, so `s.substring(offset, -1)` silently
+            // returns the prefix — the complement of what was asked for. The
+            // checked helper refuses instead, the way `list[i]` goes through
+            // `__at` rather than a bare subscript.
+            Intrinsic::StrSubstring => {
+                self.used_helpers.insert("__substring");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__substring".to_string())),
+                    args.collect(),
+                )
+            }
             Intrinsic::StrLen | Intrinsic::ListLen => js::Node::Property(
                 Box::new(args.next().unwrap_or(js::Node::Void)),
                 "length".to_string(),
@@ -7265,6 +7360,106 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// Whether the operator method at this site must be EMITTED AS AN
+    /// INSTANCE against `substitution`, or may share the generic emission
+    /// (B135). A non-native binding always specializes — the body's element
+    /// comparisons must dispatch to the bound type's own impls. An all-native
+    /// binding shares the generic emission (its operators on `T` lower to
+    /// native JS — the std `Option`/`Result`/`List` idiom, and the shape the
+    /// corpus goldens pin) UNLESS the body transitively contains a call that
+    /// needs the substitution to resolve at all — an explicit `.eq()` on a
+    /// `T`-typed value, which absent a substitution falls through to the
+    /// trait's bodyless requirement and trips the never-silent check.
+    fn operator_instance_required(
+        &mut self,
+        method_id: Id,
+        substitution: &HashMap<TypeId, TypeId>,
+    ) -> bool {
+        for &bound in substitution.values() {
+            let resolved = self.resolve_type_id(bound);
+            if !self.compares_natively(resolved) {
+                return true;
+            }
+        }
+        self.reaches_bare_requirement(method_id)
+    }
+
+    /// Whether `function_id`'s body — transitively, through the calls and
+    /// lexical closures the program's call graph records — contains a
+    /// dispatch that, emitted WITHOUT a substitution, falls through to a
+    /// BODYLESS trait requirement (`assemble`'s never-silent ICE, B135).
+    /// The walk follows resolved calls into their bodies, descends into
+    /// every lexical closure (a hidden `.eq()` in a closure invoked through
+    /// a variable still counts — its call edge is `Indirect`), treats a
+    /// dispatch falling back to a trait DEFAULT body as a walk into that
+    /// body, and stops at externs and variant constructors. Operator uses of
+    /// `T` contribute nothing here — a binary expression records no call
+    /// edge, which is exactly what lets an operator-only body keep the
+    /// generic emission. Memoized per queried root; the per-query visited
+    /// set keeps cycles finite without poisoning other roots' answers.
+    fn reaches_bare_requirement(&mut self, function_id: Id) -> bool {
+        if let Some(&known) = self.bare_requirement_memo.get(&function_id) {
+            return known;
+        }
+        let program = self.program;
+        let graph = program.call_graph();
+        let mut visited: HashSet<Id> = HashSet::default();
+        let mut stack = vec![function_id];
+        let mut reaches = false;
+        'walk: while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(children) = graph.closure_children_of(node) {
+                stack.extend(children.iter().copied());
+            }
+            for call in graph.calls_of(node) {
+                match call.target {
+                    CallTarget::Function(callee) | CallTarget::Closure(callee) => {
+                        stack.push(callee);
+                    }
+                    CallTarget::External(_) | CallTarget::Variant(_) => {}
+                    // A call through a function/closure VALUE resolves to
+                    // whatever the value holds — never to a requirement.
+                    CallTarget::Indirect(IndirectReason::Value) => {}
+                    CallTarget::Indirect(
+                        IndirectReason::GenericMember | IndirectReason::TraitDispatch,
+                    ) => {
+                        let Some(fallback) = self.dispatch_fallback(call.call_id) else {
+                            continue;
+                        };
+                        if program
+                            .functions
+                            .get(&fallback)
+                            .is_some_and(|function| !function.has_body)
+                        {
+                            reaches = true;
+                            break 'walk;
+                        }
+                        stack.push(fallback);
+                    }
+                }
+            }
+        }
+        self.bare_requirement_memo.insert(function_id, reaches);
+        reaches
+    }
+
+    /// The function a dispatch-carrying call site emits when NO substitution
+    /// resolves it: a `for` loop's recorded `next`, or the `Expr::Local`
+    /// target its subject names — for `x.eq(y)` on a `T`-bounded receiver,
+    /// the trait's requirement itself.
+    fn dispatch_fallback(&self, call_id: Id) -> Option<Id> {
+        if let Some(&next_id) = self.program.for_each_next.get(&call_id) {
+            return Some(next_id);
+        }
+        let function_call = self.program.function_calls.get(&call_id)?;
+        match self.program.entity_map.get(&function_call.subject_id) {
+            Some(Expr::Local(target_id)) => Some(*target_id),
+            _ => None,
+        }
+    }
+
     /// A stable key identifying a concrete type, used to deduplicate instances.
     ///
     /// STRUCTURAL, not id-keyed (B95). The obvious spelling — `format!("{:?}",
@@ -7544,6 +7739,41 @@ impl Formatter {
         }
     }
 
+    /// Renders the SUBJECT of a postfix — a call's callee, a `.member`, an
+    /// `[index]` — parenthesizing when the subject binds looser than the postfix
+    /// does. Member access and call are JS's tightest-binding forms, so a
+    /// subject that is not an atom, a literal or another postfix gets its
+    /// operand stolen unless it is wrapped: `await (f()).x` parses as
+    /// `await ((f()).x)`, reading the member off the PROMISE rather than the
+    /// value, which is a silent wrong answer (B141).
+    ///
+    /// This is `operand`'s counterpart on the other side of the precedence
+    /// question. `operand` asks whether a child survives unwrapped in
+    /// BINARY-OPERAND position, where the danger is a child that binds too
+    /// loosely to hold together; this asks whether it survives in
+    /// POSTFIX-SUBJECT position, where the danger is the same but the threshold
+    /// is the highest one JS has, so the test is a flat "is this a postfix or an
+    /// atom" rather than a numeric comparison.
+    fn postfix_subject(&self, node: &js::Node, level: usize) -> String {
+        let rendered = self.node(node, "", level);
+        let wrap = matches!(
+            node,
+            // `await` is a unary prefix: every postfix binds tighter than it.
+            js::Node::Await(_)
+                | js::Node::Unary(_, _)
+                | js::Node::Binary(_, _, _)
+                // JS parses an assignment greedily, as `operand` also notes.
+                | js::Node::Assignment(_, _)
+                // A closure called directly must be parenthesised: `(() => …)()`.
+                | js::Node::Closure(_)
+        );
+        if wrap {
+            format!("({rendered})")
+        } else {
+            rendered
+        }
+    }
+
     /// Renders one JavaScript node at block-nesting `level` (used to indent the
     /// bodies of any nested blocks). It emits no leading indent of its own — a
     /// statement's indent is added by `sequence`, an expression is rendered inline
@@ -7620,13 +7850,7 @@ impl Formatter {
                 format!("throw {}{}", self.node(value, "", level), terminator)
             }
             js::Node::Call(subject, args) => {
-                let s_subject = self.node(subject, "", level);
-                // A closure called directly must be parenthesised: `(() => …)()`.
-                let s_subject = if matches!(&**subject, js::Node::Closure(_)) {
-                    format!("({s_subject})")
-                } else {
-                    s_subject
-                };
+                let s_subject = self.postfix_subject(subject, level);
                 let s_args = args
                     .iter()
                     .map(|x| self.node(x, "", level))
@@ -7702,11 +7926,11 @@ impl Formatter {
                 )
             }
             js::Node::Property(subject, member) => {
-                let s_subject = self.node(subject, "", level);
+                let s_subject = self.postfix_subject(subject, level);
                 format!("{}.{}{}", s_subject, member, terminator)
             }
             js::Node::PropertyIndex(subject, member) => {
-                let s_subject = self.node(subject, "", level);
+                let s_subject = self.postfix_subject(subject, level);
                 let s_member = self.node(member, "", level);
                 format!("{}[{}]{}", s_subject, s_member, terminator)
             }

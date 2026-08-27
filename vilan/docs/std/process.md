@@ -68,6 +68,7 @@ impl Request {
 	fun method(self): str
 	fun body(self): str      // the body as text
 	fun bytes(self): Bytes   // the same body raw (binary POSTs)
+	fun header(self, name: str): Option<str>   // a request header, case-insensitive
 }
 impl Response {
 	fun builder(): ResponseBuilder
@@ -86,6 +87,43 @@ impl ResponseStream {
 	fun on_close(self, handler: || void)   // the client went away
 }
 ```
+
+`Request::header` reads one header off the request, which is what a
+conditional request needs — the validator arrives as `If-None-Match`, and
+the response side (`code(304)` + `set_header`) could already express the
+answer:
+
+```vilan,norun
+import std::http::{ Response, Server };
+import std::option::Option::{ None, Some, self };
+
+fun main() {
+	Server::builder()
+		.on_request(|request| {
+			let tag = "\"v1\"";
+			match request.header("If-None-Match") {
+				Some(let seen) => if seen == tag {
+					ret Response::builder().code(304).build();
+				},
+				None => {}
+			}
+			Response::builder().set_header("ETag", tag).body("hello").build()
+		})
+		.build()
+		.start();
+}
+```
+
+Header names are **case-insensitive**: node lowercases every name it parses
+off the wire, and `header` lowers `name` to match, so the casing you write
+and the casing the client sent are both irrelevant. `None` means the request
+did not carry the header, which stays distinct from `Some("")` for one sent
+empty. A header the client **repeated** reads back joined with `", "` — the
+list form ordinary headers already define — so nothing is silently dropped,
+but nothing is split for you either; `set-cookie` is node's one unjoined
+header and arrives comma-joined without the space, which a cookie value's
+own commas make unsafe to split, so repeated `set-cookie` is not readable
+through this accessor.
 
 `ServerBuilder::port(0)` asks the OS for a free port instead of guessing
 one, and the `Server` handed to `on_start` carries the port it actually
@@ -108,27 +146,49 @@ fun main() {
 `serve_build` is the one call that replaces the boot reads and the
 content-type table a full-stack server used to write by hand. It takes a
 [`LegBuild`](#stdbuild) and installs one route per artifact at
-`/<file name>` — the bundle, the style sidecar if the leg emitted one, and
-every route chunk — in front of `on_request`, whatever order the chain was
-written in. So the app's catch-all still answers every path the build does
+`/<name>` — the bundle, the style sidecar if the leg emitted one, every
+route chunk, and every resource the leg bundled with
+[`const asset::bundle`](misc.md#stdasset) — in front of `on_request`,
+whatever order the chain was written in. So the app's catch-all still answers every path the build does
 not claim, and a leg that gains `split = true` gains its chunk routes with
 no server edit. It is the one way a server serves its build: an rpc app
 that wants it puts its service on the same chain with `with_service`
 ([below](#stdrpc_server)) rather than reaching for a `serve_*` boot
 function, which hands you only a fallback and no builder to install on.
 
-Three details are decisions, not defaults. The route shape is
-`/<file name>`, which is what every shell already asks for, so adopting it
-moves no HTML. Content types come from a short fixed table (`.js`/`.mjs`,
-`.css`, `.json`, `.html`); anything else is not served, because
-`serve_build` serves a *build*, not a directory. And an artifact the build
-named but did not write **stops the server at boot**, naming the file and
-the leg, rather than 404ing for the life of the process.
+Three details are decisions, not defaults. The route shape is `/<name>`,
+which is what every shell already asks for, so adopting it moves no HTML —
+and a bundled resource keeps its package-relative path, so a subdirectory
+survives into the url rather than being flattened onto the site root. Content types come from a table generated from
+[`mime-db`](https://github.com/jshttp/mime-db) — the registry aggregate
+vite's own mime lookup is generated from — covering what a build emits and
+what a page it serves loads as a whole sub-resource: scripts, styles and
+markup, json and the web manifest, images, fonts and wasm. An extension
+outside it is still not served, because `serve_build` serves a *build*, not
+a directory — and the skip is said, not silent: boot prints a warning naming
+the artifact it will not serve. And an artifact the build named but did not
+write **stops the server at boot**, naming the file and the leg, rather than
+404ing for the life of the process.
+
+Artifacts are served as **bytes**, exactly as the build wrote them — a
+favicon or a font arrives byte for byte, which a table alone would not
+achieve. That is also why every `text/*` row spells `; charset=utf-8`: a raw
+body carries no encoding of its own, so an unspelled `text/css` would be
+decoded by whatever the browser defaults to. `application/json` and its
+`+json` relatives take no charset, being utf8 by spec, and `.webmanifest` is
+served `application/manifest+json` because Chrome rejects a manifest under
+any other type.
+
+Audio and video are deliberately absent from the table. `serve_build` writes
+a whole body and honours no `Range` header, so a browser could not seek in
+anything it served; a row for `.mp4` would type a response that does not
+work. Media belongs behind the static file server §5.10 defers, not here.
 
 Freshness is its dev-mode policy: under `vilan run --watch`
 ([`is_watching`](#stdwatch)) each asset is re-read per request, so a
 rebuild is served without a restart; otherwise the copy read at boot is
-served from memory.
+served from memory. Both halves read bytes, so a watch never serves a
+freshly decoded — and freshly corrupted — copy of a binary artifact.
 
 A **streaming** response holds the connection open: once the status and
 headers are written, `on_open` receives the live `ResponseStream` and
@@ -171,29 +231,103 @@ side: [Services & RPC](../guide/services.md) and the
 ## std::fs
 
 ```vilan,fragment
-fun exists(path: str): bool                     // sync
+// reading
 fun read_file_to_str(path: str): str            // async, UTF-8
-fun read_file_to_str_sync(path: str): str       // sync, UTF-8 — blocks the event loop
 fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
-fun write_file(path: str, contents: str)        // async
-fun read_dir(path: str): List<str>              // async, entry NAMES, flat (v1)
+fun exists(path: str): bool                     // sync — the one blocking call here
 fun stat(path: str): Option<Stat>               // async — None if `path` doesn't exist; every other failure throws
+
+// writing
+fun write_file(path: str, contents: str)        // async
+fun write_bytes(path: str, contents: Bytes)     // async — the binary write, `read_bytes`'s mirror
+fun write_atomic(path: str, contents: str)      // async — temp sibling + rename, never a torn file
+fun write_bytes_atomic(path: str, contents: Bytes)  // async — the byte twin of `write_atomic`
+fun append(path: str, contents: str)            // async — extends, never truncates
+fun update(path: str, revise: |str| str)        // async — read, revise, replace atomically
+fun copy(from: str, to: str)                    // async — file copy; the source survives
+fun rename(from: str, to: str)                  // async — move/replace; atomic within one filesystem
+fun remove(path: str)                           // async — deletes a FILE
+
+// directories
+fun read_dir(path: str): List<str>              // async, entry NAMES, flat
+fun read_dir_all(path: str): List<str>          // async, RELATIVE paths, the whole tree
+fun scan_dir(path: str): List<Entry>            // async, flat, WITH each entry's kind
+fun create_dir(path: str)                       // async — one level; EEXIST if it's already there
+fun create_dir_all(path: str)                   // async — the whole chain; idempotent
+fun remove_dir(path: str)                       // async — must be empty
+fun remove_dir_all(path: str)                   // async — the whole tree; a missing path is a no-op
+fun copy_dir(from: str, to: str)                // async — the whole tree, merged into `to`
+
 struct Stat {
     size: i32,
     modified_at_ms: f64,   // epoch milliseconds
     is_directory: bool,
 }
+
+struct Entry {
+    name: str,
+    is_directory: bool,
+    is_file: bool,
+    is_symlink: bool,
+}
 ```
 
-`read_bytes`, `read_dir`, and `read_file_to_str` throw host-side on any
-failure, missing path included — the same posture `read_file_to_str` always
-had. `stat` alone is a non-throwing probe: it exists to let a caller ask
-"is this here yet, and what does it look like" (a poller's use case), so a
-missing path is `None`, not a thrown exception. Prefer the async read; the
-sync one exists for a read that must complete inside a callback that cannot
-suspend — `serve_build`'s dev-mode revalidation is the case it was added
-for.
+Everything here throws host-side on any failure, missing path included —
+the same posture `read_file_to_str` always had — with exactly two
+exceptions, both non-throwing because a missing path already satisfies
+what the call *means*. `stat` is a probe: it exists to let a caller ask "is
+this here yet, and what does it look like" (a poller's use case), so a
+missing path is `None`. `remove_dir_all` means "make sure this is gone",
+which a path that was never there already is, so removing something absent
+is a no-op. Any *other* failure of either — a permissions error, a busy
+directory — still throws. If you need to know whether a thing was there,
+`stat` before you act.
+
+There is no synchronous read. There used to be one, justified by a caller
+that could not suspend; no such caller existed, so it is gone. Async *is*
+the calling convention here — `read_file_to_str(path)` is implicitly
+awaited and reads like a plain call — so a sync variant buys a caller
+nothing and costs the event loop the length of the read. `exists` is the
+module's one blocking call, and it blocks for a different reason:
+`node:fs/promises` has no `exists`, and syncness is the only thing
+separating it from `stat(path).is_some()`. It is sized for a boot-time
+branch; on a request path, call `stat`.
+
+Three directory listings, one honesty policy. `read_dir` is deliberately
+flat: immediate entry *names*, not path-joined, no file-vs-directory
+distinction. `read_dir_all` walks the whole tree in one call — every entry
+under the path, files and subdirectories alike, as paths *relative* to it,
+joined with the host's own separator. `scan_dir` is `read_dir` with the
+kinds: flat again, but each entry arrives as an `Entry` that already knows
+whether it is a file, a directory or a symlink, so the thousand `stat`
+calls a thousand-entry directory used to cost are gone — the host had that
+information all along and `read_dir` threw it away. None of the three
+promises an order; sort the list if order matters.
+
+`Entry` carries three booleans rather than a kind enum, because a host
+directory entry has *nine* kinds — file, directory, symlink, FIFO, socket,
+block device, character device, unknown — and an enum would have to either
+model five nobody will ever meet or carry a catch-all meaning "one of five
+things I did not model". Three booleans answer the three questions people
+actually ask, and an entry that is none of the three reads back with all
+three `false`, which is true rather than wrong. The kinds do not follow
+symlinks: a link to a directory is `is_symlink = true` with
+`is_directory = false`, which is what stops a recursive walker from
+following a loop it cannot see. `stat` *does* follow, so that is how you
+ask what a link points at.
+
+Making and unmaking directories comes in a strict form and a forgiving one,
+and the pairing is deliberate. `create_dir` makes exactly one level and
+fails with `EEXIST` if something is already there — which makes it the only
+way this module can claim a name exclusively — while `create_dir_all` makes
+every missing level and succeeds when the whole chain already exists, so
+"make sure this place exists before I write into it" never fails for having
+already run. `remove_dir` refuses a directory that is not empty;
+`remove_dir_all` takes the tree and everything under it. `copy_dir` copies
+a tree into `to`, creating it if needed: files already there with a
+counterpart in the source are overwritten and files with no counterpart are
+left alone, so it is a merge, not a mirror.
 
 Three reads, three different questions. `read_bytes` is the true binary
 read: the host hands back a `Buffer`, which binds straight to `Bytes` with
@@ -205,6 +339,78 @@ not UTF-8; `read_file_to_str` is a one-line call to it. (It was called
 `read_file_bytes` until v0.34.0, which is the name that made the rename
 worth doing: it promised bytes and returned a decoded string. No alias was
 kept.)
+
+One write that cannot tear. `write_file` truncates the target and then
+fills it, so a process that dies partway through leaves a half-written
+file — and a store that reads itself back at boot then finds corrupt data
+where its state used to be. `write_atomic` writes to a uniquely-named
+sibling and `rename`s it over the target instead: a crash leaves either the
+previous file intact or the complete new one, never a mix. Use it for
+anything the program reads back later — a JSON store, a cache, a config
+the app rewrites. Atomic is not durable, though: after a *power* loss the
+rename may not have reached the device, and closing that last gap needs
+`fsync`, which the host exposes only on an open file handle — std has no
+handle type yet. The temporary is a sibling because a rename across
+filesystems is not atomic and would fail outright, which also means a
+crashed run can strand a `<path>.<uuid>.tmp` file beside the target;
+`vilan` has no `try`/`catch` to sweep it up. `rename` is the primitive
+underneath, and it is also how you move a file: the destination is
+replaced if it exists, and the source stops existing.
+
+Bytes go out as well as in. `write_bytes` is `read_bytes`'s mirror and it
+was missing for a while, which meant a program could read a favicon and
+could not write one back: `writeFile` was bound once, typed for `str`. It
+takes `Bytes` and the bytes reach the file unchanged — no encode, no
+decode, no replacement character. That is not a small promise. A text round
+trip through UTF-8 turned kolt's 483-byte favicon into 853 bytes served,
+one U+FFFD for every byte that was not a legal sequence, and that is the
+failure `write_bytes` exists to make unrepresentable.
+`write_bytes_atomic` is the same call with `write_atomic`'s temp-sibling
+discipline, for an image or a font a running server is reading.
+
+`append` extends a file and never truncates it, creating it if it is not
+there — the right call for a log, the wrong one for a store, because an
+append is not atomic and a crash partway through leaves a partial line.
+`update(path, revise)` is the read-modify-write every JSON store and every
+config rewrite is made of, with the write half already atomic: the file is
+read as UTF-8, handed to your closure, and what comes back is written
+through `write_atomic`. It is not a lock, and the difference is worth
+knowing before you rely on it — two processes calling `update` on one path
+can still interleave read-read-write-write, and the second write wins
+whole. `update` closes the *tearing* window, not the *racing* one; closing
+that would need advisory locking, which the host has no access to. For a
+single writer — a store, a cache, a config — it is the complete answer.
+`revise` is a plain value-returning closure, so it is asyncness-polymorphic:
+a revision that awaits makes that `update` await too, with nothing to
+write at either the declaration or the call site.
+
+`copy` duplicates a file and the source survives, which is the whole
+difference from `rename`; an occupied destination is replaced. `remove`
+deletes a *file* and refuses a directory — the split is the host's, and
+`remove_dir`/`remove_dir_all` are the other side of it. There is no
+synchronous variant of any of these, and none was asked for: a sync variant
+of an async operation has to name the caller that cannot suspend, and in
+this module there is exactly one such caller in the whole language — a
+module-level `let`, which cannot await — so the bar is a name, not a
+category.
+
+Reading a build's assets, rewriting one, and putting the result somewhere
+new is the shape most of this is for:
+
+```vilan,norun
+import std::fs::{ create_dir_all, read_bytes, scan_dir, update, write_bytes_atomic };
+
+fun main() {
+	create_dir_all("dist/assets");
+	for entry in scan_dir("assets") {
+		if entry.is_file {
+			write_bytes_atomic(i"dist/assets/{entry.name}", read_bytes(i"assets/{entry.name}"));
+		}
+	}
+	update("dist/manifest.json", |text| i"{text}\n");
+}
+main();
+```
 
 ## std::build
 
@@ -219,6 +425,7 @@ struct LegBuild {
 	styles: Option<str>,    // `client.css`, or None if the leg compiled no styles
 	chunks: List<str>,      // route chunks, empty unless the leg splits
 	classic_script: bool,   // true exactly when it splits
+	assets: List<str>,      // resources `const asset::bundle` carried in
 }
 
 fun build_of(leg: str): Result<LegBuild, BuildError>   // async
@@ -235,6 +442,13 @@ serve, so it stops with the error's message instead of starting.
 `LegBuild::artifacts()` gives `(url, file)` pairs — `("/client.js",
 "dist/client.js")` — in serving order. `std::http`'s
 [`serve_build`](#stdhttp-the-server) is the consumer that makes them routes.
+
+`assets` is what makes a built app need nothing but `dist/`: every
+non-code resource the leg named with
+[`const asset::bundle`](misc.md#stdasset), by its package-relative path, so
+`static/icon.svg` is served at `/static/icon.svg` from
+`dist/static/icon.svg`. A build written before bundling existed carries no
+`assets` field and reads as a build with none, which is what it was.
 
 ## std::document
 
@@ -404,10 +618,17 @@ of the same material.
 
 ```vilan,fragment
 fun args(): List<str>            // CLI arguments
+fun cwd(): str                   // current working directory, absolute
 fun env(key: str): Option<str>   // environment variable
 fun exit(code: i32)
 fun scan(): str                  // read a line from stdin
 ```
+
+Every relative path in a `std::fs` or `std::build` call resolves against the
+process's working directory; `cwd()` reads it (absolute), so a boot check can
+say which directory the server actually ran from instead of guessing. It is
+*not* a project-root finder — walking up to `vilan.toml` is a separate,
+undecided helper, and `cwd()` does not preempt it.
 
 Server-side hot-swapping of code is not a thing
 here and is not planned — the node leg restarts.

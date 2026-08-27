@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, five crates, plus the language's own tree:
+Rust workspace, six crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -29,6 +29,13 @@ Rust workspace, five crates, plus the language's own tree:
   (`tests/corpus.rs`, `cancellation.rs`, `rpc_http.rs`, `streaming.rs`,
   `transport_robustness.rs`, …).
 - `crates/vilan-lsp` — the language server.
+- `crates/vilan-ide` — the editor-facing queries the language server and the web
+  playground SHARE (K9, `proposals/proposal/playground-completion.md` §3): the line
+  index, the completion engine, and the navigation primitives it reads. It depends on
+  `vilan-core` and nothing else on purpose, so it builds wherever core does —
+  including `wasm32-unknown-unknown`, where the language server's tower-lsp/tokio
+  stack cannot follow. A completion behavior belongs here, not in `vilan-lsp`, whose
+  `line_index.rs` is only a newtype speaking `lsp_types` at the protocol edge.
 - `crates/vilan-embedded-std` — embeds the std source into the binary.
 - `crates/vilan-wasm` — the compiler as a WebAssembly module; the web
   playground's engine (`proposals/proposal/web-playground.md`). The compile logic is
@@ -97,23 +104,42 @@ Rust workspace, five crates, plus the language's own tree:
   `let` binding.
 - **Numerics:** the JS-backed integers are `i53`/`u53` (a ±2^53 contract); unknown
   numeric suffixes are hard errors.
-- **A new keyword lands in THREE places** — the lexer (`lexing.rs`, whose
-  keyword table is the `KEYWORDS` const `read_identifier` looks up), the
-  TextMate grammar (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the
-  book's highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource`
-  keyword shipped with only the first and was caught twice, days apart. The
-  same drift reaches the **primitive-type** and **attribute-marker** lists
-  that sit beside the keywords in both grammars (`SCALAR_PRIMITIVE_NAMES` and
-  `NUMERIC_SUFFIXES` in `type_.rs`, `KNOWN_ATTRIBUTE_MARKERS` in `parsing.rs`
-  are the sources of truth); D15's audit found `i64`/`u64` still highlighted
-  as valid types a release after they became a hard error. The lexer-vs-list
-  diff is a gate: `crates/vilan-cli/tests/grammar_sync.rs` reads those tables
-  and holds both grammars to them in both directions on every suite run, so
-  a keyword added to the lexer fails the suite until both grammars carry it.
+- **A new keyword lands in THREE places — and two of them are generated** —
+  the lexer (`lexing.rs`, whose keyword table is the `KEYWORDS` const
+  `read_identifier` looks up), the TextMate grammar
+  (`editors/vscode/syntaxes/vilan.tmLanguage.json`), and the book's
+  highlight.js theme (`vilan/docs/theme/vilan.js`). The `resource` keyword
+  shipped with only the first and was caught twice, days apart. The same
+  drift reaches the **primitive-type**, **attribute-marker**,
+  **numeric-suffix** and **operator** lists that sit beside the keywords in
+  both grammars (`SCALAR_PRIMITIVE_NAMES` and `NUMERIC_SUFFIXES` in
+  `type_.rs`, `KNOWN_ATTRIBUTE_MARKERS` in `parsing.rs`,
+  `TWO_CHARACTER_OPERATORS` in `lexing.rs` are the sources of truth); D15's
+  audit found `i64`/`u64` still highlighted as valid types a release after
+  they became a hard error. Since E91 the grammars' word-list halves are
+  GENERATED from those tables: `crates/vilan-cli/tests/grammar_sync.rs`
+  byte-holds every generated fragment — and what each grammar actually
+  registers — to the compiler's tables on every suite run. A new keyword is a
+  `KEYWORDS` row + a `Token` variant + a role row in grammar_sync.rs's
+  `KEYWORD_ROLES`; then
+  `VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated`
+  rewrites both grammars in place. Never hand-edit a generated fragment —
+  only the structural rules (strings, elements, captures) are hand-written.
   Its sibling `crates/vilan-lsp/src/book_sync.rs` holds the LSP's 32
   keyword-hover deep links to the book's headings and
   `docs/appendix/editor.md` to the server's code-action titles, capabilities
   and settings (D18/D19).
+- **`serve_build`'s content-type table is GENERATED too** — the third fragment in
+  this tree that must never be hand-edited. The rows in `content_type_of`
+  (`vilan/std/src/process/build.vl`) sit between `GENERATED(mime-table)` markers
+  and are generated from `crates/vilan-core/tests/mime-table.tsv`, itself derived
+  from the `mime-db` registry data by `scripts/regen-mime-table.py`.
+  `crates/vilan-core/tests/mime_table_sync.rs` byte-holds the arms to the dataset
+  on every suite run and gates the charset rule, the curated extension list, the
+  §5.10 fence and the provenance. To add an extension: add it to `CURATED` in the
+  script AND in the gate (both, deliberately — neither may move alone), refresh
+  the dataset, then
+  `VILAN_REGENERATE_MIME_TABLE=1 cargo test -p vilan-core --test mime_table_sync`.
 - **A post-`analyze()` pass must be wired into BOTH pipelines** — `lib.rs`'s
   `analyze_source` (tests + LSP) *and* the CLI's duplicated sequence in
   `crates/vilan-cli/src/main.rs` — and verified with a CLI probe, not only an

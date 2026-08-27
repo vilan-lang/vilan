@@ -145,7 +145,9 @@ were emitted. Your server serves those two files and an HTML shell; the
 shape.
 
 > **Going deeper.** Build assets come from `std::asset::emit(kind,
-> content)`, callable only during `const` evaluation. The styling
+> content)`, callable only during `const` evaluation; its input sibling
+> `std::asset::read(path)` pulls a project file in at compile time the
+> same way. The styling
 > system's `const style()` chains call it to write CSS rules. Libraries
 > can also declare platform overlays of their own (a base root plus
 > per-platform roots in `[library.layer]`), which is how std itself is

@@ -48,6 +48,10 @@ impl Default for Limits {
     }
 }
 
+/// What one `asset::bundle` call costs: a stat plus a whole-file read, priced
+/// as work rather than as bytes (the `__bundle_asset` arm says why).
+const BUNDLE_FUEL: u64 = 4_096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// The fuel budget ran out — the macro-loop backstop.
@@ -215,15 +219,33 @@ impl ConstValue {
     }
 }
 
+/// The compile-time file channel's project half: `asset::read`'s host
+/// (docs-port.md §3.3) and `asset::bundle`'s (kolt.local 029). The interpreter
+/// knows nothing about paths or filesystems — the caller (the const pass)
+/// supplies resolution, the actual read, and the build-input recording behind
+/// these methods; `Err` is the complete, user-facing reason it did not happen.
+pub trait AssetReader {
+    fn read(&self, path: &str) -> Result<String, String>;
+
+    /// Registers `path` as a file the build must CARRY, and returns the url the
+    /// bundled copy answers on. The bytes never enter the program — a font and
+    /// a favicon ride this the same way a `.txt` does — so the reader reads
+    /// them only to hash them as a build input.
+    fn bundle(&self, path: &str) -> Result<String, String>;
+}
+
 /// Everything one const evaluation produced. The result is what the caller
-/// wants; the other three are the interpreter's OBSERVABLE EFFECT channels,
-/// and which of them a caller may ignore is exactly what separates the two
-/// const forms (const-eval.md §9.2).
+/// wants; assets/stdout/exited are the interpreter's OBSERVABLE EFFECT
+/// channels, and which of them a caller may ignore is exactly what separates
+/// the two const forms (const-eval.md §9.2). `fuel_used` is the run's
+/// measured cost — what the `VILAN_PHASE_TIMING` fuel line reports, so the
+/// budget constant can be sized against real workloads instead of estimates.
 struct ConstRun {
     value: ConstValue,
     assets: Vec<(String, String)>,
     stdout: String,
     exited: Option<i32>,
+    fuel_used: u64,
 }
 
 /// Evaluates one const site against the pass's SHARED world (const-eval.md
@@ -240,34 +262,52 @@ fn run_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
     allow_assets: bool,
+    reader: Option<&'a dyn AssetReader>,
 ) -> Result<ConstRun, Failure> {
     check_reach(&site.imports, &site.helpers)?;
     let mut interpreter = Interpreter::new(limits, allow_assets);
+    interpreter.reader = reader;
     let value = interpreter.run_const_site(site);
     // Either arm of `value` is owned plain data (`ConstValue` / `Failure`), and
     // so is everything below — nothing borrows a scope-held `Value` past this
     // point, so the run's scopes and their closure cycles are torn down here,
     // on the error paths as much as the success one (leak-soak.md §7.8).
     interpreter.clear_scopes();
+    let fuel_used = limits.fuel - interpreter.fuel;
     Ok(ConstRun {
         value: value?,
         assets: interpreter.assets,
         stdout: interpreter.stdout,
         exited: interpreter.exited,
+        fuel_used,
     })
 }
 
+/// What [`eval_const`] hands back: the plain-data result, the asset lines the
+/// run emitted, and the fuel it consumed (the budget instrument — read back by
+/// the const pass for the `VILAN_PHASE_TIMING` line).
+pub struct ConstOutcome {
+    pub value: ConstValue,
+    pub assets: Vec<(String, String)>,
+    pub fuel_used: u64,
+}
+
 /// The EXPLICIT `const` form (const-eval.md §1): the asset channel is live —
-/// this is the one context where `asset::emit` runs (§3) — and stdout and
-/// `process::exit` are DISCARDED. That is the contract, not an oversight: the
-/// user asked for this computation to happen at compile time, and printing is
-/// part of the computation that moved.
+/// this is the one context where `asset::emit` and `asset::read` run (§3,
+/// docs-port.md §3.3) — and stdout and `process::exit` are DISCARDED. That is
+/// the contract, not an oversight: the user asked for this computation to
+/// happen at compile time, and printing is part of the computation that moved.
 pub fn eval_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
-) -> Result<(ConstValue, Vec<(String, String)>), Failure> {
-    let run = run_const(site, limits, true)?;
-    Ok((run.value, run.assets))
+    reader: Option<&'a dyn AssetReader>,
+) -> Result<ConstOutcome, Failure> {
+    let run = run_const(site, limits, true, reader)?;
+    Ok(ConstOutcome {
+        value: run.value,
+        assets: run.assets,
+        fuel_used: run.fuel_used,
+    })
 }
 
 /// The INFERRED form (const-eval.md §9.2): the same evaluator under tighter
@@ -281,7 +321,10 @@ pub fn eval_const<'a>(
 ///   silently change a working program's output when someone switched preset.
 ///   The caller turns the refusal into a silent fallback like any other.
 pub fn eval_inferred<'a>(site: &'a ConstSite<'a>, limits: Limits) -> Result<ConstValue, Failure> {
-    let run = run_const(site, limits, false)?;
+    // No reader either: `asset::read` is const-only, so a fold that reaches it
+    // was already refused statically — and the closed channel keeps that true
+    // by construction even for a path the static check cannot see.
+    let run = run_const(site, limits, false, None)?;
     if !run.stdout.is_empty() {
         return Err(Failure::unsupported(
             "output during evaluation (an inferred fold must be observably silent)",
@@ -356,6 +399,40 @@ fn check_reach(imports: &[String], helpers: &[&'static str]) -> Result<(), Failu
         }
     }
     Ok(())
+}
+
+/// `asset::emit`'s kind is an output-path segment, so it must BE one (E94).
+///
+/// The kind names the file the build writes beside its JavaScript —
+/// `write_assets` does `output_js.with_extension(kind)` — so a kind carrying a
+/// separator or `..` is not a kind at all, it is a path, and it directs the
+/// write somewhere the build never chose. This is the write-direction twin of
+/// `asset::read`'s escape fence (`const_eval::ProjectReader::read`), and it is
+/// deliberately the same shape: lexical, total, and taken before anything
+/// touches the filesystem, so the refusal is as deterministic as the channel it
+/// guards. One rule covers both shapes an audit found — `../evil` and `a/b` —
+/// because they are the same mistake: a kind names ONE file.
+///
+/// Deliberately NOT a charset allowlist. The rule is structural (one `Normal`
+/// component, no separator of either platform's flavour), which refuses every
+/// path a kind could become while leaving every kind a real `emit` passes
+/// untouched.
+fn check_emit_kind(kind: &str) -> Result<(), Failure> {
+    let one_segment = !kind.is_empty() && !kind.contains('/') && !kind.contains('\\') && {
+        let mut components = std::path::Path::new(kind).components();
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+    };
+    if one_segment {
+        return Ok(());
+    }
+    Err(Failure::new(
+        FailureKind::Thrown,
+        format!(
+            "`asset::emit` kinds name one file beside the build output; \
+             `{kind}` is not one path segment — pass a bare kind like `css`"
+        ),
+    ))
 }
 
 /// Runs one function of a transformed program — the macro-expansion entry
@@ -540,6 +617,11 @@ struct Interpreter<'a> {
     /// `asset::emit` is live only under `eval_const`; anywhere else it is a
     /// capability miss.
     allow_assets: bool,
+    /// `asset::read`'s host (docs-port.md §3.3) — present only under
+    /// `eval_const` with a project to read from. `None` with `allow_assets`
+    /// set means the context has no file channel (the wasm playground outside
+    /// its overlay); the read then fails as a clean capability miss.
+    reader: Option<&'a dyn AssetReader>,
     /// The per-run scope registry (leak-soak.md §7.8): every scope this run
     /// created, weakly held. A hoisted or expression-position function is a
     /// `Value::Closure` whose `env` is the scope holding it — a reference
@@ -562,6 +644,7 @@ impl<'a> Interpreter<'a> {
             exited: None,
             assets: Vec::new(),
             allow_assets,
+            reader: None,
             scopes: Vec::new(),
         }
     }
@@ -695,6 +778,23 @@ impl<'a> Interpreter<'a> {
             ));
         }
         self.fuel -= 1;
+        Ok(())
+    }
+
+    /// A bulk charge for work proportional to data, not to evaluated nodes —
+    /// `asset::read` pays one unit per byte read, so fuel bounds the bytes a
+    /// const evaluation can pull in exactly as it bounds the nodes it can
+    /// run. Draining to zero here still completes the current operation; the
+    /// NEXT node's `charge` reports the exhaustion.
+    fn charge_amount(&mut self, amount: u64) -> Result<(), Failure> {
+        if self.fuel < amount {
+            self.fuel = 0;
+            return Err(Failure::new(
+                FailureKind::Fuel,
+                "the fuel budget was exhausted".to_string(),
+            ));
+        }
+        self.fuel -= amount;
         Ok(())
     }
 
@@ -1355,8 +1455,65 @@ impl<'a> Interpreter<'a> {
                 }
                 let kind = expect_str(&take(0))?;
                 let line = expect_str(&take(1))?;
+                // The kind becomes a filename (E94) — fenced before it is kept.
+                check_emit_kind(&kind)?;
                 self.assets.push((kind.to_string(), line.to_string()));
                 Ok(Value::Undefined)
+            }
+            // `asset::read` — the channel's input direction (docs-port.md
+            // §3.3): live only under `eval_const`, like `emit`; resolution,
+            // the read itself, and the build-input recording all live behind
+            // the caller's `AssetReader`. A context with the channel open but
+            // no filesystem (the wasm playground outside its overlay) has no
+            // reader and refuses cleanly. The bytes read are charged as fuel,
+            // so the budget bounds input size exactly as it bounds work.
+            "__read_asset" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::read` outside a `const` expression",
+                    ));
+                }
+                let path = expect_str(&take(0))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported("the project's files (`asset::read`)"));
+                };
+                match reader.read(&path) {
+                    Ok(text) => {
+                        self.charge_amount(text.len() as u64)?;
+                        Ok(Value::Str(text.into()))
+                    }
+                    Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
+                }
+            }
+            // `asset::bundle` — the channel's OUTPUT direction for whole
+            // FILES (kolt.local 029), as against `emit`'s output direction for
+            // lines. Const-only exactly like its two siblings, and behind the
+            // same `AssetReader`: registering the file, hashing it as a build
+            // input, and minting its url all live in the caller. No fuel is
+            // charged for the file's SIZE — unlike `read`, whose bytes become a
+            // `str` the const program then computes over, these bytes never
+            // enter the program at all, so a size charge would bound how large
+            // an asset may be rather than how much work a build does. The
+            // charge below charges a flat per-call cost for the I/O instead:
+            // ~3,900 distinct files fit the explicit budget, which bounds a
+            // const function looping over paths without capping any one file.
+            "__bundle_asset" => {
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(
+                        "`asset::bundle` outside a `const` expression",
+                    ));
+                }
+                let path = expect_str(&take(0))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(
+                        "the project's files (`asset::bundle`)",
+                    ));
+                };
+                self.charge_amount(BUNDLE_FUEL)?;
+                match reader.bundle(&path) {
+                    Ok(url) => Ok(Value::Str(url.into())),
+                    Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
+                }
             }
             // The checked subscripts, matching the emitted `__at*` helpers: an
             // out-of-bounds index is a panic (`Thrown`), so a macro-time
@@ -1396,6 +1553,17 @@ impl<'a> Interpreter<'a> {
                 } else {
                     Err(index_out_of_bounds(length, index))
                 }
+            }
+            // The checked slice, matching the emitted `__substring` helper: a
+            // range outside `0 <= start <= end <= len` is a panic (`Thrown`),
+            // so a const-time violation fails the build with the same message a
+            // runtime one prints.
+            "__substring" => {
+                let text = expect_str(&take(0))?;
+                let start = expect_number(&take(1))?;
+                let end = expect_number(&take(2))?;
+                let out = substring_checked(&text, start, end)?;
+                Ok(Value::Str(Rc::from(out.as_str())))
             }
             "__map_get" => {
                 let map = expect_map(&take(0))?;
@@ -1895,28 +2063,17 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Array(Rc::new(RefCell::new(parts))))
             }
             "substring" => {
-                // JS substring: clamp to [0, len] in UTF-16 units, swap if
-                // start > end.
-                let units: Vec<u16> = s.encode_utf16().collect();
-                let len = units.len() as f64;
-                let index_of = |value: Value<'a>| -> Result<usize, Failure> {
-                    let n = match value {
-                        Value::Undefined => len,
-                        other => to_number(&other)?,
-                    };
-                    let n = if n.is_nan() { 0.0 } else { n };
-                    Ok(n.clamp(0.0, len) as usize)
-                };
-                let mut start = index_of(argument(0))?;
-                let mut end = if arguments.len() > 1 {
-                    index_of(argument(1))?
+                // Vilan's rule, NOT JS's: no clamping and no swapping. Emitted
+                // code routes through the `__substring` helper, so this arm is
+                // reached only by a host string carrying the method directly —
+                // it must still refuse, or the two paths would disagree.
+                let start = to_number(&argument(0))?;
+                let end = if arguments.len() > 1 {
+                    to_number(&argument(1))?
                 } else {
-                    units.len()
+                    s.encode_utf16().count() as f64
                 };
-                if start > end {
-                    std::mem::swap(&mut start, &mut end);
-                }
-                str_result(String::from_utf16_lossy(&units[start..end]))
+                str_result(substring_checked(&s, start, end)?)
             }
             other => Err(Failure::unsupported(format!("the string method `{other}`"))),
         }
@@ -2415,6 +2572,31 @@ fn index_out_of_bounds(length: usize, index: f64) -> Failure {
         FailureKind::Thrown,
         format!("index out of bounds: the length is {length} but the index is {index}"),
     )
+}
+
+/// `str.substring(start, end)` under the one rule the emitted `__substring`
+/// helper enforces: `0 <= start <= end <= len`, in UTF-16 code units, refused
+/// otherwise. Const eval and the runtime must agree here — this arm used to
+/// reproduce JS's clamp-and-swap faithfully, which is exactly the silent
+/// reinterpretation the ban removes, so it now refuses in the same words.
+fn substring_checked(text: &str, start: f64, end: f64) -> Result<String, Failure> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let length = units.len();
+    let whole = start.fract() == 0.0 && end.fract() == 0.0;
+    if whole && 0.0 <= start && start <= end && end <= length as f64 {
+        return Ok(String::from_utf16_lossy(
+            &units[start as usize..end as usize],
+        ));
+    }
+    Err(Failure::new(
+        FailureKind::Thrown,
+        format!(
+            "substring out of range: the length is {length} but the range is {start}..{end} \
+             — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop \
+             a known affix use strip_prefix/strip_suffix, and for the rest of the string pass \
+             s.len() as the end"
+        ),
+    ))
 }
 
 fn expect_str(value: &Value) -> Result<Rc<str>, Failure> {

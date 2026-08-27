@@ -37,6 +37,67 @@ thread_local! {
     /// the active recursion path, so a cyclic mapping terminates.
     static RESOLVING_GENERICS: std::cell::RefCell<HashSet<(u8, TypeId)>> =
         std::cell::RefCell::new(HashSet::default());
+    /// How many type inferences ([`Analyzer::infer_type_inner`]) this thread has
+    /// entered — the analyzer's unit of real work, and what a re-derived call
+    /// chain multiplies. See [`inference_entry_count`].
+    static INFERENCE_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Times a RECORDED return answer was served to an ask that carried a
+    /// caller's generic bindings — which must never happen. See
+    /// [`return_records_served_under_substitution`].
+    static RECORDS_SERVED_UNDER_SUBSTITUTION: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The number of type inferences this thread's analyzer has entered — an
+/// instrumentation probe (B139), not a behavior surface, in the shape of
+/// [`crate::parsing::atom_parse_count`] (B140) and
+/// [`crate::formatter::buffer_parse_count`] (E83): monotonic, read as a snapshot
+/// difference around the work under test.
+///
+/// It exists because B139's TIME half is otherwise evidenced only by a prose
+/// measurement and a green suite, which is not a pin. Before the recorded-answer
+/// fast path in [`Analyzer::infer_function_returns`], every link of an
+/// undeclared-return call chain re-derived every link beneath it, so the chain
+/// cost a CURVE in its length — 390 984 inference entries for 500 links against
+/// 14 730 after. A wall-clock ceiling generous enough to be stable would
+/// separate that from linear, but it would NOT catch a regression to merely
+/// QUADRATIC, and quadratic is exactly what the removal of one gate returns
+/// here. Comparing the count against a LINE in the chain's length catches both.
+///
+/// Counting is unconditional (one thread-local increment per inference, noise
+/// against the surrounding work) for the reason `atom_parse_count` is: the
+/// `VILAN_DEPTH_STATS` counter beside it is behind a `OnceLock`-cached switch
+/// that would have to be set before the process's first analysis, which a test
+/// binary sharing a process with other tests cannot promise.
+pub fn inference_entry_count() -> u64 {
+    INFERENCE_ENTRIES.with(std::cell::Cell::get)
+}
+
+/// How many times this thread served a RECORDED return answer to an ask that
+/// carried a caller's generic bindings. **This number must always be zero**, and
+/// a test asserts that it is — the whole point of the probe.
+///
+/// `inferred_return_types` is keyed by FUNCTION ALONE, but an answer is recorded
+/// whenever the inference that produced it was exact, INCLUDING when that
+/// inference ran under a caller's substitution: measured over the inference
+/// suite, 1 157 records are written under a non-empty substitution context, and
+/// one generic enum's slot receives six different instantiations in a single
+/// run. Those records are one caller's answer sitting in a slot the next caller
+/// would read. The empty-substitution guard on the read in
+/// [`Analyzer::infer_function_returns`] is what keeps them from being served
+/// across callers, and it is the only thing that does.
+///
+/// So the probe counts what the guard forbids, and the pin asserts the count
+/// stays zero. The increment below is unreachable while the guard stands — that
+/// unreachability IS the claim, and deleting the guard makes it reachable
+/// immediately (925 serves over the same suite). A behavioural pin was tried
+/// first and does not exist: with the guard deleted the whole inference suite,
+/// the docs gate, and the byte-identical corpus are all unchanged, because a
+/// wrongly-served answer is re-substituted downstream before it reaches
+/// codegen. That makes this the honest pin — it fails on deletion, and it does
+/// not pretend a miscompile is reachable today.
+pub fn return_records_served_under_substitution() -> u64 {
+    RECORDS_SERVED_UNDER_SUBSTITUTION.with(std::cell::Cell::get)
 }
 
 /// Marks one generic constraint id as being resolved (for a given operation) while a
@@ -2267,6 +2328,7 @@ pub struct Analyzer<'src> {
     // The span of the member identifier in a field access or method call (`.x`),
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
+    struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     // The file currently being walked, so type references (which aren't entities)
     // can be tagged with their source for the language server.
     current_source_id: SourceId,
@@ -2712,9 +2774,20 @@ pub struct Analyzer<'src> {
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
     asset_emit_fn_id: Option<Id>,
+    asset_read_fn_id: Option<Id>,
+    asset_bundle_fn_id: Option<Id>,
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
+    // The phase-1 walk's recursion depth against `WALK_DEPTH_LIMIT` (B138),
+    // and whether the bound already refused once — one diagnostic per
+    // analysis, not one per refused sibling subtree.
+    walk_depth: usize,
+    walk_depth_refused: bool,
+    // Whether the return-inference depth bound already refused once this
+    // analysis (B139) — one diagnostic, not one per link of the chain and not
+    // one per constraint-resolution pass over it.
+    return_depth_refused: bool,
     // `!`'s std fast-path identities and the `Try` trait, resolved by name from
     // their std modules after loading (like `panic_fn_id`).
     option_enum_id: Option<Id>,
@@ -3147,6 +3220,7 @@ impl<'src> Analyzer<'src> {
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             return_inference_stack: Vec::new(),
+            return_depth_refused: false,
             inferred_return_types: HashMap::default(),
             closure_held_targets: HashMap::default(),
             warnings: Vec::new(),
@@ -3157,6 +3231,7 @@ impl<'src> Analyzer<'src> {
             expr_id_to_scope_id_map: HashMap::default(),
             expr_id_to_type_id_map: HashMap::default(),
             member_name_spans: HashMap::default(),
+            struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
@@ -3259,7 +3334,11 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
             asset_emit_fn_id: None,
+            asset_read_fn_id: None,
+            asset_bundle_fn_id: None,
             const_exprs: Vec::new(),
+            walk_depth: 0,
+            walk_depth_refused: false,
             option_enum_id: None,
             result_enum_id: None,
             try_trait_id: None,
@@ -18303,7 +18382,47 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The walk's depth bound (B138): the walk recurses once per level of
+    /// syntactic nesting carrying the largest frame in the analyzer — the
+    /// union of [`Self::walk_expr_node_inner`]'s ~90 arms, measured by
+    /// `VILAN_DEPTH_STATS` at ~36 KiB per level unoptimized, ~4.5 KiB
+    /// optimized — so nesting depth, not node count, is what outgrows a
+    /// stack (the v0.36.0 incident, commit 0fb5e5f0: a modest server
+    /// program's walk closed a CI worker's ~2 MiB margin). Every realistic
+    /// fixture peaks at 20 levels (both walkthrough entries, the std
+    /// twin-parity and release-emission corpora); 500 is 25x that, and caps
+    /// the bounded worst case near 18 MiB unoptimized — deeper nesting gets
+    /// a clean diagnostic instead of a stack overflow.
+    const WALK_DEPTH_LIMIT: usize = 500;
+
     fn walk_expr_node(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::EXPR_WALK);
+        self.walk_depth += 1;
+        if self.walk_depth > Self::WALK_DEPTH_LIMIT {
+            self.walk_depth -= 1;
+            if !self.walk_depth_refused {
+                self.walk_depth_refused = true;
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: format!(
+                        "this expression nests more than {} levels deep, which analysis \
+                         refuses; lift inner expressions into `let` bindings to flatten it",
+                        Self::WALK_DEPTH_LIMIT
+                    ),
+                });
+            }
+            let id = self.new_entity_id();
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return id;
+        }
+        let id = self.walk_expr_node_inner(node, scope_id);
+        self.walk_depth -= 1;
+        id
+    }
+
+    fn walk_expr_node_inner(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
         // `const expr` marks and FORWARDS: the inner expression is the entity
         // (no wrapper), so every downstream pass sees a plain subtree; the
         // const pass (const_eval.rs) evaluates the marked ids after analysis.
@@ -20569,6 +20688,7 @@ impl<'src> Analyzer<'src> {
         expected_type_id: TypeId,
         lookup_scope_id: Id,
     ) -> Option<ExprPattern> {
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PATTERN);
         match pattern {
             WalkPattern::Wildcard => Some(ExprPattern::Wildcard),
             WalkPattern::Binding(capture_id) => {
@@ -22112,6 +22232,8 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> Type {
+        INFERENCE_ENTRIES.with(|count| count.set(count.get().saturating_add(1)));
+        let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::INFER);
         // `exprs_seen` guards against infinite recursion through a genuine cycle
         // (an expression whose type depends on itself). It tracks the current
         // recursion *path*, not every expression ever visited: the id is removed
@@ -23583,12 +23705,62 @@ impl<'src> Analyzer<'src> {
     /// one is then inexact (built on an unfinished neighbour) and is not
     /// recorded; that function's own `FunctionReturns` constraint computes it
     /// top-level and records then.
+    /// The return-inference chain's depth bound (B139), the companion to
+    /// [`Self::WALK_DEPTH_LIMIT`]. A link costs ~12.8 KiB unoptimized, ~2 KiB
+    /// optimized, so 500 links caps this family near 6.4 MiB — the same order
+    /// as the walk's own bounded worst case, and 25x deeper than any realistic
+    /// chain of functions that all decline to declare a return type (every
+    /// fixture in the corpus peaks in single digits). Chains this long are
+    /// generated code; the diagnostic names the fix.
+    const RETURN_DEPTH_LIMIT: usize = 500;
+
     fn infer_function_returns(
         &mut self,
         function_id: Id,
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> ReturnInference {
+        // The chain's depth bound (B139). Return inference recurses once per
+        // CALL LINK — reading `f`'s return reads `g`'s, whose tail calls `h`,
+        // and so on — carrying an inference frame measured at ~12.8 KiB per
+        // link unoptimized, so a long chain of unannotated returns is an
+        // unbounded stack cost that `return_inference_stack` did not bound: it
+        // guards CYCLES, not depth. A 500-link chain cost 6.26 MiB before this.
+        //
+        // Past the bound the answer is `never`, exactly as a re-entrant ask is
+        // answered and for the same reason — it constrains nothing — and every
+        // frame beneath the truncation is marked inexact so no partial answer
+        // is RECORDED as if it were whole. The steer is the real fix: a
+        // declared return type ends the chain, because a declared return is
+        // read straight off the signature and never inferred.
+        if self.return_inference_stack.len() >= Self::RETURN_DEPTH_LIMIT {
+            for (_, exact) in self.return_inference_stack.iter_mut() {
+                *exact = false;
+            }
+            if !self.return_depth_refused {
+                self.return_depth_refused = true;
+                let span = self
+                    .functions
+                    .get(&function_id)
+                    .map(|function| function.name_span)
+                    .unwrap_or(EMPTY_SPAN);
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "inferring this function's return type needs a chain of more than {} \
+                         calls, which analysis refuses; declare a return type on one \
+                         of them to end the chain",
+                        Self::RETURN_DEPTH_LIMIT
+                    ),
+                });
+            }
+            return ReturnInference {
+                type_: Type::Never,
+                disagreements: Vec::new(),
+            };
+        }
         if let Some(position) = self
             .return_inference_stack
             .iter()
@@ -23599,6 +23771,36 @@ impl<'src> Analyzer<'src> {
             }
             return ReturnInference {
                 type_: Type::Never,
+                disagreements: Vec::new(),
+            };
+        }
+        // The recorded answer, when there is one, IS this computation's result:
+        // it is only written for an EXACT inference (§ below) of a resolved
+        // type, so recomputing it walks the same evidence to the same place.
+        // Without this the walk is quadratic in a call chain's length — every
+        // link's own `FunctionReturns` constraint re-derives every link beneath
+        // it, which measured 379k inference entries for a 500-function chain
+        // against 15.8k for a 100-function one (B139).
+        //
+        // Only with an EMPTY substitution: the record is keyed by function
+        // alone, so an answer shaped by a caller's generic bindings is that
+        // caller's, not the function's, and must not be served to the next one.
+        // Disagreements are deliberately not recorded and not replayed — they
+        // are diagnostics belonging to the pass that first derived them, and
+        // the recorded answer is by construction one nothing disagreed with.
+        if substitution_context.is_empty()
+            && let Some(type_id) = self.inferred_return_types.get(&function_id).copied()
+        {
+            // Unreachable while the guard above stands, and that is exactly what
+            // `return_records_served_under_substitution` pins: delete the
+            // `is_empty()` and this counts every caller-shaped answer handed to
+            // the wrong caller.
+            if !substitution_context.is_empty() {
+                RECORDS_SERVED_UNDER_SUBSTITUTION
+                    .with(|count| count.set(count.get().saturating_add(1)));
+            }
+            return ReturnInference {
+                type_: self.get_type_by_type_id(type_id),
                 disagreements: Vec::new(),
             };
         }
@@ -26085,6 +26287,103 @@ impl<'src> Analyzer<'src> {
     /// method's own generics, wire the call, and spawn a `MethodArgCheck` (plus a
     /// `SlotUnification` for `push`/`run`). Defers while the receiver is
     /// unresolved or an unknown closure parameter.
+    /// An integer written as a literal, including the negative form — `-1` is
+    /// `Unary('-')` over `Number("1")`, not a signed literal, and there is no
+    /// folding in the walk. A fractional literal is not one.
+    fn literal_integer(&self, expr_id: Id) -> Option<i64> {
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Number(whole, None, _)) => whole.parse::<i64>().ok(),
+            Some(Expr::Unary('-', operand)) => match self.expr_id_to_expr_map.get(operand) {
+                Some(Expr::Number(whole, None, _)) => whole.parse::<i64>().ok().map(|value| -value),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `s.substring(start, end)` with literal bounds (kolt.local 023). The rule
+    /// is `0 <= start <= end <= len`, refused — never clamped, never swapped.
+    /// JS's own `substring` clamps a negative to 0 and swaps an inverted pair,
+    /// so `s.substring(offset, -1)` silently returns the PREFIX, the complement
+    /// of the request; this tree refuses rather than guessing.
+    ///
+    /// The `start`/`end` halves are decidable from the literals alone, so they
+    /// are caught here rather than at runtime — the array-index precedent in
+    /// `resolve_subscript`. The `end <= len` half needs the receiver's length,
+    /// which only a string literal supplies; everything else is the emitted
+    /// `__substring` helper's business.
+    fn check_literal_substring_range(
+        &mut self,
+        subject_id: Id,
+        member_name: &str,
+        subject_type: &Type,
+        argument_ids: &[Id],
+    ) {
+        if member_name != "substring" || argument_ids.len() != 2 {
+            return;
+        }
+        let str_struct_id = self.primitive_struct_ids.get("str").copied();
+        if !matches!(subject_type, Type::Struct(id, _) if Some(*id) == str_struct_id) {
+            return;
+        }
+        let (Some(start), Some(end)) = (
+            self.literal_integer(argument_ids[0]),
+            self.literal_integer(argument_ids[1]),
+        ) else {
+            return;
+        };
+        let span_of = |analyzer: &Self, expr_id: Id| -> Span {
+            **analyzer.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN)
+        };
+        let rule = "the range must satisfy 0 <= start <= end <= len, and substring \
+                    never clamps or swaps";
+        let (span, msg, note) = if start < 0 {
+            (
+                span_of(self, argument_ids[0]),
+                format!("substring start {start} is negative — {rule}"),
+                "to drop a known affix use `strip_prefix`/`strip_suffix`",
+            )
+        } else if end < 0 {
+            (
+                span_of(self, argument_ids[1]),
+                format!("substring end {end} is negative — {rule}"),
+                "to drop a known affix use `strip_suffix`; for the rest of the \
+                 string pass `s.len()` as the end",
+            )
+        } else if start > end {
+            (
+                span_of(self, argument_ids[1]),
+                format!("substring end {end} is before its start {start} — {rule}"),
+                "swap the arguments if the range was written backwards",
+            )
+        } else {
+            // The receiver's length is known only for a plain string literal.
+            // Escapes are still raw source here, so a literal carrying one is
+            // left to the runtime helper rather than mismeasured.
+            let Some(Expr::String(text)) = self.expr_id_to_expr_map.get(&subject_id) else {
+                return;
+            };
+            if text.contains('\\') {
+                return;
+            }
+            let length = text.encode_utf16().count() as i64;
+            if end <= length {
+                return;
+            }
+            (
+                span_of(self, argument_ids[1]),
+                format!("substring end {end} is past the length {length} of this string — {rule}"),
+                "for the rest of the string pass `s.len()` as the end",
+            )
+        };
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: Some(Note::here(span, note.to_string())),
+            span,
+            msg,
+        });
+    }
+
     fn resolve_method_call(
         &mut self,
         id: Id,
@@ -26540,6 +26839,15 @@ impl<'src> Analyzer<'src> {
                 if !substitution.is_empty() {
                     self.method_call_substitution.insert(id, substitution);
                 }
+                // `substring`'s range rule, decided here when the bounds are
+                // literals — every deferral path above has already returned, so
+                // this runs once. The runtime helper refuses the rest.
+                self.check_literal_substring_range(
+                    subject_id,
+                    member_name,
+                    &subject_type,
+                    argument_ids,
+                );
                 self.constraints.push(Constraint::MethodArgCheck {
                     call_id: id,
                     member_id,
@@ -29196,6 +29504,17 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
             };
+            // The key names the field, so it is a reference to it — recorded
+            // here because this is the only point where the name has been
+            // resolved to a field index (see `struct_initializer_field_spans`).
+            if let Some(source) = self.source_of_id(initializer_id) {
+                self.struct_initializer_field_spans.push((
+                    source,
+                    *field_name_span,
+                    struct_id,
+                    struct_field_index,
+                ));
+            }
             let struct_field_type = struct_field.type_id.get_type(self);
             // Infer the value against the declared field type so that, e.g., an
             // integer literal is treated as `f64` when the field is `f64`.
@@ -31248,23 +31567,23 @@ impl<'src> Analyzer<'src> {
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {
                 self.binary_op_dispatch.insert(binary_id, method_id);
-                // Monomorphize the operator method against the operand's type args
-                // (`Option<Point> ==` binds the impl's `Option<T>` to `T = Point`) so
-                // a generic element comparison inside the body — e.g. `Option<T>::eq`'s
-                // `x == y` — dispatches to the concrete impl. Only needed when a bound
-                // type is a non-native aggregate; for all-native bindings (e.g.
-                // `Option<i32>`) the generic emission already lowers `==` to native JS.
+                // Record the operand's type-arg bindings whenever there are any
+                // (`Option<Point> ==` binds the impl's `Option<T>` to `T = Point`)
+                // — the same rule `resolve_method_call` applies to an explicit
+                // method call. Whether the emission actually SPECIALIZES against
+                // them is the transformer's decision (`operator_instance_required`,
+                // B135): an all-native binding whose body lowers to native JS
+                // keeps the shared generic emission, but a body that transitively
+                // calls a trait requirement explicitly needs the substitution, or
+                // the call falls through to the requirement's empty body and trips
+                // the emitter's never-silent check.
                 let impl_subject = impl_subject_id.get_type(self);
                 if let Some((_, bindings)) =
                     self.reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
+                    && !bindings.is_empty()
                 {
-                    let needs_specialization = bindings.iter().any(|(_, concrete)| {
-                        !self.is_native_operator_type(&concrete.get_type(self))
-                    });
-                    if needs_specialization {
-                        self.method_call_substitution
-                            .insert(binary_id, bindings.into_iter().collect());
-                    }
+                    self.method_call_substitution
+                        .insert(binary_id, bindings.into_iter().collect());
                 }
             } else if let Some((_member_id, impl_subject_id, trait_id, trait_arguments)) =
                 // Natives never dispatch — native JS IS their operator
@@ -32748,6 +33067,12 @@ pub struct Program<'src> {
     pub drop_fn_id: Option<Id>,
     /// `std::asset::emit` — the const-only compile-time effect (const-eval.md).
     pub asset_emit_fn_id: Option<Id>,
+    /// `std::asset::read` — the channel's input direction (docs-port.md §3.3):
+    /// const-only exactly like `emit`.
+    pub asset_read_fn_id: Option<Id>,
+    /// `std::asset::bundle` — the channel's output direction for whole FILES
+    /// (kolt.local 029): const-only exactly like its two siblings.
+    pub asset_bundle_fn_id: Option<Id>,
     /// `const`-marked expression ids in walk order (const-eval.md §1).
     pub const_exprs: Vec<Id>,
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
@@ -32756,6 +33081,22 @@ pub struct Program<'src> {
     /// `(kind, line)` pairs `asset::emit` accumulated during const evaluation;
     /// the build deduplicates, orders, and writes them beside the output.
     pub const_assets: Vec<(String, String)>,
+    /// Every file `asset::read` touched during const evaluation, resolved, with
+    /// the content hash it read (`None` for a file that could not be read —
+    /// still a dependency: its APPEARANCE must invalidate as surely as a
+    /// change). These are build inputs exactly as the `.vl` sources are; watch
+    /// mode and the per-leg reuse check consume them so a changed input is
+    /// seen. Filled by `post_analysis_passes`.
+    pub const_input_files: Vec<(PathBuf, Option<u64>)>,
+    /// Every file `asset::bundle` registered during const evaluation, as
+    /// (resolved source, the name it takes in the output directory) — the
+    /// build OUTPUTS a build must copy so `dist/` is self-sufficient
+    /// (kolt.local 029). Filled by `post_analysis_passes`.
+    pub const_bundled_files: Vec<(PathBuf, String)>,
+    /// The package root the entry resolved under — the base `asset::read`
+    /// paths resolve against (never the process working directory), the same
+    /// base module imports resolve under.
+    pub pkg_root: PathBuf,
     // The `std::context` `Context` intrinsics (if `context.vl` loaded): the
     // `new`/`run`/`get` method ids. The context threading pass keys off these to
     // find context bindings and their `run`/`get` sites; the transformer lowers
@@ -32863,6 +33204,16 @@ pub struct Program<'src> {
     // Use-site identifier spans for field accesses / method calls (`.x`), keyed
     // by the access expr id — drives rename and go-to-definition on members.
     pub member_name_spans: HashMap<Id, Span>,
+    /// Use-site identifier spans for struct-initializer field KEYS: `(file, name
+    /// span, owning struct id, field index)`, one per `x` in `Point { x = 1 }`.
+    ///
+    /// A field ACCESS (`p.x`) records its span in `member_name_spans`, but an
+    /// initializer key is not an access and so had nowhere to record. Without
+    /// it, renaming a struct field misses every construction site and silently
+    /// emits a partial edit that breaks the build (kolt.local 002). May contain
+    /// repeats — a deferred initializer constraint is re-run, and each run
+    /// records again — so a consumer deduplicates by `(file, span)`.
+    pub struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     // Maps a struct initializer expr id to the struct definition it constructs,
     // so go-to-definition on `Point { .. }` reaches the `struct` declaration.
     pub struct_initializer_to_def: HashMap<Id, Id>,
@@ -35712,7 +36063,9 @@ pub fn analyze<'src>(
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
-    analyze_inner(
+    let (sanitized, refusals) = drop_reserved_dependency_edges(workspace);
+    let workspace = sanitized.as_ref().unwrap_or(workspace);
+    let mut program = analyze_inner(
         nodes,
         entry_source,
         std,
@@ -35721,7 +36074,74 @@ pub fn analyze<'src>(
         platform,
         workspace,
         true,
-    )
+    );
+    for refusal in refusals {
+        program.diagnostics.push(refusal);
+        program.diagnostic_sources.push(SourceId(0));
+    }
+    program
+}
+
+/// The dependency-edge names the analyzer refuses to register (E88, defensive
+/// since L12). `std` and `pkg` are the world's own import roots: a manifest
+/// declaring either as a dependency key is refused before analysis
+/// ([`crate::manifest::reserved_package_name`], L12), and a [`Workspace`]
+/// built programmatically — wasm, embedders, tests — is held to the same rule
+/// here, at the one funnel every entry path passes through. Pre-refusal the
+/// analyzer bound a `std` edge OVER the standard library
+/// (`resolve_import_root` checks dependency edges first) while the IDE's
+/// completion answered the stdlib and the macro world's `scope_for` did too —
+/// one name, three resolvers, two answers. The offending edge is reported and
+/// DROPPED rather than made fatal: `std::`/`pkg::` keep meaning the roots
+/// they always name, the program still analyzes, and every resolver agrees by
+/// construction because the shape no longer exists past this point.
+/// `macro_std` stays a legal EDGE name at this layer — the macro world itself
+/// stages the macro standard library as one (`macros.rs` builds that
+/// workspace), and it collides with no regular-world root; user manifests
+/// remain refused by L12.
+fn drop_reserved_dependency_edges(workspace: &Workspace) -> (Option<Workspace>, Vec<Error>) {
+    fn refused_root(name: &str) -> bool {
+        matches!(name, "std" | "pkg")
+    }
+    let refusal = |name: &str| {
+        let reason = crate::manifest::reserved_package_name(name)
+            .expect("a refused edge name is a reserved package name");
+        Error {
+            trace: Vec::new(),
+            note: None,
+            span: EMPTY_SPAN,
+            msg: format!(
+                "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
+                 `macro_std` are all reserved); this workspace staged a dependency \
+                 edge named `{name}` — the edge is ignored and `{name}::` keeps \
+                 meaning the root it always names; rename the dependency"
+            ),
+        }
+    };
+    let mut refusals: Vec<Error> = Vec::new();
+    for (name, _) in &workspace.entry_dependencies {
+        if refused_root(name) {
+            refusals.push(refusal(name));
+        }
+    }
+    for spec in &workspace.packages {
+        for (name, _) in &spec.dependencies {
+            if refused_root(name) {
+                refusals.push(refusal(name));
+            }
+        }
+    }
+    if refusals.is_empty() {
+        return (None, refusals);
+    }
+    let mut sanitized = workspace.clone();
+    sanitized
+        .entry_dependencies
+        .retain(|(name, _)| !refused_root(name));
+    for spec in &mut sanitized.packages {
+        spec.dependencies.retain(|(name, _)| !refused_root(name));
+    }
+    (Some(sanitized), refusals)
 }
 
 /// `analyze` with the cache switchable: the derive/macro hoist's fallback —
@@ -35745,6 +36165,15 @@ fn analyze_inner<'src>(
     // `VILAN_PHASE_TIMING` asks. The marks are unconditional — three
     // `Instant::now()` calls are noise next to an analysis.
     let phase_analyze_start = crate::PhaseClock::now();
+    // The depth instrument (B138) anchors per top-level analysis, like the marks
+    // above. `begin` is idempotent within an analysis so the CLI — which parses
+    // itself and calls `analyze` directly — anchors here, while `analyze_source`
+    // has already anchored around its own parse (B139: the parser recurses
+    // first and is not depth-bounded). A macro world is a nested analysis on the
+    // same thread whose depths belong to the outer run, so it must not anchor.
+    if !crate::macros::in_macro_world() {
+        crate::depth_stats::begin();
+    }
     // The base cache (S3c): a WORLD — everything up to and including the
     // pre-entry `resolve_world` — is a pure function of the loaded files'
     // content plus [`BaseCacheKey`] (platform, the entry's std:: reference
@@ -35835,7 +36264,7 @@ fn analyze_inner<'src>(
                 false,
             );
         }
-        return analyze_over_world(world, nodes, std, platform, workspace);
+        return analyze_over_world(world, nodes, std, pkg_root, platform, workspace);
     }
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
@@ -36783,14 +37212,23 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
     }
-    // Remember `asset::emit` — the const-only compile-time effect
-    // (const-eval.md §2-3); the const pass enforces that no runtime call
-    // path reaches it.
+    // Remember `asset::emit`, `asset::read` and `asset::bundle` — the
+    // const-only compile-time channel: lines out, text in, and whole files out
+    // (const-eval.md §2-3, docs-port.md §3.3, kolt.local 029); the const pass
+    // enforces that no runtime call path reaches any of them.
     if let Some(asset_scope_id) = module_scopes.get("asset") {
         analyzer.asset_emit_fn_id = analyzer
             .scopes
             .get(asset_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("emit").copied());
+        analyzer.asset_read_fn_id = analyzer
+            .scopes
+            .get(asset_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("read").copied());
+        analyzer.asset_bundle_fn_id = analyzer
+            .scopes
+            .get(asset_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("bundle").copied());
     }
     // Remember the std `Option`/`Result` enums and the `Try` trait: `expr!`
     // dispatches the std pair by identity and user types through `Try`
@@ -37104,7 +37542,7 @@ fn analyze_inner<'src>(
             false,
         );
     }
-    analyze_over_world(world, nodes, std, platform, workspace)
+    analyze_over_world(world, nodes, std, pkg_root, platform, workspace)
 }
 
 /// The entry tail: walks the entry over a resolved [`World`], builds,
@@ -37115,6 +37553,7 @@ fn analyze_over_world<'src>(
     world: World<'src>,
     nodes: &'src Spanned<NodeList<'src>>,
     std: &PackageSpec,
+    pkg_root: &Path,
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
@@ -37874,9 +38313,14 @@ fn analyze_over_world<'src>(
         panic_fn_id: analyzer.panic_fn_id,
         drop_fn_id: analyzer.drop_fn_id,
         asset_emit_fn_id: analyzer.asset_emit_fn_id,
+        asset_read_fn_id: analyzer.asset_read_fn_id,
+        asset_bundle_fn_id: analyzer.asset_bundle_fn_id,
         const_exprs: analyzer.const_exprs.clone(),
         const_results: HashMap::default(),
         const_assets: Vec::new(),
+        const_input_files: Vec::new(),
+        const_bundled_files: Vec::new(),
+        pkg_root: pkg_root.to_path_buf(),
         context_new_fn_id,
         context_run_fn_id,
         context_get_fn_id,
@@ -37907,6 +38351,7 @@ fn analyze_over_world<'src>(
         layer_platforms,
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,
+        struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         type_references,
         expr_types,

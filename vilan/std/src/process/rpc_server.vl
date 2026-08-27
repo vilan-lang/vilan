@@ -33,6 +33,14 @@ import pkg::ws::{ WsEvent, WsParser, binary_frame, close_frame, pong_frame, text
 
 external struct Hash;
 
+/// Synchronous, and the one place in std where the usual claim for a sync
+/// binding is actually TRUE: the handshake runs inside `upgrade_handler`, whose
+/// type is `|NodeRequest, NodeSocket, Bytes| void` (`std::http`) — a plain
+/// closure, not an `async` one — so `accept_socket` and everything it calls
+/// genuinely cannot suspend. `std::crypto` is "async where the host is"
+/// (WebCrypto's `subtle.digest` returns a promise); this binding diverges from
+/// that on purpose, because the non-async upgrade channel leaves it no choice.
+/// If that channel ever goes `async`, this is the reason to revisit.
 [extern("node:crypto", "createHash")]
 external fun create_hash(algorithm: str): Hash;
 
@@ -353,16 +361,21 @@ fun accept_socket(
 						let rest = frame.substring(2, frame.len());
 						let parts = rest.split(":");
 						let id_text = parts[0];
-						let payload = rest.substring(id_text.len() + 1, rest.len());
-						let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Text(payload)));
-						match reply {
-							Frame::Text(let answer) => {
-								socket.write_bytes(text_frame(i"r:{id_text}:{answer}"));
-							},
-							Frame::Binary(let bytes) => {
-								let id = id_text.parse_i32().unwrap_or(0 - 1);
-								socket.write_bytes(binary_frame(tag_rpc_bytes(id, bytes)));
-							},
+						// `r:<id>` with no second `:` carries no payload — a
+						// malformed frame off the wire, ignored rather than
+						// answered. (`r:7:` is the well-formed empty payload.)
+						if id_text.len() < rest.len() {
+							let payload = rest.substring(id_text.len() + 1, rest.len());
+							let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Text(payload)));
+							match reply {
+								Frame::Text(let answer) => {
+									socket.write_bytes(text_frame(i"r:{id_text}:{answer}"));
+								},
+								Frame::Binary(let bytes) => {
+									let id = id_text.parse_i32().unwrap_or(0 - 1);
+									socket.write_bytes(binary_frame(tag_rpc_bytes(id, bytes)));
+								},
+							}
 						}
 					} else if frame.starts_with("d:") {
 						// the wire turn: the frame's signal writes coalesce

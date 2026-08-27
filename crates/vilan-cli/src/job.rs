@@ -92,8 +92,9 @@ mod windows {
     /// terminates every process still in the job.
     pub struct Job(HANDLE);
 
-    // A kernel handle is just a value; this type never shares it, so moving a
-    // `ManagedChild` (which the watch loop does, round to round) is safe.
+    // SAFETY: a kernel handle is just a value; this type never shares it, so
+    // moving a `ManagedChild` (which the watch loop does, round to round) is
+    // safe, and every operation on the handle is kernel-side thread-safe.
     unsafe impl Send for Job {}
     unsafe impl Sync for Job {}
 
@@ -101,6 +102,10 @@ mod windows {
         /// Creates an anonymous kill-on-close job and assigns `child` to it.
         /// `None` on any failure — see [`super::ManagedChild::job`].
         pub fn create_and_assign(child: &Child) -> Option<Job> {
+            // SAFETY: plain WinAPI FFI. The created handle is null-checked and
+            // owned by `Job` before any early return; `zeroed()` is a valid
+            // value for the all-integer `#[repr(C)]` limits struct; the raw
+            // child handle stays valid under the `&Child` borrow.
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if handle.is_null() {
@@ -130,6 +135,7 @@ mod windows {
         pub fn terminate(&self) -> std::io::Result<()> {
             // Exit code 1: the child was stopped, not successful. The watch loop
             // discards it (it only waits to reap), and nothing else reads it.
+            // SAFETY: the handle is non-null by construction (checked at create).
             if unsafe { TerminateJobObject(self.0, 1) } == 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -148,6 +154,8 @@ mod windows {
                 JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
                 QueryInformationJobObject,
             };
+            // SAFETY: the out-parameters are live locals of the exact sizes the
+            // call is told, and the handle is non-null by construction.
             unsafe {
                 let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
                 let mut returned = 0u32;
@@ -168,6 +176,8 @@ mod windows {
 
     impl Drop for Job {
         fn drop(&mut self) {
+            // SAFETY: the owned handle is non-null by construction and closed
+            // exactly once — nothing else stores or closes it.
             unsafe {
                 CloseHandle(self.0);
             }

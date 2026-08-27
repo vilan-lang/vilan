@@ -109,6 +109,8 @@ fn enable_virtual_terminal(stream: Stream) {
         Stream::Stdout => STD_OUTPUT_HANDLE,
         Stream::Stderr => STD_ERROR_HANDLE,
     };
+    // SAFETY: plain WinAPI FFI — the handle is null-checked before use, and
+    // `GetConsoleMode` writes through a pointer to a live local.
     unsafe {
         let handle = GetStdHandle(id);
         if handle.is_null() {

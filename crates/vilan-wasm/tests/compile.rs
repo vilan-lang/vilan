@@ -29,10 +29,19 @@ fn compiler() -> MutexGuard<'static, ()> {
 /// test harness spawns: the analyzer's recursion on a real program can
 /// overflow libtest's ~2 MiB worker thread — the v0.36.0 release gate
 /// aborted (SIGABRT) exactly one margin short of a local pass — while the
-/// SHIPPED wasm links with a 64 MiB stack (release.yml's `-zstack-size`),
+/// SHIPPED wasm links with a 16 MiB stack (release.yml's `-zstack-size`),
 /// so the test thread was the only under-provisioned host. `RETAINED` is
 /// thread-local, so a compile and the completion that reads it must ride
 /// ONE spawn — wrap whole bodies, never per call.
+///
+/// Measured since (B138, `VILAN_DEPTH_STATS`): the analyses these tests run
+/// peak under 1 MiB of stack unoptimized — what closed the CI margin was the
+/// expression walk's ~36 KiB-per-nesting-level frames, depth-bounded at 500
+/// levels now, as are the return-inference chain (B139) and the parser itself
+/// (B142). The 256 MiB here matches the vilan-core harness convention, not a
+/// measured need of these fixtures — the SHIPPED margins are sized from the
+/// bounds and are much smaller (`COMPILER_STACK_SIZE`, release.yml's
+/// `-zstack-size`).
 fn on_big_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| {
         std::thread::Builder::new()

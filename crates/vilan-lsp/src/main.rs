@@ -8,6 +8,7 @@ mod document;
 mod line_index;
 mod manifest_completion;
 mod publish;
+mod references;
 mod uri;
 
 use std::collections::HashMap;
@@ -399,6 +400,19 @@ fn content_modified() -> JsonRpcError {
     JsonRpcError {
         code: ErrorCode::ContentModified,
         message: "still analyzing this file; retry in a moment".into(),
+        data: None,
+    }
+}
+
+/// A rename that cannot produce a COMPLETE edit set refuses, carrying the
+/// reason (kolt.local 002). The same `-32803` `RequestFailed` spelling rename's
+/// other refusals use, so the client surfaces the message inline on the rename
+/// widget rather than as a toast — the user is standing at the symbol, and the
+/// reason is about that symbol.
+fn rename_refused(refusal: &crate::document::RenameRefusal) -> JsonRpcError {
+    JsonRpcError {
+        code: ErrorCode::ServerError(-32803),
+        message: refusal.message().into(),
         data: None,
     }
 }
@@ -1607,7 +1621,10 @@ fn server_capabilities() -> ServerCapabilities {
         linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
-        rename_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
         document_symbol_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
@@ -2186,23 +2203,74 @@ impl LanguageServer for Backend {
                 return Err(still_analyzing());
             }
             let offset = document.analyzed_offset(position);
-            let occurrences = document.references(offset);
-            if occurrences.is_empty() {
-                return Ok(None);
-            }
+            // Rename is a thin layer over the reference index: the same spans
+            // find-references answers with, checked for the extra things a rename
+            // needs (a spellable name, files this project may edit, nothing known
+            // to be missing) and refused with a reason when any fails.
+            let spans = match document.rename_edits(offset, &new_name) {
+                Ok(spans) => spans,
+                Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
+                Err(refusal) => return Err(rename_refused(&refusal)),
+            };
             let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-            for (source, span) in occurrences {
-                if let Some(location) = self.location_for(&document, &uri, source, span) {
-                    changes.entry(location.uri).or_default().push(TextEdit {
-                        range: location.range,
-                        new_text: new_name.clone(),
-                    });
-                }
+            for (source, span) in spans {
+                // An occurrence that cannot be turned into a location would be a
+                // reference this rename silently skips — the partial edit set the
+                // rule forbids — so refuse rather than drop it.
+                let Some(location) = self.location_for(&document, &uri, source, span) else {
+                    return Err(rename_refused(
+                        &crate::document::RenameRefusal::Incomplete {
+                            what: "this symbol".to_string(),
+                            missing: 1,
+                        },
+                    ));
+                };
+                changes.entry(location.uri).or_default().push(TextEdit {
+                    range: location.range,
+                    new_text: new_name.clone(),
+                });
             }
             Ok(Some(WorkspaceEdit {
                 changes: Some(changes),
                 ..Default::default()
             }))
+        })
+    }
+
+    /// Whether the cursor is on something renameable, and the range the editor
+    /// should pre-fill. Answering this lets the client refuse *before* the user
+    /// types a new name, instead of after.
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        self.fenced("prepare_rename", Ok(None), || {
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            if document.is_stale() {
+                return Err(still_analyzing());
+            }
+            let offset = document.analyzed_offset(params.position);
+            // `rename_edits` with a name known to be valid: the answer is
+            // whether a rename COULD proceed, decided by exactly the checks the
+            // rename itself will run, so the two cannot disagree.
+            match document.rename_edits(offset, "placeholder") {
+                Ok(_) => {}
+                Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
+                Err(refusal) => return Err(rename_refused(&refusal)),
+            }
+            let Some(occurrence) = document
+                .reference_index()
+                .at(SourceId(0), offset)
+                .map(|occurrence| occurrence.span)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(PrepareRenameResponse::Range(
+                document.analyzed_range(&occurrence),
+            )))
         })
     }
 

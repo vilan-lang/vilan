@@ -1,7 +1,8 @@
 // vilan dev runtime (HMR) — prepended to browser-leg bundles by an HMR-active
 // `vilan run --watch` (hmr.md §2/§3). Plain ES2020, no dependencies. The port,
-// this build's version, and this leg's bundle name are template-substituted at
-// write time. It installs a `window.__VILAN_HMR__` singleton (a re-evaluated
+// this run's dev-channel token, this build's version, and this leg's bundle
+// name are template-substituted at write time. It installs a
+// `window.__VILAN_HMR__` singleton (a re-evaluated
 // bundle reuses it), defines the instrumentation globals the compiled bundle
 // calls (`__hmr_adopt*`/`__hmr_expose`, hmr.md §5) plus the `std::dev` host
 // globals (`__hmr_register_teardown`/`__hmr_stash`/`__hmr_take`), and reacts to
@@ -14,8 +15,20 @@
         return;
     }
     var PORT = __VILAN_HMR_PORT__;
+    var TOKEN = "__VILAN_HMR_TOKEN__";
     var VERSION = __VILAN_HMR_VERSION__;
     var BUNDLE = "__VILAN_HMR_BUNDLE__";
+
+    // Every dev-channel route requires this run's token (backlog E93), so every
+    // request this file makes goes through here — there is no second way to
+    // spell a channel URL. We can hold it because this bundle came from the
+    // page's own origin; a page that merely knows the port cannot read it, which
+    // is what keeps our compile diagnostics and our bundle to ourselves and
+    // makes `POST /refresh` unforgeable. The token is hex, so it needs no
+    // escaping.
+    function channelUrl(route) {
+        return "http://127.0.0.1:" + PORT + route + "?token=" + TOKEN;
+    }
 
     // Swap state (hmr.md §3/§4). Held in this closure AND on the singleton, so
     // the globals below and the swap protocol share one view; `seed` and
@@ -376,8 +389,26 @@
     // A fetch that 404s or errors (the dev channel lacks the asset, or is
     // unreachable) warns and changes nothing, leaving the current stylesheet
     // exactly as it was — mirroring `fetchAndSwap`'s never-reload reasoning:
-    // reloading would only re-request the user's own stale route.
-    var cssShadows = new WeakMap(); // <link> -> the <style> now superseding it.
+    // reloading would only re-request the user's own stale route. A 404 is
+    // AMBIGUOUS (a missing asset, a hiccup, a route that never existed), so it
+    // is never read as "this stylesheet was removed": only a `swap` event's
+    // `sheets` set — the round's own statement — says that (`withdrawOwnSheet`).
+    //
+    // Keyed by SIDECAR NAME rather than by <link> element, because a sheet the
+    // page has no <link> for is exactly the case that used to fall through the
+    // floor: the document a boot-time-rendered server served before the
+    // stylesheet existed carries no <link> for it, and a css-only round never
+    // restarts that server, so it never gains one (kolt.local 007).
+    var cssShadows = {}; // "client.css" -> the <style> carrying its current bytes.
+
+    // This leg's OWN sidecar. The shim may create or withdraw the page's copy
+    // of this one on its own authority — the page runs this bundle, so this
+    // bundle's stylesheet is the page's stylesheet whether or not the markup
+    // ever linked it. Any OTHER name is another page's business: the shim only
+    // maintains what this document already links, and never invents a <style>
+    // for it (in a multi-browser-leg workspace that would inject the admin
+    // leg's sheet into the client leg's page).
+    var OWN_SHEET = BUNDLE + ".css";
 
     function assetBasename(href) {
         var base = href.split("?")[0];
@@ -385,19 +416,74 @@
         return slash === -1 ? base : base.slice(slash + 1);
     }
 
-    function applyFreshCss(link, text) {
-        link.disabled = true;
-        var style = cssShadows.get(link);
-        if (!style) {
-            style = document.createElement("style");
-            (document.head || document.documentElement).appendChild(style);
-            cssShadows.set(link, style);
+    // The stylesheet <link>s whose href names `asset` (basename match, query
+    // ignored) — the asset-matching semantics of hmr.md §2, unchanged.
+    function linksFor(asset) {
+        var links = document.querySelectorAll('link[rel="stylesheet"]');
+        var found = [];
+        for (var index = 0; index < links.length; index++) {
+            var base = links[index].href.split("?")[0];
+            if (base === asset || base.endsWith("/" + asset)) {
+                found.push(links[index]);
+            }
         }
-        style.textContent = text;
+        return found;
     }
 
-    function fetchAndApplyCss(link, name) {
-        return fetch("http://127.0.0.1:" + PORT + "/asset/" + name)
+    // The <style> carrying `name`'s current bytes, created on first use and
+    // updated in place forever after — one element per sidecar, no stack.
+    //
+    // Placed immediately after the <link> it supersedes when there is one, so
+    // the sheet keeps its position in the cascade (appending to <head> would
+    // move it past every sheet that followed it, quietly re-deciding ties); a
+    // sheet with no <link> is new to the document and joins <head> at the end,
+    // where a <link> for it would have gone.
+    function shadowFor(name, anchor) {
+        var style = cssShadows[name];
+        if (!style) {
+            style = document.createElement("style");
+            if (style.setAttribute) {
+                style.setAttribute("data-vilan-hmr", name);
+            }
+            if (anchor && anchor.parentNode && anchor.parentNode.insertBefore) {
+                anchor.parentNode.insertBefore(style, anchor.nextSibling || null);
+            } else {
+                (document.head || document.documentElement).appendChild(style);
+            }
+            cssShadows[name] = style;
+        }
+        return style;
+    }
+
+    // Whether this document is a place `name` can land: it links the sheet, or
+    // the sheet is this leg's own. A name that is neither belongs to another
+    // browser leg's page — every leg's page receives the same broadcast — and
+    // is passed over in silence, not warned about.
+    function appliesHere(name) {
+        return linksFor(name).length > 0 || name === OWN_SHEET;
+    }
+
+    // Land `name`'s fresh bytes in this document. With <link>s to supersede,
+    // they are disabled and shadowed (hrefs untouched); with none, the sheet is
+    // this leg's own and simply joins <head> on its own. A name that is neither
+    // linked here nor ours applies nowhere, and says so.
+    function applyFreshCss(name, text) {
+        var links = linksFor(name);
+        if (!links.length && name !== OWN_SHEET) {
+            return false;
+        }
+        for (var index = 0; index < links.length; index++) {
+            links[index].disabled = true;
+        }
+        shadowFor(name, links[0]).textContent = text;
+        return true;
+    }
+
+    function fetchAndApplyCss(name) {
+        if (!appliesHere(name)) {
+            return undefined;
+        }
+        return fetch(channelUrl("/asset/" + name))
             .then(function (response) {
                 if (!response.ok) {
                     throw new Error("unexpected status " + response.status);
@@ -405,7 +491,7 @@
                 return response.text();
             })
             .then(function (text) {
-                applyFreshCss(link, text);
+                applyFreshCss(name, text);
             })
             .catch(function (error) {
                 if (typeof console !== "undefined" && console.warn) {
@@ -417,18 +503,81 @@
             });
     }
 
+    // A `css` event: refresh the named sidecar, or — with no name — every
+    // stylesheet <link> the page has, each by its own basename (hmr.md §2).
     function bumpStylesheets(asset) {
+        if (asset) {
+            return fetchAndApplyCss(asset);
+        }
+        // Nameless: every stylesheet the page links, each by its own basename.
+        // Which is why a first-ever sidecar needs the NAMED event the CLI always
+        // sends — a sheet with no <link> is in no list to walk.
         var links = document.querySelectorAll('link[rel="stylesheet"]');
+        var seen = {};
         var pending = [];
         for (var index = 0; index < links.length; index++) {
-            var link = links[index];
-            var base = link.href.split("?")[0];
-            if (asset && !(base === asset || base.endsWith("/" + asset))) {
+            var name = assetBasename(links[index].href);
+            if (seen[name]) {
                 continue;
             }
-            pending.push(fetchAndApplyCss(link, assetBasename(link.href)));
+            seen[name] = true;
+            var applied = fetchAndApplyCss(name);
+            if (applied) {
+                pending.push(applied);
+            }
         }
         return pending.length ? Promise.all(pending) : undefined;
+    }
+
+    // A `swap` event's `sheets` — the round's COMPLETE browser stylesheet set —
+    // reconciled against this document. Present names are fetched and applied;
+    // this leg's own sidecar being absent is the round's statement that it
+    // emitted none, so the page's copy of it is withdrawn. A swap re-evaluates
+    // the bundle without reloading the document, so this is the only thing that
+    // refreshes stylesheets on a round that also changed a bundle, and the only
+    // way a first-ever or a deleted sidecar reaches the page at all.
+    //
+    // An event with no `sheets` (nothing declared) reconciles nothing.
+    function reconcileSheets(sheets) {
+        if (!sheets || typeof sheets.length !== "number") {
+            return undefined;
+        }
+        var declared = {};
+        var pending = [];
+        for (var index = 0; index < sheets.length; index++) {
+            declared[sheets[index]] = true;
+            var applied = fetchAndApplyCss(sheets[index]);
+            if (applied) {
+                pending.push(applied);
+            }
+        }
+        if (!declared[OWN_SHEET]) {
+            withdrawOwnSheet();
+        }
+        return pending.length ? Promise.all(pending) : undefined;
+    }
+
+    // This round emits no stylesheet for this leg: take back what the shim put
+    // in, and disable the <link> that named it. Both are ours to undo — the
+    // <style> is our own artifact, and `disabled` is the same non-destructive,
+    // reload-clean toggle the supersede path already relies on. The <link> is
+    // never re-enabled and never re-pointed: it addresses the user's own server
+    // route, whose bytes are the boot-time snapshot of a file that no longer
+    // exists.
+    function withdrawOwnSheet() {
+        var style = cssShadows[OWN_SHEET];
+        if (style) {
+            if (style.parentNode && style.parentNode.removeChild) {
+                style.parentNode.removeChild(style);
+            } else if (style.remove) {
+                style.remove();
+            }
+            delete cssShadows[OWN_SHEET];
+        }
+        var links = linksFor(OWN_SHEET);
+        for (var index = 0; index < links.length; index++) {
+            links[index].disabled = true;
+        }
     }
 
     // A staleness signal (a `swap` event, or a `connected` whose version is
@@ -441,7 +590,7 @@
     // the same version gap and reloads again, forever. The dev channel, not
     // the page reload, is the only sure route to current bytes.
     function fetchAndSwap(version) {
-        return fetch("http://127.0.0.1:" + PORT + "/bundle/" + BUNDLE + ".js")
+        return fetch(channelUrl("/bundle/" + BUNDLE + ".js"))
             .then(function (response) {
                 return response.text();
             })
@@ -477,12 +626,25 @@
                 // disconnected — either way, the heal is a swap from the dev
                 // channel, NEVER a reload (hmr.md §2; a reload re-fetches the
                 // stale bundle and loops).
+                //
+                // RESIDUE: the hello carries no `sheets`, so this heal
+                // refreshes the bundle but reconciles no stylesheet. A tab
+                // opened AFTER a sidecar appeared but before the next round
+                // that names it — on a server that decided the page's <link>s
+                // at boot and has not restarted since — therefore runs current
+                // code with no styles until the next css or swap round. The
+                // channel would have to carry the round's set on the hello for
+                // this heal to close it too.
                 if (data.version !== singleton.version) {
                     return fetchAndSwap(data.version);
                 }
                 break;
             case "swap":
-                return fetchAndSwap(data.version);
+                // Stylesheets first, so the re-evaluated bundle mounts into a
+                // document that already carries this round's styles.
+                return Promise.resolve(reconcileSheets(data.sheets)).then(function () {
+                    return fetchAndSwap(data.version);
+                });
             case "reload":
                 reload();
                 break;
@@ -501,7 +663,10 @@
         if (typeof EventSource === "undefined") {
             return;
         }
-        var source = new EventSource("http://127.0.0.1:" + PORT + "/events");
+        // `EventSource` cannot set request headers, which is why the token
+        // travels as a query parameter on this route — and, for one shape rather
+        // than two, on all of them.
+        var source = new EventSource(channelUrl("/events"));
         source.onmessage = function (event) {
             var data;
             try {

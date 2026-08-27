@@ -229,20 +229,23 @@ fn heading_plain_text(text: &str) -> String {
     plain
 }
 
-/// mdBook's `normalize_id`: alphanumerics, `_` and `-` kept (lowercased),
-/// whitespace to `-`, everything else dropped.
+/// mdBook's `id_from_content` tail: the text (tags already dropped) is
+/// trimmed, then alphanumerics, `_` and `-` are kept — lowercased with the
+/// full Unicode fold, mdBook's own (`École Été` → `école-été`, v0.5.4) —
+/// each whitespace character becomes one `-`, and everything else is
+/// dropped. The same rule `std::markdown`'s `heading_id` implements;
+/// [`mdbook_heading_ids_reproduces_the_anchor_golden`] holds the two to one
+/// truth (B137).
 fn normalize_id(text: &str) -> String {
-    text.chars()
-        .filter_map(|character| {
-            if character.is_alphanumeric() || character == '_' || character == '-' {
-                Some(character.to_ascii_lowercase())
-            } else if character.is_whitespace() {
-                Some('-')
-            } else {
-                None
-            }
-        })
-        .collect()
+    let mut id = String::new();
+    for character in text.trim().chars() {
+        if character.is_alphanumeric() || character == '_' || character == '-' {
+            id.extend(character.to_lowercase());
+        } else if character.is_whitespace() {
+            id.push('-');
+        }
+    }
+    id
 }
 
 /// The `id` of every `<hN id="…">` in a rendered page, in order.
@@ -430,6 +433,67 @@ fn mdbook_heading_ids_reproduces_the_known_shapes() {
             "loops-2",
             "named",
         ]
+    );
+}
+
+#[test]
+fn mdbook_heading_ids_lowercase_beyond_ascii_and_trim_after_tag_drop() {
+    // B137's two latent divergences from mdBook v0.5.4 (and from
+    // std::markdown's `heading_id`, which is verified against it —
+    // markdown.md §10.1): the lowercase fold is full Unicode, not ASCII
+    // (`École Été` → `école-été`), and the heading's text is trimmed AFTER
+    // tags are dropped, so an anchor-fronted heading does not keep the
+    // anchor's trailing space as a leading `-`.
+    let page = "\
+# École Été
+
+## <a id=\"planted\"></a> Anchored heading
+";
+    assert_eq!(mdbook_heading_ids(page), ["école-été", "anchored-heading"]);
+}
+
+/// B137's anti-drift gate: the twin held to the same mdBook v0.5.4 truth
+/// `std::markdown`'s `heading_id` answers to — `markdown_anchors.golden`
+/// (456 ids over 56 pages at the time of writing, scraped from a real
+/// v0.5.4 build by `scripts/regen-markdown-golden.py` and pinned on the
+/// package side by vilan-core's
+/// `the_book_parses_strictly_and_reproduces_the_mdbook_anchor_golden`).
+/// With both implementations reproducing one golden, neither can drift from
+/// the other over the book's ids without its own gate going red.
+#[test]
+fn mdbook_heading_ids_reproduces_the_anchor_golden() {
+    let golden = read(&repo_root().join("crates/vilan-core/tests/markdown_anchors.golden"));
+    let mut expected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut total = 0usize;
+    for line in golden.lines() {
+        // `<page.md> h<level> <id>` — the level column is the renderer's
+        // concern, not the id algorithm's.
+        let mut columns = line.splitn(3, ' ');
+        let (Some(page), Some(_level), Some(id)) = (columns.next(), columns.next(), columns.next())
+        else {
+            panic!("malformed golden line: {line}");
+        };
+        expected
+            .entry(page.to_string())
+            .or_default()
+            .push(id.to_string());
+        total += 1;
+    }
+    assert!(
+        total >= 400,
+        "the golden holds {total} ids — regenerated away?"
+    );
+    let mut mismatches = Vec::new();
+    for (page, ids) in &expected {
+        let twin = mdbook_heading_ids(&read(&docs_root().join(page)));
+        if &twin != ids {
+            mismatches.push(format!("{page}: twin {twin:?} vs golden {ids:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "the twin disagrees with the anchor golden:\n{}",
+        mismatches.join("\n")
     );
 }
 

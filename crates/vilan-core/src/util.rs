@@ -287,6 +287,9 @@ impl RecursionGuard {
                 None
             } else {
                 depth.set(current + 1);
+                // The guard already counts this family's depth; the B138
+                // instrument only reads the high-water mark.
+                crate::depth_stats::note(crate::depth_stats::TYPE_WALK, current + 1);
                 Some(RecursionGuard)
             }
         })

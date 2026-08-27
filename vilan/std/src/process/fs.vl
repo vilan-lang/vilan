@@ -2,16 +2,33 @@
 // bindings are `async` (promise-returning host functions), so calls to them are
 // implicitly awaited.
 //
-// Error posture (F13, fullstack-dx.md §9.3): `read_bytes`, `read_file_to_str`,
-// `read_dir`, and `write_file` all throw host-side on ANY failure — a missing
-// path is treated the same as a permissions error, exactly `read_file_to_str`'s
-// posture from before this file grew. `stat` alone is different BY DESIGN: it
-// exists to let a caller ask "is this here yet, and what does it look like"
-// (dev-refresh.md §2(i)'s mtime-revalidating poller is the motivating
-// customer), so a missing path is an expected outcome it returns (`None`), not
-// an exception it throws. Any other `stat` failure still throws.
+// Error posture (F13, fullstack-dx.md §9.3): every call here throws host-side
+// on ANY failure — a missing path is treated the same as a permissions error,
+// exactly `read_file_to_str`'s posture from before this file grew — with TWO
+// named exceptions, both of which are non-throwing because the OPERATION means
+// something a missing path already satisfies:
+//
+//   `stat`            — a probe. It exists to let a caller ask "is this here
+//                       yet, and what does it look like" (dev-refresh.md
+//                       §2(i)'s mtime-revalidating poller is the motivating
+//                       customer), so a missing path is `None`, not a throw.
+//   `remove_dir_all`  — "make sure this is gone". A path that was never there
+//                       already satisfies it, so a missing one is a no-op
+//                       (`{ force: true }`, which is what the host option
+//                       means).
+//
+// Any OTHER failure of either — a permissions error, a busy directory — still
+// throws. Every other function in this module has the throwing posture, and a
+// caller who wants to branch on absence probes with `stat` first.
+//
+// Everything here is asynchronous except `exists`, which says at its own
+// declaration why it is not (proposal/filesystem.md §4: a sync variant of an
+// async operation must name the caller that cannot suspend). Nothing this file
+// gained in the write and directory slice has a sync twin, and none was asked
+// for.
 
 import pkg::bytes::Bytes;
+import pkg::crypto::random_uuid;
 import pkg::option::Option::{ None, Some, self };
 
 /// Reads a file, decoded as text under `encoding` (a `node:fs` encoding name —
@@ -34,8 +51,34 @@ async external fun read_bytes(path: str): Bytes;
 [extern("node:fs/promises", "writeFile")]
 async external fun write_file(path: str, contents: str): void;
 
-/// Whether a path exists on disk (`node:fs` `existsSync` — synchronous, so boot
-/// code can branch on it directly).
+/// Writes raw bytes to `path`, creating it or truncating what was there — the
+/// missing mirror of `read_bytes`, and the reason it was missing is worth
+/// recording: `writeFile` was bound once, typed `(path, contents: str)`, so
+/// from F13 (which added the binary read) until now bytes could come IN and
+/// never go OUT. A program could read a favicon and could not write one back.
+/// The host `writeFile` accepts a `Uint8Array` argument directly, and `Bytes`
+/// IS one, so this is the same host function bound at its other argument type
+/// — exactly how `read_bytes` and `read_file_encoded` share `readFile`.
+///
+/// The bytes reach the file unchanged: no encode, no decode, no replacement
+/// character. That is not a small promise — a text round trip through UTF-8
+/// turned kolt's 483-byte favicon into 853 bytes served, one U+FFFD per byte
+/// that was not a legal sequence.
+[extern("node:fs/promises", "writeFile")]
+async external fun write_bytes(path: str, contents: Bytes): void;
+
+/// Whether a path exists on disk (`node:fs` `existsSync`).
+///
+/// The one synchronous binding in this module, and NOT for the reason a sync
+/// function usually claims: no caller of it cannot suspend. Its callers in
+/// `std::build` (`build_of`, `load_build`) are both async and await their file
+/// reads a line or two later. It is synchronous because `node:fs/promises` has
+/// no `exists` at all — `existsSync` is the whole operation in one call — and
+/// because syncness is the ONLY thing that separates it from
+/// `stat(path).is_some()`, which is right below, is async, and is what to reach
+/// for on a request path. The cost is one blocking stat (node implements
+/// `existsSync` as exactly that): affordable for a boot-time branch, not for a
+/// per-request one.
 [extern("node:fs", "existsSync")]
 external fun exists(path: str): bool;
 
@@ -45,16 +88,315 @@ fun read_file_to_str(path: str): str {
 	read_file_encoded(path, "utf8")
 }
 
+// --- atomic replace ------------------------------------------------------
+
+/// Renames (moves) `from` to `to`, replacing `to` if it already exists.
+/// WITHIN one filesystem this is atomic: a reader of `to` sees either the old
+/// file or the new one, never a mix. ACROSS filesystems the host raises
+/// `EXDEV` and nothing moves — which is why `write_atomic` below keeps its
+/// temporary a SIBLING of its target rather than putting it in a temp dir.
+[extern("node:fs/promises", "rename")]
+async external fun rename(from: str, to: str): void;
+
+/// Writes `contents` to `path` atomically: into a uniquely-named sibling
+/// first, then `rename` over the target. A crash at any point leaves either
+/// the previous file intact or the complete new one — never the truncated
+/// half-write a plain `write_file` leaves behind, which is how a JSON store
+/// silently loses everything on the next boot that reads it back and finds it
+/// corrupt (proposal/filesystem.md §2 traces that failure end to end).
+///
+/// ATOMIC, NOT DURABLE. After a power loss the rename may not have reached the
+/// device. Durability needs `fsync`, which the host exposes only on an open
+/// file handle — std has no handle type yet (proposal/filesystem.md §5.2).
+///
+/// The temporary is uniquely named because concurrent writers must not share
+/// one, so a crash can leave a `<path>.<uuid>.tmp` file behind: `vilan` has no
+/// `try`/`catch` to clean it up on the failing path. That is the right trade —
+/// a stray temporary is recoverable by hand, a torn target is not.
+fun write_atomic(path: str, contents: str) {
+	let unique = random_uuid();
+	let temporary = i"{path}.{unique}.tmp";
+	write_file(temporary, contents);
+	rename(temporary, path);
+}
+
+/// `write_atomic` for bytes: the same uniquely-named sibling and the same
+/// `rename` over the target, so an image, a font or a wasm module replaces its
+/// predecessor whole or not at all. Everything `write_atomic`'s comment says
+/// about atomicity, durability and the stranded temporary applies here word
+/// for word — the only difference is which of the two `writeFile` bindings
+/// stages the temporary.
+fun write_bytes_atomic(path: str, contents: Bytes) {
+	let unique = random_uuid();
+	let temporary = i"{path}.{unique}.tmp";
+	write_bytes(temporary, contents);
+	rename(temporary, path);
+}
+
+// --- the other whole-path writes -----------------------------------------
+
+/// Appends `contents` to the end of `path`, creating the file if it is not
+/// there yet. Unlike `write_file` this never truncates, which makes it the
+/// right call for a log and the wrong call for a store: an append is NOT
+/// atomic, and a crash partway through leaves a partial line behind. There is
+/// no `append_bytes` twin — nothing in the tree or in kolt has asked for one,
+/// and §9's rule for this module is to bind a host call when something needs
+/// it rather than to fill in the grid.
+[extern("node:fs/promises", "appendFile")]
+async external fun append(path: str, contents: str): void;
+
+/// Copies the file at `from` to `to`, replacing `to` if it exists. Copies a
+/// FILE only: `copyFile` on a directory raises `EISDIR`, and `copy_dir` below
+/// is the directory form. The copy is not atomic — a reader watching `to` can
+/// observe it partially written — so a destination something else reads back
+/// wants `copy` to a temporary plus `rename`, which is `write_atomic`'s shape
+/// spelled out by hand.
+[extern("node:fs/promises", "copyFile")]
+async external fun copy(from: str, to: str): void;
+
+/// Removes the FILE at `path` (`unlink`). A directory raises host-side
+/// (`EPERM` or `EISDIR` depending on the platform) rather than being removed:
+/// `remove_dir` and `remove_dir_all` below are the directory forms, and the
+/// split is the host's, kept rather than papered over. A missing path throws,
+/// matching every other operation in this module except `stat` — probe with
+/// `stat(path).is_some()` first if a missing file is an ordinary outcome.
+[extern("node:fs/promises", "unlink")]
+async external fun remove(path: str): void;
+
+/// Reads `path` as UTF-8 text, hands it to `revise`, and writes what comes
+/// back atomically. The read-modify-write every JSON store and every config
+/// rewrite is made of, with the replace half already correct: a crash inside
+/// `revise` leaves the previous file untouched, and a crash during the write
+/// leaves the previous file or the complete new one.
+///
+/// NOT a lock, and the difference matters. Two processes calling `update` on
+/// one path can still interleave read-read-write-write, and the second write
+/// wins whole — the first revision is lost, silently. `update` closes the
+/// TEARING window, not the racing one; the host cannot close the racing one
+/// without advisory locking, which node has no access to
+/// (proposal/filesystem.md §9). For a single writer — which is what a store,
+/// a cache and a config all are — this is the complete answer.
+///
+/// `revise` is a plain value-returning closure, so it is asyncness-polymorphic
+/// (async-polymorphism.md): a revision that itself awaits makes this instance
+/// of `update` await too, with nothing to write at either the declaration or
+/// the call site.
+fun update(path: str, revise: |str| str) {
+	let current = read_file_to_str(path);
+	write_atomic(path, revise(current));
+}
+
 /// Lists a directory's immediate entries by NAME ONLY (files and
-/// subdirectories alike, not path-joined — join with `path` yourself), in
-/// whatever order the host filesystem hands them back (NOT guaranteed
-/// alphabetical or otherwise stable across platforms). Deliberately flat for
-/// v1 (F13): no recursion, and no dirent-kind distinction — a caller that
-/// needs to know file vs. directory calls `stat` per entry. Throws host-side
-/// on a missing or unreadable directory, matching `read_file_to_str`'s
-/// posture above.
+/// subdirectories alike, NOT path-joined — an entry is a bare name, and what
+/// addresses it is `path::join(directory, name)`), in whatever order the host
+/// filesystem hands them back (NOT guaranteed alphabetical or otherwise
+/// stable across platforms). Until kolt.local 017 this comment read "join
+/// with `path` yourself" and named a module that did not exist; `std::path`
+/// is now that module. Deliberately flat
+/// (F13): no recursion here — `read_dir_all` below walks the whole tree in
+/// one call — and no dirent-kind distinction: a caller that needs to know
+/// file vs. directory calls `scan_dir`, which gets the kind back from the same
+/// host call for free. Throws host-side on a missing or unreadable directory,
+/// matching `read_file_to_str`'s posture above.
 [extern("node:fs/promises", "readdir")]
 async external fun read_dir(path: str): List<str>;
+
+/// Lists EVERY entry under `path` — files and subdirectories alike, however
+/// deep — as paths RELATIVE to `path` (`"sub/c.txt"`, joined with the host's
+/// own separator, so backslashes on Windows), in whatever order the host's
+/// traversal hands them back (NOT guaranteed depth-first, alphabetical, or
+/// stable across platforms — `read_dir`'s honesty, recursively). No
+/// dirent-kind distinction here either: a subdirectory is one more entry, and
+/// a caller that needs file vs. directory calls `scan_dir` per level. There is
+/// deliberately no recursive `scan_dir`: the host DOES combine `recursive`
+/// with `withFileTypes`, but a `Dirent` from that call carries only a BASENAME
+/// plus a separate `parentPath`, so making it useful means joining the two —
+/// path work this module has no business doing (`std::path` owns it as of
+/// kolt.local 017, and proposal/filesystem.md §9's seam holds: `std::fs`
+/// produces and consumes plain `str` paths and takes no position on how they
+/// are built). One honesty note now that a path module exists: the entries
+/// above carry the HOST separator, so on Windows they are backslash-joined
+/// and `std::path` — which is `/`-only on every platform, by design — will
+/// read such an entry as a single component. Splitting a Windows
+/// `read_dir_all` result is the caller's problem until someone needs it.
+/// Rides `readdir`'s `{ recursive: true }` option — an option object the extern
+/// binding forms cannot spell, so the call is host-side glue
+/// (`__fs_read_dir_all`, `transformer.rs`, the same seam as `__fs_stat`).
+/// Throws host-side on a missing or unreadable directory, matching
+/// `read_dir`.
+[extern("__fs_read_dir_all")]
+async external fun read_dir_all(path: str): List<str>;
+
+// --- directories ---------------------------------------------------------
+
+/// A host options object — the `{ recursive: true }` / `{ force: true }` /
+/// `{ withFileTypes: true }` argument several `node:fs/promises` calls take as
+/// their last parameter. It is a plain host `{}` built up through setters, not
+/// a vilan struct, exactly like `std::fetch`'s `RequestInit`, and each wrapper
+/// below sets only the keys its own host call reads.
+///
+/// Worth recording, because the paper this module is growing under
+/// (proposal/filesystem.md §3.1) predicted otherwise: an options object needs
+/// NO host glue. `read_dir_all` reaches for `__fs_read_dir_all` in
+/// `transformer.rs` for its one `{ recursive: true }`, and the paper carried
+/// that forward as a seam every options-taking function would have to ride.
+/// It is not one. `[extern("Object")]` mints a fresh `{}` and `[extern(set,
+/// …)]` fills it in — both forms already existed, both are ordinary vilan, and
+/// `fetch.vl` has been building `RequestInit` this way the whole time. So the
+/// five wrappers below are plain vilan over direct bindings and this lane
+/// touches `transformer.rs` not at all; `__fs_read_dir_all` is now the odd one
+/// out rather than the precedent, and could be retired the same way whenever
+/// someone is in that file for another reason.
+external struct FsOptions;
+
+/// `Object()` returns a fresh empty `{}` to fill in.
+[extern("Object")]
+external fun new_fs_options(): FsOptions;
+
+impl FsOptions {
+	[extern(set, "recursive")]
+	external fun set_recursive(self, value: bool);
+
+	[extern(set, "force")]
+	external fun set_force(self, value: bool);
+
+	[extern(set, "withFileTypes")]
+	external fun set_with_file_types(self, value: bool);
+}
+
+/// Creates the directory `path`. ONE level: the parent must already exist
+/// (`ENOENT` otherwise), and an existing `path` raises `EEXIST` rather than
+/// succeeding quietly — `create_dir_all` is the forgiving form. Keeping the
+/// strict one is deliberate: "make exactly this directory, and tell me if
+/// something is already there" is how a process claims a name, and it is the
+/// only exclusive-create primitive this module has until the handle tier's
+/// `create_new` lands (proposal/filesystem.md §3.3).
+[extern("node:fs/promises", "mkdir")]
+async external fun create_dir(path: str): void;
+
+[extern("node:fs/promises", "mkdir")]
+async external fun mkdir_with(path: str, options: FsOptions): void;
+
+/// Creates `path` and every missing directory above it, and succeeds when the
+/// whole chain is already there — `mkdir -p`. Idempotent BY DESIGN, which is
+/// the one thing separating it from `create_dir`: this is the call for "make
+/// sure this place exists before I write into it", and that operation has no
+/// business failing because it already ran.
+fun create_dir_all(path: str) {
+	let options = new_fs_options();
+	options.set_recursive(true);
+	mkdir_with(path, options)
+}
+
+/// Removes the EMPTY directory `path`. A non-empty directory raises
+/// `ENOTEMPTY` and a missing one `ENOENT` — `remove_dir_all` is the recursive
+/// form. The strict version is worth having for the same reason `create_dir`
+/// is: it refuses to destroy anything you did not know was there.
+[extern("node:fs/promises", "rmdir")]
+async external fun remove_dir(path: str): void;
+
+[extern("node:fs/promises", "rm")]
+async external fun rm_with(path: str, options: FsOptions): void;
+
+/// Removes `path` and everything under it — `rm -rf`, and it deletes a plain
+/// file just as readily as a tree.
+///
+/// THE ONE OTHER NON-THROWING CALL IN THIS MODULE, and the exception is
+/// deliberate rather than inherited: a missing `path` is a no-op, not an
+/// `ENOENT`, because `{ force: true }` is what the host option means and
+/// because the operation's actual meaning is "make sure this is gone", which a
+/// path that was never there already satisfies. That is `stat`'s reasoning
+/// (this file's header) applied to a destructive call instead of a probing
+/// one. Every other failure — a permissions error, a busy directory — still
+/// throws. If you need to know whether something WAS there, `stat` first.
+fun remove_dir_all(path: str) {
+	let options = new_fs_options();
+	options.set_recursive(true);
+	options.set_force(true);
+	rm_with(path, options)
+}
+
+[extern("node:fs/promises", "cp")]
+async external fun cp_with(from: str, to: str, options: FsOptions): void;
+
+/// Copies the directory `from` to `to`, whole tree included, creating `to` and
+/// any missing parents. Files already at the destination are OVERWRITTEN (the
+/// host's `cp` defaults `force` to true and this does not override it), and
+/// entries under `to` that have no counterpart under `from` are left alone —
+/// so this is a merge-and-replace, not a mirror. Not atomic: a reader watching
+/// `to` sees the tree appear entry by entry.
+///
+/// The host call is `fs.promises.cp`, which reached stable in node 22.3; on an
+/// older node it works and prints one `ExperimentalWarning` to stderr.
+fun copy_dir(from: str, to: str) {
+	let options = new_fs_options();
+	options.set_recursive(true);
+	cp_with(from, to, options)
+}
+
+/// One directory entry with its kind — the information `read_dir` discards.
+///
+/// Three booleans rather than an enum, and the reason is that a host dirent
+/// has NINE kinds: file, directory, symlink, FIFO, socket, block device,
+/// character device, and unknown. An enum would either model five variants no
+/// vilan program will ever meet, or carry a catch-all meaning "one of five
+/// things I did not model". Three booleans answer the three questions anyone
+/// actually asks and stay honest about not being exhaustive: an entry that is
+/// none of the three — a FIFO, a socket, a device node — reads back with all
+/// three `false`, which is a true statement about it rather than a wrong one.
+///
+/// The kinds do NOT follow symlinks (the host dirent carries `lstat`
+/// information). A symlink to a directory is `is_symlink = true` with
+/// `is_directory = false` — verified against the host, and the reason
+/// `is_symlink` is in the struct at all despite symlinks being a non-goal for
+/// this module: a recursive walker that cannot see a link is a walker that
+/// eventually loops. To learn what a link points at, `stat` it — `stat` DOES
+/// follow.
+struct Entry {
+	name: str,
+	is_directory: bool,
+	is_file: bool,
+	is_symlink: bool,
+}
+
+/// The raw host `Dirent`. Kept opaque and internal, exactly like `RawStat`
+/// below — `scan_dir` copies the four fields into a plain `Entry`, so no
+/// caller touches the host shape.
+external struct RawEntry;
+
+impl RawEntry {
+	[extern(get, "name")]
+	external fun name(self): str;
+
+	[extern(method, "isDirectory")]
+	external fun is_directory(self): bool;
+
+	[extern(method, "isFile")]
+	external fun is_file(self): bool;
+
+	[extern(method, "isSymbolicLink")]
+	external fun is_symlink(self): bool;
+}
+
+[extern("node:fs/promises", "readdir")]
+async external fun raw_scan_dir(path: str, options: FsOptions): List<RawEntry>;
+
+/// Lists a directory's immediate entries WITH their kinds — `read_dir`'s
+/// names, plus the answer to "what is each of these". Flat, like `read_dir`,
+/// and in the same unpromised host order (sort if order matters). Throws
+/// host-side on a missing or unreadable directory.
+///
+/// This exists because the alternative costs a syscall per entry for
+/// information the host already had: `read_dir` then `stat` on each name is a
+/// thousand extra stats on a thousand-entry directory, and `read_dir`'s own
+/// comment sends callers to do exactly that. `readdir { withFileTypes: true }`
+/// hands the kind back with the name, for free.
+fun scan_dir(path: str): List<Entry> {
+	let options = new_fs_options();
+	options.set_with_file_types(true);
+	let raw = raw_scan_dir(path, options);
+	raw.map(|entry| Entry { name = entry.name(), is_directory = entry.is_directory(), is_file = entry.is_file(), is_symlink = entry.is_symlink() })
+}
 
 // --- stat --------------------------------------------------------------
 
@@ -101,20 +443,4 @@ fun stat(path: str): Option<Stat> {
 		Some(let raw) => Some(Stat { size = raw.size(), modified_at_ms = raw.mtime_ms(), is_directory = raw.is_directory() }),
 		None => None,
 	}
-}
-
-/// The synchronous read (`node:fs` `readFileSync`) — for a read that must
-/// complete inside a callback that cannot suspend.
-///
-/// Prefer `read_file_to_str`: this one blocks the event loop for the length of
-/// the read, which is the wrong trade for anything on a server's hot path. It
-/// exists because a synchronous request handler has no other option, and
-/// `serve_build`'s dev-mode revalidation is exactly that — a re-read per
-/// request, under `run --watch` only, of a file the build just wrote.
-[extern("node:fs", "readFileSync")]
-external fun read_file_bytes_sync(path: str, encoding: str): str;
-
-/// Reads a UTF-8 text file to a string, synchronously. See `read_file_bytes_sync`.
-fun read_file_to_str_sync(path: str): str {
-	read_file_bytes_sync(path, "utf8")
 }

@@ -21,10 +21,72 @@ impl str {
 	fun replace(self, from: str, to: str): str       // all occurrences
 	fun repeat(self, count: i32): str
 	fun split(self, separator: str): List<str>
-	fun substring(self, start: i32, end: i32): str   // end-exclusive
+	fun substring(self, start: i32, end: i32): str   // end-exclusive; see below
 	fun code_at(self, index: i32): u32               // UTF-16 code unit
-	fun parse_i32(self): Option<i32>                 // declared in std::option
+	fun strip_prefix(self, prefix: str): Option<str> // declared in std::option
+	fun strip_suffix(self, suffix: str): Option<str> // likewise
+	fun parse_i32(self): Option<i32>                 // likewise
 	fun parse_f64(self): Option<f64>                 // likewise
+}
+```
+
+### Slicing: `substring` refuses, it does not correct
+
+`substring(start, end)` requires
+
+```text
+0 <= start <= end <= len()
+```
+
+and **panics** on anything else — a negative bound, an inverted pair, or an
+`end` past the length. It never clamps and never swaps.
+
+That rule is worth stating plainly because the obvious host behavior is the
+opposite one. JavaScript's `substring` clamps a negative argument to `0` and
+*swaps* the pair when `start > end`, so `s.substring(offset, -1)` there returns
+`s[0..offset]` — the **prefix**, the exact complement of the suffix the caller
+was reaching for, with no error at any point. Vilan refuses instead, on the same
+principle that makes an out-of-range `list[i]` a panic rather than a silent
+`undefined`.
+
+Two consequences worth knowing:
+
+- **"To the end" is spelled `s.len()`**, not `-1` and not an over-long `end`.
+- **The bound is checked, not guessed** — `substring(0, 100)` on a short string
+  is an error, not a truncation.
+
+Where both bounds are literals the refusal happens at **compile time**:
+
+```text
+error: substring end -1 is negative — the range must satisfy
+       0 <= start <= end <= len, and substring never clamps or swaps
+```
+
+Empty ranges are legal, so the natural boundary cases all work:
+`substring(0, 0)`, `substring(len(), len())`, and `substring(0, len())`.
+
+### Cutting a known affix
+
+Reaching for `substring` to drop a leading or trailing marker is what invited
+the arithmetic in the first place. Prefer the verbs, which return `Option<str>`
+so that "absent" is distinguishable from "present but empty":
+
+```vilan
+import std::print;
+import std::option::{ Some, None };
+
+fun main() {
+	match "data: 42".strip_prefix("data: ") {
+		Some(let body) => print(body),
+		None => print("not a data line"),
+	}
+	match "report.md".strip_suffix(".md") {
+		Some(let stem) => print(stem),
+		None => print("not markdown"),
+	}
+	// `starts_with`/`ends_with` test; these two cut.
+	print("ab".strip_prefix("ab").unwrap_or("?"));   // "" — present, empty
+	print("ab".strip_prefix("zz").unwrap_or("?"));   // "?" — absent
 }
 ```
 
@@ -39,6 +101,12 @@ fun main() {
 	print("task".repeat(2));
 }
 ```
+
+**On a path, cut with [`std::path`](paths.md), not with these.** `strip_prefix`
+and `starts_with` compare text, and text is the wrong unit for a path:
+`"/a/bc".starts_with("/a/b")` is `true` while `/a/bc` is not inside `/a/b`.
+`path::starts_with` and `path::relative` compare components, and
+`path::basename`/`path::extname` cut the affixes a filename actually has.
 
 `str` also implements `PartialEq`/`Ord` (lexicographic `==`, `<`) and
 `Default` (`""`).

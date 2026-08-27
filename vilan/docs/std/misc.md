@@ -124,12 +124,44 @@ the server is the canonical use).
 fun random_bytes(length: i32): Bytes        // cryptographically secure
 fun random_uuid(): str
 fun equals_constant_time(a: Bytes, b: Bytes): bool   // timing-safe compare
+async fun sha256(data: Bytes): Bytes         // unkeyed content digests
+async fun sha384(data: Bytes): Bytes
+async fun sha512(data: Bytes): Bytes
+async fun hmac_sha512(key: Bytes, data: Bytes): Bytes
+async fun pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: i32, bits: i32): Bytes
 ```
 
-WebCrypto-backed (async where the host is). For password hashing on the
-server, bind the host's sync primitives as externs (the walkthrough
-example binds Node's `pbkdf2Sync` this way). These are candidates for
-std promotion.
+WebCrypto-backed (async where the host is). `pbkdf2_sha512` is the v1
+password-hashing primitive — store the salt beside the derived hash and
+compare with `equals_constant_time`; `hmac_sha512` signs raw byte
+messages (for tokens, `std::jwt` below is the shaped surface). Neither
+needs an extern any more.
+
+The `sha*` family are **unkeyed content digests** — for naming bytes by
+their content (an asset fingerprint, a cache validator, a dedup key), and
+paired with `Bytes::to_hex` for the hex those are written as:
+
+```vilan
+import std::crypto::sha256;
+import std::bytes::encode_utf8;
+import std::print;
+
+async fun main() {
+	let hex = sha256(encode_utf8("body { color: red }")).to_hex();
+	print(hex.substring(0, 8));   // 925e8741 — an asset fingerprint
+}
+main();
+```
+
+Do not reach for them for passwords — a raw digest is far too fast, and
+`pbkdf2_sha512` is the primitive for that. They are also not `std::hash`,
+which is the Map/Set canonical-key mechanism and promises no avalanche.
+
+The std surface is **async** because WebCrypto is. On a path that must
+stay sync — the walkthrough's rpc dispatch hashes passwords inside a
+sync method — binding the host's sync primitive as an extern is still
+the right move: the walkthrough example binds Node's `pbkdf2Sync` that
+way, and that lesson stands.
 
 ## std::jwt
 
@@ -148,9 +180,60 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 
 ```vilan,fragment
 fun emit(kind: str, line: str)   // compile-time only: append to a build asset
+fun read(path: str): str         // compile-time only: read a project file
+fun bundle(path: str): str       // compile-time only: carry a file into the build
 ```
 
-Callable only from `const` evaluation: it's how `std::style` writes the
-CSS file (`emit("css", rule)`). A browser build with emissions produces
+All three callable only from `const` evaluation — a runtime call path
+to any of them is a compile error. `emit` is how `std::style` writes the CSS
+file (`emit("css", rule)`). Reach for it directly only for a shape std
+has no spelling for: a whole declaration block under a selector you
+choose is `std::style::declare`, which builds the line — and the layer
+around it — for you. A browser build with emissions produces
 `<entry>.css` beside `<entry>.js` (beside `<entry>.mjs` on a process
 target).
+
+`read` is the channel's input direction: it returns a project file's
+text at build time, so its result can fold into the output —
+`const markdown::parse(asset::read("pages/intro.md"))` bakes a parsed
+page into the bundle as plain data. The path is **relative to the
+package root** (the base imports resolve under, never the process
+working directory); an absolute path or one that escapes the root is
+refused. Every file read becomes a **tracked build input**: `--watch`
+re-runs when one changes (or when a previously missing one appears),
+and an unchanged-source round still recompiles a leg whose read inputs
+changed. A missing file is a compile error at the `const` expression.
+Reads charge the const fuel budget per byte, so the budget bounds input
+size exactly as it bounds computation.
+
+`bundle` is the output direction for whole **files**, where `emit` is
+the output direction for lines. It tells the build to carry a
+non-code resource — an icon, a font, a webmanifest — into the output
+directory unchanged, and evaluates to the url the copy answers on:
+
+```vilan,fragment
+let icon = const asset::bundle("static/icon.svg");   // "/static/icon.svg"
+```
+
+**The path is the name.** It resolves against the package root exactly
+as `read`'s does, it is `/`-separated on every host, and the copy keeps
+it — so `static/icon.svg` becomes `dist/static/icon.svg`, served at
+`/static/icon.svg`. A subdirectory survives, two different files can
+never claim one output name, and nothing is renamed behind your back;
+where a resource lands in the build is decided by where you put the
+file. A backslash, an absolute path, one that escapes the root, or one
+that names no readable file is a compile error at the `const`
+expression. A name a leg's own build owns — `client.js`, `client.css`,
+`client.chunks.json`, a route chunk — fails the build rather than
+overwriting it.
+
+Bundled files are tracked build inputs like read ones, so `--watch`
+recopies an edited resource. They are **not** charged by size: their
+bytes never enter the program, so the fuel budget bounds build work
+rather than how large a resource may be.
+
+This is what lets a built app need nothing but `dist/`. A browser leg's
+build manifest lists what it bundled, so
+[`serve_build`](web.md#stdhttp) serves every one of them with no route
+of your own — reachability stays the compiler's, and a resource no
+`const` names is never copied and does not ship.

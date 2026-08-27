@@ -1,5 +1,16 @@
 import std::print;
-import std::style::{ Color, Display, Gradient, Length, RadialExtent, Style, space, style };
+import std::style::{
+	Color,
+	Display,
+	Gradient,
+	Length,
+	RadialExtent,
+	Style,
+	declarations,
+	declare,
+	space,
+	style,
+};
 
 // Typed atomic styles (proposal/ui-styling.md): construction inside `const`
 // via the builder chain; atomic rules and theme vars flow through the asset
@@ -14,7 +25,31 @@ fun card_style(): Style {
 		.hover(style().background(Color::gray(100)))
 }
 
+// A declaration block (kolt.local 032): declarations under a selector the
+// AUTHOR chose, minting no class and touching no slot key. Every line it adds
+// to the golden is an addition — the class names above are byte-identical
+// without it. Each block sits inside `@layer vilan`, which is the whole
+// ordering rule: unlayered styles outrank layered ones whatever their
+// specificity, so a `Style` always wins against a block and the block's
+// position in the sheet's sort decides nothing.
+fun declaration_blocks() {
+	// The exhibit this surface was cut from — kolt's theme.vl emitted this
+	// shape by hand and then flattened its own multi-line declarations with a
+	// string `replace`, because the channel appends a LINE.
+	declare("[data-theme=\"iron-dark\"]", declarations()
+		.raw("--color-ink", "#fafafa")
+		.raw("--color-ground", "#161616"));
+	// A reset is a pile of declaration blocks, and the layer is what makes one
+	// safe to ship beside atomic rules.
+	declare("*", declarations().raw("box-sizing", "border-box"));
+	// A token spent in a block carries its own `:root` line exactly as a
+	// `Style` property does — and here that line is one the styles above
+	// already emitted, so it DEDUPS: the golden grows by the block alone.
+	declare(":root", declarations().color("--brand", Color::gray(50)).length("--pad", space(4)));
+}
+
 fun main() {
+	let _blocks = const declaration_blocks();
 	let card = const card_style();
 	let active = const style().padding(space(6));
 	print(card.class_list());
@@ -36,9 +71,9 @@ fun main() {
 	// byte — a composed dark rule still starts with ':', which is what keeps
 	// it in the same cascade band as every other dark rule (B35).
 	let themed = const style()
+		.md(style().dark(style().hover(style().background(Color::gray(50)))))
 		.dark(style().background(Color::gray(900)))
-		.dark(style().hover(style().background(Color::gray(700))))
-		.md(style().dark(style().hover(style().background(Color::gray(50)))));
+		.dark(style().hover(style().background(Color::gray(700))));
 	print(themed.class_list());
 
 	// The value types (ui-styling.md §0bis.3). A translucent token renders as
@@ -47,8 +82,8 @@ fun main() {
 	// bytes. Every line this block adds is an ADDITION: the rules above keep
 	// the exact class names they had before the value types existed.
 	let translucent = const style()
-		.background(Color::rgba(27, 6, 13, 0.9))
-		.color(Color::gray(900).alpha(0.08));
+		.color(Color::gray(900).alpha(0.08))
+		.background(Color::rgba(27, 6, 13, 0.9));
 	print(translucent.class_list());
 
 	// A gradient is `background-image`, a different slot from `background` —
@@ -68,9 +103,9 @@ fun main() {
 	// the class list shows the override.
 	let framed = const style()
 		.display(Display::InlineFlex)
-		.border_top(Length::px(1), Color::gray(300))
 		.padding_top(space(2))
-		.margin_left(Length::auto());
+		.margin_left(Length::auto())
+		.border_top(Length::px(1), Color::gray(300));
 	print(framed.class_list());
 	print(const style().border(Length::px(1), Color::gray(300)).border_none().class_list());
 
@@ -79,20 +114,57 @@ fun main() {
 	// where that pair is proven in bytes. Additions again: nothing above moves.
 	let zeroed = const style()
 		.inset(Length::zero())
-		.min_width(Length::zero())
 		.left(Length::css("clamp(120px, 30%, 185px)"))
+		.min_width(Length::zero())
 		.max_width(Length::calc("100% - 2rem"));
 	print(zeroed.class_list());
+
+	// `Color::var` is `Length::var`'s counterpart: the value is `var(--accent)`
+	// verbatim and NO `:root` line emits — the app owns the declaration. The
+	// golden shows `.alpha()` composing over it through the relative-colour
+	// form, the same as over a ramp token.
+	let accented = const style()
+		.background(Color::var("--accent"))
+		.border_color(Color::var("--accent").alpha(0.5));
+	print(accented.class_list());
+
+	// `oklch` is the perceptual literal: number-form lightness, space-joined
+	// components, the hue a bare degree count. `.alpha()` composes through
+	// the relative form, the same as over every other colour.
+	let perceptual = const style()
+		.color(Color::oklch(0.97, 0.02, 340.0).alpha(0.8))
+		.background(Color::oklch(0.62, 0.19, 313.0));
+	print(perceptual.class_list());
+
+	// `size` writes the SAME two slots `width` and `height` write — the class
+	// list shows two classes for one call, and a later `height` narrows the
+	// square by the ordinary last-wins rule (three calls, two classes).
+	let squared = const style().size(Length::rem(1.0));
+	print(squared.class_list());
+	print(const style().size(Length::rem(1.0)).height(Length::rem(2.0)).class_list());
+
+	// The attribute condition selects on the element ITSELF, where dark's
+	// hardcoded ancestor is the one ancestor form. The golden pins the
+	// composed selectors in bytes: the bare suffix, the suffix before a
+	// pseudo-class, under the dark ancestor, and the full
+	// media(dark(attribute(pseudo(..)))) stack — attribute rules start with
+	// '.', so they stay in the base cascade band (B35).
+	let disclosed = const style()
+		.md(style().dark(style().attribute("data-open", "true", style().hover(style().color(Color::gray(50))))))
+		.dark(style().attribute("data-open", "true", style().background(Color::gray(800))))
+		.attribute("data-open", "true", style().display(Display::Flex))
+		.attribute("data-open", "true", style().hover(style().background(Color::gray(100))));
+	print(disclosed.class_list());
 
 	// Two methods per slot, deliberately: `background_image` writes the slot
 	// `background_gradient` writes, and `line_height_length` the slot
 	// `line_height` writes. So each pair OVERRIDES rather than racing — the
 	// class list shows one class per slot even though two methods wrote it.
 	let tiled = const style()
-		.background_image("url(tile.png)")
-		.background_size("120px 120px")
 		.line_height(1.5)
-		.line_height_length(Length::px(24));
+		.line_height_length(Length::px(24))
+		.background_image("url(tile.png)")
+		.background_size("120px 120px");
 	print(tiled.class_list());
 }
 main();

@@ -29,6 +29,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("adapt.vl", "async (adapted instances await)"),
     ("async-await.vl", "async"),
     ("async-promise-all.vl", "async"),
+    (
+        "await-postfix.vl",
+        "async + host timer (`sleep`) — every helper there awaits",
+    ),
     ("nursery.vl", "async (the nursery join awaits)"),
     (
         "reactive-turns.vl",
@@ -111,8 +115,16 @@ fn run_node(path: &Path, limit: Duration) -> Result<(String, i32), String> {
 /// Runs `source` through the pipeline once, then both execution paths.
 /// Returns `(node stdout, node exit code, interpreter result)`.
 #[allow(clippy::type_complexity)]
+/// A corpus program's package root is the corpus DIRECTORY, not the process
+/// working directory. Every runner over the corpus has to say so: a corpus
+/// program may name a project file — `const asset::bundle` carries a resource
+/// beside it into the build (kolt.local 029), and `const asset::read` would
+/// read one — and the const channel resolves those against the package root.
+/// Compiled under `.`, such a program fails to find a file that is right there
+/// beside it.
 fn both_ways(
     source: String,
+    root: PathBuf,
     fuel: u64,
 ) -> Result<(String, i32, Result<(String, i32), (FailureKind, String)>), String> {
     std::thread::Builder::new()
@@ -122,7 +134,7 @@ fn both_ways(
             let (program, errors) = analyze_source(
                 leaked,
                 &std_spec(),
-                Path::new("."),
+                &root,
                 Path::new("test.vl"),
                 Some(Platform::default()),
                 &Workspace::default(),
@@ -196,12 +208,13 @@ fn every_admitted_corpus_program_is_equivalent_interpreted() {
         let workers: Vec<_> = admitted
             .chunks(admitted.len().div_ceil(8).max(1))
             .map(|chunk| {
+                let corpus = &corpus;
                 scope.spawn(move || {
                     let mut failures = Vec::new();
                     let mut checked = 0;
                     for (name, path) in chunk {
                         let source = std::fs::read_to_string(path).expect("read corpus file");
-                        match both_ways(source, 50_000_000) {
+                        match both_ways(source, corpus.clone(), 50_000_000) {
                             Ok((node_stdout, node_exit, Ok((interp_stdout, interp_exit)))) => {
                                 checked += 1;
                                 if node_stdout != interp_stdout || node_exit != interp_exit {

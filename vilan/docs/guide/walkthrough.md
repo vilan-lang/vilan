@@ -128,7 +128,7 @@ fun retitle_note(self, token: str, note_id: i32, title: str): i32 {
 			}));
 			note_id
 		},
-		None => 0 - 1,
+		None => -1,
 	}
 }
 ```

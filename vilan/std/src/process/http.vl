@@ -8,7 +8,7 @@
 
 import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
-import pkg::json::JsonValue;
+import pkg::json::{ JsonValue, coerce_str };
 import pkg::option::Option::{ None, Some, self };
 import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
 
@@ -154,6 +154,40 @@ impl Request {
 	/// codec's POST).
 	fun bytes(self): Bytes {
 		self.content
+	}
+
+	/// The value of a named request header, or `None` when the request did
+	/// not carry it.
+	///
+	/// Header names are case-insensitive, and node lowercases every name it
+	/// parses off the wire, so `name` is lowered to match: `header("If-None-Match")`
+	/// and `header("if-none-match")` ask the same question, whatever casing the
+	/// client actually sent. `None` means ABSENT, distinctly from `Some("")`
+	/// for a header sent with an empty value — the distinction a conditional
+	/// request needs.
+	///
+	/// A header the client REPEATED reads back as node presents it: joined
+	/// with `", "`, which is the list form ordinary headers already define,
+	/// so `X-Dup: one` then `X-Dup: two` reads `Some("one, two")`. This
+	/// accessor never silently drops a repeat — but it does not split them
+	/// either. The one header node does not join is `set-cookie`, which it
+	/// keeps as an array and which therefore arrives here comma-joined
+	/// WITHOUT the space; a cookie value may itself contain a comma, so that
+	/// string is not safely splittable. Reading repeated `set-cookie` values
+	/// wants a list-returning accessor, which this deliberately is not
+	/// (`set-cookie` is a response header, so on a request it is degenerate).
+	///
+	/// Presence is `has_field` (`Object.hasOwn`) rather than a null test: an
+	/// absent header is a MISSING property, which `is_null`'s strict
+	/// `=== null` does not catch — and hasOwn also keeps an inherited name
+	/// (`header("constructor")`) from reading back as a header.
+	fun header(self, name: str): Option<str> {
+		let lowered = name.to_lowercase_ascii();
+		let headers = self.node.headers();
+		if !headers.has_field(lowered) {
+			ret None;
+		}
+		Some(coerce_str(headers.field(lowered)))
 	}
 }
 
@@ -325,9 +359,17 @@ impl Server {
 		let upgrade_handler = self.upgrade_handler;
 		let node_server = node_create_server(|node_request, node_response| {
 			// Collect the full request body (as BYTES — it may be binary)
-			// before dispatching: the handler is called indirectly and so
-			// can't suspend, so it receives the body ready rather than as a
-			// stream.
+			// before dispatching: `Request` carries a READY body rather than a
+			// stream, so every handler sees one shape and none has to drive a
+			// reader to get at the bytes.
+			//
+			// This await is also the proof that nothing downstream of it is
+			// synchronous: the callback suspends HERE, before a byte is
+			// written, and `request_handler` is `async` and awaited on the next
+			// line. Said out loud because the comment this replaces claimed the
+			// opposite — "the handler is called indirectly and so can't
+			// suspend" — and a synchronous file read in `std::fs` was justified
+			// by that claim for the length of its life.
 			let content = read_request_bytes(node_request);
 			let response = request_handler(Request { node = node_request, content = content });
 			node_response.set_status_code(response.status);
@@ -477,9 +519,16 @@ fun respond_from_build(
 /// One artifact's response: its extension's content type, and the bytes the
 /// dev-mode freshness policy says to serve right now (`asset_body` — the
 /// boot-time copy, or a fresh read while watching).
+///
+/// `body_bytes`, not `body`: the artifact goes out as the build wrote it. This
+/// is the leg that makes the content-type table honest — a table that can name
+/// `image/png` over a text body would be describing bytes that no longer exist
+/// (kolt.local 030). It is also why every `text/*` row in that table spells its
+/// charset: a raw-byte body carries no encoding of its own, so an unspelled
+/// `text/css` is decoded by the browser's default and not by utf8.
 fun asset_response(asset: BuildAsset): Response {
 	Response::builder()
 		.set_header("Content-Type", asset.content_type)
-		.body(asset_body(asset))
+		.body_bytes(asset_body(asset))
 		.build()
 }

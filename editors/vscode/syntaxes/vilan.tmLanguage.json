@@ -1,5 +1,10 @@
 {
  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+ "information_for_contributors": [
+  "The word-list halves of this grammar (the keyword, primitive-type, attribute-marker and operator lists) are GENERATED from the compiler's exported tables by crates/vilan-cli/tests/grammar_sync.rs, which byte-gates them on every suite run. Do not hand-edit a generated `match`/`begin` value; change the compiler table (or grammar_sync.rs's role tables) and regenerate:",
+  "VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated",
+  "The structural rules (strings, number shapes, elements, captures, the contextual `context`/`sync` anchors) are hand-written."
+ ],
  "name": "Vilan",
  "scopeName": "source.vilan",
  "patterns": [
@@ -197,7 +202,7 @@
     {
      "comment": "Bracket attributes: the built-in markers anywhere, plus GENERIC macro attributes `[name]` / `[name(args)]` at the start of a line (an expression's list literal never opens an item line, which keeps `[1, 2]` and `[x]` out).",
      "name": "meta.attribute.vilan",
-     "begin": "(\\[)(?=\\s*(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform|deprecated)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
+     "begin": "(\\[)(?=\\s*(derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
      "beginCaptures": {
       "1": {
        "name": "punctuation.definition.attribute.begin.vilan"
@@ -214,8 +219,8 @@
      },
      "patterns": [
       {
-       "match": "\\b(extern|derive|must_use|service|rpc|expose|trait_only|doc|platform|deprecated)\\b",
-       "name": "keyword.other.attribute.vilan"
+       "name": "keyword.other.attribute.vilan",
+       "match": "\\b(derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b"
       },
       {
        "comment": "The `method`/`get`/`set` words inside `[extern(..)]`.",
@@ -337,7 +342,7 @@
     {
      "comment": "Primitive types.",
      "name": "support.type.primitive.vilan",
-     "match": "\\b(i8|i16|i32|i53|u8|u16|u32|u53|f32|f64|str|bool|void|any)\\b"
+     "match": "\\b(str|i32|u32|f64|i8|u8|i16|u16|i53|u53|f32|bool|void|any)\\b"
     },
     {
      "comment": "User types / variants \u2014 PascalCase identifiers (and `Self`).",
@@ -358,9 +363,9 @@
   "operators": {
    "patterns": [
     {
-     "comment": "Multi-char operators first (`&mut`, `||`, `::`, `=>`, `?.`, compound assigns, comparisons), then single-char (incl. `^` bitwise-xor and postfix `?`/`!`).",
+     "comment": "GENERATED value: the lexer's fused pairs (lexing.rs TWO_CHARACTER_OPERATORS), then the presentation-only sequences the parser reassembles (`&mut`, `<=`, `>=`, `?.` — grammar_sync.rs TEXTMATE_OPERATOR_EXTRAS), then single-char (incl. `^` bitwise-xor and postfix `?`/`!`).",
      "name": "keyword.operator.vilan",
-     "match": "&mut|\\|\\||&&|::|=>|==|!=|<=|>=|\\+=|-=|\\*=|/=|%=|\\?\\.|[-+*/=<>!&|^?%]"
+     "match": "!=|%=|&&|\\*=|\\+=|-=|/=|::|==|=>|\\|\\||&mut|<=|>=|\\?\\.|[-+*/=<>!&|^?%]"
     }
    ]
   },

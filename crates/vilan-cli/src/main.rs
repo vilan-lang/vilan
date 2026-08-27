@@ -178,12 +178,37 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    // Compilation recurses over deeply-nested ASTs and type graphs (e.g. closures
-    // stored in data structures plus generic monomorphization), which can run
-    // past the default main-thread stack on otherwise-valid programs. Do the work
-    // on a worker with a generous stack, as rustc and other compilers do; the
-    // reservation is virtual address space, so it costs nothing unless used.
-    const COMPILER_STACK_SIZE: usize = 256 * 1024 * 1024;
+    // Compilation recurses over deeply-nested ASTs and type graphs, which can
+    // run past the default main-thread stack on otherwise-valid programs. Do the
+    // work on a worker with a generous stack, as rustc and other compilers do;
+    // the reservation is virtual address space, so it costs nothing unless used.
+    //
+    // The margin is measured, not folklore, and every recursive family behind
+    // it is BOUNDED now (B138/B139/B142, `VILAN_DEPTH_STATS`) — which is what
+    // brought this number down from 256 MiB:
+    //
+    //   * the PARSER, at 500 levels of nesting. The deepest consumer in the
+    //     pipeline and the one that runs first, so before B142 it reached the
+    //     cliff before either analyzer bound could refuse. Measured through
+    //     this binary on the worst plant (5000 nested parentheses): peak depth
+    //     501, 35.2 MiB unoptimized, ~10 MiB optimized.
+    //   * the phase-1 expression walk, ~36 KiB per level (500 levels, ~18 MiB).
+    //   * the return-inference chain, ~12.8 KiB per call link (500, ~6.4 MiB).
+    //
+    // Each refuses with a diagnostic rather than overflowing, and the phases
+    // run in SEQUENCE — the parse has unwound before analysis starts — so the
+    // worst case is the largest of them, not their sum: ~35 MiB unoptimized.
+    // Real code is nowhere near it: all 211 corpus entries peak at 23 parser
+    // levels against a bound of 500, and a realistic analysis peaks under 1 MiB.
+    //
+    // 128 MiB is ~3.6x that measured worst case, and the headroom is not idle.
+    // A macro-world compile NESTS a full pipeline inside the running analysis
+    // (see `Document::analyze` in vilan-lsp), so a deep walk carrying a deep
+    // nested parse inside it composes to roughly 53 MiB; this covers that with
+    // room over. Bounding the parser is what made the number finite at all —
+    // before B142 there was no worst case to size anything against, and the
+    // margin was standing in for a bound that did not exist.
+    const COMPILER_STACK_SIZE: usize = 128 * 1024 * 1024;
     std::thread::Builder::new()
         .stack_size(COMPILER_STACK_SIZE)
         .spawn(run_cli)
@@ -361,6 +386,40 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
 /// How often the watcher polls for changes.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
+/// The build inputs `const asset::read` pulled in, recorded per compile —
+/// misses included, because a file that was not there is still a dependency
+/// whose APPEARANCE must trigger a round exactly as a change to it would.
+/// The watcher's snapshot polls these alongside its `.vl` scan; process-global
+/// because the recording compile runs several opaque call frames below the
+/// watch loop's action closure. Accumulative across rounds: a path a later
+/// round no longer reads stays watched, which costs at most one round whose
+/// legs then verify by content and skip.
+static CONST_INPUT_PATHS: std::sync::Mutex<BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// Records a compile's `asset::read` inputs for the watcher.
+fn record_const_inputs(inputs: &[(PathBuf, Option<u64>)]) {
+    if inputs.is_empty() {
+        return;
+    }
+    let mut paths = CONST_INPUT_PATHS.lock().unwrap();
+    paths.extend(inputs.iter().map(|(path, _)| path.clone()));
+}
+
+/// [`scan_vl`] plus the recorded `asset::read` inputs: the full watched set.
+/// A recorded path that does not exist stays out of the map — its later
+/// appearance inserts an entry, which is exactly the snapshot difference that
+/// fires a round.
+fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
+    let mut files = scan_vl(roots);
+    for path in CONST_INPUT_PATHS.lock().unwrap().iter() {
+        if let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) {
+            files.insert(path.clone(), modified);
+        }
+    }
+    files
+}
+
 /// Runs `action` once and returns its exit code (no `--watch`, `roots` is `None`),
 /// or — under `--watch` — re-runs it on every change to a `.vl` file under `roots`.
 fn run_or_watch(roots: Option<Vec<PathBuf>>, mut action: impl FnMut() -> ExitCode) -> ExitCode {
@@ -467,11 +526,22 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
     // this window, widened by suite load; a human saving during the initial
     // build hit the same swallowed edit. Cost of this order: an edit during
     // the initial build causes one extra round — which is the correct behavior.
-    let mut snapshot = scan_vl(roots);
+    let started = SystemTime::now();
+    let mut snapshot = watch_snapshot(roots);
     action();
+    // The first build just revealed which `asset::read` inputs exist — paths
+    // the baseline could not contain. Seed them in with E20's rule intact: an
+    // input whose mtime predates the build joins the baseline (no spurious
+    // round), one modified at or after the build's start does NOT, so the
+    // next poll sees it and fires the round that re-reads it.
+    for (path, modified) in watch_snapshot(roots) {
+        if !snapshot.contains_key(&path) && modified < started {
+            snapshot.insert(path, modified);
+        }
+    }
     loop {
         std::thread::sleep(WATCH_POLL_INTERVAL);
-        let next = scan_vl(roots);
+        let next = watch_snapshot(roots);
         if next != snapshot {
             snapshot = next;
             eprintln!(
@@ -712,7 +782,7 @@ fn hmr_round(
         }
         note_split_ignored(unit);
         let mut overlay_text = String::new();
-        let (javascript, assets, sources) = match compile_unit(
+        let compiled = match compile_unit(
             unit,
             *platform,
             CompileGoal::Emit,
@@ -741,7 +811,7 @@ fn hmr_round(
                 return child;
             }
         };
-        let mut assembled = vilan_core::const_eval::assemble_assets(&assets);
+        let mut assembled = vilan_core::const_eval::assemble_assets(&compiled.assets);
         let css = assembled
             .remove("css")
             .filter(|content| !content.is_empty());
@@ -756,9 +826,10 @@ fn hmr_round(
             name: unit.name.clone(),
             is_browser: matches!(platform, Platform::Browser),
             script_extension: platform.script_extension(),
-            bundle: javascript,
+            bundle: compiled.javascript,
             css,
-            sources: sources.into_iter().collect(),
+            bundled: compiled.bundled,
+            sources: compiled.sources.into_iter().collect(),
         });
     }
 
@@ -795,10 +866,23 @@ fn hmr_round(
         channel.push("error", Some("build failed; see the terminal"));
         return child;
     }
+    let reserved: Vec<LegNamespace> = next
+        .iter()
+        .map(|leg| LegNamespace {
+            leg: leg.name.clone(),
+            extension: leg.script_extension,
+        })
+        .collect();
     for leg in &next {
         let bundle_path = dist.join(format!("{}.{}", leg.name, leg.script_extension));
         let contents = if leg.is_browser {
-            hmr::instrument(&leg.bundle, channel.port(), version, &leg.name)
+            hmr::instrument(
+                &leg.bundle,
+                channel.port(),
+                channel.token(),
+                version,
+                &leg.name,
+            )
         } else {
             leg.bundle.clone()
         };
@@ -826,8 +910,24 @@ fn hmr_round(
         // policy re-reads per request, but the DESCRIPTION is read once at boot,
         // and a watch round that swept it would leave the restarted server with
         // nothing to describe).
+        // The leg's bundled resources ride every round, including a SKIPPED
+        // one: `next` carries the previous round's artifact verbatim, so the
+        // copy is idempotent and `dist/` never loses an asset to a round that
+        // recompiled nothing. The copy reads the SOURCE, so a round TRIGGERED
+        // by an edited resource carries the new bytes whether or not the leg
+        // recompiled — which is what makes `asset_body`'s watch-mode re-read
+        // see them (`dev-refresh.md` §5, item 1). The trigger itself is the
+        // build-input record `record_const_inputs` hands the watcher; without
+        // it no round fires and `dist/` keeps the first round's copy forever.
+        let assets = write_bundled(&dist, &leg.bundled, &reserved).unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
-        let _ = write_chunks(&bundle_path, &[], styles.as_deref(), leg.is_browser);
+        let _ = write_chunks(
+            &bundle_path,
+            &[],
+            styles.as_deref(),
+            &assets,
+            leg.is_browser,
+        );
     }
     for (name, kind, content) in &other_assets {
         let asset_path = dist.join(format!("{name}.{kind}"));
@@ -862,8 +962,17 @@ fn hmr_round(
                 let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
                 // `dev-refresh.md` §5 item 2: the dev channel's port, so the
                 // child's `std::watch::force_refresh()` (a no-op without it)
-                // knows where to POST.
-                let extra = [("VILAN_HMR_PORT", channel.port().to_string())];
+                // knows where to POST — and, since backlog E93, this run's token
+                // beside it, because every route now requires one. The child is
+                // the one legitimate caller that is not the browser shim, and an
+                // inherited environment variable is how it already learns
+                // everything else about the session (`VILAN_WATCHING`,
+                // `VILAN_HMR_PORT`): nothing on disk, nothing to clean up, and
+                // no way for another process to pick it up.
+                let extra = [
+                    ("VILAN_HMR_PORT", channel.port().to_string()),
+                    ("VILAN_HMR_TOKEN", channel.token().to_string()),
+                ];
                 match spawn_watched_node(&script, args, Some(&root), &extra) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
@@ -884,7 +993,23 @@ fn hmr_round(
     }
 
     match &decision.push {
-        Some(hmr::Push::Swap) => channel.push("swap", None),
+        // The swap carries this round's COMPLETE browser stylesheet set. A swap
+        // re-evaluates the bundle without reloading the document (hmr.md §3),
+        // so without this nothing in the round refreshes the page's stylesheets
+        // — a round that changed a bundle AND its sidecar dropped the sidecar,
+        // and a sidecar that appeared or vanished had no way to reach the page
+        // at all (kolt.local 007). `state.legs` is this round's legs (assigned
+        // above), so an absent name is the round's own statement that it emits
+        // no stylesheet for that leg.
+        Some(hmr::Push::Swap) => {
+            let sheets: Vec<String> = state
+                .legs
+                .iter()
+                .filter(|leg| leg.is_browser && leg.css.is_some())
+                .map(|leg| format!("{}.css", leg.name))
+                .collect();
+            channel.push_swap(&sheets);
+        }
         Some(hmr::Push::Css(assets)) => {
             for asset in assets {
                 channel.push_css(asset);
@@ -993,7 +1118,7 @@ fn build_and_spawn_run(
                 );
                 return None;
             }
-            let (javascript, assets, _sources) = compile_unit(
+            let compiled = compile_unit(
                 &unit,
                 Platform::default(),
                 CompileGoal::Emit,
@@ -1009,12 +1134,18 @@ fn build_and_spawn_run(
             // round thus refreshes the on-disk sidecar for the dev loop (hmr.md §11
             // S0); the workspace arm below gets this for free via
             // `build_workspace_artifacts`.
-            write_assets(
-                &unit.entry.with_extension(platform.script_extension()),
-                &assets,
-            );
+            let output_path = unit.entry.with_extension(platform.script_extension());
+            write_assets(&output_path, &compiled.assets);
+            // Bundled resources land beside that same canonical output, so a
+            // watched lone package serves what this round produced.
+            write_bundled(
+                output_path.parent().unwrap_or(Path::new(".")),
+                &compiled.bundled,
+                &[],
+            )
+            .ok()?;
             let script = watch_script_path();
-            if let Err(error) = fs::write(&script, javascript) {
+            if let Err(error) = fs::write(&script, compiled.javascript) {
                 eprintln!(
                     "{} cannot write {}: {error}",
                     paint::error_prefix(),
@@ -1297,6 +1428,19 @@ impl BuildHooks {
     /// hook's output (and its TTY colors) reach the terminal as if run by hand;
     /// under `vilan build --stdout` that means a chatty hook shares the JS
     /// stream — redirect it in the command if that matters.
+    ///
+    /// The trust model is deliberate and **first-party** (E96, ruled
+    /// 2026-08-26; `proposal/build-trust.md`): a hook is code the developer
+    /// wrote in their own manifest, so it runs with their privileges and
+    /// environment — no sandbox, no allowlist, no timeout, no consent prompt —
+    /// the same trust `cargo build` and `npm run` already take. The echo below
+    /// is the whole honesty budget: the terminal always names what ran. A
+    /// first-run consent gate was proposed and **declined**; don't add one.
+    /// Only the addressed manifest contributes hooks ([`Project::hooks`]) — a
+    /// dependency's `[build] run` is never reached, which is what keeps this
+    /// tier first-party. When dependencies *can* carry hooks (kolt.local 027's
+    /// `vilan install`, the registry), that is the other tier: it does not run
+    /// by default and needs an explicit per-dependency opt-in in the manifest.
     fn run(&self) -> Result<(), String> {
         for command in &self.commands {
             eprintln!("{} {command}", paint::err(paint::Style::CYAN, "Running"));
@@ -1603,6 +1747,45 @@ fn artifact_path(dist: &Path, name: &str, platform: Platform) -> PathBuf {
     dist.join(format!("{name}.{}", platform.script_extension()))
 }
 
+/// E92: the bundle just written at `output` may sit beside a SUPERSEDED
+/// generation — the same stem under the other script classification's
+/// extension (`dist/server.js` beside the `dist/server.mjs` every
+/// post-v0.33.0 build writes, or a stranded `.mjs` after a leg retargeted to
+/// the browser). Within one build the `<name>.*` namespace belongs to one
+/// leg (`reject_output_collisions`), so a surviving other-classification
+/// sibling can only be an earlier generation's artifact — and a script,
+/// Dockerfile, or process manager still naming it keeps launching the
+/// superseded application silently, exactly the drift the gotchas page
+/// warns about. Nothing here deletes: no record proves the build wrote the
+/// old file (pre-rename builds recorded nothing), and the output directory
+/// is not exclusively the build's — the drift is reported instead, with the
+/// fix in the message.
+fn warn_superseded_sibling(output: &Path) {
+    let Some(extension) = output.extension().and_then(|extension| extension.to_str()) else {
+        return;
+    };
+    let retired_extension = match extension {
+        "mjs" => "js",
+        "js" => "mjs",
+        _ => return,
+    };
+    let superseded = output.with_extension(retired_extension);
+    if !superseded.is_file() {
+        return;
+    }
+    eprintln!(
+        "{} {} looks superseded by {} — this build names the artifact \
+         `.{extension}` and never rewrites the old spelling, so a launcher \
+         still naming the `.{retired_extension}` file runs a stale \
+         generation. Remove it, and point `node`/Dockerfile/process-manager \
+         entries at {}",
+        paint::warning_prefix(),
+        superseded.display(),
+        output.display(),
+        output.display(),
+    );
+}
+
 /// The platform of a leg selected to be *run* under `node`. `select_node_entry`
 /// filters to `Platform::Node`, so every launch path below is Node by
 /// construction; naming it keeps those paths reading through
@@ -1770,6 +1953,23 @@ enum CompileGoal {
     Check,
 }
 
+/// What one compile produced, for the caller that writes it out. A tuple grew
+/// a fourth member with `asset::bundle` (kolt.local 029) and stopped reading;
+/// naming the members also makes the two paths that ignore all but the
+/// JavaScript say so by not mentioning the rest.
+struct Compiled {
+    javascript: String,
+    /// The `(kind, line)` pairs `asset::emit` accumulated — `write_assets`
+    /// deduplicates and orders them into `<output>.<kind>`.
+    assets: Vec<(String, String)>,
+    /// The files `asset::bundle` registered: (resolved source, the name it
+    /// takes in the output directory). `write_bundled` copies them.
+    bundled: Vec<(PathBuf, String)>,
+    /// Each source this leg was compiled from, with the content hash it was
+    /// compiled at — what the watch loop re-hashes to decide a per-leg skip.
+    sources: Vec<(PathBuf, u64)>,
+}
+
 fn compile_unit(
     unit: &Unit,
     platform: Platform,
@@ -1785,7 +1985,7 @@ fn compile_unit(
     // the leg as one file, which is what keeps splitting a `build` artifact
     // decision and nothing else.
     chunks: Option<(&str, &mut Vec<EmittedChunk>)>,
-) -> Result<(String, Vec<(String, String)>, Vec<(PathBuf, u64)>), ExitCode> {
+) -> Result<Compiled, ExitCode> {
     let workspace = match resolve_workspace(unit) {
         Ok(workspace) => workspace,
         Err(message) => {
@@ -1823,7 +2023,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (javascript, assets, _sources) = match compile_unit(
+    let compiled = match compile_unit(
         unit,
         platform,
         CompileGoal::Emit,
@@ -1838,20 +2038,32 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
     if stdout {
         // `--stdout` is one stream, so it carries the eager bundle. A split
         // build's chunks are files by construction; nothing can pipe them.
-        print!("{javascript}");
+        // Bundled resources are files by construction too, so `--stdout`
+        // carries none of them either — it prints a bundle, not a build.
+        print!("{}", compiled.javascript);
         return ExitCode::SUCCESS;
     }
     let output_path = unit.entry.with_extension(platform.script_extension());
-    let styles = write_assets(&output_path, &assets);
+    let styles = write_assets(&output_path, &compiled.assets);
+    let directory = output_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let assets = match write_bundled(
+        &directory,
+        &compiled.bundled,
+        &[LegNamespace::of(&leg, platform)],
+    ) {
+        Ok(assets) => assets,
+        Err(code) => return code,
+    };
     if let Err(code) = write_chunks(
         &output_path,
         &chunks,
         styles.as_deref(),
+        &assets,
         matches!(platform, Platform::Browser),
     ) {
         return code;
     }
-    match fs::write(&output_path, javascript) {
+    match fs::write(&output_path, compiled.javascript) {
         Ok(()) => {
             println!(
                 "{} {} -> {}",
@@ -1859,6 +2071,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
                 unit.entry.display(),
                 paint::out(paint::Style::BOLD, &output_path.display().to_string())
             );
+            warn_superseded_sibling(&output_path);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -1898,21 +2111,30 @@ fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
 fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
     let platform = Platform::default();
-    let (javascript, assets, _sources) =
-        match compile_unit(unit, platform, CompileGoal::Emit, false, false, None, None) {
-            Ok(compiled) => compiled,
-            Err(code) => return code,
-        };
+    let compiled = match compile_unit(unit, platform, CompileGoal::Emit, false, false, None, None) {
+        Ok(compiled) => compiled,
+        Err(code) => return code,
+    };
     // Const-eval assets (the CSS sidecar &c.) belong beside the *canonical* build
     // output — `<entry>.css`, where `build` writes them and a served page reads
     // them — not beside the temp script `run_node_script` hands Node, which the
     // program never reads. Same helper and placement as `build_single`, so `run`
     // keeps the on-disk sidecar fresh (const-eval.md §3; hmr.md §11 S0).
-    write_assets(
-        &unit.entry.with_extension(platform.script_extension()),
-        &assets,
-    );
-    run_node_script(&javascript, args)
+    let output_path = unit.entry.with_extension(platform.script_extension());
+    write_assets(&output_path, &compiled.assets);
+    // Bundled resources land beside that same canonical output, for the same
+    // reason the sidecar does: `run` keeps the on-disk build fresh so a served
+    // program reads what this round produced (kolt.local 029).
+    if write_bundled(
+        output_path.parent().unwrap_or(Path::new(".")),
+        &compiled.bundled,
+        &[],
+    )
+    .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    run_node_script(&compiled.javascript, args)
 }
 
 /// Builds every host (non-`none`) member of a workspace into
@@ -1981,6 +2203,14 @@ fn build_workspace_artifacts(
         );
         return Err(ExitCode::FAILURE);
     }
+    // Every leg's namespace, not just the one being written: `dist/` is one
+    // directory, so a client leg bundling `server.mjs` would clobber the server
+    // exactly as it would clobber its own bundle.
+    let reserved: Vec<LegNamespace> = members
+        .iter()
+        .filter(|(_, platform)| !platform.is_none())
+        .map(|(unit, platform)| LegNamespace::of(&unit.name, *platform))
+        .collect();
     for (unit, platform) in members {
         if platform.is_none() {
             continue;
@@ -1990,10 +2220,10 @@ fn build_workspace_artifacts(
         }
         let mut chunks = Vec::new();
         let sink = (emission == Emission::AsDeclared).then(|| (unit.name.as_str(), &mut chunks));
-        let (javascript, assets, _sources) =
-            compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
+        let compiled = compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
         let output = artifact_path(&dist, &unit.name, *platform);
-        let styles = write_assets(&output, &assets);
+        let styles = write_assets(&output, &compiled.assets);
+        let assets = write_bundled(&dist, &compiled.bundled, &reserved)?;
         // Unconditional: this is also where a previous build's chunks are swept
         // when this one wrote none, and where a browser leg's build manifest is
         // written whether it split or not (`fullstack-dx.md` §10.3).
@@ -2001,9 +2231,10 @@ fn build_workspace_artifacts(
             &output,
             &chunks,
             styles.as_deref(),
+            &assets,
             matches!(platform, Platform::Browser),
         )?;
-        if let Err(error) = fs::write(&output, javascript) {
+        if let Err(error) = fs::write(&output, compiled.javascript) {
             eprintln!(
                 "{} cannot write {}: {error}",
                 paint::error_prefix(),
@@ -2017,6 +2248,7 @@ fn build_workspace_artifacts(
             unit.entry.display(),
             paint::out(paint::Style::BOLD, &output.display().to_string())
         );
+        warn_superseded_sibling(&output);
     }
     Ok(())
 }
@@ -2285,7 +2517,7 @@ fn test_context(file: &Path) -> Result<(PathBuf, Workspace, BuildOptions), Strin
 /// `compile_to_js` has already reported to stderr).
 fn run_test(file: &Path) -> Result<(), String> {
     let (pkg_root, workspace, options) = test_context(file)?;
-    let (javascript, _assets, _sources) = compile_to_js(
+    let compiled = compile_to_js(
         file,
         &pkg_root,
         Platform::default(),
@@ -2298,7 +2530,7 @@ fn run_test(file: &Path) -> Result<(), String> {
     )
     .map_err(|_| String::new())?;
     let script = env::temp_dir().join(format!("vilan-test-{}.mjs", std::process::id()));
-    if let Err(error) = fs::write(&script, javascript) {
+    if let Err(error) = fs::write(&script, compiled.javascript) {
         return Err(format!("cannot write {}: {error}", script.display()));
     }
     let output = std::process::Command::new("node").arg(&script).output();
@@ -2417,6 +2649,147 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Opt
     styles
 }
 
+/// Copies every file `const asset::bundle` registered into the build's output
+/// directory, and returns their names — the `assets` array of the leg's build
+/// manifest ([`write_chunks`]), in the order the program asked for them.
+///
+/// This is the half of kolt.local 029 that makes `dist/` self-sufficient: the
+/// const channel decides WHICH files ride the build (and so which do not — a
+/// resource no `const` names is never copied, which is the reachability the
+/// item asked the compiler to keep), and this decides where they land.
+///
+/// Three refusals, each a real collision the copy would otherwise hide:
+///
+/// - **A source that is already its own destination** is left alone, not
+///   copied. A bare file bundling a sibling (`vilan build app.vl` with
+///   `const bundle("note.txt")` beside it) resolves source and destination to
+///   one path, and `fs::copy` over itself TRUNCATES — the file the build was
+///   asked to carry would be destroyed by carrying it.
+/// - **A name a leg's own build owns** ([`LegNamespace`]) is refused and fails
+///   the build. Copying over `client.js` is the same lie a stale chunk is and
+///   it is silent; worse, `sweep_stale_chunks` and `sweep_stale_sidecar` would
+///   DELETE a bundled `client.arm.js` or `client.css` on the next build, so a
+///   resource parked on one of those names does not merely collide — it
+///   disappears.
+/// - **A name two legs both bundle** is fine and expected — it is the same
+///   package-relative file, so the copy is idempotent.
+///
+/// A failed copy fails the build. Unlike a stray chunk, a missing asset is not
+/// a tidiness problem: the manifest is about to name it, and `load_build`
+/// stops a server whose build names a file that is not on disk.
+fn write_bundled(
+    output_directory: &std::path::Path,
+    bundled: &[(PathBuf, String)],
+    reserved: &[LegNamespace],
+) -> Result<Vec<String>, ExitCode> {
+    let mut written = Vec::new();
+    for (source, name) in bundled {
+        if let Some((leg, role)) = reserved
+            .iter()
+            .find_map(|namespace| namespace.claims(name).map(|role| (&namespace.leg, role)))
+        {
+            eprintln!(
+                "{} `asset::bundle(\"{name}\")` would land on `{name}`, which is the \
+                 `{leg}` leg's {role} — rename the resource, or move it into a subdirectory",
+                paint::error_prefix()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+        let destination = output_directory.join(name);
+        // Same file, so the copy is already done — and doing it would undo it.
+        if same_file(source, &destination) {
+            written.push(name.clone());
+            continue;
+        }
+        if let Some(parent) = destination.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "{} cannot create {}: {error}",
+                paint::error_prefix(),
+                parent.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+        if let Err(error) = fs::copy(source, &destination) {
+            eprintln!(
+                "{} cannot bundle {} into {}: {error}",
+                paint::error_prefix(),
+                source.display(),
+                destination.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+        println!(
+            "{}  {}",
+            paint::out(paint::Style::GREEN, "Bundled"),
+            paint::out(paint::Style::BOLD, &destination.display().to_string())
+        );
+        written.push(name.clone());
+    }
+    Ok(written)
+}
+
+/// The names in the output directory one leg's build owns. A bundled resource
+/// may not take any of them, and the reason is not only collision: the two
+/// sweeps in [`write_chunks`] treat everything in this namespace as theirs to
+/// DELETE when a build stops producing it, so a resource parked here would be
+/// removed by the next build rather than merely overwritten by this one.
+struct LegNamespace {
+    leg: String,
+    /// The bundle's extension — `js` on a browser leg, `mjs` on a process leg.
+    extension: &'static str,
+}
+
+impl LegNamespace {
+    fn of(leg: &str, platform: Platform) -> LegNamespace {
+        LegNamespace {
+            leg: leg.to_string(),
+            extension: platform.script_extension(),
+        }
+    }
+
+    /// Why this leg's build claims `name`, or `None` if the name is free. The
+    /// role is a noun phrase for the refusal message.
+    fn claims(&self, name: &str) -> Option<&'static str> {
+        let leg = &self.leg;
+        if name == format!("{leg}.{}", self.extension) {
+            return Some("compiled bundle");
+        }
+        // Reserved whether or not this build emitted one: `sweep_stale_sidecar`
+        // removes `<leg>.css` exactly when the leg emitted no styles, so a
+        // resource on that name is deleted by the build that did not write it.
+        if name == format!("{leg}.css") {
+            return Some("style sidecar");
+        }
+        if name == format!("{leg}.chunks.json") {
+            return Some("build manifest");
+        }
+        // `<leg>.<arm>.js`, the whole route-chunk namespace — a pattern rather
+        // than a name, because `sweep_stale_chunks` removes by that pattern.
+        if name
+            .strip_prefix(&format!("{leg}."))
+            .and_then(|rest| rest.strip_suffix(".js"))
+            .is_some_and(|arm| !arm.is_empty())
+        {
+            return Some("route-chunk namespace");
+        }
+        None
+    }
+}
+
+/// Whether two paths name one file on disk. Canonicalized rather than compared
+/// textually: `vilan build ./app.vl` and the package root resolve the same file
+/// through different spellings, and a symlinked resource is still the file it
+/// points at. A path that cannot be canonicalized (the destination usually does
+/// not exist yet) is not the same file as anything.
+fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 /// Writes a browser leg's BUILD MANIFEST — `<leg>.chunks.json` — plus the route
 /// chunks it describes, when the leg split.
 ///
@@ -2434,7 +2807,9 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Opt
 /// - `classic_script` — whether the bundle must be loaded as a classic script,
 ///   true exactly when the leg split, because chunk resolution reads
 ///   `document.currentScript` (§3.5);
-/// - `chunks` — the route chunks, `[]` for a leg that does not split.
+/// - `chunks` — the route chunks, `[]` for a leg that does not split;
+/// - `assets` — the files `const asset::bundle` carried into `dist/`, `[]` for
+///   a leg that bundled none (kolt.local 029).
 ///
 /// That reverses `bundle-splitting.md` §9's "dropping `split` takes the manifest
 /// with it", and STRENGTHENS its invariant rather than weakening it: the
@@ -2464,6 +2839,10 @@ fn write_chunks(
     output_js: &std::path::Path,
     chunks: &[EmittedChunk],
     styles: Option<&str>,
+    // The names `write_bundled` just copied for this leg, in the program's own
+    // order — the manifest's `assets` array, and so what `serve_build` serves
+    // without a route of the app's own (kolt.local 029).
+    assets: &[String],
     is_browser: bool,
 ) -> Result<(), ExitCode> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
@@ -2471,6 +2850,7 @@ fn write_chunks(
     // build that wrote a manifest where this one will not (a leg retargeted off
     // the browser) is, and the sweep takes it.
     sweep_stale_chunks(output_js, chunks, is_browser);
+    sweep_stale_sidecar(output_js, styles);
     for chunk in chunks {
         let path = directory.join(&chunk.file);
         if let Err(error) = fs::write(&path, &chunk.source) {
@@ -2516,8 +2896,18 @@ fn write_chunks(
             .join(",\n");
         format!("[\n{rows}\n\t]")
     };
+    let bundled = if assets.is_empty() {
+        "[]".to_string()
+    } else {
+        let rows = assets
+            .iter()
+            .map(|name| format!("\t\t{}", json_string(name)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("[\n{rows}\n\t]")
+    };
     let manifest = format!(
-        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing}\n}}\n",
+        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing},\n\t\"assets\": {bundled}\n}}\n",
         json_string(&leg),
         json_string(&entry),
         styles.map_or_else(|| "null".to_string(), json_string),
@@ -2598,6 +2988,35 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], write
     }
 }
 
+/// Removes `<leg>.css` when this build wrote none — the style sidecar's half of
+/// the doctrine [`sweep_stale_chunks`] already enforces for chunks: the leg's
+/// dist namespace belongs to its LAST build (`bundle-splitting.md` §S3, item 4).
+/// `styles` is what [`write_assets`] just wrote for this leg, so `None` means
+/// the source stopped emitting `css` — and a sidecar that outlives the source
+/// that emitted it is exactly the lie a `chunks.json` outliving its chunks is:
+/// the manifest beside it says `"styles": null` while the file sits there, a
+/// server probing the filesystem finds a stylesheet the build did not produce,
+/// and under `--watch` the dev channel keeps serving it (kolt.local 007 — the
+/// browser then RE-INJECTS the deleted stylesheet, which is resurrection, not
+/// staleness). A failed removal is reported and otherwise ignored, exactly as
+/// the chunk sweep treats a stray.
+fn sweep_stale_sidecar(output_js: &std::path::Path, styles: Option<&str>) {
+    if styles.is_some() {
+        return;
+    }
+    let sidecar = output_js.with_extension("css");
+    if !sidecar.is_file() {
+        return;
+    }
+    if let Err(error) = fs::remove_file(&sidecar) {
+        eprintln!(
+            "{} cannot remove the stale stylesheet {}: {error}",
+            paint::warning_prefix(),
+            sidecar.display()
+        );
+    }
+}
+
 /// A JSON string literal. Chunk arms and file names come from vilan identifiers
 /// and the emitter's own sanitizer, so this only has to be correct, not clever.
 fn json_string(text: &str) -> String {
@@ -2644,7 +3063,7 @@ fn compile_to_js(
     // the returned JavaScript is then the EAGER bundle and `sink` receives one
     // entry per chunk file (`bundle-splitting.md` §3).
     split: Option<(&str, &mut Vec<EmittedChunk>)>,
-) -> Result<(String, Vec<(String, String)>, Vec<(PathBuf, u64)>), ExitCode> {
+) -> Result<Compiled, ExitCode> {
     // `read_source` drops a leading BOM so spans — and the ariadne rendering
     // below, which indexes this same text — address the source proper
     // (windows-support.md §2).
@@ -2692,6 +3111,11 @@ fn compile_to_js(
     // already lift-rewritten and `'static`; the handwritten frontend runs only
     // when the cache misses (a non-clean file), recovering a tree and naming its
     // diagnostics in a single fast-and-rich pass.
+    // The depth instrument (B138) anchors before the FIRST recursion of the
+    // pipeline, which on this path is the entry's own parse — here, or in the
+    // clean-parse cache below — rather than anything inside `analyze` (B139
+    // added the parser to the instrument, and it is the family with no bound).
+    vilan_core::begin_depth_stats();
     let cached = vilan_core::parse_clean_cached(&src);
 
     // Analyzer and codegen diagnostics, collected as `(source, span, message)`
@@ -2772,6 +3196,11 @@ fn compile_to_js(
             platform,
             &vilan_core::options::BuildOptions::default(),
         );
+
+        // Every file `const asset::read` touched is a build input: hand the
+        // set to the watcher so a change to one — or the appearance of one
+        // that was missing — triggers a round exactly as a `.vl` edit does.
+        record_const_inputs(&program.const_input_files);
 
         // The `const` INFERENCE sweep (const-eval.md §9) — THE ONE CALL SITE.
         // It lives here, on the CLI's build path, and not beside the explicit
@@ -2960,16 +3389,29 @@ fn compile_to_js(
                 // (by re-hashing, never by mtime) to skip a leg whose sources
                 // didn't change (backlog E12, half b).
                 Ok(javascript) => {
-                    output = Some((
-                        javascript,
-                        program.const_assets.clone(),
-                        program
-                            .sources
-                            .iter()
-                            .cloned()
-                            .zip(program.source_hashes.iter().copied())
-                            .collect::<Vec<_>>(),
-                    ))
+                    output =
+                        Some(Compiled {
+                            javascript,
+                            assets: program.const_assets.clone(),
+                            bundled: program.const_bundled_files.clone(),
+                            sources: program
+                                .sources
+                                .iter()
+                                .cloned()
+                                .zip(program.source_hashes.iter().copied())
+                                // `const asset::read` inputs — and `asset::bundle`'s
+                                // files, which record through the same channel — are
+                                // sources to the skip decision too: the leg
+                                // recompiles when one changes, which is what recopies
+                                // an edited asset under `--watch`. A missing input
+                                // (`None` hash) cannot reach here: a missed read, or
+                                // a bundle of a file that is not there, fails the
+                                // compile.
+                                .chain(program.const_input_files.iter().filter_map(
+                                    |(path, hash)| hash.map(|hash| (path.clone(), hash)),
+                                ))
+                                .collect::<Vec<_>>(),
+                        })
                 }
                 Err(error) => {
                     overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
@@ -3074,10 +3516,11 @@ fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Re
 const WATCHING_ENV: &str = "VILAN_WATCHING";
 
 /// [`spawn_node`] for a child a `--watch` session owns — [`WATCHING_ENV`], plus
-/// whatever `extra` the round carries (the HMR round adds `VILAN_HMR_PORT`,
-/// `dev-refresh.md` §5 item 2 — the plain restart loop adds nothing). Both
-/// watch paths go through it; plain `vilan run` does not, which is what makes
-/// `is_watching()` answer the question it is named for.
+/// whatever `extra` the round carries (the HMR round adds `VILAN_HMR_PORT` and
+/// `VILAN_HMR_TOKEN`, `dev-refresh.md` §5 item 2 and backlog E93 — the plain
+/// restart loop adds nothing). Both watch paths go through it; plain
+/// `vilan run` does not, which is what makes `is_watching()` answer the question
+/// it is named for.
 fn spawn_watched_node(
     script: &Path,
     args: &[String],
@@ -3748,6 +4191,40 @@ mod tests {
         let after_js = scan_vl(&roots);
         fs::write(dir.join("c.js"), "// also generated\n").unwrap();
         assert_eq!(scan_vl(&roots), after_js, "a new `.js` is not a change");
+    }
+
+    #[test]
+    fn watch_snapshot_includes_recorded_const_inputs() {
+        // `const asset::read` inputs are build inputs (K13 step 2): once a
+        // compile records one, the watcher polls it beside the `.vl` scan —
+        // and a recorded-but-missing input joins the snapshot the moment it
+        // APPEARS, which is the round trigger for "the file the build wanted
+        // now exists".
+        let dir = env::temp_dir().join(format!("vilan-watch-input-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("page.md");
+        let missing = dir.join("not-yet.md");
+        fs::write(&present, "# page\n").unwrap();
+        record_const_inputs(&[(present.clone(), Some(1)), (missing.clone(), None)]);
+        let roots = vec![dir.clone()];
+        let snapshot = watch_snapshot(&roots);
+        assert!(
+            snapshot.contains_key(&present),
+            "a recorded input joins the watched set: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key(&missing),
+            "a missing input stays out until it appears"
+        );
+        fs::write(&missing, "# here now\n").unwrap();
+        let next = watch_snapshot(&roots);
+        assert!(
+            next.contains_key(&missing),
+            "an appearing input is a snapshot change"
+        );
+        assert_ne!(next, snapshot);
+        let _ = fs::remove_dir_all(&dir);
 
         let _ = fs::remove_dir_all(&dir);
     }

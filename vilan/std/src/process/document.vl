@@ -37,6 +37,7 @@ import pkg::build::LegBuild;
 import pkg::fs;
 import pkg::io::panic;
 import pkg::option::Option::{ None, Some, self };
+import pkg::path;
 import pkg::result::Result::{ Err, Ok, self };
 import pkg::ui;
 import pkg::ui::{ View, escape_attribute, escape_text };
@@ -685,10 +686,15 @@ fun is_local(url: str): bool {
 /// The file name `url` addresses: its last path segment, without the query
 /// string or fragment a cache-buster adds (`/client.js?v=2` is `client.js`,
 /// which is also how `serve_build` routes it).
+///
+/// This is `std::path`'s URL seam in two lines: the query and the fragment are
+/// URL grammar and get cut here, and what is left is an ordinary `/`-separated
+/// path that `basename` already knows how to read. It used to index the last
+/// element of a `split("/")`, which differs on a trailing separator —
+/// `"/assets/"` was `""` and is now `"assets"` — the answer a directory URL
+/// deserves either way, since neither can name a file this build emitted.
 fun file_name_of(url: str): str {
-	let path = url.split("?")[0].split("#")[0];
-	let segments = path.split("/");
-	segments[segments.len() - 1]
+	path::basename(url.split("?")[0].split("#")[0])
 }
 
 /// Whether `file` is in this leg's own namespace — the `<leg>.` prefix its
@@ -737,8 +743,15 @@ fun tags_of(markup: str): List<Tag> {
 			index = index + 1;
 			jump continue;
 		}
-		if markup.substring(index, index + 4) == "<!--" {
+		if index + 4 <= length && markup.substring(index, index + 4) == "<!--" {
 			index = past(index_of(markup, "-->", index + 4), 3, length);
+			jump continue;
+		}
+		// A trailing `<` opens nothing: there is no character after it to
+		// classify. (The length guards here and above were implicit while
+		// `substring` clamped; they are the rule now.)
+		if index + 1 >= length {
+			index = index + 1;
 			jump continue;
 		}
 		let after = markup.substring(index + 1, index + 2);
@@ -828,9 +841,16 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 		let name = markup.substring(index, cursor).to_lowercase_ascii();
 		index = skip_spaces(markup, cursor);
 		mut value = "";
-		if markup.substring(index, index + 1) == "=" {
+		// `skip_spaces` returns `length` when it runs off the end — its normal
+		// result on an unterminated tag, not an edge case. Both reads below
+		// have to admit that, now that an `end` past the length is refused.
+		if index < length && markup.substring(index, index + 1) == "=" {
 			index = skip_spaces(markup, index + 1);
-			let quote = markup.substring(index, index + 1);
+			let quote = if index < length {
+				markup.substring(index, index + 1)
+			} else {
+				""
+			};
 			if quote == "\"" || quote == "'" {
 				let close = past(index_of(markup, quote, index + 1), 0, length);
 				value = markup.substring(index + 1, close);

@@ -47,8 +47,33 @@ fn parse_port(line: &str) -> Option<u16> {
         .ok()
 }
 
+/// This run's dev-channel token (backlog E93), read from the instrumented
+/// bundle in `dist/` — the same copy the browser gets. Bounded by `deadline`
+/// because round 1 is what writes it.
+fn dev_token(dir: &Path, leg: &str, deadline: Duration) -> String {
+    let bundle = dir.join("dist").join(format!("{leg}.js"));
+    let start = Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&bundle)
+            && let Some(after) = text.split("var TOKEN = \"").nth(1)
+            && let Some(token) = after.split('"').next()
+            && !token.is_empty()
+            && token != "__VILAN_HMR_TOKEN__"
+        {
+            return token.to_string();
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "the instrumented bundle {} should carry this run's token within {deadline:?}",
+            bundle.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A plain HTTP GET against the dev channel, returning the response BODY — or
-/// `None` when no whole response arrived inside `timeout`.
+/// `None` when no whole response arrived inside `timeout`. `token` is this
+/// run's dev-channel token, which every route requires (backlog E93).
 ///
 /// A partial read is never handed back (E39). The caller tells bundle B from
 /// bundle A by inequality, and a truncated body differs from A exactly as a
@@ -56,10 +81,14 @@ fn parse_port(line: &str) -> Option<u16> {
 /// as a finished rebuild and hand the node harness half a bundle. The dev
 /// channel closes each connection after responding, so a complete read ends at
 /// EOF and the timeout is only ever reached by a stall.
-fn http_get(port: u16, path: &str, timeout: Duration) -> Option<Vec<u8>> {
+fn http_get(port: u16, path: &str, token: &str, timeout: Duration) -> Option<Vec<u8>> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").ok()?;
+    write!(
+        stream,
+        "GET {path}?token={token} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    )
+    .ok()?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).ok()?;
     let separator = b"\r\n\r\n";
@@ -428,9 +457,10 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
         );
         let round_one = round_one_started.elapsed();
         let budget = support::round_budget(round_one);
+        let token = dev_token(&dir, "client", support::WATCH_LIVENESS);
 
         // Bundle A: the instrumented client (shim + adopt/expose).
-        let bundle_a = http_get(port, "/bundle/client.js", budget)
+        let bundle_a = http_get(port, "/bundle/client.js", &token, budget)
             .expect("the dev channel should serve bundle A whole");
         assert!(
             String::from_utf8_lossy(&bundle_a).contains("__hmr_adopt"),
@@ -445,7 +475,7 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
         write(&dir, "src/client.vl", CLIENT_B);
         let start = Instant::now();
         let bundle_b = loop {
-            if let Some(current) = http_get(port, "/bundle/client.js", budget)
+            if let Some(current) = http_get(port, "/bundle/client.js", &token, budget)
                 && current != bundle_a
                 && current.contains(&b'{')
             {

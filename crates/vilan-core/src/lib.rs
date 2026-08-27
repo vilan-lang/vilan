@@ -10,6 +10,7 @@ pub mod chunks;
 pub mod closest_name;
 pub mod const_eval;
 pub mod context;
+pub(crate) mod depth_stats;
 pub mod elements;
 pub mod error;
 pub mod formatter;
@@ -307,6 +308,18 @@ pub fn content_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// [`content_hash`] over bytes — what a build input that is not text is keyed
+/// on (`asset::bundle`'s files: a font, a favicon, a `.wasm`). Deliberately
+/// NOT comparable with `content_hash` of the same file decoded: the two are
+/// change detectors for different channels and are never mixed in one map.
+pub fn content_hash_bytes(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The handle to an entry tree `analyze_source_reclaimable` leaked: the
 /// `Program` it returned borrows this tree for `'static`, and the owner that
 /// drops that program may give the tree back (`Leaked::reclaim`, `unsafe`,
@@ -452,6 +465,17 @@ fn analyze_source_unfenced(
     // with every diagnostic (lexer and parser, span-ordered). Analysis below runs
     // on the salvaged tree, so a mid-edit source still yields a partial program
     // rather than nothing (frontend.md §3 S4/S5 — the LSP-facing improvement).
+    // The depth instrument (B138) anchors per top-level analysis; a macro world
+    // is a nested analysis on the same thread whose depths belong to the outer
+    // run, so it must not re-anchor. It anchors HERE rather than inside
+    // `analyze` so the parser's own recursion — which runs first and is not
+    // depth-bounded (B139) — is inside the measured window: the pipeline's
+    // stack need is the deepest point ANY phase reaches, and leaving the first
+    // phase out of the instrument is what let a nesting depth the analyzer
+    // handles comfortably overflow the stack before analysis began.
+    if !macros::in_macro_world() {
+        depth_stats::begin();
+    }
     let (tree, parse_errors) = parsing::parse(source);
     let mut diagnostics: Vec<Error> = parse_errors
         .iter()
@@ -685,12 +709,13 @@ pub fn post_analysis_passes(
     // transform time, failures are ordinary diagnostics. Runs here so
     // `check`, the LSP, and every build path agree.
     let phase_const_start = PhaseClock::now();
-    let (const_results, const_assets, const_errors) =
-        const_eval::evaluate(program, options, &call_graph);
+    let evaluated = const_eval::evaluate(program, options, &call_graph);
     let phase_const = phase_const_start.elapsed();
-    program.const_results = const_results;
-    program.const_assets = const_assets;
-    for (error, source) in const_errors {
+    program.const_results = evaluated.results;
+    program.const_assets = evaluated.assets;
+    program.const_input_files = evaluated.input_files;
+    program.const_bundled_files = evaluated.bundled;
+    for (error, source) in evaluated.errors {
         program.push_diagnostic(error, source);
     }
     // The last pass to want it by reference is done, so the graph moves onto
@@ -726,7 +751,7 @@ pub fn post_analysis_passes(
             "[vilan phase] post-passes {:.1}ms call-graph {:.1}ms async-infer {:.1}ms \
              view-suspensions {:.1}ms async-drops {:.1}ms context-drops {:.1}ms \
              platform-color {:.1}ms const-eval {:.1}ms const-lower {:.1}ms \
-             const-interp {:.1}ms init-order {:.1}ms",
+             const-interp {:.1}ms const-fuel-max {} init-order {:.1}ms",
             milliseconds(phase_post_start.elapsed()),
             milliseconds(phase_graph),
             milliseconds(phase_async),
@@ -737,8 +762,33 @@ pub fn post_analysis_passes(
             milliseconds(phase_const),
             milliseconds(const_lower),
             milliseconds(const_interp),
+            const_eval::max_fuel_used(),
             milliseconds(phase_init),
         );
+    }
+    // The depth line (B138), after the last pass that recurses: macro worlds
+    // are nested analyses whose depths already accumulated into the outer
+    // run's peaks, so only the top-level run prints (the same reason the
+    // in-analyze phase line guards).
+    if !macros::in_macro_world() {
+        depth_stats::report();
+    }
+}
+
+/// Anchor the `VILAN_DEPTH_STATS` instrument for an analysis a front end is
+/// about to drive itself.
+///
+/// [`analyze_source`] anchors around its own parse and needs no help. The CLI
+/// parses the entry file itself and hands the tree to `analyze`, so without
+/// this its parse — the pipeline's FIRST recursion, and the one that is not
+/// depth-bounded (B139) — would fall outside the measured window and the depth
+/// line would report the parser as three levels deep whatever the file nests.
+/// Anchoring is idempotent within an analysis and released by the report at the
+/// end of `post_analysis_passes`, so calling this before a parse that `analyze`
+/// will later be handed is correct, and calling it redundantly is harmless.
+pub fn begin_depth_stats() {
+    if !macros::in_macro_world() {
+        depth_stats::begin();
     }
 }
 

@@ -5,7 +5,9 @@ command's flags; this page adds the behavior the one-line help can't
 carry. One rule up front: **`vilan upgrade` is the only command that
 touches the network.** Everything else (builds, dependency resolution,
 tests) works offline (git dependencies are fetched once by the first
-build that needs them, then served from the cache forever).
+build that needs them, then served from the cache forever). That rule is
+about the network; locally, `build` and `run` execute the manifest's
+`[build] run` hooks with your own privileges, without prompting.
 
 For the guided on-ramp, see [Hello Vilan](../tour/hello-vilan.md); for
 `--watch`, HMR, and the manifest keys that shape the dev loop, see
@@ -41,7 +43,9 @@ the target's: `.mjs` on a process runtime (Node/Deno/Bun), so the host
 classifies the emitted ESM without inspecting it, and `.js` on the
 browser, whose `<script type="module">` already declares it. Assets emitted at
 compile time (the styling system's CSS) land beside the output.
-`[build] run` hooks execute first; a failing hook fails the build.
+`[build] run` hooks execute first — through your shell, with your
+privileges, each command printed before it runs; a failing hook fails the
+build.
 
 - `--stdout`: print the JavaScript instead of writing a file.
 - `--platform <p>`: `node`, `deno`, `bun`, `browser`, or `none`;
@@ -157,6 +161,26 @@ is the current directory. Formatting is conservative and a fixed point:
   above — an argument list sits inside an expression, where the builder
   convention decides layout, while a parameter list is a declaration's own
   contract and has no shape but one-per-line.
+- A `style()` builder chain's links are put in a canonical ORDER — the only
+  place `vilan fmt` reorders your code rather than re-laying it out. The order
+  is Tailwind CSS's category sequence (layout, flexbox/grid, spacing, sizing,
+  typography, backgrounds, borders, effects, filters, tables,
+  transitions/animation, transforms, interactivity, svg, accessibility), with
+  every condition combinator after every property method, in the axis order the
+  selector nests them: `md`, then `dark`, then `attribute`, then the
+  pseudo-classes. Two rules keep it safe, because a chain merges last-wins per
+  property slot. A method the formatter does not know — one of your own
+  `impl Style` extensions, or an escape hatch whose slot is an argument
+  (`raw`, `with_length`, `with_color`, `with_border`) — is a **barrier**:
+  links sort only within the runs between barriers, and nothing crosses one, so
+  a chain of your own methods is left exactly as written. And methods whose
+  slots are entangled — the same property, or a CSS shorthand over it
+  (`padding` over `padding_x` over `padding_left`, `size` over `width` and
+  `height`, `border` over `border_color`) — keep their written order, because
+  `padding` then `padding_x` means something the reverse does not. Only
+  independent slots ever cross, so the rendered stylesheet is byte-identical
+  before and after. `Style + Style` operands are never reordered: that merge's
+  order is yours.
 - A file the formatter cannot yet print faithfully is left byte-for-byte
   untouched, never half-formatted.
 

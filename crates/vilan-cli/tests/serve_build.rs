@@ -17,7 +17,11 @@
 //!      process;
 //!   4. the dev policy, both ways: bytes that move under a running server are
 //!      served fresh while `run --watch` owns it (E55's defect) and served from
-//!      the boot-time copy otherwise.
+//!      the boot-time copy otherwise;
+//!   5. **an artifact reaches the wire as the build wrote it** — byte for byte,
+//!      including every byte no UTF-8 decode survives (kolt.local 030), with
+//!      the content type its extension implies and the charset rule that a raw
+//!      body forces (kolt.local 022).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -162,8 +166,13 @@ fn wait_for_port(port: u16) -> bool {
     false
 }
 
-/// A plain HTTP GET, returning `(status line + headers, body)`.
-fn http_get(port: u16, path: &str) -> (String, String) {
+/// A plain HTTP GET, returning `(status line + headers, RAW body bytes)`.
+///
+/// The body is never decoded. That matters here and nowhere else in this file:
+/// the assertions about a `.png` are about the exact bytes on the wire, and a
+/// `String::from_utf8_lossy` would replace every byte this pipeline used to
+/// destroy with the same U+FFFD, hiding the defect it is asked to prove gone.
+fn http_get_raw(port: u16, path: &str) -> (String, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for GET");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -175,11 +184,25 @@ fn http_get(port: u16, path: &str) -> (String, String) {
     .expect("send GET");
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
-    let text = String::from_utf8_lossy(&response).into_owned();
-    match text.split_once("\r\n\r\n") {
-        Some((head, body)) => (head.to_string(), body.to_string()),
-        None => (text, String::new()),
+    // The header block is ASCII, so it can be found by bytes without decoding
+    // the body that follows it.
+    let separator = b"\r\n\r\n";
+    match response
+        .windows(separator.len())
+        .position(|window| window == separator)
+    {
+        Some(at) => (
+            String::from_utf8_lossy(&response[..at]).into_owned(),
+            response[at + separator.len()..].to_vec(),
+        ),
+        None => (String::from_utf8_lossy(&response).into_owned(), Vec::new()),
     }
+}
+
+/// The same GET with the body as text, for the artifacts that are text.
+fn http_get(port: u16, path: &str) -> (String, String) {
+    let (head, body) = http_get_raw(port, path);
+    (head, String::from_utf8_lossy(&body).into_owned())
 }
 
 fn stop(server: &mut Child) {
@@ -320,6 +343,264 @@ fn an_artifact_the_build_named_and_did_not_write_stops_the_server() {
         report.contains("dist/client.css") && report.contains("client"),
         "and must name the file and the leg:\n{report}"
     );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn an_artifact_with_an_unknown_extension_is_skipped_with_a_warning_not_silently() {
+    // kolt.local 022(b): the §5.10 fence stands — `serve_build` serves a
+    // build, not a directory, and an extension the content-type table does not
+    // name is not served — but the drop is no longer silent: boot names the
+    // artifact it skipped.
+    //
+    // The fixture is a `.zip`, and it used to be a `.png`. That swap IS the
+    // fence being re-drawn rather than removed (kolt.local 022): the table is
+    // generated from `mime-db` now and knows every kind a build emits, so a
+    // `.png` is served and would prove nothing here. An archive is still
+    // outside the fence — no build emits one, and no page loads one as a
+    // sub-resource — so it is what an unnamed extension looks like today.
+    let port = free_port();
+    let staged = stage("unknown_ext", port, Client::Styled, false);
+    build(&staged);
+    // Teach the manifest an artifact the table does not know — a `.zip` chunk
+    // entry — with the file ON DISK, so what this test observes is the
+    // extension skip and not the missing-artifact stop.
+    let manifest_path = staged.join("dist/client.chunks.json");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("the manifest");
+    assert!(
+        manifest.contains("\"chunks\": []"),
+        "the fixture's manifest shape moved under this test: {manifest}"
+    );
+    std::fs::write(
+        &manifest_path,
+        manifest.replace("\"chunks\": []", "\"chunks\": [{\"file\": \"bundle.zip\"}]"),
+    )
+    .expect("name the unknown-extension artifact");
+    std::fs::write(staged.join("dist/bundle.zip"), "zip-bytes").expect("write the artifact");
+
+    let mut server = Command::new("node")
+        .arg("dist/server.mjs")
+        .current_dir(&staged)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the server");
+    assert!(wait_for_port(port), "the server should bind {port}");
+
+    // The unknown extension is still not served: the app's fallback answers.
+    let (_, body) = http_get(port, "/bundle.zip");
+    assert!(
+        body.contains("id=\"app\""),
+        "an unknown-extension artifact must fall through to the app, not be served:\n{body}"
+    );
+    // And the known artifacts still are — the asset list is unchanged.
+    let (head, _) = http_get(port, "/client.js");
+    assert!(
+        head.contains("Content-Type: text/javascript"),
+        "the bundle's route must be untouched by the skipped artifact:\n{head}"
+    );
+    let (head, _) = http_get(port, "/client.css");
+    assert!(
+        head.contains("Content-Type: text/css"),
+        "the sidecar's route must be untouched by the skipped artifact:\n{head}"
+    );
+
+    let _ = server.kill();
+    let mut boot_output = Vec::new();
+    if let Some(mut stdout) = server.stdout.take() {
+        let _ = stdout.read_to_end(&mut boot_output);
+    }
+    let _ = server.wait();
+    let boot_output = String::from_utf8_lossy(&boot_output);
+    assert!(
+        boot_output.contains(
+            "warning: the `client` build names dist/bundle.zip, whose extension \
+             `serve_build` has no content type for — the artifact is not served"
+        ),
+        "the boot must name the artifact it skipped:\n{boot_output}"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+/// A real 1x1 PNG — 70 bytes, and not valid UTF-8 at byte 0 (`0x89`).
+///
+/// The number is the point. Decoded as text and re-encoded, these 70 bytes
+/// become 94: every byte that is not a legal UTF-8 sequence is replaced by
+/// U+FFFD, which is three bytes on the way back out. That is exactly how kolt
+/// measured this defect — a 483-byte favicon served as 853 bytes — at a size a
+/// test can assert (kolt.local 030).
+const ONE_PIXEL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+    0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// A `wOF2`-signed blob carrying every one of the 256 byte values.
+///
+/// Not a loadable font, and it does not need to be: what is under test is the
+/// pipeline's fidelity, and a body containing all 256 values is the strongest
+/// statement of it — there is no byte left for the pipeline to get wrong.
+fn every_byte_woff2() -> Vec<u8> {
+    let mut bytes = b"wOF2".to_vec();
+    bytes.extend((0..=255u8).rev());
+    bytes
+}
+
+/// Plant `files` into the build manifest's chunk list and onto disk, so
+/// `load_build` reads them as artifacts of the build.
+fn plant_artifacts(staged: &Path, files: &[(&str, Vec<u8>)]) {
+    let manifest_path = staged.join("dist/client.chunks.json");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("the manifest");
+    assert!(
+        manifest.contains("\"chunks\": []"),
+        "the fixture's manifest shape moved under this test: {manifest}"
+    );
+    let chunks = files
+        .iter()
+        .map(|(name, _)| format!("{{\"file\": \"{name}\"}}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        &manifest_path,
+        manifest.replace("\"chunks\": []", &format!("\"chunks\": [{chunks}]")),
+    )
+    .expect("name the planted artifacts");
+    for (name, bytes) in files {
+        std::fs::write(staged.join("dist").join(name), bytes).expect("write the artifact");
+    }
+}
+
+#[test]
+fn a_binary_artifact_reaches_the_wire_as_the_build_wrote_it() {
+    // kolt.local 030. Until this landed, `BuildAsset.content` was a `str` and
+    // every artifact was UTF-8-decoded on the way in, so `serve_build` could
+    // not carry a byte-typed artifact at any point in its chain — which is why
+    // kolt had to hand-roll a static layer to serve its own favicon, and why
+    // a complete content-type table could not be exercised.
+    let port = free_port();
+    let staged = stage("binary", port, Client::Styled, false);
+    build(&staged);
+    let woff2 = every_byte_woff2();
+    plant_artifacts(
+        &staged,
+        &[
+            ("favicon.png", ONE_PIXEL_PNG.to_vec()),
+            ("brand.woff2", woff2.clone()),
+            ("LOGO.PNG", ONE_PIXEL_PNG.to_vec()),
+        ],
+    );
+
+    let mut server = serve(&staged, &[]);
+    assert!(wait_for_port(port), "the server should bind {port}");
+
+    let (head, body) = http_get_raw(port, "/favicon.png");
+    assert!(
+        head.contains("Content-Type: image/png"),
+        "a `.png` artifact must be typed by the table, not skipped:\n{head}"
+    );
+    assert_eq!(
+        body, ONE_PIXEL_PNG,
+        "the favicon must reach the wire byte for byte"
+    );
+    // Said as a size too, because the size is how this defect was found: a
+    // decode-and-re-encode of these bytes is 94 long, not 70.
+    assert_eq!(
+        body.len(),
+        70,
+        "the favicon grew or shrank in transit — a lossy decode inflates these \
+         70 bytes to 94 (kolt measured 483 -> 853 on its own)"
+    );
+
+    let (head, body) = http_get_raw(port, "/brand.woff2");
+    assert!(
+        head.contains("Content-Type: font/woff2"),
+        "a `.woff2` artifact must be typed by the table:\n{head}"
+    );
+    assert_eq!(
+        body, woff2,
+        "a font carrying all 256 byte values must survive the server unchanged"
+    );
+
+    // A font and an image are typed WITHOUT a charset: a charset parameter on a
+    // binary type is meaningless, and on `application/json` it is an error.
+    assert!(
+        !head.contains("charset"),
+        "a binary artifact must not be served with a charset:\n{head}"
+    );
+
+    // The extension is matched case-insensitively: `LOGO.PNG` is one file to
+    // the build that wrote it, so it is one row to the table that types it.
+    let (head, body) = http_get_raw(port, "/LOGO.PNG");
+    assert!(
+        head.contains("Content-Type: image/png"),
+        "an uppercase extension must reach the same row as its lowercase twin:\n{head}"
+    );
+    assert_eq!(body, ONE_PIXEL_PNG, "and be served byte for byte too");
+
+    // And the artifacts that were always served are still exactly themselves.
+    let (_, body) = http_get_raw(port, "/client.js");
+    let on_disk = std::fs::read(staged.join("dist/client.js")).expect("the bundle");
+    assert_eq!(body, on_disk, "the bundle must be byte-identical too");
+
+    stop(&mut server);
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn a_text_artifact_spells_its_charset_and_a_json_one_does_not() {
+    // kolt.local 022. The body goes out as raw bytes now, so nothing downstream
+    // implies an encoding: an unspelled `text/css` is decoded by whatever the
+    // browser defaults to. `application/json` is the converse — utf8 BY SPEC,
+    // where naming a charset is the error rather than the fix — and
+    // `.webmanifest` needs its own media type because Chrome rejects a manifest
+    // served as anything else.
+    let port = free_port();
+    let staged = stage("charset", port, Client::Styled, false);
+    build(&staged);
+    plant_artifacts(
+        &staged,
+        &[
+            ("data.json", b"{\"ok\":true}".to_vec()),
+            ("site.webmanifest", b"{\"name\":\"served\"}".to_vec()),
+        ],
+    );
+
+    let mut server = serve(&staged, &[]);
+    assert!(wait_for_port(port), "the server should bind {port}");
+
+    for (path, expected) in [
+        ("/client.js", "Content-Type: text/javascript; charset=utf-8"),
+        ("/client.css", "Content-Type: text/css; charset=utf-8"),
+    ] {
+        let (head, _) = http_get(port, path);
+        assert!(
+            head.contains(expected),
+            "{path} must be served `{expected}` — a raw byte body carries no \
+             encoding of its own:\n{head}"
+        );
+    }
+
+    let (head, body) = http_get(port, "/data.json");
+    assert!(
+        head.contains("Content-Type: application/json"),
+        "a `.json` artifact must be served as json:\n{head}"
+    );
+    assert!(
+        !head.contains("charset"),
+        "json is utf8 by spec and takes no charset parameter:\n{head}"
+    );
+    assert_eq!(body, "{\"ok\":true}");
+
+    let (head, _) = http_get(port, "/site.webmanifest");
+    assert!(
+        head.contains("Content-Type: application/manifest+json"),
+        "Chrome rejects a manifest served as anything but \
+         `application/manifest+json`:\n{head}"
+    );
+
+    stop(&mut server);
     let _ = std::fs::remove_dir_all(&staged);
 }
 

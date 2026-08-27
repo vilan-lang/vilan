@@ -182,19 +182,30 @@ when a design specifies a leading in absolute units — a length inherits as a
 computed length and will not track a child that resizes its text. Both write
 the same slot, so a later one simply replaces an earlier one.
 
-For anything the typed surface doesn't cover, escape hatches:
+For anything the typed surface doesn't cover, the escape hatch is `raw`:
 
 ```vilan,fragment
 .raw("clip-path", "polygon(0 0, 100% 0, 100% 80%)")
-.with_length("scroll-margin-top", space(4))
-.with_color("outline-color", Color::blue(300))
+.raw("scroll-margin-top", space(4))
+.raw("outline-color", Color::blue(300))
 ```
 
-`raw` takes any property; `with_length` and `with_color` take an
-untyped property with a *typed* value, so a token still emits its
-`:root` declaration. The typed surface grows by demand — if you find
-yourself reaching for `raw` on the same property repeatedly, that is the
-evidence a method should exist.
+`raw` takes any property, and any *value* the CSS channel understands: a
+complete value written as a `str`, or a `Length` or `Color` — including a
+theme token like `space(4)` or `Color::blue(300)`, which carries its own
+`:root` declaration onto the stylesheet exactly as a typed property method
+does. `with_length` and `with_color` are the same thing under older names
+and stay available; they are `raw` at those two value types.
+
+Reach for the value, not its text. A token is a *pair* — the reference
+(`var(--space-4)`) and the `:root` line that declares it — and reading the
+`.css` field of one hands over the reference alone, so `space(4).css` puts a
+`var()` on the sheet that nothing defines. (That is the field, not the
+`Length::css(..)` constructor above, which is a value in its own right and
+declares nothing to lose.) Passing `space(4)` itself keeps the pair together.
+
+The typed surface grows by demand — if you find yourself reaching for `raw`
+on the same property repeatedly, that is the evidence a method should exist.
 
 ## Boxes, edges and borders
 

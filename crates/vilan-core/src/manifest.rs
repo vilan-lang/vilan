@@ -216,6 +216,30 @@ pub enum Dependency {
 /// distinguishes once, for both validation and resolution.
 pub enum DependencySource<'declaration> {
     /// A local directory, relative to the declaring manifest.
+    ///
+    /// **Deliberately not containment-checked, and this is the decision, not an
+    /// oversight (E95).** `[entry.<name>] path` is refused when it is absolute
+    /// or carries `..`; a dependency `path` is not, and the asymmetry is on
+    /// purpose. An entry path names a file *inside the package being built* —
+    /// it is resolved against `root` and its name becomes `dist/<name>.js`, so
+    /// climbing out of the package is meaningless there and the guard is a
+    /// well-formedness rule, not a security boundary. A dependency path names
+    /// *another package*, and pointing outside the declaring directory is the
+    /// whole point of the form: `common = { path = "../common" }` is what
+    /// every workspace, every monorepo, and this repo's own
+    /// `examples/fullstack` legs are spelled as. A `..` guard here would refuse
+    /// the correct spelling of the common case.
+    ///
+    /// The security argument for adding one anyway does not survive the ruled
+    /// trust model (`proposal/build-trust.md` §2, RULED 2026-08-26): the
+    /// manifest is the developer's own file, and building a project already
+    /// runs its `[build] run` hooks with the developer's full privileges, no
+    /// sandbox and no prompt. Against a manifest that can execute arbitrary
+    /// shell, a rule about which *directory* it may name reads a package it was
+    /// free to run code from anyway — it buys nothing and, worse, advertises a
+    /// containment property the trust model explicitly declines to offer.
+    /// Tier 1 is trusted; the tier that is not is dependency-authored build
+    /// code (§3), whose enforcement point is the registry (D5), not this path.
     Path(&'declaration Path),
     /// One immutable point of one repository, materialized into the git cache
     /// and then treated exactly like a path dependency.
@@ -664,6 +688,12 @@ impl Manifest {
                 }
             }
             if let Some(path) = &entry.path {
+                // Well-formedness, NOT containment: an entry is a file inside
+                // the package being built, and its name becomes `dist/<name>.js`,
+                // so a path that climbs out names nothing this build can emit.
+                // A dependency `path` gets no such rule ON PURPOSE — see
+                // `DependencySource::Path` for why the asymmetry is the
+                // decision (E95).
                 let escapes = path.is_absolute()
                     || path
                         .components()
@@ -1355,23 +1385,28 @@ fn split_needs_a_browser_leg(key: &str, declared: &str) -> String {
     )
 }
 
-/// Why `name` is reserved as a package name, if it is. The three reserved
+/// Why `name` is reserved as a package name, if it is. Three of the reserved
 /// names are the import roots the toolchain itself owns (spec §4.2's three
 /// namespaces). A dependency key under one of them would silently shadow the
 /// root (`std`, `macro_std` — the analyzer binds dependency edges before the
 /// global roots) or be silently unreachable behind it (`pkg` — the hardcoded
 /// self-package root wins); a `[package]` claiming one as its own name stakes
 /// the same claim for the day it is depended on or published (std-shape.md
-/// §4, L12). `[library] name` deliberately carries NO check: the reserved
-/// names are reserved *for* the toolchain's own `[library]` manifests (std is
-/// `[library] name = "std"`, likewise macro_std), a context-free validation
-/// cannot tell the owner from an impostor, and a library's own name — unlike
-/// a dependency key — never binds an import root.
-fn reserved_package_name(name: &str) -> Option<&'static str> {
+/// §4, L12). `vilan` is the fourth: not an import root today, but the
+/// language's own name, held ahead of the official-package namespace decision
+/// (kolt.local 026's recorded first step, 2026-08-26) — reserved before any
+/// user package can claim it, whichever way that re-ruling lands. `[library]
+/// name` deliberately carries NO check: the reserved names are reserved *for*
+/// the toolchain's own `[library]` manifests (std is `[library] name =
+/// "std"`, likewise macro_std), a context-free validation cannot tell the
+/// owner from an impostor, and a library's own name — unlike a dependency key
+/// — never binds an import root.
+pub(crate) fn reserved_package_name(name: &str) -> Option<&'static str> {
     match name {
         "std" => Some("the standard library owns it"),
         "pkg" => Some("it always means the importing package's own modules"),
         "macro_std" => Some("the macro standard library owns it"),
+        "vilan" => Some("the language owns its own name"),
         _ => None,
     }
 }
@@ -1381,8 +1416,8 @@ fn reserved_package_name(name: &str) -> Option<&'static str> {
 /// dependency).
 fn reserved_name_refusal(name: &str, reason: &str, renamed: &str) -> String {
     format!(
-        "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
-         `macro_std` are all reserved); rename the {renamed}"
+        "`{name}` is a reserved package name: {reason} (`std`, `pkg`, \
+         `macro_std`, and `vilan` are all reserved); rename the {renamed}"
     )
 }
 
@@ -1544,14 +1579,17 @@ mod tests {
     // (`import std::print` stopped resolving), one named `pkg` was silently
     // unreachable behind the self-package root, and one named `macro_std`
     // shadowed the macro world's std — measured 2026-08-24, the plant these
-    // pins were proven red against.
+    // pins were proven red against. `vilan` joined the set 2026-08-26
+    // (kolt.local 026's recorded first step): not an import root, but the
+    // language's own name, held ahead of the official-package namespace
+    // re-ruling so no user package claims it first.
 
     /// The refusal's exact head for `name`, as [`reserved_name_refusal`]
     /// builds it — asserted verbatim so the ledger row's key stays honest.
     fn reserved_head(name: &str, reason: &str, renamed: &str) -> String {
         format!(
-            "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
-             `macro_std` are all reserved); rename the {renamed}"
+            "`{name}` is a reserved package name: {reason} (`std`, `pkg`, \
+             `macro_std`, and `vilan` are all reserved); rename the {renamed}"
         )
     }
 
@@ -1592,6 +1630,20 @@ mod tests {
             vec![reserved_head(
                 "macro_std",
                 "the macro standard library owns it",
+                "package"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_package_named_vilan_is_refused() {
+        let manifest = parse("[package]\nname = \"vilan\"\n");
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "vilan",
+                "the language owns its own name",
                 "package"
             )]
         );
@@ -1643,6 +1695,23 @@ mod tests {
             vec![reserved_head(
                 "macro_std",
                 "the macro standard library owns it",
+                "dependency"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dependency_named_vilan_is_refused() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             vilan = { path = \"../vilan\" }\n",
+        );
+        let errors = manifest.validate();
+        assert_eq!(
+            errors,
+            vec![reserved_head(
+                "vilan",
+                "the language owns its own name",
                 "dependency"
             )]
         );
@@ -1712,12 +1781,13 @@ mod tests {
     #[test]
     fn a_near_miss_of_a_reserved_name_is_not_refused() {
         // Exact match only: `stdx`, `std_helpers`, `pkg_tools`,
-        // `macro_stdlib` are ordinary names.
+        // `macro_stdlib`, `vilan_ui` are ordinary names.
         let manifest = parse(
             "[package]\nname = \"stdx\"\n[package.dependencies]\n\
              std_helpers = { path = \"../std_helpers\" }\n\
              pkg_tools = { path = \"../pkg_tools\" }\n\
-             macro_stdlib = { path = \"../macro_stdlib\" }\n",
+             macro_stdlib = { path = \"../macro_stdlib\" }\n\
+             vilan_ui = { path = \"../vilan_ui\" }\n",
         );
         assert!(manifest.validate().is_empty());
     }
@@ -3091,6 +3161,29 @@ mod tests {
                 .validate()
                 .iter()
                 .any(|e| e.contains("free of `..`"))
+        );
+    }
+
+    #[test]
+    fn a_dependency_path_may_leave_the_declaring_directory() {
+        // E95's decision, pinned so it cannot be "fixed" into the entry rule by
+        // an auditor who sees only the asymmetry. A dependency `path` names
+        // ANOTHER package, and `../` is how every workspace spells that — this
+        // repo's own `examples/fullstack` legs are `common = { path =
+        // "../common" }`. The trust model behind the choice is
+        // `proposal/build-trust.md` §2: the manifest is the developer's own
+        // file, and it may already run arbitrary shell through `[build] run`,
+        // so a containment rule on the directory it names would buy nothing
+        // and advertise a guarantee the ruling declines to make. The entry
+        // pin above is the sibling that DOES refuse `..`, for a different
+        // reason: an entry is a file inside the package being built.
+        let manifest = parse(
+            "[package]\nname = \"app\"\n\n[dependencies]\ncommon = { path = \"../common\" }\n",
+        );
+        assert!(
+            manifest.validate().is_empty(),
+            "a `..` dependency path is the normal spelling, not an error: {:?}",
+            manifest.validate()
         );
     }
 

@@ -8483,6 +8483,98 @@ fn operator_monomorphizes_on_generic_aggregate() {
 }
 
 #[test]
+fn b135_operator_at_all_native_binding_monomorphizes_an_explicit_eq_body() {
+    // B135, the OPERATOR half of B127's family: a conditional impl whose body
+    // calls the trait method EXPLICITLY, invoked through `==`/`!=` at an
+    // all-native binding. The operator path used to skip monomorphization
+    // for all-native bindings (assuming the body uses only operators on `T`,
+    // which lower native), so the explicit `.eq()` fell through to
+    // `PartialEq`'s bodyless requirement and tripped the emitter's
+    // never-silent check. The body REQUIRES the substitution, so the
+    // emission specializes.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T: PartialEq> with PartialEq {
+            fun eq(self, b: Pair<T>): bool {
+                self.a.eq(b.a) && self.b.eq(b.b)
+            }
+        }
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 9, b = 9 };
+            if x == y { print("xy-eq") } else { print("xy-neq") }
+            if x == z { print("xz-eq") } else { print("xz-neq") }
+            if x != z { print("xz-ne") } else { print("xz-not-ne") }
+        }
+        "#,
+        "xy-eq\nxz-neq\nxz-ne\n",
+    );
+}
+
+#[test]
+fn b135_operator_reaches_the_requirement_through_a_generic_helper() {
+    // The transitive shape: the operator body itself calls no requirement —
+    // a generic HELPER it calls does. The specialize-or-not decision walks
+    // the call graph, so the helper's `.eq()` still forces the instance.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::print;
+        struct Pair<T> { a: T, b: T }
+        fun both_equal<E: PartialEq>(p: E, q: E, r: E, s: E): bool {
+            p.eq(q) && r.eq(s)
+        }
+        impl Pair<type T: PartialEq> with PartialEq {
+            fun eq(self, b: Pair<T>): bool {
+                both_equal(self.a, b.a, self.b, b.b)
+            }
+        }
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 9, b = 9 };
+            if x == y { print("xy-eq") } else { print("xy-neq") }
+            if x == z { print("xz-eq") } else { print("xz-neq") }
+        }
+        "#,
+        "xy-eq\nxz-neq\n",
+    );
+}
+
+#[test]
+fn b135_operator_reaches_the_requirement_through_a_closure() {
+    // The closure shape: the requirement call hides inside a closure the
+    // body creates and calls through a variable — an `Indirect` edge in the
+    // call graph. The decision walks a node's LEXICAL closures too, so the
+    // hidden `.eq()` still forces the instance.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::print;
+        struct Pair<T> { a: T, b: T }
+        impl Pair<type T: PartialEq> with PartialEq {
+            fun eq(self, b: Pair<T>): bool {
+                let check = |x: T, y: T| x.eq(y);
+                check(self.a, b.a) && check(self.b, b.b)
+            }
+        }
+        fun main() {
+            let x = Pair { a = 1, b = 2 };
+            let y = Pair { a = 1, b = 2 };
+            let z = Pair { a = 9, b = 9 };
+            if x == y { print("xy-eq") } else { print("xy-neq") }
+            if x == z { print("xz-eq") } else { print("xz-neq") }
+        }
+        "#,
+        "xy-eq\nxz-neq\n",
+    );
+}
+
+#[test]
 fn single_level_container_from_json_roundtrip_runs() {
     // A single-level `List<i32>` decode: `from_json` calls `from_json_value`, whose
     // element type comes only from the enclosing `List<i32>` instantiation — the
@@ -9413,6 +9505,156 @@ fn sync_method_through_generic_bound_is_not_made_async() {
     assert!(
         !js.contains("async") && !js.contains("await"),
         "a purely-sync generic dispatch must not be made async:\n{js}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B141: a postfix applied to an `await` must parenthesise the await.
+//
+// The emitter rendered an await as the prefix form `await (<operand>)` — it
+// parenthesised the OPERAND but never the whole await-expression — and the
+// postfix arms rendered their subject with no parens of their own. Member
+// access and call bind TIGHTER than the `await` unary, so `await (f()).x`
+// parsed as `await ((f()).x)`: the property was read off the PROMISE and the
+// program silently got `undefined`, with a clean `vilan check` and exit 0.
+//
+// These pin the shape class, one per postfix form, by RUNNING the emitted
+// program and asserting the value — the miscompile is invisible to
+// `assert_compiles`, which is exactly how it survived into released
+// toolchains. Every helper below awaits, so every call to it is implicitly
+// awaited; the async transparency the language promises is precisely the
+// inline spelling these pin.
+
+/// The shared preamble: async helpers whose calls are implicitly awaited.
+const AWAIT_POSTFIX_PRELUDE: &str = r#"
+        import std::print;
+        [extern("Promise.resolve")]
+        async external fun resolved(value: i32): i32;
+        struct Row { id: i32, name: str }
+        struct Boxed { n: i32 }
+        impl Boxed { fun doubled(self): i32 { self.n * 2 } }
+        fun fetch_row(): Row { resolved(0); Row { id = 7, name = "seven" } }
+        fun fetch_list(): List<i32> { resolved(0); [10, 20, 30] }
+        fun fetch_num(): i32 { resolved(0); 5 }
+        fun fetch_boxed(): Boxed { resolved(0); Boxed { n = 21 } }
+        fun fetch_maker(): || i32 { resolved(0); || 99 }
+"#;
+
+fn await_postfix_program(body: &str) -> String {
+    format!("{AWAIT_POSTFIX_PRELUDE}        fun main() {{ {body} }}")
+}
+
+#[test]
+fn a_field_off_an_implicitly_awaited_call_reads_the_value() {
+    // B141's headline shape. Emitted `await (fetch_row())[0]` — `undefined`.
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_row().id);"), "7\n");
+}
+
+#[test]
+fn a_method_off_an_implicitly_awaited_call_reads_the_value() {
+    // A built-in method lowers to a `.length` property access, so it is the
+    // field shape again: emitted `await (fetch_list()).length` — `undefined`.
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_list().len());"), "3\n");
+}
+
+#[test]
+fn a_call_of_an_implicitly_awaited_callable_invokes_the_value() {
+    // Calling the closure an async function returned. Emitted
+    // `await (fetch_maker())()` — which is `await ((fetch_maker())())`, a call
+    // of the PROMISE: this shape did not go silent, it threw
+    // `TypeError: fetch_maker(...) is not a function`. Not in B141's original
+    // probe; found widening the class from "postfix" to "call as well".
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_maker()());"), "99\n");
+}
+
+#[test]
+fn a_postfix_chain_off_an_implicitly_awaited_call_reads_the_value() {
+    // Two postfix links off one await (`.name` then `.len()`). Threw
+    // `Cannot read properties of undefined` — the first link already had the
+    // promise, so the second had `undefined`.
+    assert_compiles_and_runs(
+        &await_postfix_program("print(fetch_row().name.len());"),
+        "5\n",
+    );
+}
+
+#[test]
+fn a_field_off_an_explicitly_awaited_task_reads_the_value() {
+    // The bug was NOT confined to the implicit await: a hand-written
+    // `(await pending).id` — parens and all — emitted `await (pending)[0]` and
+    // read `undefined`. The user's own parentheses were dropped, then the
+    // subject was re-rendered without them. Also outside B141's original probe.
+    assert_compiles_and_runs(
+        &await_postfix_program("let pending = async fetch_row(); print((await pending).id);"),
+        "7\n",
+    );
+}
+
+#[test]
+fn a_subscript_off_an_implicitly_awaited_call_reads_the_value() {
+    // This shape was already CORRECT before the fix — but only by accident:
+    // `__at()` wraps the await in a call ARGUMENT, which parenthesises it for
+    // free. Pinned so it cannot regress silently if that helper is ever
+    // inlined to a bare `[..]`, which would put the await straight back into
+    // postfix-subject position.
+    assert_compiles_and_runs(&await_postfix_program("print(fetch_list()[0]);"), "10\n");
+}
+
+#[test]
+fn a_user_method_off_an_implicitly_awaited_call_reads_the_value() {
+    // The other accident: a user method lowers to a FREE function call, so the
+    // await lands in argument position and is parenthesised for free. Pinned
+    // for the same reason as the subscript.
+    assert_compiles_and_runs(
+        &await_postfix_program("print(fetch_boxed().doubled());"),
+        "42\n",
+    );
+}
+
+#[test]
+fn binding_an_awaited_call_before_a_postfix_reads_the_value() {
+    // The CONTROL: the bound spelling was always correct, which is why std and
+    // the whole corpus — which bind — never saw B141. If this ever goes red the
+    // failure is somewhere else entirely.
+    assert_compiles_and_runs(
+        &await_postfix_program(
+            "let row = fetch_row(); let l = fetch_list(); print(row.id); print(l.len());",
+        ),
+        "7\n3\n",
+    );
+}
+
+#[test]
+fn an_await_in_operand_position_is_not_gratuitously_parenthesised() {
+    // The counter-pin for the fix's blast radius. `await` binds TIGHTER than
+    // every binary operator, so an await in operand position needs no parens
+    // and must not acquire any — the fix is context-aware, not a blanket
+    // `(await x)`. Pinned on the emitted bytes because that is the property at
+    // risk: a blanket wrap would still run correctly and move every golden.
+    let js = compile(&await_postfix_program(
+        "print(fetch_num() + 1); print(fetch_num() > 3);",
+    ))
+    .expect("compiles");
+    assert!(
+        js.contains("await (fetch_num()) + 1") && js.contains("await (fetch_num()) > 3"),
+        "an await in binary-operand position must stay unwrapped:\n{js}"
+    );
+    assert!(
+        !js.contains("(await (fetch_num()))"),
+        "an await in binary-operand position must not be wrapped:\n{js}"
+    );
+}
+
+#[test]
+fn a_postfix_off_an_await_is_parenthesised_in_the_emitted_js() {
+    // The structural twin of the execution pins: the emitted bytes, so a
+    // regression is legible as `await (f()).x` rather than only as a wrong
+    // number. `(await (…))[0]` — the inner parens are the await's own operand
+    // parens, the outer are the fix.
+    let js = compile(&await_postfix_program("print(fetch_row().id);")).expect("compiles");
+    assert!(
+        js.contains("(await (fetch_row()))[0]"),
+        "the await must be parenthesised under a postfix:\n{js}"
     );
 }
 
@@ -17829,6 +18071,150 @@ fn an_expected_type_literal_is_range_checked() {
     );
 }
 
+// --- Type bounds: `max_value()` / `min_value()` ---
+//
+// The niladic-function stopgap for `i32::MAX` (vilan has no associated-const
+// mechanism for one to hang on). A hand-transcribed bounds table is worth only
+// what cross-checks it, so the pins come in three layers: the sixteen values
+// spelled out, each value equal to the literal the compiler admits for that
+// type, and the analyzer's own out-of-range diagnostic naming the same two
+// numbers back.
+
+#[test]
+fn type_bounds_are_the_documented_per_type_ranges() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            print(i8::max_value());
+            print(i8::min_value());
+            print(u8::max_value());
+            print(u8::min_value());
+            print(i16::max_value());
+            print(i16::min_value());
+            print(u16::max_value());
+            print(u16::min_value());
+            print(i32::max_value());
+            print(i32::min_value());
+            print(u32::max_value());
+            print(u32::min_value());
+            print(i53::max_value());
+            print(i53::min_value());
+            print(u53::max_value());
+            print(u53::min_value());
+        }
+        main();
+        "#,
+        "127\n-128\n255\n0\n32767\n-32768\n65535\n0\n2147483647\n-2147483648\n\
+         4294967295\n0\n9007199254740992\n-9007199254740992\n9007199254740992\n0\n",
+    );
+}
+
+// Each bound is exactly the literal the compiler admits for that type — the
+// pin that makes the table trustworthy rather than merely transcribed.
+#[test]
+fn type_bounds_equal_the_literals_the_compiler_admits() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            print(i8::max_value() == 127i8);
+            print(i8::min_value() == -128i8);
+            print(u8::max_value() == 255u8);
+            print(u8::min_value() == 0u8);
+            print(i16::max_value() == 32767i16);
+            print(i16::min_value() == -32768i16);
+            print(u16::max_value() == 65535u16);
+            print(u16::min_value() == 0u16);
+            print(i32::max_value() == 2147483647i32);
+            print(i32::min_value() == -2147483648i32);
+            print(u32::max_value() == 4294967295u32);
+            print(u32::min_value() == 0u32);
+            print(i53::max_value() == 9007199254740992i53);
+            print(i53::min_value() == -9007199254740992i53);
+            print(u53::max_value() == 9007199254740992u53);
+            print(u53::min_value() == 0u53);
+        }
+        main();
+        "#,
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n\
+         true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+// The other direction: the analyzer's rendered range must read exactly
+// `min_value() ..= max_value()`. If a bound in `number.vl` and the `BOUNDS`
+// table in the analyzer ever drift apart, one of these two goes red.
+#[test]
+fn the_out_of_range_diagnostic_names_the_shipped_bounds() {
+    assert_fails_spanning(
+        "fun main() { let x = 129i8; }\nmain();\n",
+        "129i8",
+        "out of range for `i8` (-128 ..= 127)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 256u8; }\nmain();\n",
+        "256u8",
+        "out of range for `u8` (0 ..= 255)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 32769i16; }\nmain();\n",
+        "32769i16",
+        "out of range for `i16` (-32768 ..= 32767)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 65536u16; }\nmain();\n",
+        "65536u16",
+        "out of range for `u16` (0 ..= 65535)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 2147483649i32; }\nmain();\n",
+        "2147483649i32",
+        "out of range for `i32` (-2147483648 ..= 2147483647)",
+    );
+    assert_fails_spanning(
+        "fun main() { let x = 4294967296u32; }\nmain();\n",
+        "4294967296u32",
+        "out of range for `u32` (0 ..= 4294967295)",
+    );
+}
+
+// The wide pair's window is the symmetric ±2^53 (spec/lexical.md), so one past
+// `u53::max_value()` is refused. `i53`'s counterpart is
+// `an_i53_literal_beyond_the_f64_window_errors` above.
+#[test]
+fn a_u53_literal_past_the_window_errors() {
+    assert_fails_spanning(
+        "fun main() { let x = 9007199254740993u53; }\nmain();\n",
+        "9007199254740993u53",
+        "use `BigInt` for larger values",
+    );
+}
+
+// The signed literal check admits the MAGNITUDE `2^(n-1)` so that the minimum
+// can be written as unary minus over a literal (`-128i8`) — numeric-types.md
+// §3's documented looseness. So `128i8` compiles while exceeding the type's
+// maximum: `max_value()` is the TYPE's bound, deliberately not "the largest
+// literal that compiles". Pinned so the pair is never "corrected" to match.
+#[test]
+fn the_signed_literal_looseness_reaches_one_past_max_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            print(128i8 > i8::max_value());
+            print(32768i16 > i16::max_value());
+            print(2147483648i32 > i32::max_value());
+        }
+        main();
+        "#,
+        "true\ntrue\ntrue\n",
+    );
+}
+
 // Integer division truncates toward zero (numeric-types.md §2) — both signs,
 // every width, the compound form, and generic `T: Div` dispatch; float and
 // BigInt division are untouched.
@@ -24678,6 +25064,347 @@ fn an_indirect_call_rooted_in_const_stays_legal() {
     assert_eq!(assets, vec![("css".to_string(), ".a{}".to_string())]);
 }
 
+// --- K13 step 2: the const input channel — `asset::read` -----------------------
+// The channel's input direction (docs-port.md §3.3, markdown.md §7): const
+// code reads a project file at build time. Paths resolve against the package
+// root; the file becomes a tracked build input on `program.const_input_files`;
+// a miss is a clean diagnostic at the read site; and `read` is const-only
+// under exactly the machinery that colors `emit`.
+
+/// A clean analysis with an EXPLICIT package root — the `asset::read` pins
+/// point it at a fixture directory (or at the real book) — returning the
+/// folded const values and the recorded read inputs.
+fn const_reads(
+    source: &str,
+    root: &Path,
+) -> (
+    Vec<vilan_core::interpreter::ConstValue>,
+    Vec<(PathBuf, Option<u64>)>,
+) {
+    let source = source.to_string();
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            let program = program.expect("a clean analysis leaves a program");
+            (
+                program.const_results.values().cloned().collect::<Vec<_>>(),
+                program.const_input_files.clone(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn a_const_read_parses_the_books_largest_page_within_budget() {
+    // THE step-2 workload (docs-port.md §2.1 located the wall; this is the
+    // wall coming down): const code reads the book's REAL largest page —
+    // `docs/spec/memory.md`, the golden fixtures' heaviest — and runs
+    // `std::markdown::parse` over it inside const evaluation, within the
+    // measured-and-raised fuel budget (2,001,457 fuel measured at the raise;
+    // this pin goes red if the page or the parser ever outgrows the budget,
+    // which is exactly the honest signal to re-measure). The read lands on
+    // `const_input_files` with a content hash: the file is a tracked build
+    // input, not an untracked ambient dependency.
+    let book_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
+    let (values, inputs) = const_reads(
+        r#"
+        import std::asset;
+        import std::markdown;
+        import std::result::Result::{ Err, Ok };
+        fun block_count(): i32 {
+            match markdown::parse(asset::read("docs/spec/memory.md")) {
+                Ok(let doc) => doc.blocks.len()
+                Err(let error) => 0 - 1
+            }
+        }
+        fun main() {
+            let _blocks = const block_count();
+        }
+        main();
+        "#,
+        &book_root,
+    );
+    assert_eq!(values.len(), 1, "one folded const: {values:?}");
+    assert!(
+        matches!(values[0], vilan_core::interpreter::ConstValue::Number(n) if n > 0.0),
+        "the page must parse to a positive block count at compile time: {values:?}"
+    );
+    assert_eq!(inputs.len(), 1, "one tracked input: {inputs:?}");
+    assert!(
+        inputs[0].0.ends_with("docs/spec/memory.md") && inputs[0].1.is_some(),
+        "the read must be recorded as a hashed build input: {inputs:?}"
+    );
+}
+
+#[test]
+fn a_missing_read_is_a_clean_diagnostic_at_the_read_site() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("vilan-k13-definitely-missing.md");
+        }
+        main();
+        "#,
+        r#"asset::read("vilan-k13-definitely-missing.md")"#,
+        "cannot read `vilan-k13-definitely-missing.md`",
+    );
+}
+
+#[test]
+fn an_absolute_read_path_is_refused() {
+    // Refused lexically, before any filesystem look: the channel reads THE
+    // PROJECT, so the build can track every input it depends on.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("/etc/hostname");
+        }
+        main();
+        "#,
+        "`asset::read` paths are relative to the package root; `/etc/hostname` is absolute",
+    );
+}
+
+#[test]
+fn a_read_path_escaping_the_package_root_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("../outside.md");
+        }
+        main();
+        "#,
+        "`asset::read` paths resolve inside the package root; `../outside.md` escapes it",
+    );
+}
+
+// --- E94: `asset::emit`'s kind is an output-path segment, and must be one ---
+//
+// The read fence above is lexical and TOTAL: `asset::read` refuses an absolute
+// path, and refuses any component that is not `Normal`/`CurDir`, before any
+// filesystem look. `asset::emit`'s kind gets none of that, and it is the same
+// kind of thing — the kind becomes a filename beside the build output
+// (`write_assets`: `output_js.with_extension(kind)`), so a kind carrying `..`
+// or a separator directs a write out of `dist/` entirely. One rule covers both
+// shapes, because both are the same mistake: a kind names ONE file, so it must
+// be a single path segment. Backlog E94.
+
+/// The wording the fix should use, mirroring the read fence's shape ("`…` paths
+/// resolve inside the package root; `…` escapes it") for the write direction.
+const EMIT_KIND_REFUSAL: &str = "`asset::emit` kinds name one file beside the build output";
+
+#[test]
+fn an_emit_kind_escaping_the_output_directory_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("../evil", "x");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+        EMIT_KIND_REFUSAL,
+    );
+}
+
+#[test]
+fn an_emit_kind_carrying_a_separator_is_refused() {
+    // Not an escape, but the same mistake: `a/b` is two segments, so it names a
+    // file in a directory the build never made. Refused by the same rule.
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("a/b", "x");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+        EMIT_KIND_REFUSAL,
+    );
+}
+
+#[test]
+fn a_legitimate_emit_kind_is_untouched() {
+    // The green negative: the fence must refuse the two shapes above and
+    // NOTHING else — an ordinary kind is what every real `emit` passes, and a
+    // rule that refused it would be worse than the hole it closes.
+    assert_compiles(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {
+            emit("css", ".a{color:red}");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a_runtime_read_is_rejected() {
+    // The const-only bit, same machinery as `emit`'s (const-eval.md §2).
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _text = asset::read("page.md");
+        }
+        main();
+        "#,
+        r#"asset::read("page.md")"#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_runtime_call_reaching_read_is_rejected_at_the_boundary() {
+    // The R-fixpoint names WHICH builtin the path reaches — a read-reaching
+    // function says `asset::read`, not `asset::emit`.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun page(): str {
+            asset::read("page.md")
+        }
+        fun main() {
+            let _text = page();
+        }
+        main();
+        "#,
+        "`page` (it reaches `asset::read`) is compile-time-only",
+    );
+}
+
+#[test]
+fn a_function_reaching_read_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun page(): str {
+            asset::read("page.md")
+        }
+        fun apply(f: || str): str {
+            f()
+        }
+        fun main() {
+            let _text = apply(page);
+        }
+        main();
+        "#,
+        "no runtime value form",
+    );
+}
+
+#[test]
+fn a_changed_input_is_seen_by_the_next_analysis() {
+    // The invalidation pin: analyze, EDIT THE FILE, analyze again in the same
+    // process — the second analysis must fold the new content. Nothing in the
+    // pipeline (the parse cache, the base cache, the shared const world) may
+    // serve the first read's value for the second analysis; if any cache ever
+    // keys const results without the read inputs, this goes red.
+    let dir = std::env::temp_dir().join(format!("vilan-const-read-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("note.txt");
+        }
+        main();
+        "#;
+    std::fs::write(dir.join("note.txt"), "one").unwrap();
+    let (first, _) = const_reads(source, &dir);
+    assert_eq!(
+        first,
+        vec![vilan_core::interpreter::ConstValue::Str("one".to_string())]
+    );
+    std::fs::write(dir.join("note.txt"), "two").unwrap();
+    let (second, inputs) = const_reads(source, &dir);
+    assert_eq!(
+        second,
+        vec![vilan_core::interpreter::ConstValue::Str("two".to_string())],
+        "the edited input must be seen — a stale read is a correctness bug"
+    );
+    assert!(
+        inputs.len() == 1 && inputs[0].1.is_some(),
+        "the re-read is recorded too: {inputs:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
+    // Reads charge fuel per byte, so the budget bounds input size exactly as
+    // it bounds computation — without this, a read was one fuel tick and the
+    // budget bounded nothing about it.
+    let dir = std::env::temp_dir().join(format!("vilan-const-read-fuel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Comfortably past the explicit fuel budget in bytes.
+    std::fs::write(dir.join("huge.txt"), "a".repeat(17_000_000)).unwrap();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _text = const asset::read("huge.txt");
+        }
+        main();
+        "#
+    .to_string();
+    let root = dir.clone();
+    let messages = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            errors
+                .into_iter()
+                .map(|error| error.msg)
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        messages.iter().any(|message| message
+            .contains("did not finish within the compile-time budget")
+            && message.contains("the fuel budget was exhausted")),
+        "an oversized read must be a budget miss, with the remedy-naming \
+         diagnostic intact: {messages:#?}"
+    );
+}
+
 // --- A8: std::style — typed atomic styles, compiled ---------------------------
 // The styling system riding const evaluation and the asset channel
 // (proposal/ui-styling.md): builder-chain construction inside `const`, atomic
@@ -26526,6 +27253,1243 @@ fn the_two_value_padding_sites_compose_from_the_axis_methods() {
     );
 }
 
+// --- W11 style dogfood: size / Color::var / Color::oklch / attribute ----------
+// Cycle 29's kolt-dogfood additions (kolt.local tracker items 010-013). Same
+// pin idioms as A8/A22/A23 above: table-shaped declarations through
+// `collected_assets`, refusals through `failure_diagnostics`, rendered class
+// lists through `assert_compiles_and_runs`.
+
+/// `size` is the sizing pair's axis shorthand (`padding_x`'s pattern): one
+/// value into the two slots `width` and `height` already own — two classes,
+/// not a new property (item 011).
+#[test]
+fn size_writes_the_width_and_height_slots() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Length };
+        fun s(): Style {
+            style().size(Length::rem(1.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in ["{width:1rem}", "{height:1rem}"] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// Because they are the SAME slots, a later `height` narrows the square by
+/// the ordinary last-wins rule: three calls, two classes.
+#[test]
+fn a_height_after_size_narrows_by_last_wins() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Length };
+        fun main() {
+            let squared = const style().size(Length::rem(1.0)).height(Length::rem(2.0));
+            print(squared.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+/// `Color::var` is `Length::var`'s counterpart (item 012): the typed spelling
+/// of a CSS-variable-backed colour. It declares NOTHING — no `:root` line
+/// emits, the app owns the custom property's declaration — and `.alpha()`
+/// composes over it through the relative-colour form, like over a ramp token.
+#[test]
+fn color_var_references_without_declaring() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style()
+                .background(Color::var("--accent"))
+                .border_color(Color::var("--accent").alpha(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:var(--accent)}",
+        "{border-color:rgb(from var(--accent) r g b / 0.5)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+    assert!(
+        !lines.iter().any(|line| line.starts_with(":root{--accent")),
+        "Color::var must not declare the property: {lines:?}"
+    );
+}
+
+/// `Color::oklch` (item 013): the perceptual literal, emitted in the CSS
+/// number form — space-joined components, the hue a bare degree count — with
+/// `.alpha()` composing through the relative form like over any colour.
+#[test]
+fn oklch_emits_the_number_form() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style()
+                .background(Color::oklch(0.62, 0.19, 313.0))
+                .color(Color::oklch(0.97, 0.02, 340.0).alpha(0.8))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:oklch(0.62 0.19 313)}",
+        "{color:rgb(from oklch(0.97 0.02 340) r g b / 0.8)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The three range refusals, per case like `rgba`'s channels: lightness is
+/// the CSS NUMBER form (0.0-1.0), not the percentage.
+#[test]
+fn an_oklch_lightness_outside_the_unit_range_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(62.0, 0.19, 313.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch lightness 62 is outside 0.0-1.0")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_oklch_chroma_outside_its_range_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(0.62, 0.7, 313.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch chroma 0.7 is outside 0.0-0.5")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// Angles wrap in CSS, so admitting 700 beside 340 would mint two classes
+/// for one colour — the canonical turn is required.
+#[test]
+fn an_oklch_hue_outside_the_canonical_turn_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::oklch(0.62, 0.19, 700.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("oklch hue 700 is outside 0.0-360.0")),
+        "{diagnostics:#?}"
+    );
+}
+
+// `Style::attribute(name, value, inner)` (item 010): a condition on the
+// element ITSELF — `.sX[data-open="true"]` — where dark's hardcoded ancestor
+// is the one ancestor form. Its own slot in the condition axis, between dark
+// and the pseudo-class: `md(dark(attribute(.., hover(..))))`. The pins mirror
+// the dark×pseudo set: composition on each axis pair, the full stack, the
+// ordering refusals naming the fix, the const validation, per-(condition,
+// property) merge, and the ssr leg.
+
+#[test]
+fn an_attribute_condition_selects_on_the_element_itself() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            // Starts with '.' — no ancestor, and the base cascade band (B35).
+            line.starts_with('.') && line.contains("[data-open=\"true\"]{opacity:0.5}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The attribute suffix sits between the class and the pseudo-class, the
+/// outside-in order of the call: `attribute(.., hover(..))`.
+#[test]
+fn an_attribute_condition_wraps_a_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().hover(style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with('.') && line.contains("[data-open=\"true\"]:hover{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// dark's ancestor composes over an attribute-conditioned style through the
+/// same generic path it composes over a pseudo-class — dark() unchanged.
+#[test]
+fn dark_wraps_an_attribute_condition() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().dark(style().attribute("data-open", "true", style().opacity(0.8)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with(":root[data-theme=\"dark\"] .")
+                && line.contains("[data-open=\"true\"]{opacity:0.8}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// All four axes at once, outside-in: media, dark, attribute, pseudo. The
+/// composed line still starts with '@', so B35's media ordering sees it.
+#[test]
+fn all_four_condition_axes_compose_outside_in() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().md(style().dark(style().attribute(
+                "data-open",
+                "true",
+                style().hover(style().opacity(0.8)),
+            )))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@media (min-width: 768px){:root[data-theme=\"dark\"] .")
+                && line.ends_with("[data-open=\"true\"]:hover{opacity:0.8}}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The four ordering refusals, each naming the fix — the dark×pseudo
+/// refusal set extended to the new axis.
+#[test]
+fn an_attribute_cannot_wrap_a_media_conditioned_style() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().md(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("nest conditions as md(attribute(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_cannot_wrap_dark() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute("data-open", "true", style().dark(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("dark(attribute(..)), not attribute(dark(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_pseudo_class_cannot_wrap_an_attribute_condition() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().hover(style().attribute("data-open", "true", style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message
+                .contains("attribute(.., hover(..)), not hover(attribute(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_cannot_wrap_an_attribute_condition() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute(
+                "data-open",
+                "true",
+                style().attribute("data-side", "left", style().background(Color::gray(700))),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already attribute-conditioned")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The name and value fences: the characters that delimit the slot key, the
+/// condition grammar, and the selector's own quoting are refused at const
+/// time, like every other validation in the module.
+#[test]
+fn an_attribute_name_with_a_delimiter_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data open", "true", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("an attribute name cannot contain ' '")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_attribute_value_with_a_quote_fails_the_build() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().attribute("data-open", "tr\"ue", style().opacity(0.5))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("an attribute value cannot contain '\"'")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The slot key carries the attribute condition, so last-wins merge stays
+/// per-(condition, property): the same attribute and property override to
+/// one class; two values of one attribute are two conditions and coexist.
+#[test]
+fn attribute_slots_merge_per_condition_and_property() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style };
+        fun main() {
+            let togged = const style()
+                .attribute("data-open", "true", style().opacity(0.5))
+                .attribute("data-open", "true", style().opacity(1.0));
+            print(togged.class_list().split(" ").len());
+            let sided = const style()
+                .attribute("data-side", "left", style().opacity(0.5))
+                .attribute("data-side", "right", style().opacity(1.0));
+            print(sided.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+/// The ssr leg: an attribute-conditioned style reaches `styled` like any
+/// other — the class attribute carries the attribute class beside the base
+/// class, and the rules were already in the build-time stylesheet.
+#[test]
+fn ssr_renders_attribute_conditioned_classes() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Color };
+        import std::ui::{ view, render };
+        fun main() {
+            let disclosure = const style()
+                .color(Color::gray(700))
+                .attribute("data-open", "true", style().color(Color::gray(900)));
+            print(render(view("div").styled(disclosure)));
+        }
+        main();
+        "#,
+        "<div class=\"s1hbtfg8 sjt5x3g\"></div>\n",
+    );
+}
+
+// --- kolt.local 032: the declaration block (std::style::declare) ---------------
+// The generic form of the escape hatch apps were hand-rolling: a set of
+// declarations under an author-chosen selector, straight into the const-only
+// CSS channel. It mints NO class, produces no `Style`, touches no slot key and
+// rehashes nothing — the atomic system is untouched, which is what keeps this
+// beside `Style` rather than inside it.
+//
+// ORDERING RULING. Every block emits inside one cascade layer, `@layer vilan`.
+// Unlayered styles beat layered ones whatever their specificity, so a `Style`
+// always outranks a declaration block and the block's position in the sheet's
+// lexical sort decides nothing — which is why B35's `@media` comparator is
+// untouched here rather than extended (the layer line carries no `min-width`,
+// so it sorts as an ordinary non-media line).
+//
+// VALIDATION. The channel is line-granular, so a newline in a selector or a
+// declaration SPLITS the rule into two independently-deduped, independently
+// sorted lines; braces are `declare`'s own; and an at-rule is refused because a
+// group at-rule holds rules, not declarations.
+
+#[test]
+fn a_declaration_block_emits_its_selector_and_declarations() {
+    // THE EXHIBIT, in std: kolt's theme.vl emitted
+    // `[data-theme="{id}"]{{variables_css}}` by hand and then flattened its own
+    // multi-line declarations with `.replace(";\n--", ";--")`. `declare` builds
+    // the one line, so the surgery has nothing left to do.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ declare, declarations, Color };
+        fun theme(id: str) {
+            declare(
+                i"[data-theme=\"{id}\"]",
+                declarations()
+                    .color("--color-ink", Color::hex("#fafafa"))
+                    .color("--color-ground", Color::hex("#161616")),
+            );
+        }
+        let _theme = const theme("iron-dark");
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&(
+            "css".to_string(),
+            "@layer vilan{[data-theme=\"iron-dark\"]{--color-ink:#fafafa;--color-ground:#161616}}"
+                .to_string()
+        )),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn a_declaration_block_mints_no_class() {
+    // The whole sheet, for a program whose only styling IS a declaration
+    // block: one line, no class band at all. Nothing was hashed, so there is
+    // nothing for a slot key or a class name to be.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun reset() {
+            declare("*", declarations().raw("box-sizing", "border-box"));
+        }
+        let _reset = const reset();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, "@layer vilan{*{box-sizing:border-box}}\n", "{css}");
+}
+
+#[test]
+fn a_declaration_block_leaves_the_atomic_sheet_byte_identical() {
+    // The invariant this item lives or dies by. The same styled program, with
+    // and without a declaration block: strip the block's own lines and the two
+    // stylesheets are equal BYTE FOR BYTE — same class names, same rules, same
+    // order. A declaration block adds; it never moves anything.
+    const STYLED: &str = r##"
+        import std::style::{ style, space, Color, Style };
+        fun card(): Style {
+            style().padding(space(4)).color(Color::gray(700)).hover(style().color(Color::gray(900)))
+        }
+        let _card = const card();
+        "##;
+    let without = style_css(&format!("{STYLED}\nfun main() {{}}\nmain();\n"));
+    let with = style_css(&format!(
+        r##"{STYLED}
+        import std::style::{{ declare, declarations }};
+        fun theme() {{
+            declare(":root", declarations().raw("--color-ink", "#fafafa"));
+        }}
+        let _theme = const theme();
+        fun main() {{}}
+        main();
+        "##
+    ));
+    let stripped = with
+        .lines()
+        .filter(|line| !line.starts_with("@layer vilan{"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    assert_eq!(without, stripped, "with the block:\n{with}");
+    assert!(
+        with.contains("@layer vilan{:root{--color-ink:#fafafa}}"),
+        "the block must actually be there:\n{with}"
+    );
+}
+
+#[test]
+fn a_declaration_block_is_layered_and_a_style_rule_is_not() {
+    // The ordering ruling, read off the sheet: the block is inside
+    // `@layer vilan`, the atomic rules are unlayered, and unlayered wins the
+    // cascade against any layer regardless of specificity — so the author's
+    // chosen selector can never out-specify a view's own style.
+    let css = style_css(
+        r##"
+        import std::style::{ style, declare, declarations, Color, Style };
+        fun s(): Style {
+            style().color(Color::hex("#111111"))
+        }
+        fun over() {
+            declare("#app div.card", declarations().raw("color", "#eeeeee"));
+        }
+        let _s = const s();
+        let _over = const over();
+        fun main() {}
+        main();
+        "##,
+    );
+    for line in css.lines() {
+        if line.contains("--") && line.starts_with(':') {
+            continue;
+        }
+        let layered = line.starts_with("@layer vilan{");
+        assert_eq!(
+            layered,
+            line.contains("#app div.card"),
+            "exactly the declaration block is layered:\n{css}"
+        );
+    }
+}
+
+#[test]
+fn the_declaration_layer_does_not_disturb_the_media_sort() {
+    // B35, unchanged and unextended. `media_min_width` reads an
+    // `@media (min-width: ` prefix that `@layer vilan{` does not carry, so the
+    // layer line sorts as an ordinary non-media line and every media block
+    // still lands after it in ascending min-width order.
+    let css = style_css(
+        r##"
+        import std::style::{ style, space, declare, declarations, Style };
+        fun s(): Style {
+            style().sm(style().padding(space(2))).lg(style().padding(space(3)))
+        }
+        fun theme() {
+            declare(":root", declarations().raw("--color-ink", "#fafafa"));
+        }
+        let _s = const s();
+        let _theme = const theme();
+        fun main() {}
+        main();
+        "##,
+    );
+    let layer_at = css.find("@layer vilan{").expect("the layer line");
+    let small_at = css
+        .find("@media (min-width: 640px){")
+        .expect("the sm block");
+    let large_at = css
+        .find("@media (min-width: 1024px){")
+        .expect("the lg block");
+    assert!(
+        layer_at < small_at && small_at < large_at,
+        "the layer sorts as a non-media line and the min-width order survives:\n{css}"
+    );
+}
+
+#[test]
+fn a_token_spent_in_a_declaration_block_declares_itself() {
+    // `.color`/`.length` carry the value's own `:root` line onto the sheet
+    // exactly as a `Style` property does, so a ramp or spacing token spent in a
+    // block is never a dangling `var()`. That line stays UNLAYERED, like every
+    // other token line — the two channels agree rather than one shadowing the
+    // other.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ declare, declarations, space, Color };
+        fun tokens() {
+            declare(
+                ":root",
+                declarations().color("--brand", Color::gray(50)).length("--pad", space(4)),
+            );
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--gray-50:#f9fafb}".to_string()))
+            && assets.contains(&("css".to_string(), ":root{--space-4:1rem}".to_string())),
+        "{assets:?}"
+    );
+    assert!(
+        assets.contains(&(
+            "css".to_string(),
+            "@layer vilan{:root{--brand:var(--gray-50);--pad:var(--space-4)}}".to_string()
+        )),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn declarations_keep_their_authoring_order() {
+    // A declaration block is CASCADE text: reordering its links would change
+    // what it means, where reordering a `style()` chain's links cannot (each
+    // link owns a slot). The links join in authoring order here, and the
+    // formatter's canonical style-chain sort never reaches a `declarations()`
+    // chain — it fires only on a run rooted at the literal `style ( )` tokens
+    // (`starts_style_builder`), pinned in `vilan-cli/tests/style_chain_order.rs`.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(
+                "body",
+                declarations()
+                    .raw("z-index", "1")
+                    .raw("box-sizing", "border-box")
+                    .raw("display", "block"),
+            );
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        css.contains("{z-index:1;box-sizing:border-box;display:block}"),
+        "{css}"
+    );
+}
+
+/// A data URI carries a `;` (`url("data:image/svg+xml;base64,…")`), so a value
+/// keeps its semicolons on purpose — the fences are exactly the characters that
+/// break the CHANNEL (a newline) or the BLOCK (a brace), and nothing else.
+#[test]
+fn a_data_uri_value_keeps_its_semicolon() {
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(
+                "body",
+                declarations().raw("background-image", "url(\"data:image/svg+xml;base64,AAA\")"),
+            );
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        css.contains("@layer vilan{body{background-image:url(\"data:image/svg+xml;base64,AAA\")}}"),
+        "{css}"
+    );
+}
+
+#[test]
+fn a_declaration_block_selector_cannot_contain_a_newline() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root\n:host", declarations().raw("--color-ink", "#fafafa"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics.iter().any(|(message, _)| message
+            .contains("selector cannot contain a newline")
+            && message.contains("line-granular")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_declaration_block_selector_cannot_contain_a_brace() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root{color:red}", declarations().raw("--color-ink", "#fafafa"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics.iter().any(
+            |(message, _)| message.contains("selector cannot contain '{'")
+                && message.contains("declare writes the block's braces")
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
+/// A group at-rule holds RULES, not declarations, so `@media (…){color:red}`
+/// would be invalid CSS the moment the surface admitted it — and the surface's
+/// meaning would start depending on the first byte of its argument.
+#[test]
+fn a_declaration_block_selector_cannot_be_an_at_rule() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare("@media (prefers-color-scheme: light)", declarations().raw("--color-ink", "#111111"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("selector cannot be an at-rule")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_declaration_block_with_no_declarations_is_rejected() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root", declarations());
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("declares nothing")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The property owns the `:` that separates it from its value and the `;` that
+/// separates it from the next declaration, so it may carry neither.
+#[test]
+fn a_declaration_property_cannot_carry_its_own_separator() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root", declarations().raw("color:red", "1"));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics.iter().any(
+            |(message, _)| message.contains("property cannot contain ':'")
+                && message.contains("pass the value as the second argument")
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_blank_declaration_value_is_rejected() {
+    let diagnostics = failure_diagnostics(
+        r##"
+        import std::style::{ declare, declarations };
+        fun block() {
+            declare(":root", declarations().raw("--color-ink", ""));
+        }
+        let _block = const block();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("the value for \"--color-ink\"")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// `declare` reaches `asset::emit`, so it inherits the const-only bit with no
+/// new machinery — the diagnostic names `declare` and the channel it reaches.
+#[test]
+fn a_runtime_declare_is_rejected() {
+    assert_fails_spanning(
+        r##"
+        import std::style::{ declare, declarations };
+        fun main() {
+            declare(":root", declarations().raw("--color-ink", "#fafafa"));
+        }
+        main();
+        "##,
+        r##"declare(":root", declarations().raw("--color-ink", "#fafafa"))"##,
+        "compile-time-only",
+    );
+}
+
+// --- K2b: typed values in `raw` (proposal/css-block.md §6, slice S1) ---------
+// `Style::raw` and `Declarations::raw` are generic over `CssValue` — a `str`
+// is a verbatim CSS value, a `Length`/`Color` is a value that may be a THEME
+// TOKEN, and a token owes the sheet the `:root` line that defines it. Before
+// the widening the only way to get a token into `raw` was to reach for its
+// `.css` field, which hands over the text and throws the line away: the
+// emitted stylesheet then referenced a custom property nothing declared.
+
+#[test]
+fn raw_carries_a_length_tokens_root_line() {
+    // The fix, on the `Style` side. `space(4)` renders `var(--space-4)`, and
+    // the declaration of `--space-4` lands beside it.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().raw("padding", space(4));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--space-4:1rem}".to_string())),
+        "the spacing token's :root line is missing: {assets:?}"
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.contains("padding:var(--space-4)")),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn raw_carries_a_color_tokens_root_line() {
+    // The same, for a ramp step — the other half of `CssValue`'s token arm.
+    let assets = collected_assets(
+        r##"
+        import std::style::{ style, Color };
+        let _outlined = const style().raw("outline-color", Color::gray(50));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(
+        assets.contains(&("css".to_string(), ":root{--gray-50:#f9fafb}".to_string())),
+        "the ramp token's :root line is missing: {assets:?}"
+    );
+    assert!(
+        assets
+            .iter()
+            .any(|(_, line)| line.contains("outline-color:var(--gray-50)")),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn the_css_field_route_declares_no_token() {
+    // The hazard the widening removes, pinned as the contrast it is. A `.css`
+    // field access hands over a `str`; a `str` carries no token, so the sheet
+    // gets `var(--space-4)` with nothing declaring it. This is not a bug in
+    // `raw` — it is what asking for the text alone MEANS — and it is exactly
+    // why `raw` had to grow the typed spelling above.
+    let css = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().raw("padding", space(4).css);
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains("padding:var(--space-4)"), "{css}");
+    assert!(
+        !css.contains("--space-4:"),
+        "the text-only route cannot declare the token it references:\n{css}"
+    );
+}
+
+#[test]
+fn raw_and_with_length_mint_the_same_rule() {
+    // The widening is not a second channel: `raw` at the `Length`
+    // instantiation IS `with_length`, so the two spellings produce one rule,
+    // one class name and one token line — byte for byte.
+    let through_raw = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().raw("scroll-margin-top", space(4));
+        fun main() {}
+        main();
+        "##,
+    );
+    let through_with_length = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _padded = const style().with_length("scroll-margin-top", space(4));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(through_raw, through_with_length, "{through_raw}");
+}
+
+#[test]
+fn raw_with_a_str_declares_nothing() {
+    // The instantiation every existing call site uses. Widening must be
+    // INVISIBLE here: the rule alone, no token line, no empty line from an
+    // unguarded emit.
+    let css = style_css(
+        r##"
+        import std::style::{ style };
+        let _flex = const style().raw("display", "flex");
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, ".sbiovxm{display:flex}\n", "{css}");
+}
+
+#[test]
+fn raw_with_an_untokened_length_declares_nothing() {
+    // `Length::px` is a literal, not a token: its `root` is "", and an empty
+    // root must not reach the channel as a blank line.
+    let css = style_css(
+        r##"
+        import std::style::{ style, Length };
+        let _wide = const style().raw("scroll-padding", Length::px(37.0));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, ".susg4iv{scroll-padding:37px}\n", "{css}");
+}
+
+#[test]
+fn a_typed_raw_keeps_its_conditions_and_its_family() {
+    // `raw` reaches the sheet through `rule` like every property method, so
+    // the widened value composes with the condition combinators and with
+    // last-wins across a FAMILY: the `padding` shorthand written here clears
+    // the `padding-left` longhand it covers, and the hover variant is its own
+    // slot.
+    let css = style_css(
+        r##"
+        import std::style::{ style, space };
+        let _card = const style()
+            .padding_left(space(2))
+            .raw("padding", space(4))
+            .hover(style().raw("padding", space(6)));
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains("*.s1ufvr2{padding:var(--space-4)}"), "{css}");
+    assert!(css.contains(":hover{padding:var(--space-6)}"), "{css}");
+    assert!(
+        css.contains(":root{--space-4:1rem}")
+            && css.contains(":root{--space-6:1.5rem}")
+            && css.contains(":root{--space-2:0.5rem}"),
+        "every token spent in the chain declares itself:\n{css}"
+    );
+}
+
+#[test]
+fn a_non_css_value_in_raw_names_the_trait() {
+    // The bound's failure shape, the `Slot`/`AttrValue` precedent: the type,
+    // the trait, and a secondary span at the declaration.
+    assert_fails_with(
+        r##"
+        import std::style::{ style };
+        let _bad = const style().raw("z-index", 3);
+        fun main() {}
+        main();
+        "##,
+        "'i32' does not implement trait 'CssValue'",
+    );
+}
+
+#[test]
+fn a_declaration_blocks_raw_carries_a_length_token() {
+    // The fix on the `Declarations` side — the surface whose whole job is
+    // custom properties, where a dangling `var()` is likeliest.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations, space };
+        fun tokens() {
+            declare(":root", declarations().raw("--pad", space(6)));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains(":root{--space-6:1.5rem}"), "{css}");
+    assert!(
+        css.contains("@layer vilan{:root{--pad:var(--space-6)}}"),
+        "{css}"
+    );
+}
+
+#[test]
+fn a_declaration_blocks_raw_carries_a_color_token() {
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations, Color };
+        fun tokens() {
+            declare(":root", declarations().raw("--brand", Color::gray(50)));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert!(css.contains(":root{--gray-50:#f9fafb}"), "{css}");
+    assert!(
+        css.contains("@layer vilan{:root{--brand:var(--gray-50)}}"),
+        "{css}"
+    );
+}
+
+#[test]
+fn a_declaration_blocks_str_raw_declares_nothing() {
+    // The instantiation the existing call sites use: the block's line alone.
+    let css = style_css(
+        r##"
+        import std::style::{ declare, declarations };
+        fun reset() {
+            declare("*", declarations().raw("box-sizing", "border-box"));
+        }
+        let _reset = const reset();
+        fun main() {}
+        main();
+        "##,
+    );
+    assert_eq!(css, "@layer vilan{*{box-sizing:border-box}}\n", "{css}");
+}
+
+#[test]
+fn a_declaration_chain_carries_its_tokens_rather_than_emitting_them() {
+    // The `Gradient` shape, and the reason `Declarations` stayed usable
+    // outside a `const` expression: the chain ACCUMULATES the `:root` lines it
+    // owes and `declare` puts them on the sheet. A chain that is never
+    // declared reaches the sheet with nothing — including its tokens.
+    let assets = collected_assets(
+        r##"
+        import std::print;
+        import std::style::{ declarations, space };
+        fun main() {
+            let dropped = declarations().raw("--pad", space(6));
+            print(dropped.text);
+        }
+        main();
+        "##,
+    );
+    assert!(
+        assets.is_empty(),
+        "an undeclared chain emits nothing: {assets:?}"
+    );
+}
+
+#[test]
+fn a_declaration_chain_builds_outside_a_const_expression() {
+    // The corollary, pinned in its own right: building the chain is ordinary
+    // runtime code — only `declare` is const-only. Routing the token lines
+    // through the VALUE is what keeps that true; an `emit` inside `raw` would
+    // have made every declaration chain, `str` ones included, compile-time-only.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::style::{ declarations, space, Color };
+        fun main() {
+            let block = declarations()
+                .raw("box-sizing", "border-box")
+                .raw("--pad", space(6))
+                .raw("--brand", Color::gray(50));
+            print(block.text);
+        }
+        main();
+        "##,
+        "box-sizing:border-box;--pad:var(--space-6);--brand:var(--gray-50)\n",
+    );
+}
+
+#[test]
+fn a_non_css_value_in_a_declaration_names_the_trait() {
+    assert_fails_with(
+        r##"
+        import std::style::{ declare, declarations };
+        fun tokens() {
+            declare(":root", declarations().raw("--z", 3));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+        "'i32' does not implement trait 'CssValue'",
+    );
+}
+
+#[test]
+fn a_typed_declaration_value_is_checked_like_a_str_one() {
+    // `check_declaration` guards the RESOLVED text, so the line-granular
+    // channel's rules reach a typed value too — a `Length::css` carrying a
+    // newline is refused exactly as the `str` spelling is.
+    assert_run_panics(
+        r##"
+        import std::style::{ declare, declarations, Length };
+        fun tokens() {
+            declare(":root", declarations().raw("--pad", Length::css("1rem\n2rem")));
+        }
+        let _tokens = const tokens();
+        fun main() {}
+        main();
+        "##,
+        "cannot contain a newline",
+    );
+}
+
+#[test]
+#[ignore = "pre-existing: the const-only capability check follows call edges and \
+            cannot follow a bounded generic's trait dispatch, so an `emit` reached \
+            only through an impl escapes it and reaches the emitted JS as a live \
+            `__emit_asset` with no runtime binding. Un-ignore when const_eval's \
+            check_const_only learns generic dispatch. Found while designing \
+            `CssValue` (proposal/css-block.md §6); it is why the trait describes a \
+            value rather than emitting for it."]
+fn emit_reached_through_a_bounded_generic_is_const_only() {
+    assert_fails_with(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        fun render<V: Emitter>(value: V): str {
+            value.text()
+        }
+        fun main() {
+            print(render(Token { css = "var(--p)" }));
+        }
+        main();
+        "##,
+        "compile-time-only",
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the
@@ -26575,6 +28539,56 @@ fn hmac_sha512_matches_the_rfc_vector() {
         main();
         "#,
         "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737\n",
+    );
+}
+
+#[test]
+fn the_unkeyed_digests_match_their_published_vectors() {
+    // kolt.local 024. The vectors are FIPS 180-4's one-block message sample
+    // ("abc") for each of the three widths — a digest pin is only worth
+    // anything against a value published independently of this implementation.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::crypto::{ sha256, sha384, sha512 };
+        import std::bytes::encode_utf8;
+        async fun main() {
+            print(sha256(encode_utf8("abc")).to_hex());
+            print(sha384(encode_utf8("abc")).to_hex());
+            print(sha512(encode_utf8("abc")).to_hex());
+        }
+        main();
+        "#,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n\
+         cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7\n\
+         ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\n",
+    );
+}
+
+#[test]
+fn sha256_digests_the_empty_input_and_mints_a_fingerprint_prefix() {
+    // The empty input is the digest's other published edge (FIPS 180-4), and
+    // it is the one a naive "hash the bytes I read" path most easily gets
+    // wrong by returning "" instead. The second line is kolt's actual demand
+    // case (024's exhibit): an asset fingerprint is the first eight hex digits
+    // of the file's sha256 — which nothing in the language could produce, so
+    // kolt's names were minted out of band and `is_fingerprinted` could only
+    // RECOGNIZE the shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::crypto::sha256;
+        import std::bytes::encode_utf8;
+        async fun main() {
+            let empty = sha256(encode_utf8("")).to_hex();
+            print(empty);
+            let hex = sha256(encode_utf8("body { color: red }")).to_hex();
+            print(hex.substring(0, 8));
+        }
+        main();
+        "#,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+         925e8741\n",
     );
 }
 
@@ -64601,5 +66615,1418 @@ fn markdown_refuses_a_lazy_list_continuation() {
     assert_markdown_refuses(
         "- item\\nlazy line\\n",
         "line 2: a lazy list continuation — indent the line under its item (two spaces) or separate it from the list with a blank line",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B136 — an `is` test in a loop CONDITION must read the subject as of THIS
+// iteration. The transformer hoisted the subject temp (`const $a = subject;`)
+// into the enclosing block, BEFORE the `while`, so a body reassignment never
+// reached the condition: `proposal/markdown.md` §10.7's repro printed 3 where
+// 1 is correct, and the unbounded form looped forever. `if` position was
+// always fine — the hazard is exactly the re-evaluated condition position.
+// The fix walks the condition into its own prelude and, when that prelude is
+// non-empty, emits `while (true) { <prelude> if (!cond) break; <body> }`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b136_an_is_in_a_loop_condition_reads_the_current_subject() {
+    // The §10.7 minimal repro, verbatim: the first iteration sets `found`,
+    // so the second condition evaluation must see `Some` and stop at 1.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            mut cursor = 0;
+            for (found is None) && cursor < 3 {
+                found = Some(cursor);
+                cursor += 1;
+            }
+            print(cursor);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_an_unbounded_is_condition_loop_terminates() {
+    // §10.7's "with no bounding conjunct: infinite loop" — no second
+    // conjunct caps the trip count, so ONLY a re-evaluated `is` can end the
+    // loop. Before the fix this hung (the spike port's surfacing symptom);
+    // the budget is generous because it only guards against the hang.
+    assert_runs_within(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            for found is None {
+                found = Some(7);
+            }
+            print(1);
+        }
+        "#,
+        "1\n",
+        std::time::Duration::from_secs(10),
+    );
+}
+
+#[test]
+fn b136_a_jump_break_bounded_is_condition_loop_exits_on_reassignment() {
+    // The infinite-loop shape a program would actually write, bounded by a
+    // `jump break` safety valve: the reassignment must end the loop at 1;
+    // the stale hoist rode the valve to 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            mut cursor = 0;
+            for found is None {
+                if cursor >= 3 {
+                    jump break;
+                }
+                found = Some(cursor);
+                cursor += 1;
+            }
+            print(cursor);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_nested_loops_each_reevaluate_their_is_condition() {
+    // Each level owns a hoist; both were stale (the inner one refreshed only
+    // per OUTER iteration). One inner pass and one outer pass is correct.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut outer: Option<i32> = None;
+            mut n = 0;
+            for outer is None && n < 10 {
+                mut inner: Option<i32> = None;
+                for inner is None && n < 10 {
+                    inner = Some(1);
+                    n += 1;
+                }
+                outer = Some(1);
+            }
+            print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_a_loop_condition_is_binding_reads_the_current_payload() {
+    // A BINDING pattern in the condition: the capture (`let v`) reads the
+    // subject temp's payload slot, so a stale temp froze `v` at 3 and the
+    // countdown never reached `None` (hang). Re-evaluating the prelude
+    // rebinds the capture each iteration: 3+2+1+0 = 6.
+    assert_runs_within(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut next: Option<i32> = Some(3);
+            mut sum = 0;
+            for next is Some(let v) {
+                sum += v;
+                if v == 0 {
+                    next = None;
+                } else {
+                    next = Some(v - 1);
+                }
+            }
+            print(sum);
+        }
+        "#,
+        "6\n",
+        std::time::Duration::from_secs(10),
+    );
+}
+
+#[test]
+fn b136_two_is_tests_in_one_condition_both_reevaluate() {
+    // Two subjects, two hoists in one condition — both must move inside.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut a: Option<i32> = None;
+            mut b: Option<i32> = None;
+            mut n = 0;
+            for a is None && b is None && n < 10 {
+                a = Some(1);
+                b = Some(2);
+                n += 1;
+            }
+            print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_a_result_is_condition_reevaluates() {
+    // §10.9 asked the fix lane to pin a `Result` variant beside the repro:
+    // same shape over `Err`, with a binding to boot.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::result::Result::{ Ok, Err, self };
+        fun main() {
+            mut state: Result<i32, str> = Err("pending");
+            mut n = 0;
+            for state is Err(let _reason) && n < 5 {
+                state = Ok(n);
+                n += 1;
+            }
+            print(n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b136_an_is_in_an_if_inside_a_loop_stays_fresh() {
+    // Control: `if` position was never wrong (§10.7 — "the same expression
+    // in an `if` is fine"), and the fix must not disturb it. The `if` sees
+    // `None` only on the first pass, so `found` pins to 0.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            mut found: Option<i32> = None;
+            mut n = 0;
+            for n < 3 {
+                if found is None {
+                    found = Some(n);
+                }
+                n += 1;
+            }
+            match found {
+                Some(let v) => print(v),
+                None => print(-1),
+            };
+        }
+        "#,
+        "0\n",
+    );
+}
+
+// --- `str::substring` refuses rather than clamping or swapping -----------
+// The host's `substring` clamps a negative bound to 0 and SWAPS an inverted
+// pair, so `s.substring(offset, -1)` quietly returns the PREFIX — the
+// complement of the request. The rule is now `0 <= start <= end <= len`,
+// refused otherwise: at compile time where the bounds are literals, at run
+// time where they are computed, and identically under `const`.
+
+#[test]
+fn substring_with_a_negative_literal_start_is_a_compile_error() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(-1, 3)); }
+        main();
+        "#,
+        "-1",
+        "substring start -1 is negative",
+    );
+}
+
+#[test]
+fn substring_with_a_negative_literal_end_is_a_compile_error() {
+    // The exact spelling the ban is named for.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello, world".substring(7, -1)); }
+        main();
+        "#,
+        "-1",
+        "substring end -1 is negative",
+    );
+}
+
+#[test]
+fn substring_with_literal_bounds_inverted_is_a_compile_error() {
+    // No negative in sight: `start > end` is the same silent reinterpretation,
+    // which is why the rule is stated as one inequality rather than a sign check.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(5, 2)); }
+        main();
+        "#,
+        "2",
+        "substring end 2 is before its start 5",
+    );
+}
+
+#[test]
+fn substring_past_the_end_of_a_string_literal_is_a_compile_error() {
+    // `end > len` is refused too, not clamped: a caller who means "to the end"
+    // writes `s.len()`.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(0, 100)); }
+        main();
+        "#,
+        "100",
+        "substring end 100 is past the length 5 of this string",
+    );
+}
+
+#[test]
+fn substring_names_the_replacement_verbs_in_its_note() {
+    assert_fails_noting(
+        r#"
+        import std::print;
+        fun main() { print("hello".substring(2, -1)); }
+        main();
+        "#,
+        "substring end -1 is negative",
+        "-1",
+        "strip_suffix",
+    );
+}
+
+#[test]
+fn substring_admits_its_boundary_ranges() {
+    // The refusal is of the ranges OUTSIDE `0 <= start <= end <= len`, not of
+    // the degenerate ones inside it: both empty ends and the whole string work.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            print(s.substring(0, 0).len());
+            print(s.substring(s.len(), s.len()).len());
+            print(s.substring(2, 2).len());
+            print(s.substring(0, s.len()));
+        }
+        main();
+        "#,
+        "0\n0\n0\nhello\n",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_negative_start_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            let start = 0 - 1;
+            print(s.substring(start, 3));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is -1..3",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_negative_end_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello, world";
+            let offset = 7;
+            let end = 0 - 1;
+            print(s.substring(offset, end));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 12 but the range is 7..-1",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_inverted_range_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            let start = 4;
+            let end = 2;
+            print(s.substring(start, end));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is 4..2",
+    );
+}
+
+#[test]
+fn substring_with_a_computed_end_past_the_length_panics() {
+    assert_run_panics(
+        r#"
+        import std::print;
+        fun main() {
+            let s = "hello";
+            let end = 100;
+            print(s.substring(0, end));
+        }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is 0..100",
+    );
+}
+
+#[test]
+fn substring_out_of_range_fails_const_evaluation() {
+    // Const eval and the runtime must agree: this arm used to reproduce JS's
+    // clamp-and-swap faithfully, which would have folded a wrong string into
+    // the build instead of failing it.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun cut(text: str, start: i32, end: i32): str { text.substring(start, end) }
+        fun main() { let bad = const cut("hello", 4, 2); print(bad); }
+        main();
+        "#,
+        "substring out of range: the length is 5 but the range is 4..2",
+    );
+}
+
+#[test]
+fn strip_prefix_and_strip_suffix_cut_or_report_absence() {
+    // `starts_with`/`ends_with` test; these two cut — the verbs a caller
+    // reaching for `substring(offset, -1)` actually wanted.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            match "data: 42".strip_prefix("data: ") {
+                Some(let body) => print(body),
+                None => print("none"),
+            }
+            match "report.md".strip_suffix(".md") {
+                Some(let stem) => print(stem),
+                None => print("none"),
+            }
+            match "data: 42".strip_prefix("zz") {
+                Some(let body) => print(body),
+                None => print("prefix absent"),
+            }
+            match "report.md".strip_suffix(".zz") {
+                Some(let stem) => print(stem),
+                None => print("suffix absent"),
+            }
+        }
+        main();
+        "#,
+        "42\nreport\nprefix absent\nsuffix absent\n",
+    );
+}
+
+#[test]
+fn stripping_a_whole_match_is_some_empty_not_none() {
+    // Why these return `Option<str>` and not `str`: "absent" and "present but
+    // empty" are different answers, and a bare `str` could not tell them apart.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            match "ab".strip_prefix("ab") {
+                Some(let rest) => print(i"some:{rest}"),
+                None => print("none"),
+            }
+            match "ab".strip_suffix("ab") {
+                Some(let rest) => print(i"some:{rest}"),
+                None => print("none"),
+            }
+        }
+        main();
+        "#,
+        "some:\nsome:\n",
+    );
+}
+
+// --- B139: the recorded return answer is the FUNCTION's, never a caller's ----
+//
+// `infer_function_returns` serves `inferred_return_types` to skip re-deriving a
+// chain (B139's TIME half, pinned for cost in `tests/deep_nesting.rs`). That
+// record is keyed by FUNCTION ALONE, while an answer is recorded whenever the
+// inference that produced it was exact — including when it ran under a caller's
+// substitution. So the map genuinely does collect caller-shaped answers: over
+// this suite, 1 157 records are written under a non-empty substitution context,
+// and one generic enum's slot receives six different instantiations in a single
+// run. The `substitution_context.is_empty()` guard on the READ is the only
+// thing standing between those records and the next caller, and nothing named
+// it until this pin.
+
+/// The number of recorded return answers served to an ask carrying a caller's
+/// generic bindings while `source` compiles, read on the worker the compile runs
+/// on — the probe is thread-local, like the analyzer's other counters.
+fn records_served_under_substitution(source: &str) -> u64 {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let before = vilan_core::analyzer::return_records_served_under_substitution();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                program.is_some() && errors.is_empty(),
+                "the plant must analyze cleanly, got: {errors:#?}"
+            );
+            vilan_core::analyzer::return_records_served_under_substitution() - before
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// The shapes that put caller-shaped answers into the record in the first place,
+/// each instantiated at TWO types so a shared slot would be read across
+/// bindings: a generic impl method with an undeclared return, a static hung off
+/// a trait (the `b102`/`i5` shape whose records this suite was measured on), and
+/// a plain generic function.
+const CALLER_SHAPED_RETURN_PLANT: &str = r#"
+        import std::print;
+
+        trait Producer<T> {
+            fun produce(self): T;
+        }
+
+        struct Holder<T> {
+            item: T,
+        }
+
+        impl Holder<type T> with Producer<T> {
+            fun produce(self) {
+                self.item
+            }
+        }
+
+        impl Producer<type T> {
+            fun of(item: T): Holder<T> {
+                Holder { item }
+            }
+        }
+
+        fun echo<T>(value: T) {
+            value
+        }
+
+        fun main() {
+            let ints = Producer::of(1);
+            let strs = Producer::of("hi");
+            print(ints.produce());
+            print(strs.produce());
+            print(echo(2));
+            print(echo("bye"));
+        }
+        "#;
+
+/// A recorded answer is NEVER served to an ask that carries a caller's generic
+/// bindings — the correctness half of B139's memo.
+///
+/// Non-vacuous, and provably so: deleting `substitution_context.is_empty()` from
+/// the read in `infer_function_returns` turns this red immediately (925 serves
+/// across this suite, 4 of them answers that differ from the correct one).
+///
+/// This asserts the guard rather than a wrong-typed program on purpose. A
+/// behavioural pin was attempted first and does not exist today: with the guard
+/// deleted, all 2 596 inference tests, the docs gate, and the byte-identical
+/// corpus are unchanged, because a wrongly-served answer is re-substituted
+/// downstream before it can reach codegen. The hazard is real — the records are
+/// caller-shaped — but only this guard makes it unreachable, so this is what
+/// there is to pin.
+#[test]
+fn b139_a_recorded_return_is_never_served_under_a_callers_bindings() {
+    assert_eq!(
+        records_served_under_substitution(CALLER_SHAPED_RETURN_PLANT),
+        0,
+        "a recorded return answer was served to an ask carrying a caller's \
+         generic bindings — the record is keyed by function alone, so that \
+         answer belongs to a DIFFERENT caller (B139)"
+    );
+}
+
+/// The plant is not vacuous either: it really does compile and run, and really
+/// does instantiate each generic shape at two distinct types. A plant that
+/// stopped exercising the shape would make the pin above pass for free.
+#[test]
+fn b139_the_caller_shaped_return_plant_runs_at_both_instantiations() {
+    assert_compiles_and_runs(CALLER_SHAPED_RETURN_PLANT, "1\nhi\n2\nbye\n");
+}
+
+// --- `std::path` (kolt.local 017) --------------------------------------------
+//
+// The module is free functions over `str`, POSIX-shaped (`/` only, on every
+// platform), and colorless — the three forks the item filed, settled in
+// `vilan/std/src/path.vl`'s header. What follows is one pin per case rather
+// than one per function: the edges that bite are trailing separators, `.` and
+// `..`, the absolute/relative split between `join` and `resolve`, and the
+// dotfile rule in `extname`, and each of those is where a hand-rolled version
+// goes wrong.
+//
+// Answers were differentialled against node's `path.posix` over a 34-case
+// table before they were pinned. They agree case for case with TWO deliberate
+// divergences, both pinned below so they cannot drift back by accident:
+// `normalize` drops a trailing separator where node keeps it, and
+// `dirname("a//b")` is `"a"` where node leaves the dangling `"a/"`.
+
+#[test]
+fn path_normalize_collapses_separators_and_resolves_dot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("a//b/./c"));
+            print(path::normalize("a/b/../c"));
+            print(path::normalize("./a"));
+            print(path::normalize(""));
+            print(path::normalize("."));
+            print(path::normalize("/"));
+            print(path::normalize("//"));
+        }
+        main();
+        "#,
+        "a/b/c\na/c\na\n.\n.\n/\n/\n",
+    );
+}
+
+#[test]
+fn path_normalize_drops_a_trailing_separator_where_node_keeps_it() {
+    // The one divergence from `path.posix.normalize`, and the point of the
+    // function: two spellings of one path must compare equal, and node's
+    // "a/b" / "a/b/" do not — which is how a cache or an asset map ends up
+    // with two entries for one file.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("a/b/"));
+            print(path::normalize("/a/b/"));
+            print(path::normalize("a/"));
+            print(path::normalize("/"));
+            print(path::normalize("a/b") == path::normalize("a/b/"));
+        }
+        main();
+        "#,
+        "a/b\n/a/b\na\n/\ntrue\n",
+    );
+}
+
+#[test]
+fn path_normalize_stops_at_an_absolute_root_but_keeps_a_relative_climb() {
+    // A `..` above the root is dropped (the root's parent is the root); a
+    // leading `..` on a relative path is kept, because it names something.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::normalize("/../a"));
+            print(path::normalize("/a/../../.."));
+            print(path::normalize("../a"));
+            print(path::normalize("a/../../b"));
+            print(path::normalize(".."));
+        }
+        main();
+        "#,
+        "/a\n/\n../a\n../b\n..\n",
+    );
+}
+
+#[test]
+fn path_functions_never_fold_case() {
+    // `windows-support.md` §5 enforces case-EXACT module resolution precisely
+    // so that `import foo` cannot resolve `Foo.vl` on NTFS. A path module that
+    // decided `Foo` and `foo` were the same path would hand that back, so
+    // every comparison here is byte-for-byte and `normalize` preserves the
+    // case it was given.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            print(path::normalize("Foo/../BAR"));
+            print(path::basename("/a/README.md"));
+            print(path::starts_with("/A/b", "/a"));
+            match path::relative("/A", "/a") {
+                Some(let answer) => print(answer),
+                None => print("none"),
+            }
+        }
+        main();
+        "#,
+        "BAR\nREADME.md\nfalse\n../a\n",
+    );
+}
+
+#[test]
+fn path_join_does_not_reset_on_an_absolute_second_argument_but_resolve_does() {
+    // The split that decides what each verb is for. `join` is textual; the
+    // caller asking "…unless the second is already absolute" is asking about
+    // REFERENCES and wants `resolve`. A `join` that silently discarded its
+    // first argument would be a traversal primitive wearing a concatenation's
+    // name.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("/a", "/b"));
+            print(path::resolve("/a", "/b"));
+            print(path::join("/a", "b"));
+            print(path::resolve("/a", "b"));
+        }
+        main();
+        "#,
+        "/a/b\n/b\n/a/b\n/a/b\n",
+    );
+}
+
+#[test]
+fn path_join_treats_an_empty_side_as_nothing() {
+    // `join("", "b")` must not become absolute — the empty base contributes
+    // no separator, it contributes nothing at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("", "b"));
+            print(path::join("a", ""));
+            print(path::join("", ""));
+            print(path::join("a", "../b"));
+            print(path::join("a", ".."));
+        }
+        main();
+        "#,
+        "b\na\n.\nb\n.\n",
+    );
+}
+
+#[test]
+fn path_join_all_folds_left_and_answers_the_empty_list() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            let parts: List<str> = ["a", "b", "c"];
+            print(path::join_all(parts));
+            let nothing: List<str> = [];
+            print(path::join_all(nothing));
+            let climbing: List<str> = ["/a", "..", "b"];
+            print(path::join_all(climbing));
+        }
+        main();
+        "#,
+        "a/b/c\n.\n/b\n",
+    );
+}
+
+#[test]
+fn path_basename_ignores_trailing_separators_and_the_root_has_none() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::basename("/a/b.txt"));
+            print(path::basename("/a/b/"));
+            print(path::basename("a"));
+            print(path::basename("/"));
+            print(path::basename(""));
+            print(path::basename("a/.."));
+        }
+        main();
+        "#,
+        "b.txt\nb\na\n\n\n..\n",
+    );
+}
+
+#[test]
+fn path_dirname_stops_at_the_root_and_answers_dot_without_a_separator() {
+    // `dirname("a//b")` is the second divergence from node, which answers
+    // `"a/"` — a parent path carrying a dangling separator, which then has to
+    // be normalized away by whoever receives it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::dirname("/a/b.txt"));
+            print(path::dirname("/a"));
+            print(path::dirname("/"));
+            print(path::dirname("a"));
+            print(path::dirname(""));
+            print(path::dirname("a/b/"));
+            print(path::dirname("a//b"));
+            print(path::dirname("/../a"));
+        }
+        main();
+        "#,
+        "/a\n/\n/\n.\n.\na\na\n/..\n",
+    );
+}
+
+#[test]
+fn path_extname_gives_a_dotfile_no_extension() {
+    // The landmine this module exists to defuse. `.gitignore` is a hidden
+    // file, not a file of type "gitignore": the leading dot marks it, it does
+    // not name a type. `.` and `..` likewise have none. (node's
+    // `path.extname` answers the same way and hand-rolled versions rarely do.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::extname(".gitignore"));
+            print(path::extname("a/.gitignore"));
+            print(path::extname("."));
+            print(path::extname(".."));
+            print(path::extname(".a.b"));
+        }
+        main();
+        "#,
+        "\n\n\n\n.b\n",
+    );
+}
+
+#[test]
+fn path_extname_reads_the_last_dot_of_the_last_component() {
+    // A dot in a DIRECTORY name is invisible from here — the question is
+    // about the file — and a trailing dot is an empty extension spelled ".".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::extname("index.html"));
+            print(path::extname("a.b.c"));
+            print(path::extname("noext"));
+            print(path::extname("file."));
+            print(path::extname("a.b/c"));
+            print(path::extname("/a/b/"));
+        }
+        main();
+        "#,
+        ".html\n.c\n\n.\n\n\n",
+    );
+}
+
+#[test]
+fn path_stem_and_extname_cut_the_basename_in_two() {
+    // `stem(p) + extname(p) == basename(p)` for every p, including the
+    // degenerate spellings — the invariant that makes the pair safe to use
+    // together instead of re-deriving the split at each call site.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun holds(candidate: str): bool {
+            path::stem(candidate) + path::extname(candidate) == path::basename(candidate)
+        }
+        fun main() {
+            print(path::stem("/a/b.txt"));
+            print(path::stem(".gitignore"));
+            print(path::stem("file."));
+            print(path::stem("a/b/"));
+            print(holds("/a/b.txt"));
+            print(holds(".gitignore"));
+            print(holds("file."));
+            print(holds("..."));
+            print(holds("/"));
+        }
+        main();
+        "#,
+        "b\n.gitignore\nfile\nb\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn path_starts_with_compares_components_where_the_str_verb_compares_text() {
+    // The answer to "do `str::strip_prefix`/`starts_with` suffice for paths":
+    // they do not, and the first two lines are the proof. `/a/bc` starts with
+    // the TEXT `/a/b` and is not inside the DIRECTORY `/a/b`. Deriving an
+    // asset key by cutting a textual prefix is the same mistake, which is what
+    // kolt.local 023 filed.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print("/a/bc".starts_with("/a/b"));
+            print(path::starts_with("/a/bc", "/a/b"));
+            print(path::starts_with("/a/b/c", "/a/b"));
+            print(path::starts_with("/a/b", "/a/b"));
+            print(path::starts_with("/a/b", "/a/"));
+            print(path::starts_with("/a/b", "/"));
+            print(path::starts_with("a/b", "/a"));
+            print(path::starts_with("/a", "/a/b"));
+        }
+        main();
+        "#,
+        "true\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn path_relative_inverts_resolve() {
+    // `resolve(from, relative(from, to))` is `normalize(to)` — the property
+    // that makes the pair usable for rebasing a whole tree of paths.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun step(from: str, to: str) {
+            match path::relative(from, to) {
+                Some(let hop) => print(path::resolve(from, hop) == path::normalize(to)),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            print(path::relative("/a/b", "/a/c").unwrap_or("none"));
+            print(path::relative("/a/b", "/a/b/c").unwrap_or("none"));
+            print(path::relative("/a/b", "/a/b").unwrap_or("none"));
+            print(path::relative("/", "/a").unwrap_or("none"));
+            print(path::relative("/a", "/").unwrap_or("none"));
+            step("/a/b", "/x/y");
+            step("a/b", "a/b/c/d");
+            step("/a/b/", "/a/b/c/");
+        }
+        main();
+        "#,
+        "../c\nc\n.\na\n..\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn path_relative_is_none_where_there_is_no_lexical_answer() {
+    // Two cases, both real: the two sides disagree about being absolute (no
+    // working directory here to bridge them), or `from` still begins with `..`
+    // after the common prefix comes off (climbing out of an unknown place, so
+    // what is above it is unknown too). An `Option` for `strip_prefix`'s
+    // reason — "no answer" and "the answer is `.`" are different.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun show(from: str, to: str) {
+            match path::relative(from, to) {
+                Some(let hop) => print(hop),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            show("/a/b", "b");
+            show("b", "/a/b");
+            show("../a", "b");
+            show("a", "../b");
+        }
+        main();
+        "#,
+        "none\nnone\nnone\n../../b\n",
+    );
+}
+
+#[test]
+fn std_path_is_colorless_and_serves_a_browser_build() {
+    // The coloring call, verified rather than assumed. `std::fs` and friends
+    // are seeded `@process` by living in `src/process` (`std/vilan.toml`'s
+    // `[library.layer.process]`), and a browser build that reaches one is
+    // refused. `std::path` is in the base `root` layer and has no host call
+    // in it, so it serves both — which is the point: a browser router and an
+    // SSR render manipulate the same `/`-separated strings, and a
+    // `@process`-colored path module would have put that shared half out of
+    // reach of half the program.
+    assert_compiles_browser(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            print(path::join("/assets", "app.css"));
+            print(path::basename("/assets/app.css"));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn path_arithmetic_folds_under_const() {
+    // Pure vilan with no host call, so it is const-evaluable — the property a
+    // build-time consumer (bundled-asset paths, kolt.local 029) needs, and one
+    // a `node:path` binding could never have had.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::path;
+        fun main() {
+            let folded = const path::join("dist", "../dist/app.js");
+            print(folded);
+        }
+        main();
+        "#,
+    )
+    .expect("expected a clean compile");
+    assert!(
+        js.contains("const folded = \"dist/app.js\";"),
+        "expected the join to fold to a literal at compile time, got:\n{js}"
+    );
+}
+
+#[test]
+fn path_strip_prefix_cuts_only_where_starts_with_agrees() {
+    // The path sibling of `str::strip_prefix` (Order 12), and the last line is
+    // why it had to exist: the `str` verb answers `Some("c")` for a path that
+    // is not inside the prefix at all. `starts_with` tests, this one cuts —
+    // and it is a different question from `relative`, which always has an
+    // answer for two paths under one root and will climb with `..` to reach
+    // it. Cutting the whole of a path gives `Some(".")`, matching `relative`'s
+    // answer for a path to itself.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::path;
+        import std::option::Option::{ None, Some, self };
+        fun show(path: str, prefix: str) {
+            match path::strip_prefix(path, prefix) {
+                Some(let rest) => print(rest),
+                None => print("none"),
+            }
+        }
+        fun main() {
+            show("/srv/site/css/app.css", "/srv/site");
+            show("/a/bc", "/a/b");
+            show("/a/b", "/a/b");
+            show("/a/b", "/a/b/");
+            show("/a/b", "/");
+            show("a/b/c", "a");
+            show("a/b", "/a");
+            show("/A/b", "/a");
+            print("/a/bc".strip_prefix("/a/b").unwrap_or("?"));
+        }
+        main();
+        "#,
+        "css/app.css\nnone\n.\n.\na/b\nb/c\nnone\nnone\nc\n",
+    );
+}
+
+// --- kolt.local 029: the const output channel for FILES — `asset::bundle` ------
+// `emit`'s sibling on the other axis. `emit` accumulates LINES into one
+// generated file; `bundle` carries an EXISTING file through unchanged, so a
+// built app needs nothing but `dist/`. Same const-only bit, same package-root
+// resolution, same build-input record — the three properties `asset::read`
+// already had, now pointing the other way.
+
+/// A clean analysis with an explicit package root, returning the folded const
+/// values, the recorded build inputs, and the files registered for bundling.
+fn const_bundles(
+    source: &str,
+    root: &Path,
+) -> (
+    Vec<vilan_core::interpreter::ConstValue>,
+    Vec<(PathBuf, Option<u64>)>,
+    Vec<(PathBuf, String)>,
+) {
+    let source = source.to_string();
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            let program = program.expect("a clean analysis leaves a program");
+            (
+                program.const_results.values().cloned().collect::<Vec<_>>(),
+                program.const_input_files.clone(),
+                program.const_bundled_files.clone(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// The book's own tree, used as a package root: the pins below bundle files
+/// that really exist rather than staging a fixture for each one.
+fn bundle_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan")
+}
+
+#[test]
+fn a_const_bundle_registers_the_file_and_folds_to_its_url() {
+    let (values, inputs, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("docs/SUMMARY.md");
+        }
+        main();
+        "#,
+        &bundle_root(),
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/docs/SUMMARY.md".to_string()
+        )],
+        "the call folds to the url its bundled copy answers on"
+    );
+    assert_eq!(bundled.len(), 1, "one registered file: {bundled:?}");
+    assert_eq!(
+        bundled[0].1, "docs/SUMMARY.md",
+        "the path IS the name — the subdirectory survives: {bundled:?}"
+    );
+    assert!(
+        bundled[0].0.ends_with("docs/SUMMARY.md"),
+        "resolved against the package root: {bundled:?}"
+    );
+    assert_eq!(inputs.len(), 1, "one tracked input: {inputs:?}");
+    assert!(
+        inputs[0].1.is_some(),
+        "a bundled file is a HASHED build input, exactly as a read one is — \
+         that record is what makes an edited resource drive a watch round: \
+         {inputs:?}"
+    );
+}
+
+#[test]
+fn a_file_bundled_twice_is_registered_once() {
+    // Two call sites, one file: the copy is idempotent, so the registry must
+    // not name it twice (a duplicate would put it in the manifest twice and
+    // make `serve_build` install two identical routes).
+    let (_, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _one = const asset::bundle("docs/SUMMARY.md");
+            let _two = const asset::bundle("./docs/SUMMARY.md");
+        }
+        main();
+        "#,
+        &bundle_root(),
+    );
+    assert_eq!(
+        bundled.len(),
+        1,
+        "one file, one registration — and `./` normalizes to the same name: {bundled:?}"
+    );
+    assert_eq!(bundled[0].1, "docs/SUMMARY.md");
+}
+
+#[test]
+fn a_missing_bundle_is_a_clean_diagnostic_at_the_call_site() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("vilan-029-definitely-missing.png");
+        }
+        main();
+        "#,
+        r#"asset::bundle("vilan-029-definitely-missing.png")"#,
+        "cannot bundle `vilan-029-definitely-missing.png`",
+    );
+}
+
+#[test]
+fn a_missing_bundle_is_still_a_tracked_build_input() {
+    // A file that was not there is still a dependency: its APPEARANCE must
+    // invalidate the compile that failed on it, exactly as a change to a
+    // present one does. The analysis fails, so the record is read off the
+    // program the failing analysis left rather than through `const_bundles`.
+    let root = bundle_root();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("vilan-029-definitely-missing.png");
+        }
+        main();
+        "#
+    .to_string();
+    let inputs = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, _errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            program
+                .map(|program| program.const_input_files.clone())
+                .unwrap_or_default()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(
+        inputs.iter().any(
+            |(path, hash)| path.ends_with("vilan-029-definitely-missing.png") && hash.is_none()
+        ),
+        "the miss must be recorded, unhashed: {inputs:?}"
+    );
+}
+
+#[test]
+fn an_absolute_bundle_path_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("/etc/hostname");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths are relative to the package root; `/etc/hostname` is absolute",
+    );
+}
+
+#[test]
+fn a_bundle_path_escaping_the_package_root_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("../outside.png");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths resolve inside the package root; `../outside.png` escapes it",
+    );
+}
+
+#[test]
+fn a_backslash_in_a_bundle_path_is_refused() {
+    // POSIX-only, for the reason `std::path` is (kolt.local 017): the name is
+    // derived OUTPUT — a url, a manifest row, a golden — and a separator-aware
+    // rule would make every one of them host-dependent. `\` is refused rather
+    // than translated, so a path that means two things on two hosts means
+    // nothing on either.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("static\\logo.png");
+        }
+        main();
+        "#,
+        "`asset::bundle` paths are `/`-separated on every host",
+    );
+}
+
+#[test]
+fn a_bundle_path_naming_no_file_is_refused() {
+    // `"."` and `""` resolve to the package root itself, which is a directory
+    // and not a resource. Refused by name rather than by the read failing, so
+    // the message says what is wrong instead of reporting an OS error.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle(".");
+        }
+        main();
+        "#,
+        "`asset::bundle` needs a file inside the package root; `.` names none",
+    );
+}
+
+#[test]
+fn a_runtime_bundle_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = asset::bundle("logo.png");
+        }
+        main();
+        "#,
+        r#"asset::bundle("logo.png")"#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_runtime_call_reaching_bundle_is_rejected_at_the_boundary() {
+    // The R-fixpoint names WHICH builtin the path reaches — a bundle-reaching
+    // function says `asset::bundle`, not `asset::emit`.
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun icon(): str {
+            asset::bundle("logo.png")
+        }
+        fun main() {
+            let _url = icon();
+        }
+        main();
+        "#,
+        "`icon` (it reaches `asset::bundle`) is compile-time-only",
+    );
+}
+
+#[test]
+fn a_function_reaching_bundle_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun icon(): str {
+            asset::bundle("logo.png")
+        }
+        fun apply(f: || str): str {
+            f()
+        }
+        fun main() {
+            let _url = apply(icon);
+        }
+        main();
+        "#,
+        "no runtime value form",
+    );
+}
+
+#[test]
+fn a_changed_bundled_file_is_seen_by_the_next_analysis() {
+    // The invalidation pin, `asset::read`'s sibling: analyze, EDIT THE FILE,
+    // analyze again in the same process — the second analysis must record the
+    // new hash. If any cache ever keys const results without the bundled
+    // inputs, a `--watch` round stops recopying an edited resource and the dev
+    // loop serves last round's bytes forever.
+    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("static")).unwrap();
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("static/note.txt");
+        }
+        main();
+        "#;
+    std::fs::write(dir.join("static/note.txt"), "one").unwrap();
+    let (values, first, bundled) = const_bundles(source, &dir);
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/static/note.txt".to_string()
+        )]
+    );
+    assert_eq!(bundled.len(), 1);
+    std::fs::write(dir.join("static/note.txt"), "two").unwrap();
+    let (_, second, _) = const_bundles(source, &dir);
+    assert_ne!(
+        first[0].1, second[0].1,
+        "the edited resource must re-hash to a different input record — a \
+         stale hash is a resource that stops being recopied: {first:?} {second:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bundled_file_is_not_charged_by_its_size() {
+    // Deliberately unlike `asset::read`, whose bytes become a `str` the const
+    // program then computes over: a bundled file's bytes never enter the
+    // program, so charging fuel by size would bound how large an asset may be
+    // rather than how much work a build does. A file comfortably past the
+    // explicit fuel budget in bytes bundles fine.
+    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-fuel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("huge.bin"), "a".repeat(17_000_000)).unwrap();
+    let (values, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle("huge.bin");
+        }
+        main();
+        "#,
+        &dir,
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/huge.bin".to_string()
+        )],
+        "a 17 MB resource is a build output, not a compile-time computation"
+    );
+    assert_eq!(bundled.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_builds_content_type_reads_the_extension_through_path_extname() {
+    // `content_type_of` used to be `file.split(".").last()` — a hand-rolled
+    // `extname` carrying `extname`'s classic bug: a DOTFILE's leading dot read
+    // as a type. `dist/.css` is a hidden file with no extension, and typing it
+    // `text/css` would serve a file the table has no row for. It now goes
+    // through `path::extname` (kolt.local 017), which answers `""` there.
+    //
+    // The subdirectory cases below are newly reachable: a bundled resource
+    // keeps its package-relative path (kolt.local 029), so `content_type_of`
+    // now sees paths with directories in them for the first time.
+    assert_compiles_and_runs(
+        r#"
+        import std::build::content_type_of;
+        import std::io::print;
+        import std::option::Option::{ None, Some };
+        fun name(file: str): str {
+            match content_type_of(file) {
+                Some(let content_type) => content_type
+                None => "none"
+            }
+        }
+        fun main() {
+            print(name("dist/static/logo.png"));
+            print(name("dist/.css"));
+            print(name("dist/vendor.d/README"));
+            print(name("dist/FAVICON.ICO"));
+            print(name("dist/a.b/c.woff2"));
+        }
+        main();
+        "#,
+        "image/png\nnone\nnone\nimage/x-icon\nfont/woff2\n",
     );
 }
