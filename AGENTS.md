@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, five crates, plus the language's own tree:
+Rust workspace, six crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -29,6 +29,13 @@ Rust workspace, five crates, plus the language's own tree:
   (`tests/corpus.rs`, `cancellation.rs`, `rpc_http.rs`, `streaming.rs`,
   `transport_robustness.rs`, …).
 - `crates/vilan-lsp` — the language server.
+- `crates/vilan-ide` — the editor-facing queries the language server and the web
+  playground SHARE (K9, `proposals/proposal/playground-completion.md` §3): the line
+  index, the completion engine, and the navigation primitives it reads. It depends on
+  `vilan-core` and nothing else on purpose, so it builds wherever core does —
+  including `wasm32-unknown-unknown`, where the language server's tower-lsp/tokio
+  stack cannot follow. A completion behavior belongs here, not in `vilan-lsp`, whose
+  `line_index.rs` is only a newtype speaking `lsp_types` at the protocol edge.
 - `crates/vilan-embedded-std` — embeds the std source into the binary.
 - `crates/vilan-wasm` — the compiler as a WebAssembly module; the web
   playground's engine (`proposals/proposal/web-playground.md`). The compile logic is
