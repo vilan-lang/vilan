@@ -39,8 +39,22 @@
 //!    `struct_initializer_to_def`; a match pattern's segments are re-recorded on
 //!    every type-check pass), so the table is deduplicated at build time. This
 //!    is what makes a rename's edit set applicable.
+//!
+//! One table per PROGRAM, though — and a program reaches only its own import
+//! closure, the files below its entry. So a symbol queried in the file that
+//! DEFINES it could not see the files that import it (kolt.local 034, 003
+//! branch (c)): in a multi-file app the declaration came back and nothing
+//! else. The importers' programs had already indexed those occurrences; what
+//! was missing was a definition identity that survives the program boundary.
+//! [`DefinitionKey`] — the declaration's file plus its name span in that
+//! file's text — is that identity: [`ReferenceIndex::key_of`] derives it,
+//! [`ReferenceIndex::definition_of_key`] re-resolves it in another program's
+//! index, and the document layer unions the per-program answers over every
+//! open document (`Document::references_across`, with rename reading the same
+//! union so the two cannot disagree about what a symbol's references are).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use vilan_core::Span;
 use vilan_core::analyzer::{Expr, Program, SourceId};
@@ -67,6 +81,36 @@ impl Definition {
             Definition::Entity(id) => (id.0, usize::MAX),
             Definition::Field(struct_id, index) => (struct_id.0, index),
         }
+    }
+}
+
+/// A definition's identity ACROSS programs (kolt.local 034, 003 branch (c)).
+///
+/// Each open document analyzes its own program, so a [`Definition`]'s entity
+/// ids are meaningless outside the program that minted them — two programs
+/// that both loaded `library.vl` give `struct Point` two unrelated ids. What
+/// every program agrees on is the declaration itself: the file it is written
+/// in and the identifier's span in that file's text. That pair (plus the name,
+/// so a program that read a DIFFERENT version of the file refuses to match
+/// rather than linking two symbols that merely share an address) is the key
+/// the cross-document union resolves through.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DefinitionKey {
+    /// The canonical path of the file the definition is declared in
+    /// (`Program::canonical_sources`, so every program spells it one way).
+    path: PathBuf,
+    /// The declaration name's span, in that file's text.
+    span: Span,
+    /// The declared name — a consistency check, not an address: a mismatch
+    /// means the two programs analyzed different texts of `path`.
+    name: String,
+}
+
+impl DefinitionKey {
+    /// The canonical path of the declaring file — what
+    /// [`crate::document::Document::depends_on`] scopes the union by.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -555,6 +599,53 @@ impl ReferenceIndex {
         self.dropped.get(&definition).copied().unwrap_or(0)
     }
 
+    /// The cross-program identity of `definition` — see [`DefinitionKey`].
+    ///
+    /// `None` when the definition has no usable declaration address: its
+    /// declaration row was dropped (its span could not be narrowed onto an
+    /// identifier), it has no declaration row at all (a module), or it lives
+    /// in generated code, which no file holds. A definition with no key simply
+    /// cannot be reached from another program, and the union degrades to the
+    /// single-program answer.
+    pub fn key_of(&self, program: &Program, definition: Definition) -> Option<DefinitionKey> {
+        let declaration = self
+            .occurrences_of(definition)
+            .find(|occurrence| occurrence.is_declaration)?;
+        let path = program
+            .canonical_sources
+            .get(declaration.source.0 as usize)?
+            .clone();
+        let name = name_of(program, definition)?.to_string();
+        Some(DefinitionKey {
+            path,
+            span: declaration.span,
+            name,
+        })
+    }
+
+    /// The definition `key` names in THIS index's program, found by its
+    /// declaration address — the other direction of [`ReferenceIndex::key_of`],
+    /// and the step that makes a cross-document query one lookup per program.
+    ///
+    /// A linear scan over the declaration rows, filtered span-first so the
+    /// path comparison (the expensive half) runs on at most a handful of rows.
+    /// `None` when this program never loaded the declaring file, or loaded a
+    /// text in which that span does not spell `key`'s name.
+    pub fn definition_of_key(&self, program: &Program, key: &DefinitionKey) -> Option<Definition> {
+        self.occurrences
+            .iter()
+            .filter(|row| row.is_declaration && row.span == key.span)
+            .find(|row| {
+                name_of(program, row.definition) == Some(key.name.as_str())
+                    && program
+                        .canonical_sources
+                        .get(row.source.0 as usize)
+                        .map(PathBuf::as_path)
+                        == Some(key.path())
+            })
+            .map(|row| row.definition)
+    }
+
     /// Every occurrence in `source`, in source order.
     pub fn occurrences_in(&self, source: SourceId) -> impl Iterator<Item = &Occurrence> {
         self.occurrences
@@ -1029,33 +1120,175 @@ fun main(): i32 {
         assert_eq!(count(one), 3, "the reverted text");
     }
 
-    // --- A recorded gap ---------------------------------------------------
+    // --- Cross-document reach (kolt.local 034, 003 branch (c)) -----------
+    // A query answers over the open file's own program — its entry file plus
+    // the import closure below it — so a symbol clicked in the file that
+    // DEFINES it used to see none of the files that IMPORT that file: the
+    // declaration came back and nothing else, which in a multi-file app is
+    // what "Find References intermittently returns nothing" was. The fix is
+    // the cross-program `DefinitionKey` plus a union over every open
+    // document's program, and rename reads the same union.
 
-    // BRANCH (c) of kolt.local 003, still open. A query answers over the open
-    // file's own program — its entry file plus the import closure below it — so
-    // a symbol clicked in the file that DEFINES it does not see the files that
-    // IMPORT that file. In a multi-file app that is most of the time, and it is
-    // what "Find References intermittently returns nothing" describes from the
-    // user's side: the declaration comes back and nothing else.
-    //
-    // Fixing it means resolving the cursor to a definition key that is stable
-    // ACROSS programs (each open document analyzes its own, so raw entity ids
-    // are not comparable) and unioning the answer over every program in play.
-    // The index makes that tractable — it is one lookup per program — but it is
-    // a separate change with its own scope, so the gap is pinned here rather
-    // than left unrecorded.
+    const LIBRARY: &str = "struct Point {\n\tx: i32,\n}\n";
+    const APPLICATION: &str =
+        "import pkg::library::Point;\n\nfun main(): i32 {\n\tlet p = Point { x = 1 };\n\tp.x\n}\n";
+
+    /// `library.vl` (the definer) analyzed as the open document, and
+    /// `application.vl` (its importer) open beside it as its own document —
+    /// the two-programs-in-play shape every pin in this section queries.
+    fn library_and_application() -> (std::path::PathBuf, Document, Document) {
+        let (dir, library_document) =
+            analyze_workspace(&[("library.vl", LIBRARY), ("application.vl", APPLICATION)]);
+        let application_document = Document::analyze(
+            APPLICATION,
+            &crate::document::tests::std_root(),
+            &dir.join("application.vl"),
+        );
+        (dir, library_document, application_document)
+    }
+
+    /// How many of `found` land in the file named `name`.
+    fn in_file(found: &[(std::path::PathBuf, Span)], name: &str) -> usize {
+        found
+            .iter()
+            .filter(|(path, _)| path.ends_with(name))
+            .count()
+    }
+
     #[test]
-    #[ignore = "kolt.local 003 branch (c): the query does not reach reverse dependencies"]
     fn a_definition_sees_the_files_that_import_it() {
-        let library = "struct Point {\n\tx: i32,\n}\n";
-        let application = "import pkg::library::Point;\n\nfun main(): i32 {\n\tlet p = Point { x = 1 };\n\tp.x\n}\n";
-        let (dir, document) =
-            analyze_workspace(&[("library.vl", library), ("application.vl", application)]);
-        let offset = library.find("struct Point").expect("the declaration") + 7;
-        let found = document.references(offset);
+        let (dir, document, application_document) = library_and_application();
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+        let found = document.references_across(offset, [&application_document]);
         assert!(
             found.len() > 1,
             "`Point` is used in application.vl, but only {found:?} came back",
+        );
+        // The declaration itself is a row in BOTH programs — the union
+        // reports it once.
+        assert_eq!(in_file(&found, "library.vl"), 1, "{found:?}");
+        // The importer contributes its import leaf and its constructor.
+        assert_eq!(in_file(&found, "application.vl"), 2, "{found:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The field shape crosses programs through the OTHER key arm — a field has
+    // no entity id, so its key addresses the field declaration row itself.
+    #[test]
+    fn a_field_definition_sees_the_accesses_in_files_that_import_it() {
+        let (dir, document, application_document) = library_and_application();
+        let offset = LIBRARY.find("\tx: i32").expect("the field") + 1;
+        let found = document.references_across(offset, [&application_document]);
+        assert_eq!(in_file(&found, "library.vl"), 1, "{found:?}");
+        // The initializer key in `Point { x = 1 }` and the access `p.x`.
+        assert_eq!(in_file(&found, "application.vl"), 2, "{found:?}");
+        for (path, span) in &found {
+            let text = if path.ends_with("library.vl") {
+                LIBRARY
+            } else {
+                APPLICATION
+            };
+            assert_eq!(&text[span.into_range()], "x", "{path:?} {span:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_function_definition_sees_the_calls_in_files_that_import_it() {
+        let library = "fun helper(value: i32): i32 {\n\tvalue + 1\n}\n";
+        let application = "import pkg::library::helper;\n\nfun main(): i32 {\n\thelper(1)\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("library.vl", library), ("application.vl", application)]);
+        let application_document = Document::analyze(
+            application,
+            &crate::document::tests::std_root(),
+            &dir.join("application.vl"),
+        );
+        let offset = library.find("fun helper").expect("the declaration") + 4;
+        let found = document.references_across(offset, [&application_document]);
+        assert_eq!(in_file(&found, "library.vl"), 1, "{found:?}");
+        // The import leaf and the call.
+        assert_eq!(in_file(&found, "application.vl"), 2, "{found:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The union must not manufacture reach: a file that never imports the
+    // definer contributes nothing — even one declaring an identically named
+    // struct at the identical offsets, which is exactly what a raw
+    // span-address comparison without the file would mistake for a match.
+    #[test]
+    fn a_file_that_never_imports_the_definer_contributes_nothing() {
+        let (dir, document) = analyze_workspace(&[
+            ("library.vl", LIBRARY),
+            ("application.vl", APPLICATION),
+            ("unrelated.vl", LIBRARY),
+        ]);
+        let application_document = Document::analyze(
+            APPLICATION,
+            &crate::document::tests::std_root(),
+            &dir.join("application.vl"),
+        );
+        let unrelated_document = Document::analyze(
+            LIBRARY,
+            &crate::document::tests::std_root(),
+            &dir.join("unrelated.vl"),
+        );
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+        let found =
+            document.references_across(offset, [&application_document, &unrelated_document]);
+        assert_eq!(
+            in_file(&found, "unrelated.vl"),
+            0,
+            "unrelated.vl's own `Point` is a different definition: {found:?}",
+        );
+        assert_eq!(found.len(), 3, "{found:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The rename face of the same reach (the standing rule from 003: rename
+    // reads the same index, so it had the same blind spot and gains the same
+    // fix — through the same path, not a parallel one).
+    #[test]
+    fn a_rename_at_a_definition_rewrites_the_files_that_import_it() {
+        let (dir, document, application_document) = library_and_application();
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+        let spans = document
+            .rename_edits_across(offset, "Renamed", [&application_document])
+            .expect("the cross-file rename");
+        assert_eq!(in_file(&spans, "library.vl"), 1, "{spans:?}");
+        assert_eq!(in_file(&spans, "application.vl"), 2, "{spans:?}");
+        // Every edit replaces exactly the identifier, in its own file's text.
+        for (path, span) in &spans {
+            let text = if path.ends_with("library.vl") {
+                LIBRARY
+            } else {
+                APPLICATION
+            };
+            assert_eq!(&text[span.into_range()], "Point", "{path:?} {span:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An importer whose buffer has moved past its analysis cannot be trusted
+    // for edit positions, and silently skipping it would emit the partial
+    // rename the refusal rule forbids — so the rename refuses, for the one
+    // debounce the state lasts.
+    #[test]
+    fn a_rename_refuses_while_an_importing_file_is_still_analyzing() {
+        let (dir, document, mut application_document) = library_and_application();
+        application_document.set_text("fun main() {}\n");
+        let offset = LIBRARY.find("struct Point").expect("the declaration") + 7;
+        let refusal = document
+            .rename_edits_across(offset, "Renamed", [&application_document])
+            .expect_err("a stale importer must refuse the rename");
+        assert!(
+            matches!(refusal, RenameRefusal::StillAnalyzing { .. }),
+            "{refusal:?}",
+        );
+        assert!(
+            refusal.message().contains("still being analyzed"),
+            "{}",
+            refusal.message(),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

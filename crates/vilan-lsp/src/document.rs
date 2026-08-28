@@ -283,6 +283,11 @@ pub enum RenameRefusal {
     /// The index knows it is missing references to this definition: use sites
     /// whose recorded span could not be proven to cover an identifier.
     Incomplete { what: String, missing: usize },
+    /// An open file that imports the definition's file has un-analyzed edits,
+    /// so its analyzed spans cannot be trusted against its live buffer —
+    /// applying them could corrupt it, and skipping it would emit the partial
+    /// rename this enum exists to forbid. The state lasts one debounce.
+    StillAnalyzing { what: String },
 }
 
 impl RenameRefusal {
@@ -303,6 +308,9 @@ impl RenameRefusal {
             ),
             RenameRefusal::Incomplete { what, missing } => format!(
                 "cannot rename {what}: {missing} of its references could not be located, so the edit would be incomplete"
+            ),
+            RenameRefusal::StillAnalyzing { what } => format!(
+                "cannot rename {what} yet: an open file that references it is still being analyzed; retry in a moment"
             ),
         }
     }
@@ -2054,6 +2062,107 @@ impl Document {
             .collect()
     }
 
+    /// Every occurrence of the definition under `offset`, unioned over this
+    /// document's program AND each `neighbors` (the other open documents')
+    /// program, as `(canonical file path, span)` — kolt.local 034 (003 branch
+    /// (c)).
+    ///
+    /// A single program reaches only its own import closure, so a symbol
+    /// queried in the file that DEFINES it cannot see its importers from any
+    /// one program — the declaration came back and nothing else. Each
+    /// importer's program has already indexed those occurrences; this query
+    /// re-resolves the definition there through its cross-program
+    /// [`DefinitionKey`] and merges the answers. The union is in path space
+    /// because source ids are per-program; it is deduplicated by `(path,
+    /// span)` because the declaration itself is a row in every program that
+    /// loaded its file. An occurrence in generated code has no file and is
+    /// dropped, exactly as the location conversion has always dropped it.
+    pub fn references_across<'a>(
+        &self,
+        offset: usize,
+        neighbors: impl IntoIterator<Item = &'a Document>,
+    ) -> Vec<(PathBuf, Span)> {
+        let Some((definition, _)) = self.reference_target(offset) else {
+            return Vec::new();
+        };
+        let own = self
+            .reference_index
+            .occurrences_of(definition)
+            .map(|occurrence| (occurrence.source, occurrence.span))
+            .collect();
+        let mut merged = self.spans_by_path(own);
+        if let Some(key) = self.definition_key(definition) {
+            for neighbor in neighbors {
+                // `depends_on` scopes the union (B39a's edge, reused): a
+                // program that never loaded the defining file cannot hold a
+                // reference to the definition.
+                if !neighbor.depends_on(key.path()) {
+                    continue;
+                }
+                let Some(local) = neighbor.definition_of_key(&key) else {
+                    continue;
+                };
+                let found = neighbor
+                    .reference_index
+                    .occurrences_of(local)
+                    .map(|occurrence| (occurrence.source, occurrence.span))
+                    .collect();
+                merged.extend(neighbor.spans_by_path(found));
+            }
+        }
+        merged.sort();
+        merged.dedup();
+        merged
+    }
+
+    /// The cross-program identity of `definition` — [`ReferenceIndex::key_of`]
+    /// over this document's program. `None` when the definition has no
+    /// declaration address another program could agree on.
+    pub fn definition_key(
+        &self,
+        definition: Definition,
+    ) -> Option<crate::references::DefinitionKey> {
+        let program = self.program.as_ref()?;
+        self.reference_index.key_of(program, definition)
+    }
+
+    /// The definition `key` names in THIS document's program —
+    /// [`ReferenceIndex::definition_of_key`]'s document form.
+    pub fn definition_of_key(&self, key: &crate::references::DefinitionKey) -> Option<Definition> {
+        let program = self.program.as_ref()?;
+        self.reference_index.definition_of_key(program, key)
+    }
+
+    /// `(source, span)` rows from this document's program in `(canonical file
+    /// path, span)` form — the program-independent coordinates the
+    /// cross-document union merges in. A row whose source has no path
+    /// (generated code) is dropped.
+    fn spans_by_path(&self, spans: Vec<(SourceId, Span)>) -> Vec<(PathBuf, Span)> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        spans
+            .into_iter()
+            .filter_map(|(source, span)| {
+                program
+                    .canonical_sources
+                    .get(source.0 as usize)
+                    .map(|path| (path.clone(), span))
+            })
+            .collect()
+    }
+
+    /// The canonical path of the file this document's analysis read as its
+    /// entry (`None` when nothing was analyzed) — how the location conversion
+    /// recognizes a path-space span as belonging to an open document.
+    pub fn entry_path(&self) -> Option<&Path> {
+        self.program
+            .as_ref()?
+            .canonical_sources
+            .first()
+            .map(PathBuf::as_path)
+    }
+
     /// The definition the identifier under `offset` names, with its kind — the
     /// shared front half of find-references and rename.
     pub fn reference_target(&self, offset: usize) -> Option<(Definition, DefinitionKind)> {
@@ -2077,6 +2186,55 @@ impl Document {
         offset: usize,
         new_name: &str,
     ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
+        let (definition, what) = self.rename_target(offset, new_name)?;
+        self.rename_spans(definition, &what)
+    }
+
+    /// [`Document::rename_edits`] unioned over each `neighbors` (the other
+    /// open documents') program, in `(canonical file path, span)` form — the
+    /// rename face of [`Document::references_across`], per the standing rule
+    /// that rename reads the same index reach find-references does. Every
+    /// contributing program's spans pass the same per-program validation the
+    /// single-document rename runs, so a refusal reason cannot be laundered
+    /// away by the union.
+    pub fn rename_edits_across<'a>(
+        &self,
+        offset: usize,
+        new_name: &str,
+        neighbors: impl IntoIterator<Item = &'a Document>,
+    ) -> std::result::Result<Vec<(PathBuf, Span)>, RenameRefusal> {
+        let (definition, what) = self.rename_target(offset, new_name)?;
+        let mut merged = self.spans_by_path(self.rename_spans(definition, &what)?);
+        if let Some(key) = self.definition_key(definition) {
+            for neighbor in neighbors {
+                if !neighbor.depends_on(key.path()) {
+                    continue;
+                }
+                // A stale importer's analyzed program may also MISS a
+                // just-typed reference, so this refuses before asking whether
+                // the key even resolves there — conservative, and over in one
+                // debounce.
+                if neighbor.is_stale() {
+                    return Err(RenameRefusal::StillAnalyzing { what });
+                }
+                let Some(local) = neighbor.definition_of_key(&key) else {
+                    continue;
+                };
+                merged.extend(neighbor.spans_by_path(neighbor.rename_spans(local, &what)?));
+            }
+        }
+        merged.sort();
+        merged.dedup();
+        Ok(merged)
+    }
+
+    /// The shared front half of the rename entry points: the definition under
+    /// `offset` and the phrase refusals name it by, with `new_name` validated.
+    fn rename_target(
+        &self,
+        offset: usize,
+        new_name: &str,
+    ) -> std::result::Result<(Definition, String), RenameRefusal> {
         let Some(program) = self.program.as_ref() else {
             return Err(RenameRefusal::NotAnIdentifier);
         };
@@ -2087,11 +2245,27 @@ impl Document {
             return Err(RenameRefusal::InvalidName(new_name.to_string()));
         }
         let name = crate::references::name_of(program, definition).unwrap_or("this symbol");
-        let what = format!("the {} `{name}`", kind.noun());
+        Ok((definition, format!("the {} `{name}`", kind.noun())))
+    }
 
+    /// The per-program back half: every span a rename of `definition` must
+    /// rewrite IN THIS PROGRAM, or the reason the edit set cannot be complete.
+    /// `definition` is this program's own (for a neighbor, the result of
+    /// re-resolving the origin's [`crate::references::DefinitionKey`] here).
+    fn rename_spans(
+        &self,
+        definition: Definition,
+        what: &str,
+    ) -> std::result::Result<Vec<(SourceId, Span)>, RenameRefusal> {
+        let Some(program) = self.program.as_ref() else {
+            return Err(RenameRefusal::NotAnIdentifier);
+        };
         let missing = self.unindexed_references(definition);
         if missing > 0 {
-            return Err(RenameRefusal::Incomplete { what, missing });
+            return Err(RenameRefusal::Incomplete {
+                what: what.to_string(),
+                missing,
+            });
         }
 
         let spans: Vec<(SourceId, Span)> = self
@@ -2106,20 +2280,22 @@ impl Document {
             // Generated code has no path, so an edit there cannot be expressed —
             // and dropping it silently is the partial rename the rule forbids.
             if *source == DERIVED_SOURCE {
-                return Err(RenameRefusal::Generated { what });
+                return Err(RenameRefusal::Generated {
+                    what: what.to_string(),
+                });
             }
             // A rename reached through an import must not rewrite the library it
             // reached into. The old code would happily hand the client edits for
             // files under `$VILAN_STD`.
             if program.std_sources.contains(source) {
                 return Err(RenameRefusal::NotOwned {
-                    what,
+                    what: what.to_string(),
                     origin: "the standard library",
                 });
             }
             if program.dependency_sources.contains(source) {
                 return Err(RenameRefusal::NotOwned {
-                    what,
+                    what: what.to_string(),
                     origin: "a dependency",
                 });
             }

@@ -50,7 +50,9 @@ hinted: its type is written in the signature already.
 which also highlights `vilan` fences inside Markdown.
 
 **Go to definition** (including into `std`), **find references**,
-**rename**, and a **document outline**.
+**rename**, and a **document outline**. References and rename reach in
+both directions across your open files: asked in the file that *defines*
+a symbol, they also find the open files that import it.
 
 **Formatting** — the same `vilan_core` formatter `vilan fmt` runs, so the
 editor and the CLI cannot disagree. Whole-document only; there is no range
