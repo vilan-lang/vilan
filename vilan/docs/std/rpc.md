@@ -102,8 +102,17 @@ The reconnect lifecycle (automatic): on drop → `Reconnecting`, in-flight
 calls reject with `Transport("connection lost")`, new calls fail fast with
 `Transport("not connected")`; dial with backoff (250 ms doubling, 4 s cap,
 10 attempts); on success → contract re-check, mirrors re-attach and resync,
-`Connected`. Backoff exhausted → `Closed`. Nothing is ever silently
-retried; retry is the app's decision.
+`Connected`. Nothing is ever silently retried; retry is the app's decision.
+
+`Closed` is terminal, and three things reach it: the attempt budget runs
+out; the re-dialled server's contract has **drifted** (it redeployed a
+different surface, so typed mirrors would decode against a shape they were
+not built for); or the **re-attach itself is refused** — the server answers,
+but will not hand back channel ids. The last two close the socket rather
+than staying `Connected`, because a mirror that cannot be rebound is pointed
+at the previous connection's dead channels: it would never update again, and
+the socket would say nothing was wrong. Bind `Closed` and offer the restart;
+that decision is the app's.
 
 `on_reconnect` is where that decision goes. Hooks run after each successful
 re-dial, awaited in order, and the generated client registers its own mirror

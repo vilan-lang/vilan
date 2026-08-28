@@ -353,7 +353,9 @@ at-least-once — see
 > **Going deeper.** The backoff dials at 250 ms doubling to a 4 s cap,
 > ten attempts before giving up (`Closed`). Mirrors rebind by
 > re-running the contract check and re-attaching each subscription; you
-> never re-subscribe manually. The full state machine is in the
+> never re-subscribe manually — and if either step is refused, the
+> connection goes `Closed` too, rather than reporting itself live over
+> mirrors that can no longer update. The full state machine is in the
 > [rpc reference](../std/rpc.md).
 
 ## Authentication

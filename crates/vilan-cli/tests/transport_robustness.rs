@@ -1,17 +1,25 @@
-//! End-to-end test for K6 transport robustness
+//! End-to-end tests for K6 transport robustness
 //! (proposal/transport-robustness.md): a generated client rides a real
 //! WebSocket to a real server, which is then STOPPED (SIGSTOP — the in-flight
-//! call hangs), KILLED (the socket closes), and RESTARTED with different
-//! state. Asserts the whole contract: the pending call rejects with a typed
-//! transport error (never dangles), the state signal walks
-//! Connected → Reconnecting → Connected, a call made while down fails fast,
-//! the mirror RE-SYNCS to the restarted server's value through the re-attach
-//! hook, and calls work again afterwards.
+//! call hangs), KILLED (the socket closes), and RESTARTED. What the restarted
+//! server IS is the variable this file turns: the same service (the happy
+//! re-sync path), a service that will not open a session (the re-attach fails),
+//! or a DIFFERENT service (the contract drifted under us). All three are real
+//! servers built from one source — there is no fault-injection seam in std, and
+//! none is needed, because every failure the reconnect path can meet is
+//! reachable from `Service`'s own public surface.
+//!
+//! Asserted across the three: the pending call rejects with a typed transport
+//! error (never dangles), the state signal walks Connected → Reconnecting →
+//! Connected, a call made while down fails fast, the mirror RE-SYNCS to the
+//! restarted server's value through the re-attach hook, calls work again
+//! afterwards — and, when the mirrors CANNOT be rebound, the socket reaches the
+//! terminal `Closed` instead of claiming to be live over dead channel ids.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-// The reconnect test drives the server with `kill -STOP`/`-KILL`; everything
-// that exists only to serve it is unix-gated with it (see the test).
+// The reconnect tests drive the server with `kill -STOP`/`-KILL`; everything
+// that exists only to serve them is unix-gated with them (see the tests).
 #[cfg(unix)]
 use std::net::TcpListener;
 #[cfg(unix)]
@@ -37,12 +45,12 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// TOCTOU window). Fixed literals are unbindable outright inside Windows'
 /// Hyper-V/WSL reserved ranges (windows-support.md §4).
 ///
-/// The one probe backlog E19's port-0 rework deliberately LEFT: this test kills
-/// the server mid-call and starts a SECOND server process that the client must
-/// reconnect to, so the port has to be the same across two independent binds —
-/// which a port-0 bind cannot promise. Phase 1 could announce its port for phase
-/// 3 to reuse, but that only moves the window (the port is released by the kill),
-/// so it buys nothing the probe does not already have.
+/// The one probe backlog E19's port-0 rework deliberately LEFT: these tests kill
+/// the server and start a SECOND server process that the client must reconnect
+/// to, so the port has to be the same across two independent binds — which a
+/// port-0 bind cannot promise. Phase 1 could announce its port for phase 3 to
+/// reuse, but that only moves the window (the port is released by the kill), so
+/// it buys nothing the probe does not already have.
 #[cfg(unix)]
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -61,12 +69,10 @@ struct LineChild {
 
 #[cfg(unix)]
 impl LineChild {
-    fn spawn(bundle: &Path, argument: Option<&str>) -> LineChild {
+    fn spawn(bundle: &Path, arguments: &[&str]) -> LineChild {
         let mut command = Command::new("node");
         command.arg(bundle);
-        if let Some(argument) = argument {
-            command.arg(argument);
-        }
+        command.args(arguments);
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -88,21 +94,37 @@ impl LineChild {
         LineChild { child, lines }
     }
 
-    /// Blocks until a stdout line containing `needle` arrives; returns it.
-    fn await_line(&self, needle: &str, timeout: Duration) -> String {
+    /// Every stdout line up to and INCLUDING the first containing `needle`.
+    /// How a negative is asserted here: "the mirror never resynced" is a claim
+    /// about the lines between two events, not about any one line — and the
+    /// consumed lines are gone once `await_line` has skipped them.
+    fn collect_until(&self, needle: &str, timeout: Duration) -> Vec<String> {
         let deadline = Instant::now() + timeout;
+        let mut seen: Vec<String> = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
-                "timed out waiting for `{needle}` on stdout"
+                "timed out waiting for `{needle}` on stdout; saw: {seen:?}"
             );
             match self.lines.recv_timeout(remaining) {
-                Ok(line) if line.contains(needle) => return line,
-                Ok(_other) => {}
-                Err(_) => panic!("stdout ended or timed out before `{needle}`"),
+                Ok(line) => {
+                    let matched = line.contains(needle);
+                    seen.push(line);
+                    if matched {
+                        return seen;
+                    }
+                }
+                Err(_) => panic!("stdout ended or timed out before `{needle}`; saw: {seen:?}"),
             }
         }
+    }
+
+    /// Blocks until a stdout line containing `needle` arrives; returns it.
+    fn await_line(&self, needle: &str, timeout: Duration) -> String {
+        self.collect_until(needle, timeout)
+            .pop()
+            .expect("collect_until returns the matched line last")
     }
 
     /// Send a signal by name (`-STOP`, `-KILL`) via `kill(1)`. Unix-only and
@@ -147,6 +169,20 @@ impl StatusBoard {
 }
 "#;
 
+/// The server, whose FAILURE MODE is an argument: `<status> <mode>`.
+///
+/// - `none` — the ordinary service. `Service::new`'s default lifecycle
+///   registers a reactive session per connection, so `__attach` answers.
+/// - `refuse-attach` — the same service surface, with the connection lifecycle
+///   replaced by one that registers NO session. `Service::on_connect` is the
+///   documented seam for exactly this ("an app-written attach"), and the
+///   generated `__attach` route's own `Option::None` arm is what answers:
+///   `RpcError::Remote("unknown connection")`. `__contract` still matches, so
+///   the client reaches the attach step and fails THERE — the one ordering the
+///   swallowed-`Err` defect needed.
+/// - `drift` — a DIFFERENT service on the same mount and port: the server
+///   redeployed under the client, which is what the reconnect's `__contract`
+///   re-check exists to catch.
 #[cfg(unix)]
 const SERVER: &str = r#"import std::print;
 import std::reactive::Signal;
@@ -157,6 +193,20 @@ import std::http::{ Response, Server };
 import std::rpc_server::Service;
 import common::StatusBoard;
 
+// A second service with a DIFFERENT contract surface — the redeployed server.
+[service(DriftClient)]
+struct DriftBoard {
+	[expose] tally: Signal<i32>,
+}
+
+impl DriftBoard {
+	[rpc]
+	fun bump(self, by: i32): i32 {
+		self.tally.set(self.tally.get() + by);
+		self.tally.get()
+	}
+}
+
 async fun main() {
 	let initial = match args().get(0) {
 		Some(let raw) => match raw.parse_i32() {
@@ -165,12 +215,25 @@ async fun main() {
 		},
 		None => 0,
 	};
+	let mode = match args().get(1) {
+		Some(let raw) => raw,
+		None => "none",
+	};
 	let board = StatusBoard { status = Signal::new(initial) };
+	let service = if mode == "refuse-attach" {
+		Service::new(board.dispatcher().into_protocol(json_codec()))
+			.on_connect(|connection, wire| print(i"attach-refused:{connection}"))
+	} else if mode == "drift" {
+		let drifted = DriftBoard { tally = Signal::new(initial) };
+		Service::new(drifted.dispatcher().into_protocol(json_codec()))
+	} else {
+		Service::new(board.dispatcher().into_protocol(json_codec()))
+	};
 	Server::builder()
 		.port(9297)
-		.with_service(Service::new(board.dispatcher().into_protocol(json_codec())))
+		.with_service(service)
 		.on_request(|request| Response::builder().code(404).body("nope").build())
-		.on_start(|server| print(i"listening {initial}"))
+		.on_start(|server| print(i"listening {initial} {mode}"))
 		.build()
 		.start();
 }
@@ -239,54 +302,132 @@ async fun main() {
 }
 "#;
 
+/// The plain observer: every connection-state transition and every mirror
+/// value, and nothing else. What the re-attach failure cases need is not a
+/// call to make but a claim to disprove — that the socket says `Connected`
+/// while the mirrors are bound to a dead connection's channels — so the client
+/// only reports, and the assertions are about what does and does not appear.
+#[cfg(unix)]
+const WATCH_CLIENT: &str = r#"import std::print;
+import std::json::json_codec;
+import std::result::Result::{ self, Ok, Err };
+import std::time::sleep;
+import common::{ StatusBoard, StatusClient };
+
+async fun main() {
+	match StatusClient::connect("ws://localhost:9297/", json_codec()) {
+		Ok(let client) => {
+			let watching_state = client.transport.connection_state().sub(|current| {
+				print(i"state:{current.debug()}");
+			});
+			let watching_mirror = client.status.sub(|value| {
+				print(i"mirror:{value}");
+			});
+			print("ready");
+			// Held open through the outage; the harness kills the process.
+			sleep(600000);
+		},
+		Err(let error) => print(i"connect failed: {error.debug()}"),
+	}
+}
+"#;
+
+/// One built project — `common` (the shared `[service]`), `server` (the
+/// mode-taking server above) and `client` (whichever program the test drives)
+/// — on one ephemeral port, ready to spawn processes from. The port is
+/// substituted into both halves at build time, so it lives in the sources
+/// rather than on this value.
+#[cfg(unix)]
+struct ReconnectFixture {
+    directory: PathBuf,
+}
+
+#[cfg(unix)]
+impl ReconnectFixture {
+    /// Write the three packages, substitute the port into both halves, build.
+    fn build(tag: &str, client_source: &str) -> ReconnectFixture {
+        let directory = temp_project(tag);
+        let port = free_port().to_string();
+        write(
+            &directory,
+            "vilan.toml",
+            "[project]\npackages = [\"common\", \"server\", \"client\"]\n",
+        );
+        write(
+            &directory,
+            "common/vilan.toml",
+            "[library]\nname = \"common\"\n",
+        );
+        write(
+            &directory,
+            "server/vilan.toml",
+            "[package]\nname = \"server\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
+        );
+        write(
+            &directory,
+            "client/vilan.toml",
+            "[package]\nname = \"client\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
+        );
+        write(&directory, "common/src/lib.vl", COMMON);
+        write(
+            &directory,
+            "server/src/main.vl",
+            &SERVER.replace("9297", &port),
+        );
+        write(
+            &directory,
+            "client/src/main.vl",
+            &client_source.replace("9297", &port),
+        );
+
+        let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["build", directory.to_str().unwrap()])
+            .output()
+            .expect("run vilan build");
+        assert!(
+            build.status.success(),
+            "build failed:\n{}{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        ReconnectFixture { directory }
+    }
+
+    /// A server process serving `status`, in one of the three failure modes.
+    fn server(&self, status: &str, mode: &str) -> LineChild {
+        LineChild::spawn(&self.directory.join("dist/server.mjs"), &[status, mode])
+    }
+
+    fn client(&self) -> LineChild {
+        LineChild::spawn(&self.directory.join("dist/client.mjs"), &[])
+    }
+
+    /// Only on the success path, deliberately: a failed run leaves the built
+    /// project behind to be read.
+    fn clean(&self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
 /// UNIX-ONLY, permanently (windows-support.md §1 non-goals, §4): phase 2 freezes
 /// the server with `kill -STOP` so a call is caught in flight, which has no
 /// Windows analogue. The rest of the K6 contract (fail-fast, typed rejection,
 /// mirror re-sync) is only observable *because* the server can be frozen
 /// mid-call, so the test is not splittable into a portable half.
+///
+/// This is also the ATTACH-SUCCEEDS case of A26: the re-attach answers, so the
+/// `rebinds` loop runs and every mirror moves to the fresh connection's
+/// channels. The two tests below are its failing siblings.
 #[cfg(unix)]
 #[test]
 fn a_dropped_connection_reconnects_and_resyncs() {
-    let dir = temp_project("reconnect");
-    // An ephemeral port, substituted into both halves of the pair.
-    let port = free_port().to_string();
-    write(
-        &dir,
-        "vilan.toml",
-        "[project]\npackages = [\"common\", \"server\", \"client\"]\n",
-    );
-    write(&dir, "common/vilan.toml", "[library]\nname = \"common\"\n");
-    write(
-        &dir,
-        "server/vilan.toml",
-        "[package]\nname = \"server\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
-    );
-    write(
-        &dir,
-        "client/vilan.toml",
-        "[package]\nname = \"client\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
-    );
-    write(&dir, "common/src/lib.vl", COMMON);
-    write(&dir, "server/src/main.vl", &SERVER.replace("9297", &port));
-    write(&dir, "client/src/main.vl", &CLIENT.replace("9297", &port));
-
-    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
-        .args(["build", dir.to_str().unwrap()])
-        .output()
-        .expect("run vilan build");
-    assert!(
-        build.status.success(),
-        "build failed:\n{}{}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-
+    let fixture = ReconnectFixture::build("reconnect", CLIENT);
     let wait = Duration::from_secs(20);
 
     // Phase 1: server up (status 1), client syncs.
-    let server = LineChild::spawn(&dir.join("dist/server.mjs"), Some("1"));
+    let server = fixture.server("1", "none");
     server.await_line("listening 1", wait);
-    let client = LineChild::spawn(&dir.join("dist/client.mjs"), None);
+    let client = fixture.client();
     client.await_line("state:Connected", wait);
     client.await_line("mirror:1", wait);
 
@@ -316,19 +457,100 @@ fn a_dropped_connection_reconnects_and_resyncs() {
 
     // Phase 3: restart with DIFFERENT state — the backoff loop reconnects,
     // the hook re-attaches, the mirror resyncs, calls work again.
-    let revived = LineChild::spawn(&dir.join("dist/server.mjs"), Some("2"));
+    let revived = fixture.server("2", "none");
     revived.await_line("listening 2", wait);
     client.await_line("state:Connected", wait);
     client.await_line("mirror:2", wait);
     client.await_line("call:ok:5", wait);
 
-    let _ = std::fs::remove_dir_all(&dir);
+    fixture.clean();
+}
+
+/// A26 (N16 audit run 2, ruled 2026-08-28): the reconnect's `__attach` FAILS.
+/// The restarted server answers `__contract` with the matching hash and then
+/// refuses to open a session, so there are no fresh channel ids to rebind to.
+///
+/// The defect this pins: `reattach_mirrors`'s `Err` arm was `{}`, so the
+/// `rebinds` loop was skipped in silence — the socket stayed `Connected`, every
+/// mirror kept pointing at the dead connection's channel ids, and nothing
+/// anywhere reported it. A live-looking client that can never update again.
+/// The failed attach now takes the same terminal `Closed` (+ `close()`) as the
+/// contract-drift sibling, which is a state the app's `or`/state machinery can
+/// actually see.
+#[cfg(unix)]
+#[test]
+fn a_refused_reattach_closes_the_socket_instead_of_wedging_the_mirrors() {
+    let fixture = ReconnectFixture::build("refused_attach", WATCH_CLIENT);
+    let wait = Duration::from_secs(20);
+
+    let server = fixture.server("1", "none");
+    server.await_line("listening 1", wait);
+    let client = fixture.client();
+    client.await_line("state:Connected", wait);
+    client.await_line("mirror:1", wait);
+
+    server.signal("-KILL");
+    drop(server);
+    client.await_line("state:Reconnecting", wait);
+
+    // Same surface (so the contract re-check passes), no session registry (so
+    // the attach it reaches next fails).
+    let revived = fixture.server("2", "refuse-attach");
+    revived.await_line("listening 2", wait);
+    revived.await_line("attach-refused", wait);
+
+    // The state flips to Connected a beat before the hooks run — by design
+    // (§2.5: the re-attach's own rpc call needs a usable transport). What must
+    // NOT happen is that it stays there.
+    client.await_line("state:Connected", wait);
+    let settled = client.collect_until("state:Closed", wait);
+    assert!(
+        !settled.iter().any(|line| line.contains("mirror:2")),
+        "nothing was rebound, so no mirror can have resynced: {settled:?}"
+    );
+
+    fixture.clean();
+}
+
+/// The sibling branch, which had no pin of its own: the restarted server is a
+/// DIFFERENT service, so the reconnect's `__contract` re-check finds drift.
+/// `reattach_mirrors` closes for good rather than feeding typed mirrors from a
+/// surface they were not built against (transport-robustness.md §2.5). Only the
+/// CONNECT-time refusal was covered (`Err(RpcError::Contract(..))`, pinned in
+/// the inference suite); the reconnect-time one is this.
+#[cfg(unix)]
+#[test]
+fn a_server_that_redeploys_a_different_surface_closes_the_socket() {
+    let fixture = ReconnectFixture::build("contract_drift", WATCH_CLIENT);
+    let wait = Duration::from_secs(20);
+
+    let server = fixture.server("1", "none");
+    server.await_line("listening 1", wait);
+    let client = fixture.client();
+    client.await_line("state:Connected", wait);
+    client.await_line("mirror:1", wait);
+
+    server.signal("-KILL");
+    drop(server);
+    client.await_line("state:Reconnecting", wait);
+
+    let revived = fixture.server("2", "drift");
+    revived.await_line("listening 2", wait);
+
+    client.await_line("state:Connected", wait);
+    let settled = client.collect_until("state:Closed", wait);
+    assert!(
+        !settled.iter().any(|line| line.contains("mirror:2")),
+        "a drifted surface must not feed the mirrors: {settled:?}"
+    );
+
+    fixture.clean();
 }
 
 /// The draft leg (A14, `proposal/draft-reconnect.md`): a `Draft` edited
 /// WHILE THE CONNECTION IS DOWN re-sends itself when it comes back, over a real
 /// socket and a real server restart. Same unix gate and the same reason as the
-/// test above — the outage is produced by killing the server process.
+/// tests above — the outage is produced by killing the server process.
 #[cfg(unix)]
 const DRAFT_CLIENT: &str = r#"import std::print;
 import std::shared::Shared;
@@ -405,52 +627,16 @@ async fun main() {
 #[cfg(unix)]
 #[test]
 fn a_dirty_draft_repushes_itself_on_reconnect() {
-    let dir = temp_project("draft_repush");
-    let port = free_port().to_string();
-    write(
-        &dir,
-        "vilan.toml",
-        "[project]\npackages = [\"common\", \"server\", \"client\"]\n",
-    );
-    write(&dir, "common/vilan.toml", "[library]\nname = \"common\"\n");
-    write(
-        &dir,
-        "server/vilan.toml",
-        "[package]\nname = \"server\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
-    );
-    write(
-        &dir,
-        "client/vilan.toml",
-        "[package]\nname = \"client\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
-    );
-    write(&dir, "common/src/lib.vl", COMMON);
-    write(&dir, "server/src/main.vl", &SERVER.replace("9297", &port));
-    write(
-        &dir,
-        "client/src/main.vl",
-        &DRAFT_CLIENT.replace("9297", &port),
-    );
-
-    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
-        .args(["build", dir.to_str().unwrap()])
-        .output()
-        .expect("run vilan build");
-    assert!(
-        build.status.success(),
-        "build failed:\n{}{}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-
+    let fixture = ReconnectFixture::build("draft_repush", DRAFT_CLIENT);
     let wait = Duration::from_secs(20);
 
     // Phase 1: server up with status 1; the draft adopts it (clean local).
     // The mirror's first value arrives over the wire, so it lands AFTER the
     // wiring finishes — `await_line` consumes what it skips, so the order
     // here mirrors the client's emission order.
-    let server = LineChild::spawn(&dir.join("dist/server.mjs"), Some("1"));
+    let server = fixture.server("1", "none");
     server.await_line("listening 1", wait);
-    let client = LineChild::spawn(&dir.join("dist/client.mjs"), None);
+    let client = fixture.client();
     client.await_line("state:Connected", wait);
     client.await_line("ready", wait);
     client.await_line("mirror:1", wait);
@@ -470,7 +656,7 @@ fn a_dirty_draft_repushes_itself_on_reconnect() {
     // Phase 3: a DIFFERENT server comes up (status 2). The backoff reconnects,
     // the mirror resyncs to 2 — which must NOT take the dirty local — and the
     // app's reconnect hook re-pushes the stranded 7.
-    let revived = LineChild::spawn(&dir.join("dist/server.mjs"), Some("2"));
+    let revived = fixture.server("2", "none");
     revived.await_line("listening 2", wait);
     client.await_line("state:Connected", wait);
     client.await_line("mirror:2", wait);
@@ -497,7 +683,7 @@ fn a_dirty_draft_repushes_itself_on_reconnect() {
         "the outage should cost exactly two commit attempts, got: {settled}"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
+    fixture.clean();
 }
 
 /// B21 (FIXED): a unit consuming a DEPENDENCY package's `[service]` without
