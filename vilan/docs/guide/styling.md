@@ -266,7 +266,7 @@ let button = const style()
 ```
 
 Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
-`.last`, `.dark`, and `.pseudo(name, inner)` for anything else.
+`.last`, and `.pseudo(name, inner)` for anything else.
 Breakpoints work the same way: `.sm(inner)` (640px), `.md(inner)`
 (768px), `.lg(inner)` (1024px), `.xl(inner)` (1280px), or
 `.media(min_width, inner)`. All are `min-width` conditions, so chains are
@@ -274,37 +274,71 @@ mobile-first: in `.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching
 breakpoint wins (the stylesheet emits media rules in ascending min-width
 order, which is what makes that true).
 
-## Dark mode, and stacking conditions
+## Theming, and stacking conditions
 
-`.dark(inner)` applies under a `:root[data-theme="dark"]` ancestor — an
-explicit switch you set on the document, not `prefers-color-scheme`. That
-is deliberate: a server can decide the theme and write the attribute
-before a byte of JavaScript runs, and a user's toggle is one attribute
-write.
+`.within(name, value, inner)` applies under an **ancestor** carrying the
+attribute — `within("data-theme", "dark", ..)` is the theme condition,
+under a `[data-theme="dark"]` switch you set on the document, not
+`prefers-color-scheme`. That is deliberate: a server can decide the theme
+and write the attribute before a byte of JavaScript runs, and a user's
+toggle is one attribute write. Nothing is special about the theme: any
+ancestor state rides — an n-ary theme id (`within("data-theme",
+"iron-dark", ..)`), a density mode, a `[data-collapsed]` sidebar.
+
+For colours, the stronger recipe is usually no condition at all: declare
+per-theme custom properties with a [declaration
+block](../std/style.md#declaration-blocks) and read them with
+`Color::var(..)` — switching themes then re-paints every element through
+the variables, and `within` covers the *structural* changes a value swap
+cannot express.
 
 Conditions **stack**, nesting outside-in in the order the CSS nests them:
-a breakpoint outside dark, dark outside the pseudo-class.
+a breakpoint outside the guard, the guard outside the pseudo-class.
 
 ```vilan,fragment
 let button = const style()
 	.background(Color::gray(100))
 	.hover(style().background(Color::gray(200)))
-	.dark(style().background(Color::gray(800)))
-	.dark(style().hover(style().background(Color::gray(700))))
-	.md(style().dark(style().hover(style().background(Color::gray(600)))));
+	.within("data-theme", "dark", style().background(Color::gray(800)))
+	.within("data-theme", "dark", style().hover(style().background(Color::gray(700))))
+	.md(style().within("data-theme", "dark", style().hover(style().background(Color::gray(600)))));
 ```
 
 Write them in any other order and the build stops and tells you which
-order it wanted — `hover(dark(..))` says to write `dark(hover(..))`. No
-axis may wrap itself, so one media, one dark and one pseudo-class is the
-whole lattice.
+order it wanted — `hover(within(..))` says to write `within(..,
+hover(..))`. No axis may wrap itself, so one media, one guard and one
+pseudo-class is the whole lattice.
 
-Why the order matters beyond spelling: `dark(hover(..))` produces a
-*more specific* selector than either `dark(..)` or `hover(..)`, so it
-beats both. Between a plain `.dark(x)` and a plain `.hover(y)` on the
-same property the two are equally specific and dark wins — a theme
-shouldn't be undone by a hover — so when a dark theme needs its own
-hover colour, say so with `dark(hover(..))`.
+Why the order matters beyond spelling: `within(.., hover(..))` produces a
+*more specific* selector than either `within(..)` or `hover(..)`, so it
+beats both. Between a plain `.within(.., x)` and a plain `.hover(y)` on
+the same property the guard wins — a theme shouldn't be undone by a hover
+— so when a dark theme needs its own hover colour, say so with
+`within(.., hover(..))`.
+
+## Styling children from the parent
+
+`.children(inner)` styles every direct child of the element, and
+`.divide(inner)` every direct child but the first — the parent-owned
+spacing idioms (Tailwind's `space-*` and `divide-*`):
+
+```vilan,fragment
+let list = const style()
+	.children(style().padding_y(space(2)))
+	.divide(style().border_top(Length::px(1), Color::gray(200)));
+```
+
+Two rules make this safe to use anywhere. First, **a child's own style
+always wins**: a `children`/`divide` rule is emitted in a lower cascade
+layer, so anything the child says about itself — through its own
+`style()` — overrides what its parent reaches in with, whatever the
+selectors' specificity. They set defaults the child may refuse; they are
+not a way to force a child's hand. Second, where `children` and `divide`
+touch the *same* property, `divide` wins on every child but the first —
+the narrower relation outranks the blanket, whichever you wrote first.
+
+Both take an unconditioned inner style: to give the children a hover
+colour, put the `hover(..)` on the child's own style.
 
 ## Dynamic values
 
@@ -373,8 +407,8 @@ request is rendered is the one served.
 > build: two styles that both say `padding(space(4))` share one class.
 > `styled` sets `class_list()`, the space-joined class names. Each
 > combination of conditions is its own slot, so `hover(..)` and
-> `dark(hover(..))` never fight over one — they are different rules with
-> different class names, resolved by CSS specificity.
+> `within(.., hover(..))` never fight over one — they are different rules
+> with different class names, resolved by CSS specificity.
 
 ## Traps
 
@@ -393,6 +427,6 @@ request is rendered is the one served.
   `border` with `border_color`) resolve by the order you wrote them, not
   by specificity: a later longhand narrows the shorthand, a later
   shorthand replaces the whole family. This holds per condition, so a
-  `dark` or `hover` variant of one family never disturbs the base.
+  `within` or `hover` variant of one family never disturbs the base.
 
 Full method table: the [style reference](../std/style.md).

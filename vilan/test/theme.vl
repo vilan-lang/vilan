@@ -1,0 +1,45 @@
+import std::print;
+import std::style::{ Color, Length, Style, declarations, declare, space, style };
+
+// The theme system a real app hand-rolled through `asset::emit`, expressed
+// entirely in std's surface (kolt.local 009+014, ui-styling.md §0bis.6):
+// per-theme declaration blocks carry a var()-backed palette, elements read
+// the palette through `Color::var`, and the `within` ancestor guard covers
+// the structural changes a value swap cannot. Switching themes is ONE
+// attribute write on an ancestor — zero recompilation, and SSR-friendly
+// because the server can stamp the attribute before a byte of JS runs.
+
+fun theme(id: str, ink: str, ground: str) {
+	declare(i"[data-theme=\"{id}\"]", declarations()
+		.raw("--color-ink", ink)
+		.raw("--color-ground", ground));
+}
+
+fun themes() {
+	theme("iron-light", "#161616", "#fafafa");
+	theme("iron-dark", "#fafafa", "#161616");
+}
+
+fun main() {
+	let _themes = const themes();
+
+	// The element never names a theme: its colors are the tokens, so every
+	// `[data-theme="…"]` block re-paints it through the custom properties.
+	let card = const style()
+		.padding(space(4))
+		.color(Color::var("--color-ink"))
+		.background(Color::var("--color-ground"))
+		.border(Length::px(1), Color::var("--color-ink").alpha(0.2));
+	print(card.class_list());
+
+	// Where a theme needs a STRUCTURAL change rather than a value swap, the
+	// guard reaches the same slots under the ancestor condition — unlayered
+	// and (0,2,0), so it beats the element's own base rule exactly when the
+	// guard matches, composing with a pseudo-class on one slot.
+	let lifted = const card
+		.box_shadow("0 1px 2px rgba(0, 0, 0, 0.08)")
+		.within("data-theme", "iron-dark", style().box_shadow("none"))
+		.within("data-theme", "iron-dark", style().hover(style().border_color(Color::var("--color-ink"))));
+	print(lifted.class_list());
+}
+main();

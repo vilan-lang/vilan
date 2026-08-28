@@ -167,8 +167,8 @@ is the current directory. Formatting is conservative and a fixed point:
   typography, backgrounds, borders, effects, filters, tables,
   transitions/animation, transforms, interactivity, svg, accessibility), with
   every condition combinator after every property method, in the axis order the
-  selector nests them: `md`, then `dark`, then `attribute`, then the
-  pseudo-classes. Two rules keep it safe, because a chain merges last-wins per
+  selector nests them: `md`, then the relation (`within`, `children`,
+  `divide`), then `attribute`, then the pseudo-classes. Two rules keep it safe, because a chain merges last-wins per
   property slot. A method the formatter does not know — one of your own
   `impl Style` extensions, or an escape hatch whose slot is an argument
   (`raw`, `with_length`, `with_color`, `with_border`) — is a **barrier**:
