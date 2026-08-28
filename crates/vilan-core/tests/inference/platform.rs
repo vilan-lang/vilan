@@ -1,0 +1,5119 @@
+//! Platform coloring and its fences, fn coercion, `std::time`, `Draft<T>`, the
+//! diagnostics audit batches, and the fixed-bug regression guards.
+//!
+//! One subject module of the `inference` test binary; the harness it is
+//! written against lives in `support.rs`.
+
+use crate::support::*;
+
+// --- §3.7: declared platform fences ------------------------------------------
+//
+// `[platform("…")]` declares the platforms a function promises to run on;
+// the inferred requirement is checked against every matching host on EVERY
+// compile — no entry needed, independent of the build target. Violations
+// hang their chain from the fence.
+
+#[test]
+fn a_platform_fence_rejects_an_off_platform_reach() {
+    // Checked on a NODE build (which itself admits `stat`) and with main
+    // never calling the fenced function — the fence alone carries the check.
+    assert_fails_spanning(
+        r#"
+        import std::fs::stat;
+
+        [platform("browser")]
+        fun probe_cache(): bool {
+            stat("cache").is_some()
+        }
+
+        fun main() {}
+        "#,
+        r#"stat("cache")"#,
+        "reachable from `probe_cache`, fenced `[platform(\"browser\")]`",
+    );
+}
+
+#[test]
+fn a_satisfied_fence_compiles_on_every_build_target() {
+    let source = r#"
+        import std::fs::stat;
+
+        [platform("@process")]
+        fun probe_cache(): bool {
+            stat("cache").is_some()
+        }
+
+        fun main() {}
+        "#;
+    assert_compiles(source);
+    assert_compiles_browser(source);
+}
+
+#[test]
+fn a_neutral_fence_spanning_families_holds_for_base_code() {
+    assert_compiles(
+        r#"
+        import std::print;
+
+        [platform("@process", "browser")]
+        fun shared_label(): str {
+            "everywhere"
+        }
+
+        fun main() {
+            print(shared_label());
+        }
+        "#,
+    );
+}
+
+#[test]
+fn an_unknown_fence_pattern_errors() {
+    assert_fails(
+        r#"
+        [platform("wat")]
+        fun probe(): i32 { 1 }
+
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn a_fence_on_a_generic_promises_every_instantiation() {
+    // Fences walk unbound, so dispatch considers every candidate: the
+    // colored impl's existence alone breaks a browser fence on the generic —
+    // deliberate conservatism (the fence promises for every possible T).
+    assert_fails_browser_with(
+        r#"
+        import std::fs::stat;
+
+        trait Check {
+            fun check(self): bool;
+        }
+
+        struct DiskProbe { path: str }
+
+        impl DiskProbe with Check {
+            fun check(self): bool {
+                stat(self.path).is_some()
+            }
+        }
+
+        [platform("browser")]
+        fun run_check<T: Check>(subject: T): bool {
+            subject.check()
+        }
+
+        fun main() {}
+        "#,
+        "reachable from `run_check`, fenced `[platform(\"browser\")]`",
+    );
+}
+
+#[test]
+fn a_fence_on_a_method_checks_like_a_functions() {
+    assert_fails_browser_with(
+        r#"
+        import std::fs::stat;
+
+        struct Store { path: str }
+
+        impl Store {
+            [platform("browser")]
+            fun probe(self): bool {
+                stat(self.path).is_some()
+            }
+        }
+
+        fun main() {}
+        "#,
+        "reachable from `probe`, fenced `[platform(\"browser\")]`",
+    );
+}
+
+#[test]
+fn a_colored_instantiation_still_rejects_beside_a_neutral_one() {
+    // The refinement is not a hole: when the SAME generic is instantiated
+    // both ways, the colored instantiation's path still rejects — chained
+    // through the impl that instantiation actually selects.
+    assert_fails_browser_with(
+        r#"
+        import std::fs::write_file;
+
+        trait Save {
+            fun save(self): bool;
+        }
+
+        struct MemStore { last: str }
+        struct DiskStore { path: str }
+
+        impl MemStore with Save {
+            fun save(self): bool { true }
+        }
+
+        impl DiskStore with Save {
+            fun save(self): bool {
+                write_file(self.path, "state");
+                true
+            }
+        }
+
+        fun save_it<T: Save>(store: T): bool {
+            store.save()
+        }
+
+        fun main() {
+            save_it(MemStore { last = "" });
+            save_it(DiskStore { path = "s.txt" });
+        }
+        "#,
+        "reachable from the entry: main → save_it → save → write_file (std::fs)",
+    );
+}
+
+#[test]
+fn instantiation_bindings_compose_through_nested_generics() {
+    // `route<T>` forwards to `commit<U>` — the binding threads two frames
+    // deep, so the neutral instantiation stays admitted even though the
+    // dispatch happens in the inner generic.
+    assert_compiles_browser(
+        r#"
+        import std::fs::write_file;
+
+        trait Save {
+            fun save(self): bool;
+        }
+
+        struct MemStore { last: str }
+        struct DiskStore { path: str }
+
+        impl MemStore with Save {
+            fun save(self): bool { true }
+        }
+
+        impl DiskStore with Save {
+            fun save(self): bool {
+                write_file(self.path, "state");
+                true
+            }
+        }
+
+        fun commit<U: Save>(store: U): bool {
+            store.save()
+        }
+
+        fun route<T: Save>(store: T): bool {
+            commit(store)
+        }
+
+        fun main() {
+            route(MemStore { last = "" });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_never_instantiated_impls_globals_leave_no_residue() {
+    // The emission side moves with the refinement (emitted ⊆ admitted): a
+    // binding referenced only by the impl no instantiation selects is
+    // dropped, its callees — and their `node:` imports — with it. The global
+    // must be a SYNCHRONOUS `@process` call carrying a `node:` import, so a
+    // module-level `Database` stands in for the deleted `fs::exists`
+    // (kolt.local 031 Q3): `Database::open` is sync and statically imports
+    // `node:sqlite`.
+    let source = r#"
+        import std::db::Database;
+
+        trait Save {
+            fun save(self): bool;
+        }
+
+        struct MemStore { last: str }
+        struct DiskStore { path: str }
+
+        let disk_db: Database = Database::open("state");
+
+        impl MemStore with Save {
+            fun save(self): bool { true }
+        }
+
+        impl DiskStore with Save {
+            fun save(self): bool {
+                disk_db.exec("SELECT 1");
+                true
+            }
+        }
+
+        fun save_it<T: Save>(store: T): bool {
+            store.save()
+        }
+
+        fun main() {
+            save_it(MemStore { last = "" });
+        }
+        "#;
+    let browser = compile_browser(source).expect("the neutral instantiation compiles");
+    assert!(
+        !browser.contains("node:") && !browser.contains("\"state\""),
+        "the unselected impl's binding leaked into the bundle:\n{browser}"
+    );
+}
+
+#[test]
+fn the_router_is_browser_only() {
+    // `std::router` lives in the browser layer. Under platform coloring the
+    // import is fine — REACHING `navigate` from a node build's entry is the
+    // violation, anchored at the user call site with the chain
+    // (proposal/platform-coloring.md §3.6).
+    assert_fails_spanning(
+        r#"
+        import std::router::navigate;
+
+        fun main() {
+            navigate("/home");
+        }
+        "#,
+        r#"navigate("/home")"#,
+        "requires the `browser` layer of `std` and cannot run on `node",
+    );
+}
+
+// --- platform coloring: per-function requirement lines (hover's data) --------
+//
+// `platform_color::requirements` renders what the admission walk knows into an
+// entry-independent per-function map — the language server appends these lines
+// to hover (proposal/platform-coloring.md phase 2). The pins fix the exact
+// vocabulary: the layer label, a SHORTEST via-chain, library frames labeled
+// with their module, user frames bare.
+
+#[test]
+fn a_requirement_line_names_the_layer_and_the_via_chain() {
+    let line = requirement_line_of(
+        r#"
+        import std::fs;
+
+        fun save() {
+            fs::write_file("state", "data");
+        }
+
+        fun main() {
+            save();
+        }
+        "#,
+        "save",
+    )
+    .expect("`save` reaches `std::fs` and should carry a requirement");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `write_file (std::fs)`)"
+    );
+}
+
+#[test]
+fn a_requirement_line_propagates_to_callers_growing_the_chain() {
+    // `main` acquires the same label one hop later; its own frame is implicit,
+    // the user frame `save` renders bare, the library frame keeps its module.
+    let line = requirement_line_of(
+        r#"
+        import std::fs;
+
+        fun save() {
+            fs::write_file("state", "data");
+        }
+
+        fun main() {
+            save();
+        }
+        "#,
+        "main",
+    )
+    .expect("`main` reaches `std::fs` through `save`");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `save → write_file (std::fs)`)"
+    );
+}
+
+#[test]
+fn a_seeded_library_functions_line_has_no_chain() {
+    // The std function itself is seeded at its definition site — its line is
+    // the bare requirement, no `via`.
+    let line = requirement_line_of(
+        r#"
+        import std::fs;
+
+        fun main() {
+            fs::write_file("state", "data");
+        }
+        "#,
+        "write_file",
+    )
+    .expect("`write_file` is defined in the layer");
+    assert_eq!(line, "requires the `process` layer of `std`");
+}
+
+#[test]
+fn the_via_chain_is_a_shortest_path_to_the_layer() {
+    // `main` reaches the layer both through `relay → save` and through `save`
+    // directly; the witness chain takes the short way.
+    let line = requirement_line_of(
+        r#"
+        import std::fs;
+
+        fun save() {
+            fs::write_file("state", "data");
+        }
+
+        fun relay() {
+            save();
+        }
+
+        fun main() {
+            relay();
+            save();
+        }
+        "#,
+        "main",
+    )
+    .expect("`main` reaches the layer");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `save → write_file (std::fs)`)"
+    );
+}
+
+#[test]
+fn a_created_closures_requirement_lands_on_its_creator_line() {
+    // The v1 creator rule, rendered: the closure's body charges its creator,
+    // and the chain shows the closure frame it traveled through.
+    let line = requirement_line_of(
+        r#"
+        import std::fs::write_file;
+
+        fun make_saver(path: str): |str| void {
+            |content: str| {
+                write_file(path, content);
+            }
+        }
+
+        fun main() {
+            let _saver = make_saver("s.txt");
+        }
+        "#,
+        "make_saver",
+    )
+    .expect("`make_saver` creates the colored closure");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `closure → write_file (std::fs)`)"
+    );
+}
+
+#[test]
+fn a_dispatch_candidates_requirement_reaches_the_bounded_caller_line() {
+    // Candidate descent (async_infer's rule): the bounded call charges the
+    // colored impl's method, and the line says which one — even though this
+    // node build ADMITS the layer (the map is platform-independent).
+    let line = requirement_line_of(
+        r#"
+        import std::fs::write_file;
+
+        trait Save {
+            fun save(self): bool;
+        }
+
+        struct DiskStore { path: str }
+
+        impl DiskStore with Save {
+            fun save(self): bool {
+                write_file(self.path, "state");
+                true
+            }
+        }
+
+        fun save_it<T: Save>(store: T): bool {
+            store.save()
+        }
+
+        fun main() {
+            save_it(DiskStore { path = "s.txt" });
+        }
+        "#,
+        "save_it",
+    )
+    .expect("`save_it`'s bound admits the colored impl");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `save → write_file (std::fs)`)"
+    );
+}
+
+#[test]
+fn a_base_only_function_is_colorless() {
+    assert_eq!(
+        requirement_line_of(
+            r#"
+        import std::print;
+
+        fun greet() {
+            print("hi");
+        }
+
+        fun main() {
+            greet();
+        }
+        "#,
+            "greet",
+        ),
+        None
+    );
+}
+
+#[test]
+fn an_unreached_function_still_knows_its_requirement() {
+    // Entry-independence: nothing calls `orphan`, but its line exists — the
+    // fixpoint serves the editor, not just the entry walk.
+    let line = requirement_line_of(
+        r#"
+        import std::fs;
+
+        fun orphan() {
+            fs::write_file("state", "data");
+        }
+
+        fun main() {}
+        "#,
+        "orphan",
+    )
+    .expect("`orphan` should be colored without being reachable");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `write_file (std::fs)`)"
+    );
+}
+
+// --- platform coloring: module-level initializers ----------------------------
+//
+// A module-level binding's initializer runs iff something reachable
+// references it (F6 — emission's rule), so a REFERENCE is an edge and the
+// initializer's calls color like any body. Previously initializers were not
+// graph nodes at all: a browser build could reference a binding whose
+// initializer called `std::fs` and compile clean, shipping a load-time crash.
+
+#[test]
+fn a_module_initializers_call_colors_the_referencing_entry() {
+    // `std::process::env` — synchronous, so the initializer is legal on the
+    // node build and ONLY the coloring is under test. (`fs::exists`, this
+    // pin's original subject, was deleted by kolt.local 031's Q3 ruling; the
+    // fs module now has no synchronous entry a module initializer could call.)
+    assert_fails_browser_with(
+        r#"
+        import std::process::env;
+
+        let cache = env("CACHE");
+
+        fun main() {
+            let content = cache;
+        }
+        "#,
+        "`env` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → cache → env (std::process)",
+    );
+}
+
+#[test]
+fn an_initializer_violation_anchors_at_the_initializer_call() {
+    // The deepest user-code call site on the path is the initializer's own
+    // call — the squiggle lands on the code that would run off-platform.
+    // (Span-pinned on the node build via a browser-layer binding, the
+    // `navigate` precedent.)
+    assert_fails_spanning(
+        r#"
+        import std::storage::get;
+
+        let token = get("notes-token");
+
+        fun main() {
+            let t = token;
+        }
+        "#,
+        r#"get("notes-token")"#,
+        "requires the `browser` layer of `std` and cannot run on `node",
+    );
+}
+
+#[test]
+fn an_initializer_reaching_a_user_function_colors_through_it() {
+    assert_fails_browser_with(
+        r#"
+        import std::process::env;
+
+        fun boot_check(): bool {
+            env("STATE").is_some()
+        }
+
+        let ready = boot_check();
+
+        fun main() {
+            let r = ready;
+        }
+        "#,
+        "reachable from the entry: main → ready → boot_check → env (std::process)",
+    );
+}
+
+#[test]
+fn a_global_referencing_a_colored_global_chains_through_both() {
+    assert_fails_browser_with(
+        r#"
+        import std::process::env;
+
+        let raw = env("DATA");
+        let copy = raw;
+
+        fun main() {
+            let c = copy;
+        }
+        "#,
+        "reachable from the entry: main → copy → raw → env (std::process)",
+    );
+}
+
+#[test]
+fn a_global_closures_body_charges_the_binding_that_creates_it() {
+    // The creator rule, at module level: the initializer creates the closure,
+    // so referencing the binding is what admits (or rejects) the body.
+    assert_fails_browser_with(
+        r#"
+        import std::fs::write_file;
+
+        let saver = |content: str| write_file("state", content);
+
+        fun main() {
+            let s = saver;
+        }
+        "#,
+        "reachable from the entry: main → saver → closure → write_file (std::fs)",
+    );
+}
+
+#[test]
+fn calling_a_global_closure_colors_via_its_binding() {
+    // Before initializer edges, a global closure's body was charged to
+    // NOBODY: the call is value-indirect (skipped) and it has no lexical
+    // parent. The call's subject is a reference to the binding, so the
+    // reference edge now carries the charge.
+    assert_fails_browser_with(
+        r#"
+        import std::fs::write_file;
+
+        let saver = |content: str| write_file("state", content);
+
+        fun main() {
+            saver("boot");
+        }
+        "#,
+        "requires the `process` layer of `std` and cannot run on `browser`",
+    );
+}
+
+#[test]
+fn an_unreferenced_colored_global_is_elided_not_rejected() {
+    // F6: a dropped binding's initializer does not run — referencing it only
+    // from unreached code keeps the browser build clean.
+    assert_compiles_browser(
+        r#"
+        import std::fs::read_file_to_str;
+
+        let cache = read_file_to_str("cache.txt");
+
+        fun server_only(): str {
+            cache
+        }
+
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn a_neutral_global_is_colorless_everywhere() {
+    assert_compiles_browser(
+        r#"
+        import std::print;
+
+        let greeting = "hello";
+
+        fun main() {
+            print(greeting);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_const_bindings_initializer_is_compile_time_data() {
+    // `const` initializers run in the compile-time interpreter and ship as
+    // serialized values — nothing runs on the build platform, so the binding
+    // seeds nothing and carries no requirement line.
+    assert_compiles_browser(
+        r#"
+        import std::print;
+
+        let width = const 2 + 2;
+
+        fun main() {
+            print(width);
+        }
+        "#,
+    );
+    assert_eq!(
+        requirement_line_of(
+            r#"
+        import std::print;
+
+        let width = const 2 + 2;
+
+        fun main() {
+            print(width);
+        }
+        "#,
+            "width",
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_coerced_functions_body_charges_the_reference_site() {
+    // fn-to-closure coercion (proposal/fn-coercion.md): a named function
+    // passed as a value has no closure-creation event for the creator rule,
+    // so the REFERENCE is the charge — every later call through the value is
+    // deliberately uncharged (`Indirect(Value)`).
+    assert_fails_browser_with(
+        r#"
+        import std::fs::write_file;
+
+        fun save(content: str) {
+            write_file("state", content);
+        }
+
+        fun apply(action: |str| void) {
+            action("x");
+        }
+
+        fun main() {
+            apply(save);
+        }
+        "#,
+        "reachable from the entry: main → save → write_file (std::fs)",
+    );
+}
+
+#[test]
+fn an_index_expressions_subject_reference_colors() {
+    // The `Index` collector blind spot: `cache[0]` never walked its subject,
+    // so the reference — and the initializer behind it — went unseen (it also
+    // dropped load-bearing bindings from emission; `const.vl`'s golden pins
+    // that side).
+    assert_fails_browser_with(
+        r#"
+        import std::print;
+        import std::fs::read_file_to_str;
+
+        let cache = [read_file_to_str("cache.txt")];
+
+        fun main() {
+            print(cache[0]);
+        }
+        "#,
+        "requires the `process` layer of `std` and cannot run on `browser`",
+    );
+}
+
+#[test]
+fn an_iterator_protocols_next_call_colors_the_loop() {
+    // `for x in iterable` calls the resolved protocol `next()` every pass —
+    // an edge anchored at the loop (previously invisible: the desugar happened
+    // at emission, after the graph was built).
+    assert_fails_browser_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::iterator::Iterator;
+        import std::fs::write_file;
+
+        mut produced = 0;
+
+        struct Audited { limit: i32 }
+
+        impl Audited with Iterator<i32> {
+            fun next(&mut self): Option<i32> {
+                write_file("audit.log", "tick");
+                produced = produced + 1;
+                if produced <= self.limit {
+                    Some(produced)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            // The struct-literal iterable is parenthesized: a `for .. in`
+            // iterable is a condition position, which excludes bare struct
+            // literals (§H.1).
+            for n in (Audited { limit = 3 }) {
+                let _n = n;
+            }
+        }
+        "#,
+        "requires the `process` layer of `std` and cannot run on `browser`",
+    );
+}
+
+#[test]
+fn a_dropped_bindings_initializer_leaves_no_residue_in_the_bundle() {
+    // Emission's half of F6 (the phantom-retention fix): a binding referenced
+    // only by unreached code must not drag its callees — nor their host
+    // `import ... from "node:..."` lines — into the bundle. A browser bundle
+    // with a `node:` import fails at module parse, before any code runs.
+    let source = r#"
+        import std::fs::read_file_to_str;
+
+        let cache = read_file_to_str("cache.txt");
+
+        fun server_only(): str {
+            cache
+        }
+
+        fun main() {}
+        "#;
+    let browser = compile_browser(source).expect("the elided reach compiles for the browser");
+    assert!(
+        !browser.contains("node:"),
+        "phantom host import in the browser bundle:\n{browser}"
+    );
+    assert!(
+        !browser.contains("cache.txt"),
+        "dropped initializer emitted:\n{browser}"
+    );
+    // The same binding still emits where the reference is load-bearing. (A
+    // reference inside an ELIDED unused local doesn't count as running the
+    // initializer — emission drops both, and admission merely
+    // over-approximates in the safe direction by still checking it.)
+    // `env` rather than an fs read: a module initializer cannot await, and
+    // the fs module's last synchronous entry was deleted (kolt.local 031 Q3).
+    let node = compile(
+        r#"
+        import std::print;
+        import std::process::env;
+
+        let cache = env("cache.txt");
+
+        fun main() {
+            print(cache.is_some());
+        }
+        "#,
+    )
+    .expect("the node build admits the reach");
+    assert!(node.contains("cache.txt"), "reached initializer must emit");
+}
+
+#[test]
+fn a_globals_requirement_line_serves_hover_like_a_functions() {
+    let line = requirement_line_of(
+        r#"
+        import std::fs::read_file_to_str;
+
+        let cache = read_file_to_str("cache.txt");
+
+        fun main() {}
+        "#,
+        "cache",
+    )
+    .expect("`cache`'s initializer reaches the layer");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `read_file_to_str (std::fs)`)"
+    );
+}
+
+#[test]
+fn a_function_referencing_a_colored_global_inherits_its_line() {
+    let line = requirement_line_of(
+        r#"
+        import std::fs::read_file_to_str;
+
+        let cache = read_file_to_str("cache.txt");
+
+        fun peek(): str {
+            cache
+        }
+
+        fun main() {}
+        "#,
+        "peek",
+    )
+    .expect("`peek` runs the initializer by referencing the binding");
+    assert_eq!(
+        line,
+        "requires the `process` layer of `std` (via `cache → read_file_to_str (std::fs)`)"
+    );
+}
+
+#[test]
+fn a_function_requiring_two_layers_renders_one_line_each_in_label_order() {
+    // The mixed form: one function reaching two different layers gets one
+    // line per label, label-sorted. (`torn` is unreached, so the node build
+    // stays admissible while the browser requirement is still computed.)
+    let line = requirement_line_of(
+        r#"
+        import std::fs;
+        import std::router::navigate;
+
+        fun torn() {
+            fs::write_file("state", "data");
+            navigate("/home");
+        }
+
+        fun main() {}
+        "#,
+        "torn",
+    )
+    .expect("`torn` requires both layers");
+    assert_eq!(
+        line,
+        "requires the `browser` layer of `std` (via `navigate (std::router)`)\n\
+         requires the `process` layer of `std` (via `write_file (std::fs)`)"
+    );
+}
+
+// --- B19: closure-return-grounded method generics (backlog.md §B.19) ---------
+//
+// A method's own generic fixed ONLY by a closure argument's return
+// (`map<U>(self, transform: |V| U)`) used to freeze abstract when the call
+// resolved before the closure's body typed: the substitution — and the call's
+// return type — kept `Generic(U)`, so a later bounded call rejected 'U', and
+// monomorphization through the value dispatched abstractly. The resolution now
+// defers (the same retry the non-closure path always had) until the closure's
+// type lands. The browser-side shape is pinned above
+// (`a_mapped_signal_meets_a_bound_without_annotation`).
+
+#[test]
+fn a_closure_grounded_generic_dispatches_through_its_bound() {
+    // The runtime half: the grounded `U` must reach monomorphization, so the
+    // consumer's `==` dispatches to the REAL PartialEq — both outcomes, so an
+    // empty abstract method (undefined ~ falsy) cannot pass.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+
+        struct Wrap<V> {
+            value: V,
+        }
+
+        impl Wrap<type V> {
+            fun map<U>(self, transform: |V| U): Wrap<U> {
+                Wrap { value = transform(self.value) }
+            }
+        }
+
+        [derive(PartialEq)]
+        struct Label {
+            text: str,
+        }
+
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun tag(n: i32): Label {
+            Label { text = i"tag-{n}" }
+        }
+
+        fun main() {
+            let a = Wrap { value = 3 }.map(|n| tag(n));
+            let b = Wrap { value = 3 }.map(|n| tag(n));
+            let c = Wrap { value = 4 }.map(|n| tag(n));
+            print(same(a.value, b.value));
+            print(same(a.value, c.value));
+        }
+        main();
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn a_closure_grounded_generic_still_fails_an_unmet_bound() {
+    // The other direction: once `U` grounds to a type WITHOUT the impl, the
+    // bound check must reject it — deferral must not soften the gate.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+
+        struct Wrap<V> {
+            value: V,
+        }
+
+        impl Wrap<type V> {
+            fun map<U>(self, transform: |V| U): Wrap<U> {
+                Wrap { value = transform(self.value) }
+            }
+        }
+
+        struct Opaque {
+            tag: str,
+        }
+
+        fun needs_eq<T: PartialEq>(wrapped: Wrap<T>): bool {
+            wrapped.value == wrapped.value
+        }
+
+        fun cloak(n: i32): Opaque {
+            Opaque { tag = i"{n}" }
+        }
+
+        fun main() {
+            let wrapped = Wrap { value = 3 }.map(|n| cloak(n));
+            print(needs_eq(wrapped));
+        }
+        "#,
+        "needs_eq(wrapped)",
+        "does not implement trait 'PartialEq'",
+    );
+}
+
+#[test]
+fn chained_maps_ground_each_link() {
+    // Two chained closure-grounded links: the outer receiver is itself a
+    // deferred call result, so the retries must converge inside-out.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+
+        struct Wrap<V> {
+            value: V,
+        }
+
+        impl Wrap<type V> {
+            fun map<U>(self, transform: |V| U): Wrap<U> {
+                Wrap { value = transform(self.value) }
+            }
+        }
+
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun stringify(n: i32): str {
+            i"{n}"
+        }
+
+        fun measure(text: str): i32 {
+            text.len()
+        }
+
+        fun main() {
+            let wrapped = Wrap { value = 41 }.map(|n| stringify(n)).map(|text| measure(text));
+            print(same(wrapped.value, 2));
+            print(wrapped.value);
+        }
+        main();
+        "#,
+        "true\n2\n",
+    );
+}
+
+#[test]
+fn a_closure_grounded_generic_meets_a_method_bound() {
+    // The consumer as a METHOD with its own bounded generic (the `swap` shape)
+    // rather than a free function.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+
+        struct Wrap<V> {
+            value: V,
+        }
+
+        impl Wrap<type V> {
+            fun map<U>(self, transform: |V| U): Wrap<U> {
+                Wrap { value = transform(self.value) }
+            }
+        }
+
+        struct Gate {
+            open: bool,
+        }
+
+        impl Gate {
+            fun admits<T: PartialEq>(self, wrapped: Wrap<T>): bool {
+                self.open && wrapped.value == wrapped.value
+            }
+        }
+
+        fun parse(text: str): i32 {
+            text.len()
+        }
+
+        fun main() {
+            let gate = Gate { open = true };
+            let wrapped = Wrap { value = "hi" }.map(|text| parse(text));
+            print(gate.admits(wrapped));
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+// --- B20: named functions as closure values (proposal/fn-coercion.md) --------
+//
+// A reference to a plain (non-generic, non-method, non-async, non-extern)
+// named function coerces to a matching closure type — `map(parse)` instead of
+// `map(|path| parse(path))`. On JS the named function IS the value, so the
+// whole feature is type-layer.
+
+#[test]
+fn a_named_function_passes_as_a_method_closure_argument() {
+    // The motivating shape: a method's closure parameter whose return binds
+    // the method's own generic (`map<U>`'s `U = Route`) from the FUNCTION's
+    // declared return.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Wrap<V> {
+            value: V,
+        }
+
+        impl Wrap<type V> {
+            fun map<U>(self, transform: |V| U): Wrap<U> {
+                Wrap { value = transform(self.value) }
+            }
+        }
+
+        fun measure(text: str): i32 {
+            text.len()
+        }
+
+        fun main() {
+            let wrapped = Wrap { value = "abcd" }.map(measure);
+            print(wrapped.value);
+        }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn a_named_function_passes_as_a_free_closure_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun apply(seed: i32, transform: |i32| i32): i32 {
+            transform(seed)
+        }
+
+        fun double(n: i32): i32 {
+            n * 2
+        }
+
+        fun main() {
+            print(apply(21, double));
+        }
+        main();
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_named_function_binds_to_an_annotated_let_and_field() {
+    // The two storage positions: a closure-annotated binding, and a
+    // closure-typed struct field (the Kolt server-hook shape).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Holder {
+            hook: |str| i32,
+        }
+
+        fun measure(text: str): i32 {
+            text.len()
+        }
+
+        fun main() {
+            let bound: |str| i32 = measure;
+            print(bound("abc"));
+            let holder = Holder { hook = measure };
+            let hook = holder.hook;
+            print(hook("abcde"));
+        }
+        main();
+        "#,
+        "3\n5\n",
+    );
+}
+
+#[test]
+fn a_named_function_returns_as_a_closure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(n: i32): i32 {
+            n * 2
+        }
+
+        fun pick(): |i32| i32 {
+            double
+        }
+
+        fun main() {
+            let f = pick();
+            print(f(8));
+        }
+        main();
+        "#,
+        "16\n",
+    );
+}
+
+#[test]
+fn a_void_function_without_annotation_coerces() {
+    // An unannotated-return (void) function into a `|| void` slot — the
+    // handler shape; the return type comes from the body's inferred type.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun run_twice(action: || void) {
+            action();
+            action();
+        }
+
+        fun say_hi() {
+            print("hi");
+        }
+
+        fun main() {
+            run_twice(say_hi);
+        }
+        main();
+        "#,
+        "hi\nhi\n",
+    );
+}
+
+#[test]
+fn a_stored_function_value_survives_shared_storage() {
+    // Through `Shared<|str| i32>` — stored as a value, read back, called
+    // indirectly (the pilot's hook pattern, without the eta-expansion).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+
+        fun measure(text: str): i32 {
+            text.len()
+        }
+
+        fun main() {
+            let hook: Shared<|str| i32> = Shared::new(measure);
+            let stored = hook.read();
+            print(stored("abcd"));
+        }
+        main();
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn a_mismatched_function_still_fails_closure_positions() {
+    // Wrong parameter type: no coercion, the mismatch error stays.
+    assert_fails(
+        r#"
+        fun apply(seed: i32, transform: |i32| i32): i32 {
+            transform(seed)
+        }
+
+        fun shout(text: str): str {
+            text + "!"
+        }
+
+        fun main() {
+            apply(3, shout);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_generic_function_does_not_coerce() {
+    // Rule 2: no single value exists for a generic function (which
+    // instantiation?) — deferred, still the mismatch error.
+    assert_fails(
+        r#"
+        fun apply(seed: i32, transform: |i32| i32): i32 {
+            transform(seed)
+        }
+
+        fun identity<T>(value: T): T {
+            value
+        }
+
+        fun main() {
+            apply(3, identity);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn an_async_function_does_not_coerce() {
+    // Rule 4: a call through a plain closure value is not awaited, so the
+    // coerced value would leak a raw promise — rejected.
+    assert_fails(
+        r#"
+        fun apply(seed: i32, transform: |i32| i32): i32 {
+            transform(seed)
+        }
+
+        async fun slow_double(n: i32): i32 {
+            n * 2
+        }
+
+        fun main() {
+            apply(3, slow_double);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_context_reading_function_still_cannot_be_a_value() {
+    // Rule 5: coercion doesn't bypass the context pass — a needs-context
+    // function used as a value keeps its value-use rejection (its hidden
+    // parameter can't thread through an indirect call).
+    let source = r#"
+        import std::context::Context;
+
+        let scope: Context<i32> = Context::new();
+
+        fun reads_scope(): i32 {
+            scope.get()
+        }
+
+        fun apply(transform: || i32): i32 {
+            transform()
+        }
+
+        fun main() {
+            let result = scope.run(7, || apply(reads_scope));
+        }
+        main();
+        "#;
+    match compile(source) {
+        Ok(_) => panic!("expected the context value-use rejection, but it compiled"),
+        Err(errors) => assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("can't be used as a value")),
+            "no diagnostic mentions the value-use rule; got: {errors:#?}"
+        ),
+    }
+}
+
+#[test]
+fn an_imported_function_coerces_across_modules() {
+    // The reference resolves through an import binding (browser layer:
+    // `std::router::segments` is a plain vilan fn) — the coercion and the
+    // emitted value must both follow the alias to the defining function.
+    assert_compiles_browser(
+        r#"
+        import std::router::segments;
+
+        fun apply(path: str, transform: |str| List<str>): List<str> {
+            transform(path)
+        }
+
+        fun main() {
+            let parts = apply("/a/b", segments);
+        }
+        "#,
+    );
+}
+
+// --- B75: calling a fn-typed binding (fn-coercion.md §4) --------------------
+//
+// `let f = helper; f(1)` used to fail with "cannot call this as a function: it
+// is fn helper(i32): i32". `fn-coercion.md` §4 recorded the opposite ("calling
+// such a binding works as before"), so this was a hole, not a refusal: the call
+// resolver dispatched on the subject's ENTITY (a binding, not a declaration) and
+// never read its TYPE. It reads it now, through the same eligibility predicate
+// B20's coercion uses — one rule for what a `fun` value is, so the two can never
+// disagree. Emission needed nothing: a fn reference already emits as its own
+// (mangled) name, which is why the ANNOTATED form already worked.
+
+#[test]
+fn a_fn_typed_binding_calls() {
+    // The filed shape, end to end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            print(f(1));
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_nested_fn_typed_binding_calls() {
+    // A `fun` declared inside another function (B71's neighbourhood, where this
+    // was found) is the same value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            fun helper(i: i32): i32 {
+                i * 3
+            }
+            let f = helper;
+            print(f(4));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_calls_at_every_arity() {
+    // Arity is the parameter list of the DECLARATION, so zero-, one- and
+    // multi-parameter forms all have to come through the one path — and a
+    // void-returning one has no declared return to read.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun nothing(): i32 {
+            7
+        }
+
+        fun two(a: i32, b: i32): i32 {
+            a * b
+        }
+
+        fun shout(text: str) {
+            print(text);
+        }
+
+        fun main() {
+            let n = nothing;
+            let t = two;
+            let s = shout;
+            print(n());
+            print(t(3, 4));
+            s("hi");
+        }
+        main();
+        "#,
+        "7\n12\nhi\n",
+    );
+}
+
+#[test]
+fn a_rebound_fn_typed_binding_still_calls() {
+    // The type rides through a chain of bindings — each `let` copies
+    // `Type::Function(id)`, so the last one resolves the same declaration.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 10
+        }
+
+        fun main() {
+            let f = helper;
+            let g = f;
+            let h = g;
+            print(h(5));
+        }
+        main();
+        "#,
+        "15\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_composes_with_the_b20_coercion() {
+    // The two directions must compose: bind a `fun` unannotated, CALL it, and
+    // also hand the same binding to a closure-typed parameter (where B20's
+    // coercion converts it). One value, both uses, in one program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            transform(value)
+        }
+
+        fun main() {
+            let f = double;
+            print(f(4));
+            print(apply(f, 5));
+        }
+        main();
+        "#,
+        "8\n10\n",
+    );
+}
+
+#[test]
+fn a_closure_typed_parameter_rebinds_and_calls() {
+    // The receiving end: a closure-typed parameter rebound to a plain `let` and
+    // called through the copy. This one always worked (the parameter's declared
+    // type is `Type::Closure`); it pins that widening the call operator did not
+    // disturb it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            let inner = transform;
+            inner(value)
+        }
+
+        fun main() {
+            print(apply(double, 6));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arguments() {
+    // Resolving through the declaration is what buys the ordinary checks: a
+    // wrong argument TYPE through a binding reports like any other call.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f("text");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arity() {
+    // The arity check comes from the same path, so it reports the declaration's
+    // parameter count rather than silently accepting — and (S4,
+    // editing-dx.md §6.2) names it by the DECLARATION's name, `helper`, even
+    // though the call goes through the binding `f`.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f(1, 2);
+        }
+        "#,
+        "`helper` expects 1 argument, but got 2 instead.",
+    );
+}
+
+// --- S4: count messages name their subject (editing-dx.md §6-7) -----------
+// `Expected 2 arguments, but got 1 instead.` named neither the callee nor
+// what was missing; a struct-field count named neither the struct. Both now
+// do, and the too-few direction also names the missing parameter/field by
+// name and (for a call) its declared type — arguments and fields bind
+// positionally/by-name, so which one is missing is unambiguous. Too many
+// names the callee (P15/P16) but, for a call, not which argument is extra
+// (B4: no principled guess); a struct literal's extra field IS identifiable
+// (P18), since fields are named.
+
+// P15 — a plain function call, too few arguments.
+#[test]
+fn call_argument_count_too_few_names_the_callee_and_the_missing_parameter() {
+    assert_fails_spanning(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3);
+        }
+        "#,
+        "(3)",
+        "`distance` expects 2 arguments, but got 1 instead: `y: i32` is missing.",
+    );
+}
+
+// P15 — the same call, too many arguments: the callee is named; which
+// argument is extra is not (B4 — no principled guess).
+#[test]
+fn call_argument_count_too_many_names_only_the_callee() {
+    assert_fails_spanning(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3, 4, 5);
+        }
+        "#,
+        "(3, 4, 5)",
+        "`distance` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// The C3 "declared here" note (editing-dx.md §17.3, the residual §16
+// deferred): an arity mismatch also notes the callee's OWN declaration, in
+// the wording the codebase already uses for this note
+// (``` `{name}` is declared here ```, const_eval.rs / init_order.rs) — so a
+// call far from its definition doesn't leave the reader hunting for it.
+#[test]
+fn call_argument_count_notes_the_callees_declaration() {
+    assert_fails_noting(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3);
+        }
+        "#,
+        "`distance` expects 2 arguments",
+        "distance",
+        "`distance` is declared here",
+    );
+}
+
+// P16 — a method call behaves identically, naming the METHOD (not the
+// receiver or the struct).
+#[test]
+fn method_argument_count_too_few_names_the_method_and_the_missing_parameter() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1);
+        }
+        "#,
+        "(1)",
+        "`shift` expects 2 arguments, but got 1 instead: `dy: i32` is missing.",
+    );
+}
+
+#[test]
+fn method_argument_count_too_many_names_only_the_method() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1, 2, 3);
+        }
+        "#,
+        "(1, 2, 3)",
+        "`shift` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// The C3 note again, for a METHOD's arity: notes the method's own
+// declaration inside `impl Point`, not the struct itself — `declared_here_
+// note` resolves `member_id` the same way `callable_name` does.
+#[test]
+fn method_argument_count_notes_the_methods_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1);
+        }
+        "#,
+        "`shift` expects 2 arguments",
+        "shift",
+        "`shift` is declared here",
+    );
+}
+
+// P17 — a wrapped argument list clamps its span to the first line: a count
+// is a property of the whole list, not of how many lines the formatter
+// split it across (§13.3). Checked by byte offset, not `assert_fails_spanning`,
+// because the clamped span is not a source SUBSTRING (it ends mid-line at
+// the newline, not at a token boundary the snippet-search would find).
+#[test]
+fn call_argument_count_span_clamps_to_the_first_line_of_a_wrapped_list() {
+    let source = "
+        fun distance(x: i32, y: i32): i32 {
+        \tx + y
+        }
+
+        fun main() {
+        \tdistance(
+        \t\t3,
+        \t);
+        }
+        ";
+    let diagnostics = failure_diagnostics(source);
+    let (message, range) = diagnostics
+        .iter()
+        .find(|(message, _)| message.contains("`distance` expects 2 arguments"))
+        .expect("the arity diagnostic is published");
+    assert_eq!(
+        message,
+        "`distance` expects 2 arguments, but got 1 instead: `y: i32` is missing.",
+    );
+    let call_open_paren = source.rfind("distance(").unwrap() + "distance".len();
+    let first_line_end = source[call_open_paren..].find('\n').unwrap() + call_open_paren;
+    assert_eq!(
+        range.start, call_open_paren,
+        "starts at the argument list's `(`"
+    );
+    assert!(
+        range.end <= first_line_end,
+        "clamped to the first line: {range:?} runs past {first_line_end} into the second"
+    );
+    assert!(
+        range.end > call_open_paren,
+        "not clamped into nothing: {range:?}"
+    );
+}
+
+// P18 — a struct initializer, too few fields: names the struct and the
+// missing field; the brace region stays the anchor (the gap has no
+// narrower home).
+#[test]
+fn struct_initializer_field_count_too_few_names_the_struct_and_the_missing_field() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3 };
+        }
+        "#,
+        "{ x = 3 }",
+        "`Point` expects 2 fields, but got 1 instead: `y` is missing.",
+    );
+}
+
+// P18 — too many fields: unlike an extra call argument, an extra struct
+// field IS identifiable (fields are named), so this direction gets a steer
+// too, and the anchor moves to the offending field's NAME.
+#[test]
+fn struct_initializer_field_count_too_many_names_the_struct_and_spans_the_extra_field() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3, y = 4, z = 5 };
+        }
+        "#,
+        "z",
+        "`Point` expects 2 fields, but got 3 instead: `z` is not a field of `Point`.",
+    );
+}
+
+// The C3 note for a struct-field count mismatch: notes the struct's OWN
+// declaration, the same wording and mechanism as the call-arity notes
+// above, built by hand at the initializer's own push site (the subject is
+// a `Struct`, which `declared_here_note` — scoped to callables — does not
+// resolve).
+#[test]
+fn struct_initializer_field_count_notes_the_structs_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3 };
+        }
+        "#,
+        "`Point` expects 2 fields",
+        "Point",
+        "`Point` is declared here",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_types_its_result() {
+    // The call's TYPE is the declaration's return type, not `Unknown`: a `str`
+    // result used as an `i32` has to fail.
+    assert_fails_with(
+        r#"
+        fun name(): str {
+            "x"
+        }
+
+        fun main() {
+            let f = name;
+            let n: i32 = f();
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+// The four functions with no value form (`fn-coercion.md` §1 rules 1-4,
+// `spec/types.md` §5.8). Each is DEFERRED there with its own reason, so a
+// binding cannot hold one to call either — pinned so that widening the call
+// operator can never quietly widen the value form with it. Each message names
+// the disqualifying property, which is what the tour promises ("the compiler
+// will tell you when you hit one").
+
+#[test]
+fn a_generic_fn_typed_binding_does_not_call() {
+    // Rule 2. Left open, this MISCOMPILED: the binding emits the declaration's
+    // name, monomorphization mints instance names from a disjoint pool, and the
+    // call reached a name specialization never produced (`$a is not defined`).
+    assert_fails_with(
+        r#"
+        fun identity<T>(x: T): T {
+            x
+        }
+
+        fun main() {
+            let f = identity;
+            let n = f(1);
+        }
+        "#,
+        "a generic function has no single value",
+    );
+}
+
+#[test]
+fn an_async_fn_typed_binding_does_not_call() {
+    // Rule 4. Left open, this compiled and printed `Promise { 2 }`: a call
+    // through a value is not awaited (the J2 gap), so the promise leaks.
+    assert_fails_with(
+        r#"
+        async fun fetchy(i: i32): i32 {
+            i + 1
+        }
+
+        async fun main() {
+            let f = fetchy;
+            let n = f(1);
+        }
+        "#,
+        "an `async` function has no value form",
+    );
+}
+
+#[test]
+fn a_method_fn_typed_binding_does_not_call() {
+    // Rule 3 — `x.method` as a value means receiver capture, deferred there.
+    // `Bag::bump` types as `fn bump(Bag): i32`, so without the gate it would
+    // have become callable as a side effect of this change.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+
+        impl Bag {
+            fun bump(self): i32 {
+                self.n + 1
+            }
+        }
+
+        fun main() {
+            let f = Bag::bump;
+            let b = Bag { n = 1 };
+            let n = f(b);
+        }
+        "#,
+        "a method has no value form",
+    );
+}
+
+#[test]
+fn an_external_fn_typed_binding_does_not_call() {
+    // Rule 1 — an extern's binding forms are call-shaped, so there is no sound
+    // value to hold.
+    assert_fails_with(
+        r#"
+        [extern("parseInt")]
+        external fun parse_int(text: str): i32;
+
+        fun main() {
+            let f = parse_int;
+            let n = f("12");
+        }
+        "#,
+        "an `external` function has no value form",
+    );
+}
+
+// --- K5: `std::time` + i53 on the wire (kolt-migration.md §2.5) --------------
+//
+// The runtime surface (arithmetic, describe, ISO, codec round-trips, sleep) is
+// pinned by the corpus (`vilan/test/time.vl`, node-run; interpreter-excluded —
+// host clock). These pin the compile-level rules.
+
+#[test]
+fn the_clock_is_not_const_evaluable() {
+    // `now()` reads the host clock — an impure capability. A `const` forcing
+    // it must fail at compile time, not fold a build-machine timestamp into
+    // the program.
+    let source = r#"
+        import std::time::now;
+        import std::print;
+
+        fun main() {
+            let moment = const now();
+            print(moment.millis);
+        }
+        main();
+        "#;
+    match compile(source) {
+        Ok(_) => panic!("expected `const now()` to be rejected, but it compiled"),
+        Err(errors) => assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unknown host call `Date.now`")),
+            "no diagnostic rejects the host clock under const; got: {errors:#?}"
+        ),
+    }
+}
+
+#[test]
+fn time_is_platform_neutral() {
+    // `Date.now`/`Date`/`setTimeout` exist on every host, so the module lives
+    // in the base layer: the same program compiles for node AND browser.
+    let source = r#"
+        import std::time::{ now, sleep_for, Instant, Duration };
+
+        async fun main() {
+            let anchor = Instant { millis = 0i53 };
+            let age = now().since(anchor) + Duration::minutes(1);
+            let _rendered = age.describe();
+            let _shifted = now() - Duration::hours(1) + Duration::seconds(30);
+            sleep_for(Duration::millis(1i53));
+        }
+        "#;
+    assert_compiles(source);
+    assert_compiles_browser(source);
+}
+
+#[test]
+fn i53_fields_are_wire() {
+    // The K5 blocker, closed: `i53` is a Wire scalar (its own serializer
+    // channel), so timestamps and row ids ride derives directly — including
+    // nested through `Instant` and `List`/`Option`.
+    assert_compiles(
+        r#"
+        import std::time::Instant;
+        import std::option::Option;
+
+        [derive(Wire)]
+        struct Task {
+            id: i53,
+            created_at: Instant,
+            due: Option<i53>,
+            checkpoints: List<i53>,
+        }
+
+        fun main() {
+            let _task = Task {
+                id = 9007199254740991i53,
+                created_at = Instant { millis = 0i53 },
+                due = Option::None,
+                checkpoints = [1i53, 2i53],
+            };
+        }
+        "#,
+    );
+}
+
+#[test]
+fn i53_signatures_are_rpc_legal() {
+    // The `[rpc]` Wire-signature rule shares the scalar set: i53 parameters
+    // and returns are legal.
+    assert_compiles(
+        r#"
+        import std::reactive::Signal;
+
+        [service(TickClient)]
+        struct Ticker {
+            [expose] latest: Signal<i53>,
+        }
+
+        impl Ticker {
+            [rpc]
+            fun record(self, at: i53): i53 {
+                at
+            }
+        }
+
+        fun main() {
+            let _ticker = Ticker { latest = Signal::new(0i53) };
+        }
+        "#,
+    );
+}
+
+#[test]
+fn non_wire_fields_still_fail() {
+    // The gate holds around the new scalar: a closure-typed field is still
+    // rejected by the Wire boundary.
+    assert_fails_spanning(
+        r#"
+        [derive(Wire)]
+        struct Holder {
+            callback: |i53| i53,
+        }
+        "#,
+        "|i53| i53",
+        "which is not Wire",
+    );
+}
+
+// --- `std::time::Timer` — the cancelable timer -------------------------------
+//
+// `setTimeout`/`clearTimeout` as one value (backlog-2026-07-18.md's "per-task
+// cancel handles" first field case). One pin per numbered semantic. Every
+// timing here is ORDERING, never a wall-clock race: a timer armed before a
+// longer sleep has fired by the time that sleep returns (node's timer list is
+// expiry-ordered), and everything else is cancel-before-fire.
+
+#[test]
+fn timer_after_starts_the_host_timer_at_construction() {
+    // §1 — the clock starts at `after`, not at the first `wait`. The
+    // discriminator is a race the two readings decide differently: the timer
+    // is armed for 60ms and left alone for 90ms, then its `wait` is run
+    // against a fresh 30ms sleep. Started at construction it has already
+    // fired, so its wait resolves on the microtask queue and wins; started
+    // lazily at `wait` it would need 60ms and lose to the 30ms sleeper.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        import std::task::nursery;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(60);
+            sleep(90);
+
+            let order: Shared<List<str>> = Shared::new([]);
+            nursery(|n| {
+                let _fired = async {
+                    order.write().push(i"timer:{timer.wait()}");
+                };
+                let _slept = async {
+                    sleep(30);
+                    order.write().push("sleep");
+                };
+            });
+            for mark in order.read() {
+                print(mark);
+            }
+        }
+        main();
+        "#,
+        "timer:true\nsleep\n",
+    );
+}
+
+#[test]
+fn timer_after_for_mirrors_sleep_for() {
+    // §1 — the `Duration` spelling is the same timer (an i32-ms cap, like
+    // `sleep_for`): armed at construction, fires, verdict `true`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Duration, Timer };
+
+        fun main() {
+            let timer = Timer::after_for(Duration::millis(1i53));
+            sleep(30);
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn timer_wait_gives_concurrent_waiters_one_verdict() {
+    // §2 — two tasks parked on the same PENDING timer both observe the one
+    // verdict when it fires.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        import std::task::nursery;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(20);
+            let seen: Shared<List<str>> = Shared::new([]);
+            nursery(|n| {
+                let _one = async {
+                    seen.write().push(i"one:{timer.wait()}");
+                };
+                let _two = async {
+                    seen.write().push(i"two:{timer.wait()}");
+                };
+            });
+            for mark in seen.read() {
+                print(mark);
+            }
+        }
+        main();
+        "#,
+        "one:true\ntwo:true\n",
+    );
+}
+
+#[test]
+fn timer_wait_after_settlement_returns_the_memoized_verdict() {
+    // §2 — the verdict is MEMOIZED, not a second timer: waiting a settled
+    // timer answers immediately, as often as you ask, on both verdicts.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let fired = Timer::after(1);
+            sleep(30);
+            print(i"{fired.wait()} {fired.wait()}");
+
+            let called_off = Timer::after(60000);
+            called_off.cancel();
+            print(i"{called_off.wait()} {called_off.wait()}");
+        }
+        main();
+        "#,
+        "true true\nfalse false\n",
+    );
+}
+
+#[test]
+fn timer_cancel_before_settlement_resolves_waiters_false() {
+    // §3 — a waiter parked before the cancel resolves `false` at once, and so
+    // does everyone who asks afterwards.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::nursery;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(60000);
+            nursery(|n| {
+                let _waiter = async {
+                    print(i"waiter:{timer.wait()}");
+                };
+                sleep(5);
+                timer.cancel();
+            });
+            print(i"after:{timer.wait()}");
+        }
+        main();
+        "#,
+        "waiter:false\nafter:false\n",
+    );
+}
+
+#[test]
+fn timer_cancel_clears_the_host_timer() {
+    // §3 — the other half of `cancel`, which stdout cannot show: settling the
+    // verdict is not enough, the host timer must be CLEARED or a cancelled
+    // timer would go on holding the process open (see
+    // `a_pending_timer_keeps_the_process_alive`). Pinned on the emitted
+    // helper, since process-exit timing is only observable as a wall-clock
+    // race.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(60000);
+            timer.cancel();
+            print(timer.wait());
+        }
+        main();
+        "#,
+    )
+    .expect("a timer program compiles");
+    assert!(
+        js.contains("\tcancel() {\n\t\tif (this.settled) return;\n\t\tclearTimeout(this.id);\n"),
+        "`cancel` must clear the host timer before settling: {js}"
+    );
+}
+
+#[test]
+fn timer_cancel_after_firing_is_a_no_op() {
+    // §3 — first settlement wins forever: a late cancel never rewrites a
+    // `true` verdict into a `false` one.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(1);
+            sleep(30);
+            timer.cancel();
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn timer_cancel_is_idempotent() {
+    // §3 — cancelling twice is cancelling once; the second call finds the
+    // timer settled and does nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(60000);
+            timer.cancel();
+            timer.cancel();
+            timer.cancel();
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn a_cancelling_nursery_tears_down_the_waiter_but_not_the_timer() {
+    // §4 — the sharp distinction. `wait` carries the ambient cancel signal the
+    // way `sleep` does, so a cancelling nursery unwinds the task that was
+    // awaiting (neither UNREACHED line prints) — but that is structured
+    // teardown of ONE waiter, not a verdict: the timer is neither settled nor
+    // cleared, so afterwards `waited` still fires `true` and `called_off` is
+    // still cancellable to `false` by the holder of the value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::nursery;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let waited = Timer::after(60);
+            let called_off = Timer::after(60);
+            nursery(|n| {
+                let _a = async {
+                    print(i"UNREACHED-a:{waited.wait()}");
+                };
+                let _b = async {
+                    print(i"UNREACHED-b:{called_off.wait()}");
+                };
+                sleep(5);
+                n.cancel();
+            });
+            print("nursery returned");
+            called_off.cancel();
+            print(i"called_off:{called_off.wait()}");
+            print(i"waited:{waited.wait()}");
+        }
+        main();
+        "#,
+        "nursery returned\ncalled_off:false\nwaited:true\n",
+    );
+}
+
+#[test]
+fn a_timer_that_fires_with_no_waiters_memoizes_true() {
+    // §5 — nothing has to be awaiting a timer for it to run out; the verdict
+    // is waiting when someone finally asks.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(1);
+            sleep(30);
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn a_pending_timer_keeps_the_process_alive() {
+    // §6 — parity with `sleep`, and no unref knob. `main` returns with the
+    // timer pending and the only other thing in flight a task awaiting it. A
+    // pending promise does NOT hold node open by itself, so the second line
+    // prints only because the host timer does.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(30);
+            let _watcher = async {
+                print(i"fired:{timer.wait()}");
+            };
+            print("main done");
+        }
+        main();
+        "#,
+        "main done\nfired:true\n",
+    );
+}
+
+#[test]
+fn copying_a_timer_shares_the_underlying_host_timer() {
+    // §7 — an ordinary value wrapping one external handle, like `Signal`:
+    // assigning it and passing it to a function both alias the ONE timer, so
+    // a cancel through any copy settles every copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun call_off(timer: Timer) {
+            timer.cancel();
+        }
+
+        fun main() {
+            let original = Timer::after(60000);
+            let copy = original;
+            copy.cancel();
+            print(i"{original.wait()} {copy.wait()}");
+
+            let passed = Timer::after(60000);
+            call_off(passed);
+            print(passed.wait());
+        }
+        main();
+        "#,
+        "false false\nfalse\n",
+    );
+}
+
+#[test]
+fn timers_are_platform_neutral() {
+    // `setTimeout`/`clearTimeout` exist on every host, so `Timer` stays in
+    // std's base layer alongside `sleep` — the same program compiles for node
+    // AND browser.
+    let source = r#"
+        import std::time::{ Duration, Timer };
+
+        fun main() {
+            let timer = Timer::after_for(Duration::seconds(1i53));
+            let _verdict = timer.wait();
+            timer.cancel();
+        }
+        "#;
+    assert_compiles(source);
+    assert_compiles_browser(source);
+}
+
+// --- B22: return-expectation inference bound to the caller's generics --------
+//
+// A call's return-type-only generic inference (the `let n: Cell<i32> =
+// Cell::fresh()` gap-filler) must bind only the CALLEE's own generics. When an
+// abstract argument already bound the callee's `T` to the caller's `T`, the
+// substituted return type's generics are the caller's — unifying THOSE against
+// the expectation wrote a caller-keyed entry into the call's substitution map,
+// and the bound check then demanded the caller generic's bounds of whatever it
+// unified with (a raw unbounded struct binder), rejecting valid code.
+
+#[test]
+fn a_bounded_caller_constructs_an_unbounded_struct_via_a_generic_static_new() {
+    // The motivating shape (std::reactive's `draft()`): `fun draft<T:
+    // PartialEq>` building a struct whose field is made by an UNBOUNDED
+    // generic container's static `new`. The field expectation mentions the
+    // struct's raw binder; the call's return mentions the caller's `T` — the
+    // poison unification paired the two and demanded `PartialEq` of the
+    // struct binder.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+
+        struct Cell<T> {
+            value: T,
+        }
+
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> {
+                Cell { value }
+            }
+        }
+
+        struct Box<T> {
+            inner: Cell<T>,
+        }
+
+        fun boxed<T: PartialEq>(initial: T): Box<T> {
+            Box {
+                inner = Cell::new(initial),
+            }
+        }
+
+        fun main() {
+            let held = boxed(3);
+            print(held.inner.value);
+        }
+        main();
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn two_bounded_generics_construct_two_unbounded_fields() {
+    // Multi-parameter form: each field's constructor call must stay keyed to
+    // its own binding — before the fix BOTH `A` and `B` were rejected.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+
+        struct Cell<T> {
+            value: T,
+        }
+
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> {
+                Cell { value }
+            }
+        }
+
+        struct Duo<A, B> {
+            left: Cell<A>,
+            right: Cell<B>,
+        }
+
+        fun paired<A: PartialEq, B: PartialEq>(first: A, second: B): Duo<A, B> {
+            Duo {
+                left = Cell::new(first),
+                right = Cell::new(second),
+            }
+        }
+
+        fun main() {
+            let held = paired(1, "two");
+            print(held.left.value);
+            print(held.right.value);
+        }
+        main();
+        "#,
+        "1\ntwo\n",
+    );
+}
+
+#[test]
+fn a_nested_generic_argument_still_binds_through_the_expectation() {
+    // Nested form: the caller's `T` sits INSIDE the callee's binding
+    // (`Cell::new([initial])` binds the callee's `T` to `List<T_caller>`).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+
+        struct Cell<T> {
+            value: T,
+        }
+
+        impl Cell<type T> {
+            fun new(value: T): Cell<T> {
+                Cell { value }
+            }
+        }
+
+        struct Box<T> {
+            inner: Cell<List<T>>,
+        }
+
+        fun boxed<T: PartialEq>(initial: T): Box<T> {
+            Box {
+                inner = Cell::new([initial]),
+            }
+        }
+
+        fun main() {
+            let held = boxed(7);
+            print(held.inner.value[0]);
+        }
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn return_type_only_inference_still_binds_a_static_generic() {
+    // The feature the merge exists for keeps working: no argument mentions
+    // `T`, so the expectation is the only thing that can bind it — the
+    // callee's own return-type generic must still be inferred.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Cell<T> {
+            value: List<T>,
+        }
+
+        impl Cell<type T> {
+            fun fresh(): Cell<T> {
+                Cell { value = [] }
+            }
+        }
+
+        fun main() {
+            let cell: Cell<i32> = Cell::fresh();
+            print(cell.value.len());
+        }
+        main();
+        "#,
+        "0\n",
+    );
+}
+
+// --- Draft<T>: local-first cells (std::reactive, kolt-migration §3) ----------
+//
+// `draft(initial, commit)` is a local-first cell: edits land in `local`
+// FIRST (`push` spawns the commit, never awaits it), `adopt` folds in remote
+// changes without fighting in-flight edits, and failure KEEPS the local value
+// (unlike `optimistic`'s rollback — right for one-shot actions, hostile
+// mid-typing). Conflicts are last-write-wins.
+
+#[test]
+fn draft_push_is_local_first_and_settles_synced() {
+    // `push` returns with `local` set and the state Dirty while the commit
+    // is still on the wire; the settle lands afterwards.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let committed: Shared<List<str>> = Shared::new([]);
+            let name = draft("seed", |value: str| {
+                sleep_for(Duration::millis(5));
+                committed.write().push(value);
+                None
+            });
+            print(name.state.get() == DraftState::Synced);
+            name.push("edit");
+            print(name.local.get());
+            print(name.state.get() == DraftState::Dirty);
+            sleep_for(Duration::millis(20));
+            print(name.state.get() == DraftState::Synced);
+            print(committed.read().len());
+        }
+        main();
+        "#,
+        "true\nedit\ntrue\ntrue\n1\n",
+    );
+}
+
+#[test]
+fn draft_adopt_echo_is_a_no_op() {
+    // A pushed value reflected back by the remote (the mirror echo) changes
+    // nothing — state stays Synced, `local` untouched.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let name = draft("seed", |value: str| {
+                let _sent = value;
+                None
+            });
+            name.push("edit");
+            sleep_for(Duration::millis(10));
+            name.adopt("edit");
+            print(name.local.get());
+            print(name.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "edit\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_adopt_takes_remote_when_local_is_clean() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let name = draft("seed", |value: str| {
+                let _sent = value;
+                None
+            });
+            name.adopt("remote");
+            print(name.local.get());
+            print(name.synced.read());
+            print(name.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "remote\nremote\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_failure_keeps_the_local_value() {
+    // Unlike `optimistic`, no rollback: the user's text survives the failed
+    // commit, and the state carries the reason.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sour = draft("base", |value: str| {
+                let _sent = value;
+                Some("boom")
+            });
+            sour.push("mine");
+            sleep_for(Duration::millis(10));
+            print(sour.state.get() == DraftState::Failed("boom"));
+            print(sour.local.get());
+            print(sour.synced.read());
+        }
+        main();
+        "#,
+        "true\nmine\nbase\n",
+    );
+}
+
+#[test]
+fn draft_dirty_local_survives_adoption() {
+    // Last-write-wins: a dirty local ignores the remote value in `local`
+    // (the user's text wins for now) while `synced` records it, so the
+    // eventual push knowingly overwrites.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sour = draft("base", |value: str| {
+                let _sent = value;
+                Some("boom")
+            });
+            sour.push("mine");
+            sleep_for(Duration::millis(10));
+            sour.adopt("theirs");
+            print(sour.local.get());
+            print(sour.synced.read());
+        }
+        main();
+        "#,
+        "mine\ntheirs\n",
+    );
+}
+
+#[test]
+fn draft_generation_guard_discards_superseded_pushes() {
+    // Fast typing over a slow wire: the first push's commit lands LAST, but
+    // only the newest push settles the state — the stale completion is
+    // discarded.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let raced = draft("start", |value: str| {
+                if value == "slow" {
+                    sleep_for(Duration::millis(30));
+                } else {
+                    sleep_for(Duration::millis(5));
+                }
+                None
+            });
+            raced.push("slow");
+            raced.push("fast");
+            sleep_for(Duration::millis(60));
+            print(raced.local.get());
+            print(raced.synced.read());
+            print(raced.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "fast\nfast\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_push_publishes_one_coherent_wave() {
+    // A lifecycle transition writes TWO signals (`local` and `state`), so an
+    // observer of both must never see half of one
+    // (`proposal/optimistic-lifecycle.md` §5). Under a UI boundary turn they
+    // coalesced already — `View.on` wraps every dispatch — but with NO ambient
+    // turn (a node program, SSR, a test) `push` published the new text still
+    // claiming `Synced` before publishing `Dirty`. `batch` joins the ambient
+    // turn when there is one and creates one when there is not, so the middle
+    // is unobservable either way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState, combine };
+        import std::option::Option::{ self, Some, None };
+        import std::time::{ sleep_for, Duration };
+
+        fun label(state: DraftState): str {
+            match state {
+                DraftState::Synced => "synced",
+                DraftState::Dirty => "dirty",
+                DraftState::Failed(let reason) => reason,
+            }
+        }
+
+        fun main() {
+            let cell = draft("A", |value: str| {
+                let _sent = value;
+                sleep_for(Duration::millis(5));
+                let outcome: Option<str> = None;
+                outcome
+            });
+            let both = combine((cell.local, cell.state));
+            let _watch = both.sub(|pair| {
+                let (text, state) = pair;
+                print(i"{text}/{label(state)}");
+            });
+            cell.push("B");
+            sleep_for(Duration::millis(20));
+        }
+        main();
+        "#,
+        "A/synced\nB/dirty\nB/synced\n",
+    );
+}
+
+#[test]
+fn draft_adoption_publishes_one_coherent_wave() {
+    // The same rule on the other two-signal transition: `adopt`'s clean
+    // branch writes `local` and `state`, and must publish them together.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState, combine };
+        import std::option::Option::{ self, Some, None };
+
+        fun label(state: DraftState): str {
+            match state {
+                DraftState::Synced => "synced",
+                DraftState::Dirty => "dirty",
+                DraftState::Failed(let reason) => reason,
+            }
+        }
+
+        fun main() {
+            let cell = draft("A", |value: str| {
+                let _sent = value;
+                let outcome: Option<str> = None;
+                outcome
+            });
+            let both = combine((cell.local, cell.state));
+            let _watch = both.sub(|pair| {
+                let (text, state) = pair;
+                print(i"{text}/{label(state)}");
+            });
+            cell.adopt("remote");
+        }
+        main();
+        "#,
+        "A/synced\nremote/synced\n",
+    );
+}
+
+// --- Draft re-push on reconnect (A14, proposal/draft-reconnect.md) ----------
+//
+// `repush()` re-sends edits the remote never accepted — `local != synced`,
+// which covers an edit whose commit never left AND one caught in flight by
+// the drop. Wired to a transport's reconnect hook, a dropped connection
+// stops losing the user's work. Delivery is at-least-once, by construction.
+
+#[test]
+fn draft_repush_resends_edits_the_remote_never_accepted() {
+    // The outage shape: a commit that fail-fast rejects while down leaves
+    // `local` ahead of `synced`, and the re-push sends it EXACTLY once —
+    // then settles the draft, so a second reconnect sends nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let down: Shared<bool> = Shared::new(true);
+            let sent: Shared<List<str>> = Shared::new([]);
+            let title = draft("base", |value: str| {
+                sent.write().push(value);
+                if down.read() { Some("not connected") } else { None }
+            });
+
+            title.push("mine");
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(title.state.get() == DraftState::Failed("not connected"));
+            print(title.synced.read());
+
+            // The connection comes back.
+            down.write() = false;
+            title.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(title.synced.read());
+            print(title.state.get() == DraftState::Synced);
+
+            // A LATER reconnect has nothing left to send.
+            title.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+        }
+        main();
+        "#,
+        "1\ntrue\nbase\n2\nmine\ntrue\n2\n",
+    );
+}
+
+#[test]
+fn draft_repush_on_a_clean_draft_sends_nothing() {
+    // `local == synced` — the remote already has everything. A screen full
+    // of untouched drafts costs zero frames on reconnect.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let name = draft("seed", |value: str| {
+                sent.write().push(value);
+                None
+            });
+
+            // Never edited.
+            name.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+
+            // Edited, pushed, settled — clean again.
+            name.push("edit");
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            name.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(name.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "0\n1\n1\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_repush_is_at_least_once() {
+    // The documented hazard, pinned rather than hidden: a commit that
+    // SUCCEEDED server-side but whose acknowledgement was lost with the
+    // connection is indistinguishable from one that never arrived, so the
+    // re-push sends it again and the server sees it twice. Draft's own
+    // reconcile absorbs the duplicate (the state settles once, correctly);
+    // an appending commit closure would not.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let server_saw: Shared<List<str>> = Shared::new([]);
+            let ack_lost: Shared<bool> = Shared::new(true);
+            let title = draft("base", |value: str| {
+                // The server applies it either way.
+                server_saw.write().push(value);
+                if ack_lost.read() { Some("connection lost") } else { None }
+            });
+
+            title.push("mine");
+            sleep_for(Duration::millis(10));
+            ack_lost.write() = false;
+            title.repush();
+            sleep_for(Duration::millis(10));
+
+            print(server_saw.read().len());
+            print(server_saw.read()[0]);
+            print(server_saw.read()[1]);
+            print(title.state.get() == DraftState::Synced);
+            print(title.local.get());
+        }
+        main();
+        "#,
+        "2\nmine\nmine\ntrue\nmine\n",
+    );
+}
+
+#[test]
+fn draft_repush_rides_the_reconnect_hook_shape() {
+    // The composition the feature actually ships as: the hook is a plain
+    // `|| void` in a list, drained the way `handle_drop` drains
+    // `SocketDuplex.on_reconnect` — re-marked `async` at a `let` (J2's typed
+    // channel) so a hook that awaits does. One reconnect, one re-push.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let down: Shared<bool> = Shared::new(true);
+            let sent: Shared<List<str>> = Shared::new([]);
+            let title = draft("base", |value: str| {
+                sent.write().push(value);
+                if down.read() { Some("not connected") } else { None }
+            });
+
+            let on_reconnect: Shared<List<|| void>> = Shared::new([]);
+            on_reconnect.write().push(|| title.repush());
+
+            title.push("mine");
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+
+            // What the reconnect loop does after a successful re-dial.
+            down.write() = false;
+            for entry in on_reconnect.read() {
+                let hook: async || void = entry;
+                hook();
+            }
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(title.synced.read());
+        }
+        main();
+        "#,
+        "1\n2\nmine\n",
+    );
+}
+
+// --- Draft debounce (A14, proposal/draft-reconnect.md §5) -------------------
+//
+// `debounce(millis)` coalesces a burst of pushes into ONE commit, trailing
+// edge, over a real `std::time::Timer` — cancelling settles the verdict and
+// clears the host timeout. Local-first is untouched: the value and the
+// Dirty state still land synchronously; only the commit waits.
+
+#[test]
+fn draft_debounce_coalesces_a_burst_into_one_commit() {
+    // Three keystrokes inside the window produce one commit, carrying the
+    // LAST value. Without the window they produce three.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("a");
+            notes.push("ab");
+            notes.push("abc");
+            sleep_for(Duration::millis(150));
+
+            print(sent.read().len());
+            print(sent.read()[0]);
+            print(notes.synced.read());
+            print(notes.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "1\nabc\nabc\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_debounce_keeps_the_local_half_synchronous() {
+    // The window delays the COMMIT, never the keystroke: `local` and the
+    // Dirty state are set before `push` returns, exactly as undebounced.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("typed");
+            // Same instant: the user's text is there, the wire is not.
+            print(notes.local.get());
+            print(notes.state.get() == DraftState::Dirty);
+            print(sent.read().len());
+
+            sleep_for(Duration::millis(150));
+            print(sent.read().len());
+        }
+        main();
+        "#,
+        "typed\ntrue\n0\n1\n",
+    );
+}
+
+#[test]
+fn draft_commit_cancels_a_pending_debounce() {
+    // The explicit save (a blur, a Save button): the pending window is
+    // called off and the value goes now — exactly one commit, not the
+    // manual one plus the window's. The sleep deliberately outlasts the
+    // window, so a `commit` that failed to cancel shows up as a second
+    // commit rather than passing unobserved.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("typed");
+            notes.commit();
+            sleep_for(Duration::millis(150));
+
+            print(sent.read().len());
+            print(sent.read()[0]);
+            print(notes.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "1\ntyped\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_repush_cancels_a_pending_debounce() {
+    // A reconnect arriving mid-window: recovery is not typing, so the
+    // window is called off and the edit goes immediately. One commit — the
+    // sleep outlasts the window, so a re-push that sent WITHOUT cancelling
+    // shows up as the window's second commit.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("typed");
+            print(sent.read().len());
+            notes.repush();
+            sleep_for(Duration::millis(150));
+
+            print(sent.read().len());
+            print(sent.read()[0]);
+            print(notes.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "0\n1\ntyped\ntrue\n",
+    );
+}
+
+#[test]
+fn bind_draft_compiles_for_the_browser() {
+    // The ui seam: an input two-way bound to a draft (user input pushes;
+    // adoption writes `local` and bypasses the push path).
+    assert_compiles_browser(
+        r#"
+        import std::ui::{ view, View, mount_root };
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let name = draft("seed", |value: str| {
+                let _sent = value;
+                None
+            });
+            let _root = mount_root("app", || view("input").bind_draft(name));
+        }
+        main();
+        "#,
+    );
+}
+
+// --- B23: effect-closure parameter grounding (backlog.md §B.23) --------------
+
+#[test]
+fn an_effect_closures_unannotated_parameter_grounds_from_the_signal() {
+    // B23, FIXED: the inherited-trait-default path now records the trait's
+    // receiver bindings (so `effect`'s `|T| void` types concretely), and
+    // `resolve_match` defers on a not-yet-filled closure parameter instead
+    // of binding pattern captures against the enum's raw declaration.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Signal, Owner, run_with_owner };
+        import std::option::Option::{ self, Some, None };
+
+        struct Task {
+            name: str,
+        }
+
+        fun main() {
+            let entry: Signal<Option<Task>> = Signal::new(Some(Task { name = "a" }));
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                entry.effect(|current| {
+                    match current {
+                        Some(let task) => print(task.name),
+                        None => {},
+                    }
+                });
+            });
+        }
+        main();
+        "#,
+        "a\n",
+    );
+}
+
+#[test]
+fn an_annotated_effect_parameter_destructures_the_signals_payload() {
+    // The pinned workaround (and the kolt draft editor's shipped shape):
+    // annotating the parameter grounds everything downstream.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Signal, Owner, run_with_owner };
+        import std::option::Option::{ self, Some, None };
+
+        struct Task {
+            name: str,
+        }
+
+        fun main() {
+            let entry: Signal<Option<Task>> = Signal::new(Some(Task { name = "a" }));
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                entry.effect(|current: Option<Task>| {
+                    match current {
+                        Some(let task) => print(task.name),
+                        None => {},
+                    }
+                });
+            });
+        }
+        main();
+        "#,
+        "a\n",
+    );
+}
+
+// --- Notes finale: cross-source notes + the recorded refinements -------------
+
+#[test]
+fn a_missing_trait_member_renders_the_signature_and_notes_the_trait() {
+    // The conformance error names the member, renders the signature to
+    // write (B4), and its note points INTO std at the trait's own
+    // declaration (the first cross-source note).
+    let diagnostics = failure_diagnostics_with_notes(
+        r#"
+        import std::compare::PartialEq;
+        struct Point { x: i32 }
+        impl Point with PartialEq {}
+        fun main() {
+            let _p = Point { x = 1 };
+        }
+        "#,
+    );
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _, _)| message.contains("missing 'eq'"))
+        .collect();
+    assert!(!matching.is_empty(), "{diagnostics:#?}");
+    assert!(
+        matching
+            .iter()
+            .any(|(message, _, _)| message.contains("declare `fun eq(")),
+        "the expected signature must render: {matching:#?}"
+    );
+    assert!(
+        matching.iter().any(
+            |(_, _, note)| note.as_ref().is_some_and(|(msg, _, cross_source)| {
+                msg.contains("the trait declares it here") && *cross_source
+            })
+        ),
+        "the note must point into the trait's file: {matching:#?}"
+    );
+}
+
+#[test]
+fn a_bound_failure_notes_the_bounds_declaration() {
+    // "does not implement trait 'X', required by a generic bound" now notes
+    // WHERE that bound is declared — in the callee's own file (here: this
+    // one; std callees make it cross-source).
+    assert_fails_noting(
+        r#"
+        trait Greet {
+            fun greet(self): str;
+        }
+        struct Cat { name: str }
+        fun welcome<T: Greet>(guest: T): str {
+            guest.greet()
+        }
+        fun main() {
+            let _w = welcome(Cat { name = "tom" });
+        }
+        "#,
+        "does not implement trait 'Greet'",
+        "T",
+        "the bound is declared here",
+    );
+}
+
+// --- Diagnostics audit, batch 7: cascades demoted (standard B5) --------------
+
+#[test]
+fn a_root_error_does_not_cascade_into_residual_noise() {
+    // One unknown name used to produce the root error PLUS "type of
+    // variable … could not be resolved" (and friends) for everything
+    // downstream of it — five residuals for one cause in the worst
+    // observed wall. The residuals are near-information-free, so they
+    // surface only as the LONE signal.
+    let diagnostics = failure_diagnostics(
+        r#"
+        fun main() {
+            let text = zzz_missing(42);
+            let doubled = text;
+        }
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("cannot find 'zzz_missing'")),
+        "the root error must stand: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|(message, _)| !message.contains("could not be resolved")),
+        "residual cascade noise must be demoted behind the root: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn one_unresolved_name_does_not_cascade_across_many_use_sites() {
+    // The multi-use-site form (backlog item 7): one unknown name feeds EVERY
+    // residual-producing position — a plain variable, a field access, a call
+    // argument, a struct field, and a match subject. Each of these is a
+    // `could not be resolved` residual site (struct-initializer, field-
+    // accessor, variable, call-subject, match); the std-missing wall printed
+    // five of them for one cause before batch 7 demoted them (standard B5).
+    // The root must stand alone: no residual echoes it at any of the five.
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct Box { v: i32 }
+        fun take(x: i32): i32 { x }
+        fun main() {
+            let root = zzz_missing(1);
+            let via_var = root;
+            let via_field = root.field;
+            let via_call = take(root);
+            let via_struct = Box { v = root };
+            let via_match = match root {
+                _ => 1,
+            };
+        }
+        "#,
+    );
+    // Exactly one root error, once — not once per downstream use.
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|(message, _)| message.contains("cannot find 'zzz_missing'"))
+            .count(),
+        1,
+        "the root error must stand exactly once: {diagnostics:#?}"
+    );
+    // None of the five downstream positions emits a residual.
+    assert!(
+        diagnostics
+            .iter()
+            .all(|(message, _)| !message.contains("could not be resolved")),
+        "one unresolved name must not fan into `could not be resolved` residuals: {diagnostics:#?}"
+    );
+    // And no echo storm: the root plus at most the one call-subject
+    // consequence (`root` is called, so `zzz_missing(1)` also reports
+    // `cannot call ... void`) — never a per-use-site wall.
+    assert!(
+        diagnostics.len() <= 2,
+        "one unresolved name must not bury the user in echoes: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_unknown_struct_steers_to_its_import() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut table = Map { };
+        }
+        "#,
+        "unknown struct: Map; import it first (`import std::map::Map;`)",
+    );
+}
+
+// --- Diagnostics audit, batch 5: generated-code diagnostics (standard A2) ----
+
+#[test]
+fn a_diagnostic_in_generated_code_anchors_at_the_attribute() {
+    // The macro emits a function whose body mismatches its return type. The
+    // error used to anchor in the generated text (invisible; the LSP showed
+    // "(in generated code)" at 0..0); it now re-anchors at the ATTRIBUTE
+    // that produced the code, provenance said in the message.
+    let source = r#"
+        macro fun Applied(item: Item): Source {
+            source("fun oops(): i32 { \"text\" }")
+        }
+
+        [Applied]
+        struct Point { x: i32 }
+
+        fun main() {
+            let p = Point { x = 1 };
+        }
+        "#;
+    // The expected span is the ATTRIBUTE's name — the macro definition
+    // contains the same text earlier, so locate it via the bracket form.
+    let name_start = source.find("[Applied]").expect("attribute in source") + 1;
+    let expected = name_start..name_start + "Applied".len();
+    let diagnostics = failure_diagnostics(source);
+    assert!(
+        diagnostics.iter().any(|(message, range)| {
+            message.contains("in code generated by this attribute:")
+                && message.contains("Expected i32, but got str instead.")
+                && *range == expected
+        }),
+        "expected the generated-code error re-anchored at the attribute: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn e82_a_derive_refusal_anchors_at_the_attribute_not_the_generated_text() {
+    // `[derive(PartialEq)]` on a struct whose field type provides no
+    // `PartialEq` refuses inside the GENERATED `eq` — its field compare is an
+    // `==` the post-fixpoint binary-operator pass checks. That pass pushed
+    // without attributing, so the refusal kept the generated TEMPLATE's span
+    // while claiming the entry file and drew its label over whatever the
+    // entry held at those offsets (E82's live shape: a comment line). It
+    // re-anchors at the attribute that generated the code, provenance said in
+    // the message, exactly like every other generated-code diagnostic
+    // (standard A2, `a_diagnostic_in_generated_code_anchors_at_the_attribute`).
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        [derive(PartialEq)]
+        struct Widget { item: Opaque }
+
+        struct Opaque { x: i32 }
+
+        fun main() {
+            let w = Widget { item = Opaque { x = 1 } };
+            print(w.item.x);
+        }
+        "#,
+        "PartialEq",
+        "in code generated by this attribute: type 'Opaque' does not implement the `PartialEq` operator",
+    );
+}
+
+// --- Diagnostics audit, batch 3: method/call anchors (standard A1/A4) --------
+
+#[test]
+fn a_no_method_error_anchors_at_the_method_name() {
+    // The NAME identifies the problem, not the argument list it happens to
+    // be called with.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let text = "x";
+            text.launch(1, 2);
+        }
+        "#,
+        "launch",
+        "has no method 'launch'",
+    );
+}
+
+#[test]
+fn an_array_no_method_error_anchors_at_the_method_name() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            mut a = [0; 4];
+            a.push(1);
+        }
+        "#,
+        "push",
+        "has no method 'push'",
+    );
+}
+
+#[test]
+fn a_non_function_call_names_the_subjects_type() {
+    // "cannot call a non-function value" said nothing about WHAT the value
+    // was; it now renders the type and anchors at the subject.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let x = (42)(1);
+        }
+        "#,
+        "42",
+        "cannot call this as a function: it is i32",
+    );
+}
+
+// --- Diagnostics audit, batch 2: mismatch origins (standard B3) --------------
+
+#[test]
+fn a_reassignment_mismatch_notes_the_inferring_initializer() {
+    // `mut n = 1` fixed n's type invisibly; the later conflicting write
+    // names the origin as a note at the initializer (B3/C3).
+    assert_fails_noting(
+        r#"
+        fun main() {
+            mut n = 1;
+            n = "two";
+        }
+        "#,
+        "Expected i32, but got str instead.",
+        "1",
+        "the variable's type was inferred from this initializer (i32)",
+    );
+}
+
+#[test]
+fn an_annotated_variables_mismatch_stays_noteless() {
+    // With an annotation the origin is visible — no note (the message
+    // stands alone, exactly as before).
+    let diagnostics = failure_diagnostics_with_notes(
+        r#"
+        fun main() {
+            mut n: i32 = 1;
+            n = "two";
+        }
+        "#,
+    );
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _, _)| message.contains("Expected i32, but got str"))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "expected the mismatch: {diagnostics:#?}"
+    );
+    assert!(
+        matching.iter().all(|(_, _, note)| note.is_none()),
+        "an annotated variable's mismatch must not carry an inference note: {matching:#?}"
+    );
+}
+
+// --- Diagnostics audit, batch 1: name resolution steers (standard B4) --------
+//
+// "cannot find X" now steers to the import when X uniquely names a known
+// module's export — the common miss after the derive-leak fix made
+// `JsonValue` require its import. Ambiguous or unknown names stay silent
+// (a wrong steer is worse than none).
+
+#[test]
+fn an_unknown_type_steers_to_its_std_import() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let v: JsonValue = 1;
+        }
+        "#,
+        "cannot find type 'JsonValue'; import it first (`import std::json::JsonValue;`)",
+    );
+}
+
+#[test]
+fn an_unknown_value_steers_to_its_std_import() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let text = format(42);
+        }
+        "#,
+        "import std::display::format;",
+    );
+}
+
+#[test]
+fn an_unknown_trait_steers_to_its_std_import() {
+    assert_fails_with(
+        r#"
+        struct Point { x: i32 }
+        impl Point with PartialOrd {
+            fun partial_compare(self, b: Point): Option<Ordering> {
+                None
+            }
+        }
+        fun main() {}
+        "#,
+        "cannot find trait 'PartialOrd'; import it first (`import std::compare::PartialOrd;`)",
+    );
+}
+
+#[test]
+fn an_unknown_name_gets_no_bogus_steer() {
+    // No module exports `zzz_missing`; the message stays plain.
+    let diagnostics = failure_diagnostics(
+        r#"
+        fun main() {
+            let x = zzz_missing;
+        }
+        "#,
+    );
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _)| message.contains("cannot find 'zzz_missing'"))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "expected the plain error: {diagnostics:#?}"
+    );
+    assert!(
+        matching
+            .iter()
+            .all(|(message, _)| !message.contains("import it first")),
+        "an unknown name must not get a steer: {matching:#?}"
+    );
+}
+
+// --- The derive-import leak: expansion imports are scoped (FIXED) ------------
+//
+// A derive expansion self-carries its imports; they used to register into
+// the DERIVING module's scope, so `JsonValue` resolved after `[derive(Json)]`
+// with no import — and user code could silently depend on an invisible name.
+// Generated items now walk under a child scope (imports bind there only)
+// with the expansion's DEFINITIONS hoisted to the module by node-level name.
+
+#[test]
+fn a_derives_imports_no_longer_leak() {
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        struct Point { x: i32 }
+        fun main() {
+            let v: JsonValue = Point { x = 1 }.to_json();
+        }
+        "#,
+        "cannot find type 'JsonValue'",
+    );
+}
+
+#[test]
+fn a_derived_impl_stays_module_visible_and_explicit_imports_coexist() {
+    // The hoist keeps generated definitions usable from module code, and an
+    // explicit import of the same name a derive uses internally is fine.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::JsonValue;
+        [derive(PartialEq, Json)]
+        struct Point { x: i32 }
+        fun typed(value: JsonValue): JsonValue { value }
+        fun main() {
+            let a = Point { x = 1 };
+            let b = Point { x = 1 };
+            print(a == b);                          // true — the derived impl
+            print(Point { x = 2 }.to_json().len() > 0);   // true — Json derive
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+// --- B13 residual: a later conflicting call names the inferring one (FIXED) --
+
+#[test]
+fn a_conflicting_later_call_names_the_first_call_inference() {
+    // The first call fills an unannotated closure parameter's type; a later
+    // conflicting call used to read as a bare mismatch with no hint of WHERE
+    // i32 came from. It now names the origin and the fix.
+    // (`|x| print(x)` would not reproduce: `print`'s `any` parameter makes
+    // `x` adopt `any` through the argument-adoption channel before any call
+    // — the identity body keeps the parameter open until the first call.)
+    // The origin rides as a NOTE anchored at the FIRST call's argument
+    // (diagnostics-standard.md B3/C3); the message keeps the annotate steer.
+    assert_fails_noting(
+        r#"
+        fun main() {
+            let pass = |x| x;
+            let a = pass(1);
+            let b = pass("two");
+        }
+        "#,
+        "The parameter is unannotated; annotate it",
+        "1",
+        "inferred from this, the closure's first call",
+    );
+}
+
+#[test]
+fn consistent_later_calls_stay_clean() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let show = |x| print(x);
+            show(1);
+            show(2);
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+// --- B16 remainder: an unannotated Map::new() checked vacuously (FIXED) ------
+//
+// `mut table = Map::new(); table.insert("k", 1); table.insert(2, "v")`
+// COMPILED AND RAN, and a read came back under any annotation: Map is not a
+// slot container, so K/V never grounded and every argument check reconciled
+// against raw generics. The post-solve sweep now rejects any binding whose
+// final type keeps a generic declared in ANOTHER file (`Map::new`'s `K` can
+// never ground in user code) — general over containers, not Map-cased. A
+// generic declared in the SAME file stays legal (a generic function's own
+// body); the same-file leak shape is the recorded miss.
+
+#[test]
+fn an_unannotated_map_new_requires_an_annotation() {
+    assert_fails_with(
+        r#"
+        import std::map::Map;
+        fun main() {
+            mut table = Map::new();
+            table.insert("k", 1);
+        }
+        "#,
+        "never fully determined",
+    );
+}
+
+#[test]
+fn an_unannotated_set_new_requires_an_annotation() {
+    assert_fails_with(
+        r#"
+        import std::set::Set;
+        fun main() {
+            mut seen = Set::new();
+            seen.insert(7);
+        }
+        "#,
+        "never fully determined",
+    );
+}
+
+#[test]
+fn an_annotated_map_checks_its_inserts() {
+    // With the annotation the parameters ground, so a mistyped insert is a
+    // real error (the B16 substitution-applied argument check).
+    assert_fails(
+        r#"
+        import std::map::Map;
+        fun main() {
+            mut table: Map<str, i32> = Map::new();
+            table.insert(2, "v");
+        }
+        "#,
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut table: Map<str, i32> = Map::new();
+            table.insert("k", 1);
+            print(table.get("k").unwrap_or(-1));
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_generic_functions_own_bindings_stay_legal() {
+    // The legitimacy rule: a residual generic declared in the SAME file (the
+    // enclosing generic function's own parameter) is not a leak.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun pick<T>(a: T): T {
+            let x = a;
+            x
+        }
+        fun main() {
+            print(pick(41) + 1);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+// --- B28: conditions are not type-checked (FIXED) ----------------------------
+//
+// Found building expression lifting: NOTHING checked an `if`/`for` condition
+// against `bool`, so `if 5 { .. }` compiled and branched on JS truthiness —
+// and any non-empty aggregate (an Option is a tagged array) always took the
+// branch. Conditions now check post-solve like the `&&`/`||` operands (B24):
+// a grounded non-`bool` rejects; `Never`/`any` pass by their own rules;
+// match guards already had their own equivalent check.
+
+#[test]
+fn an_integer_if_condition_is_rejected() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            if 5 {
+                let _x = 1;
+            }
+        }
+        "#,
+        "this `if` condition is `i32`, but a condition must be `bool`",
+    );
+}
+
+#[test]
+fn a_string_if_condition_is_rejected() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let name = "ada";
+            if name {
+                let _x = 1;
+            }
+        }
+        "#,
+        "this `if` condition is `str`, but a condition must be `bool`",
+    );
+}
+
+#[test]
+fn an_option_if_condition_is_rejected() {
+    // The truthiness trap the check exists for: an Option is a tagged array
+    // at runtime — always truthy, so this silently took the branch.
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(1);
+            if maybe {
+                let _x = 1;
+            }
+        }
+        "#,
+        "but a condition must be `bool`",
+    );
+}
+
+#[test]
+fn a_non_bool_while_condition_is_rejected() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut n = 3;
+            for n {
+                n = n - 1;
+            }
+        }
+        "#,
+        "this `for` condition is `i32`, but a condition must be `bool`",
+    );
+}
+
+#[test]
+fn bool_conditions_of_every_shape_still_compile_and_run() {
+    // The whole legitimate surface: a bool binding, a comparison, an `is`
+    // test, `&&`-composition, a bool-returning call — in `if` and `for`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun ready(n: i32): bool { n > 1 }
+        fun main() {
+            let flag = true;
+            if flag { print("flag"); }
+            let maybe = Some(2);
+            if maybe is Some(let n) && n > 1 { print("is"); }
+            if ready(2) { print("call"); }
+            mut n = 2;
+            for n > 0 { n = n - 1; }
+            print(n);
+        }
+        "#,
+        "flag\nis\ncall\n0\n",
+    );
+}
+
+#[test]
+fn an_any_condition_stays_lenient() {
+    // `any` absorbs everywhere (the std::db parameter rule); a condition of
+    // type `any` keeps that leniency — documented, pinned.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let flags: List<any> = [true];
+            if flags[0] {
+                print("lenient");
+            }
+        }
+        "#,
+        "lenient\n",
+    );
+}
+
+// --- B24: primitive comparisons skip operand-type checking (FIXED) ----------
+//
+// Found writing the spec (§5.7): comparison operators between PRIMITIVES
+// bypassed the PartialEq/PartialOrd model, so ill-typed mixes compiled and
+// emitted raw JS comparisons (with JS coercion semantics). The rule now
+// checked on the native fast path: the right operand types as `B = Self`
+// with no implicit conversions (§5.8), `bool` has no ordering, and `&&`/`||`
+// take `bool`. The right side is inferred WITH the left's type as its
+// expectation, so an unsuffixed literal adapts exactly as it does in a
+// `let` — `1i53 < 3` is `i53 < i53` — while genuinely typed operands must
+// match.
+
+#[test]
+fn a_bool_compared_to_an_integer_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = true < 3;
+        }
+        "#,
+        "true < 3",
+        "`bool` has no ordering",
+    );
+}
+
+#[test]
+fn an_integer_compared_to_a_string_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = 1 == "a";
+        }
+        "#,
+        r#"1 == "a""#,
+        "`==` compares two values of the same type",
+    );
+}
+
+#[test]
+fn mixed_width_typed_comparison_is_rejected() {
+    // TYPED operands of different widths reject — no implicit conversions.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let a: i53 = 1;
+            let b: i32 = 3;
+            let _x = a < b;
+        }
+        "#,
+        "a < b",
+        "`<` compares two values of the same type",
+    );
+}
+
+#[test]
+fn an_unsuffixed_literal_adapts_to_the_comparisons_peer() {
+    // The literal rule (numeric-types.md §3): an unsuffixed integer takes
+    // the expected type — the peer operand here — so this is `i53 < i53`.
+    assert_compiles(
+        r#"
+        fun main() {
+            let _x = 1i53 < 3;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn equality_between_mismatched_natives_is_rejected_for_typed_operands() {
+    assert_fails(
+        r#"
+        fun main() {
+            let n: u32 = 5;
+            let s = "five";
+            let _x = n == s;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn logical_operators_take_bool_operands() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = 1 && true;
+        }
+        "#,
+        "1 && true",
+        "`&&` takes `bool` operands; the left operand is `i32`",
+    );
+}
+
+#[test]
+fn ordering_dispatches_through_a_partial_ord_impl() {
+    // B25, fixed: the ordering operators resolve `PartialOrd`'s comparison
+    // methods — usually the trait DEFAULTS over the impl's `partial_compare`,
+    // re-dispatched to the concrete receiver like any inherited method.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ now, Duration };
+
+        fun main() {
+            let started = now();
+            let deadline = started + Duration::hours(2i53);
+            if started < deadline {
+                print("dispatches");
+            }
+        }
+        "#,
+        "dispatches\n",
+    );
+}
+
+#[test]
+fn all_four_orderings_dispatch_on_a_user_type() {
+    // lt / le / gt / ge, each through the trait default over one
+    // `partial_compare` — both truth values exercised.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::Option::{ self, Some };
+
+        struct Level { rank: i32 }
+
+        impl Level with PartialEq {
+            fun eq(self, b: Level): bool { self.rank == b.rank }
+        }
+
+        impl Level with PartialOrd {
+            fun partial_compare(self, b: Level): Option<Ordering> {
+                self.rank.partial_compare(b.rank)
+            }
+        }
+
+        fun main() {
+            let low = Level { rank = 1 };
+            let high = Level { rank = 9 };
+            if low < high { print("lt"); }
+            if low <= low { print("le"); }
+            if high > low { print("gt"); }
+            if high >= high { print("ge"); }
+            if high < low { print("wrong-lt"); }
+            if low > high { print("wrong-gt"); }
+        }
+        "#,
+        "lt\nle\ngt\nge\n",
+    );
+}
+
+#[test]
+fn a_declared_lt_override_wins_over_the_default() {
+    // An impl may declare the operator method itself (the `binary_op_dispatch`
+    // path) — reversed ordering proves the OVERRIDE ran, not the default.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::{ PartialEq, PartialOrd, Ordering };
+        import std::option::Option::{ self, Some };
+
+        struct Upside { value: i32 }
+
+        impl Upside with PartialEq {
+            fun eq(self, b: Upside): bool { self.value == b.value }
+        }
+
+        impl Upside with PartialOrd {
+            fun partial_compare(self, b: Upside): Option<Ordering> {
+                self.value.partial_compare(b.value)
+            }
+
+            fun lt(self, b: Upside): bool {
+                self.value > b.value
+            }
+        }
+
+        fun main() {
+            let small = Upside { value = 1 };
+            let big = Upside { value = 9 };
+            if big < small { print("override"); }
+            if small < big { print("default"); }
+        }
+        "#,
+        "override\n",
+    );
+}
+
+#[test]
+fn a_partial_ord_bound_dispatches_orderings_generically() {
+    // `T: PartialOrd` — the `OnConstraint` path, re-resolved per
+    // monomorphization; exercised with std's `Duration` impl.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialOrd;
+        import std::time::Duration;
+
+        fun smallest<T: PartialOrd>(a: T, b: T): T {
+            if a < b { a } else { b }
+        }
+
+        fun main() {
+            let short = Duration::seconds(5i53);
+            let long = Duration::minutes(2i53);
+            print(smallest(long, short).describe());
+            print(smallest(3, 11));
+        }
+        "#,
+        "5s\n3\n",
+    );
+}
+
+#[test]
+fn ordering_a_struct_is_rejected_not_js_compared() {
+    // No `PartialOrd` dispatch for user types yet — a silent raw-JS `<`
+    // (object coercion) would be a miscompile, so it errors instead.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32 }
+
+        fun main() {
+            let a = Point { x = 1 };
+            let b = Point { x = 2 };
+            let _x = a < b;
+        }
+        "#,
+        "a < b",
+        "does not implement the `PartialOrd` operator; add `impl Point with PartialOrd` providing `partial_compare`",
+    );
+}
+
+#[test]
+fn same_type_native_comparisons_still_compile_and_run() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let a: u32 = 5;
+            let b: u32 = 9;
+            if a < b && "a" < "b" && "x" == "x" && 1.5 < 2.5 && true == false || 3 <= 3 {
+                print("ok");
+            }
+        }
+        "#,
+        "ok\n",
+    );
+}
+
+// --- §J.3: module-level initializers cannot await ----------------------------
+//
+// Initializers run at module load — no enclosing function to become async,
+// no top-level await in the emission model. An async call there used to
+// type-check as `T` while holding a live promise at runtime (`state + 1`
+// was garbage); it is now refused cleanly. Creating async closures stays
+// legal: nothing awaits at load.
+
+#[test]
+fn an_async_call_in_a_module_initializer_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun ready(tag: str): i32 {
+            sleep_for(Duration::millis(1));
+            42
+        }
+
+        let state = ready("boot");
+
+        fun main() {
+            print(state + 1);
+        }
+        "#,
+        r#"ready("boot")"#,
+        "a module-level binding cannot await",
+    );
+}
+
+#[test]
+fn an_initializer_calling_an_inferred_async_function_is_rejected() {
+    // `warm` never says `async`; it is inferred (it calls `sleep_for`), and
+    // the initializer's call to it is refused all the same.
+    assert_fails_spanning(
+        r#"
+        import std::time::{ sleep_for, Duration };
+
+        fun warm(tag: str): i32 {
+            sleep_for(Duration::millis(1));
+            7
+        }
+
+        let state = warm("boot");
+
+        fun main() {
+            let _s = state;
+        }
+        "#,
+        r#"warm("boot")"#,
+        "calls `warm`, which is async",
+    );
+}
+
+#[test]
+fn creating_an_async_closure_in_an_initializer_stays_legal() {
+    // The charge is on AWAITING at load, not on holding async machinery:
+    // a closure created in an initializer awaits nothing until called.
+    assert_compiles(
+        r#"
+        import std::time::{ sleep_for, Duration };
+
+        let warm = || sleep_for(Duration::millis(1));
+
+        fun main() {
+            let _w = warm;
+        }
+        "#,
+    );
+}
+
+// --- B86: the rule is AWAIT-shaped, not call-shaped ---------------------------
+//
+// The shipped check walked `initializer_calls_of`, so it only ever saw an
+// async CALL. An `await` whose operand is not a call — a `Task`-valued
+// binding, a spawn, a `Task` returned by a plain sync function — slipped
+// through, compiled clean, and emitted a genuine top-level `await` into the
+// bundle (`top-level-await.md` §1.3), which then miscompiled on the Node leg
+// (§1.4) and failed to parse at all under HMR (§1.5). These pin every row of
+// §5.2's boundary table, per case.
+
+/// `ready` + a module-level spawn, the shared preamble for the rows below.
+const AWAIT_SHAPED_PREAMBLE: &str = r#"
+        import std::print;
+        import std::task::Task;
+        import std::time::{ sleep_for, Duration };
+
+        fun ready(): i32 {
+            sleep_for(Duration::millis(1));
+            7
+        }
+"#;
+
+#[test]
+fn awaiting_a_task_valued_module_binding_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_valued_module_binding_steers_to_main() {
+    // The second message form: the operand is right there and already
+    // spawned, so the steer is to move the `await`, not to restructure.
+    assert_fails_noting(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "a module-level binding cannot suspend",
+        "await pending",
+        "hold `pending` here and `await` it in `main`",
+    );
+}
+
+#[test]
+fn awaiting_a_spawn_in_an_initializer_is_rejected() {
+    // The sharpest hole: `async ready()` is a CREATION, so the call to
+    // `ready` lives inside the spawned closure and never entered the
+    // initializer's direct call set.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async ready();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async ready()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_an_async_block_in_an_initializer_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async {{ 7 }};
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async { 7 }",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_from_a_sync_function_is_rejected() {
+    // `spawn_it` is not async — it returns a `Task`. The call check sees a
+    // sync callee and passes; the await check is what refuses it.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        fun spawn_it(): Task<i32> {{
+            async ready()
+        }}
+
+        let value: i32 = await spawn_it();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await spawn_it()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_nested_in_an_initializer_expression_is_rejected() {
+    // Any `await` REACHABLE in the initializer's own expression tree — not
+    // just one at its root.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = (await pending) + 1;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_non_task_in_an_initializer_is_rejected() {
+    // `await` on a plain value is legal JS and legal vilan inside a function;
+    // at module level it is still a suspension point, so it is still refused
+    // — and the steer stays true (it never claims the operand is a spawn).
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        let plain: i32 = 7;
+        let value: i32 = await plain;
+
+        fun main() {
+            print(value);
+        }
+        "#,
+        "await plain",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_inside_a_closure_created_by_an_initializer_stays_legal() {
+    // THE BOUNDARY, kept deliberately where the call-shaped check had it: a
+    // closure's body is not the initializer. Creating the closure suspends
+    // nothing at load, so the initializer does not await — only calling it
+    // does, and that happens wherever the caller is.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let later = || {{ await pending }};
+
+        async fun main() {{
+            print(await later());
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_await_inside_an_async_block_in_an_initializer_stays_legal() {
+    // Same boundary through the `async { .. }` spelling: the block lowers to
+    // a closure, which is its own unit.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let wrapped: Task<i32> = async {{ await pending }};
+
+        async fun main() {{
+            print(await wrapped);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn spawning_at_module_level_stays_legal() {
+    // The idiom the diagnostic steers to, and the reason the null
+    // recommendation holds: the work starts at load, only the observation
+    // moves into `main`.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+
+        async fun main() {{
+            print(await pending);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_explicit_await_on_an_async_call_keeps_the_call_message() {
+    // `await ready()` is BOTH an await and an async call. The call form names
+    // the callee, so it wins — and it must be the ONLY diagnostic, not a pair
+    // for one line.
+    // `warm` takes an argument so the call site's snippet (`warm(1)`) is
+    // distinct from its declaration — the span must land on the call.
+    let source = r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        fun warm(seed: i32): i32 {
+            sleep_for(Duration::millis(1));
+            seed
+        }
+
+        let value: i32 = await warm(1);
+
+        fun main() {
+            print(value);
+        }
+        "#;
+    assert_fails_spanning(source, "warm(1)", "calls `warm`, which is async");
+    let refusals = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| {
+            message.contains("cannot await (module initialization is synchronous)")
+                || message.contains("cannot suspend")
+        })
+        .count();
+    assert_eq!(
+        refusals, 1,
+        "one refusal per binding, not a pair for one line"
+    );
+}
+
+// --- J6: `main`'s promise gets a contract ------------------------------------
+//
+// An async `main` is emitted as a fire-and-forget IIFE, and its promise used to
+// be DISCARDED. What a failing `main` then did was the HOST's policy, not
+// vilan's: Node >= 15 rethrows an unhandled rejection and exits non-zero, but
+// it buries the program's error under `UnhandledPromiseRejection` and an
+// engine-internal stack, and a host configured otherwise exits 0. A sync `main`
+// that panics has always terminated with the message and a non-zero code, and
+// async `main` is what the language steers people to instead of top-level
+// await (`top-level-await.md` §4.4/§8.3) — so the two must agree.
+
+#[test]
+fn a_rejecting_async_main_exits_nonzero_with_the_error_surfaced() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("before");
+            panic("boom");
+            print("after");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a rejecting `main` must exit 1; stderr: {stderr}");
+    assert!(
+        stderr.contains("boom"),
+        "the program's own error must reach stderr: {stderr}"
+    );
+    // The point is not merely a non-zero code — Node already gave one. It is
+    // that the failure is OURS to report, so the host's unhandled-rejection
+    // wrapper is gone and what remains is the message.
+    assert!(
+        !stderr.contains("UnhandledPromiseRejection")
+            && !stderr.contains("ERR_UNHANDLED_REJECTION"),
+        "the error must be surfaced by the shim, not left to the host's \
+         unhandled-rejection path: {stderr}"
+    );
+    assert!(
+        stdout.contains("before") && !stdout.contains("after"),
+        "output before the failure must still flush, and nothing after it \
+         may run: {stdout:?}"
+    );
+}
+
+#[test]
+fn a_resolving_async_main_exits_zero() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ok");
+        }
+        "#,
+    );
+    assert_eq!(code, 0, "a resolving `main` must exit 0; stderr: {stderr}");
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn a_panicking_sync_main_is_unchanged() {
+    // The contract async `main` was brought level WITH; it must not move.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+
+        fun main() {
+            print("before");
+            panic("boom");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a panicking sync `main` still exits 1: {stderr}");
+    assert!(stderr.contains("boom"), "and still says why: {stderr}");
+    assert!(stdout.contains("before"));
+}
+
+#[test]
+fn an_async_main_that_keeps_working_is_not_cut_short() {
+    // THE SERVER-LEG CARVE, in the form a test can hold: the shim attaches a
+    // handler, it does not `await`. A `main` that suspends and resumes — the
+    // shape a listening server generalizes — runs to completion, and a `main`
+    // that never settles is likewise never hurried. Had the shim awaited the
+    // IIFE (or exited on settle), this would truncate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            print("start");
+            sleep_for(Duration::millis(30));
+            print("middle");
+            sleep_for(Duration::millis(30));
+            print("end");
+        }
+        "#,
+        "start\nmiddle\nend\n",
+    );
+}
+
+#[test]
+fn the_browser_leg_gets_no_exit_handler() {
+    // The browser has no exit code, and its own unhandled-rejection path
+    // already reports to the console — so there is nothing to attach, and
+    // `process` does not exist to reference.
+    let emitted = compile_browser(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ui");
+        }
+        "#,
+    )
+    .expect("expected a clean browser compile");
+    assert!(
+        !emitted.contains("process.exit"),
+        "the browser bundle must not reference `process`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("})();"),
+        "the browser entry stays the bare fire-and-forget IIFE:\n{emitted}"
+    );
+}
+
+// --- The i53/u53 rename (numeric-types.md §8) --------------------------------
+//
+// The f64-backed wide integers are named for the precision they deliver
+// (±2^53), and unknown numeric suffixes are ERRORS rather than silently
+// typing as unsuffixed (`5q` once compiled as an i32).
+
+#[test]
+fn an_unknown_numeric_suffix_errors() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = 5q;
+        }
+        "#,
+        "5q",
+        "unknown numeric suffix `q`",
+    );
+}
+
+#[test]
+fn a_fractional_literal_with_an_unknown_suffix_errors() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = 2.5q;
+        }
+        "#,
+        "2.5q",
+        "unknown numeric suffix `q`",
+    );
+}
+
+#[test]
+fn the_old_i64_suffix_errors_with_a_rename_hint() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _stamp = 1000i64;
+        }
+        "#,
+        "1000i64",
+        "`i64` was renamed to `i53`",
+    );
+}
+
+#[test]
+fn the_old_u64_suffix_errors_with_a_rename_hint() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _wide = 1000u64;
+        }
+        "#,
+        "1000u64",
+        "`u64` was renamed to `u53`",
+    );
+}
+
+#[test]
+fn i53_suffixed_literals_compile_and_run() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let wide = 9007199254740992i53;
+            print(wide);
+            print((3.9).as_i53());
+            print((5i53).as_u53());
+        }
+        "#,
+        "9007199254740992\n3\n5\n",
+    );
+}
+
+// --- Bare-namespace paths in expression position (found by the walkthrough) --
+//
+// `std::math::min(1, 2)` inline used to PANIC the compiler: the failed
+// resolution of the path head left its type id unmapped, and the static-
+// accessor pass crashed on the first `get_type`. The namespace root is not
+// a binding by design — qualified access goes through an imported module
+// name — so the shape is a clean, guiding error now.
+
+#[test]
+fn a_bare_std_function_path_errors_cleanly() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = std::math::min(1, 2);
+        }
+        "#,
+        "std",
+        "`std` is a namespace, not a value",
+    );
+}
+
+#[test]
+fn a_bare_std_variant_path_errors_cleanly() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = std::compare::Ordering::Less;
+        }
+        "#,
+        "std",
+        "`std` is a namespace, not a value",
+    );
+}
+
+#[test]
+fn an_imported_module_alias_qualifies_statics() {
+    // The supported spelling: import the module, qualify through its name.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::math;
+
+        fun main() {
+            print(math::min(1, 2));
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// --- Direct calls on postfix results (backlog §H.18, fixed) ------------------
+//
+// `self.hook.read()(a, b)` used to fail to parse ("expected a method name
+// after `.`"): the member grammar greedily folded the second `(args)` into
+// the member. A member now fuses at most ONE call; further `(args)` are
+// direct-call postfixes on the chain (calling a closure-typed value).
+
+#[test]
+fn a_method_call_result_is_directly_callable() {
+    // The service-hook shape that carried the bind-first workaround.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+
+        struct Holder {
+            hook: Shared<|i32, i32| i32>,
+        }
+
+        fun main() {
+            let holder = Holder { hook = Shared::new(|a: i32, b: i32| a + b) };
+            print(holder.hook.read()(20, 22));
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn an_index_result_is_directly_callable() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let handlers: List<|i32| i32> = [|n: i32| n * 2, |n: i32| n + 1];
+            print(handlers[0](21));
+            print(handlers[1](41));
+        }
+        "#,
+        "42\n42\n",
+    );
+}
+
+#[test]
+fn a_direct_call_chains_into_further_postfixes() {
+    // The direct call's result re-enters the chain (here: indexed).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+
+        struct Factory {
+            make: Shared<|i32| List<i32>>,
+        }
+
+        fun main() {
+            let factory = Factory { make = Shared::new(|seed: i32| [seed, seed * 2]) };
+            print(factory.make.read()(21)[1]);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn tuple_member_access_grounds() {
+    // §I.19, fixed: `.0` resolves positionally against the tuple's elements
+    // (spec §5.9) — the field path grew its Tuple arm. Destructuring remains
+    // the multi-element form; `.0` is the point access.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let pair: (i32, i32) = (41, 1);
+            print(pair.0 + pair.1);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn tuple_member_access_infers_without_an_annotation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let pair = (40, 2);
+            print(pair.0 + pair.1);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn tuple_elements_carry_their_own_types() {
+    // `.1` on `(i32, str)` is a str — methods dispatch on the element type.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let entry = (7, "vilan");
+            print(entry.1.len());
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn nested_tuple_access_chains() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let nested = ((1, 2), 3);
+            print(nested.0.1);
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_tuple_typed_element_reads_as_a_value() {
+    // Flat storage: `.0` on a nested tuple reslices its region, and the
+    // result behaves as a full tuple value (destructure, re-access).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let nested = ((1, 2), 3);
+            let inner = nested.0;
+            let (x, y) = inner;
+            print(inner.1 + x + y);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn a_tuple_typed_element_assignment_writes_its_region() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut nested = ((1, 2), 3);
+            nested.0 = (40, 2);
+            print(nested.0.0 + nested.0.1 + nested.1);
+        }
+        "#,
+        "45\n",
+    );
+}
+
+#[test]
+fn a_nested_tuple_write_hits_the_storage_not_a_copy() {
+    // Chained positional accesses FOLD to one flat offset on the root, so a
+    // write through a nested path mutates the tuple — never a resliced copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut deep = ((1, 2), 3);
+            deep.0.1 = 41;
+            print(deep.0.1 + deep.0.0);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_tuple_element_out_of_range_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let pair = (41, 1);
+            let _x = pair.2;
+        }
+        "#,
+        "pair.2",
+        "has no element 2: its arity is 2",
+    );
+}
+
+#[test]
+fn a_named_member_on_a_tuple_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let pair = (41, 1);
+            let _x = pair.first;
+        }
+        "#,
+        "pair.first",
+        "a tuple's members are its positions",
+    );
+}
+
+#[test]
+fn a_tuple_element_assigns_through_a_mut_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut pair: (i32, i32) = (41, 1);
+            pair.0 = 40;
+            pair.1 = 2;
+            print(pair.0 + pair.1);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_tuple_element_assignment_needs_a_mut_binding() {
+    assert_fails(
+        r#"
+        fun main() {
+            let pair: (i32, i32) = (41, 1);
+            pair.0 = 5;
+        }
+        "#,
+    );
+}
+
+// --- Never-typed divergence (two gotchas closed) ------------------------------
+//
+// `panic(..)`, `ret ..`, and `jump break/continue` now type as `Never`,
+// which YIELDS in unification: a diverging match leg or if branch no longer
+// constrains (panic's old `Any` absorbed the whole match; `ret` legs typed
+// void and mismatched). The transformer emits diverging leg results as
+// statements (`return e`, not `x = return e`).
+
+#[test]
+fn a_ret_leg_no_longer_poisons_the_match_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun first_or_bail(items: List<i32>): i32 {
+            mut copy = items;
+            let head = match copy.pop() {
+                Some(let value) => value,
+                None => ret 0 - 1,
+            };
+            head * 2
+        }
+
+        fun main() {
+            print(first_or_bail([21]));
+            let empty: List<i32> = [];
+            print(first_or_bail(empty));
+        }
+        "#,
+        "42\n-1\n",
+    );
+}
+
+#[test]
+fn a_panic_leg_no_longer_absorbs_the_match_type() {
+    // The binding is UNANNOTATED — the value leg's type wins.
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, panic };
+        import std::option::Option::{ self, Some, None };
+
+        fun unwrap_or_panic(slot: Option<str>): str {
+            let value = match slot {
+                Some(let text) => text,
+                None => panic("missing"),
+            };
+            value + "!"
+        }
+
+        fun main() {
+            print(unwrap_or_panic(Some("hi")));
+        }
+        "#,
+        "hi!\n",
+    );
+}
+
+#[test]
+fn a_panicking_if_branch_yields_to_the_other() {
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, panic };
+
+        fun main() {
+            let flag = true;
+            let picked = if flag { 42 } else { panic("no") };
+            print(picked);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_jump_leg_diverges_inside_a_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut total = 0;
+            for step in [1, 0, 2, 0, 3] {
+                let value = match step {
+                    0 => jump continue,
+                    let n => n,
+                };
+                total += value;
+            }
+            print(total);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn all_diverging_legs_still_satisfy_an_annotation() {
+    // Never fits any expected type; nothing runs past the match.
+    assert_compiles(
+        r#"
+        import std::panic;
+
+        fun choose(flag: bool): i32 {
+            let value: i32 = match flag {
+                true => panic("a"),
+                false => ret 0,
+            };
+            value
+        }
+
+        fun main() {
+            let _n = choose(false);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_direct_call_types_several_unannotated_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let add = |a, b| a + b;
+            print(add(20, 22));
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_direct_call_respects_annotated_parameters() {
+    // Mixed: the annotation stays authoritative; only the Unknown fills.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let scale = |a: i32, b| a * b;
+            print(scale(6, 7));
+        }
+        "#,
+        "42\n",
+    );
+}

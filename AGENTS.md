@@ -68,10 +68,14 @@ Rust workspace, six crates, plus the language's own tree:
    framework, or the language updates the affected `vilan/docs/` page in the same
    change-set.
 4. **Per-case pins.** Every behavior added or changed gets its own tests in
-   `crates/vilan-core/tests/inference.rs` (`assert_compiles`,
+   `crates/vilan-core/tests/inference/` (`assert_compiles`,
    `assert_compiles_and_runs`, `assert_fails`) — one pin per case, including the edge
    cases (multi-parameter, nested, mixed, ordering-sensitive), not one representative
    example. A known-but-unfixed gap is pinned `#[ignore]` with a comment saying why.
+   B145 split the old single 69k-line `tests/inference.rs` into subject modules of
+   ONE binary: `main.rs` declares them, the harness is `support.rs`, and a new pin
+   goes in the subject module that owns its area (a new subject is a new `mod`).
+   The command is unchanged: `cargo test -p vilan-core --test inference`.
 5. **`cargo fmt` after every Rust change.** It may reformat neighboring code —
    expected and desired. 4-space indent in Rust; full variable names (`parameter`,
    never `p`).

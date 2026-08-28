@@ -800,7 +800,7 @@ fn const_pass_walls(
 /// against the fixed tree's **3.44×** — a real improvement in the absolute
 /// numbers (114.6 → 101.6 ms and 404.8 → 349.8 ms) and nothing a ratio bound can
 /// separate. What reddens on the pre-fix tree is the counter pin in
-/// `vilan-core/tests/inference.rs`
+/// `vilan-core/tests/inference/`
 /// (`the_const_pass_builds_one_name_seed_however_many_const_sites_there_are`).
 /// This one guards the ASYMPTOTE, and is non-vacuous on its own terms: planting
 /// one whole-program mini-build per other const site — the exact shape it

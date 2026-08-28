@@ -1984,7 +1984,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
 // A single-file program cannot see any of this: every user diagnostic in one is
 // `SourceId(0)`, so a check attributing to the wrong file is indistinguishable
 // from one attributing to the right file. That is why these live here rather
-// than beside the single-source pins in `inference.rs` — the same reason B74's
+// than beside the single-source pins in the `inference` suite — the same reason B74's
 // cross-module duplicate does.
 
 /// The `resource Guard` preamble the resource-rule cases share, since a `Guard`

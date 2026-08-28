@@ -137,7 +137,7 @@ fun main() {{
 }
 
 /// Compile through the full pipeline on a large-stack worker (the harness
-/// shape `inference.rs` and `docs.rs` use; test targets cannot import one
+/// shape the `inference` suite and `docs.rs` use; test targets cannot import one
 /// another).
 fn compile(source: &str) -> Result<String, Vec<String>> {
     let source = source.to_string();
