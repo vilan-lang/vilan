@@ -405,6 +405,30 @@ const EXPRESSION_FIXTURES: &[&str] = &[
     "<p>\"a\" <b/> {c}</p>",
     "x < <div/>",            // a comparison whose right operand is an element
     "<div hidden.show(f)/>", // bare attr, then a chain link, no space (positional)
+    // --- `css` blocks (css-block S2) ---------------------------------------
+    "css { }",
+    "css { display: flex; }",
+    "css { display: flex; padding: 1rem; }",
+    "css { flex-direction: column; }",      // a hyphenated property
+    "css { --color-ink: white; }",          // a custom property
+    "css { -webkit-mask-composite: add; }", // one leading hyphen
+    "css { type: a; }",                     // a KEYWORD property name
+    "css { width: 1px; }",                  // a dimension lexes as one token
+    "css { width: 1.5rem; }",
+    "css { width: 50%; }",
+    "css { width: calc(100% - 2rem); }",
+    "css { background: url(\"a.png\"); }",
+    "css { grid-template-columns: repeat(3, 1fr); }",
+    "css { gap: {space(4)}; }",  // a one-hole value
+    "css { padding: {a} {b}; }", // a mixed value
+    "css { padding: calc({a} + 2px); }",
+    "css { .hover { color: red; } }",
+    "css { .within(\"data-theme\", \"dark\") { color: red; } }",
+    "css { .md { .hover { .attribute(\"data-open\", \"true\") { color: red; } } } }",
+    "css { color: red; .hover { color: blue; } padding: 1rem; }",
+    "css { display: flex; } + other",      // an ordinary operand
+    "css { display: flex; }.class_list()", // postfix hangs off it
+    "const css { display: flex; }",
 ];
 
 /// Fixtures parsed in CONDITION position (`if <fixture> { }`) — struct literals are
@@ -443,6 +467,11 @@ const CONDITION_FIXTURES: &[&str] = &[
     "flag & mask == 0",
     "a << 2 > b",
     "items.contains(x)",
+    // A `css` block is brace-initial, so a condition takes it only in parens —
+    // the same escape hatch a struct literal has (css-block.md §4.2). The
+    // DECLINER list carries the bare form.
+    "(css { display: flex; })",
+    "(css { display: flex; }).class_list().len() > 0",
 ];
 
 /// WHOLE-FILE fixtures: item-free programs (statement sequences) that both
@@ -492,4 +521,14 @@ const DECLINER_FIXTURES: &[&str] = &[
     "<h2>Todos</h2>",    // bare text children are quoted strings
     "<div name(a, b)/>", // an attribute takes one value
     "<div>< /div>",      // a non-adjacent `</` is not a close marker
+    // --- `css` blocks (css-block S2) ---------------------------------------
+    "css",                            // the keyword alone is no expression
+    "css { display: flex }",          // the `;` is required, including on the last
+    "css { display flex; }",          // the `:` is required
+    "css { 1px: red; }",              // a property is a name, not a value token
+    "css { color: red;",              // an unclosed block
+    "css { color: #333; }",           // `#` does not lex
+    "css { @media { color: red; } }", // `@` does not lex
+    "css { color: red !important; }", // refused permanently, with its fix
+    "css { .1 { color: red; } }",     // a combinator head is a name
 ];

@@ -28,7 +28,7 @@ impl Length {
 	fun zero(): Length             // bare `0`, not `0px`
 	fun var(name: str): Length     // a CSS custom-property reference ("--w")
 	fun calc(expression: str): Length  // "100% - 2rem" — no calc(..) wrapper
-	fun css(expression: str): Length   // a COMPLETE value, verbatim: "clamp(..)"
+	fun raw(expression: str): Length   // a COMPLETE value, verbatim: "clamp(..)"
 }
 
 impl Color {
@@ -77,8 +77,8 @@ or `view.style_var` writing it at runtime). `.alpha()` composes over it
 through the same relative-colour form, so a variable-backed colour
 translucifies exactly like a ramp token.
 
-`calc` wraps and `css` does not: `Length::calc(e)` is
-`Length::css("calc(" + e + ")")`. Write `calc` for arithmetic, `css` for a
+`calc` wraps and `raw` does not: `Length::calc(e)` is
+`Length::raw("calc(" + e + ")")`. Write `calc` for arithmetic, `raw` for a
 value that is already whole — `clamp()`, `min()`, `max()`, `env()`,
 `fit-content()`, or one named expression reused across properties. Both
 refuse an empty value at const time.
@@ -196,7 +196,7 @@ declaration onto the stylesheet, so `.raw("padding", space(4))` is never a
 dangling `var()`. `with_length` and `with_color` are `raw` at those two value
 types, kept for the spelling the surface has always had.
 
-Pass the value, not its text: `space(4).css` is the string
+Pass the value, not its text: `space(4).text` is the string
 `var(--space-4)` with the declaration left behind, and a `str` carries no
 token.
 

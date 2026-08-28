@@ -18,7 +18,7 @@
 	hljs.registerLanguage("vilan", function (hljs) {
 		const KEYWORDS = {
 			// GENERATED(keyword-groups): lexing.rs KEYWORDS split by grammar_sync.rs's KEYWORD_ROLES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-			keyword: "async await borrows const else enum export external for fun if impl import in is jump let macro match mod mut own resource ret struct trait type use with",
+			keyword: "async await borrows const css else enum export external for fun if impl import in is jump let macro match mod mut own resource ret struct trait type use with",
 			literal: "true false null void self Self",
 			// END GENERATED(keyword-groups)
 			built_in: "print panic assert",

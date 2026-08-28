@@ -586,10 +586,14 @@ fn a_diagnostic_after_a_parse_error_keeps_its_own_file() {
         Some("fun probe(): i32 {\n    let bad: i32 = \"text\";\n    1\n}\n".to_string()),
     );
     // Two parse errors in the entry (the prefix the attribution has to lose),
-    // and one analyzer error that belongs to the injected module.
+    // and one analyzer error that belongs to the injected module. `$` is the
+    // un-lexable byte, deliberately: it is in no charset and carries no
+    // curated rule, so the prefix stays the GENERIC "expected a token" this
+    // test asserts on. (`@` used to serve here and no longer can — it names
+    // the `css` block's at-rule refusal now, proposal/css-block.md §4.1.)
     let output = on_big_stack(|| {
         vilan_wasm::compile_program(
-            "import std::e42_probe::probe;\n\nfun main() {\n    let value = probe();\n}\n\n@\n@\n",
+            "import std::e42_probe::probe;\n\nfun main() {\n    let value = probe();\n}\n\n$\n$\n",
         )
     });
     let files: Vec<&str> = output

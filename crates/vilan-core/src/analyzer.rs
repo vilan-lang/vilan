@@ -18479,6 +18479,9 @@ impl<'src> Analyzer<'src> {
             // entity match is a pass bug, degraded like a parse error rather
             // than panicking an analysis.
             Node::Element(..) => Some(Expr::Error),
+            // Likewise for `css` blocks (css::rewrite_items, at every lift
+            // site): one reaching the entity match is a pass bug.
+            Node::Css(..) => Some(Expr::Error),
             Node::Error => Some(Expr::Error),
             Node::Void => Some(Expr::Void),
             Node::Null => Some(Expr::Null),
@@ -33918,6 +33921,7 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
         .collect();
     let root: Box<crate::span::Spanned<NodeList<'static>>> = match tree {
         Some(mut root) => {
+            crate::css::rewrite_items(&mut root.0, text);
             crate::elements::rewrite_items(&mut root.0, text);
             crate::lift::rewrite_items(&mut root.0);
             Box::new(root)
@@ -34061,6 +34065,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     );
     let root: &'static crate::span::Spanned<NodeList<'static>> = match tree {
         Some(mut root) => {
+            crate::css::rewrite_items(&mut root.0, source);
             crate::elements::rewrite_items(&mut root.0, source);
             crate::lift::rewrite_items(&mut root.0);
             let leaked = &*Box::leak(Box::new(root));

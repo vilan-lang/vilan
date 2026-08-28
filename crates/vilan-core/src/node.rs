@@ -159,6 +159,87 @@ pub struct Closure<'src> {
     pub return_value: Box<Spanned<Node<'src>>>,
 }
 
+/// A `css { … }` block's payload (proposal/css-block.md §4.3): the items, in
+/// written order. Desugared to a `style()` method chain before analysis
+/// (`css::rewrite_items`) — the analyzer, transformer, and interpreter never
+/// see this node.
+#[derive(Debug)]
+pub struct CssBody<'src> {
+    pub items: Vec<CssItem<'src>>,
+    /// The `{ … }` span, so the desugar can anchor the generated `style()` on
+    /// the block itself and the formatter can find the body's own extent.
+    pub braces: Span,
+}
+
+/// One item of a `css` block. The dot is the whole disambiguator (§3):
+/// undotted is a declaration, dotted is a condition combinator — so the
+/// grammar never consults `Style`'s method list, and adding a method to
+/// `Style` can never change what existing `css` means.
+#[derive(Debug)]
+pub enum CssItem<'src> {
+    Declaration(CssDeclaration<'src>),
+    Nested(CssNested<'src>),
+}
+
+impl CssItem<'_> {
+    /// The item's own span — the whole `property: value;` or the whole
+    /// `.name(..) { … }`. Carried per item from the first commit (§7.3) so the
+    /// LSP slice has the anchor it needs without reshaping the tree.
+    pub fn span(&self) -> Span {
+        match self {
+            CssItem::Declaration(declaration) => declaration.span,
+            CssItem::Nested(nested) => nested.span,
+        }
+    }
+}
+
+/// `property: value;` — one declaration, lowering to exactly one
+/// `.raw(property, value)` call (§5.2).
+#[derive(Debug)]
+pub struct CssDeclaration<'src> {
+    /// The property name's SPAN, not a slice: a hyphenated or custom property
+    /// (`flex-direction`, `--color-ink`) spans several tokens carrying no
+    /// joined text, and the parser has no source access — the desugar slices
+    /// it where the source is in scope, exactly as an element's tag name is.
+    pub property: Span,
+    pub value: Vec<CssValuePiece<'src>>,
+    /// The value's whole extent, `:` exclusive and `;` exclusive. The slice
+    /// the mixed-value row of §5.2's table renders, and the anchor a
+    /// wrong-typed value reports at.
+    pub value_span: Span,
+    /// The declaration's own span, `;` inclusive.
+    pub span: Span,
+}
+
+/// One piece of a declaration's value: a `{expr}` hole, or a run of source
+/// text between holes. A value is a TOKEN RUN, not a typed grammar — typed
+/// values arrive through holes, which is where the type system already lives
+/// (§10).
+#[derive(Debug)]
+pub enum CssValuePiece<'src> {
+    /// `{expression}` — the hole's expression, and the span of the whole
+    /// `{…}` including its braces (what a reprint has to reproduce).
+    Hole(Spanned<Node<'src>>, Span),
+    /// A run of value text, verbatim from source.
+    Text(Span),
+}
+
+/// `.name { … }` / `.name(a, b) { … }` — a condition combinator, lowering to
+/// `.name(a, b, style() … )`: the block's own chain appended as the final
+/// argument (§5.3).
+#[derive(Debug)]
+pub struct CssNested<'src> {
+    pub name: Spanned<&'src str>,
+    /// The head's arguments, ordinary vilan expressions; the inner chain is
+    /// appended after them at desugar.
+    pub arguments: Vec<Spanned<Node<'src>>>,
+    pub body: CssBody<'src>,
+    /// The head's span — `.name` or `.name(a, b)` — which is where a
+    /// misnesting reports.
+    pub head: Span,
+    pub span: Span,
+}
+
 /// An element expression's payload (proposal/element-syntax.md §3): the tag,
 /// the head items, and the children. Desugared to a `view("tag")` method
 /// chain before analysis (`elements::rewrite_items`) — the analyzer,
@@ -321,15 +402,20 @@ pub enum Node<'src> {
         source: Box<Spanned<Node<'src>>>,
         body: Box<Spanned<Node<'src>>>,
     },
-    // An enum declaration: name, generics, the `resource` flag (the
-    // owned-resource modifier, destruction.md §3 — SURFACE ONLY, carried but
-    // not yet classified on), and the variants — each a name, the types of its
-    // optional data, and an optional explicit discriminant (`Less = -1`).
+    // A `css { … }` block (proposal/css-block.md) — CSS-shaped sugar over the
+    // `std::style` chain. Exists only between parse and the pre-analysis
+    // desugar (`css::rewrite_items`); the formatter prints it from source
+    // (S2's passthrough; S3 brings the canonical printer).
+    Css(CssBody<'src>),
     // An element expression `<div …> … </div>` (proposal/element-syntax.md) —
     // markup sugar over the `std::ui` view chain. Exists only between parse
     // and the pre-analysis desugar (`elements::rewrite_items`); the formatter
     // prints it from source.
     Element(ElementBody<'src>),
+    // An enum declaration: name, generics, the `resource` flag (the
+    // owned-resource modifier, destruction.md §3 — SURFACE ONLY, carried but
+    // not yet classified on), and the variants — each a name, the types of its
+    // optional data, and an optional explicit discriminant (`Less = -1`).
     Enum(
         Spanned<&'src str>,
         Option<GenericParameters<'src>>,
@@ -655,6 +741,7 @@ impl<'src> Node<'src> {
                     visit(argument);
                 }
             }
+            Node::Css(body) => visit_css_body(body, visit),
             Node::Element(body) => {
                 for item in &body.head {
                     match item {
@@ -1033,4 +1120,31 @@ pub enum BinaryOp {
     And,
     // Logical OR (`||`). Binds looser than `&&`.
     Or,
+}
+
+/// Visits every expression position inside a `css` block, at any nesting
+/// depth: each declaration value's holes and each nested rule's head
+/// arguments. Free rather than a method so [`Node::for_each_child`]'s
+/// borrow-shaped visitor can recurse through a `CssBody`, which is not a node.
+fn visit_css_body<'a, 'src>(
+    body: &'a CssBody<'src>,
+    visit: &mut dyn FnMut(&'a Spanned<Node<'src>>),
+) {
+    for item in &body.items {
+        match item {
+            CssItem::Declaration(declaration) => {
+                for piece in &declaration.value {
+                    if let CssValuePiece::Hole(expression, _) = piece {
+                        visit(expression);
+                    }
+                }
+            }
+            CssItem::Nested(nested) => {
+                for argument in &nested.arguments {
+                    visit(argument);
+                }
+                visit_css_body(&nested.body, visit);
+            }
+        }
+    }
 }

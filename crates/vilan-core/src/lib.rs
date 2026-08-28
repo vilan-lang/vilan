@@ -10,6 +10,7 @@ pub mod chunks;
 pub mod closest_name;
 pub mod const_eval;
 pub mod context;
+pub mod css;
 pub(crate) mod depth_stats;
 pub mod dispatch_refine;
 pub mod elements;
@@ -309,6 +310,7 @@ pub fn parse_clean_cached(
             .insert(key);
         return None;
     };
+    css::rewrite_items(&mut root.0, leaked);
     elements::rewrite_items(&mut root.0, leaked);
     lift::rewrite_items(&mut root.0);
     let leaked_root: &'static Spanned<node::NodeList<'static>> = Box::leak(Box::new(root));
@@ -584,10 +586,13 @@ fn analyze_source_unfenced(
         }
     }
 
-    // Elements desugar to their view chains, then bare-`?` marks become lift
-    // regions, before the tree freezes (element-syntax.md §4,
-    // expression-lifting.md) — the formatter parses separately and keeps
-    // raw trees, so source text prints back verbatim.
+    // `css` blocks desugar to their style chains, elements to their view
+    // chains, then bare-`?` marks become lift regions, before the tree freezes
+    // (css-block.md §5, element-syntax.md §4, expression-lifting.md) — the
+    // formatter parses separately and keeps raw trees, so source text prints
+    // back verbatim. The css pass runs FIRST so a block inside an element's
+    // head or a child hole is already a chain when the element pass reaches it.
+    css::rewrite_items(&mut root.0, source);
     elements::rewrite_items(&mut root.0, source);
     lift::rewrite_items(&mut root.0);
     // The tally is a tree-proportional estimate — one `Spanned<Node>` of
