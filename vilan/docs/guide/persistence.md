@@ -130,6 +130,58 @@ no edit here: the build says what it emitted and the server believes it.
 An rpc app adds `.with_service(Service::new(protocol))` to the same chain
 — [Services & RPC](services.md#the-server-side) has it whole.
 
+### Caching: ETag and 304
+
+Anything you serve at a **fixed URL** re-downloads on every page load
+until you give the browser a validator. The policy every static layer
+converges on has two tiers, and the *name* decides which one a response
+gets:
+
+- A **fingerprinted name** — one that carries a content hash, so a new
+  build writes a new URL — is free to be cached for a year and never asked
+  about again: `Cache-Control: public, max-age=31536000, immutable`. No
+  validator needed; the name already is one.
+- A **fixed URL** — `/`, a favicon, a page the browser asks for by that
+  exact path — can change under the cache, so it gets a short life or
+  `no-cache`, plus an `ETag`, and a revalidation answers `304 Not
+  Modified` instead of re-sending the bytes.
+
+`std::http` ships the validator tier whole. `etag_of(bytes)` mints a
+strong, quoted tag from the bytes' sha-256 — compute it once, where the
+bytes settle. `etag_response(request, tag, bytes, content_type)` answers
+the request: `304` with the tag echoed and no body when the request's
+`If-None-Match` already names it, the full `200` otherwise. It returns the
+builder still open, so the Cache-Control tier chains after it and reaches
+both arms:
+
+```vilan,norun
+import std::bytes::encode_utf8;
+import std::http::{ Server, etag_of, etag_response };
+
+async fun main() {
+	let page = encode_utf8("<!doctype html><h1>hello</h1>");
+	let tag = etag_of(page);   // once, at boot — the bytes are settled
+
+	Server::builder()
+		.port(8080)
+		.on_request(|request| {
+			// A fixed URL revalidates: no-cache + ETag means every load
+			// asks, and an unchanged page answers 304 with no body.
+			etag_response(request, tag, page, "text/html; charset=utf-8")
+				.set_header("Cache-Control", "no-cache")
+				.build()
+		})
+		.build()
+		.start();
+}
+```
+
+A page you render per request works the same way — hash the rendered
+bytes with `etag_of` before answering, and an unchanged render still
+saves the transfer, just not the render. The matching semantics (the
+list and `*` forms, weak comparison, the GET/HEAD gate) are in the
+[reference](../std/process.md#stdhttp-the-server).
+
 ## Files: `std::fs`
 
 ```vilan,fragment
