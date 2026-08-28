@@ -11,7 +11,7 @@ Rust workspace, six crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
-  chumsky 2026-07-22, `proposals/proposal/frontend.md`) → AST in `node.rs` → macro
+  chumsky 2026-07-22, `proposals/projects/vilan/proposal/frontend.md`) → AST in `node.rs` → macro
   expansion in `macros.rs` (with `interpreter.rs`, the native evaluator that
   must stay behaviorally equivalent to emitted JS) → `elements.rs`
   (element-syntax desugar) and `lift.rs` (the expression-lifting rewrite;
@@ -23,14 +23,14 @@ Rust workspace, six crates, plus the language's own tree:
   diagnostics in `error.rs` — there is a house diagnostics standard, so match
   the shape of existing messages; `formatter.rs` is `vilan fmt`. Also in this
   crate: `bindgen/` (`vilan bindgen`, generating `external` bindings from
-  `.d.ts` files, `proposals/proposal/bindgen.md`) and `leak_tally.rs` (per-site leak
+  `.d.ts` files, `proposals/projects/vilan/proposal/bindgen.md`) and `leak_tally.rs` (per-site leak
   instrumentation the test suite reads — not a compile stage).
 - `crates/vilan-cli` — the `vilan` binary and the end-to-end suites
   (`tests/corpus.rs`, `cancellation.rs`, `rpc_http.rs`, `streaming.rs`,
   `transport_robustness.rs`, …).
 - `crates/vilan-lsp` — the language server.
 - `crates/vilan-ide` — the editor-facing queries the language server and the web
-  playground SHARE (K9, `proposals/proposal/playground-completion.md` §3): the line
+  playground SHARE (K9, `proposals/projects/vilan/proposal/playground-completion.md` §3): the line
   index, the completion engine, and the navigation primitives it reads. It depends on
   `vilan-core` and nothing else on purpose, so it builds wherever core does —
   including `wasm32-unknown-unknown`, where the language server's tower-lsp/tokio
@@ -38,14 +38,14 @@ Rust workspace, six crates, plus the language's own tree:
   `line_index.rs` is only a newtype speaking `lsp_types` at the protocol edge.
 - `crates/vilan-embedded-std` — embeds the std source into the binary.
 - `crates/vilan-wasm` — the compiler as a WebAssembly module; the web
-  playground's engine (`proposals/proposal/web-playground.md`). The compile logic is
+  playground's engine (`proposals/projects/vilan/proposal/web-playground.md`). The compile logic is
   plain Rust tested natively on the host; the `wasm_bindgen` layer at the
   bottom is a thin type-conversion shim, not where behavior lives.
 - `vilan/std/src/*.vl` — the standard library, written in vilan. std loads as its own
   package with root-scoped module resolution.
 - `vilan/test/` — the corpus: `.vl` programs with **byte-identical** `.mjs` goldens.
 - `vilan/docs/` — the user-facing book + spec; every fenced example compiles.
-- The `proposals` sibling repo (`proposals/proposal/…`, workspace-relative —
+- The `proposals` sibling repo (`proposals/projects/vilan/proposal/…`, workspace-relative —
   N15 moved the design memory out of this tree) — design documents. Semantics
   are settled there **before** code; the proposal named in your work order is
   the spec for your change.
@@ -221,7 +221,7 @@ Rust workspace, six crates, plus the language's own tree:
 - **Read the named proposal sections first.** `proposals/tracker/backlog.md`
   (in the `vilan-lang/proposals` sibling repo) is the single planning surface
   (its Now/Next/Later block names what's active); the papers under
-  `proposals/proposal/` are the specs, and each backlog item cites the one
+  `proposals/projects/vilan/proposal/` are the specs, and each backlog item cites the one
   that governs it. A work-order brief that names sections
   overrides this default. (Arcs move; the tracker is the pointer that stays
   true.)
