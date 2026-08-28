@@ -3,7 +3,7 @@
 //! compiles cleanly or fails, run through the real pipeline on a large-stack
 //! worker (so a recursion bug surfaces as an error, not an aborted suite).
 //!
-//! `#[ignore]`d tests are KNOWN BUGS (see vilan/proposal/analyzer-refactor.md):
+//! `#[ignore]`d tests are KNOWN BUGS (see proposal/analyzer-refactor.md):
 //! they assert the *desired* outcome, so removing `#[ignore]` when the bug is
 //! fixed turns them green — that's how we track progress against the plan.
 
@@ -52200,7 +52200,7 @@ fn a_generic_impl_grounds_the_traits_parameter_through_its_own_binder() {
 }
 
 // --- B62: a pattern capture that takes ownership of a resource payload is
-// destroyed at its scope end (`vilan/proposal/affine-moves.md` §7) ------------
+// destroyed at its scope end (`proposal/affine-moves.md` §7) ------------------
 
 /// The `resource struct Res` + `Drop` preamble every B62 pin below shares.
 const B62_PRELUDE: &str = r#"
@@ -53201,7 +53201,7 @@ fn an_async_function_returning_a_task_should_type_as_the_value() {
 }
 
 // --- B66: a generic body cannot destroy a `T`, so no delta-resource value may
-// reach a scope-end drop (`vilan/proposal/affine-moves.md` §9.2) ---------------
+// reach a scope-end drop (`proposal/affine-moves.md` §9.2) ---------------------
 
 #[test]
 fn b66_the_generic_capture_leak_names_the_capture_at_the_instantiation() {
@@ -53691,7 +53691,7 @@ fn b66_a_body_that_already_failed_the_move_scan_reports_once() {
 }
 
 // --- B65: a capture of a LOANED subject is a loan, and may not be consumed
-// (`vilan/proposal/affine-moves.md` §9.1) -------------------------------------
+// (`proposal/affine-moves.md` §9.1) -------------------------------------------
 
 #[test]
 fn b65_the_is_capture_diagnostic_names_the_subject_and_the_by_value_steer() {
@@ -64795,7 +64795,7 @@ fn b128_an_expectation_selecting_a_ranked_home_beside_an_unrankable_one_runs() {
 
 // --- A25: remote sources — subscribe by demand, unsubscribe at zero ---------
 //
-// RATIFIED 2026-08-19 and shipped (`vilan/proposal/remote-sources.md` §2, §5,
+// RATIFIED 2026-08-19 and shipped (`proposal/remote-sources.md` §2, §5,
 // §8). Every observing path on a `RemoteSource` takes a COUNTED lease: the
 // 0→1 transition sends `Subscribe` (eagerly — the server's immediate
 // current-value `Update` is how the mirror seeds), the 1→0 transition sends

@@ -1,5 +1,5 @@
 //! End-to-end test for K6 transport robustness
-//! (vilan/proposal/transport-robustness.md): a generated client rides a real
+//! (proposal/transport-robustness.md): a generated client rides a real
 //! WebSocket to a real server, which is then STOPPED (SIGSTOP — the in-flight
 //! call hangs), KILLED (the socket closes), and RESTARTED with different
 //! state. Asserts the whole contract: the pending call rejects with a typed
@@ -325,7 +325,7 @@ fn a_dropped_connection_reconnects_and_resyncs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The draft leg (A14, `vilan/proposal/draft-reconnect.md`): a `Draft` edited
+/// The draft leg (A14, `proposal/draft-reconnect.md`): a `Draft` edited
 /// WHILE THE CONNECTION IS DOWN re-sends itself when it comes back, over a real
 /// socket and a real server restart. Same unix gate and the same reason as the
 /// test above — the outage is produced by killing the server process.

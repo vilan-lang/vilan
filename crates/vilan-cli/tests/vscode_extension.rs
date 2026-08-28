@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The registered publisher identity — the org's, not a person's (F9,
-/// `vilan/proposal/org-migration.md`).
+/// `proposal/org-migration.md`).
 const PUBLISHER: &str = "vilan-lang";
 
 fn repo_root() -> PathBuf {
