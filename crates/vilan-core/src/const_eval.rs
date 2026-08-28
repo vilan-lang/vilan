@@ -457,18 +457,33 @@ fn inference_candidates(program: &Program) -> Vec<Id> {
 }
 
 /// Deduplicates and deterministically orders the collected `(kind, line)`
-/// pairs into per-kind file contents (newline-terminated). Lines sort
-/// lexically — which is SOUND for the CSS the styling system emits: `.class`
-/// rules ('.' = 0x2E) sort before `:root` variables and `@media` blocks
-/// ('@' = 0x40), so media rules take the later cascade position they need,
-/// and pseudo-class rules don't compete with base rules on cascade order at
-/// all (their classes are distinct and their specificity is higher) — EXCEPT
-/// among `@media (min-width: …)` lines themselves, which sort by ascending
-/// min-width, not by digit bytes. On a wide viewport every narrower
-/// `min-width` rule also matches, specificity ties, and cascade order
-/// decides — so the widest matching breakpoint must come last for a
-/// mobile-first `.sm(x).lg(y)` chain to render `y`. The lexical digit sort
-/// put `1024px` before `640px` and the narrow rule won (B35).
+/// pairs into per-kind file contents (newline-terminated). Every kind's
+/// bytes are a function of the SET of contributions — write order never
+/// leaks (build-hooks.md §5.1) — under a kind-specific rule (const-eval.md
+/// §3):
+///
+/// - **Every kind but `css` sorts lexically by line.** That is the one
+///   content-derived order that assumes nothing about what the lines mean,
+///   and it is exactly what the proposed keyed surface gives an un-keyed
+///   `emit` (`emit_keyed(kind, line, line)` sorts by `(line, line)` —
+///   build-hooks.md §5.3), so these bytes hold if that surface lands.
+///
+/// - **`css` alone adds the cascade override**: `@media (min-width: …)`
+///   lines sort by ascending min-width, after everything else, not by digit
+///   bytes. The lexical half is SOUND for the CSS the styling system emits —
+///   `.class` rules ('.' = 0x2E) sort before `:root` variables and `@media`
+///   blocks ('@' = 0x40), so media rules take the later cascade position
+///   they need, and pseudo-class rules don't compete with base rules on
+///   cascade order at all (their classes are distinct and their specificity
+///   is higher). The width override exists because on a wide viewport every
+///   narrower `min-width` rule also matches, specificity ties, and cascade
+///   order decides — the widest matching breakpoint must come last for a
+///   mobile-first `.sm(x).lg(y)` chain to render `y`, and the lexical digit
+///   sort put `1024px` before `640px` so the narrow rule won (B35). Applied
+///   to any other kind that comparator silently reordered — a line that
+///   happened to parse as a media rule sorted last whatever its first byte,
+///   because `None` precedes `Some` in the key (G5) — which is why it is
+///   fenced to the one kind whose semantics justify it.
 pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> {
     let mut by_kind: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (kind, line) in assets {
@@ -478,10 +493,13 @@ pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> 
         .into_iter()
         .map(|(kind, lines)| {
             let mut lines = lines.into_iter().collect::<Vec<_>>();
-            // Media lines as a group sort after everything else ('@' is the
-            // highest first byte the styling system emits) — the key only has
-            // to order them among themselves and keep the rest lexical.
-            lines.sort_by_key(|line| (media_min_width(line).map(f64::to_bits), *line));
+            if kind == "css" {
+                // Media lines as a group sort after everything else ('@' is
+                // the highest first byte the styling system emits) — the key
+                // only has to order them among themselves and keep the rest
+                // lexical.
+                lines.sort_by_key(|line| (media_min_width(line).map(f64::to_bits), *line));
+            }
             let mut content = lines.join("\n");
             content.push('\n');
             (kind.to_string(), content)

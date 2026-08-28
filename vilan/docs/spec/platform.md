@@ -112,6 +112,19 @@ platforms, whose runtimes classify a file as ESM or CommonJS before
 running it, and `.js` on the browser, where the loading
 `<script type="module">` tag classifies it instead.
 
+Any other emitted kind (§9.2's channel takes an arbitrary kind) lands
+the same way: `dist/<name>.<kind>`, holding the kind's deduplicated
+lines in a kind-specific deterministic order — `css` sorts in cascade
+order (base rules before `@media` blocks, media blocks by ascending
+min-width), and every other kind sorts lexically by line — so a kind's
+bytes are a function of the set of contributions, never of the order
+const evaluation reached them. A kind that stops being emitted stops
+shipping: the build records which kind files each entry's flush wrote
+(`dist/.vilan-asset-kinds`) and removes a recorded file when a later
+build emits nothing for its kind. Only recorded files are ever
+removed — a file the record does not name is never the build's to
+touch.
+
 A `browser` entry declaring **`split = true`** emits **route chunks**
 instead of one file: `dist/<name>.js` carries every module-level binding
 (so §7.6's initialization order is untouched) and every function two or
