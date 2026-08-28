@@ -5014,6 +5014,141 @@ fn a_legitimate_emit_kind_is_untouched() {
     );
 }
 
+// --- G7: a kind may not name a file the build's own namespace owns ---
+//
+// E94 above fenced the kind's SHAPE and stopped there, and shape was only half
+// the question: one path segment beside the build output can still be a segment
+// the build writes there itself. The probe that found it is the first pin below
+// — `emit("vl", "CLOBBERED")` in a bare build OVERWROTE THE ENTRY SOURCE FILE
+// and exited 0, because a lone package's outputs sit exactly where its entry
+// does. `mjs`/`js` take the compiled bundle, `chunks.json` the build manifest,
+// and `<arm>.js` the route-chunk namespace (that one worse than an overwrite:
+// `sweep_stale_chunks` DELETES what lands there on the next build).
+//
+// The refusal reads ONE list — `const_eval::build_owned_emit_kind` — which is
+// the same list the CLI's per-kind prune reads (`recordable_emit_kind`, G6), so
+// the write side and the prune side cannot come to disagree about what the
+// build owns. `css` is the one member the fence admits: the build owns it AND
+// `emit` is how it is written. Backlog G7, build-hooks.md §5.6.
+
+/// The wording of the namespace half of the fence, as against E94's shape half
+/// (`EMIT_KIND_REFUSAL` above): the shared lead-in plus the per-kind clause
+/// naming WHICH of the build's files the kind would have taken. Pinning both
+/// halves keeps a refusal from drifting into "reserved" with no reason in it.
+fn owned_refusal(kind: &str, collides_with: &str) -> String {
+    format!(
+        "`asset::emit` kinds name one file beside the build output, and \
+         `{kind}` collides with {collides_with}"
+    )
+}
+
+/// A program whose `const` initializer emits one line under `kind`.
+fn emitting_program(kind: &str) -> String {
+    format!(
+        r#"
+        import std::asset::emit;
+        fun rule(): i32 {{
+            emit("{kind}", "x");
+            1
+        }}
+        let _asset = const rule();
+        fun main() {{}}
+        main();
+        "#
+    )
+}
+
+#[test]
+fn an_emit_kind_naming_the_entry_source_is_refused() {
+    // The probe inverted: this exact program overwrote its own source with
+    // `x` and exited 0 before the fence existed.
+    assert_fails_with(
+        &emitting_program("vl"),
+        &owned_refusal("vl", "the entry source a build's outputs sit beside"),
+    );
+}
+
+#[test]
+fn an_emit_kind_naming_the_process_bundle_is_refused() {
+    assert_fails_with(
+        &emitting_program("mjs"),
+        &owned_refusal("mjs", "the compiled bundle"),
+    );
+}
+
+#[test]
+fn an_emit_kind_naming_the_browser_bundle_is_refused() {
+    // The same file on the other platform — one member of the list, two
+    // spellings, because a leg's bundle extension follows its target.
+    assert_fails_with(
+        &emitting_program("js"),
+        &owned_refusal("js", "the compiled bundle"),
+    );
+}
+
+#[test]
+fn an_emit_kind_naming_the_build_manifest_is_refused() {
+    assert_fails_with(
+        &emitting_program("chunks.json"),
+        &owned_refusal("chunks.json", "the build manifest"),
+    );
+}
+
+#[test]
+fn an_emit_kind_in_the_route_chunk_namespace_is_refused() {
+    // A pattern, not a name: every `<arm>.js` belongs to the chunk sweep, so
+    // the fence refuses the family rather than an enumeration of arms.
+    assert_fails_with(
+        &emitting_program("Route_Docs.js"),
+        &owned_refusal("Route_Docs.js", "the build's route-chunk namespace"),
+    );
+}
+
+#[test]
+fn a_computed_emit_kind_is_fenced_like_a_literal_one() {
+    // The fence is taken on the const-evaluated VALUE, not on the syntax of
+    // the argument, so a kind assembled at const time is refused exactly as a
+    // literal is — and it clobbered the source exactly as the literal did
+    // before the fix. There is no third path: `asset::emit` is const-only, so
+    // the kind is always known where the fence runs.
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun kind_name(): str {
+            "v" + "l"
+        }
+        fun rule(): i32 {
+            emit(kind_name(), "x");
+            1
+        }
+        let _asset = const rule();
+        fun main() {}
+        main();
+        "#,
+        &owned_refusal("vl", "the entry source a build's outputs sit beside"),
+    );
+}
+
+#[test]
+fn the_style_sidecar_kind_stays_admitted() {
+    // `css` IS in the owned list — the prune may never touch `<leg>.css`,
+    // because `sweep_stale_sidecar` owns it — and it is nonetheless the one
+    // member `emit` admits, because `emit("css", …)` is how the styling system
+    // writes that very file. A fence refusing it would take the whole styling
+    // system with it, which is why the exemption is a named variant rather
+    // than a second copy of the list with one name missing.
+    assert_compiles(&emitting_program("css"));
+}
+
+#[test]
+fn an_emit_kind_the_build_does_not_own_stays_admitted() {
+    // The green negative for the namespace half, as
+    // `a_legitimate_emit_kind_is_untouched` is for the shape half: a kind of
+    // the program's own is exactly what the refusal tells the user to pass, so
+    // it had better still compile.
+    assert_compiles(&emitting_program("routes"));
+}
+
 #[test]
 fn a_runtime_read_is_rejected() {
     // The const-only bit, same machinery as `emit`'s (const-eval.md §2).

@@ -3265,6 +3265,16 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
 /// absence is the fact a shell cannot see today (`fullstack-dx.md` §5.2, F1/F2):
 /// the manifest states it positively instead of leaving a server to probe the
 /// filesystem for it.
+///
+/// This is also where the previous flush's leftovers go, BOTH mechanisms
+/// together (backlog G8): the per-kind prune for every recordable kind, and
+/// [`sweep_stale_sidecar`] for `css`. The sidecar sweep used to live only in
+/// [`write_chunks`], which `build` calls and `run` / the single-file watch
+/// round do not — so a `<entry>.css` survived `vilan run` after the styles
+/// that produced it were deleted, while `vilan build` on the same tree removed
+/// it. The flush is the one place that knows what this round emitted, so it is
+/// where BOTH prunes belong; `write_chunks` keeps its own call for the HMR
+/// watch loop, which writes its sidecar directly rather than through here.
 fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Option<String> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
     let leg = output_js
@@ -3301,6 +3311,7 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Opt
                 .map(|name| name.to_string_lossy().into_owned());
         }
     }
+    sweep_stale_sidecar(output_js, styles.as_deref());
     styles
 }
 
@@ -3314,21 +3325,29 @@ fn asset_kind_path(directory: &std::path::Path, leg: &str, kind: &str) -> PathBu
 }
 
 /// Whether the per-kind prune records — and so may later remove — `kind`'s
-/// file. The refusals mirror the names a leg's build already owns through
-/// OTHER machinery, plus the one it must never touch: `css` belongs to
-/// [`sweep_stale_sidecar`], the bundle (`js`/`mjs`), the manifest
-/// (`chunks.json`) and the `<arm>.js` route-chunk shapes to [`write_chunks`]'s
-/// sweeps, and `vl` is the SOURCE — a bare build's outputs sit exactly where
-/// its entry does. A kind carrying a separator or a line break cannot ride
-/// the record's `leg/kind` line format and is refused on both sides.
-/// Refusal means "never pruned", not "never written": E94 decides what
-/// `emit` accepts; this only decides what the prune may touch.
+/// file. Two refusals, from two different places:
+///
+/// - **The names a leg's build already owns through OTHER machinery**, which
+///   is [`vilan_core::const_eval::build_owned_emit_kind`] — `css` belongs to
+///   [`sweep_stale_sidecar`], the bundle (`js`/`mjs`), the manifest
+///   (`chunks.json`) and the `<arm>.js` route-chunk shapes to
+///   [`write_chunks`]'s sweeps, and `vl` is the SOURCE. That list is NOT
+///   written here: since G7 the emit-time fence refuses the same list (all of
+///   it but `css`, which `emit` is the sanctioned writer of), and two copies
+///   of a list are how the write side and the prune side come to disagree
+///   about what the build owns. One list, two consumers.
+/// - **The record's own line format**: a kind carrying a separator or a line
+///   break cannot ride a `leg/kind` line, and that is this consumer's
+///   constraint alone.
+///
+/// Refusal means "never pruned", not "never written". Since G7 the emit fence
+/// makes the first half unreachable in practice — a reserved kind never
+/// reaches a flush at all — and it stays as the prune's own guard, because
+/// what the prune may DELETE should not depend on a check made elsewhere.
 fn recordable_emit_kind(kind: &str) -> bool {
-    let reserved = ["css", "vl", "js", "mjs", "chunks.json"];
     !kind.is_empty()
         && !kind.contains(['/', '\\', '\n', '\r'])
-        && !reserved.contains(&kind)
-        && !kind.ends_with(".js")
+        && vilan_core::const_eval::build_owned_emit_kind(kind).is_none()
 }
 
 /// The build's own record of the non-`css` asset kinds each leg's last flush
@@ -3645,6 +3664,9 @@ fn write_chunks(
     // build that wrote a manifest where this one will not (a leg retargeted off
     // the browser) is, and the sweep takes it.
     sweep_stale_chunks(output_js, chunks, is_browser);
+    // For the HMR watch loop, which writes its sidecar straight into `dist/`
+    // rather than through [`write_assets`] — every other caller has already
+    // swept there, and a second call on the same `styles` is a no-op (G8).
     sweep_stale_sidecar(output_js, styles);
     for chunk in chunks {
         let path = directory.join(&chunk.file);
@@ -3795,6 +3817,13 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], write
 /// browser then RE-INJECTS the deleted stylesheet, which is resurrection, not
 /// staleness). A failed removal is reported and otherwise ignored, exactly as
 /// the chunk sweep treats a stray.
+///
+/// Called from [`write_assets`] — every path that flushes assets, `build` and
+/// `run` and both watch loops alike (backlog G8; before that it hung off
+/// [`write_chunks`], which only `build` reaches) — and once more from
+/// [`write_chunks`] for the HMR loop, which never flushes through
+/// `write_assets`. It touches ONE name, `<leg>.css`, so a user file beside the
+/// entry is not in its reach.
 fn sweep_stale_sidecar(output_js: &std::path::Path, styles: Option<&str>) {
     if styles.is_some() {
         return;

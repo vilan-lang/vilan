@@ -508,6 +508,80 @@ pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> 
         .collect()
 }
 
+/// Why a build already owns the file an `asset::emit` kind would name, or
+/// `None` when the kind is the program's to write.
+///
+/// **This is THE list of kinds the build's own output namespace owns**, and it
+/// has two consumers that must never disagree about it: the emit-time refusal
+/// ([`interpreter::check_emit_kind`], G7) and the CLI's per-kind prune
+/// (`recordable_emit_kind`, G6). Before it existed they were two literal
+/// arrays, and the drift was not hypothetical — the prune's array shipped in
+/// Order 17 while the write side had no namespace check at all, which is
+/// exactly the hole G7 records: `emit("vl", …)` in a bare build OVERWROTE THE
+/// ENTRY SOURCE at exit 0, because E94's fence checks a kind's SHAPE (one path
+/// segment) and nothing checked whose file that segment names.
+///
+/// The two consumers act on the answer differently, and the difference is the
+/// reason this returns a *reason* rather than a bool:
+///
+/// - **The prune refuses every one of them**, `css` included: a kind here is
+///   some other machinery's file (`sweep_stale_sidecar`'s, `write_chunks`'s)
+///   or the source itself, and the per-kind prune may not delete a file it
+///   does not own.
+/// - **`emit` refuses every one of them EXCEPT [`BuildOwnedKind::StyleSidecar`]**.
+///   `css` is owned by the build *and* `emit` is how it is written — the whole
+///   styling system reaches `<leg>.css` through `emit("css", …)`, and
+///   `write_assets` recognizes that kind by name. It is reserved *against a
+///   build hook* (build-hooks.md §5.6, where a manifest declaring
+///   `[build.asset.css]` is an error naming `std::style`), never against the
+///   const channel that produces it.
+///
+/// `chunks.json` is matched before the `.js` family so the manifest keeps its
+/// own reason; note that `chunks.json` does not end in `.js` anyway, so the
+/// order is documentation rather than load-bearing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BuildOwnedKind {
+    /// `css` — the style sidecar `write_assets` writes and
+    /// `sweep_stale_sidecar` removes.
+    StyleSidecar,
+    /// `vl` — the SOURCE. A bare build's outputs sit exactly where its entry
+    /// does, so this kind's file *is* the program being compiled.
+    EntrySource,
+    /// `js` / `mjs` — the compiled bundle, on the browser and on a process leg.
+    Bundle,
+    /// `chunks.json` — the leg's build manifest.
+    BuildManifest,
+    /// `<arm>.js` — the route-chunk namespace `sweep_stale_chunks` owns by
+    /// pattern rather than by name.
+    RouteChunk,
+}
+
+impl BuildOwnedKind {
+    /// The noun phrase a diagnostic uses for the file this kind collides with.
+    pub fn collides_with(self) -> &'static str {
+        match self {
+            BuildOwnedKind::StyleSidecar => "the style sidecar",
+            BuildOwnedKind::EntrySource => "the entry source a build's outputs sit beside",
+            BuildOwnedKind::Bundle => "the compiled bundle",
+            BuildOwnedKind::BuildManifest => "the build manifest",
+            BuildOwnedKind::RouteChunk => "the build's route-chunk namespace",
+        }
+    }
+}
+
+/// The one list. See [`BuildOwnedKind`] for who reads it and why they answer
+/// differently.
+pub fn build_owned_emit_kind(kind: &str) -> Option<BuildOwnedKind> {
+    match kind {
+        "css" => Some(BuildOwnedKind::StyleSidecar),
+        "vl" => Some(BuildOwnedKind::EntrySource),
+        "js" | "mjs" => Some(BuildOwnedKind::Bundle),
+        "chunks.json" => Some(BuildOwnedKind::BuildManifest),
+        _ if kind.ends_with(".js") => Some(BuildOwnedKind::RouteChunk),
+        _ => None,
+    }
+}
+
 /// The numeric minimum width of an `@media (min-width: …)` line, in px —
 /// `em`/`rem` normalized at the CSS-initial 16px — or `None` for a non-media
 /// line, or a width in units the styling system doesn't emit (those keep
