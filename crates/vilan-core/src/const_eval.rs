@@ -10,8 +10,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use crate::analyzer::{Expr, Program, SourceId};
-use crate::call_graph::{Call, CallGraph, CallTarget, Node};
+use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason, Node};
+use crate::dispatch_refine::{DispatchSite, RefinedCaller};
 use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -1036,6 +1037,18 @@ impl<'p, 'src> State<'p, 'src> {
     /// never join R — a root's call into R is the offending boundary,
     /// reported at that call site.
     ///
+    /// A trait-dispatched call resolves to `CallTarget::Indirect(TraitDispatch
+    /// | GenericMember)` — also no caller edge, and an `emit` inside a trait
+    /// impl reached only through a bounded generic used to escape the check
+    /// entirely (backlog B143: a clean compile, then a `ReferenceError` at run
+    /// time). The fixpoint now follows [`crate::dispatch_refine`]'s refined
+    /// edges for those sites: an `OnConstraint` site is charged at the ENTRY
+    /// call whose recorded substitution selects an R-member — so a clean
+    /// instantiation of the same generic stays admitted — and every
+    /// unresolvable shape (a value-taken generic, an opaque binding, a
+    /// receiver-less `OnType`) widens to the whole candidate list.
+    /// Over-refusal is the acceptable fallback direction; an escape is not.
+    ///
     /// A call THROUGH a value resolves to `CallTarget::Indirect(Value)`, which
     /// carries no caller edge, so the fixpoint cannot follow it. §2's rule is
     /// therefore a refusal at the point the value is MADE: an R-member
@@ -1090,6 +1103,88 @@ impl<'p, 'src> State<'p, 'src> {
                 }
             }
         }
+        // The dispatch sites the graph deliberately leaves indirect (B143): a
+        // bounded generic's member call, a trait re-dispatch onto a concrete
+        // receiver, or an iterator-protocol `for` edge. Enumerate every
+        // non-const one — node-owned, initializer-owned, and bare top-level —
+        // and let `dispatch_refine` resolve each to the callees its recorded
+        // dispatch actually selects; the reverse map joins the fixpoint below
+        // as extra caller edges.
+        let dispatched_name = |call_id: Id| -> Option<&str> {
+            match crate::async_infer::dispatch_at(self.program, call_id) {
+                Some(GenericDispatch::OnConstraint(_, name))
+                | Some(GenericDispatch::OnType(_, name)) => Some(name),
+                None => None,
+            }
+        };
+        let is_dispatch_target = |target: CallTarget| {
+            matches!(
+                target,
+                CallTarget::Indirect(IndirectReason::TraitDispatch | IndirectReason::GenericMember)
+            )
+        };
+        let mut refinement_sites: Vec<DispatchSite> = Vec::new();
+        for node in graph.nodes() {
+            for call in graph.calls_of(node.id()) {
+                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
+                    continue;
+                }
+                let Some(name) = dispatched_name(call.call_id) else {
+                    continue;
+                };
+                refinement_sites.push(DispatchSite {
+                    owner: RefinedCaller::Node(node.id()),
+                    call: call.call_id,
+                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                });
+            }
+        }
+        // Module-level initializers own no graph node; a dispatch site there
+        // is TopLevel-owned, so an R-selecting resolution is a boundary by
+        // itself. (A `const`-marked initializer never appears here — the
+        // graph skips it, and the const-subtree cut would drop it anyway.)
+        let mut initializer_call_ids: HashSet<Id> = HashSet::default();
+        for binding in self.program.module_level_bindings() {
+            for call in graph.initializer_calls_of(binding) {
+                initializer_call_ids.insert(call.call_id);
+                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
+                    continue;
+                }
+                let Some(name) = dispatched_name(call.call_id) else {
+                    continue;
+                };
+                refinement_sites.push(DispatchSite {
+                    owner: RefinedCaller::TopLevel,
+                    call: call.call_id,
+                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                });
+            }
+        }
+        // Top-level statement calls own neither a node nor an initializer
+        // record, so the dispatch record itself is the gate.
+        for (call_id, _) in &self.program.function_calls {
+            if owned_calls.contains(call_id)
+                || initializer_call_ids.contains(call_id)
+                || self.in_const_subtree(*call_id)
+            {
+                continue;
+            }
+            let Some(name) = dispatched_name(*call_id) else {
+                continue;
+            };
+            refinement_sites.push(DispatchSite {
+                owner: RefinedCaller::TopLevel,
+                call: *call_id,
+                candidates: crate::dispatch_refine::candidates_of(self.program, name),
+            });
+        }
+        let mut refined_callers: HashMap<Id, Vec<(RefinedCaller, Id)>> = HashMap::default();
+        for edge in crate::dispatch_refine::refined_edges(self.program, graph, &refinement_sites) {
+            refined_callers
+                .entry(edge.callee)
+                .or_default()
+                .push((edge.caller, edge.anchor));
+        }
         // Propagate to callers through non-const sites; roots never join.
         while let Some(member) = worklist.pop() {
             for caller in graph.callers_of(member) {
@@ -1118,6 +1213,29 @@ impl<'p, 'src> State<'p, 'src> {
                             reaches.insert(caller_id, builtin);
                         }
                         worklist.push(caller_id);
+                    }
+                }
+            }
+            // The refined dispatch edges into this member (B143). The anchor
+            // is the runtime crossing the edge charges — the entry call that
+            // selected the member, or the dispatch site on a conservative
+            // fallback — so the const-subtree cut applies to it exactly as to
+            // a direct site.
+            for (caller, anchor) in refined_callers.get(&member).into_iter().flatten() {
+                if self.in_const_subtree(*anchor) {
+                    continue;
+                }
+                match *caller {
+                    RefinedCaller::TopLevel => boundary_errors.push((*anchor, member)),
+                    RefinedCaller::Node(caller_id) => {
+                        if Some(caller_id) == main_id {
+                            boundary_errors.push((*anchor, member));
+                        } else if in_r.insert(caller_id) {
+                            if let Some(&builtin) = reaches.get(&member) {
+                                reaches.insert(caller_id, builtin);
+                            }
+                            worklist.push(caller_id);
+                        }
                     }
                 }
             }

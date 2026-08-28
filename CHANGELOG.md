@@ -34,6 +34,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**An `asset::emit` reached only through trait dispatch escaped the const-only check — a clean compile, then a `ReferenceError` at run time.** The check propagates "compile-time-only" over call edges, and a bounded generic's `value.text()` has none: an emitting impl behind it was invisible, so while both concrete spellings of the same call were refused, the generic one landed in the emitted JavaScript as a live `__emit_asset(...)` with no runtime binding. The check now follows the analyzer's recorded dispatch — the same refinement the context coverage check uses, extracted into a shared `dispatch_refine` module: a generic call is charged at the entry whose substitution selects an emitting impl, so the refusal is per call site and a clean impl of the same trait member through the same generic stays legal; an inherited trait default re-dispatched onto a concrete receiver narrows by the receiver's head; module-level initializer entries are boundaries like any other; and anything the compiler cannot resolve — a shared default body's `self` call — refuses every receiver, conservatively, because the alternative is the silent crash. Inside a `const` nothing changes: the interpreter makes the call, which is the whole styling shape. Pinned in both directions, with plants confirming the escape pins and the clean-admission pins each redden alone. (backlog B143)
+
+---
+
 <!-- family: tooling -->
 **Non-`css` `emit` kinds order lexically by line, not by the CSS cascade.** The asset flush applied its one comparator — `(Option<min-width>, line)`, the CSS cascade rule with B35's ascending-width override — to *every* accumulated kind, so a kind named `manifest` holding a line that happened to parse as a media rule had that line forced last whatever its first byte: a plain line starting `z` (0x7A) sorted before an `@media` line (`@` is 0x40). The comparator is now fenced to the one kind whose semantics justify it. `css` keeps its cascade order byte-for-byte (the corpus gate holds every golden unchanged), and every other kind sorts lexically by line — the kind-specific rule `const-eval.md` §3 promised, a pure function of the set of contributions, and exactly the order the proposed `emit_keyed(kind, line, line)` desugar would give an un-keyed `emit`, so these bytes hold if that surface lands. Found by Order 16's build-hooks probes (P2). (backlog G5)
 
@@ -46,6 +51,11 @@ written down.
 
 <!-- family: tooling -->
 **A kind that stops emitting stops shipping.** Accumulator flushes write one `<leg>.<kind>` file per kind — and a build whose flush held no contributions for a kind a previous build wrote left the old file in place, so `dist/` kept serving output no current build produced (probe P8: delete the last `emit("routes", …)` and `dist/server.routes` survived, unchanged and unmentioned — worse than a missing file under "a built app needs nothing but `dist/`", because it ships). Every flush now records the kind files it wrote (`.vilan-asset-kinds` beside the outputs, removed with its last entry) and the next build prunes a recorded file whose kind emitted nothing. The pruner acts only on its own record — never on a filename it merely finds, so user-placed files and other legs' outputs are untouched — and the general "delete whatever this build did not write" sweep stays filed with E92. Every build path shares the one helper: `build`, `run`, watch rounds, and the dev loop's `dist/` writes. (backlog G6)
+
+---
+
+<!-- family: tooling -->
+**`walk_type_node`'s catch-all no longer panics — an unclassified node in type position draws a diagnostic.** The analyzer's twelve-variant match on user-input-driven `Node` in type position ended in `unimplemented!` where every neighbouring path degrades into a diagnostic. Probed unreachable today — the type grammar's single door produces only the handled shapes, and B142's `Node::Error` depth stand-in never survives to the walk — so this is hardening, not a live crash: the next type-position variant now draws "this expression cannot be used as a type; write a type here — …" and the slot degrades to the non-cascading `Unresolved`, the same rule already-errored expressions follow, while a parse-recovery `Node::Error` stays silent because its diagnostic already exists at the parser. Pinned at unit level (the arm is unreachable through source), with the old panic planted to prove the pin reddens. (backlog B144)
 
 ---
 

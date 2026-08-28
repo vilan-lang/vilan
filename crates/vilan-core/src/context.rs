@@ -514,42 +514,12 @@ fn analyze(
     // caller edge only strengthens the coverage demand); the same sites join
     // the threading plan, and a callee that turns out not to need the value
     // simply ignores the extra argument.
-    let dispatch_member_name = |call_id: Id| -> Option<&str> {
-        let subject_id = program.function_calls.get(&call_id)?.subject_id;
-        for key in [call_id, subject_id] {
-            match program.generic_dispatch.get(&key) {
-                Some(crate::analyzer::GenericDispatch::OnConstraint(_, name))
-                | Some(crate::analyzer::GenericDispatch::OnType(_, name)) => return Some(name),
-                None => {}
-            }
-        }
-        None
-    };
-    let dispatch_candidates = |name: &str| -> Vec<Id> {
-        let mut candidates = Vec::new();
-        for trait_ in program.traits.values() {
-            let Some(&declaration_id) = trait_.declarations.get(name) else {
-                continue;
-            };
-            // The trait's own default body, when it has one.
-            if program
-                .functions
-                .get(&declaration_id)
-                .is_some_and(|function| function.has_body)
-            {
-                candidates.push(declaration_id);
-            }
-            // Every implementation's override of this trait's member.
-            for implementation in &program.implementations {
-                if implementation.trait_ids.contains(&trait_.id) {
-                    if let Some(&member_id) = implementation.declarations.get(name) {
-                        candidates.push(member_id);
-                    }
-                }
-            }
-        }
-        candidates
-    };
+    // The name and candidate lookups live in `dispatch_refine` (shared with
+    // the const-only capability check since B143).
+    let dispatch_member_name =
+        |call_id: Id| -> Option<&str> { crate::dispatch_refine::member_name_at(program, call_id) };
+    let dispatch_candidates =
+        |name: &str| -> Vec<Id> { crate::dispatch_refine::candidates_of(program, name) };
     // (caller node, call id, candidate callees) per dispatch site.
     let mut dispatch_sites: Vec<(Id, Id, Vec<Id>)> = Vec::new();
     // callee -> the nodes that may reach it through dispatch.
@@ -617,107 +587,15 @@ fn analyze(
     // proposal/requirement-polymorphism.md): the union edges above stay for
     // needs/strict/threading — sound, and the hidden value physically flows
     // caller → generic body → impl either way — but COVERAGE follows the
-    // resolved instantiation. Per `OnConstraint` site, a WALK enumerates the
-    // entries of the function owning the constraint (a closure-owned site
-    // resolves as its parent function does): an entry whose recorded
-    // bindings — explicit generic arguments over the inferred substitution —
-    // resolve the constraint concretely draws coverage edges from ITS caller
-    // to only the impl members that type selects (a top-level entry marks
-    // them outside-entered — always uncovered); a binding that leads to
-    // another generic parameter recurses to the entry's own enclosing
-    // function, so a forwarding wrapper resolves per call site; an
-    // unresolvable binding falls back per entry (every candidate, from that
-    // entry's caller). A revisited (function, constraint) pair is skipped
-    // exactly — its edges are a function of the pair alone — so recursion
-    // needs no cap. Only a value-taken or dispatch-reachable level, whose
-    // entries cannot be enumerated, falls back to the whole-site union.
-    // `OnType` sites with a recorded receiver narrow by the receiver's HEAD
-    // (substitution cannot change it); a receiver-less `OnType` — a `self`
-    // call inside a shared trait default body — keeps the union.
-    let impl_members_for = |resolved: &Type, member: &str| -> Vec<Id> {
-        let matches_subject = |subject: &Type| match (subject, resolved) {
-            (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => {
-                a == b
-            }
-            (a, b) => a == b,
-        };
-        let matching: Vec<&crate::analyzer::Implementation> = program
-            .implementations
-            .iter()
-            .filter(|implementation| {
-                program
-                    .type_id_to_type_map
-                    .get(&implementation.subject)
-                    .is_some_and(matches_subject)
-            })
-            .collect();
-        // A declared member wins outright; else the trait defaults the
-        // matching impls inherit (the `dispatch_candidates_for` shape,
-        // widened to primitive subjects — `impl str with Slot` is real here).
-        let declared: Vec<Id> = matching
-            .iter()
-            .filter_map(|implementation| implementation.declarations.get(member).copied())
-            .collect();
-        if !declared.is_empty() {
-            return declared;
-        }
-        matching
-            .iter()
-            .flat_map(|implementation| implementation.trait_ids.iter())
-            .filter_map(|trait_id| {
-                program
-                    .traits
-                    .get(trait_id)
-                    .and_then(|trait_| trait_.declarations.get(member).copied())
-            })
-            .collect()
-    };
-    enum Resolution {
-        Concrete(crate::type_::TypeId),
-        Parameter(crate::type_::TypeId),
-        Opaque,
-    }
-    // Chase a constraint through one call's recorded bindings —
-    // `method_call_substitution` is the single channel every instantiation
-    // shape records into, explicit generic arguments included.
-    let resolve_through = |bindings: Option<&crate::type_::SubstitutionContext>,
-                           constraint: crate::type_::TypeId|
-     -> Resolution {
-        let Some(bindings) = bindings else {
-            return Resolution::Opaque;
-        };
-        let Some(mut resolved) = bindings.get(&constraint).copied() else {
-            return Resolution::Opaque;
-        };
-        for _ in 0..16 {
-            match program.type_id_to_type_map.get(&resolved) {
-                Some(Type::Generic(inner)) => match bindings.get(inner) {
-                    Some(bound) if *bound != resolved => resolved = *bound,
-                    _ => break,
-                },
-                _ => break,
-            }
-        }
-        match program.type_id_to_type_map.get(&resolved) {
-            Some(Type::Generic(inner)) => Resolution::Parameter(*inner),
-            Some(Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)) | None => {
-                Resolution::Opaque
-            }
-            Some(_) => Resolution::Concrete(resolved),
-        }
-    };
-    // The nearest enclosing function of a graph node (identity for a
-    // function; a closure hops its lexical parents).
-    let enclosing_function = |node: Id| -> Option<Id> {
-        let mut current = node;
-        loop {
-            if program.functions.contains_key(&current) {
-                return Some(current);
-            }
-            current = graph.closure_parent_of(current)?;
-        }
-    };
-    // Incoming direct calls per function, and top-level incoming calls.
+    // resolved instantiation: per site, only the callees the recorded
+    // dispatch actually selects, resolved per entry for `OnConstraint` sites
+    // and by the receiver's head for `OnType` ones, with every unresolvable
+    // shape widening back to the whole candidate list. The resolution rules
+    // live in [`crate::dispatch_refine`] (extracted for the const-only
+    // capability check, backlog B143 — see that module's documentation).
+    // Incoming direct calls per function, and top-level incoming calls (the
+    // A2 walk-back below reads these; the refinement recomputes its own
+    // internally, so its edges are a function of program + graph alone).
     let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
     for node in graph.nodes() {
         for call in graph.calls_of(node.id()) {
@@ -738,121 +616,30 @@ fn analyze(
             top_level_incoming.entry(target).or_default().push(*call_id);
         }
     }
+    // A `Node` edge draws a coverage edge from that caller; a `TopLevel`
+    // edge marks the callee outside-entered — always uncovered.
+    let refinement_sites: Vec<crate::dispatch_refine::DispatchSite> = dispatch_sites
+        .iter()
+        .map(
+            |(owner, site_call, candidates)| crate::dispatch_refine::DispatchSite {
+                owner: crate::dispatch_refine::RefinedCaller::Node(*owner),
+                call: *site_call,
+                candidates: candidates.clone(),
+            },
+        )
+        .collect();
     let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
     let mut coverage_outside: HashSet<Id> = HashSet::default();
-    for (owner, site_call, candidates) in &dispatch_sites {
-        let union_fallback = |map: &mut HashMap<Id, Vec<Id>>| {
-            for &candidate in candidates {
-                map.entry(candidate).or_default().push(*owner);
+    for edge in crate::dispatch_refine::refined_edges(program, graph, &refinement_sites) {
+        match edge.caller {
+            crate::dispatch_refine::RefinedCaller::Node(caller) => {
+                coverage_dispatch_callers
+                    .entry(edge.callee)
+                    .or_default()
+                    .push(caller);
             }
-        };
-        let (constraint, member) = match crate::async_infer::dispatch_at(program, *site_call) {
-            Some(crate::analyzer::GenericDispatch::OnConstraint(constraint, member)) => {
-                (constraint, member)
-            }
-            Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
-                // A concrete-receiver re-dispatch (the Gap-E shape: an
-                // inherited trait default). The receiver's HEAD cannot
-                // change under substitution, and the head is what selects
-                // among candidates, so the site narrows to the members the
-                // head selects — edges from the site's owner, no entry
-                // enumeration. A receiver resolving to a generic or opaque
-                // type keeps the union, as does an empty selection.
-                match program.type_id_to_type_map.get(&receiver) {
-                    Some(resolved)
-                        if !matches!(
-                            resolved,
-                            Type::Generic(_)
-                                | Type::Any
-                                | Type::Unknown
-                                | Type::Unresolved
-                                | Type::Trait(..)
-                        ) =>
-                    {
-                        let selected = impl_members_for(resolved, member);
-                        if selected.is_empty() {
-                            union_fallback(&mut coverage_dispatch_callers);
-                        } else {
-                            for candidate in selected {
-                                coverage_dispatch_callers
-                                    .entry(candidate)
-                                    .or_default()
-                                    .push(*owner);
-                            }
-                        }
-                    }
-                    _ => union_fallback(&mut coverage_dispatch_callers),
-                }
-                continue;
-            }
-            // `OnType(None, _)` — a `self` call inside a shared trait
-            // default body — and unrecorded sites keep the union.
-            _ => {
-                union_fallback(&mut coverage_dispatch_callers);
-                continue;
-            }
-        };
-        // Concrete resolution → the impl members the type selects; an
-        // empty selection (defensive — the bound audit rejects no-impl
-        // types) falls back to every candidate.
-        let selected_for = |resolved: crate::type_::TypeId| -> Vec<Id> {
-            let selected = program
-                .type_id_to_type_map
-                .get(&resolved)
-                .map(|type_| impl_members_for(type_, member))
-                .unwrap_or_default();
-            if selected.is_empty() {
-                candidates.clone()
-            } else {
-                selected
-            }
-        };
-        let Some(root) = enclosing_function(*owner) else {
-            union_fallback(&mut coverage_dispatch_callers);
-            continue;
-        };
-        let mut visited: HashSet<(Id, crate::type_::TypeId)> = HashSet::default();
-        let mut walk: Vec<(Id, crate::type_::TypeId)> = vec![(root, constraint)];
-        while let Some((function, constraint)) = walk.pop() {
-            if !visited.insert((function, constraint)) {
-                // A revisit re-derives identical edges — skipping is exact.
-                continue;
-            }
-            if value_taken.contains(&function) || dispatch_callers.contains_key(&function) {
-                // This level's entries cannot be enumerated.
-                union_fallback(&mut coverage_dispatch_callers);
-                continue;
-            }
-            for (caller, incoming_call) in incoming_calls.get(&function).into_iter().flatten() {
-                let bindings = program.method_call_substitution.get(incoming_call);
-                let selected = match resolve_through(bindings, constraint) {
-                    Resolution::Concrete(resolved) => selected_for(resolved),
-                    Resolution::Parameter(parameter) => match enclosing_function(*caller) {
-                        Some(outer) => {
-                            walk.push((outer, parameter));
-                            continue;
-                        }
-                        None => candidates.clone(),
-                    },
-                    Resolution::Opaque => candidates.clone(),
-                };
-                for candidate in selected {
-                    coverage_dispatch_callers
-                        .entry(candidate)
-                        .or_default()
-                        .push(*caller);
-                }
-            }
-            for incoming_call in top_level_incoming.get(&function).into_iter().flatten() {
-                let bindings = program.method_call_substitution.get(incoming_call);
-                match resolve_through(bindings, constraint) {
-                    Resolution::Concrete(resolved) => {
-                        coverage_outside.extend(selected_for(resolved));
-                    }
-                    // Top-level code has no generic parameters to recurse
-                    // into — an unresolved binding marks every candidate.
-                    _ => coverage_outside.extend(candidates.iter().copied()),
-                }
+            crate::dispatch_refine::RefinedCaller::TopLevel => {
+                coverage_outside.insert(edge.callee);
             }
         }
     }
@@ -904,7 +691,8 @@ fn analyze(
                                 | Type::Trait(..)
                         ) =>
                     {
-                        let selected = impl_members_for(resolved, member);
+                        let selected =
+                            crate::dispatch_refine::impl_members_for(program, resolved, member);
                         selected.is_empty() || selected.contains(&candidate)
                     }
                     _ => true,

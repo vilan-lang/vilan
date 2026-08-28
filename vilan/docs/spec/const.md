@@ -59,7 +59,15 @@ A function that reaches `emit`, `read` or `bundle` is
 **compile-time-only**,
 transitively, and the compiler enforces that statically. A call from
 runtime code into compile-time-only territory is an error at the
-outermost crossing — the call that leaves ordinary code. Because a
+outermost crossing — the call that leaves ordinary code. A crossing
+made **through trait dispatch** counts too: a generic call whose bound
+selects an emitting impl is refused at the call that selected it,
+while a clean impl of the same trait member through the same generic
+stays legal — the check follows the resolved instantiation, per call
+site. Where the compiler cannot see which impl a dispatch selects (a
+shared default body's `self` call, for instance) it refuses every
+receiver rather than let one slip through and throw at run time.
+Because a
 call made *through a value* has no statically known callee, a
 compile-time-only function also has **no runtime value form**: naming
 one as a value (passing it to a higher-order function, binding it, or

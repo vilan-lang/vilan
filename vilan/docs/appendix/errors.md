@@ -638,6 +638,12 @@ The same rule, caught statically: some function on this call path reaches
 `asset::emit` or `asset::read`, and the call itself sits in runtime code.
 The span is the outermost runtime crossing — the call that leaves ordinary
 code and enters compile-time territory — so wrap *that* call in a `const`.
+A crossing through trait dispatch counts too: a generic call is charged at
+the entry whose concrete type selects an emitting impl (a clean impl of the
+same trait member through the same generic stays legal), and a dispatch the
+compiler cannot resolve — a shared default body's `self` call — is refused
+for every receiver, conservatively, since letting one through would compile
+clean and throw at run time.
 
 **"cannot read `…` (resolved against the package root to `…`): …"**
 A `const asset::read(path)` found no readable file. Paths are relative
