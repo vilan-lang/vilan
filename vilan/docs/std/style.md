@@ -178,7 +178,7 @@ others forms a family — `padding`, `margin`, `inset` (over `top`,
 `background`, `flex` — and last-wins applies to the whole family: a
 longhand written after the shorthand narrows it, a shorthand written
 after a longhand replaces the family outright. Per condition, so a
-`hover` or `dark` variant never disturbs the base, and through `raw`
+`hover` or `within` variant never disturbs the base, and through `raw`
 too, since the family is a fact about the CSS property.
 
 Escape hatches:
@@ -211,7 +211,9 @@ fun active(self, inner: Style): Style
 fun disabled(self, inner: Style): Style
 fun first(self, inner: Style): Style      // :first-child
 fun last(self, inner: Style): Style       // :last-child
-fun dark(self, inner: Style): Style       // :root[data-theme="dark"] ancestor
+fun within(self, name: str, value: str, inner: Style): Style     // [name="value"] .sX — an ancestor guard
+fun children(self, inner: Style): Style   // @layer vilan{.sX > *} — every direct child
+fun divide(self, inner: Style): Style     // @layer vilan{.sX > :not(:first-child)} — every child but the first
 fun attribute(self, name: str, value: str, inner: Style): Style  // .sX[name="value"] — the element itself
 fun pseudo(self, name: str, inner: Style): Style
 
@@ -225,39 +227,63 @@ fun media(self, min_width: str, inner: Style): Style
 ### Stacking
 
 The four condition axes nest **outside-in, in the order the selector
-nests them** — media, then dark, then the attribute, then the
-pseudo-class:
+nests them** — media, then the relation (`within`, `children`, `divide`),
+then the attribute, then the pseudo-class:
 
 ```vilan,fragment
-style().md(style().dark(style().hover(style().opacity(0.8))))
-// @media (min-width: 768px){:root[data-theme="dark"] .sX:hover{opacity:0.8}}
+style().md(style().within("data-theme", "dark", style().hover(style().opacity(0.8))))
+// @media (min-width: 768px){[data-theme="dark"] .sX:hover{opacity:0.8}}
 
-style().md(style().dark(style().attribute("data-open", "true", style().hover(style().opacity(0.8)))))
-// @media (min-width: 768px){:root[data-theme="dark"] .sX[data-open="true"]:hover{opacity:0.8}}
+style().md(style().within("data-theme", "dark", style().attribute("data-open", "true", style().hover(style().opacity(0.8)))))
+// @media (min-width: 768px){[data-theme="dark"] .sX[data-open="true"]:hover{opacity:0.8}}
 ```
 
 Every other order is a compile-time-evaluation panic naming the fix
-(`hover(dark(..))` says to write `dark(hover(..))`), and no axis can wrap
-itself — one media, one dark, one attribute, one pseudo-class per slot.
-Media rules emit in ascending min-width order, so a chain like
-`.sm(x).lg(y)` is mobile-first: the widest matching breakpoint wins.
+(`hover(within(..))` says to write `within(.., hover(..))`), and no axis
+can wrap itself — one media, one relation, one attribute, one
+pseudo-class per slot. Media rules emit in ascending min-width order, so
+a chain like `.sm(x).lg(y)` is mobile-first: the widest matching
+breakpoint wins.
 
 `attribute` conditions on the element **itself** — `.sX[data-open="true"]`
-— where `dark` is the ancestor form. It is the general spelling of state
+— where `within` is the ancestor form. It is the general spelling of state
 carried in markup: `data-state`, `data-open`, `aria-expanded` — any
 attribute rides, `aria-*` included, and the value matches exactly. The
 app owns *setting* the attribute on the element; the style only selects
 on it. Name and value refuse quotes, spaces and `:` at const time (they
 delimit the machinery underneath), and a styling hook is a single token
-in practice.
+in practice — the same fences guard `within`'s name and value.
 
-`dark` is an ancestor selector, so a composed `dark(hover(..))` rule is
-more specific than either `dark(..)` or `hover(..)` alone and wins
-against both — and the same holds along the attribute axis:
-`attribute(.., hover(..))` outranks both of its parts. Between an
-*un*composed `dark(x)` and `hover(y)` on the same property the two are
-equally specific and dark wins, so use `dark(hover(..))` when a dark
-theme needs its own hover.
+`within` prepends an ancestor selector, so a composed
+`within(.., hover(..))` rule is more specific than either `within(..)` or
+`hover(..)` alone and wins against both — and the same holds along the
+attribute axis: `attribute(.., hover(..))` outranks both of its parts.
+Between an *un*composed `within(.., x)` and `hover(y)` on the same
+property the guard wins — a theme shouldn't be undone by a hover — so use
+`within(.., hover(..))` when a dark theme needs its own hover.
+
+### Relations
+
+`within` guards the element's own slots on an **ancestor's** attribute —
+the theme condition (`within("data-theme", "dark", ..)`, or any theme id
+under kolt-style n-ary theming) and every other "when an ancestor says
+so" state. Its rule is unlayered and beats the element's own base rule
+exactly when the guard matches. For colours, prefer declaring per-theme
+custom properties with a [declaration block](#declaration-blocks) and
+reading them with `Color::var(..)`; `within` covers the structural
+changes a value swap cannot.
+
+`children` and `divide` style the element's **children** — the
+parent-owned spacing idioms (Tailwind's `space-*`/`divide-*`). Their
+rules emit inside `@layer vilan`, and that is the whole cascade story:
+**a child's own `Style` always wins against a rule reaching in from an
+ancestor**, whatever the specificity — they set defaults the child may
+refuse, never force. (The cost is symmetric: a `children`/`divide` rule
+cannot override *any* unlayered CSS.) Where both touch one property,
+`divide` outranks `children` on every child but the first, whichever was
+written first. Both take an **unconditioned** inner style in this
+version — a hover or attribute condition belongs on the child's own
+style — and a breakpoint wraps either (`md(children(..))`).
 
 ## Declaration blocks
 

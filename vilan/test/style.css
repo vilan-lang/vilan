@@ -33,22 +33,20 @@
 .s2m9jw6{display:inline-flex}
 .s5hidsk{background-image:url(tile.png)}
 .s63dg6q{max-width:calc(100% - 2rem)}
+.s8myypq{gap:var(--space-2)}
 .s9bu6v3{line-height:1.5}
 .sbiovxm{display:flex}
 .siolu0w{background-color:var(--gray-50)}
 .sitgfdt{min-width:0}
 .skugn91{background-size:120px 120px}
 .snq90yh{line-height:24px}
+.snx6qru{margin-top:var(--space-2)}
+.snx6qto{margin-top:var(--space-4)}
 .sq42fek[data-open="true"]:hover{color:var(--gray-50)}
 .srg1886{color:var(--gray-50)}
 .stbzxoc{padding-top:var(--space-2)}
 .sumjtxl{background-color:var(--accent)}
 .szxtch6{background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)}
-:root[data-theme="dark"] .s13q9rby[data-open="true"]:hover{color:var(--gray-50)}
-:root[data-theme="dark"] .s1bn73s7[data-open="true"]{background-color:var(--gray-800)}
-:root[data-theme="dark"] .s1mdwlwm:hover{background-color:var(--gray-50)}
-:root[data-theme="dark"] .s8ww588:hover{background-color:var(--gray-700)}
-:root[data-theme="dark"] .suuxkdy{background-color:var(--gray-900)}
 :root{--blue-600:#2563eb}
 :root{--gray-100:#f3f4f6}
 :root{--gray-300:#d1d5db}
@@ -61,9 +59,18 @@
 :root{--space-4:1rem}
 :root{--space-6:1.5rem}
 @layer vilan{*{box-sizing:border-box}}
+@layer vilan{.skr9oll > :not(:first-child){margin-top:var(--space-4)}}
+@layer vilan{.sxzag36 > *{margin-top:var(--space-2)}}
+@layer vilan{.szvd0yu > *{gap:var(--space-2)}}
 @layer vilan{:root{--brand:var(--gray-50);--pad:var(--space-4)}}
 @layer vilan{[data-theme="iron-dark"]{--color-ink:#fafafa;--color-ground:#161616}}
+[data-theme="dark"] .s120e6x3{background-color:var(--gray-900)}
+[data-theme="dark"] .s1ecvm3b:hover{background-color:var(--gray-50)}
+[data-theme="dark"] .s1jqpl5k[data-open="true"]{background-color:var(--gray-800)}
+[data-theme="dark"] .sejtazz[data-open="true"]:hover{color:var(--gray-50)}
+[data-theme="dark"] .ss3fj9l:hover{background-color:var(--gray-700)}
 @media (min-width: 640px){*.sl8ru5a{padding:var(--space-2)}}
-@media (min-width: 768px){:root[data-theme="dark"] .s1pifanf[data-open="true"]:hover{color:var(--gray-50)}}
-@media (min-width: 768px){:root[data-theme="dark"] .s8ahr6b:hover{background-color:var(--gray-50)}}
+@media (min-width: 768px){@layer vilan{.svmscer > *{gap:var(--space-2)}}}
+@media (min-width: 768px){[data-theme="dark"] .s1dwvy7w[data-open="true"]:hover{color:var(--gray-50)}}
+@media (min-width: 768px){[data-theme="dark"] .sayz5ok:hover{background-color:var(--gray-50)}}
 @media (min-width: 1024px){*.s4x9b8s{padding:var(--space-3)}}

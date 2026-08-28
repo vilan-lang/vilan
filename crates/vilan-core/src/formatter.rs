@@ -481,7 +481,7 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
 // — layout, flexbox/grid, spacing, sizing, typography, backgrounds, borders,
 // effects, filters, tables, transitions/animation, transforms, interactivity,
 // svg, accessibility — with every CONDITION method after every property method,
-// in the axis order the selector nests them (media → dark → attribute →
+// in the axis order the selector nests them (media → relation → attribute →
 // pseudo): the same shape as Tailwind's plugin putting variant groups last.
 //
 // Two rules keep the reorder SEMANTICS-preserving, which is not optional: a
@@ -541,12 +541,14 @@ pub enum StyleCategory {
 
 /// The four condition axes, in the order the selector nests them (and therefore
 /// the order the condition combinators require at the call site — see
-/// `render_rule` in `vilan/std/src/style.vl`).
+/// `render_rule` in `vilan/std/src/style.vl`). `Relation` is the axis
+/// `within`/`children`/`divide` write (ui-styling.md §0bis.6) — it holds the
+/// grammar seat the deleted `dark` held.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ConditionAxis {
     Media,
-    Dark,
+    Relation,
     Attribute,
     Pseudo,
 }
@@ -679,7 +681,9 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("lg",        ConditionAxis::Media),
     ("xl",        ConditionAxis::Media),
     ("media",     ConditionAxis::Media),
-    ("dark",      ConditionAxis::Dark),
+    ("within",    ConditionAxis::Relation),
+    ("children",  ConditionAxis::Relation),
+    ("divide",    ConditionAxis::Relation),
     ("attribute", ConditionAxis::Attribute),
     ("hover",     ConditionAxis::Pseudo),
     ("focus",     ConditionAxis::Pseudo),
@@ -705,6 +709,7 @@ pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "with_length",
     "with_color",
     "with_border",
+    "child_relation",
     "add",
     "class_list",
 ];
@@ -8273,15 +8278,29 @@ mod style_chain_order {
     }
 
     /// Among themselves the conditions follow the axis order the selector nests
-    /// them in — media, dark, attribute, pseudo — which is the order the
-    /// combinators already require when they are NESTED (`style.vl`'s
+    /// them in — media, the relation, attribute, pseudo — which is the order
+    /// the combinators already require when they are NESTED (`style.vl`'s
     /// `render_rule`). Written here in exactly the reverse.
     #[test]
     fn conditions_sort_in_the_axis_order_the_selector_nests() {
+        // The sorted chain is over the 100-column budget, so the canonical
+        // form is also the split form — one link per line.
         assert_construct(
-            "let s = const style().hover(a).attribute(\"data-open\", \"true\", b).dark(c).md(d);\n",
-            "let s = const style().md(d).dark(c).attribute(\"data-open\", \"true\", b).hover(a);\n",
+            "let s = const style().hover(a).attribute(\"data-open\", \"true\", b).within(\"data-theme\", \"dark\", c).md(d);\n",
+            "let s = const style()\n\t.md(d)\n\t.within(\"data-theme\", \"dark\", c)\n\t.attribute(\"data-open\", \"true\", b)\n\t.hover(a);\n",
         );
+    }
+
+    /// The three relations share one axis, so they keep their written order —
+    /// `children`/`divide` never cross `within` or each other.
+    #[test]
+    fn relations_keep_their_written_order() {
+        for chain in [
+            "let s = const style().children(a).divide(b);\n",
+            "let s = const style().divide(a).within(\"data-theme\", \"dark\", b);\n",
+        ] {
+            assert_construct(chain, chain);
+        }
     }
 
     /// Two conditions on the SAME axis keep their written order, which is what

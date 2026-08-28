@@ -25590,13 +25590,18 @@ fn breakpoints_wrap_media_and_stack_with_pseudo() {
     );
 }
 
+/// The ancestor guard (ui-styling.md §0bis.6): `within("data-theme", "dark",
+/// ..)` is the theme condition's spelling since `Style::dark`'s deletion
+/// (kolt.local 014, ruled 2026-08-27). The rule is UNLAYERED — its (0,2,0)
+/// beats the element's own base rule exactly when the guard matches, which is
+/// the semantics `dark()` had and a layered rule could never express.
 #[test]
-fn dark_prefixes_the_theme_selector() {
+fn within_prefixes_the_ancestor_guard() {
     let assets = collected_assets(
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().dark(style().background(Color::gray(900)))
+            style().within("data-theme", "dark", style().background(Color::gray(900)))
         }
         let _s = const s();
         fun main() {}
@@ -25606,20 +25611,21 @@ fn dark_prefixes_the_theme_selector() {
     assert!(
         assets
             .iter()
-            .any(|(_, line)| line.starts_with(":root[data-theme=\"dark\"] .")),
+            .any(|(_, line)| line.starts_with("[data-theme=\"dark\"] .")
+                && line.ends_with("{background-color:var(--gray-900)}")),
         "{assets:?}"
     );
 }
 
-/// dark × pseudo composes on ONE slot: the dark ancestor selector and the
+/// within × pseudo composes on ONE slot: the ancestor guard and the
 /// pseudo-class suffix land in the same rule, nested the way CSS nests them.
 #[test]
-fn dark_stacks_over_a_pseudo_class() {
+fn within_stacks_over_a_pseudo_class() {
     let assets = collected_assets(
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().dark(style().hover(style().background(Color::gray(700))))
+            style().within("data-theme", "dark", style().hover(style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -25628,7 +25634,7 @@ fn dark_stacks_over_a_pseudo_class() {
     );
     assert!(
         assets.iter().any(|(_, line)| {
-            line.starts_with(":root[data-theme=\"dark\"] .")
+            line.starts_with("[data-theme=\"dark\"] .")
                 && line.ends_with(":hover{background-color:var(--gray-700)}")
         }),
         "{assets:?}"
@@ -25638,12 +25644,12 @@ fn dark_stacks_over_a_pseudo_class() {
 /// All three axes at once, media outermost. The composed line still starts
 /// with '@', so B35's numeric media ordering keeps seeing it.
 #[test]
-fn a_breakpoint_wraps_dark_over_a_pseudo_class() {
+fn a_breakpoint_wraps_within_over_a_pseudo_class() {
     let assets = collected_assets(
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().md(style().dark(style().hover(style().padding(space(6)))))
+            style().md(style().within("data-theme", "dark", style().hover(style().padding(space(6)))))
         }
         let _s = const s();
         fun main() {}
@@ -25651,25 +25657,24 @@ fn a_breakpoint_wraps_dark_over_a_pseudo_class() {
         "#,
     );
     assert!(
-        assets.iter().any(|(_, line)| line
-            // The class name `s19fbteb` is byte-identical to what this rule
-            // minted before A22: the marker lives in `render_rule`, and the
-            // hash is over `key|declaration`.
-            == "@media (min-width: 768px){:root[data-theme=\"dark\"] *.s19fbteb:hover{padding:var(--space-6)}}"),
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@media (min-width: 768px){[data-theme=\"dark\"] *.")
+                && line.ends_with(":hover{padding:var(--space-6)}}")
+        }),
         "{assets:?}"
     );
 }
 
-/// Composition has ONE spelling. dark goes outside the pseudo — the same
-/// outside-in rule that makes `md(hover(..))` legal — and the refusal names
-/// the fix rather than just saying no.
+/// Composition has ONE spelling. The relation goes outside the pseudo — the
+/// same outside-in rule that makes `md(hover(..))` legal — and the refusal
+/// names the fix rather than just saying no.
 #[test]
-fn a_pseudo_class_cannot_wrap_dark() {
+fn a_pseudo_class_cannot_wrap_within() {
     let diagnostics = failure_diagnostics(
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().hover(style().dark(style().background(Color::gray(700))))
+            style().hover(style().within("data-theme", "dark", style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -25679,18 +25684,18 @@ fn a_pseudo_class_cannot_wrap_dark() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("dark(hover(..)), not hover(dark(..))")),
+            .any(|(message, _)| message.contains("within(.., hover(..)), not hover(within(..))")),
         "{diagnostics:#?}"
     );
 }
 
 #[test]
-fn dark_cannot_wrap_dark() {
+fn within_cannot_wrap_within() {
     let diagnostics = failure_diagnostics(
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().dark(style().dark(style().background(Color::gray(700))))
+            style().within("data-theme", "dark", style().within("data-theme", "dim", style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -25700,18 +25705,18 @@ fn dark_cannot_wrap_dark() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("already dark-conditioned")),
+            .any(|(message, _)| message.contains("already relation-conditioned")),
         "{diagnostics:#?}"
     );
 }
 
 #[test]
-fn dark_cannot_wrap_a_breakpoint() {
+fn within_cannot_wrap_a_breakpoint() {
     let diagnostics = failure_diagnostics(
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
-            style().dark(style().md(style().padding(space(6))))
+            style().within("data-theme", "dark", style().md(style().padding(space(6))))
         }
         let _s = const s();
         fun main() {}
@@ -25721,7 +25726,30 @@ fn dark_cannot_wrap_a_breakpoint() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("nest conditions as md(dark(..))")),
+            .any(|(message, _)| message.contains("nest conditions as md(within(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// within's name and value ride the slot key and the selector, so they are
+/// fenced at const time by the same checks `attribute` uses.
+#[test]
+fn within_validates_its_name_and_value() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().within("data theme", "dark", style().background(Color::gray(700)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("an attribute name cannot contain")),
         "{diagnostics:#?}"
     );
 }
@@ -25771,11 +25799,12 @@ fn a_breakpoint_cannot_wrap_a_breakpoint() {
 }
 
 /// The slot key gained a condition GRAMMAR, not a fourth field — so every
-/// class name minted before dark×pseudo existed is byte-identical after it.
-/// (The `style.vl` corpus golden is the broad version of this; these two are
-/// the ones the composition code could plausibly have disturbed.)
+/// class name minted before dark×pseudo (and then the relation axis) existed
+/// is byte-identical after it. (The `style.vl` corpus golden is the broad
+/// version of this; these two are the ones the composition code could
+/// plausibly have disturbed.)
 #[test]
-fn composing_dark_leaves_the_uncomposed_class_names_untouched() {
+fn composing_conditions_leaves_the_uncomposed_class_names_untouched() {
     let assets = collected_assets(
         r#"
         import std::style::{ style, Style, Color };
@@ -26327,7 +26356,7 @@ fn the_display_enum_covers_every_variant() {
                 .disabled(style().display(Display::InlineBlock))
                 .first(style().display(Display::InlineFlex))
                 .last(style().display(Display::InlineGrid))
-                .dark(style().display(Display::Hidden))
+                .within("data-theme", "dark", style().display(Display::Hidden))
         }
         let _s = const s();
         fun main() {}
@@ -26640,41 +26669,42 @@ fn a_merge_resolves_a_family_the_way_a_chain_does() {
 
 #[test]
 fn a_condition_never_clears_the_base_family() {
-    // Cross-condition: the drop is keyed on media AND condition, so a dark or
-    // hover variant of one family leaves the base slots alone — and the marker
-    // changes no specificity, so the base/condition cascade is exactly what it
-    // was (a dark rule is (0,2,0) over a base rule's (0,1,0), either way round).
+    // Cross-condition: the drop is keyed on media AND condition, so a themed
+    // or hover variant of one family leaves the base slots alone — and the
+    // marker changes no specificity, so the base/condition cascade is exactly
+    // what it was (a within rule is (0,2,0) over a base rule's (0,1,0),
+    // either way round).
     let css = style_css(
         r#"
         import std::style::{ style, space, Style };
-        fun shorthand_under_dark(): Style {
-            style().padding_top(space(0)).dark(style().padding(space(4)))
+        fun shorthand_under_within(): Style {
+            style().padding_top(space(0)).within("data-theme", "dark", style().padding(space(4)))
         }
         fun longhand_under_hover(): Style {
             style().padding(space(6)).hover(style().padding_top(space(2)))
         }
-        let _a = const shorthand_under_dark();
+        let _a = const shorthand_under_within();
         let _b = const longhand_under_hover();
         fun main() {}
         main();
         "#,
     );
-    // The dark shorthand did not clear the base edge — the base edge rule is
-    // still there, unmarked and outside the dark band.
+    // The themed shorthand did not clear the base edge — the base edge rule
+    // is still there, unmarked and outside the ancestor-guard band.
     let (base_edge, _) = rule_for(&css, "padding-top:var(--space-0)");
     assert!(
-        base_edge.starts_with('.') && !base_edge.contains("dark"),
-        "the base edge must survive a dark shorthand: {base_edge}"
+        base_edge.starts_with('.') && !base_edge.contains("data-theme"),
+        "the base edge must survive a themed shorthand: {base_edge}"
     );
-    // The dark shorthand keeps the dark band (':' first, B35) and gains the
+    // The themed shorthand keeps the '[' band (B35 / §0bis.6) and gains the
     // marker inside it. (Its inner chain's own base rule is also in the
     // stylesheet — the recorded over-approximation — so the pin names the
     // selector rather than taking the first match.)
     assert!(
         css.lines()
-            .any(|line| line.starts_with(r#":root[data-theme="dark"] *."#)
+            .any(|line| line.starts_with(r#"[data-theme="dark"] *."#)
                 && line.ends_with("{padding:var(--space-4)}")),
-        "no marked dark shorthand:\n{css}"
+        "no marked themed shorthand:\n{css}"
     );
     // The base shorthand is neither cleared by nor clears the hover edge.
     let (base_shorthand, _) = rule_for(&css, "padding:var(--space-6)");
@@ -26693,7 +26723,7 @@ fn a_condition_never_clears_the_base_family() {
         import std::print;
         import std::style::{ style, space, Style };
         fun main() {
-            let themed = const style().padding_top(space(0)).dark(style().padding(space(4)));
+            let themed = const style().padding_top(space(0)).within("data-theme", "dark", style().padding(space(4)));
             print(themed.class_list().split(" ").len());
         }
         main();
@@ -27472,10 +27502,10 @@ fn an_oklch_hue_outside_the_canonical_turn_fails_the_build() {
 }
 
 // `Style::attribute(name, value, inner)` (item 010): a condition on the
-// element ITSELF — `.sX[data-open="true"]` — where dark's hardcoded ancestor
-// is the one ancestor form. Its own slot in the condition axis, between dark
-// and the pseudo-class: `md(dark(attribute(.., hover(..))))`. The pins mirror
-// the dark×pseudo set: composition on each axis pair, the full stack, the
+// element ITSELF — `.sX[data-open="true"]` — where `within` is the ancestor
+// form. Its own slot in the condition axis, between the relation and the
+// pseudo-class: `md(within(.., attribute(.., hover(..))))`. The pins mirror
+// the within×pseudo set: composition on each axis pair, the full stack, the
 // ordering refusals naming the fix, the const validation, per-(condition,
 // property) merge, and the ssr leg.
 
@@ -27524,15 +27554,15 @@ fn an_attribute_condition_wraps_a_pseudo_class() {
     );
 }
 
-/// dark's ancestor composes over an attribute-conditioned style through the
-/// same generic path it composes over a pseudo-class — dark() unchanged.
+/// The ancestor guard composes over an attribute-conditioned style through
+/// the same generic path it composes over a pseudo-class.
 #[test]
-fn dark_wraps_an_attribute_condition() {
+fn within_wraps_an_attribute_condition() {
     let assets = collected_assets(
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().dark(style().attribute("data-open", "true", style().opacity(0.8)))
+            style().within("data-theme", "dark", style().attribute("data-open", "true", style().opacity(0.8)))
         }
         let _s = const s();
         fun main() {}
@@ -27541,22 +27571,22 @@ fn dark_wraps_an_attribute_condition() {
     );
     assert!(
         assets.iter().any(|(_, line)| {
-            line.starts_with(":root[data-theme=\"dark\"] .")
+            line.starts_with("[data-theme=\"dark\"] .")
                 && line.contains("[data-open=\"true\"]{opacity:0.8}")
         }),
         "{assets:?}"
     );
 }
 
-/// All four axes at once, outside-in: media, dark, attribute, pseudo. The
-/// composed line still starts with '@', so B35's media ordering sees it.
+/// All four axes at once, outside-in: media, the relation, attribute, pseudo.
+/// The composed line still starts with '@', so B35's media ordering sees it.
 #[test]
 fn all_four_condition_axes_compose_outside_in() {
     let assets = collected_assets(
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().md(style().dark(style().attribute(
+            style().md(style().within("data-theme", "dark", style().attribute(
                 "data-open",
                 "true",
                 style().hover(style().opacity(0.8)),
@@ -27569,7 +27599,7 @@ fn all_four_condition_axes_compose_outside_in() {
     );
     assert!(
         assets.iter().any(|(_, line)| {
-            line.starts_with("@media (min-width: 768px){:root[data-theme=\"dark\"] .")
+            line.starts_with("@media (min-width: 768px){[data-theme=\"dark\"] .")
                 && line.ends_with("[data-open=\"true\"]:hover{opacity:0.8}}")
         }),
         "{assets:?}"
@@ -27600,12 +27630,12 @@ fn an_attribute_cannot_wrap_a_media_conditioned_style() {
 }
 
 #[test]
-fn an_attribute_cannot_wrap_dark() {
+fn an_attribute_cannot_wrap_within() {
     let diagnostics = failure_diagnostics(
         r#"
         import std::style::{ style, Style, Color };
         fun s(): Style {
-            style().attribute("data-open", "true", style().dark(style().background(Color::gray(700))))
+            style().attribute("data-open", "true", style().within("data-theme", "dark", style().background(Color::gray(700))))
         }
         let _s = const s();
         fun main() {}
@@ -27615,7 +27645,8 @@ fn an_attribute_cannot_wrap_dark() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("dark(attribute(..)), not attribute(dark(..))")),
+            .any(|(message, _)| message
+                .contains("within(.., attribute(..)), not attribute(within(..))")),
         "{diagnostics:#?}"
     );
 }
@@ -27756,6 +27787,290 @@ fn ssr_renders_attribute_conditioned_classes() {
         main();
         "#,
         "<div class=\"s1hbtfg8 sjt5x3g\"></div>\n",
+    );
+}
+
+// --- kolt.local 009+014: the child-side relations (ui-styling.md §0bis.6) ------
+// `children`/`divide` rules REACH IN — they style elements other than the one
+// carrying the class — so they emit inside `@layer vilan`, and 032's cascade
+// invariant reads as: a child's own `Style` always wins against a rule
+// reaching in from an ancestor. `within` stays UNLAYERED (its rules dress the
+// element itself; see the within pins above). `divide` renders
+// `> :not(:first-child)` — the same element set as the owl `> * + *` but
+// carrying (0,2,0) — so on a property both relations touch, divide outranks
+// children by SPECIFICITY instead of tying and falling to the class-hash line
+// order (the §0bis.6 probe caught the owl's winner flipping with hash bytes).
+//
+// Order 12's lesson applies here: the CSS bytes alone can stay right while
+// the slot map goes wrong, so each behavior pins BOTH the emitted rule and
+// the RESOLVED state (`class_list` counts and identities at runtime).
+
+#[test]
+fn children_emits_a_layered_child_combinator() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().children(style().margin_top(space(2)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.") && line.ends_with(" > *{margin-top:var(--space-2)}}")
+        }),
+        "{assets:?}"
+    );
+}
+
+#[test]
+fn divide_emits_the_layered_not_first_child_refinement() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().divide(style().margin_top(space(4)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@layer vilan{.")
+                && line.ends_with(" > :not(:first-child){margin-top:var(--space-4)}}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The RESOLVED state of the relation slots, not just the emitted CSS: the
+/// same (relation, property) slot merges last-wins — in a chain and across
+/// `+` — while children and divide are two slots and coexist, and a relation
+/// slot never collides with the base slot of the same property.
+#[test]
+fn relation_slots_merge_per_relation_and_property() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space, Style };
+        fun main() {
+            // same relation, same property, twice: ONE slot, last wins —
+            // byte-identical to writing only the last call
+            let merged = const style()
+                .children(style().margin_top(space(2)))
+                .children(style().margin_top(space(4)));
+            let last_only = const style().children(style().margin_top(space(4)));
+            print(merged.class_list() == last_only.class_list());
+            // across `+` too: the right side wins the shared slot
+            let a = const style().children(style().margin_top(space(2)));
+            let b = const style().children(style().margin_top(space(4)));
+            print((a + b).class_list() == last_only.class_list());
+            // children and divide on ONE property: TWO slots, both survive
+            let overlap = const style()
+                .children(style().margin_top(space(2)))
+                .divide(style().margin_top(space(4)));
+            print(overlap.class_list().split(" ").len());
+            // a relation slot and the base slot of one property are distinct
+            // (the base dresses the element, the relation its children)
+            let split = const style()
+                .margin_top(space(2))
+                .children(style().margin_top(space(4)));
+            print(split.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "true\ntrue\n2\n2\n",
+    );
+}
+
+/// A breakpoint wraps a child relation through the existing media pass-through
+/// — media outermost in the emitted line, so B35's numeric `min-width` sort
+/// still sees its prefix, with the layer nested inside.
+#[test]
+fn a_breakpoint_wraps_a_child_relation() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().md(style().children(style().gap(space(2))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with("@media (min-width: 768px){@layer vilan{.")
+                && line.ends_with(" > *{gap:var(--space-2)}}}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// The §0bis.4 family marker holds inside the layer: a shorthand's `*.` still
+/// sorts ahead of its family's longhands because the `@layer vilan{` prefix is
+/// byte-identical across the pair, so the `*`/`.` byte still decides.
+#[test]
+fn the_family_marker_orders_a_shorthand_inside_the_layer() {
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().children(style().padding(space(4)).padding_top(space(0)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let shorthand_at = css
+        .find("@layer vilan{*.")
+        .expect("a marked layered shorthand");
+    let longhand = css
+        .lines()
+        .find(|line| line.starts_with("@layer vilan{.") && line.contains("padding-top"))
+        .expect("a layered longhand");
+    let longhand_at = css.find(longhand).expect("the longhand's offset");
+    assert!(
+        shorthand_at < longhand_at,
+        "the shorthand must sort ahead of the longhand inside the layer:\n{css}"
+    );
+}
+
+/// The `[` band (§0bis.6's ledger): a within rule sorts AFTER a pseudo rule,
+/// so their (0,2,0) tie on one property resolves to the theme — the
+/// dark-beats-hover outcome, now carried by source order instead of `:root`'s
+/// extra specificity point.
+#[test]
+fn a_within_rule_sorts_after_the_pseudo_band() {
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style()
+                .hover(style().background(Color::gray(100)))
+                .within("data-theme", "dark", style().background(Color::gray(900)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    // Each inner chain's own base rule also emits (the recorded
+    // over-approximation), so both pins name the conditioned selector shape
+    // rather than taking the first declaration match.
+    let hover_line = css
+        .lines()
+        .find(|line| {
+            line.starts_with('.') && line.contains(":hover{background-color:var(--gray-100)}")
+        })
+        .expect("the hover rule");
+    let within_line = css
+        .lines()
+        .find(|line| {
+            line.starts_with("[data-theme=\"dark\"] .")
+                && line.ends_with("{background-color:var(--gray-900)}")
+        })
+        .expect("the within rule");
+    let hover_at = css.find(hover_line).expect("the hover rule's offset");
+    let within_at = css.find(within_line).expect("the within rule's offset");
+    assert!(
+        hover_at < within_at,
+        "the within rule must take the later cascade position:\n{css}"
+    );
+}
+
+/// The v1 scope refusals, each naming the fix: a child relation takes an
+/// UNCONDITIONED inner (a pseudo or attribute under it would bind to the
+/// child's compound — unruled semantics), cannot wrap a breakpoint, and no
+/// relation wraps a relation.
+#[test]
+fn a_child_relation_takes_an_unconditioned_style() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().children(style().hover(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("children takes an unconditioned style")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn divide_takes_an_unconditioned_style() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().divide(style().attribute("data-open", "true", style().opacity(0.5)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("divide takes an unconditioned style")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_child_relation_cannot_wrap_a_breakpoint() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().children(style().md(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("nest conditions as md(children(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn within_cannot_wrap_a_child_relation() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().within("data-theme", "dark", style().children(style().margin_top(space(2))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already relation-conditioned")),
+        "{diagnostics:#?}"
     );
 }
 
