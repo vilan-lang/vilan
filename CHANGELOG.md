@@ -29,6 +29,16 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**Formatting is a gate now: `cargo fmt --all --check` runs in CI, on a pinned toolchain.** `cargo fmt` after every Rust change is this repository's own rule, and the tree had still drifted four hunks out of true — enough that three lanes in one cycle each hit the churn, reverted it, and reported it. The drift is reformatted away (whitespace-only, proven by comparing the whitespace-stripped byte streams before and after), and a `fmt` job in `ci.yml` holds the line from here, feeding the required `check` like every other leg. What makes the check *stable* is the new `rust-toolchain.toml`: rustfmt's default layout moves between stables, so the gate runs the exact pinned toolchain — the stable the tree builds with today — and a toolchain bump becomes a deliberate commit that lands the pin and its reformat together, rather than a surprise for whoever runs `cargo fmt` next. The suite and release-build legs deliberately keep proving the tree against *current* stable: they declare `RUSTUP_TOOLCHAIN=stable` explicitly, because the toolchain file would otherwise outrank the toolchain their action installs — and on the cross-compiling legs, silently drop their targets. (backlog N21; the clippy and cargo-audit legs the item also names are follow-up, not part of this change)
+
+---
+
+<!-- family: tooling -->
+**A release can no longer be cut over CI that is not verifiably green.** v0.37.0 was tagged and published while its Windows CI leg had been red for days: `release.yml`'s gate ran the full suite on ubuntu only while `ci.yml` tests a ubuntu+windows matrix — so the gate authorizing five publish channels was strictly weaker than the gate deciding a commit is green — and nothing in the cut sequence said to check CI on the commit being tagged. Both halves are fixed. The release gate now runs the same platform matrix as `ci.yml`, extending the "same instrument, change them together" rule from the command to the platforms it runs on; and `scripts/cut-release.sh` reads `ci.yml`'s verdict on origin at the exact commit the cut is against (`gh run list` at that sha — the trustworthy read, where the Pages builds endpoint lags) and REFUSES anything but a completed green run, each state named with its remedy: red says fix the tree, pending says wait, absent says push and let CI finish — and *cannot look* (no `gh`, no `origin`, unreachable) is its own refusal rather than a silent pass, because unverified is not green. `--allow-red-ci` is the deliberate override for the day the gate itself is what is broken, and it prints what it is riding over, loudly. The script refusing rather than the human remembering is the same lesson the orphan-marker refusal taught, applied to CI; every verdict is pinned, the override and the tool-missing refusal included. (backlog L17; releases.md §7 step 1 and §7.2 step 4 record the finding)
+
+---
+
 ## v0.37.0 — 2026-08-27
 
 > **Upgrade if you are on v0.36.0 or earlier: this release fixes two

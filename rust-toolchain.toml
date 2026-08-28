@@ -1,0 +1,19 @@
+# Pinned (backlog N21): `cargo fmt --all --check` is a gate now (ci.yml's
+# `fmt` job), and rustfmt's default layout moves between stables — an unpinned
+# gate would go red the day a new stable ships, for a tree nobody edited. One
+# exact toolchain means the formatter gives one answer on every machine and in
+# CI; bumping it is a deliberate commit that lands the reformat and the pin
+# together. The version is the stable the tree builds and formats with today,
+# and pinning the toolchain rather than writing a rustfmt.toml keeps the
+# formatting configuration at "rustfmt's defaults", exactly as before.
+#
+# The CI legs that run the SUITE deliberately do not follow this file: they
+# keep proving the tree against current stable (and the release legs keep
+# building with it). That does not happen by itself — dtolnay/rust-toolchain
+# only runs `rustup default`, which this file would override — so each of
+# those jobs declares `RUSTUP_TOOLCHAIN: stable` explicitly. A cargo-running
+# job without that line resolves through this file, which is what the `fmt`
+# job and every local `cargo` run do.
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt"]

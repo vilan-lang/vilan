@@ -11,9 +11,13 @@
 //!
 //! Both scripts locate their repository as `dirname $0/..`, which is what makes
 //! this testable at all: a copy of the script placed in a fixture repo's
-//! `scripts/` operates on that repo and nothing else. No fixture here has an
-//! `origin`, so no test reaches the network — the checks that need one report
-//! themselves skipped, which is itself pinned.
+//! `scripts/` operates on that repo and nothing else. No test reaches the
+//! network: a fixture's `origin` is a name pointing at a path that never
+//! exists (nothing fetches or pushes), and the `gh` a script finds on PATH is
+//! the fixture's own shim, answering the CI verdict the test chose. The fold
+//! fixture removes that origin again — its premise is a repository missing
+//! every precondition, and the checks that need one report themselves
+//! skipped, which is itself pinned.
 //!
 //! unix-only: both are POSIX shell scripts and the Windows leg of CI has no
 //! shell to run them with (`tests/brew_formula.rs` is gated the same way).
@@ -27,14 +31,33 @@ fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The fixture's `gh` (backlog L17): no network. The cut consumes `gh run
+/// list --jq …` as one cooked verdict string, so the shim prints exactly
+/// that — whatever `$VILAN_FIXTURE_CI` holds, "completed success" when the
+/// test says nothing (every pre-L17 pin then doubles as a green-CI pin) —
+/// and "unreachable" makes it fail the way an offline or unauthenticated
+/// gh does.
+const GH_SHIM: &str = r#"#!/bin/sh
+set -eu
+verdict="${VILAN_FIXTURE_CI:-completed success}"
+if [ "$verdict" = unreachable ]; then
+    echo "fixture gh: unreachable" >&2
+    exit 1
+fi
+printf '%s\n' "$verdict"
+"#;
+
 /// A throwaway git repository holding a copy of both scripts, an initial
 /// commit, and whatever changelog the test wants. Its `HOME` and git config are
 /// redirected at the scratch directory so nothing here can read — or be
 /// perturbed by — the machine's own git identity, signing setup, or installed
-/// toolchain.
+/// toolchain. Its `origin` is a name only (the path never exists; nothing
+/// here fetches or pushes), and the `gh` answering for that origin is the
+/// shim in the fixture's own `bin/`, first on `PATH`.
 struct Fixture {
     root: PathBuf,
     home: PathBuf,
+    bin: PathBuf,
 }
 
 impl Fixture {
@@ -54,8 +77,12 @@ impl Fixture {
             )
             .expect("copy the script into the fixture");
         }
-        let fixture = Fixture { root, home };
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("create the fixture bin/");
+        write_shim(&bin.join("gh"), GH_SHIM);
+        let fixture = Fixture { root, home, bin };
         fixture.git(&["init", "--initial-branch=next"]);
+        fixture.git(&["remote", "add", "origin", "/var/empty/fixture-origin.git"]);
         fs::write(fixture.root.join("CHANGELOG.md"), changelog).expect("write the changelog");
         // A second tracked file so the initial commit is not records-only —
         // the sweep notes a changelog entry that arrived without code, and a
@@ -86,8 +113,15 @@ impl Fixture {
 
     fn command(&self, program: &str) -> Command {
         let mut command = Command::new(program);
+        // The fixture's bin/ (the `gh` shim) shadows the machine's own gh —
+        // nothing a script resolves through PATH may reach the network.
+        let path = std::env::join_paths(std::iter::once(self.bin.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .expect("assemble the fixture PATH");
         command
             .current_dir(&self.root)
+            .env("PATH", path)
             .env("HOME", &self.home)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -99,11 +133,21 @@ impl Fixture {
     }
 
     /// Runs one of the copied scripts and returns `(exit ok, stdout+stderr)`.
+    /// The fixture's CI answers green — the cut's default world.
     fn script(&self, name: &str, arguments: &[&str]) -> (bool, String) {
+        self.script_with_ci(name, arguments, "completed success")
+    }
+
+    /// `script`, with the fixture's CI answering `verdict` — the cooked
+    /// string the real `gh run list --jq` pipeline yields ("completed
+    /// failure", "in_progress ", "none", …; "unreachable" makes the shim
+    /// fail the way an offline gh does).
+    fn script_with_ci(&self, name: &str, arguments: &[&str], verdict: &str) -> (bool, String) {
         let output = self
             .command("sh")
             .arg(format!("scripts/{name}"))
             .args(arguments)
+            .env("VILAN_FIXTURE_CI", verdict)
             .output()
             .unwrap_or_else(|error| panic!("run scripts/{name}: {error}"));
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -179,7 +223,7 @@ fn the_cut_retitles_the_section_and_orders_it_by_family() {
 
     // Sweep (a): every entry traces to the commit that introduced it.
     assert_eq!(
-        report.matches("  ok    ").count(),
+        traced_entries(&report),
         4,
         "expected four traced entries:\n{report}"
     );
@@ -258,7 +302,7 @@ fn the_cut_refuses_an_entry_it_cannot_classify_instead_of_guessing() {
     );
     // Refusing is not a reason to stop reporting: the sweep still runs, so one
     // run tells the operator everything that is wrong.
-    assert_eq!(report.matches("  ok    ").count(), 4, "{report}");
+    assert_eq!(traced_entries(&report), 4, "{report}");
     assert!(!out.exists(), "a refused cut must write nothing");
 
     // An unknown family is refused the same way, naming what it does not know.
@@ -267,6 +311,15 @@ fn the_cut_refuses_an_entry_it_cannot_classify_instead_of_guessing() {
     let (ok, report) = fixture.script("cut-release.sh", &["--date", "2026-01-02", "9.9.9"]);
     assert!(!ok, "an unknown family was accepted:\n{report}");
     assert!(report.contains("the unknown family `refactor`"), "{report}");
+}
+
+/// The sweep's own `ok` lines — the CI verdict prints an `ok` too, and the
+/// assertions using this count traced ENTRIES, not everything green.
+fn traced_entries(report: &str) -> usize {
+    report
+        .lines()
+        .filter(|line| line.starts_with("  ok    ") && !line.contains("ci.yml"))
+        .count()
 }
 
 /// The 1-based line `needle` sits on, for a refusal that must name it.
@@ -322,7 +375,7 @@ fn the_cut_refuses_a_marker_that_opens_no_entry() {
     );
     // Refusing is not a reason to stop reporting: the sweep still traces the
     // four entries the section does hold.
-    assert_eq!(report.matches("  ok    ").count(), 4, "{report}");
+    assert_eq!(traced_entries(&report), 4, "{report}");
 
     // A `commit:` marker is a marker too.
     let stranded = SCRAMBLED.replace(
@@ -472,7 +525,7 @@ fn the_cut_accepts_a_commit_marker_on_either_side_of_the_family_marker() {
         ok,
         "the cut refused a commit marker beside a family marker:\n{report}"
     );
-    assert_eq!(report.matches("  ok    ").count(), 4, "{report}");
+    assert_eq!(traced_entries(&report), 4, "{report}");
     let proposed = fs::read_to_string(&out).expect("read the proposed changelog");
     for family in ["breaking", "feature"] {
         let expected =
@@ -725,9 +778,210 @@ fn the_sweep_reds_an_entry_whose_commit_is_not_an_ancestor_of_the_tag() {
     assert!(report.contains("A feature entry."), "{report}");
 }
 
+// --- The commit's CI (releases.md §7.2 step 4, backlog L17) -----------------
+//
+// v0.37.0 was tagged and published over a Windows CI leg that had been red
+// for days: the only suite anyone had run was local (one platform),
+// release.yml's gate was ubuntu-only, and nothing in the cut looked at CI on
+// the commit being tagged. Now cut-release.sh reads ci.yml's verdict on
+// origin at that exact sha and refuses anything but green — fail-CLOSED, so
+// "cannot look" (no gh, no origin, unreachable) refuses too. The pins above
+// all run against a fixture whose CI answers green, so every one of them
+// doubles as the green path's; these are the other verdicts.
+
+/// A cut that must refuse on the CI verdict alone: the section itself is
+/// fully classified and every entry traces, so the one red is CI's.
+fn refuse_ci(name: &str, verdict: &str) -> String {
+    let fixture = Fixture::new(name, SCRAMBLED);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script_with_ci(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.9",
+        ],
+        verdict,
+    );
+    assert!(
+        !ok,
+        "the cut accepted the CI verdict `{verdict}`:\n{report}"
+    );
+    assert!(
+        report.contains("refusing to cut"),
+        "the refusal must say nothing was changed:\n{report}"
+    );
+    assert!(!out.exists(), "a refused cut must write nothing");
+    // Fail-closed is not fail-degraded: the sweep still traces every entry,
+    // so one run tells the operator everything.
+    assert_eq!(traced_entries(&report), 4, "{report}");
+    report
+}
+
+#[test]
+fn the_cut_names_the_green_ci_verdict() {
+    let fixture = Fixture::new("ci-green", SCRAMBLED);
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &["--date", "2026-01-02", "--dry-run", "9.9.9"],
+    );
+    assert!(ok, "a green-CI cut refused:\n{report}");
+    assert!(
+        report.contains("ok    ci.yml is green on origin at"),
+        "the report must say what it verified, not just proceed:\n{report}"
+    );
+}
+
+#[test]
+fn the_cut_refuses_red_pending_absent_and_unreadable_ci_each_by_name() {
+    // Red: the L17 verdict itself.
+    let report = refuse_ci("ci-red", "completed failure");
+    assert!(
+        report.contains("ci.yml concluded 'failure', not success"),
+        "the refusal must name the conclusion:\n{report}"
+    );
+    assert!(
+        report.contains("--allow-red-ci"),
+        "the refusal must name the override it is not taking:\n{report}"
+    );
+
+    // A cancelled run is not a green run.
+    let report = refuse_ci("ci-cancelled", "completed cancelled");
+    assert!(report.contains("ci.yml concluded 'cancelled'"), "{report}");
+
+    // Pending: the verdict does not exist yet, and waiting is the remedy.
+    let report = refuse_ci("ci-pending", "in_progress ");
+    assert!(report.contains("ci.yml is still 'in_progress'"), "{report}");
+
+    // Absent: the commit was never pushed, or CI never triggered.
+    let report = refuse_ci("ci-absent", "none");
+    assert!(report.contains("ci.yml has NO run at"), "{report}");
+
+    // Unreachable: offline or unauthenticated is a refusal of its own, never
+    // a silent pass — the one machine that cannot see CI is exactly the one
+    // that must not tag blind.
+    let report = refuse_ci("ci-unreachable", "unreachable");
+    assert!(report.contains("could not read ci.yml's runs"), "{report}");
+}
+
+#[test]
+fn the_cut_refuses_with_no_origin_to_verify_against() {
+    let fixture = Fixture::new("ci-no-origin", SCRAMBLED);
+    fixture.git(&["remote", "remove", "origin"]);
+    let (ok, report) = fixture.script(
+        "cut-release.sh",
+        &["--date", "2026-01-02", "--dry-run", "9.9.9"],
+    );
+    assert!(!ok, "the cut proceeded with no origin to check:\n{report}");
+    assert!(report.contains("no 'origin' remote"), "{report}");
+    assert!(report.contains("refusing to cut"), "{report}");
+}
+
+#[test]
+fn the_cut_refuses_when_no_gh_can_read_ci_at_all() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("ci-no-gh", SCRAMBLED);
+    // A PATH built the way the installer fixtures below build theirs: the
+    // real tools the script resolves, linked in one by one — and no gh
+    // anywhere on it. `command -v gh` failing IS the case under test, so
+    // everything else must still work; otherwise the refusal would be an
+    // accident of a broken environment rather than the script's own.
+    let scrubbed = fixture.root.join("nogh-bin");
+    fs::create_dir_all(&scrubbed).expect("create the scrubbed PATH");
+    for tool in [
+        "git", "grep", "awk", "date", "mktemp", "rm", "tail", "head", "sort", "dirname",
+    ] {
+        let real = locate(tool).unwrap_or_else(|| panic!("no `{tool}` on this machine's PATH"));
+        symlink(real, scrubbed.join(tool)).expect("link a real tool into the scrubbed PATH");
+    }
+    let output = Command::new("/bin/sh")
+        .arg("scripts/cut-release.sh")
+        .args(["--date", "2026-01-02", "--dry-run", "9.9.9"])
+        .current_dir(&fixture.root)
+        .env_clear()
+        .env("PATH", &scrubbed)
+        .env("HOME", &fixture.home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("run scripts/cut-release.sh with no gh on PATH");
+    let mut report = String::from_utf8_lossy(&output.stdout).into_owned();
+    report.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        !output.status.success(),
+        "the cut proceeded with no way to read CI:\n{report}"
+    );
+    assert!(
+        report.contains("gh is not installed"),
+        "the refusal must name the missing tool:\n{report}"
+    );
+    assert!(report.contains("refusing to cut"), "{report}");
+    // Fail-closed is not fail-degraded here either.
+    assert_eq!(traced_entries(&report), 4, "{report}");
+}
+
+#[test]
+fn allow_red_ci_overrides_loudly_and_lifts_only_the_ci_red() {
+    let fixture = Fixture::new("ci-override", SCRAMBLED);
+    let out = fixture.root.join("proposed.md");
+    let (ok, report) = fixture.script_with_ci(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--allow-red-ci",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+            "9.9.9",
+        ],
+        "completed failure",
+    );
+    assert!(ok, "--allow-red-ci did not lift the CI red:\n{report}");
+    assert!(
+        report.contains("OVERRIDDEN by --allow-red-ci"),
+        "the override must print what it is, loudly:\n{report}"
+    );
+    assert!(
+        report.contains("could not verify green"),
+        "the override must say what it is riding over:\n{report}"
+    );
+    assert!(out.exists(), "an overridden cut must actually cut");
+
+    // The flag lifts the CI red and NOTHING else: a section the parser
+    // refuses still refuses, override or no override.
+    let unclassifiable = SCRAMBLED.replace(
+        "<!-- family: feature -->\n**A feature entry.**",
+        "**A feature entry.**",
+    );
+    let fixture = Fixture::new("ci-override-not-a-skeleton-key", &unclassifiable);
+    let (ok, report) = fixture.script_with_ci(
+        "cut-release.sh",
+        &[
+            "--date",
+            "2026-01-02",
+            "--allow-red-ci",
+            "--dry-run",
+            "9.9.9",
+        ],
+        "completed failure",
+    );
+    assert!(
+        !ok,
+        "--allow-red-ci lifted a refusal that is not CI's:\n{report}"
+    );
+    assert!(report.contains("refusing to cut"), "{report}");
+}
+
 #[test]
 fn the_fold_names_each_precondition_it_cannot_meet() {
     let fixture = Fixture::new("fold", SCRAMBLED);
+    // This fixture's premise is a repository missing EVERY precondition, the
+    // named origin included — without one, the checks that would need the
+    // network skip themselves, which the assertions below pin.
+    fixture.git(&["remote", "remove", "origin"]);
     let (ok, report) = fixture.script("fold-release.sh", &["v9.9.9", "--dry-run"]);
     assert!(!ok, "the fold passed a repository with no tag:\n{report}");
 
