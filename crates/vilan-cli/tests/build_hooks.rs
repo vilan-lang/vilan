@@ -1,0 +1,736 @@
+//! End-to-end CLI tests for the build-hook staleness predicate and the tier-2
+//! boundary (proposal/build-hooks.md §3 and §4.3, slices S1 and S2; the trust
+//! model they extend is proposal/build-trust.md).
+//!
+//! Two behaviors, one file, because they are two halves of one question the
+//! manifest asks — *does this command run?*:
+//!
+//! * **S1, freshness.** A `[[build.hook]]` that declares `inputs` and/or
+//!   `outputs` runs when one of them has moved and is skipped when none has,
+//!   decided by CONTENT and recorded in `dist/.build-hooks.json`. A `[build]
+//!   run` command declares nothing and so runs every time, exactly as it
+//!   always has.
+//! * **S2, the tier-2 note.** A dependency that declares build hooks does not
+//!   get to run them — and now says so, once per build, naming itself. The
+//!   opt-in (`build-hooks = true`) parses and is refused too: the point of the
+//!   slice is that the syntax is fixed before anything can cross it.
+//!
+//! Each test writes a throwaway project tree and drives the built `vilan`
+//! binary. The fixtures are per-platform where they have to be: a hook runs
+//! through the PLATFORM shell, so `printf` (which `cmd` does not have) is
+//! never assumed.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// A fresh temp directory for one test's project tree.
+fn temp_project(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "vilan_hooks_cli_{tag}_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn write(dir: &Path, relative: &str, contents: &str) {
+    let path = dir.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+/// Runs the `vilan` binary with `args`, with `NO_COLOR=1` so the dim note and
+/// the `Fresh` line can be asserted as literal text.
+fn vilan(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vilan")
+}
+
+fn combined(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// A hook command that appends one line to `file`, in the platform's shell.
+/// Counting these lines is how a test knows whether a hook ran.
+fn append(file: &str) -> String {
+    if cfg!(windows) {
+        format!("echo ran>> {file}")
+    } else {
+        format!("printf 'ran\\n' >> {file}")
+    }
+}
+
+/// A hook command that writes one line of `text` to `file`, replacing it.
+fn write_line(file: &str, text: &str) -> String {
+    if cfg!(windows) {
+        format!("echo {text}> {file}")
+    } else {
+        format!("printf '{text}\\n' > {file}")
+    }
+}
+
+/// How many times the hook wrote its marker. A missing file is zero runs.
+/// Counted by non-blank lines, because `cmd`'s `echo` and `printf` disagree
+/// about trailing whitespace and line endings and neither is the assertion.
+fn runs(dir: &Path, file: &str) -> usize {
+    std::fs::read_to_string(dir.join(file))
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// The smallest program that compiles and runs.
+const MAIN: &str = "import std::print;\nfun main() { print(\"ok\") }\nmain();\n";
+
+/// A `[package]` with one declared hook: it appends to `ran.txt` and writes
+/// `generated.txt`, declaring `input.txt` in and `generated.txt` out.
+fn declared_hook_manifest() -> String {
+    format!(
+        "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"gen\"\nrun = [{}, {}]\n\
+         inputs = \"input.txt\"\noutputs = \"generated.txt\"\n",
+        toml_string(&append("ran.txt")),
+        toml_string(&write_line("generated.txt", "generated"))
+    )
+}
+
+/// A TOML basic string. The commands carry `'` and `\` on unix, so they cannot
+/// be pasted raw.
+fn toml_string(text: &str) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Writes the standard one-hook project and returns its directory.
+fn declared_hook_project(tag: &str) -> PathBuf {
+    let dir = temp_project(tag);
+    write(&dir, "vilan.toml", &declared_hook_manifest());
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+    dir
+}
+
+/// Builds `dir`, asserting success.
+fn build(dir: &Path) -> String {
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "build failed:\n{text}");
+    text
+}
+
+// ── S1: the staleness predicate (§3, one pin per transition of §9's list) ──
+
+#[test]
+fn a_declared_hook_runs_cold_and_is_skipped_while_nothing_moves() {
+    // The two halves of the whole feature: it runs once (there is no stamp),
+    // and then it does not (every declared path re-digests to what was
+    // recorded). Three builds, one run.
+    let dir = declared_hook_project("fresh");
+    let first = build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "the cold build runs it:\n{first}");
+    assert!(
+        !first.contains("Fresh"),
+        "a cold hook is not fresh:\n{first}"
+    );
+
+    let second = build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "the second build skips it");
+    assert!(
+        second.contains("Fresh   gen"),
+        "a skipped hook says so, by name — silence is the failure mode this \
+         design exists to avoid:\n{second}"
+    );
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "and the third");
+    // The build still happened.
+    assert!(dir.join("src/main.mjs").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_moved_input_reruns_the_hook() {
+    // The transition the whole predicate exists for. Content, never mtime:
+    // the file is rewritten with DIFFERENT bytes.
+    let dir = declared_hook_project("input_moved");
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    write(&dir, "input.txt", "two\n");
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2, "a changed input re-runs it");
+    // And settles again.
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewriting_an_input_with_the_same_bytes_does_not_rerun_it() {
+    // The other half of "content, never mtime" — and the bug the watch loop
+    // already refused once. Touching a file must not cost a hook run.
+    let dir = declared_hook_project("same_bytes");
+    build(&dir);
+    write(&dir, "input.txt", "one\n");
+    let second = build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        1,
+        "same bytes, same digest, no run:\n{second}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_input_that_appears_where_it_was_missing_reruns_the_hook() {
+    // A declared input that is not there is recorded AS missing rather than
+    // ignored — a file that was not there is a dependency, and its appearance
+    // has to invalidate.
+    let dir = declared_hook_project("input_appears");
+    std::fs::remove_file(dir.join("input.txt")).unwrap();
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "still missing, still fresh");
+    write(&dir, "input.txt", "arrived\n");
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2, "its appearance re-runs it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_deleted_output_reruns_the_hook() {
+    let dir = declared_hook_project("output_gone");
+    build(&dir);
+    std::fs::remove_file(dir.join("generated.txt")).unwrap();
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2, "a missing output is not fresh");
+    assert!(dir.join("generated.txt").is_file(), "and it was rebuilt");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_hand_edited_output_reruns_the_hook() {
+    let dir = declared_hook_project("output_edited");
+    build(&dir);
+    write(&dir, "generated.txt", "tampered\n");
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2, "an edited output is not fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_changed_command_string_reruns_the_hook() {
+    // Editing the hook's own declaration re-runs it by construction, which is
+    // half of why §3.2's accepted unsoundness is bounded.
+    let dir = declared_hook_project("command_changed");
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    let changed = format!(
+        "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"gen\"\nrun = [{}, {}]\n\
+         inputs = \"input.txt\"\noutputs = \"generated.txt\"\n",
+        toml_string(&append("ran.txt")),
+        toml_string(&write_line("generated.txt", "different"))
+    );
+    write(&dir, "vilan.toml", &changed);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2, "a changed command is not fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn changing_the_declared_paths_reruns_the_hook() {
+    // The declaration is part of the fingerprint, so adding an input is a
+    // change even when every file it names is untouched. No rule of its own —
+    // it falls out of comparing the whole recorded structure.
+    let dir = declared_hook_project("declaration_changed");
+    build(&dir);
+    write(&dir, "second.txt", "second\n");
+    let widened = format!(
+        "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"gen\"\nrun = [{}, {}]\n\
+         inputs = [\"input.txt\", \"second.txt\"]\noutputs = \"generated.txt\"\n",
+        toml_string(&append("ran.txt")),
+        toml_string(&write_line("generated.txt", "generated"))
+    );
+    write(&dir, "vilan.toml", &widened);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2, "a widened declaration re-runs it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_declared_directory_digests_its_whole_tree() {
+    // The copy case (§2.1's `src/static`): a directory is declared as one
+    // path, and a file added anywhere under it moves the digest. This is what
+    // stands in for the glob patterns the manifest refuses.
+    let dir = temp_project("directory_input");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"copy\"\nrun = {}\n\
+             inputs = \"static\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "static/a.txt", "a\n");
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "an untouched tree is fresh");
+    write(&dir, "static/nested/b.txt", "b\n");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "a new file in the tree re-runs it"
+    );
+    write(&dir, "static/a.txt", "changed\n");
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 3, "so does a changed file in it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rerun_hooks_runs_a_fresh_hook_anyway() {
+    // §3.2's escape, for the hook that reads something it did not declare.
+    let dir = declared_hook_project("rerun_flag");
+    build(&dir);
+    let output = vilan(&["build", dir.to_str().unwrap(), "--rerun-hooks"]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(runs(&dir, "ran.txt"), 2, "--rerun-hooks ignores freshness");
+    assert!(
+        !text.contains("Fresh"),
+        "and does not claim freshness:\n{text}"
+    );
+    // The stamp is still correct afterwards, so the next plain build skips.
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_hook_that_declares_nothing_runs_on_every_build() {
+    // Today's behavior, kept exactly: a hook with no `inputs` and no `outputs`
+    // is never fresh. Both spellings of it — the `run` list and a
+    // `[[build.hook]]` that declares no paths.
+    let plain = temp_project("undeclared_run");
+    write(
+        &plain,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[build]\nrun = [{}]\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&plain, "src/main.vl", MAIN);
+    for expected in 1..=3 {
+        build(&plain);
+        assert_eq!(runs(&plain, "ran.txt"), expected, "`run` runs every build");
+    }
+    // …and it grows no `dist/`: the stamp is written only where there is a
+    // declared hook to stamp, so a `run`-only project is untouched.
+    assert!(
+        !plain.join("dist").exists(),
+        "a `run`-only project gains no dist/"
+    );
+    let _ = std::fs::remove_dir_all(&plain);
+
+    let named = temp_project("undeclared_table");
+    write(
+        &named,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"always\"\nrun = {}\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&named, "src/main.vl", MAIN);
+    for expected in 1..=3 {
+        let text = build(&named);
+        assert_eq!(
+            runs(&named, "ran.txt"),
+            expected,
+            "and so does a named hook"
+        );
+        assert!(!text.contains("Fresh"), "never fresh:\n{text}");
+    }
+    let _ = std::fs::remove_dir_all(&named);
+}
+
+#[test]
+fn a_failing_hook_leaves_no_stamp_so_the_next_build_reruns_it() {
+    // A hook that failed did not produce what it promised, so recording it as
+    // done would skip it forever. The build fails, naming the hook.
+    let dir = temp_project("hook_fails");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"gen\"\n\
+             run = [{}, \"exit 3\"]\ninputs = \"input.txt\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "a failing hook fails the build");
+    assert!(
+        text.contains("[[build.hook]]") && text.contains("gen") && text.contains("exit 3"),
+        "the failure names the hook and the command:\n{text}"
+    );
+    assert!(
+        !dir.join("src/main.mjs").exists(),
+        "the build never happened"
+    );
+
+    let second = vilan(&["build", dir.to_str().unwrap()]);
+    assert!(!second.status.success());
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "a failed hook is not fresh: {}",
+        combined(&second)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_stamp_lives_in_dist_so_removing_dist_rebuilds_the_hooks() {
+    // Q2's ruling, made observable: `rm -rf dist` means "rebuild everything,
+    // hooks included" — the sentence a user already believes.
+    let dir = declared_hook_project("stamp_in_dist");
+    build(&dir);
+    let stamp = dir.join("dist").join(".build-hooks.json");
+    assert!(stamp.is_file(), "the stamp is at dist/.build-hooks.json");
+    let text = std::fs::read_to_string(&stamp).unwrap();
+    assert!(
+        text.contains("\"gen\"") && text.contains("\"input.txt\"") && text.contains("\"outputs\""),
+        "the stamp keys on the hook's name and its declared paths:\n{text}"
+    );
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+
+    std::fs::remove_dir_all(dir.join("dist")).unwrap();
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 2, "no stamp, so it runs");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_corrupt_stamp_reads_as_no_stamp_rather_than_failing_the_build() {
+    // The whole design is safe because its failure direction is a re-run. A
+    // truncated write, a hand edit, a version this binary does not know: each
+    // costs one hook run, never a wrong build and never an error.
+    let dir = declared_hook_project("corrupt_stamp");
+    build(&dir);
+    let stamp = dir.join("dist").join(".build-hooks.json");
+    for corruption in ["", "{", "not json at all", "{\"version\": \"99\"}"] {
+        std::fs::write(&stamp, corruption).unwrap();
+        let before = runs(&dir, "ran.txt");
+        let text = build(&dir);
+        assert_eq!(
+            runs(&dir, "ran.txt"),
+            before + 1,
+            "`{corruption}` must re-run rather than be trusted:\n{text}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_hook_removed_from_the_manifest_takes_its_stamp_entry_with_it() {
+    // The stamp is a function of what the manifest says TODAY, so it cannot
+    // accumulate entries for hooks that no longer exist.
+    let dir = declared_hook_project("stamp_pruned");
+    build(&dir);
+    let stamp = dir.join("dist").join(".build-hooks.json");
+    assert!(std::fs::read_to_string(&stamp).unwrap().contains("gen"));
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    build(&dir);
+    assert!(
+        !stamp.exists(),
+        "the last entry removed takes the file with it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_hook_generates_a_module_the_same_build_compiles_and_then_stops_paying_for_it() {
+    // The paper's P6 probe, promoted to a pin and carried one step further:
+    // the generated module is absent from a clean tree, present and compiled
+    // after one command — and the SECOND build skips the generator while
+    // still compiling the module it left behind. That second half is the
+    // lucide case in miniature.
+    let dir = temp_project("generates_module");
+    let generate = if cfg!(windows) {
+        "echo fun generated(): i32 { 41 }> src/generated.vl".to_string()
+    } else {
+        "printf 'fun generated(): i32 { 41 }\\n' > src/generated.vl".to_string()
+    };
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"icons\"\nrun = [{}, {}]\n\
+             inputs = \"icons.lock\"\noutputs = \"src/generated.vl\"\n",
+            toml_string(&append("ran.txt")),
+            toml_string(&generate)
+        ),
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::print;\nimport pkg::generated::generated;\n\
+         fun main() { print(generated() + 1) }\nmain();\n",
+    );
+    write(&dir, "icons.lock", "v1\n");
+    assert!(!dir.join("src/generated.vl").exists());
+
+    let output = vilan(&["run", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && text.contains("42"),
+        "the hook produced the module the build consumed:\n{text}"
+    );
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+
+    let output = vilan(&["run", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success() && text.contains("42"), "{text}");
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        1,
+        "the generator is fresh, and the module it wrote still compiles:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_runs_no_hook_of_either_form_and_writes_no_stamp() {
+    // `vilan check` produces no artifacts, so there is nothing for a hook to
+    // feed — and nothing to stamp.
+    let dir = declared_hook_project("check");
+    let output = vilan(&["check", dir.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(runs(&dir, "ran.txt"), 0);
+    assert!(!dir.join("dist").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── S2: the tier-2 boundary, said and spelled (§4.3, `build-trust.md` §3) ──
+
+/// Writes an app at `dir` depending on a `[library]` at `dir/dep` that
+/// declares a build hook. `grant` is the dependency declaration's trust key.
+fn dependency_with_a_hook(dir: &Path, grant: &str) {
+    write(
+        dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n[package.dependencies]\ndep = {{ path = \"dep\"{grant} }}\n"
+        ),
+    );
+    write(dir, "src/main.vl", MAIN);
+    write(
+        &dir.join("dep"),
+        "vilan.toml",
+        &format!(
+            "[library]\nname = \"dep\"\n\n[build]\nrun = {}\n",
+            toml_string(&append("../dependency-ran.txt"))
+        ),
+    );
+    write(&dir.join("dep"), "src/lib.vl", "fun unused(): i32 { 1 }\n");
+}
+
+#[test]
+fn an_un_opted_in_dependency_hook_prints_one_note_and_does_not_run() {
+    // P5 promoted from a probe to a pin, with its silence closed. Before this
+    // slice a dependency's `[build] run` produced no output, no warning and no
+    // note — indistinguishable from the toolchain never having looked.
+    let dir = temp_project("dep_no_optin");
+    dependency_with_a_hook(&dir, "");
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a refused dependency hook is a normal outcome, not a failure:\n{text}"
+    );
+    assert_eq!(
+        runs(&dir, "dependency-ran.txt"),
+        0,
+        "the dependency's hook did not run:\n{text}"
+    );
+    assert_eq!(
+        text.matches("note: `dep` declares build hooks").count(),
+        1,
+        "exactly one line, naming the dependency:\n{text}"
+    );
+    assert!(
+        text.contains("build-hooks = true"),
+        "and it names the opt-in that would record consent:\n{text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("warning:"),
+        "a note, never a warning — §3 calls the refusal a normal outcome:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_opted_in_dependency_hook_still_does_not_run_and_says_so() {
+    // The syntax is shipped REFUSING everything: fixed and reviewable before
+    // anything can cross it.
+    let dir = temp_project("dep_optin");
+    dependency_with_a_hook(&dir, ", build-hooks = true");
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "the exit code is unchanged:\n{text}"
+    );
+    assert_eq!(
+        runs(&dir, "dependency-ran.txt"),
+        0,
+        "no dependency hook runs in this slice:\n{text}"
+    );
+    assert_eq!(
+        text.matches("is opted in").count(),
+        1,
+        "the opt-in case gets its own line, once:\n{text}"
+    );
+    assert!(
+        text.contains("`dep`") && text.contains("did not"),
+        "naming the dependency and what did not happen:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_dependency_without_hooks_is_never_mentioned() {
+    // The note exists because a dependency asked for something. One that asked
+    // for nothing must stay silent, or the line stops carrying information.
+    let dir = temp_project("dep_quiet");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n[package.dependencies]\ndep = { path = \"dep\" }\n",
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(
+        &dir.join("dep"),
+        "vilan.toml",
+        "[library]\nname = \"dep\"\n",
+    );
+    write(&dir.join("dep"), "src/lib.vl", "fun unused(): i32 { 1 }\n");
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains("declares build hooks"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_note_appears_once_per_build_not_once_per_member() {
+    // Two workspace members depending on the same package: the note is about
+    // the package, so it is said once however many edges reach it.
+    let dir = temp_project("dep_shared");
+    write(
+        &dir,
+        "vilan.toml",
+        "[project]\npackages = [\"one\", \"two\"]\n",
+    );
+    for member in ["one", "two"] {
+        write(
+            &dir.join(member),
+            "vilan.toml",
+            &format!(
+                "[package]\nname = \"{member}\"\n[package.dependencies]\n\
+                 dep = {{ path = \"../dep\" }}\n"
+            ),
+        );
+        write(&dir.join(member), "src/main.vl", MAIN);
+    }
+    write(
+        &dir.join("dep"),
+        "vilan.toml",
+        &format!(
+            "[library]\nname = \"dep\"\n\n[build]\nrun = {}\n",
+            toml_string(&append("../dependency-ran.txt"))
+        ),
+    );
+    write(&dir.join("dep"), "src/lib.vl", "fun unused(): i32 { 1 }\n");
+
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("note: `dep` declares build hooks").count(),
+        1,
+        "once per build, not once per member:\n{text}"
+    );
+    assert_eq!(runs(&dir, "dependency-ran.txt"), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_grant_written_by_either_member_counts_for_the_shared_dependency() {
+    // A package reached through two edges is one row, so the grant on one edge
+    // has to reach it — otherwise a real opt-in would be reported as absent.
+    let dir = temp_project("dep_shared_grant");
+    write(
+        &dir,
+        "vilan.toml",
+        "[project]\npackages = [\"one\", \"two\"]\n",
+    );
+    for (member, grant) in [("one", ""), ("two", ", build-hooks = true")] {
+        write(
+            &dir.join(member),
+            "vilan.toml",
+            &format!(
+                "[package]\nname = \"{member}\"\n[package.dependencies]\n\
+                 dep = {{ path = \"../dep\"{grant} }}\n"
+            ),
+        );
+        write(&dir.join(member), "src/main.vl", MAIN);
+    }
+    write(
+        &dir.join("dep"),
+        "vilan.toml",
+        "[library]\nname = \"dep\"\n\n[build]\nrun = \"exit 0\"\n",
+    );
+    write(&dir.join("dep"), "src/lib.vl", "fun unused(): i32 { 1 }\n");
+
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("is opted in").count(),
+        1,
+        "the grant on one edge is the package's answer:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_says_nothing_about_dependency_hooks() {
+    // `vilan check` runs no hooks at all, first-party ones included, so there
+    // is no refusal to report.
+    let dir = temp_project("dep_check");
+    dependency_with_a_hook(&dir, "");
+    let output = vilan(&["check", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains("declares build hooks"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

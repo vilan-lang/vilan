@@ -7,7 +7,9 @@ touches the network.** Everything else (builds, dependency resolution,
 tests) works offline (git dependencies are fetched once by the first
 build that needs them, then served from the cache forever). That rule is
 about the network; locally, `build` and `run` execute the manifest's
-`[build] run` hooks with your own privileges, without prompting.
+own build hooks with your own privileges, without prompting — a
+dependency's are never executed, and one that declares them is named in
+a `note:` line rather than passed over silently.
 
 For the guided on-ramp, see [Hello Vilan](../tour/hello-vilan.md); for
 `--watch`, HMR, and the manifest keys that shape the dev loop, see
@@ -43,11 +45,18 @@ the target's: `.mjs` on a process runtime (Node/Deno/Bun), so the host
 classifies the emitted ESM without inspecting it, and `.js` on the
 browser, whose `<script type="module">` already declares it. Assets emitted at
 compile time (the styling system's CSS) land beside the output.
-`[build] run` hooks execute first — through your shell, with your
-privileges, each command printed before it runs; a failing hook fails the
-build.
+Build hooks execute first — through your shell, with your privileges,
+each command printed before it runs; a failing hook fails the build.
+Every `[build] run` command runs on every build; a named
+`[[build.hook]]` that declared `inputs`/`outputs` is skipped while none
+of them has moved, and says `Fresh <name>` instead
+([the dev loop](../guide/dev-loop.md#running-something-alongside-the-build)).
+A *dependency* that declares hooks gets a `note:` line and no execution.
 
 - `--stdout`: print the JavaScript instead of writing a file.
+- `--rerun-hooks`: run every `[[build.hook]]` even if it is fresh — the
+  escape for a hook that reads something it did not declare. (`rm -rf
+  dist` is the bigger hammer: the freshness record lives there.)
 - `--platform <p>`: `node`, `deno`, `bun`, `browser`, or `none`;
   overrides the package's `target` (`--target` is an accepted alias).
   `none` checks against no platform's layers, the strictest reading.

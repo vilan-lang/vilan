@@ -4,3 +4,6 @@
 *.js
 *.css
 *.chunks.json
+# `dist/` holds what the build records for itself — today the `[[build.hook]]`
+# freshness stamp. Deleting it re-runs every hook, which is the point.
+dist/
