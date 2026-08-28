@@ -54,6 +54,7 @@ impl ServerBuilder {
 	fun on_start(own self, callback: |Server| void): ServerBuilder
 	fun on_stop(own self, callback: |Server| void): ServerBuilder
 	fun serve_build(own self, build: LegBuild): ServerBuilder   // one route per artifact
+	fun cache_build(own self, policy: |str| CachePolicy): ServerBuilder   // opt in to caching
 	fun build(self): Server
 }
 impl Server {
@@ -91,6 +92,13 @@ impl ResponseStream {
 fun etag_of(body: Bytes): str          // async — a strong validator, quoted
 fun if_none_match_matches(header: str, etag: str): bool
 fun etag_response(request: Request, etag: str, body: Bytes, content_type: str): ResponseBuilder
+
+// what `cache_build` asks for, per served artifact
+impl CachePolicy {
+	fun none(): CachePolicy                                    // no validator, no header
+	fun validated(): CachePolicy                               // ETag + 304
+	fun cache_control(own self, value: str): CachePolicy       // the field value, verbatim
+}
 ```
 
 `Request::header` reads one header off the request, and the conditional
@@ -215,6 +223,46 @@ Freshness is its dev-mode policy: under `vilan run --watch`
 rebuild is served without a restart; otherwise the copy read at boot is
 served from memory. Both halves read bytes, so a watch never serves a
 freshly decoded — and freshly corrupted — copy of a binary artifact.
+
+**Caching is opt-in, and off by default.** `serve_build` sends one header,
+`Content-Type`, and the bytes — a browser cache policy is an application's
+decision, not a default std can guess right for every deployment, and
+`serve_build` serves a build rather than a directory. `cache_build` is the
+one call that opts in: it asks your policy, per artifact, what to send
+beyond the bytes, keyed on the route the build claimed. The two-tier shape
+every static layer converges on is one expression:
+
+```vilan,norun
+import std::build::require_build;
+import std::http::{ CachePolicy, Response, Server };
+
+async fun main() {
+	Server::builder()
+		.serve_build(require_build("client"))
+		.cache_build(|url| if url.starts_with("/chunk-") {
+			// A fingerprinted name cannot go stale: cache it for a year.
+			CachePolicy::none().cache_control("public, max-age=31536000, immutable")
+		} else {
+			// Everything else revalidates — a round trip, but never a body.
+			CachePolicy::validated().cache_control("no-cache")
+		})
+		.on_request(|request| Response::builder().code(404).body("Not Found").build())
+		.build()
+		.start();
+}
+```
+
+`CachePolicy::validated()` mints an [`etag_of`](#stdhttp-the-server)
+validator over the bytes being served and answers a matching
+`If-None-Match` with a `304`; `cache_control` sets the field value
+verbatim, on either base, and it reaches the `304` arm as well as the
+`200`. The policy is asked about the **url** and nothing else, so it cannot
+quietly become a second request handler — anything genuinely per-request
+belongs in `on_request`, built from `etag_response` directly. A validator
+costs one sha-256 per hit, over the bytes actually served, which is what
+keeps it correct under `run --watch`. Leave `cache_build` off the chain and
+nothing changes: the response is byte-for-byte what it was before the hook
+existed.
 
 A **streaming** response holds the connection open: once the status and
 headers are written, `on_open` receives the live `ResponseStream` and

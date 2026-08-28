@@ -182,6 +182,41 @@ saves the transfer, just not the render. The matching semantics (the
 list and `*` forms, weak comparison, the GET/HEAD gate) are in the
 [reference](../std/process.md#stdhttp-the-server).
 
+**The same two tiers, for a served build.** The artifacts `serve_build`
+installs get no caching by default — one
+`Content-Type` header and the bytes — because which tier a build's files
+belong in is a deployment's decision and not one std can make for you. Opt
+in with `cache_build`, which asks your policy per artifact, keyed on the
+route:
+
+```vilan,norun
+import std::build::require_build;
+import std::http::{ CachePolicy, Response, Server };
+
+async fun main() {
+	Server::builder()
+		.port(8080)
+		.serve_build(require_build("client"))
+		.cache_build(|url| if url.starts_with("/chunk-") {
+			// Fingerprinted: the name changes when the bytes do.
+			CachePolicy::none().cache_control("public, max-age=31536000, immutable")
+		} else {
+			// Fixed URL: revalidate, and pay a body only when it changed.
+			CachePolicy::validated().cache_control("no-cache")
+		})
+		.on_request(|request| Response::builder().code(404).body("Not Found").build())
+		.build()
+		.start();
+}
+```
+
+That is the same two tiers as above, written once instead of per route:
+`validated()` is the `etag_of` + `etag_response` pair applied to the
+artifact's own bytes, and `cache_control` is the header, reaching the `304`
+arm as well as the `200`. Delete the `cache_build` line and the server is
+byte-for-byte back to no caching — there is no third state, and no default
+moved under you.
+
 ## Files: `std::fs`
 
 ```vilan,fragment
