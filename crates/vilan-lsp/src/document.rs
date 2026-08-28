@@ -4335,7 +4335,7 @@ pub(crate) mod tests {
     // frames, anchored at the offending call in the entry.
     #[test]
     fn coloring_violation_publishes_live_on_a_browser_target() {
-        let entry = "import std::fs;\n\nfun main() {\n\tlet present = fs::exists(\"marker\");\n}\n";
+        let entry = "import std::fs;\n\nfun main() {\n\tlet present = fs::stat(\"marker\");\n}\n";
         let (dir, document) = analyze_workspace(&[
             ("src/main.vl", entry),
             (
@@ -4367,12 +4367,12 @@ pub(crate) mod tests {
             violation.message
         );
         assert!(
-            violation.message.contains("main → exists (std::fs)"),
+            violation.message.contains("main → stat (std::fs)"),
             "{}",
             violation.message
         );
-        // The anchor is the deepest user-code call site: the `fs::exists` call.
-        let call = entry.find("exists(").unwrap();
+        // The anchor is the deepest user-code call site: the `fs::stat` call.
+        let call = entry.find("stat(").unwrap();
         let range = violation.span.into_range();
         assert!(
             range.start <= call && call < range.end,
@@ -4385,7 +4385,7 @@ pub(crate) mod tests {
     // the manifest's `target` is what drives the editor's platform.
     #[test]
     fn the_manifest_target_admits_the_same_reach_on_node() {
-        let entry = "import std::fs;\n\nfun main() {\n\tlet present = fs::exists(\"marker\");\n}\n";
+        let entry = "import std::fs;\n\nfun main() {\n\tlet present = fs::stat(\"marker\");\n}\n";
         let (dir, document) = analyze_workspace(&[
             ("src/main.vl", entry),
             (
@@ -4410,7 +4410,7 @@ pub(crate) mod tests {
     #[test]
     fn an_inferred_browser_file_colors_without_a_manifest() {
         let document = Document::analyze(
-            "import std::dom;\nimport std::fs;\n\nfun main() {\n\tlet present = fs::exists(\"marker\");\n}\n",
+            "import std::dom;\nimport std::fs;\n\nfun main() {\n\tlet present = fs::stat(\"marker\");\n}\n",
             &std_root(),
             Path::new("scratch.vl"),
         );
@@ -4438,7 +4438,7 @@ pub(crate) mod tests {
     fn multi_entry_files_analyze_under_their_entry_targets() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let store = "import std::fs;\n\nfun load(): bool {\n\tfs::exists(\"state\")\n}\n";
+        let store = "import std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n";
         let reach = "import std::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"?\") }\n}\n";
         let (dir, client) = analyze_workspace(&[
             ("src/client.vl", reach),
@@ -5783,12 +5783,11 @@ pub(crate) mod tests {
     // non-entry read path) alongside the signature.
     #[test]
     fn hover_reads_imported_declarations_from_their_files() {
-        let hover = hover_at_cursor(
-            "import std::fs::exists;\n\nfun main() {\n\tlet _e = exi|sts(\"x\");\n}\n",
-        )
-        .expect("hover on the std call");
+        let hover =
+            hover_at_cursor("import std::fs::stat;\n\nfun main() {\n\tlet _s = st|at(\"x\");\n}\n")
+                .expect("hover on the std call");
         assert!(
-            hover.contains("exists(") && hover.contains("```vilan"),
+            hover.contains("stat(") && hover.contains("```vilan"),
             "{hover}"
         );
     }

@@ -2963,7 +2963,7 @@ fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
 ///
 /// - `leg` / `entry` — the leg's name and its eager bundle's file name;
 /// - `styles` — the style sidecar's file name, or `null` when the leg compiled
-///   no styles (F1/F2: the fact a shell cannot see and a `fs::exists` probe
+///   no styles (F1/F2: the fact a shell cannot see and a `fs::stat` probe
 ///   cannot check in both directions);
 /// - `classic_script` — whether the bundle must be loaded as a classic script,
 ///   true exactly when the leg split, because chunk resolution reads

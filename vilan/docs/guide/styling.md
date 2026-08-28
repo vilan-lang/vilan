@@ -57,7 +57,7 @@ Server::builder().port(8080).serve_build(require_build("client"))
 ```
 
 That also means a leg that stops emitting styles stops having them
-served, with no `fs::exists` guard to remember: the build says whether it
+served, with no `fs::stat` guard to remember: the build says whether it
 wrote a sidecar, and the server believes it.
 
 Miss the link and the app runs unstyled while the compiler faithfully

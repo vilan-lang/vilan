@@ -42,6 +42,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("crypto.vl", "async + host WebCrypto (`crypto.subtle`)"),
     ("db.vl", "host database (`node:sqlite`)"),
     (
+        "file.vl",
+        "async + host filesystem (`node:fs/promises` handles)",
+    ),
+    (
         "time.vl",
         "host clock + timers (`Date.now`, `Date#toISOString`, `setTimeout`)",
     ),

@@ -354,7 +354,7 @@ fn a_platform_violation_renders_in_the_file_that_holds_the_call() {
             ),
             (
                 "src/alpha.vl",
-                "import std::fs::exists;\n\nfun go(): bool {\n\texists(\"cache.txt\")\n}\n",
+                "import std::fs::stat;\n\nfun go(): bool {\n\tstat(\"cache.txt\").is_some()\n}\n",
             ),
         ],
     );
@@ -367,7 +367,7 @@ fn a_platform_violation_renders_in_the_file_that_holds_the_call() {
         "the platform violation is reported: {stderr}"
     );
     assert!(
-        renders_in(&stderr, "alpha.vl", "exists(\"cache.txt\")"),
+        renders_in(&stderr, "alpha.vl", "stat(\"cache.txt\")"),
         "and renders at the call, in the module holding it: {stderr}"
     );
 }

@@ -258,7 +258,7 @@ fn write_multi_entry_package(dir: &Path) {
     write(
         dir,
         "src/store.vl",
-        "import std::fs;\n\nfun load(): bool {\n\tfs::exists(\"state\")\n}\n",
+        "import std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n",
     );
     write(
         dir,
@@ -562,7 +562,7 @@ fn check_colors_each_entry_against_its_own_target() {
         "unexpected output: {text}"
     );
     assert!(
-        text.contains("main → load → exists (std::fs)"),
+        text.contains("main → load → stat (std::fs)"),
         "the chain should name the path: {text}"
     );
     let _ = std::fs::remove_dir_all(&dir);

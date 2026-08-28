@@ -133,13 +133,15 @@ An rpc app adds `.with_service(Service::new(protocol))` to the same chain
 ## Files: `std::fs`
 
 ```vilan,fragment
-fun exists(path: str): bool                 // sync — the module's one blocking call
 fun read_file_to_str(path: str): str        // async (implicitly awaited), UTF-8
 fun read_file_encoded(path: str, encoding: str): str   // async — any host encoding
 fun read_bytes(path: str): Bytes            // async — the true binary read
 fun write_file(path: str, contents: str)    // async
 fun read_dir(path: str): List<str>          // async — entry names, flat
 fun stat(path: str): Option<Stat>           // async — None if the path isn't there
+
+resource external struct File               // an open file — the handle tier
+fun with_file<T>(path: str, body: |File| T): T   // open, run, close (awaited)
 ```
 
 `read_bytes` reads a file with no decode in between — the host's buffer
@@ -151,7 +153,41 @@ directory's immediate entries by name — flat and unordered, so call `stat`
 per entry when you need file-vs-directory. `stat` reads `size`,
 `modified_at_ms` (epoch millis) and `is_directory`, and is the one read
 here that answers `None` instead of throwing on a missing path: it exists
-for a caller asking "is this here yet". Full signatures:
+for a caller asking "is this here yet" — `stat(path).is_some()` is the
+existence probe (there is no `exists`; everything in this module is
+async, and `stat` answers strictly more).
+
+When one open file needs more than one act — read a header, then seek
+into the middle; write, then `sync` for durability — you open a handle.
+`File::open(path)` (and `create`, `create_new`, `append_to`, `modify`)
+hands back a *resource*: it moves rather than copies, and its destructor
+closes the handle at scope end, so there is no `close()` to forget —
+`drop(file)` closes early. Reads and writes are positional
+(`file.read_at(buffer, position)`, `file.write_at(buffer, position)`),
+`file.stat()` answers with no `Option` (the handle is already open, and
+nothing re-resolves the path between probe and act), and `file.sync()` is
+`fsync`, the durability step `write_atomic` alone cannot give you. The
+documented idiom is the scoped form:
+
+```vilan,norun
+import std::bytes::{ Bytes, decode_utf8 };
+import std::fs::with_file;
+
+fun main() {
+	let head = with_file("data.bin", |file| {
+		let buffer = Bytes::alloc(16);
+		file.read_at(buffer, 0);
+		decode_utf8(buffer.slice(0, 16))
+	});
+}
+main();
+```
+
+`with_file` opens the file, hands it to your closure as a per-call
+parameter, and closes it before returning — with the close *awaited*, so
+a failure to close is a failure of `with_file`; a `File` you hold
+yourself closes through its destructor instead, which starts the close
+without waiting on it. Full signatures:
 [the process reference](../std/process.md#stdfs).
 
 What a server does *not* read by hand any more is its own build.

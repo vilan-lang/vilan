@@ -118,7 +118,7 @@ fun persist(list: List<Todo>) {
 // The stored list — empty on a first run, and empty (not a crash) if the file
 // is corrupt: the codec's decode is validating.
 fun load(): List<Todo> {
-	if fs::exists(storage) {
+	if fs::stat(storage).is_some() {
 		let stored: Result<List<Todo>, str> = decode(json_codec(), Frame::Text(fs::read_file_to_str(storage)));
 		match stored {
 			Ok(let list) => list,

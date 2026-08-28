@@ -694,6 +694,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_column",
         "__db_is_null",
         "__db_close",
+        "__fs_close",
+        "__fs_close_awaited",
         "__fs_stat",
         "__fs_read_dir_all",
         "__local_get",
@@ -955,6 +957,30 @@ fn helper_source(name: &str) -> &'static str {
         // `Database`'s `Drop` closes the handle (destruction.md §9). No public
         // `close()` surfaces this — the destructor is the only caller.
         "__db_close" => "function __db_close(database) {\n\tdatabase.close();\n}",
+        // `File`'s `Drop` (filesystem.md §5.1; kolt.local 031 Q1, ruled
+        // (a)+(c) and scoped to `File` alone). `FileHandle.close()` returns a
+        // promise and a destructor cannot await, so the drop INITIATES the
+        // close without waiting: data already written is safe (a resolved
+        // write was handed to the OS), and the process cannot exit under the
+        // pending close (it holds the event loop). What is lost is the
+        // close's own ERROR — reported here rather than left to take the
+        // process down as an unhandled rejection. `with_file` is the spelling
+        // in which the close is awaited and its failure observable.
+        "__fs_close" => {
+            "function __fs_close(file) {\n\
+             \tfile.close().catch((error) => {\n\
+             \t\tconsole.error(\"vilan: closing a dropped file failed:\", error);\n\
+             \t});\n\
+             }"
+        }
+        // `with_file`'s close — awaited, so a failure to close is a failure
+        // of `with_file` itself. The handle's `Drop` still runs at scope end
+        // and re-enters `close()` fire-and-forget; the host close is
+        // idempotent (a second call resolves against the already-closed
+        // handle), so the safety net stays benign behind the awaited path.
+        "__fs_close_awaited" => {
+            "async function __fs_close_awaited(file) {\n\tawait file.close();\n}"
+        }
         // `std::fs::stat` (F13, fullstack-dx.md §9.3): `fs.promises.stat`
         // wrapped so a missing path reads back the `Option` array `None`
         // instead of throwing — vilan has no `try`/`catch`, so the ENOENT
