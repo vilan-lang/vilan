@@ -144,6 +144,40 @@ Rust workspace, six crates, plus the language's own tree:
   `analyze_source` (tests + LSP) *and* the CLI's duplicated sequence in
   `crates/vilan-cli/src/main.rs` — and verified with a CLI probe, not only an
   inference pin. A pass added to one place ships a check the other silently skips.
+- **The panic fence is four sites, and a new pipeline entry point picks a
+  side deliberately** (N19). The workspace deliberately does NOT build
+  with `panic = "abort"` (the comment above `[profile.wasm-release]` in
+  the root `Cargo.toml` records why): the long-lived surfaces fence
+  their work in `catch_unwind` so a compiler panic degrades to one
+  honest diagnostic instead of a dead process. The four sites:
+  `crates/vilan-core/src/lib.rs`'s outer fence in
+  `analyze_source_reclaimable` (covers lex/parse/lift — degrades to "no
+  program" plus an internal-error diagnostic; before it, a panic
+  unwound through `Document::analyze`'s join and aborted the language
+  server, B40) and its inner fence in `analyze_source_unfenced` (around
+  `analyze` + `post_analysis_passes` — the one that matters for tree
+  reclaim); `crates/vilan-lsp/src/main.rs`'s per-request `fenced` seam
+  (one bad request answers its fallback instead of locking the user out
+  of every LSP feature); and `crates/vilan-lsp/src/document.rs`'s
+  analysis thread (a panicked analysis becomes an internal-error
+  document, never a re-raise through the join). There is no panic hook
+  anywhere: the default hook's stderr write IS the "details are on
+  stderr" every fence's diagnostic promises. On wasm32 the fence only
+  holds if the target unwinds — the playground's instance-recycle path
+  exists as the cover for when it does not, not as an optimization. The
+  CLI is deliberately OUTSIDE the fence: `main.rs` imports `analyze`,
+  not the fenced `analyze_source`, and joins its compiler thread with
+  `.expect("compiler thread panicked")`, so a compiler panic in a
+  one-shot `vilan build` double-panics and exits loudly — nothing there
+  to keep alive, and a swallowed panic would be a wrong build. The rule
+  for a fifth site: a new long-lived entry point into the pipeline (a
+  server, a watcher, an editor surface) fences at its own boundary —
+  catch, degrade to an honest internal-error answer, details left to
+  stderr; a new one-shot entry takes the CLI's stance. Either way,
+  write which and why at the site, and mind E97's open question before
+  holding a global lock across fenced code — a *caught* panic is
+  exactly how a poisoned mutex would outlive the request that poisoned
+  it.
 - **Git is scoped to your worktree.** A lane works in its own git worktree under
   `.claude/worktrees/<lane>`, on its own branch off `next`, and commits there —
   `git add <paths>` naming each file explicitly (never `-A`), with a
