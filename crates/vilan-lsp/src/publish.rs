@@ -83,6 +83,18 @@ impl PublishState {
         document: &Document,
     ) -> Vec<(Url, Vec<Diagnostic>)> {
         let owner_key = self.key(owner);
+        // Clear before rebuild, deliberately (backlog E97). This planner is
+        // reached under a poison-RECOVERING lock, and it is the one place here
+        // that a caught panic could leave behind something worse than an absent
+        // entry: `diagnostic_groups` does span-to-range arithmetic over the
+        // analysis, so it is the panic-prone half, and it runs with the guard
+        // held. Taking this owner's groups OUT first means an unwind leaves the
+        // owner contributing NOTHING, which the next analysis of it rebuilds —
+        // where leaving them in would keep `merged` folding one document's
+        // superseded diagnostics into every OTHER document's republishes of a
+        // shared module, with nothing to trigger a correction. Same result on
+        // the happy path: the entry is reinserted below.
+        let previous = self.owned.remove(&owner_key);
         // The groups come back addressed (the owner's own URI, each module's
         // minted one); key them, and remember the address each key was seen at.
         let groups: Vec<(Url, Vec<Diagnostic>)> = diagnostic_groups(document, owner)
@@ -95,10 +107,10 @@ impl PublishState {
             .collect();
         self.open_spellings.insert(owner_key.clone(), owner.clone());
         let mut affected: Vec<Url> = groups.iter().map(|(target, _)| target.clone()).collect();
-        if let Some(previous) = self.owned.get(&owner_key) {
+        if let Some(previous) = previous {
             for (target, _) in previous {
-                if !affected.contains(target) {
-                    affected.push(target.clone());
+                if !affected.contains(&target) {
+                    affected.push(target);
                 }
             }
         }
@@ -549,6 +561,54 @@ mod tests {
             .find(|(target, _)| *target == uri)
             .map(|(_, group)| group)
             .unwrap_or_default()
+    }
+
+    /// backlog E97: the server reaches this planner through a POISON-RECOVERING
+    /// lock, because `fenced` catches a per-request panic and a propagated
+    /// poison would wedge every request after it. Pinned at the shape the server
+    /// uses — `Backend::publish_document`'s expression, over a mutex a caught
+    /// panic has already poisoned.
+    #[test]
+    fn a_poisoned_publish_planner_still_plans() {
+        let directory = std::env::temp_dir().join(format!("vilan_poison_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("entry.vl");
+        std::fs::write(&path, "fun main() {\n\tlet wrong: i32 = \"text\";\n}\n")
+            .expect("a writable scratch file");
+        let uri = Url::from_file_path(&path).expect("a file URL");
+        let document = Document::analyze(
+            &std::fs::read_to_string(&path).expect("readable"),
+            &std_root(),
+            &path,
+        );
+
+        let state = std::sync::Mutex::new(PublishState::new());
+        // Poison it exactly as a caught panic does: unwind out of a held guard,
+        // catch, keep running.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().expect("not poisoned yet");
+            panic!("a request panicked inside the fence");
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(outcome.is_err(), "the probe panic must have unwound");
+        assert!(
+            state.is_poisoned(),
+            "the probe poisoned the planner's mutex"
+        );
+
+        let actions = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .plan_publish(&uri, &document);
+        assert!(
+            actions
+                .iter()
+                .any(|(target, group)| *target == uri && !group.is_empty()),
+            "the next request plans its diagnostics through the recovered guard: {actions:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The BLACKOUT (`editing-dx.md` §2, the survey's headline finding), pinned at

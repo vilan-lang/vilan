@@ -6,16 +6,25 @@
 // build time. `+` combines named styles (right side wins per property).
 //
 // Slot keys encode conditions as `media:condition:property`, where a CONDITION
-// is up to three optional tokens, space-joined outside-in: the dark marker
-// ("dark", the one ancestor form — the space under it mirroring the
-// descendant combinator the selector renders), a self-targeting attribute
-// selector (`[data-open="true"]`, always the bracketed token), and a
-// pseudo-class ("hover", always last). So "" (base), "hover", "dark",
-// "dark hover", `[data-open="true"] hover` and the full
-// `dark [data-open="true"] hover` are all conditions. Conditions nest
-// OUTSIDE-IN in the order the CSS nests them,
-// `md(dark(attribute(.., hover(..))))`; any other order is
-// refused with a message naming the fix. Class names are
+// is up to three optional tokens, space-joined outside-in: a RELATION token
+// (whose element does this slot dress? — the ancestor guard
+// `^[data-theme="dark"]`, the children combinator `>*`, or the divide
+// combinator `>*+*`; the `^`/`>` first byte is what keeps it distinct from
+// the attribute token), a self-targeting attribute selector
+// (`[data-open="true"]`, always the bracketed token), and a pseudo-class
+// ("hover", always last). So "" (base), "hover", `^[data-theme="dark"]`,
+// `^[data-theme="dark"] hover`, `[data-open="true"] hover`, `>*` and the full
+// `^[data-theme="dark"] [data-open="true"] hover` are all conditions.
+// Conditions nest OUTSIDE-IN in the order the CSS nests them,
+// `md(within(.., attribute(.., hover(..))))`; any other order is
+// refused with a message naming the fix, one relation per slot, and the
+// child-side relations (`children`, `divide`) take an unconditioned inner.
+// Child-side rules emit inside `@layer vilan` (ui-styling.md §0bis.6): a
+// child's own Style always wins against a rule reaching in from an ancestor,
+// because unlayered styles beat layered ones whatever their specificity —
+// while the ancestor guard stays UNLAYERED and wins against its own
+// element's base rule on specificity, exactly as the deleted `dark()` did.
+// Class names are
 // content hashes of `key|declaration` (deterministic across builds — the
 // channel dedups identical rules program-wide, which is what makes the
 // stylesheet plateau). Themeable tokens carry their value as a CSS custom
@@ -43,41 +52,41 @@ import pkg::range::Range;
 /// A CSS length: a token's IDENTITY (`var(--space-4)`) or a literal unit.
 /// `root` carries the token's `:root` declaration ("" when none).
 struct Length {
-	css: str,
+	text: str,
 	root: str,
 }
 
 impl Length {
 	fun px(value: f64): Length {
-		Length { css = i"{value}px", root = "" }
+		Length { text = i"{value}px", root = "" }
 	}
 
 	fun rem(value: f64): Length {
-		Length { css = i"{value}rem", root = "" }
+		Length { text = i"{value}rem", root = "" }
 	}
 
 	/// Relative to the element's own font size — the unit `letter_spacing`
 	/// and optical spacing are written in.
 	fun em(value: f64): Length {
-		Length { css = i"{value}em", root = "" }
+		Length { text = i"{value}em", root = "" }
 	}
 
 	fun pct(value: f64): Length {
-		Length { css = i"{value}%", root = "" }
+		Length { text = i"{value}%", root = "" }
 	}
 
 	/// Viewport units. `min_height(Length::vh(100.0))` is the full-height
 	/// shell.
 	fun vh(value: f64): Length {
-		Length { css = i"{value}vh", root = "" }
+		Length { text = i"{value}vh", root = "" }
 	}
 
 	fun vw(value: f64): Length {
-		Length { css = i"{value}vw", root = "" }
+		Length { text = i"{value}vw", root = "" }
 	}
 
 	fun auto(): Length {
-		Length { css = "auto", root = "" }
+		Length { text = "auto", root = "" }
 	}
 
 	/// Bare `0` — the unit-less zero CSS accepts for any length, and what the
@@ -85,7 +94,7 @@ impl Length {
 	/// written as. `space(0)` renders `var(--space-0)` and `Length::px(0.0)`
 	/// renders `0px`; all three compute the same, and this one is the spelling.
 	fun zero(): Length {
-		Length { css = "0", root = "" }
+		Length { text = "0", root = "" }
 	}
 
 	/// A `calc()` expression, written WITHOUT the wrapper:
@@ -94,30 +103,30 @@ impl Length {
 	/// model — rides a string. Composes with tokens through their rendered
 	/// form, e.g. `Length::calc("100vh - var(--space-16)")`.
 	///
-	/// Sugar over `css`: `Length::calc(e)` is `Length::css("calc(" + e + ")")`.
+	/// Sugar over `raw`: `Length::calc(e)` is `Length::raw("calc(" + e + ")")`.
 	fun calc(expression: str): Length {
 		check_not_blank("Length::calc", expression);
-		Length { css = i"calc({expression})", root = "" }
+		Length { text = i"calc({expression})", root = "" }
 	}
 
 	/// A complete CSS value, verbatim — `Color::hex`'s twin for lengths, and
 	/// the escape for the functional values the representation does not model:
-	/// `Length::css("clamp(120px, 100vw, 1920px)")`, `min()`, `max()`, `env()`,
+	/// `Length::raw("clamp(120px, 100vw, 1920px)")`, `min()`, `max()`, `env()`,
 	/// `fit-content()`. Use `calc` when you are writing ARITHMETIC and want the
 	/// wrapper supplied; use this when the value is already whole, which is also
 	/// what lets one named expression be reused across properties.
 	///
 	/// (`clamp`/`min`/`max` also nest inside `calc()`, so `calc` reaches them
 	/// too — at the cost of a wrapper the author did not write.)
-	fun css(expression: str): Length {
-		check_not_blank("Length::css", expression);
-		Length { css = expression, root = "" }
+	fun raw(expression: str): Length {
+		check_not_blank("Length::raw", expression);
+		Length { text = expression, root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel: pairs with
 	/// `view.style_var(name, signal)` writing the custom property at runtime.
 	fun var(name: str): Length {
-		Length { css = i"var({name})", root = "" }
+		Length { text = i"var({name})", root = "" }
 	}
 }
 
@@ -140,35 +149,35 @@ fun space(step: i32): Length {
 		24 => "6rem",
 		_ => panic(i"unknown spacing step {step} (the scale has 0-6, 8, 10, 12, 16, 20, 24)"),
 	};
-	Length { css = i"var(--space-{step})", root = i":root\{--space-{step}:{value}\}" }
+	Length { text = i"var(--space-{step})", root = i":root\{--space-{step}:{value}\}" }
 }
 
 /// A CSS color: a ramp token's identity (`var(--gray-50)`) or a literal.
 struct Color {
-	css: str,
+	text: str,
 	root: str,
 }
 
 fun ramp(name: str, step: i32, value: str): Color {
-	Color { css = i"var(--{name}-{step})", root = i":root\{--{name}-{step}:{value}\}" }
+	Color { text = i"var(--{name}-{step})", root = i":root\{--{name}-{step}:{value}\}" }
 }
 
 impl Color {
 	fun white(): Color {
-		Color { css = "#ffffff", root = "" }
+		Color { text = "#ffffff", root = "" }
 	}
 
 	fun black(): Color {
-		Color { css = "#000000", root = "" }
+		Color { text = "#000000", root = "" }
 	}
 
 	fun transparent(): Color {
-		Color { css = "transparent", root = "" }
+		Color { text = "transparent", root = "" }
 	}
 
 	/// The typed arbitrary-value escape.
 	fun hex(value: str): Color {
-		Color { css = value, root = "" }
+		Color { text = value, root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel for colours — `Length::var`'s
@@ -179,7 +188,7 @@ impl Color {
 	/// `rgb(from var(..) r g b / a)`, so a variable-backed colour
 	/// translucifies exactly like a ramp token.
 	fun var(name: str): Color {
-		Color { css = i"var({name})", root = "" }
+		Color { text = i"var({name})", root = "" }
 	}
 
 	fun gray(step: i32): Color {
@@ -254,7 +263,7 @@ impl Color {
 		check_channel("green", green);
 		check_channel("blue", blue);
 		check_alpha(alpha);
-		Color { css = i"rgba({red}, {green}, {blue}, {alpha})", root = "" }
+		Color { text = i"rgba({red}, {green}, {blue}, {alpha})", root = "" }
 	}
 
 	/// A perceptual literal — OKLCH, Oklab's polar form: `lightness` 0.0-1.0
@@ -268,7 +277,7 @@ impl Color {
 	/// `.alpha()` composes over the result like over any other colour.
 	fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
 		check_oklch(lightness, chroma, hue);
-		Color { css = i"oklch({lightness} {chroma} {hue})", root = "" }
+		Color { text = i"oklch({lightness} {chroma} {hue})", root = "" }
 	}
 
 	/// This color at `alpha` (0.0-1.0). Renders the RELATIVE color form,
@@ -280,7 +289,7 @@ impl Color {
 	/// percentage, and `0.07 * 100.0` is `7.000000000000001`.)
 	fun alpha(self, value: f64): Color {
 		check_alpha(value);
-		Color { css = i"rgb(from {self.css} r g b / {value})", root = self.root }
+		Color { text = i"rgb(from {self.text} r g b / {value})", root = self.root }
 	}
 }
 
@@ -406,7 +415,7 @@ impl Gradient {
 		if color.root != "" {
 			roots.push(color.root);
 		}
-		let rendered = i"{color.css} {percent}%";
+		let rendered = i"{color.text} {percent}%";
 		Gradient {
 			function = self.function,
 			geometry = self.geometry,
@@ -464,7 +473,7 @@ impl str with CssValue {
 /// A length — a token's identity plus the `:root` line that defines it.
 impl Length with CssValue {
 	fun css_text(self): str {
-		self.css
+		self.text
 	}
 
 	fun css_root(self): str {
@@ -475,7 +484,7 @@ impl Length with CssValue {
 /// A color — `Length`'s twin, same token discipline.
 impl Color with CssValue {
 	fun css_text(self): str {
-		self.css
+		self.text
 	}
 
 	fun css_root(self): str {
@@ -681,10 +690,17 @@ fun without_covered(
 	out
 }
 
-/// Whether a condition slot carries the dark marker — `"dark"` alone, or
-/// `"dark hover"` stacked over a pseudo-class.
-fun is_dark(condition: str): bool {
-	condition.split(" ")[0] == "dark"
+/// The condition's RELATION token, if any — always the FIRST token when it is
+/// one: the ancestor guard (`^[data-theme="dark"]`), the children combinator
+/// (`>*`), or the divide combinator (`>*+*`). `""` when the condition opens
+/// with an attribute or pseudo-class token instead.
+fun condition_relation(condition: str): str {
+	let first = condition.split(" ")[0];
+	if first.starts_with("^") || first.starts_with(">") {
+		first
+	} else {
+		""
+	}
 }
 
 /// The condition's attribute token, if any: `[data-open="true"]` from any
@@ -700,13 +716,14 @@ fun condition_attribute(condition: str): str {
 }
 
 /// The condition's pseudo-class, if any — always the LAST token, when that
-/// token is neither the dark marker nor an attribute selector: `"hover"`
-/// from `"hover"`, from `"dark hover"` and from `dark [data-open="true"]
-/// hover`; `""` from `""`, from `"dark"` and from `[data-open="true"]`.
+/// token is neither a relation token nor an attribute selector: `"hover"`
+/// from `"hover"`, from `^[data-theme="dark"] hover` and from the full
+/// three-token stack; `""` from `""`, from `^[data-theme="dark"]`, from
+/// `[data-open="true"]` and from `>*`.
 fun condition_pseudo(condition: str): str {
 	let parts = condition.split(" ");
 	let last = parts[parts.len() - 1];
-	if last == "dark" || last.starts_with("[") {
+	if last.starts_with("^") || last.starts_with(">") || last.starts_with("[") {
 		""
 	} else {
 		last
@@ -714,24 +731,37 @@ fun condition_pseudo(condition: str): str {
 }
 
 /// One atomic rule as CSS text. The four condition axes nest the way CSS
-/// nests them — media outermost, then the dark ancestor selector, then the
-/// attribute suffix on the element itself, then the pseudo-class suffix —
-/// which is exactly the outside-in order the condition combinators require
-/// at the call site.
+/// nests them — media outermost, then the relation (the ancestor guard's
+/// prefix, or the child combinator's suffix), then the attribute suffix on
+/// the element itself, then the pseudo-class suffix — which is exactly the
+/// outside-in order the condition combinators require at the call site.
 ///
 /// The leading byte is load-bearing (B35): `assemble_assets` has no
 /// "base < pseudo < media" comparator, it sorts lines lexically with a numeric
 /// override for `@media` min-widths, and the band order falls out of ASCII
-/// ('.' < ':' < '@'). A dark rule starts with ':' whether or not it also
-/// carries a pseudo-class, so every dark rule lands in one band; composed
-/// rules then win their cascade on SPECIFICITY (0,3,0 over the 0,2,0 of plain
-/// `dark` and plain `:hover`), never on the sort.
+/// ('*' < '.' < ':' < '@' < '['). An ancestor-guarded rule starts with '[',
+/// so every `within` rule lands in one band AFTER the base, pseudo, `:root`
+/// and `@layer` bands and before the media group (which sorts last by its
+/// numeric key, not by '@') — so a `within` rule wins its (0,2,0) tie against
+/// a pseudo rule by source order (the theme beats the state), and composed
+/// rules win their cascade on SPECIFICITY, never on the sort. The full
+/// ledger, tie by tie, is ui-styling.md §0bis.6.
+///
+/// A child-side relation's rule is wrapped in `@layer vilan` — 032's cascade
+/// invariant, "unlayered beats layered whatever the specificity", read as: a
+/// child's own Style always wins against a rule reaching in from an ancestor.
+/// `divide` renders `> :not(:first-child)` rather than `> * + *` — the same
+/// element set, but carrying (0,2,0) — so on a property both relations touch,
+/// divide outranks children by SPECIFICITY instead of tying and falling to
+/// the class-hash line order (§0bis.6's probe caught the owl spelling's
+/// winner flipping with the hash bytes).
 ///
 /// A family SHORTHAND carries one more sort marker, on the same principle
 /// (§0bis.4): its selector is `*.sX` rather than `.sX`. `*` is 0x2A and `.` is
 /// 0x2E, so every shorthand rule sorts ahead of its family's longhands inside
-/// its own band, and the band order simply grows a step to `*` < `.` < `:` <
-/// `@`. The marker is free of side effects: `*.sX` is the same compound
+/// its own band — a condition prefix is byte-identical across a family pair,
+/// so the `*`/`.` byte still decides inside the `[` band and inside the
+/// layer. The marker is free of side effects: `*.sX` is the same compound
 /// selector as `.sX` matching the same elements at the same specificity (the
 /// universal selector contributes nothing), so the condition axis — which is
 /// also specificity — is exactly as it was.
@@ -741,8 +771,11 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 	} else {
 		"*." + class
 	};
-	if is_dark(condition) {
-		selector = ":root[data-theme=\"dark\"] " + selector;
+	let relation = condition_relation(condition);
+	if relation.starts_with("^") {
+		// The ancestor guard: the token minus its `^` marker is the ancestor's
+		// attribute selector, prepended with the descendant combinator.
+		selector = relation.substring(1, relation.len()) + " " + selector;
 	}
 	// The attribute token is already selector syntax, appended to the
 	// element's own compound selector — an attribute-conditioned base rule
@@ -755,7 +788,16 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 	if pseudo != "" {
 		selector = selector + ":" + pseudo;
 	}
+	if relation == ">*" {
+		selector = selector + " > *";
+	}
+	if relation == ">*+*" {
+		selector = selector + " > :not(:first-child)";
+	}
 	mut rule = selector + "{" + declaration + "}";
+	if relation.starts_with(">") {
+		rule = "@layer vilan{" + rule + "}";
+	}
 	if media != "" {
 		rule = "@media (min-width: " + media + "){" + rule + "}";
 	}
@@ -986,7 +1028,7 @@ impl Style {
 		if color.root != "" {
 			emit("css", color.root);
 		}
-		self.rule("", "", property, i"{property}:{width.css} solid {color.css}")
+		self.rule("", "", property, i"{property}:{width.text} solid {color.text}")
 	}
 
 	fun border(self, width: Length, color: Color): Style {
@@ -1158,10 +1200,13 @@ impl Style {
 	// over-approximation, shared with unused styles generally.)
 	//
 	// The four axes nest OUTSIDE-IN in the order the selector nests them:
-	// media, then dark, then the attribute, then the pseudo-class —
-	// `md(dark(attribute(.., hover(..))))`. Every other order is a build
+	// media, then the relation, then the attribute, then the pseudo-class —
+	// `md(within(.., attribute(.., hover(..))))`. Every other order is a build
 	// error naming the fix, so there is exactly one spelling per combination
-	// and one slot key per combination with it.
+	// and one slot key per combination with it. One relation per slot, and
+	// the child-side relations (`children`, `divide`) take an unconditioned
+	// inner in v1: a pseudo or attribute under them would bind to the CHILD's
+	// compound, which is semantics nobody has ruled yet.
 
 	fun hover(self, inner: Style): Style {
 		self.pseudo("hover", inner)
@@ -1187,15 +1232,26 @@ impl Style {
 		self.pseudo("last-child", inner)
 	}
 
-	/// Dark mode: explicit `:root[data-theme="dark"]` control — SSR-friendly,
-	/// since the server can set `data-theme` before a byte of JS runs.
-	/// STACKS OVER A PSEUDO-CLASS, dark on the outside: `dark(hover(..))`
-	/// nests the way the selector does (`:root[data-theme="dark"] .c:hover`),
-	/// the same outside-in rule that makes `md(hover(..))` legal and
-	/// `hover(md(..))` an error. The composed rule's specificity (0,3,0) beats
-	/// both plain `dark` and plain `hover` (0,2,0), so it wins its cascade on
-	/// specificity rather than on emission order.
-	fun dark(self, inner: Style): Style {
+	/// The ancestor guard — `[name="value"] .sX`: the element's own slots,
+	/// conditioned on an ANCESTOR carrying the attribute. The theme condition
+	/// is its motivating instance — `within("data-theme", "dark", ..)` under a
+	/// root the app stamps, and SSR-friendly for the same reason the deleted
+	/// `dark()` was: the server sets the attribute before a byte of JS runs —
+	/// but any ancestor state rides: an n-ary theme id, a density mode, a
+	/// `[data-collapsed]` sidebar. The guard's rule is UNLAYERED and (0,2,0),
+	/// so it beats the element's own base rule (0,1,0) exactly when the
+	/// ancestor matches; ties against a pseudo rule resolve to the guard by
+	/// the sheet's band order (the theme beats the state — ui-styling.md
+	/// §0bis.6's ledger).
+	///
+	/// Takes dark's grammar seat: an attribute and a pseudo-class nest INSIDE
+	/// (`within(.., attribute(.., hover(..)))` — the composed rule outranks
+	/// its parts on specificity), media nests outside, and no relation wraps
+	/// a relation. Name and value are fenced at const time like `attribute`'s
+	/// — one token, no quotes, spaces or `:`.
+	fun within(self, name: str, value: str, inner: Style): Style {
+		check_attribute_name(name);
+		check_attribute_value(value);
 		mut out = self;
 		for key in inner.rules.keys() {
 			match inner.rules.get(key) {
@@ -1203,15 +1259,16 @@ impl Style {
 					let (_class, declaration) = entry;
 					let parts = key.split(":");
 					if parts[0] != "" {
-						panic("nest conditions as md(dark(..)) — dark cannot wrap a media-conditioned style");
+						panic("nest conditions as md(within(..)) — within cannot wrap a media-conditioned style");
 					}
-					if is_dark(parts[1]) {
-						panic("dark cannot wrap an already dark-conditioned style");
+					if condition_relation(parts[1]) != "" {
+						panic("within cannot wrap an already relation-conditioned style — one within, children or divide per slot");
 					}
+					let token = i"^[{name}=\"{value}\"]";
 					let condition = if parts[1] == "" {
-						"dark"
+						token
 					} else {
-						"dark " + parts[1]
+						token + " " + parts[1]
 					};
 					out = out.rule("", condition, parts[2], declaration);
 				}
@@ -1221,16 +1278,64 @@ impl Style {
 		out
 	}
 
+	/// Styles every direct CHILD of the element — `.sX > *`, the parent-owned
+	/// spacing idiom (Tailwind's `space-*` family). The rule emits inside
+	/// `@layer vilan`, and that is the whole cascade story: a child's own
+	/// `Style` always wins against a rule reaching in from an ancestor,
+	/// because unlayered styles beat layered ones whatever their specificity.
+	/// The symmetric cost is real: a children rule cannot override ANY
+	/// unlayered declaration, so this is a default the child may refuse, not
+	/// an escape hatch.
+	fun children(self, inner: Style): Style {
+		self.child_relation(">*", "children", inner)
+	}
+
+	/// Styles every direct child BUT THE FIRST — the between-children slot
+	/// (Tailwind's `divide-*`), rendered `> :not(:first-child)` rather than
+	/// `> * + *`: the same element set, but carrying the argument's (0,1,0)
+	/// so the whole selector is (0,2,0) — on a property `children` also
+	/// touches, divide outranks it by SPECIFICITY, whatever the authoring
+	/// order, instead of tying and falling to the class-hash line order
+	/// (§0bis.6). Layered like `children`, with the same standing.
+	fun divide(self, inner: Style): Style {
+		self.child_relation(">*+*", "divide", inner)
+	}
+
+	/// The two child-side relations' shared chokepoint. Their inner style is
+	/// UNCONDITIONED in v1 — a pseudo or attribute under a child combinator
+	/// would bind to the child's compound (`.sX > *:hover`), semantics no
+	/// ruling has settled — and media wraps from outside as ever.
+	fun child_relation(self, token: str, name: str, inner: Style): Style {
+		mut out = self;
+		for key in inner.rules.keys() {
+			match inner.rules.get(key) {
+				Some(let entry) => {
+					let (_class, declaration) = entry;
+					let parts = key.split(":");
+					if parts[0] != "" {
+						panic(i"nest conditions as md({name}(..)) — {name} cannot wrap a media-conditioned style");
+					}
+					if parts[1] != "" {
+						panic(i"{name} takes an unconditioned style — a hover, attribute or within condition belongs on the child's own style");
+					}
+					out = out.rule("", token, parts[2], declaration);
+				}
+				None => {}
+			}
+		}
+		out
+	}
+
 	/// An attribute condition on the element ITSELF — `.sX[data-open="true"]`
-	/// — where `dark`'s hardcoded ancestor is the one ancestor form. The
-	/// general spelling of state carried in markup: `data-state`, `data-open`,
-	/// `aria-expanded` — any attribute rides, `aria-*` included, and the value
-	/// matches exactly (CSS `[name="value"]`). Its own slot in the condition
-	/// axis, between dark and the pseudo-class —
-	/// `md(dark(attribute(.., hover(..))))` — so a dark theme composes with an
-	/// element's state; every other order is refused naming the fix, and one
-	/// attribute per slot, like one dark and one pseudo-class. The composed
-	/// rule outranks its parts on SPECIFICITY, the dark×pseudo rule again:
+	/// — where `within` is the ancestor form. The general spelling of state
+	/// carried in markup: `data-state`, `data-open`, `aria-expanded` — any
+	/// attribute rides, `aria-*` included, and the value matches exactly
+	/// (CSS `[name="value"]`). Its own slot in the condition axis, between
+	/// the relation and the pseudo-class —
+	/// `md(within(.., attribute(.., hover(..))))` — so a theme guard composes
+	/// with an element's state; every other order is refused naming the fix,
+	/// and one attribute per slot, like one relation and one pseudo-class.
+	/// The composed rule outranks its parts on SPECIFICITY:
 	/// `.sX[..]:hover` is (0,3,0) over both (0,2,0) components.
 	///
 	/// The app owns SETTING the attribute on the element; the style only
@@ -1250,8 +1355,8 @@ impl Style {
 					if parts[0] != "" {
 						panic("nest conditions as md(attribute(..)) — attribute cannot wrap a media-conditioned style");
 					}
-					if is_dark(parts[1]) {
-						panic("nest dark OUTSIDE the attribute — dark(attribute(..)), not attribute(dark(..))");
+					if condition_relation(parts[1]) != "" {
+						panic("nest the relation OUTSIDE the attribute — within(.., attribute(..)), not attribute(within(..))");
 					}
 					if condition_attribute(parts[1]) != "" {
 						panic("attribute cannot wrap an already attribute-conditioned style");
@@ -1272,13 +1377,9 @@ impl Style {
 
 	/// An arbitrary pseudo-class — `.pseudo("focus-visible", ..)`; the named
 	/// methods above are the common set. A pseudo-class takes the INNERMOST
-	/// position: `dark`, an attribute and a breakpoint may wrap it, and it may
-	/// wrap none of them (nor another pseudo-class). `pseudo("dark", ..)` is
-	/// `dark(..)`.
+	/// position: a relation, an attribute and a breakpoint may wrap it, and it
+	/// may wrap none of them (nor another pseudo-class).
 	fun pseudo(self, name: str, inner: Style): Style {
-		if name == "dark" {
-			ret self.dark(inner);
-		}
 		mut out = self;
 		for key in inner.rules.keys() {
 			match inner.rules.get(key) {
@@ -1288,8 +1389,8 @@ impl Style {
 					if parts[0] != "" {
 						panic(i"nest conditions as md(hover(..)) — {name} cannot wrap a media-conditioned style");
 					}
-					if is_dark(parts[1]) {
-						panic(i"nest dark OUTSIDE the pseudo — dark({name}(..)), not {name}(dark(..))");
+					if condition_relation(parts[1]) != "" {
+						panic(i"nest the relation OUTSIDE the pseudo — within(.., {name}(..)), not {name}(within(..))");
 					}
 					if condition_attribute(parts[1]) != "" {
 						panic(i"nest the attribute OUTSIDE the pseudo — attribute(.., {name}(..)), not {name}(attribute(..))");
@@ -1307,8 +1408,9 @@ impl Style {
 
 	/// Breakpoints (Tailwind's): min-width media queries. Media is the
 	/// OUTERMOST condition — it may wrap a pseudo-conditioned style
-	/// (`md(hover(..))`), a dark one (`md(dark(..))`) or both
-	/// (`md(dark(hover(..)))`), and never another media.
+	/// (`md(hover(..))`), a relation-conditioned one (`md(within(..))`,
+	/// `md(children(..))`) or a full stack (`md(within(.., hover(..)))`),
+	/// and never another media.
 	fun sm(self, inner: Style): Style {
 		self.media("640px", inner)
 	}
@@ -1500,6 +1602,158 @@ fun declare(selector: str, body: Declarations) {
 		emit("css", root);
 	}
 	emit("css", "@layer vilan{" + selector + "{" + body.text + "}}");
+}
+
+/// A base stylesheet — the opinionated reset (kolt.local 008) an app opts
+/// into with one `const preflight()` and opts out of by deleting the line.
+///
+/// **What it is.** Tailwind's preflight scope, adapted: `box-sizing:
+/// border-box` everywhere, the UA's margins zeroed, its form-control chrome
+/// stripped so a button inherits the page's font and colour instead of the
+/// platform's, replaced elements laid out as blocks that cannot overflow their
+/// container, list markers and heading sizes removed, and the ruling's own
+/// addition — **`a`, `button` and `select` are `display: block`**. That last
+/// one is the most visible: an anchor in running prose becomes a block, so a
+/// page that wants inline links styles them back. It is a deliberate,
+/// opinionated default, not a normalization.
+///
+/// **Why it is opt-in.** A reset baked into every build would be a breaking
+/// change for anyone styling against UA defaults, and there is no way to
+/// unsend one. So it is a std style asset the app EMITS, like `declare` — the
+/// only door into the stylesheet is a `const` expression, and a build that
+/// never calls this emits a byte-identical sheet. It deliberately is NOT a
+/// `Document::of` option: `Document` reads a build's manifest and writes one
+/// `<link>`, it has no channel into the sheet at all, and a browser-only
+/// project — the one that most wants a reset — has no server leg to call it
+/// from.
+///
+/// **Ordering, which is the whole design.** Every rule here goes in
+/// `@layer vilan.preflight`, a SUB-layer of the layer `declare` and the
+/// child-side relations use. That settles precedence by the cascade rather
+/// than by where a line lands in the sheet's sort, twice over and in the same
+/// direction each time:
+///
+/// - unlayered beats layered, so **every `Style` wins against every reset
+///   rule**, whatever either one's specificity — the same guarantee `declare`
+///   already gives, unchanged;
+/// - a layer's own rules beat its sub-layers', so **every `declare` block wins
+///   against every reset rule** too, and an app that resets `button` further
+///   does not have to out-specify std to do it.
+///
+/// The reset is therefore the weakest author-origin thing in the sheet, which
+/// is exactly what a reset should be — and it is still stronger than every UA
+/// default, because layers order AUTHOR declarations and the UA origin loses
+/// to all of them. Nothing above depends on the sheet's byte order, which
+/// matters because that order is a lexical sort with no notion of a reset
+/// (`const-eval.md` §3).
+///
+/// ```vilan,fragment
+/// let _reset = const preflight();
+/// // @layer vilan.preflight{*,::before,::after{box-sizing:border-box}}
+/// // …and one line per rule below, deduped and sorted with everything else
+/// ```
+fun preflight() {
+	// Structure. The universal box model is the one rule the whole system
+	// leans on: `width(px(200)).padding(space(4))` measures 200 under it and
+	// 232 without.
+	preflight_rule("*,::before,::after", declarations().raw("box-sizing", "border-box"));
+	preflight_rule("html", declarations()
+		.raw("line-height", "1.5")
+		.raw("-webkit-text-size-adjust", "100%")
+		.raw("tab-size", "4"));
+	preflight_rule("body", declarations().raw("margin", "0").raw("line-height", "inherit"));
+
+	// The UA's margins, gone — the block elements that carry one by default.
+	preflight_rule("blockquote,dl,dd,h1,h2,h3,h4,h5,h6,hr,figure,p,pre", declarations().raw("margin", "0"));
+	preflight_rule("fieldset", declarations().raw("margin", "0").raw("padding", "0"));
+	preflight_rule("legend", declarations().raw("padding", "0"));
+	preflight_rule("dialog", declarations().raw("padding", "0"));
+	preflight_rule("ol,ul,menu", declarations()
+		.raw("list-style", "none")
+		.raw("margin", "0")
+		.raw("padding", "0"));
+
+	// Typography: headings and small print stop having sizes of their own, so
+	// a type scale is the app's to state.
+	preflight_rule("h1,h2,h3,h4,h5,h6", declarations()
+		.raw("font-size", "inherit")
+		.raw("font-weight", "inherit"));
+	preflight_rule("b,strong", declarations().raw("font-weight", "bolder"));
+	preflight_rule("small", declarations().raw("font-size", "80%"));
+	preflight_rule("code,kbd,samp,pre", declarations()
+		.raw("font-family", "ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace")
+		.raw("font-size", "1em"));
+	preflight_rule("a", declarations().raw("color", "inherit").raw("text-decoration", "inherit"));
+	preflight_rule("table", declarations()
+		.raw("text-indent", "0")
+		.raw("border-color", "inherit")
+		.raw("border-collapse", "collapse"));
+	preflight_rule("hr", declarations()
+		.raw("height", "0")
+		.raw("color", "inherit")
+		.raw("border-top-width", "1px"));
+
+	// Form controls: the platform's chrome off, the page's typography on.
+	preflight_rule("button,input,optgroup,select,textarea", declarations()
+		.raw("font-family", "inherit")
+		.raw("font-size", "100%")
+		.raw("font-weight", "inherit")
+		.raw("line-height", "inherit")
+		.raw("color", "inherit")
+		.raw("margin", "0")
+		.raw("padding", "0")
+		.raw("border", "0")
+		.raw("background-color", "transparent"));
+	preflight_rule("button,select", declarations().raw("text-transform", "none"));
+	preflight_rule("button,[type=\"button\"],[type=\"reset\"],[type=\"submit\"]", declarations()
+		.raw("-webkit-appearance", "button")
+		.raw("background-image", "none"));
+	preflight_rule("[type=\"search\"]", declarations()
+		.raw("-webkit-appearance", "textfield")
+		.raw("outline-offset", "-2px"));
+	preflight_rule("::-webkit-search-decoration", declarations().raw("-webkit-appearance", "none"));
+	preflight_rule("::-webkit-file-upload-button", declarations()
+		.raw("-webkit-appearance", "button")
+		.raw("font", "inherit"));
+	preflight_rule("textarea", declarations().raw("resize", "vertical"));
+	preflight_rule("input::placeholder,textarea::placeholder", declarations()
+		.raw("opacity", "1")
+		.raw("color", "#9ca3af"));
+	preflight_rule("button,[role=\"button\"]", declarations().raw("cursor", "pointer"));
+	preflight_rule("progress", declarations().raw("vertical-align", "baseline"));
+	preflight_rule("summary", declarations().raw("display", "list-item"));
+
+	// Replaced elements lay out as blocks and cannot overflow their container.
+	preflight_rule("img,svg,video,canvas,audio,iframe,embed,object", declarations()
+		.raw("display", "block")
+		.raw("vertical-align", "middle"));
+	preflight_rule("img,video", declarations().raw("max-width", "100%").raw("height", "auto"));
+
+	// The ruling's own addition, stated on its own line so it reads as the
+	// decision it is: an anchor, a button and a select are BLOCKS here, where
+	// every reset this one is adapted from leaves them inline.
+	preflight_rule("a,button,select", declarations().raw("display", "block"));
+
+	// `[hidden]` last in reading order and strongest in the cascade — (0,1,0)
+	// against the element selectors above, so hiding still wins.
+	preflight_rule("[hidden]", declarations().raw("display", "none"));
+}
+
+/// One [`preflight`] rule, in the reset's own sub-layer. Internal to this
+/// module by the same convention `render_rule` and `check_selector` keep — the
+/// language has no privacy modifier here, so what makes it internal is that it
+/// is absent from the reference surface: `@layer vilan.preflight` is std's
+/// floor, not a third place an app puts declarations. `declare` is the app's
+/// door, and it deliberately lands one layer ABOVE this one.
+fun preflight_rule(selector: str, body: Declarations) {
+	check_selector(selector);
+	// Tokens spent in a rule declare themselves beside it, exactly as
+	// `declare` does. Nothing in the reset above spends one today; the loop
+	// is here so a later rule that does cannot leave a dangling `var()`.
+	for root in body.roots {
+		emit("css", root);
+	}
+	emit("css", "@layer vilan.preflight{" + selector + "{" + body.text + "}}");
 }
 
 /// What a declaration block's SELECTOR must avoid, in the const-time-refusal

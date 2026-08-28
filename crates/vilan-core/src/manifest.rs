@@ -209,6 +209,32 @@ pub enum Dependency {
         /// enclosing workspace root's `[project.dependencies]`. Opt-in, per
         /// member, per dependency — never automatic (see [`enclosing_project`]).
         project: Option<bool>,
+        /// `build-hooks = true` — **tier 2's opt-in** (`build-trust.md` §3,
+        /// specified by `build-hooks.md` §8's S2 under the owner's Q6 ruling
+        /// of 2026-08-28: tier 2's threshold is the git dependency, i.e. now).
+        ///
+        /// It grants this one dependency permission to run *its* `[build]`
+        /// hooks with your privileges. It satisfies §3's three properties by
+        /// construction: it is **per dependency** (there is no project-wide
+        /// spelling), it is **recorded in the manifest** (a word on the line a
+        /// reviewer already reads when a dependency changes, which a revert
+        /// undoes), and **absent means no**.
+        ///
+        /// It lives on the dependency's own declaration rather than in a
+        /// grant table of its own for two reasons that are properties, not
+        /// taste: you cannot grant what you do not declare, so no grant can
+        /// name a package that is not there; and removing the dependency
+        /// removes the grant, so a grant can never outlive its subject.
+        ///
+        /// **Nothing honors it yet, deliberately.** Every dependency hook is
+        /// refused in this slice, opted in or not; the point of shipping the
+        /// key now is that the syntax is fixed and reviewable *before*
+        /// anything can cross it, and a registry inherits a spelling that
+        /// already exists rather than minting one under pressure
+        /// (`build-hooks.md` §4.2). `false` is accepted and means exactly what
+        /// absence means — a considered "no" is worth being able to write down.
+        #[serde(rename = "build-hooks")]
+        build_hooks: Option<bool>,
     },
 }
 
@@ -239,7 +265,11 @@ pub enum DependencySource<'declaration> {
     /// free to run code from anyway — it buys nothing and, worse, advertises a
     /// containment property the trust model explicitly declines to offer.
     /// Tier 1 is trusted; the tier that is not is dependency-authored build
-    /// code (§3), whose enforcement point is the registry (D5), not this path.
+    /// code (§3), whose enforcement point is ~~the registry (D5)~~ **the
+    /// `build-hooks` key on this declaration's own table** — the threshold
+    /// moved to the git dependency, i.e. now, on the owner's Q6 ruling of
+    /// 2026-08-28 (`build-hooks.md` §4.2). Still not this path: a grant is a
+    /// word the declaring manifest writes, not a shape the directory has.
     Path(&'declaration Path),
     /// One immutable point of one repository, materialized into the git cache
     /// and then treated exactly like a path dependency.
@@ -263,6 +293,19 @@ impl Dependency {
         }
     }
 
+    /// Whether this declaration carries tier 2's opt-in (`build-hooks = true`).
+    /// Absent — and a bare version string, which has nowhere to write it — is
+    /// no (`build-trust.md` §3).
+    pub fn grants_build_hooks(&self) -> bool {
+        matches!(
+            self,
+            Dependency::Detailed {
+                build_hooks: Some(true),
+                ..
+            }
+        )
+    }
+
     /// What this dependency resolves against, or the reason its declaration is
     /// not a dependency at all. One place decides, so `validate` and
     /// `resolve_dependency_edges` can never disagree about a manifest.
@@ -279,6 +322,7 @@ impl Dependency {
             rev,
             branch,
             project,
+            build_hooks,
         } = self
         else {
             // A bare version string.
@@ -304,6 +348,13 @@ impl Dependency {
                 ("tag", tag.is_some()),
                 ("rev", rev.is_some()),
                 ("branch", branch.is_some()),
+                // Trust travels with the declaration, like everything else an
+                // inherited dependency takes wholesale: the grant belongs in
+                // the `[project.dependencies]` line that says where the
+                // dependency comes from, so one review sees both facts about
+                // it at once (`build-trust.md` §3's "recorded in the
+                // manifest").
+                ("build-hooks", build_hooks.is_some()),
             ] {
                 if present {
                     return Err(format!(
@@ -399,33 +450,89 @@ impl Dependency {
     }
 }
 
-/// The `[build] run` hooks (A9): external commands run before each build. One
-/// command may be written bare (`run = "npx tailwindcss …"`); several go in a
-/// list, and run in declaration order.
+/// One value or a list of them — the manifest's "write one bare, or several in
+/// a list" shape. `[build] run` (A9) spells its commands this way, and
+/// `[[build.hook]]`'s `run` / `inputs` / `outputs` reuse it so the three keys
+/// share one vocabulary rather than each inventing its own
+/// (`build-hooks.md` §2.3).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-pub enum RunHooks {
+pub enum StringList {
     One(String),
     Many(Vec<String>),
 }
 
-impl RunHooks {
-    /// The declared commands, in order.
-    pub fn commands(&self) -> &[String] {
+impl StringList {
+    /// The declared values, in order.
+    pub fn values(&self) -> &[String] {
         match self {
-            RunHooks::One(command) => std::slice::from_ref(command),
-            RunHooks::Many(commands) => commands,
+            StringList::One(value) => std::slice::from_ref(value),
+            StringList::Many(values) => values,
         }
+    }
+}
+
+/// A named `[[build.hook]]` — the table form of a build hook
+/// (`build-hooks.md` §2.3), which exists so a hook has somewhere to hang the
+/// facts the staleness predicate needs. `run = [...]` keeps working exactly as
+/// it did and stays the "every build" default; a hook here that declares
+/// `inputs` and/or `outputs` is *skipped* while none of them has moved (§3.1).
+///
+/// `name` is required, because it is what every message and every stamp entry
+/// keys on: a hook the build reports on has to be nameable by the reader.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookDeclaration {
+    /// The hook's name — required, unique within the manifest.
+    pub name: Option<String>,
+    /// The command(s) this hook runs, in order.
+    pub run: Option<StringList>,
+    /// The files (or directories) the hook READS. A declared input that is
+    /// missing is recorded as missing, so its *appearance* invalidates (§3.1).
+    pub inputs: Option<StringList>,
+    /// The files (or directories) the hook WRITES. A missing or hand-edited
+    /// output re-runs the hook.
+    pub outputs: Option<StringList>,
+}
+
+impl HookDeclaration {
+    /// The hook's command(s), in declaration order. Empty when `run` is absent
+    /// (which [`Manifest::validate`] refuses).
+    pub fn commands(&self) -> &[String] {
+        self.run
+            .as_ref()
+            .map(StringList::values)
+            .unwrap_or_default()
+    }
+
+    /// The declared inputs, in declaration order.
+    pub fn inputs(&self) -> &[String] {
+        self.inputs
+            .as_ref()
+            .map(StringList::values)
+            .unwrap_or_default()
+    }
+
+    /// The declared outputs, in declaration order.
+    pub fn outputs(&self) -> &[String] {
+        self.outputs
+            .as_ref()
+            .map(StringList::values)
+            .unwrap_or_default()
     }
 }
 
 /// The `[build]` section: the code-generation knobs, deserialized before
 /// resolving against a preset (see [`Manifest::build_options`]), plus the `run`
-/// hooks.
+/// hooks and the named `[[build.hook]]` tables beside them.
 #[derive(Debug, Default, Deserialize)]
 pub struct Build {
     /// Commands to run before each build (A9). See [`Manifest::build_hooks`].
-    pub run: Option<RunHooks>,
+    pub run: Option<StringList>,
+    /// `[[build.hook]]` — named hooks with declared inputs and outputs, which
+    /// is what makes them skippable (`build-hooks.md` §3). They run *after*
+    /// every `run = [...]` command, in declaration order.
+    #[serde(rename = "hook", default)]
+    pub hooks: Vec<HookDeclaration>,
     pub preset: Option<String>,
     pub indent: Option<bool>,
     pub spaces: Option<bool>,
@@ -586,6 +693,7 @@ impl Manifest {
                         .to_string(),
                 );
             }
+            validate_declared_hooks(&build.hooks, &mut errors);
         }
         errors
     }
@@ -752,13 +860,37 @@ impl Manifest {
     }
 
     /// The `[build] run` hooks (A9), in declaration order — the commands to run
-    /// before each build. Empty when none are declared.
+    /// before *every* build. Empty when none are declared.
+    ///
+    /// These are the undeclared hooks: they name no inputs and no outputs, so
+    /// they can never be fresh and the staleness predicate never skips them
+    /// (`build-hooks.md` §3.1). That is what keeps the change backward
+    /// compatible to the byte — a manifest that only writes `run = [...]`
+    /// behaves exactly as it did before `[[build.hook]]` existed.
     pub fn build_hooks(&self) -> &[String] {
         self.build
             .as_ref()
             .and_then(|build| build.run.as_ref())
-            .map(RunHooks::commands)
+            .map(StringList::values)
             .unwrap_or_default()
+    }
+
+    /// The named `[[build.hook]]` declarations, in declaration order — the
+    /// hooks the staleness predicate may skip (`build-hooks.md` §3). They run
+    /// after every [`Manifest::build_hooks`] command, as §2.3 spells it.
+    pub fn declared_hooks(&self) -> &[HookDeclaration] {
+        self.build
+            .as_ref()
+            .map(|build| build.hooks.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Whether this manifest asks for **any** build-time command execution —
+    /// the question tier 2 asks of a *dependency's* manifest
+    /// (`build-trust.md` §3, `build-hooks.md` §4.3). Nothing here decides
+    /// whether it runs; it only decides whether there is something to say.
+    pub fn declares_build_hooks(&self) -> bool {
+        !self.build_hooks().is_empty() || !self.declared_hooks().is_empty()
     }
 
     /// Resolves the `[build]` options: a `preset` (default `debug`) initializes
@@ -814,6 +946,88 @@ fn validate_dependencies(
                  local `path` or a `git` repository today)"
             )),
             Err(problem) => errors.push(format!("dependency `{name}` {problem}")),
+        }
+    }
+}
+
+/// The characters a declared `inputs` / `outputs` entry may not contain, and
+/// the reason: they are the shell-glob metacharacters, and this design
+/// deliberately does **not** match globs (`build-hooks.md` §3.1 digests
+/// *declared* paths). Left unchecked, `inputs = ["src/**/*.css"]` would be
+/// digested as one path that is simply never there — recorded as missing,
+/// matching "missing" forever, and so silently freezing the hook after its
+/// first run. Refusing it is the difference between a loud manifest error and
+/// a hook that quietly stops running.
+const GLOB_METACHARACTERS: [char; 3] = ['*', '?', '['];
+
+/// Checks the `[[build.hook]]` tables (`build-hooks.md` §2.3): every hook is
+/// named, uniquely, and carries at least one command, and every declared path
+/// is a plain path. Reported as errors rather than ignored, because each of
+/// these mistakes produces a hook that looks declared and does nothing.
+fn validate_declared_hooks(hooks: &[HookDeclaration], errors: &mut Vec<String>) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (position, hook) in hooks.iter().enumerate() {
+        // Positional, because a hook with no usable name has nothing else to
+        // be addressed by — and the ordinal is exactly how the reader finds
+        // the table in the file.
+        let ordinal = position + 1;
+        let name = match hook.name.as_deref() {
+            Some(name) if !name.trim().is_empty() => name,
+            Some(_) => {
+                errors.push(format!(
+                    "`[[build.hook]]` #{ordinal} has a blank `name`: the name is what the \
+                     build reports on and what its freshness stamp keys on, so give it one \
+                     (`name = \"lucide\"`)"
+                ));
+                continue;
+            }
+            None => {
+                errors.push(format!(
+                    "`[[build.hook]]` #{ordinal} is missing a `name`: the name is what the \
+                     build reports on and what its freshness stamp keys on, so give it one \
+                     (`name = \"lucide\"`)"
+                ));
+                continue;
+            }
+        };
+        if !seen.insert(name) {
+            errors.push(format!(
+                "two `[[build.hook]]` tables are both named `{name}`: the name keys the \
+                 freshness stamp, so it has to pick out one hook"
+            ));
+        }
+        let commands = hook.commands();
+        if commands.is_empty() {
+            errors.push(format!(
+                "`[[build.hook]]` `{name}` declares no `run`: a hook is a command line for \
+                 the platform shell (`run = \"sh scripts/lucide.sh\"`)"
+            ));
+        }
+        if commands.iter().any(|command| command.trim().is_empty()) {
+            errors.push(format!(
+                "`[[build.hook]]` `{name}` has an empty command: each entry is a command \
+                 line for the platform shell (`run = \"sh scripts/lucide.sh\"`)"
+            ));
+        }
+        for (key, paths) in [("inputs", hook.inputs()), ("outputs", hook.outputs())] {
+            for path in paths {
+                if path.trim().is_empty() {
+                    errors.push(format!(
+                        "`[[build.hook]]` `{name}` declares an empty `{key}` entry: each one \
+                         is a file or directory path relative to the manifest"
+                    ));
+                    continue;
+                }
+                if let Some(metacharacter) = path.chars().find(|c| GLOB_METACHARACTERS.contains(c))
+                {
+                    errors.push(format!(
+                        "`[[build.hook]]` `{name}` declares `{key}` entry `{path}`, which \
+                         contains `{metacharacter}`: freshness digests the paths you declare, \
+                         and there is no glob matching — name the directory (`src/static`) or \
+                         the files themselves"
+                    ));
+                }
+            }
         }
     }
 }
@@ -939,6 +1153,45 @@ impl From<String> for WorkspaceError {
 /// build) or read a warm cache only (the editor; see [`GitDeps`]). It is an
 /// explicit parameter precisely so every caller states its policy.
 pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace, WorkspaceError> {
+    resolve_workspace_with_hook_report(package_dir, git).map(|(workspace, _)| workspace)
+}
+
+/// One dependency in the resolved graph whose **own** manifest asks for
+/// build-time command execution — tier 2's subject (`build-trust.md` §3,
+/// `build-hooks.md` §4.3).
+///
+/// It exists because "absent means no" and "the toolchain never looked" are
+/// indistinguishable from the terminal, and today they are literally the same
+/// thing: `Project::hooks` reads the addressed manifest and nothing else, so a
+/// dependency's `[build] run` produces no output, no warning and no note (the
+/// paper's probe P5). Reporting it is the whole of the difference.
+///
+/// Recorded during resolution because resolution is the one pass that already
+/// reads every dependency manifest; deciding it anywhere else would mean a
+/// second walk of the graph and a second answer to "what is a dependency".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyHooks {
+    /// The import name the declaration bound it to — what a message calls it.
+    pub name: String,
+    /// The dependency's own package directory.
+    pub directory: PathBuf,
+    /// Whether the manifest that declared this dependency wrote tier 2's
+    /// opt-in (`build-hooks = true`). Nothing honors it yet: every dependency
+    /// hook is refused in either case (`build-hooks.md` §8's S2).
+    pub opted_in: bool,
+}
+
+/// [`resolve_workspace`], plus the tier-2 report: every dependency in the
+/// resolved graph whose manifest declares build hooks, sorted by directory so
+/// the report is a function of the graph and not of the walk.
+///
+/// Two entry points rather than one so the CLI can ask the question and the
+/// language server — which resolves the same graph on every keystroke and has
+/// no terminal to say anything on — is not made to carry the answer.
+pub fn resolve_workspace_with_hook_report(
+    package_dir: &Path,
+    git: &GitDeps,
+) -> Result<(Workspace, Vec<DependencyHooks>), WorkspaceError> {
     let manifest = load_manifest(package_dir)?;
     let defaults = crate::macros::MacroLimits::default();
     let macro_limits = manifest
@@ -953,15 +1206,22 @@ pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace,
         (Some(package), _) => &package.dependencies,
         (None, Some(library)) => &library.dependencies,
         (None, None) => {
-            return Ok(Workspace {
-                macro_limits,
-                ..Workspace::default()
-            });
+            return Ok((
+                Workspace {
+                    macro_limits,
+                    ..Workspace::default()
+                },
+                Vec::new(),
+            ));
         }
     };
     let mut packages = Vec::new();
     let mut index_by_path = HashMap::new();
     let mut visiting = HashSet::new();
+    // Keyed on the same canonical directory the dedup keys on, so one package
+    // reached through two edges is reported once however many times it is
+    // depended on — §9's "once per build, not once per member".
+    let mut hook_report: BTreeMap<PathBuf, DependencyHooks> = BTreeMap::new();
     // E90 (diagnostics-standard.md C3a): the enclosing workspace root's
     // declared members, resolved once against the ENTRY's directory — the
     // packages the demotion carve-out treats as the user's own code, wherever
@@ -981,12 +1241,16 @@ pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace,
         &mut visiting,
         &members,
         git,
+        &mut hook_report,
     )?;
-    Ok(Workspace {
-        packages,
-        entry_dependencies,
-        macro_limits,
-    })
+    Ok((
+        Workspace {
+            packages,
+            entry_dependencies,
+            macro_limits,
+        },
+        hook_report.into_values().collect(),
+    ))
 }
 
 /// Resolves a `[library]`'s layered [`PackageSpec`] from its package directory `dir`
@@ -1215,6 +1479,10 @@ fn resolve_dependency_edges(
     visiting: &mut HashSet<PathBuf>,
     members: &HashSet<PathBuf>,
     git: &GitDeps,
+    // Tier 2's report, accumulated as the walk reads each dependency manifest
+    // ([`DependencyHooks`]). Keyed on the canonical directory so a package
+    // reached through several edges is one row.
+    hook_report: &mut BTreeMap<PathBuf, DependencyHooks>,
 ) -> Result<Vec<(String, usize)>, WorkspaceError> {
     let mut edges = Vec::new();
     // The enclosing workspace root, read at most once per manifest and only if
@@ -1296,7 +1564,15 @@ fn resolve_dependency_edges(
         // `\\?\` prefix would do the same for a mix of on-disk and not-yet-on-disk
         // directories — duplicating a package, or hiding a cycle.
         let canonical = crate::util::canonical_path(&dependency_dir);
+        // A grant is a property of the DECLARATION, and one package can be
+        // depended on from several manifests — so a second edge that grants
+        // has to reach the row the first edge wrote, or a real opt-in would be
+        // reported as absent.
+        let grants = declaration.grants_build_hooks();
         if let Some(&index) = index_by_path.get(&canonical) {
+            if let Some(recorded) = hook_report.get_mut(&canonical) {
+                recorded.opted_in |= grants;
+            }
             edges.push((import_name.clone(), index));
             continue;
         }
@@ -1311,6 +1587,20 @@ fn resolve_dependency_edges(
                 "dependency `{import_name}`: {error}"
             )))
         })?;
+        // Read here, where the dependency's manifest is already in hand and
+        // before it is taken apart below. Whether it is a `[library]` or a
+        // `[package]` makes no difference: the question is only whether this
+        // dependency asks to run commands on the machine building it.
+        if manifest.declares_build_hooks() {
+            hook_report.insert(
+                canonical.clone(),
+                DependencyHooks {
+                    name: import_name.clone(),
+                    directory: dependency_dir.clone(),
+                    opted_in: grants,
+                },
+            );
+        }
         // A dependency is a `[library]` (layered, contract-checked, with a
         // `lib.vl` surface) — or, since platform coloring, a `[package]` (an
         // app): its `src/` modules import by path, its items color
@@ -1345,6 +1635,7 @@ fn resolve_dependency_edges(
             visiting,
             members,
             git,
+            hook_report,
         )?;
         visiting.remove(&canonical);
         let index = packages.len();
@@ -1448,6 +1739,7 @@ mod tests {
             rev: None,
             branch: None,
             project: None,
+            build_hooks: None,
         }
     }
 
@@ -1531,6 +1823,7 @@ mod tests {
             &mut visiting,
             &HashSet::new(),
             &GitDeps::cache_only(root.join("unused-git-cache")),
+            &mut BTreeMap::new(),
         )
         .expect("both spellings resolve");
         assert_eq!(packages.len(), 1, "one package, not one per spelling");
@@ -3270,6 +3563,227 @@ mod tests {
         let options = manifest.build_options().unwrap();
         assert!(!options.indent); // release
         assert!(options.readable_names); // overridden on
+    }
+
+    // ── `[[build.hook]]`: the table form of a build hook
+    // (`build-hooks.md` §2.3, §9's "Manifest parsing" list) ──
+
+    /// A `[package]` whose `[build]` section is `body`, with its validation
+    /// errors — the shape every hook-parsing pin below reads.
+    fn build_section(body: &str) -> (Manifest, Vec<String>) {
+        let manifest = parse(&format!("[package]\nname = \"app\"\n[build]\n{body}"));
+        let errors = manifest.validate();
+        (manifest, errors)
+    }
+
+    #[test]
+    fn the_hook_table_stands_beside_the_string_and_list_forms_of_run() {
+        // All three spellings in one manifest, because they compose: `run`
+        // keeps meaning "every build" and the table adds the skippable kind.
+        let (manifest, errors) = build_section(
+            "run = [\"echo one\", \"echo two\"]\n\
+             [[build.hook]]\nname = \"lucide\"\nrun = \"sh scripts/lucide.sh\"\n\
+             inputs = [\"scripts/lucide.sh\", \"lucide.lock\"]\noutputs = \"src/icons.vl\"\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(manifest.build_hooks(), ["echo one", "echo two"]);
+        let hooks = manifest.declared_hooks();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].name.as_deref(), Some("lucide"));
+        assert_eq!(hooks[0].commands(), ["sh scripts/lucide.sh"]);
+        assert_eq!(hooks[0].inputs(), ["scripts/lucide.sh", "lucide.lock"]);
+        // A bare string is one entry, exactly as `run` has always read one.
+        assert_eq!(hooks[0].outputs(), ["src/icons.vl"]);
+
+        let (manifest, errors) = build_section("run = \"echo one\"\n");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(manifest.build_hooks(), ["echo one"]);
+        assert!(manifest.declared_hooks().is_empty());
+    }
+
+    #[test]
+    fn a_hook_run_takes_a_bare_string_or_a_list() {
+        let (manifest, errors) =
+            build_section("[[build.hook]]\nname = \"two\"\nrun = [\"echo one\", \"echo two\"]\n");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            manifest.declared_hooks()[0].commands(),
+            ["echo one", "echo two"]
+        );
+    }
+
+    #[test]
+    fn a_hook_with_no_name_is_refused_naming_the_key() {
+        let (_, errors) = build_section("[[build.hook]]\nrun = \"echo hi\"\n");
+        assert!(
+            errors.iter().any(|error| error.contains("missing a `name`")
+                && error.contains("[[build.hook]]")
+                && error.contains("#1")),
+            "{errors:?}"
+        );
+        // A name that is only whitespace is no name either.
+        let (_, errors) = build_section("[[build.hook]]\nname = \"  \"\nrun = \"echo hi\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("blank `name`") && error.contains("#1")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn two_hooks_with_one_name_are_refused() {
+        // The name keys the freshness stamp, so two hooks under one name would
+        // share — and overwrite — one entry.
+        let (_, errors) = build_section(
+            "[[build.hook]]\nname = \"gen\"\nrun = \"echo one\"\n\
+             [[build.hook]]\nname = \"gen\"\nrun = \"echo two\"\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("both named `gen`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_hook_with_no_command_or_an_empty_one_is_refused() {
+        let (_, errors) = build_section("[[build.hook]]\nname = \"gen\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("`gen` declares no `run`")),
+            "{errors:?}"
+        );
+        let (_, errors) =
+            build_section("[[build.hook]]\nname = \"gen\"\nrun = [\"echo\", \"  \"]\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("`gen` has an empty command")),
+            "{errors:?}"
+        );
+        // The pre-existing `[build] run` rule is untouched.
+        let (_, errors) = build_section("run = [\"\"]\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("`[build] run` has an empty command")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_declared_path_carrying_a_glob_is_refused_on_both_keys() {
+        // The loud failure exists because the quiet one is so bad: an
+        // unmatched pattern would digest as a path that is never there, match
+        // "missing" forever, and freeze the hook after its first run.
+        for (key, body) in [
+            ("inputs", "inputs = [\"src/**/*.css\"]"),
+            ("outputs", "outputs = \"out/?.js\""),
+            ("inputs", "inputs = \"src/[abc].vl\""),
+        ] {
+            let (_, errors) = build_section(&format!(
+                "[[build.hook]]\nname = \"gen\"\nrun = \"x\"\n{body}\n"
+            ));
+            assert!(
+                errors.iter().any(|error| error.contains(key)
+                    && error.contains("no glob matching")
+                    && error.contains("`gen`")),
+                "{key}: {errors:?}"
+            );
+        }
+        // A plain path — including a directory — is fine.
+        let (_, errors) =
+            build_section("[[build.hook]]\nname = \"gen\"\nrun = \"x\"\ninputs = \"src/static\"\n");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn an_empty_declared_path_is_refused() {
+        let (_, errors) =
+            build_section("[[build.hook]]\nname = \"gen\"\nrun = \"x\"\noutputs = [\"\"]\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("empty `outputs` entry")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn declares_build_hooks_sees_either_form_and_nothing_else() {
+        // The question tier 2 asks of a DEPENDENCY's manifest: does it ask to
+        // run commands at all?
+        assert!(!parse("[package]\nname = \"app\"\n").declares_build_hooks());
+        assert!(
+            !parse("[package]\nname = \"app\"\n[build]\npreset = \"release\"\n")
+                .declares_build_hooks()
+        );
+        assert!(
+            build_section("run = \"echo hi\"\n")
+                .0
+                .declares_build_hooks()
+        );
+        assert!(
+            build_section("[[build.hook]]\nname = \"g\"\nrun = \"echo hi\"\n")
+                .0
+                .declares_build_hooks()
+        );
+        // A `[library]` can write one too, and that is exactly the case the
+        // note exists for — a dependency is usually a library.
+        assert!(
+            parse("[library]\nname = \"dep\"\n[build]\nrun = \"echo hi\"\n").declares_build_hooks()
+        );
+    }
+
+    // ── tier 2's opt-in: `build-hooks = true` on a dependency
+    // (`build-trust.md` §3, `build-hooks.md` §8's S2) ──
+
+    #[test]
+    fn a_dependency_records_the_build_hooks_grant() {
+        let (manifest, errors) =
+            dependency_declaration("{ path = \"../dep\", build-hooks = true }");
+        assert!(errors.is_empty(), "{errors:?}");
+        let declaration = &manifest.package.as_ref().unwrap().dependencies["shapes"];
+        assert!(declaration.grants_build_hooks());
+        // The grant does not disturb the source: it is a policy key, not a
+        // second way of saying where the package comes from.
+        assert!(matches!(source_of(&manifest), DependencySource::Path(_)));
+    }
+
+    #[test]
+    fn absent_and_false_both_mean_no() {
+        // "Absent means no" is the ruled property; `false` is the same answer
+        // written down on purpose, and refusing it would punish the reader who
+        // documented their decision.
+        for declaration in [
+            "{ path = \"../dep\" }",
+            "{ path = \"../dep\", build-hooks = false }",
+            "\"1.2\"",
+        ] {
+            let (manifest, _) = dependency_declaration(declaration);
+            assert!(
+                !manifest.package.as_ref().unwrap().dependencies["shapes"].grants_build_hooks(),
+                "{declaration} must not grant"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_dependency_cannot_grant_build_hooks_of_its_own() {
+        // `project = true` takes the WHOLE declaration from the workspace
+        // root, and trust is part of the declaration — so the grant belongs in
+        // `[project.dependencies]`, where one review sees the source and the
+        // permission together.
+        let (_, errors) = dependency_declaration("{ project = true, build-hooks = true }");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("`build-hooks`") && error.contains("project = true")),
+            "{errors:?}"
+        );
     }
 
     #[test]

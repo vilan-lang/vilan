@@ -450,7 +450,7 @@ fn edges(program: &Program, graph: &CallGraph, node: Id) -> Vec<(Id, Option<(Spa
 /// like
 ///
 /// ```text
-/// requires the `process` layer of `std` (via `load (server::store) → exists (std::fs)`)
+/// requires the `process` layer of `std` (via `load (server::store) → stat (std::fs)`)
 /// ```
 ///
 /// Unlike [`check`] this is **entry-independent** — a library function nobody
@@ -572,7 +572,7 @@ fn requirement_of<'program>(program: &'program Program, node: Id) -> Option<Requ
 
 /// A frame's display name: bare for user code, `name (lib::module)` for
 /// library code — the chain then reads `main → boot (server::store) →
-/// exists (std::fs)`.
+/// stat (std::fs)`.
 fn frame_label(program: &Program, id: Id) -> String {
     let name = name_of(program, id);
     if is_user_code(program, id) {

@@ -356,8 +356,8 @@ fn recovers_misplaced_resource_and_continues() {
     // parser.rs ~1501: `resource` before anything but `struct`/`enum` steers — it
     // emits a diagnostic and a `Node::Error` placeholder, leaving the offending
     // token unconsumed so `fun`/`impl`/`let`/`trait` parse as themselves. The
-    // MESSAGE is already pinned in inference.rs (`resource_on_a_*_is_rejected`);
-    // this pins the RECOVERY half — the steer placeholder plus the fact that the
+    // MESSAGE is already pinned in the `inference` suite
+    // (`resource_on_a_*_is_rejected`); this pins the RECOVERY half — the steer placeholder plus the fact that the
     // steered item AND every subsequent item still parse.
     for_each_frontend(
         "resource fun foo() {}\nfun after() {}\n",
@@ -511,7 +511,7 @@ mod analyze {
 //   3. A parse error never removes a diagnostic from a region it does not
 //      contain. At the parse level that reads: the statements and items around a
 //      broken one are still in the tree. (The analyze-level half — that their
-//      DIAGNOSTICS survive — is pinned in `vilan-core/tests/inference.rs` and,
+//      DIAGNOSTICS survive — is pinned in `vilan-core/tests/inference/` and,
 //      for the editor, in `vilan-lsp/src/document.rs`.)
 
 /// Each diagnostic of a recovered parse as `(rendered message, the source text it

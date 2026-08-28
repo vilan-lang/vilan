@@ -130,16 +130,110 @@ no edit here: the build says what it emitted and the server believes it.
 An rpc app adds `.with_service(Service::new(protocol))` to the same chain
 — [Services & RPC](services.md#the-server-side) has it whole.
 
+### Caching: ETag and 304
+
+Anything you serve at a **fixed URL** re-downloads on every page load
+until you give the browser a validator. The policy every static layer
+converges on has two tiers, and the *name* decides which one a response
+gets:
+
+- A **fingerprinted name** — one that carries a content hash, so a new
+  build writes a new URL — is free to be cached for a year and never asked
+  about again: `Cache-Control: public, max-age=31536000, immutable`. No
+  validator needed; the name already is one.
+- A **fixed URL** — `/`, a favicon, a page the browser asks for by that
+  exact path — can change under the cache, so it gets a short life or
+  `no-cache`, plus an `ETag`, and a revalidation answers `304 Not
+  Modified` instead of re-sending the bytes.
+
+`std::http` ships the validator tier whole. `etag_of(bytes)` mints a
+strong, quoted tag from the bytes' sha-256 — compute it once, where the
+bytes settle. `etag_response(request, tag, bytes, content_type)` answers
+the request: `304` with the tag echoed and no body when the request's
+`If-None-Match` already names it, the full `200` otherwise. It returns the
+builder still open, so the Cache-Control tier chains after it and reaches
+both arms:
+
+```vilan,norun
+import std::bytes::encode_utf8;
+import std::http::{ Server, etag_of, etag_response };
+
+async fun main() {
+	let page = encode_utf8("<!doctype html><h1>hello</h1>");
+	let tag = etag_of(page);   // once, at boot — the bytes are settled
+
+	Server::builder()
+		.port(8080)
+		.on_request(|request| {
+			// A fixed URL revalidates: no-cache + ETag means every load
+			// asks, and an unchanged page answers 304 with no body.
+			etag_response(request, tag, page, "text/html; charset=utf-8")
+				.set_header("Cache-Control", "no-cache")
+				.build()
+		})
+		.build()
+		.start();
+}
+```
+
+A page you render per request works the same way — hash the rendered
+bytes with `etag_of` before answering, and an unchanged render still
+saves the transfer, just not the render. The matching semantics (the
+list and `*` forms, weak comparison, the GET/HEAD gate) are in the
+[reference](../std/process.md#stdhttp-the-server).
+
+**The same two tiers, for a served build.** The artifacts `serve_build`
+installs get no caching by default — one
+`Content-Type` header and the bytes — because which tier a build's files
+belong in is a deployment's decision and not one std can make for you. Opt
+in with `cache_build`, which asks your policy per artifact, keyed on the
+route:
+
+```vilan,norun
+import std::build::require_build;
+import std::http::{ CachePolicy, Response, Server };
+
+async fun main() {
+	Server::builder()
+		.port(8080)
+		.serve_build(require_build("client"))
+		.cache_build(|url| if url.starts_with("/chunk-") {
+			// Fingerprinted: the name changes when the bytes do.
+			CachePolicy::none().cache_control("public, max-age=31536000, immutable")
+		} else {
+			// Fixed URL: revalidate, and pay a body only when it changed.
+			CachePolicy::validated().cache_control("no-cache")
+		})
+		.on_request(|request| Response::builder().code(404).body("Not Found").build())
+		.build()
+		.start();
+}
+```
+
+That is the same two tiers as above, written once instead of per route:
+`validated()` is the `etag_of` + `etag_response` pair applied to the
+artifact's own bytes, and `cache_control` is the header, reaching the `304`
+arm as well as the `200`. Delete the `cache_build` line and the server is
+byte-for-byte back to no caching — there is no third state, and no default
+moved under you.
+
 ## Files: `std::fs`
 
 ```vilan,fragment
-fun exists(path: str): bool                 // sync — the module's one blocking call
 fun read_file_to_str(path: str): str        // async (implicitly awaited), UTF-8
 fun read_file_encoded(path: str, encoding: str): str   // async — any host encoding
 fun read_bytes(path: str): Bytes            // async — the true binary read
 fun write_file(path: str, contents: str)    // async
 fun read_dir(path: str): List<str>          // async — entry names, flat
 fun stat(path: str): Option<Stat>           // async — None if the path isn't there
+
+resource external struct File               // an open file — the handle tier
+fun with_file<T>(path: str, body: |File| T): T   // open, run, close (awaited)
+
+resource external struct Watcher            // a live watch — the watch tier
+fun Watcher::watch(path: str): Watcher      // the path, and a directory's own entries
+fun Watcher::watch_all(path: str): Watcher  // the whole tree beneath it
+fun Watcher::next(self): Change             // async — the next change
 ```
 
 `read_bytes` reads a file with no decode in between — the host's buffer
@@ -151,8 +245,81 @@ directory's immediate entries by name — flat and unordered, so call `stat`
 per entry when you need file-vs-directory. `stat` reads `size`,
 `modified_at_ms` (epoch millis) and `is_directory`, and is the one read
 here that answers `None` instead of throwing on a missing path: it exists
-for a caller asking "is this here yet". Full signatures:
+for a caller asking "is this here yet" — `stat(path).is_some()` is the
+existence probe (there is no `exists`; everything in this module is
+async, and `stat` answers strictly more).
+
+When one open file needs more than one act — read a header, then seek
+into the middle; write, then `sync` for durability — you open a handle.
+`File::open(path)` (and `create`, `create_new`, `append_to`, `modify`)
+hands back a *resource*: it moves rather than copies, and its destructor
+closes the handle at scope end, so there is no `close()` to forget —
+`drop(file)` closes early. Reads and writes are positional
+(`file.read_at(buffer, position)`, `file.write_at(buffer, position)`),
+`file.stat()` answers with no `Option` (the handle is already open, and
+nothing re-resolves the path between probe and act), and `file.sync()` is
+`fsync`, the durability step `write_atomic` alone cannot give you. The
+documented idiom is the scoped form:
+
+```vilan,norun
+import std::bytes::{ Bytes, decode_utf8 };
+import std::fs::with_file;
+
+fun main() {
+	let head = with_file("data.bin", |file| {
+		let buffer = Bytes::alloc(16);
+		file.read_at(buffer, 0);
+		decode_utf8(buffer.slice(0, 16))
+	});
+}
+main();
+```
+
+`with_file` opens the file, hands it to your closure as a per-call
+parameter, and closes it before returning — with the close *awaited*, so
+a failure to close is a failure of `with_file`; a `File` you hold
+yourself closes through its destructor instead, which starts the close
+without waiting on it. Full signatures:
 [the process reference](../std/process.md#stdfs).
+
+When you want to know that a file changed rather than to read it once,
+you open a *watch*. `Watcher::watch(path)` observes a path (and a
+directory's immediate entries); `Watcher::watch_all(path)` observes the
+whole tree under it. You pull changes out one at a time:
+
+```vilan,norun
+import std::fs::{ Change, ChangeKind, Watcher };
+import std::print;
+
+fun main() {
+	let watcher = Watcher::watch_all("content");
+	let change = watcher.next();
+	match change.kind {
+		ChangeKind::Created => print(i"new: {change.path}"),
+		ChangeKind::Modified => print(i"changed: {change.path}"),
+		ChangeKind::Removed => print(i"gone: {change.path}"),
+	}
+}
+main();
+```
+
+`next()` is async like everything else here, so it reads as a plain call
+and suspends until something happens, and `change.path` is ready to hand
+to `read_file_to_str`. There is no callback form: a `|Change| void`
+handler could not await the read of the file it was told about, and could
+not hold a `File` open across events either — a pull returns into a scope
+that can. Under the hood it *polls*, comparing stats every 300 ms, which
+is what lets it tell creation from modification from removal on every
+platform (the host's own `fs.watch` cannot); the costs are up to an
+interval of latency, blindness to a change that cancels itself out inside
+one interval, and a `stat` per watched entry per interval — so watch the
+narrowest path that answers your question. A `Watcher` is a `resource`
+like `File`, its destructor stops the poll, and that matters more than it
+does for a handle: a live poll holds the event loop open, so **a watcher
+that is never dropped is a program that never exits.**
+
+`std::watch` is a different thing wearing a similar name — the dev-refresh
+channel (`is_watching()`, `force_refresh()`), not a file watcher.
 
 What a server does *not* read by hand any more is its own build.
 `serve_build` knows the bundle's name, the stylesheet's, and every chunk's,

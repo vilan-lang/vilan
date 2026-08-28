@@ -161,11 +161,47 @@
       "additionalProperties": false,
       "properties": {
         "run": {
-          "description": "Commands to run through the platform shell BEFORE each build, in this manifest's directory. One bare command, or several in a list, run in order. A failure fails the build.",
+          "description": "Commands to run through the platform shell BEFORE each build, in this manifest's directory. One bare command, or several in a list, run in order. They run on EVERY build; a hook that should be skipped when nothing moved goes in `[[build.hook]]` instead. A failure fails the build.",
           "oneOf": [
             { "type": "string" },
             { "type": "array", "items": { "type": "string" } }
           ]
+        },
+        "hook": {
+          "type": "array",
+          "description": "Named build hooks, run after every `run` command in declaration order. A hook that declares `inputs` and/or `outputs` is SKIPPED while none of them has moved (content, never mtime); `vilan build --rerun-hooks` runs it anyway.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "run"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The hook's name — what the build reports on and what its freshness stamp keys on. Required, and unique in this manifest."
+              },
+              "run": {
+                "description": "The command line (or lines) this hook runs through the platform shell, with your own privileges and no prompt.",
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "array", "items": { "type": "string" } }
+                ]
+              },
+              "inputs": {
+                "description": "The files or directories the hook READS, relative to this manifest. A declared input that is missing is recorded as missing, so its appearance re-runs the hook. Plain paths — there is no glob matching.",
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "array", "items": { "type": "string" } }
+                ]
+              },
+              "outputs": {
+                "description": "The files or directories the hook WRITES. A missing or hand-edited output re-runs it. Plain paths — there is no glob matching.",
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "array", "items": { "type": "string" } }
+                ]
+              }
+            }
+          }
         },
         "preset": {
           "type": "string",
@@ -252,6 +288,10 @@
         "project": {
           "type": "boolean",
           "description": "`project = true` takes this dependency's whole declaration from the workspace root's `[project.dependencies]` (paths there are relative to the project root). Combines with no other key."
+        },
+        "build-hooks": {
+          "type": "boolean",
+          "description": "Grant THIS dependency permission to run its own build hooks with your privileges. Absent means no. Nothing runs a dependency's hooks yet — every one is refused, opted in or not — so this records the grant, in the diff, ahead of the mechanism."
         },
         "version": {
           "type": "string",

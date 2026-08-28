@@ -417,22 +417,54 @@ fn check_reach(imports: &[String], helpers: &[&'static str]) -> Result<(), Failu
 /// component, no separator of either platform's flavour), which refuses every
 /// path a kind could become while leaving every kind a real `emit` passes
 /// untouched.
+///
+/// **Shape was only half the question (G7).** One path segment beside the build
+/// output can still be a segment the build itself writes there: `emit("vl", …)`
+/// in a bare build passed this fence and OVERWROTE THE ENTRY SOURCE at exit 0,
+/// because a lone package's outputs sit exactly where its entry does. So the
+/// second rule asks *whose* file the segment names, and it asks
+/// [`crate::const_eval::build_owned_emit_kind`] — the same list the CLI's per-kind
+/// prune reads, so the write side and the prune side can never disagree about
+/// what the build owns. `css` alone is admitted: it is owned by the build AND
+/// `emit` is how it is written (the whole styling system reaches `<leg>.css`
+/// this way); build-hooks.md §5.6 reserves it against a build *hook*, not
+/// against the const channel that produces it.
+///
+/// Taken on the const-evaluated VALUE, so a computed kind is fenced exactly as
+/// a literal one is — `emit(kind_name(), …)` with `kind_name()` folding to
+/// `"vl"` clobbered the source just as the literal did, and there is no other
+/// path to reach here: `asset::emit` is const-only (the const pass refuses any
+/// runtime call to it, and `__emit_asset` is a capability miss outside
+/// `eval_const`), so the value is always known where this runs.
 fn check_emit_kind(kind: &str) -> Result<(), Failure> {
     let one_segment = !kind.is_empty() && !kind.contains('/') && !kind.contains('\\') && {
         let mut components = std::path::Path::new(kind).components();
         matches!(components.next(), Some(std::path::Component::Normal(_)))
             && components.next().is_none()
     };
-    if one_segment {
-        return Ok(());
+    if !one_segment {
+        return Err(Failure::new(
+            FailureKind::Thrown,
+            format!(
+                "`asset::emit` kinds name one file beside the build output; \
+                 `{kind}` is not one path segment — pass a bare kind like `css`"
+            ),
+        ));
     }
-    Err(Failure::new(
-        FailureKind::Thrown,
-        format!(
-            "`asset::emit` kinds name one file beside the build output; \
-             `{kind}` is not one path segment — pass a bare kind like `css`"
-        ),
-    ))
+    if let Some(owned) = crate::const_eval::build_owned_emit_kind(kind)
+        && owned != crate::const_eval::BuildOwnedKind::StyleSidecar
+    {
+        return Err(Failure::new(
+            FailureKind::Thrown,
+            format!(
+                "`asset::emit` kinds name one file beside the build output, and \
+                 `{kind}` collides with {} — pass a kind of the program's own, \
+                 like `routes`",
+                owned.collides_with()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Runs one function of a transformed program — the macro-expansion entry

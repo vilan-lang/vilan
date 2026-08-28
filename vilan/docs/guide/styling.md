@@ -36,6 +36,83 @@ fun main() {
   prefix (see [Macros & const](../tour/macros-and-const.md)). The rules
   are emitted during the build.
 - `view.styled(card)` puts the style's classes on the element.
+- There is **no reset unless you ask for one**. Browser defaults are in
+  force, so `body` keeps its 8px margin and
+  `width(px(200)).padding(space(4))` measures 232px, not 200. Add
+  `let _reset = const preflight();` for the opinionated base stylesheet
+  (`box-sizing: border-box` everywhere, margins zeroed, form-control
+  chrome stripped) — it lives in its own cascade sub-layer, so every
+  style you write still wins against it. The
+  [reference](../std/style.md#declaration-blocks) has what it contains.
+
+## The `css` block
+
+The chain has a second spelling that reads like the CSS you already
+know. A `css { … }` block **is** a `Style` — it is sugar over the chain
+above, lowered before anything else in the compiler sees it — so the two
+forms mix freely in one file, one function, one expression, and both
+emit exactly the same stylesheet.
+
+```vilan,fragment
+let card = const css {
+	display: flex;
+	flex-direction: column;
+	gap: {space(2)};
+	padding: {space(4)};
+	background-color: {Color::gray(100)};
+
+	.hover {
+		background-color: {Color::gray(200)};
+	}
+};
+```
+
+**One rule, and the whole feature falls out of it.** An undotted
+`property: value;` is a declaration and becomes `.raw(property, value)`;
+a dotted `.name { … }` is a condition combinator and becomes
+`.name(style() … )`, with the block's own chain as its last argument.
+The dot is the only thing the grammar looks at, so every condition
+method works inside a block — `.hover`, `.md`, `.within("data-theme",
+"dark")`, `.children`, `.attribute("data-open", "true")` — including
+ones added later, and nesting order is combinator order: media outside,
+then the relation, then the attribute, then the pseudo-class.
+
+```vilan,fragment
+let panel = const css {
+	color: {Color::gray(900)};
+
+	.within("data-theme", "dark") {
+		color: {Color::gray(50)};
+	}
+
+	.children {
+		margin-top: {space(2)};
+	}
+};
+```
+
+Values are text and **holes**. Anything you can write in CSS rides
+through verbatim — `repeat(3, 1fr)`, `url("tile.png")`, `50%`, `1.5rem`
+— and `{expression}` drops a typed vilan value in. A value that is
+*exactly* one hole keeps its type, which is what carries a token's
+`:root` line onto the sheet, so write `gap: {space(4)};` rather than
+`gap: 1rem;` when you mean the scale.
+
+Four things the block does not do, each on purpose:
+
+- **The `;` is required**, including after the last declaration.
+- **`#` and `@` are not vilan characters.** A colour is
+  `{Color::hex("#663399")}` — which routes it through `Color`, so its
+  `:root` line travels with it — and a media query is `.md { … }`.
+  There are no at-rules; a declaration block under a selector of your
+  own is [`declare`](../std/style.md#declaration-blocks).
+- **`!important` is refused.** Merging a style is a record update, so a
+  later declaration on the same property already wins.
+- **A block is brace-initial**, like a struct literal, so a condition,
+  a `for … in` iterable and a `match` subject take one only in
+  parentheses: `if (css { … }).class_list() != "" { … }`.
+
+`vilan fmt` currently prints a block back exactly as you wrote it.
 
 ## Getting the stylesheet onto the page
 
@@ -57,7 +134,7 @@ Server::builder().port(8080).serve_build(require_build("client"))
 ```
 
 That also means a leg that stops emitting styles stops having them
-served, with no `fs::exists` guard to remember: the build says whether it
+served, with no `fs::stat` guard to remember: the build says whether it
 wrote a sidecar, and the server believes it.
 
 Miss the link and the app runs unstyled while the compiler faithfully
@@ -103,11 +180,11 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   variable (see dynamic values below), and
   `Length::calc("100% - 2rem")` when the value is arithmetic — you write
   the expression, not the `calc(..)` wrapper.
-- **`Length::css(..)`** is the verbatim escape, `Color::hex`'s twin: a
+- **`Length::raw(..)`** is the verbatim escape, `Color::hex`'s twin: a
   complete CSS value written as text, for the functional forms `Length`
-  does not model — `Length::css("clamp(1100px, 100vw, 1920px)")`,
+  does not model — `Length::raw("clamp(1100px, 100vw, 1920px)")`,
   `min()`, `max()`, `env()`, `fit-content()`. Use `calc` when you are
-  writing *arithmetic* and want the wrapper supplied; use `css` when the
+  writing *arithmetic* and want the wrapper supplied; use `raw` when the
   value is already whole, which is also what lets one named expression be
   reused across several properties. An empty value stops the build.
 - **`Color`** has `Color::white()`, `Color::black()`,
@@ -199,9 +276,9 @@ and stay available; they are `raw` at those two value types.
 
 Reach for the value, not its text. A token is a *pair* — the reference
 (`var(--space-4)`) and the `:root` line that declares it — and reading the
-`.css` field of one hands over the reference alone, so `space(4).css` puts a
+`.text` field of one hands over the reference alone, so `space(4).text` puts a
 `var()` on the sheet that nothing defines. (That is the field, not the
-`Length::css(..)` constructor above, which is a value in its own right and
+`Length::raw(..)` constructor above, which is a value in its own right and
 declares nothing to lose.) Passing `space(4)` itself keeps the pair together.
 
 The typed surface grows by demand — if you find yourself reaching for `raw`
@@ -266,7 +343,7 @@ let button = const style()
 ```
 
 Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
-`.last`, `.dark`, and `.pseudo(name, inner)` for anything else.
+`.last`, and `.pseudo(name, inner)` for anything else.
 Breakpoints work the same way: `.sm(inner)` (640px), `.md(inner)`
 (768px), `.lg(inner)` (1024px), `.xl(inner)` (1280px), or
 `.media(min_width, inner)`. All are `min-width` conditions, so chains are
@@ -274,37 +351,71 @@ mobile-first: in `.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching
 breakpoint wins (the stylesheet emits media rules in ascending min-width
 order, which is what makes that true).
 
-## Dark mode, and stacking conditions
+## Theming, and stacking conditions
 
-`.dark(inner)` applies under a `:root[data-theme="dark"]` ancestor — an
-explicit switch you set on the document, not `prefers-color-scheme`. That
-is deliberate: a server can decide the theme and write the attribute
-before a byte of JavaScript runs, and a user's toggle is one attribute
-write.
+`.within(name, value, inner)` applies under an **ancestor** carrying the
+attribute — `within("data-theme", "dark", ..)` is the theme condition,
+under a `[data-theme="dark"]` switch you set on the document, not
+`prefers-color-scheme`. That is deliberate: a server can decide the theme
+and write the attribute before a byte of JavaScript runs, and a user's
+toggle is one attribute write. Nothing is special about the theme: any
+ancestor state rides — an n-ary theme id (`within("data-theme",
+"iron-dark", ..)`), a density mode, a `[data-collapsed]` sidebar.
+
+For colours, the stronger recipe is usually no condition at all: declare
+per-theme custom properties with a [declaration
+block](../std/style.md#declaration-blocks) and read them with
+`Color::var(..)` — switching themes then re-paints every element through
+the variables, and `within` covers the *structural* changes a value swap
+cannot express.
 
 Conditions **stack**, nesting outside-in in the order the CSS nests them:
-a breakpoint outside dark, dark outside the pseudo-class.
+a breakpoint outside the guard, the guard outside the pseudo-class.
 
 ```vilan,fragment
 let button = const style()
 	.background(Color::gray(100))
 	.hover(style().background(Color::gray(200)))
-	.dark(style().background(Color::gray(800)))
-	.dark(style().hover(style().background(Color::gray(700))))
-	.md(style().dark(style().hover(style().background(Color::gray(600)))));
+	.within("data-theme", "dark", style().background(Color::gray(800)))
+	.within("data-theme", "dark", style().hover(style().background(Color::gray(700))))
+	.md(style().within("data-theme", "dark", style().hover(style().background(Color::gray(600)))));
 ```
 
 Write them in any other order and the build stops and tells you which
-order it wanted — `hover(dark(..))` says to write `dark(hover(..))`. No
-axis may wrap itself, so one media, one dark and one pseudo-class is the
-whole lattice.
+order it wanted — `hover(within(..))` says to write `within(..,
+hover(..))`. No axis may wrap itself, so one media, one guard and one
+pseudo-class is the whole lattice.
 
-Why the order matters beyond spelling: `dark(hover(..))` produces a
-*more specific* selector than either `dark(..)` or `hover(..)`, so it
-beats both. Between a plain `.dark(x)` and a plain `.hover(y)` on the
-same property the two are equally specific and dark wins — a theme
-shouldn't be undone by a hover — so when a dark theme needs its own
-hover colour, say so with `dark(hover(..))`.
+Why the order matters beyond spelling: `within(.., hover(..))` produces a
+*more specific* selector than either `within(..)` or `hover(..)`, so it
+beats both. Between a plain `.within(.., x)` and a plain `.hover(y)` on
+the same property the guard wins — a theme shouldn't be undone by a hover
+— so when a dark theme needs its own hover colour, say so with
+`within(.., hover(..))`.
+
+## Styling children from the parent
+
+`.children(inner)` styles every direct child of the element, and
+`.divide(inner)` every direct child but the first — the parent-owned
+spacing idioms (Tailwind's `space-*` and `divide-*`):
+
+```vilan,fragment
+let list = const style()
+	.children(style().padding_y(space(2)))
+	.divide(style().border_top(Length::px(1), Color::gray(200)));
+```
+
+Two rules make this safe to use anywhere. First, **a child's own style
+always wins**: a `children`/`divide` rule is emitted in a lower cascade
+layer, so anything the child says about itself — through its own
+`style()` — overrides what its parent reaches in with, whatever the
+selectors' specificity. They set defaults the child may refuse; they are
+not a way to force a child's hand. Second, where `children` and `divide`
+touch the *same* property, `divide` wins on every child but the first —
+the narrower relation outranks the blanket, whichever you wrote first.
+
+Both take an unconditioned inner style: to give the children a hover
+colour, put the `hover(..)` on the child's own style.
 
 ## Dynamic values
 
@@ -373,8 +484,8 @@ request is rendered is the one served.
 > build: two styles that both say `padding(space(4))` share one class.
 > `styled` sets `class_list()`, the space-joined class names. Each
 > combination of conditions is its own slot, so `hover(..)` and
-> `dark(hover(..))` never fight over one — they are different rules with
-> different class names, resolved by CSS specificity.
+> `within(.., hover(..))` never fight over one — they are different rules
+> with different class names, resolved by CSS specificity.
 
 ## Traps
 
@@ -393,6 +504,6 @@ request is rendered is the one served.
   `border` with `border_color`) resolve by the order you wrote them, not
   by specificity: a later longhand narrows the shorthand, a later
   shorthand replaces the whole family. This holds per condition, so a
-  `dark` or `hover` variant of one family never disturbs the base.
+  `within` or `hover` variant of one family never disturbs the base.
 
 Full method table: the [style reference](../std/style.md).

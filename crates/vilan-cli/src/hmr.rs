@@ -141,6 +141,16 @@ pub fn instrument(bundle: &str, port: u16, token: &str, version: u64, leg: &str)
 /// broadcast that fails to write to it. Removal by id is idempotent, so the
 /// second one to arrive is a no-op instead of a race — and both go through the
 /// one mutex, so neither can observe a half-updated registry.
+///
+/// Every lock below RECOVERS from poisoning (backlog E97, the tree's one
+/// posture). The dev channel outlives any single connection thread, and a
+/// panicking connection thread does not take the process with it, so a
+/// propagated poison would silently stop every browser from ever refreshing
+/// again — a wedge with no diagnostic, which is strictly worse than serving a
+/// registry one entry short. Nothing here can leave torn state to observe: the
+/// guard is only held over pushes, an id-keyed `retain`, and the broadcast's
+/// writes, and a `Vec` that lost an element to an unwind is still a valid
+/// registry of live clients, which the reader threads re-establish anyway.
 #[derive(Default)]
 struct Clients {
     connected: Mutex<Vec<Client>>,
@@ -165,7 +175,10 @@ impl Clients {
     /// [`Clients::remove`] takes it back out by.
     fn register(&self, stream: Arc<TcpStream>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.connected.lock().unwrap().push(Client { id, stream });
+        self.connected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Client { id, stream });
         id
     }
 
@@ -174,7 +187,7 @@ impl Clients {
     fn remove(&self, id: u64) {
         self.connected
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|client| client.id != id);
     }
 
@@ -188,7 +201,10 @@ impl Clients {
     /// actually keeps the registry honest.
     fn broadcast(&self, payload: &str) {
         let frame = sse_frame(payload);
-        let mut connected = self.connected.lock().unwrap();
+        let mut connected = self
+            .connected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         connected.retain(|client| {
             let mut stream: &TcpStream = &client.stream;
             let alive = stream
@@ -208,7 +224,10 @@ impl Clients {
     /// How many browsers are registered right now.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.connected.lock().unwrap().len()
+        self.connected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 }
 

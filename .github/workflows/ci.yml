@@ -104,6 +104,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The suite proves the tree against CURRENT stable, not against the pin in
+    # rust-toolchain.toml — that file is the formatter's pin (backlog N21; the
+    # `fmt` job below is what follows it). Explicit because it would not hold
+    # by itself: dtolnay/rust-toolchain only runs `rustup default`, and a
+    # committed toolchain file outranks the default, so without this line the
+    # file would quietly repin every cargo invocation in this job.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     # Both legs are REQUIRED. The windows leg ran allowed-fail while it was
     # the arc's instrument (windows-support.md §8-§9: it settled the
     # include_str `\\?\` build risk and the NTFS case behavior, and produced
@@ -147,6 +155,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # Same declaration as `test`, and here it is load-bearing twice over: the
+    # wasm32 target is installed for the toolchain the ACTION names, so letting
+    # rust-toolchain.toml resolve the build to its pinned channel would fail on
+    # a missing target — at build time, on a tree nobody broke.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -174,6 +188,24 @@ jobs:
             target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
           ls -l pkg/vilan_wasm_bg.wasm
 
+  # Formatting is a gate (backlog N21). `cargo fmt` after every Rust change is
+  # CLAUDE.md's own rule, and the tree still drifted — four hunks that then
+  # cost three separate lanes in one cycle a revert-and-report each. This leg
+  # holds the tree to rustfmt's answer, and deliberately carries NO
+  # `RUSTUP_TOOLCHAIN`: it resolves through rust-toolchain.toml, whose exact
+  # pinned toolchain is what makes that answer byte-stable across rustfmt
+  # releases (the runner's preinstalled rustup reads the file and fetches the
+  # pinned toolchain, rustfmt included, on first use — no action needed).
+  # ubuntu only: formatting is platform-independent text.
+  fmt:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The tree is formatted
+        run: cargo fmt --all --check
+
   # **This is the job to make a required status check** (process.md §2.5, where
   # it is called `ci`; the context reads `ci / check`). Everything above it can
   # legitimately not run; this cannot, which is the entire point — a required
@@ -188,12 +220,12 @@ jobs:
   #   cancelled-> FAIL    the result is unknown, and unknown is not green
   #
   # So a docs-only or root-prose-only push takes the cheap path — `changes`
-  # runs, `test` and `wasm` skip, `check` is green — and any red leg turns
-  # `check` red. `changes` is in `needs` on purpose: if the filter itself
-  # fails, the two legs skip, and without this the aggregate would call that
-  # a pass.
+  # runs, `test`, `wasm` and `fmt` skip, `check` is green — and any red leg
+  # turns `check` red. `changes` is in `needs` on purpose: if the filter
+  # itself fails, the expensive legs skip, and without this the aggregate
+  # would call that a pass.
   check:
-    needs: [changes, test, wasm]
+    needs: [changes, test, wasm, fmt]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -258,7 +258,7 @@ fn write_multi_entry_package(dir: &Path) {
     write(
         dir,
         "src/store.vl",
-        "import std::fs;\n\nfun load(): bool {\n\tfs::exists(\"state\")\n}\n",
+        "import std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n",
     );
     write(
         dir,
@@ -562,7 +562,7 @@ fn check_colors_each_entry_against_its_own_target() {
         "unexpected output: {text}"
     );
     assert!(
-        text.contains("main → load → exists (std::fs)"),
+        text.contains("main → load → stat (std::fs)"),
         "the chain should name the path: {text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -724,7 +724,7 @@ fn a_parse_error_inside_a_package_module_fails_the_build_loudly() {
 // B74: a duplicate inherent STATIC across two modules. The cross-file half of
 // the diagnostic — the `by module '…'` clause and the note that carries its own
 // source — needs two files to be observable at all, so it lives here rather
-// than beside the single-source pins in `inference.rs`. This is also the shape
+// than beside the single-source pins in the `inference` suite. This is also the shape
 // the hazard actually takes in the wild: nobody writes two colliding `new`s on
 // one screen, they write one in each of two modules and never see that one is
 // dead.

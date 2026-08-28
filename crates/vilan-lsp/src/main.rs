@@ -470,6 +470,16 @@ struct Backend {
     /// the union of their importers' views, and stale targets get explicit
     /// empties. Locked only around synchronous planning, never across an
     /// await.
+    ///
+    /// Every lock of this mutex — and of [`Backend::config`] below — RECOVERS
+    /// from poisoning with `PoisonError::into_inner` (backlog E97, the tree's
+    /// one posture). This server is the exact architecture the posture is for:
+    /// `fenced` CATCHES a per-request panic so one bad request answers its
+    /// fallback instead of locking the user out, and a propagated poison would
+    /// undo that by wedging every later request on a mutex the caught panic left
+    /// behind. This is the one shared structure here that a panic could leave
+    /// *stale* rather than merely absent, which is why `plan_publish` drops the
+    /// re-planning owner's entry before it computes the new one — see there.
     publish_state: Arc<std::sync::Mutex<PublishState>>,
     /// `std` files don't change during a session, so cache their line indices
     /// rather than re-reading the file on every cross-file definition/reference.
@@ -477,7 +487,9 @@ struct Backend {
     /// The client's feature settings, seeded from `initializationOptions` and
     /// updated live by `workspace/didChangeConfiguration`. Read per request
     /// (`inlay_hint`, `semantic_tokens_full`, …) so a toggle takes effect without
-    /// re-registering capabilities.
+    /// re-registering capabilities. Poison-recovering like `publish_state`
+    /// (E97); every write is a whole-value assignment, so a recovered guard
+    /// reads either the old `Config` or the new one, never a mixture.
     config: Arc<std::sync::RwLock<Config>>,
     /// Whether the client can render snippet completions (`$1`/`${1:name}`
     /// tab-stops). Captured from `ClientCapabilities` at `initialize` (fixed for
@@ -1598,6 +1610,37 @@ impl Backend {
             range: line_index.range(&span),
         })
     }
+
+    /// Convert a cross-program `(canonical path, span)` — the coordinates the
+    /// document layer's cross-document union answers in (kolt.local 034) —
+    /// into an LSP `Location`.
+    ///
+    /// A path that is an open document's ENTRY converts through that
+    /// document's analyzed index and answers with the URI the client opened it
+    /// under: the span came from an analysis of exactly that text (S1). Any
+    /// other file converts through the session line-index cache, exactly as
+    /// [`Backend::location_for`] always has for a non-entry source.
+    fn location_for_path(
+        &self,
+        open: &[dashmap::mapref::multiple::RefMulti<'_, Url, Document>],
+        path: &Path,
+        span: Span,
+    ) -> Option<Location> {
+        for entry in open {
+            if entry.value().entry_path() == Some(path) {
+                return Some(Location {
+                    uri: entry.key().clone(),
+                    range: entry.value().analyzed_range(&span),
+                });
+            }
+        }
+        let line_index = self.line_index_for(path)?;
+        let uri = Url::from_file_path(path).ok()?;
+        Some(Location {
+            uri,
+            range: line_index.range(&span),
+        })
+    }
 }
 
 /// What the server advertises at `initialize` — every provider it answers
@@ -2174,14 +2217,26 @@ impl LanguageServer for Backend {
         self.fenced("references", Ok(None), || {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
-            let Some(document) = self.documents.get(&uri) else {
+            // Every open document at once (kolt.local 034): the union below
+            // re-resolves the definition in each neighbor's program, which is
+            // what lets a query IN the defining file see the files that import
+            // it. One iteration pass collects every guard up front —
+            // re-entering the map while holding any of them could deadlock a
+            // shard against a concurrent writer.
+            let open: Vec<_> = self.documents.iter().collect();
+            let Some(origin) = open.iter().find(|entry| *entry.key() == uri) else {
                 return Ok(None);
             };
-            let offset = document.analyzed_offset(position);
-            let locations = document
-                .references(offset)
+            let offset = origin.value().analyzed_offset(position);
+            let neighbors = open
+                .iter()
+                .filter(|entry| *entry.key() != uri)
+                .map(|entry| entry.value());
+            let locations = origin
+                .value()
+                .references_across(offset, neighbors)
                 .into_iter()
-                .filter_map(|(source, span)| self.location_for(&document, &uri, source, span))
+                .filter_map(|(path, span)| self.location_for_path(&open, &path, span))
                 .collect();
             Ok(Some(locations))
         })
@@ -2192,13 +2247,19 @@ impl LanguageServer for Backend {
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
             let new_name = params.new_name;
-            let Some(document) = self.documents.get(&uri) else {
+            // The same one-pass guard collection the references handler uses
+            // (kolt.local 034): rename reads the same cross-document union, so
+            // a rename issued at a definition rewrites the files that import it.
+            let open: Vec<_> = self.documents.iter().collect();
+            let Some(origin) = open.iter().find(|entry| *entry.key() == uri) else {
                 return Ok(None);
             };
+            let document = origin.value();
             // S3: a rename is edits computed from program data. Applying them to a
             // buffer that has moved on corrupts it, so refuse while the snapshots
             // diverge instead of guessing. At human timescales this is invisible —
-            // a rename happens at rest, after the debounce has landed.
+            // a rename happens at rest, after the debounce has landed. (A STALE
+            // NEIGHBOR refuses inside `rename_edits_across`, for the same reason.)
             if document.is_stale() {
                 return Err(still_analyzing());
             }
@@ -2207,17 +2268,21 @@ impl LanguageServer for Backend {
             // find-references answers with, checked for the extra things a rename
             // needs (a spellable name, files this project may edit, nothing known
             // to be missing) and refused with a reason when any fails.
-            let spans = match document.rename_edits(offset, &new_name) {
+            let neighbors = open
+                .iter()
+                .filter(|entry| *entry.key() != uri)
+                .map(|entry| entry.value());
+            let spans = match document.rename_edits_across(offset, &new_name, neighbors) {
                 Ok(spans) => spans,
                 Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
                 Err(refusal) => return Err(rename_refused(&refusal)),
             };
             let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-            for (source, span) in spans {
+            for (path, span) in spans {
                 // An occurrence that cannot be turned into a location would be a
                 // reference this rename silently skips — the partial edit set the
                 // rule forbids — so refuse rather than drop it.
-                let Some(location) = self.location_for(&document, &uri, source, span) else {
+                let Some(location) = self.location_for_path(&open, &path, span) else {
                     return Err(rename_refused(
                         &crate::document::RenameRefusal::Incomplete {
                             what: "this symbol".to_string(),
@@ -2246,17 +2311,24 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         self.fenced("prepare_rename", Ok(None), || {
             let uri = params.text_document.uri;
-            let Some(document) = self.documents.get(&uri) else {
+            let open: Vec<_> = self.documents.iter().collect();
+            let Some(origin) = open.iter().find(|entry| *entry.key() == uri) else {
                 return Ok(None);
             };
+            let document = origin.value();
             if document.is_stale() {
                 return Err(still_analyzing());
             }
             let offset = document.analyzed_offset(params.position);
-            // `rename_edits` with a name known to be valid: the answer is
-            // whether a rename COULD proceed, decided by exactly the checks the
-            // rename itself will run, so the two cannot disagree.
-            match document.rename_edits(offset, "placeholder") {
+            // `rename_edits_across` with a name known to be valid: the answer
+            // is whether a rename COULD proceed, decided by exactly the checks
+            // the rename itself will run — neighbors included — so the two
+            // cannot disagree.
+            let neighbors = open
+                .iter()
+                .filter(|entry| *entry.key() != uri)
+                .map(|entry| entry.value());
+            match document.rename_edits_across(offset, "placeholder", neighbors) {
                 Ok(_) => {}
                 Err(crate::document::RenameRefusal::NotAnIdentifier) => return Ok(None),
                 Err(refusal) => return Err(rename_refused(&refusal)),
@@ -3761,6 +3833,120 @@ mod snapshot_consistency_tests {
             SOURCE,
             "the snapshot stays consistent at the last adopted analysis",
         );
+    }
+}
+
+/// kolt.local 034: the cross-document reach of references and rename at the
+/// HANDLER level. The union itself is pinned on `Document` (references.rs);
+/// these pin that the handlers actually hand every open document to it — a
+/// handler that quietly answers from one program alone reddens here while the
+/// document pins stay green.
+#[cfg(test)]
+mod cross_document_reach_tests {
+    use super::*;
+    use crate::document::tests::{analyze_workspace, std_root};
+    use snapshot_consistency_tests::{backend, rename_params};
+
+    const LIBRARY: &str = "struct Point {\n\tx: i32,\n}\n";
+    const APPLICATION: &str =
+        "import pkg::library::Point;\n\nfun main(): i32 {\n\tlet p = Point { x = 1 };\n\tp.x\n}\n";
+
+    /// `library.vl` (the definer) and `application.vl` (its importer), both
+    /// open on one backend. Returns the temp dir and each file's URI.
+    fn open_pair(backend: &Backend) -> (std::path::PathBuf, Url, Url) {
+        let (dir, library_document) =
+            analyze_workspace(&[("library.vl", LIBRARY), ("application.vl", APPLICATION)]);
+        let application_path = dir.join("application.vl");
+        let application_document = Document::analyze(APPLICATION, &std_root(), &application_path);
+        let library_uri = Url::from_file_path(dir.join("library.vl")).expect("an absolute path");
+        let application_uri = Url::from_file_path(&application_path).expect("an absolute path");
+        backend
+            .documents
+            .insert(library_uri.clone(), library_document);
+        backend
+            .documents
+            .insert(application_uri.clone(), application_document);
+        (dir, library_uri, application_uri)
+    }
+
+    /// Inside `Point` on line 0 of `library.vl` (`struct Point {`).
+    fn declaration_position() -> Position {
+        Position::new(0, 9)
+    }
+
+    #[tokio::test]
+    async fn find_references_reaches_the_open_files_that_import_the_definer() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (dir, library_uri, application_uri) = open_pair(backend);
+        let locations = backend
+            .references(ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: library_uri.clone(),
+                    },
+                    position: declaration_position(),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+            })
+            .await
+            .expect("references answers")
+            .expect("an answer for an open document");
+        let count = |uri: &Url| {
+            locations
+                .iter()
+                .filter(|location| location.uri == *uri)
+                .count()
+        };
+        assert_eq!(
+            count(&library_uri),
+            1,
+            "the declaration, exactly once: {locations:?}",
+        );
+        assert_eq!(
+            count(&application_uri),
+            2,
+            "the import leaf and the constructor: {locations:?}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rename_at_a_definition_rewrites_the_open_files_that_import_it() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (dir, library_uri, application_uri) = open_pair(backend);
+        let edit = backend
+            .rename(rename_params(&library_uri, declaration_position()))
+            .await
+            .expect("the rename answers")
+            .expect("`Point` is renameable");
+        let changes = edit.changes.expect("per-file edits");
+        assert_eq!(changes[&library_uri].len(), 1, "the declaration");
+        assert_eq!(
+            changes[&application_uri].len(),
+            2,
+            "the import leaf and the constructor",
+        );
+        // Every edit replaces exactly the identifier, in each file's own text.
+        for (uri, edits) in &changes {
+            let text = if *uri == library_uri {
+                LIBRARY
+            } else {
+                APPLICATION
+            };
+            let index = LineIndex::new(text);
+            for edit in edits {
+                let start = index.offset(edit.range.start);
+                let end = index.offset(edit.range.end);
+                assert_eq!(&text[start..end], "Point", "in {uri}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -148,6 +148,14 @@ pub const DEPENDENCY_KEYS: &[Key] = &[
         values: ValueSet::OnlyTrue,
     },
     Key {
+        name: "build-hooks",
+        documentation: "Grant THIS dependency permission to run its own build hooks with \
+                        your privileges. Absent means no. Nothing runs a dependency's \
+                        hooks yet — every one is refused, opted in or not — so this \
+                        records the grant, in the diff, ahead of the mechanism.",
+        values: ValueSet::Boolean,
+    },
+    Key {
         name: "version",
         documentation: "A registry dependency's version requirement. Registry dependencies \
                         are not resolved yet.",
@@ -332,8 +340,16 @@ pub const TABLES: &[Table] = &[
                 name: "run",
                 documentation: "Commands to run through the platform shell BEFORE each \
                                 build, in the manifest's directory, with your own privileges \
-                                and no prompt. One bare, or several in a list. A failure \
-                                fails the build.",
+                                and no prompt. One bare, or several in a list. They run on \
+                                EVERY build; a hook that should be skipped when nothing \
+                                moved goes in `[[build.hook]]`. A failure fails the build.",
+                values: ValueSet::Open,
+            },
+            Key {
+                name: "hook",
+                documentation: "`[[build.hook]]` — named hooks, run after every `run` \
+                                command in declaration order. One that declares `inputs` \
+                                and/or `outputs` is SKIPPED while none of them has moved.",
                 values: ValueSet::Open,
             },
             Key {
@@ -370,6 +386,41 @@ pub const TABLES: &[Table] = &[
                 documentation: "Fold `let` initializers the compiler can evaluate, without the \
                                 `const` keyword (on under `release`, off under `debug`).",
                 values: ValueSet::Boolean,
+            },
+        ],
+    },
+    Table {
+        path: "build.hook",
+        documentation: "One named build hook (`[[build.hook]]`, an array of tables): a \
+                        command, and what it reads and writes. Declaring `inputs` and/or \
+                        `outputs` is what makes it skippable — freshness compares content, \
+                        never mtime, and `vilan build --rerun-hooks` overrides it.",
+        keys: &[
+            Key {
+                name: "name",
+                documentation: "The hook's name — what the build reports on and what its \
+                                freshness stamp keys on. Required, and unique here.",
+                values: ValueSet::Open,
+            },
+            Key {
+                name: "run",
+                documentation: "The command line (or lines) this hook runs through the \
+                                platform shell, with your own privileges and no prompt.",
+                values: ValueSet::Open,
+            },
+            Key {
+                name: "inputs",
+                documentation: "The files or directories the hook READS. A declared input \
+                                that is missing is recorded as missing, so its appearance \
+                                re-runs the hook. Plain paths — no glob matching.",
+                values: ValueSet::Open,
+            },
+            Key {
+                name: "outputs",
+                documentation: "The files or directories the hook WRITES. A missing or \
+                                hand-edited output re-runs it. Plain paths — no glob \
+                                matching.",
+                values: ValueSet::Open,
             },
         ],
     },
@@ -588,8 +639,12 @@ fn enclosing_header(text: &str, offset: usize) -> String {
     let mut header = String::new();
     for line in text[..line_start(text, offset)].lines() {
         let trimmed = line.trim();
-        // `[[array.of.tables]]` is not part of the manifest schema, but reading
-        // its inner name keeps the header tracking honest if one appears.
+        // `[[array.of.tables]]` reads as its inner name, so the keys of
+        // `[[build.hook]]` — the schema's one array of tables — complete like
+        // any other table's. It is deliberately absent from [`HEADERS`]:
+        // those complete into a `[header]`, and `[build.hook]` is the wrong
+        // spelling for an array of tables. Offering the right one needs
+        // [`HEADERS`] to carry the bracket form, which is its own change.
         let inner = trimmed
             .strip_prefix("[[")
             .and_then(|rest| rest.strip_suffix("]]"))

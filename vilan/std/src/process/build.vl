@@ -36,8 +36,9 @@ struct LegBuild {
 	bundle: str,
 	/// The style sidecar's file name, when the build emitted one. `None` means
 	/// the leg compiled no styles — a fact a hand-written shell must respect
-	/// and cannot see, and one `fs::exists` can only half-answer (it cannot
-	/// tell a missing stylesheet from a stale one a previous build left).
+	/// and cannot see, and one `fs::stat` probe can only half-answer (it
+	/// cannot tell a missing stylesheet from a stale one a previous build
+	/// left).
 	styles: Option<str>,
 	/// The route chunks' file names, in the build's own order. Empty for a leg
 	/// that does not `split` (`bundle-splitting.md` §4).
@@ -123,7 +124,7 @@ fun build_of(leg: str): Result<LegBuild, BuildError> {
 	// already assumed, now assumed in exactly one place.
 	let dist = "dist";
 	let manifest_path = path::join(dist, i"{leg}.chunks.json");
-	if !fs::exists(manifest_path) {
+	if fs::stat(manifest_path).is_none() {
 		ret Err(BuildError::NotBuilt(manifest_path));
 	}
 	match fs::read_file_to_str(manifest_path).try_parse_json() {
@@ -228,7 +229,7 @@ fun load_build(build: LegBuild): List<BuildAsset> {
 			// silent (kolt.local 022(b)), and the warning names the artifact.
 			None => print(i"warning: the `{build.leg}` build names {file}, whose extension `serve_build` has no content type for — the artifact is not served"),
 			Some(let content_type) => {
-				if !fs::exists(file) {
+				if fs::stat(file).is_none() {
 					panic(i"the `{build.leg}` build names {file}, which is not on disk — rebuild the leg (`vilan build .`), and run the server from the project root");
 				}
 				assets.push(BuildAsset {

@@ -760,6 +760,10 @@ const KEYWORD_ROLES: &[(&str, KeywordRole)] = &[
     ("resource", KeywordRole::Modifier),
     ("with", KeywordRole::Other),
     ("borrows", KeywordRole::Other),
+    // `css` heads an expression rather than declaring or modifying an item, so
+    // it takes the general bucket beside `with`/`borrows` rather than
+    // `storage.type` (which colours the word that names a new item).
+    ("css", KeywordRole::Other),
     ("true", KeywordRole::Literal),
     ("false", KeywordRole::Literal),
     ("null", KeywordRole::Literal),

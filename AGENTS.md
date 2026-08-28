@@ -68,10 +68,14 @@ Rust workspace, six crates, plus the language's own tree:
    framework, or the language updates the affected `vilan/docs/` page in the same
    change-set.
 4. **Per-case pins.** Every behavior added or changed gets its own tests in
-   `crates/vilan-core/tests/inference.rs` (`assert_compiles`,
+   `crates/vilan-core/tests/inference/` (`assert_compiles`,
    `assert_compiles_and_runs`, `assert_fails`) — one pin per case, including the edge
    cases (multi-parameter, nested, mixed, ordering-sensitive), not one representative
    example. A known-but-unfixed gap is pinned `#[ignore]` with a comment saying why.
+   B145 split the old single 69k-line `tests/inference.rs` into subject modules of
+   ONE binary: `main.rs` declares them, the harness is `support.rs`, and a new pin
+   goes in the subject module that owns its area (a new subject is a new `mod`).
+   The command is unchanged: `cargo test -p vilan-core --test inference`.
 5. **`cargo fmt` after every Rust change.** It may reformat neighboring code —
    expected and desired. 4-space indent in Rust; full variable names (`parameter`,
    never `p`).
@@ -144,6 +148,58 @@ Rust workspace, six crates, plus the language's own tree:
   `analyze_source` (tests + LSP) *and* the CLI's duplicated sequence in
   `crates/vilan-cli/src/main.rs` — and verified with a CLI probe, not only an
   inference pin. A pass added to one place ships a check the other silently skips.
+- **The panic fence is four sites, and a new pipeline entry point picks a
+  side deliberately** (N19). The workspace deliberately does NOT build
+  with `panic = "abort"` (the comment above `[profile.wasm-release]` in
+  the root `Cargo.toml` records why): the long-lived surfaces fence
+  their work in `catch_unwind` so a compiler panic degrades to one
+  honest diagnostic instead of a dead process. The four sites:
+  `crates/vilan-core/src/lib.rs`'s outer fence in
+  `analyze_source_reclaimable` (covers lex/parse/lift — degrades to "no
+  program" plus an internal-error diagnostic; before it, a panic
+  unwound through `Document::analyze`'s join and aborted the language
+  server, B40) and its inner fence in `analyze_source_unfenced` (around
+  `analyze` + `post_analysis_passes` — the one that matters for tree
+  reclaim); `crates/vilan-lsp/src/main.rs`'s per-request `fenced` seam
+  (one bad request answers its fallback instead of locking the user out
+  of every LSP feature); and `crates/vilan-lsp/src/document.rs`'s
+  analysis thread (a panicked analysis becomes an internal-error
+  document, never a re-raise through the join). There is no panic hook
+  anywhere: the default hook's stderr write IS the "details are on
+  stderr" every fence's diagnostic promises. On wasm32 the fence only
+  holds if the target unwinds — the playground's instance-recycle path
+  exists as the cover for when it does not, not as an optimization. The
+  CLI is deliberately OUTSIDE the fence: `main.rs` imports `analyze`,
+  not the fenced `analyze_source`, and joins its compiler thread with
+  `.expect("compiler thread panicked")`, so a compiler panic in a
+  one-shot `vilan build` double-panics and exits loudly — nothing there
+  to keep alive, and a swallowed panic would be a wrong build. The rule
+  for a fifth site: a new long-lived entry point into the pipeline (a
+  server, a watcher, an editor surface) fences at its own boundary —
+  catch, degrade to an honest internal-error answer, details left to
+  stderr; a new one-shot entry takes the CLI's stance. Either way,
+  write which and why at the site.
+- **Every lock RECOVERS from poisoning — no exceptions, and a test
+  holds the line** (E97, ruled 2026-08-28: "do the safe thing, prevent
+  a poisoned cache"). `.lock()`, `.read()` and `.write()` are followed
+  by `.unwrap_or_else(std::sync::PoisonError::into_inner)` at every
+  site in every crate's `src/`, because a *caught* panic (the fence
+  above is four of them) is exactly how a poisoned mutex outlives the
+  request that poisoned it — and one poisoned process-global turns a
+  one-shot compiler bug into a language server that answers "internal
+  error" for the rest of the session. The defect this closed was
+  DRIFT, not absence (one file defended a cache in one function and
+  not in its neighbour thirty lines later), so
+  `every_lock_in_the_workspace_recovers_from_poisoning`
+  (`crates/vilan-core/src/lib.rs`) scans the sources and fails on the
+  next `.unwrap()`-ing lock anyone adds; an in-`src` test that must
+  acquire a lock says `.expect("…")`. Recovery is only safe because
+  these guards are held over whole-value inserts — build the value
+  BEFORE you take the lock, or the recovered guard hands the next
+  reader a half-written entry. Where a guard is held across
+  panic-prone code, clear the entry before rebuilding it rather than
+  leaving a stale one behind (`publish.rs`'s `plan_publish` is the
+  worked example).
 - **Git is scoped to your worktree.** A lane works in its own git worktree under
   `.claude/worktrees/<lane>`, on its own branch off `next`, and commits there —
   `git add <paths>` naming each file explicitly (never `-A`), with a

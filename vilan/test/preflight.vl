@@ -1,0 +1,43 @@
+import std::print;
+import std::style::{ Display, Style, declarations, declare, preflight, style };
+
+// The opt-in base stylesheet (kolt.local 008): one `const preflight()` and the
+// build's sheet gains a reset — Tailwind's preflight scope adapted, plus the
+// ruling's own `display: block` for anchors, buttons and selects.
+//
+// The byte gate is the point of this program. Everything about the reset is a
+// property of the emitted TEXT: which rules it carries, and — the design's
+// whole risk — which cascade layer each one lands in. The golden beside this
+// file holds all of it, so a rule that changed, moved layer, or quietly
+// stopped being emitted is a diff and not a discovery.
+//
+// Three tiers on one property (`display`), each strictly beating the next by
+// the cascade and not by where its line landed in the sheet's lexical sort:
+//
+//   `.sX{display:flex}`                        a Style, UNLAYERED — always wins
+//   `@layer vilan{a{display:inline-block}}`    a declare block
+//   `@layer vilan.preflight{a,button,select{display:block}}`   the reset
+//
+// css-cascade-5 §6.4.3 gives both steps with one sentence — unlayered rules
+// sort after layered ones "within the same parent layer (if any)" — so the
+// reset is the weakest author-origin thing in the sheet, and still stronger
+// than every UA default, because layers order AUTHOR declarations only.
+
+fun app_reset() {
+	// An app tightening one of the reset's own rules. It needs no `!important`
+	// and no longer selector: `@layer vilan` outranks `@layer vilan.preflight`
+	// whatever the specificity.
+	declare("a", declarations().raw("display", "inline-block"));
+}
+
+fun panel(): Style {
+	style().display(Display::Flex)
+}
+
+fun main() {
+	let _reset = const preflight();
+	let _app = const app_reset();
+	let card = const panel();
+	print(card.class_list());
+}
+main();

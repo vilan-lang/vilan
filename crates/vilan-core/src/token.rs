@@ -4,6 +4,13 @@ pub enum Token<'src> {
     Await,
     Bool(bool),
     Ctrl(char),
+    // `css` — the head of a `css { … }` block (proposal/css-block.md), CSS
+    // declarations that lower to a `std::style` chain before analysis. A HARD
+    // keyword rather than a contextual gate (§5.4, Q3 ruled 2026-08-28): the
+    // headed form `css [attr="v"] { … }` needs a token the two-token lookahead
+    // cannot give, and taking the word is cheap in alpha and impossible after
+    // the beta contract.
+    Css,
     Else,
     Enum,
     Export,
@@ -54,6 +61,7 @@ impl std::fmt::Display for Token<'_> {
             Token::Await => write!(f, "await"),
             Token::Bool(x) => write!(f, "{x}"),
             Token::Ctrl(c) => write!(f, "{c}"),
+            Token::Css => write!(f, "css"),
             Token::Else => write!(f, "else"),
             Token::Enum => write!(f, "enum"),
             Token::Export => write!(f, "export"),

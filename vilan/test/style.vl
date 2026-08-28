@@ -65,15 +65,16 @@ fun main() {
 	let responsive = const style().sm(style().padding(space(2))).lg(style().padding(space(3)));
 	print(responsive.class_list());
 
-	// Conditions stack outside-in, media > dark > pseudo. The golden pins the
-	// composed selectors in bytes: the dark ancestor and the pseudo suffix in
-	// ONE rule, and the whole thing inside a media block. Note the leading
-	// byte — a composed dark rule still starts with ':', which is what keeps
-	// it in the same cascade band as every other dark rule (B35).
+	// Conditions stack outside-in, media > within > pseudo. The golden pins
+	// the composed selectors in bytes: the ancestor guard and the pseudo
+	// suffix in ONE rule, and the whole thing inside a media block. Note the
+	// leading byte — a within rule starts with '[', the LAST unlayered band
+	// (B35 / ui-styling.md §0bis.6), so its (0,2,0) tie against a pseudo rule
+	// resolves to the theme by source order.
 	let themed = const style()
-		.md(style().dark(style().hover(style().background(Color::gray(50)))))
-		.dark(style().background(Color::gray(900)))
-		.dark(style().hover(style().background(Color::gray(700))));
+		.md(style().within("data-theme", "dark", style().hover(style().background(Color::gray(50)))))
+		.within("data-theme", "dark", style().background(Color::gray(900)))
+		.within("data-theme", "dark", style().hover(style().background(Color::gray(700))));
 	print(themed.class_list());
 
 	// The value types (ui-styling.md §0bis.3). A translucent token renders as
@@ -110,11 +111,11 @@ fun main() {
 	print(const style().border(Length::px(1), Color::gray(300)).border_none().class_list());
 
 	// The remainder's value surfaces (ui-styling.md §0bis.5). `zero()` is a bare
-	// `0`, not `0px`; `css()` is verbatim where `calc()` wraps — the golden is
+	// `0`, not `0px`; `raw()` is verbatim where `calc()` wraps — the golden is
 	// where that pair is proven in bytes. Additions again: nothing above moves.
 	let zeroed = const style()
 		.inset(Length::zero())
-		.left(Length::css("clamp(120px, 30%, 185px)"))
+		.left(Length::raw("clamp(120px, 30%, 185px)"))
 		.min_width(Length::zero())
 		.max_width(Length::calc("100% - 2rem"));
 	print(zeroed.class_list());
@@ -143,18 +144,32 @@ fun main() {
 	print(squared.class_list());
 	print(const style().size(Length::rem(1.0)).height(Length::rem(2.0)).class_list());
 
-	// The attribute condition selects on the element ITSELF, where dark's
-	// hardcoded ancestor is the one ancestor form. The golden pins the
-	// composed selectors in bytes: the bare suffix, the suffix before a
-	// pseudo-class, under the dark ancestor, and the full
-	// media(dark(attribute(pseudo(..)))) stack — attribute rules start with
-	// '.', so they stay in the base cascade band (B35).
+	// The attribute condition selects on the element ITSELF, where within is
+	// the ancestor form. The golden pins the composed selectors in bytes: the
+	// bare suffix, the suffix before a pseudo-class, under the ancestor
+	// guard, and the full media(within(attribute(pseudo(..)))) stack —
+	// attribute rules start with '.', so they stay in the base cascade band
+	// (B35).
 	let disclosed = const style()
-		.md(style().dark(style().attribute("data-open", "true", style().hover(style().color(Color::gray(50))))))
-		.dark(style().attribute("data-open", "true", style().background(Color::gray(800))))
+		.md(style().within("data-theme", "dark", style().attribute("data-open", "true", style().hover(style().color(Color::gray(50))))))
+		.within("data-theme", "dark", style().attribute("data-open", "true", style().background(Color::gray(800))))
 		.attribute("data-open", "true", style().display(Display::Flex))
 		.attribute("data-open", "true", style().hover(style().background(Color::gray(100))));
 	print(disclosed.class_list());
+
+	// The child-side relations (ui-styling.md §0bis.6): children and divide
+	// reach the element's CHILDREN, so their rules emit inside `@layer vilan`
+	// — a child's own Style always wins against a rule reaching in from an
+	// ancestor. divide renders `> :not(:first-child)`, carrying (0,2,0) over
+	// children's (0,1,0), so the margin both relations set here resolves to
+	// divide on every child but the first by SPECIFICITY, never by the sheet's
+	// class-hash order. A breakpoint wraps a relation media-outermost, so the
+	// numeric min-width sort still sees the `@media` prefix.
+	let stacked = const style()
+		.md(style().children(style().gap(space(2))))
+		.children(style().margin_top(space(2)))
+		.divide(style().margin_top(space(4)));
+	print(stacked.class_list());
 
 	// Two methods per slot, deliberately: `background_image` writes the slot
 	// `background_gradient` writes, and `line_height_length` the slot

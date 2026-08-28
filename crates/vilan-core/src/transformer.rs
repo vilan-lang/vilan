@@ -694,8 +694,12 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_column",
         "__db_is_null",
         "__db_close",
+        "__fs_close",
+        "__fs_close_awaited",
         "__fs_stat",
         "__fs_read_dir_all",
+        "__fs_watch",
+        "__fs_watch_stop",
         "__local_get",
         "__session_get",
         "__router_path",
@@ -955,6 +959,30 @@ fn helper_source(name: &str) -> &'static str {
         // `Database`'s `Drop` closes the handle (destruction.md §9). No public
         // `close()` surfaces this — the destructor is the only caller.
         "__db_close" => "function __db_close(database) {\n\tdatabase.close();\n}",
+        // `File`'s `Drop` (filesystem.md §5.1; kolt.local 031 Q1, ruled
+        // (a)+(c) and scoped to `File` alone). `FileHandle.close()` returns a
+        // promise and a destructor cannot await, so the drop INITIATES the
+        // close without waiting: data already written is safe (a resolved
+        // write was handed to the OS), and the process cannot exit under the
+        // pending close (it holds the event loop). What is lost is the
+        // close's own ERROR — reported here rather than left to take the
+        // process down as an unhandled rejection. `with_file` is the spelling
+        // in which the close is awaited and its failure observable.
+        "__fs_close" => {
+            "function __fs_close(file) {\n\
+             \tfile.close().catch((error) => {\n\
+             \t\tconsole.error(\"vilan: closing a dropped file failed:\", error);\n\
+             \t});\n\
+             }"
+        }
+        // `with_file`'s close — awaited, so a failure to close is a failure
+        // of `with_file` itself. The handle's `Drop` still runs at scope end
+        // and re-enters `close()` fire-and-forget; the host close is
+        // idempotent (a second call resolves against the already-closed
+        // handle), so the safety net stays benign behind the awaited path.
+        "__fs_close_awaited" => {
+            "async function __fs_close_awaited(file) {\n\tawait file.close();\n}"
+        }
         // `std::fs::stat` (F13, fullstack-dx.md §9.3): `fs.promises.stat`
         // wrapped so a missing path reads back the `Option` array `None`
         // instead of throwing — vilan has no `try`/`catch`, so the ENOENT
@@ -982,12 +1010,187 @@ fn helper_source(name: &str) -> &'static str {
         // directory throws host-side, matching `read_dir`'s posture. The
         // dynamic `import` is self-contained on purpose, and Node caches
         // module resolution, so a hot loop does not re-resolve it per call.
+        // Entries come back `/`-separated on every host. node's recursive
+        // `readdir` joins with the PLATFORM separator, so on Windows a nested
+        // entry arrived as `sub\\c.txt` — one component to `std::path`, which
+        // is POSIX-shaped by ruling (kolt.local 017: a separator-aware path
+        // module would make every derived cache key, asset url and golden
+        // host-dependent). Normalizing here rather than in `read_dir_all`
+        // keeps the whole language on one path shape, and this is the only
+        // place in std where a host hands back a joined path.
+        //
+        // Gated on `path.sep`, NOT unconditional: a backslash is a LEGAL
+        // filename byte on Linux, so rewriting it there would corrupt a real
+        // name to fix a problem that platform does not have. On Windows a
+        // filename cannot contain one, so splitting is unambiguous exactly
+        // where it runs. (backlog N25)
         "__fs_read_dir_all" => {
             "async function __fs_read_dir_all(path) {\n\
              \tconst fsPromises = await import(\"node:fs/promises\");\n\
-             \treturn await fsPromises.readdir(path, { recursive: true });\n\
+             \tconst nodePath = await import(\"node:path\");\n\
+             \tconst entries = await fsPromises.readdir(path, { recursive: true });\n\
+             \tif (nodePath.sep === \"/\") return entries;\n\
+             \treturn entries.map((entry) => entry.split(nodePath.sep).join(\"/\"));\n\
              }"
         }
+        // `std::fs::Watcher` (kolt.local 020, which owns the watch surface
+        // whole). The mechanism is a stat-diffing POLL, not `node:fs`'s own
+        // `watch`: that binding coalesces and duplicates events, folds
+        // creation, deletion and renaming into one ambiguous `"rename"`,
+        // varies by platform and node version on recursive watching, can
+        // report a null filename on macOS, and throws outright on a path that
+        // does not exist yet. Comparing two `stat`s promises strictly more —
+        // Created / Modified / Removed, unambiguous everywhere — and it is the
+        // choice the compiler made for its own `--watch` loop
+        // (`proposals/proposal/watch-mode.md`).
+        //
+        // The loop lives here rather than in `fs.vl` for two reasons the
+        // language decides: it must own a host timer and a wake queue, and a
+        // walk of a live tree hits paths that vanish between the `readdir` and
+        // the `stat`, which `vilan` has no `try`/`catch` to absorb. It calls
+        // the same `fs.promises.stat` that `std::fs::stat` wraps and compares
+        // the same `mtimeMs`/`size` that `Stat` exposes.
+        //
+        // A self-rescheduling `setTimeout`, deliberately NOT `setInterval`:
+        // the scan is asynchronous, and an interval would stack overlapping
+        // walks on a tree slower to read than the period. Entry keys are
+        // `/`-separated on every host, the same normalization
+        // `__fs_read_dir_all` applies and for the same ruling (kolt.local
+        // 017), and gated on `path.sep` for the same reason — a backslash is a
+        // legal filename byte on Unix.
+        //
+        // A directory's own mtime moves whenever its contents do, so a
+        // directory reports Created and Removed but never Modified: that event
+        // would restate an entry change the watcher has already reported
+        // individually, and it does not fire uniformly across filesystems
+        // anyway. A poll that fails for a reason other than absence reports to
+        // stderr and keeps watching — a permissions error on one tick is not a
+        // reason to silently stop observing.
+        "__fs_watch" => {
+            "class __Watcher {\n\
+             \tconstructor(fsPromises, nodePath, root, recursive, intervalMs) {\n\
+             \t\tthis.fs = fsPromises;\n\
+             \t\tthis.nodePath = nodePath;\n\
+             \t\tthis.root = nodePath.join(root, \".\");\n\
+             \t\tthis.recursive = recursive;\n\
+             \t\tthis.intervalMs = intervalMs;\n\
+             \t\tthis.previous = new Map();\n\
+             \t\tthis.queue = [];\n\
+             \t\tthis.waiters = [];\n\
+             \t\tthis.stopped = false;\n\
+             \t\tthis.id = null;\n\
+             \t}\n\
+             \t__key(path) {\n\
+             \t\treturn this.nodePath.sep === \"/\" ? path : path.split(this.nodePath.sep).join(\"/\");\n\
+             \t}\n\
+             \tasync __stat(path) {\n\
+             \t\ttry {\n\
+             \t\t\treturn await this.fs.stat(path);\n\
+             \t\t} catch (error) {\n\
+             \t\t\tif (error && (error.code === \"ENOENT\" || error.code === \"ENOTDIR\")) return null;\n\
+             \t\t\tthrow error;\n\
+             \t\t}\n\
+             \t}\n\
+             \tasync __snapshot() {\n\
+             \t\tconst seen = new Map();\n\
+             \t\tconst rootStat = await this.__stat(this.root);\n\
+             \t\tif (rootStat === null) return seen;\n\
+             \t\tseen.set(this.__key(this.root), { mtime: rootStat.mtimeMs, size: rootStat.size, dir: rootStat.isDirectory() });\n\
+             \t\tif (!rootStat.isDirectory()) return seen;\n\
+             \t\tlet names;\n\
+             \t\ttry {\n\
+             \t\t\tnames = await this.fs.readdir(this.root, { recursive: this.recursive });\n\
+             \t\t} catch (error) {\n\
+             \t\t\tif (error && error.code === \"ENOENT\") return seen;\n\
+             \t\t\tthrow error;\n\
+             \t\t}\n\
+             \t\tfor (const name of names) {\n\
+             \t\t\tconst full = this.nodePath.join(this.root, name);\n\
+             \t\t\tconst entry = await this.__stat(full);\n\
+             \t\t\tif (entry !== null) seen.set(this.__key(full), { mtime: entry.mtimeMs, size: entry.size, dir: entry.isDirectory() });\n\
+             \t\t}\n\
+             \t\treturn seen;\n\
+             \t}\n\
+             \t__diff(current) {\n\
+             \t\tconst changes = [];\n\
+             \t\tfor (const [ path, now ] of current) {\n\
+             \t\t\tconst before = this.previous.get(path);\n\
+             \t\t\tif (before === undefined) changes.push({ path: path, kind: [ 0 ] });\n\
+             \t\t\telse if (!now.dir && (before.mtime !== now.mtime || before.size !== now.size)) changes.push({ path: path, kind: [ 1 ] });\n\
+             \t\t}\n\
+             \t\tfor (const path of this.previous.keys()) {\n\
+             \t\t\tif (!current.has(path)) changes.push({ path: path, kind: [ 2 ] });\n\
+             \t\t}\n\
+             \t\tchanges.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);\n\
+             \t\treturn changes;\n\
+             \t}\n\
+             \t__arm() {\n\
+             \t\tif (this.stopped) return;\n\
+             \t\tthis.id = setTimeout(() => this.__tick(), this.intervalMs);\n\
+             \t}\n\
+             \tasync __tick() {\n\
+             \t\tthis.id = null;\n\
+             \t\tif (this.stopped) return;\n\
+             \t\tlet current;\n\
+             \t\ttry {\n\
+             \t\t\tcurrent = await this.__snapshot();\n\
+             \t\t} catch (error) {\n\
+             \t\t\tconsole.error(\"vilan: a filesystem watch poll failed:\", error);\n\
+             \t\t\tthis.__arm();\n\
+             \t\t\treturn;\n\
+             \t\t}\n\
+             \t\tif (this.stopped) return;\n\
+             \t\tfor (const change of this.__diff(current)) this.queue.push(change);\n\
+             \t\tthis.previous = current;\n\
+             \t\twhile (this.queue.length > 0 && this.waiters.length > 0) this.waiters.shift().resolve(this.queue.shift());\n\
+             \t\tthis.__arm();\n\
+             \t}\n\
+             \tnext_change(signal) {\n\
+             \t\tif (this.queue.length > 0) return Promise.resolve(this.queue.shift());\n\
+             \t\tconst sig = signal && signal[0] === 0 ? signal[1] : undefined;\n\
+             \t\treturn new Promise((resolve, reject) => {\n\
+             \t\t\tif (this.stopped) {\n\
+             \t\t\t\treject(\"the watcher was dropped while a change was awaited\");\n\
+             \t\t\t\treturn;\n\
+             \t\t\t}\n\
+             \t\t\tif (sig && sig.aborted) {\n\
+             \t\t\t\treject(sig.reason);\n\
+             \t\t\t\treturn;\n\
+             \t\t\t}\n\
+             \t\t\tconst waiter = { resolve: resolve, reject: reject };\n\
+             \t\t\tthis.waiters.push(waiter);\n\
+             \t\t\tif (sig) sig.addEventListener(\"abort\", () => {\n\
+             \t\t\t\tconst parked = this.waiters.indexOf(waiter);\n\
+             \t\t\t\tif (parked >= 0) this.waiters.splice(parked, 1);\n\
+             \t\t\t\treject(sig.reason);\n\
+             \t\t\t}, { once: true });\n\
+             \t\t});\n\
+             \t}\n\
+             \tstop() {\n\
+             \t\tif (this.stopped) return;\n\
+             \t\tthis.stopped = true;\n\
+             \t\tif (this.id !== null) clearTimeout(this.id);\n\
+             \t\tthis.id = null;\n\
+             \t\tconst waiters = this.waiters;\n\
+             \t\tthis.waiters = [];\n\
+             \t\tfor (const waiter of waiters) waiter.reject(\"the watcher was dropped while a change was awaited\");\n\
+             \t}\n\
+             }\n\
+             async function __fs_watch(root, recursive, intervalMs) {\n\
+             \tconst fsPromises = await import(\"node:fs/promises\");\n\
+             \tconst nodePath = await import(\"node:path\");\n\
+             \tconst watcher = new __Watcher(fsPromises, nodePath, root, recursive, intervalMs);\n\
+             \twatcher.previous = await watcher.__snapshot();\n\
+             \twatcher.__arm();\n\
+             \treturn watcher;\n\
+             }"
+        }
+        // `Watcher`'s `Drop` — genuinely synchronous, unlike `File`'s
+        // (`clearTimeout` is not a promise), so this resource needs no part of
+        // Q1's exception. Idempotent: a second stop is a no-op, so the
+        // destructor stays benign behind any earlier `drop(watcher)`. No
+        // public `stop()` surfaces it — the destructor is the only caller.
+        "__fs_watch_stop" => "function __fs_watch_stop(watcher) {\n\twatcher.stop();\n}",
         // Cryptographically random bytes.
         "__random_bytes" => {
             "function __random_bytes(length) {\n\treturn crypto.getRandomValues(new Uint8Array(length));\n}"

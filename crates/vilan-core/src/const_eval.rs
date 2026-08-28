@@ -10,8 +10,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use crate::analyzer::{Expr, Program, SourceId};
-use crate::call_graph::{Call, CallGraph, CallTarget, Node};
+use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason, Node};
+use crate::dispatch_refine::{DispatchSite, RefinedCaller};
 use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -457,18 +458,33 @@ fn inference_candidates(program: &Program) -> Vec<Id> {
 }
 
 /// Deduplicates and deterministically orders the collected `(kind, line)`
-/// pairs into per-kind file contents (newline-terminated). Lines sort
-/// lexically — which is SOUND for the CSS the styling system emits: `.class`
-/// rules ('.' = 0x2E) sort before `:root` variables and `@media` blocks
-/// ('@' = 0x40), so media rules take the later cascade position they need,
-/// and pseudo-class rules don't compete with base rules on cascade order at
-/// all (their classes are distinct and their specificity is higher) — EXCEPT
-/// among `@media (min-width: …)` lines themselves, which sort by ascending
-/// min-width, not by digit bytes. On a wide viewport every narrower
-/// `min-width` rule also matches, specificity ties, and cascade order
-/// decides — so the widest matching breakpoint must come last for a
-/// mobile-first `.sm(x).lg(y)` chain to render `y`. The lexical digit sort
-/// put `1024px` before `640px` and the narrow rule won (B35).
+/// pairs into per-kind file contents (newline-terminated). Every kind's
+/// bytes are a function of the SET of contributions — write order never
+/// leaks (build-hooks.md §5.1) — under a kind-specific rule (const-eval.md
+/// §3):
+///
+/// - **Every kind but `css` sorts lexically by line.** That is the one
+///   content-derived order that assumes nothing about what the lines mean,
+///   and it is exactly what the proposed keyed surface gives an un-keyed
+///   `emit` (`emit_keyed(kind, line, line)` sorts by `(line, line)` —
+///   build-hooks.md §5.3), so these bytes hold if that surface lands.
+///
+/// - **`css` alone adds the cascade override**: `@media (min-width: …)`
+///   lines sort by ascending min-width, after everything else, not by digit
+///   bytes. The lexical half is SOUND for the CSS the styling system emits —
+///   `.class` rules ('.' = 0x2E) sort before `:root` variables and `@media`
+///   blocks ('@' = 0x40), so media rules take the later cascade position
+///   they need, and pseudo-class rules don't compete with base rules on
+///   cascade order at all (their classes are distinct and their specificity
+///   is higher). The width override exists because on a wide viewport every
+///   narrower `min-width` rule also matches, specificity ties, and cascade
+///   order decides — the widest matching breakpoint must come last for a
+///   mobile-first `.sm(x).lg(y)` chain to render `y`, and the lexical digit
+///   sort put `1024px` before `640px` so the narrow rule won (B35). Applied
+///   to any other kind that comparator silently reordered — a line that
+///   happened to parse as a media rule sorted last whatever its first byte,
+///   because `None` precedes `Some` in the key (G5) — which is why it is
+///   fenced to the one kind whose semantics justify it.
 pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> {
     let mut by_kind: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (kind, line) in assets {
@@ -478,15 +494,92 @@ pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> 
         .into_iter()
         .map(|(kind, lines)| {
             let mut lines = lines.into_iter().collect::<Vec<_>>();
-            // Media lines as a group sort after everything else ('@' is the
-            // highest first byte the styling system emits) — the key only has
-            // to order them among themselves and keep the rest lexical.
-            lines.sort_by_key(|line| (media_min_width(line).map(f64::to_bits), *line));
+            if kind == "css" {
+                // Media lines as a group sort after everything else ('@' is
+                // the highest first byte the styling system emits) — the key
+                // only has to order them among themselves and keep the rest
+                // lexical.
+                lines.sort_by_key(|line| (media_min_width(line).map(f64::to_bits), *line));
+            }
             let mut content = lines.join("\n");
             content.push('\n');
             (kind.to_string(), content)
         })
         .collect()
+}
+
+/// Why a build already owns the file an `asset::emit` kind would name, or
+/// `None` when the kind is the program's to write.
+///
+/// **This is THE list of kinds the build's own output namespace owns**, and it
+/// has two consumers that must never disagree about it: the emit-time refusal
+/// ([`interpreter::check_emit_kind`], G7) and the CLI's per-kind prune
+/// (`recordable_emit_kind`, G6). Before it existed they were two literal
+/// arrays, and the drift was not hypothetical — the prune's array shipped in
+/// Order 17 while the write side had no namespace check at all, which is
+/// exactly the hole G7 records: `emit("vl", …)` in a bare build OVERWROTE THE
+/// ENTRY SOURCE at exit 0, because E94's fence checks a kind's SHAPE (one path
+/// segment) and nothing checked whose file that segment names.
+///
+/// The two consumers act on the answer differently, and the difference is the
+/// reason this returns a *reason* rather than a bool:
+///
+/// - **The prune refuses every one of them**, `css` included: a kind here is
+///   some other machinery's file (`sweep_stale_sidecar`'s, `write_chunks`'s)
+///   or the source itself, and the per-kind prune may not delete a file it
+///   does not own.
+/// - **`emit` refuses every one of them EXCEPT [`BuildOwnedKind::StyleSidecar`]**.
+///   `css` is owned by the build *and* `emit` is how it is written — the whole
+///   styling system reaches `<leg>.css` through `emit("css", …)`, and
+///   `write_assets` recognizes that kind by name. It is reserved *against a
+///   build hook* (build-hooks.md §5.6, where a manifest declaring
+///   `[build.asset.css]` is an error naming `std::style`), never against the
+///   const channel that produces it.
+///
+/// `chunks.json` is matched before the `.js` family so the manifest keeps its
+/// own reason; note that `chunks.json` does not end in `.js` anyway, so the
+/// order is documentation rather than load-bearing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BuildOwnedKind {
+    /// `css` — the style sidecar `write_assets` writes and
+    /// `sweep_stale_sidecar` removes.
+    StyleSidecar,
+    /// `vl` — the SOURCE. A bare build's outputs sit exactly where its entry
+    /// does, so this kind's file *is* the program being compiled.
+    EntrySource,
+    /// `js` / `mjs` — the compiled bundle, on the browser and on a process leg.
+    Bundle,
+    /// `chunks.json` — the leg's build manifest.
+    BuildManifest,
+    /// `<arm>.js` — the route-chunk namespace `sweep_stale_chunks` owns by
+    /// pattern rather than by name.
+    RouteChunk,
+}
+
+impl BuildOwnedKind {
+    /// The noun phrase a diagnostic uses for the file this kind collides with.
+    pub fn collides_with(self) -> &'static str {
+        match self {
+            BuildOwnedKind::StyleSidecar => "the style sidecar",
+            BuildOwnedKind::EntrySource => "the entry source a build's outputs sit beside",
+            BuildOwnedKind::Bundle => "the compiled bundle",
+            BuildOwnedKind::BuildManifest => "the build manifest",
+            BuildOwnedKind::RouteChunk => "the build's route-chunk namespace",
+        }
+    }
+}
+
+/// The one list. See [`BuildOwnedKind`] for who reads it and why they answer
+/// differently.
+pub fn build_owned_emit_kind(kind: &str) -> Option<BuildOwnedKind> {
+    match kind {
+        "css" => Some(BuildOwnedKind::StyleSidecar),
+        "vl" => Some(BuildOwnedKind::EntrySource),
+        "js" | "mjs" => Some(BuildOwnedKind::Bundle),
+        "chunks.json" => Some(BuildOwnedKind::BuildManifest),
+        _ if kind.ends_with(".js") => Some(BuildOwnedKind::RouteChunk),
+        _ => None,
+    }
 }
 
 /// The numeric minimum width of an `@media (min-width: …)` line, in px —
@@ -1018,6 +1111,18 @@ impl<'p, 'src> State<'p, 'src> {
     /// never join R — a root's call into R is the offending boundary,
     /// reported at that call site.
     ///
+    /// A trait-dispatched call resolves to `CallTarget::Indirect(TraitDispatch
+    /// | GenericMember)` — also no caller edge, and an `emit` inside a trait
+    /// impl reached only through a bounded generic used to escape the check
+    /// entirely (backlog B143: a clean compile, then a `ReferenceError` at run
+    /// time). The fixpoint now follows [`crate::dispatch_refine`]'s refined
+    /// edges for those sites: an `OnConstraint` site is charged at the ENTRY
+    /// call whose recorded substitution selects an R-member — so a clean
+    /// instantiation of the same generic stays admitted — and every
+    /// unresolvable shape (a value-taken generic, an opaque binding, a
+    /// receiver-less `OnType`) widens to the whole candidate list.
+    /// Over-refusal is the acceptable fallback direction; an escape is not.
+    ///
     /// A call THROUGH a value resolves to `CallTarget::Indirect(Value)`, which
     /// carries no caller edge, so the fixpoint cannot follow it. §2's rule is
     /// therefore a refusal at the point the value is MADE: an R-member
@@ -1072,6 +1177,88 @@ impl<'p, 'src> State<'p, 'src> {
                 }
             }
         }
+        // The dispatch sites the graph deliberately leaves indirect (B143): a
+        // bounded generic's member call, a trait re-dispatch onto a concrete
+        // receiver, or an iterator-protocol `for` edge. Enumerate every
+        // non-const one — node-owned, initializer-owned, and bare top-level —
+        // and let `dispatch_refine` resolve each to the callees its recorded
+        // dispatch actually selects; the reverse map joins the fixpoint below
+        // as extra caller edges.
+        let dispatched_name = |call_id: Id| -> Option<&str> {
+            match crate::async_infer::dispatch_at(self.program, call_id) {
+                Some(GenericDispatch::OnConstraint(_, name))
+                | Some(GenericDispatch::OnType(_, name)) => Some(name),
+                None => None,
+            }
+        };
+        let is_dispatch_target = |target: CallTarget| {
+            matches!(
+                target,
+                CallTarget::Indirect(IndirectReason::TraitDispatch | IndirectReason::GenericMember)
+            )
+        };
+        let mut refinement_sites: Vec<DispatchSite> = Vec::new();
+        for node in graph.nodes() {
+            for call in graph.calls_of(node.id()) {
+                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
+                    continue;
+                }
+                let Some(name) = dispatched_name(call.call_id) else {
+                    continue;
+                };
+                refinement_sites.push(DispatchSite {
+                    owner: RefinedCaller::Node(node.id()),
+                    call: call.call_id,
+                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                });
+            }
+        }
+        // Module-level initializers own no graph node; a dispatch site there
+        // is TopLevel-owned, so an R-selecting resolution is a boundary by
+        // itself. (A `const`-marked initializer never appears here — the
+        // graph skips it, and the const-subtree cut would drop it anyway.)
+        let mut initializer_call_ids: HashSet<Id> = HashSet::default();
+        for binding in self.program.module_level_bindings() {
+            for call in graph.initializer_calls_of(binding) {
+                initializer_call_ids.insert(call.call_id);
+                if !is_dispatch_target(call.target) || self.in_const_subtree(call.call_id) {
+                    continue;
+                }
+                let Some(name) = dispatched_name(call.call_id) else {
+                    continue;
+                };
+                refinement_sites.push(DispatchSite {
+                    owner: RefinedCaller::TopLevel,
+                    call: call.call_id,
+                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                });
+            }
+        }
+        // Top-level statement calls own neither a node nor an initializer
+        // record, so the dispatch record itself is the gate.
+        for (call_id, _) in &self.program.function_calls {
+            if owned_calls.contains(call_id)
+                || initializer_call_ids.contains(call_id)
+                || self.in_const_subtree(*call_id)
+            {
+                continue;
+            }
+            let Some(name) = dispatched_name(*call_id) else {
+                continue;
+            };
+            refinement_sites.push(DispatchSite {
+                owner: RefinedCaller::TopLevel,
+                call: *call_id,
+                candidates: crate::dispatch_refine::candidates_of(self.program, name),
+            });
+        }
+        let mut refined_callers: HashMap<Id, Vec<(RefinedCaller, Id)>> = HashMap::default();
+        for edge in crate::dispatch_refine::refined_edges(self.program, graph, &refinement_sites) {
+            refined_callers
+                .entry(edge.callee)
+                .or_default()
+                .push((edge.caller, edge.anchor));
+        }
         // Propagate to callers through non-const sites; roots never join.
         while let Some(member) = worklist.pop() {
             for caller in graph.callers_of(member) {
@@ -1100,6 +1287,29 @@ impl<'p, 'src> State<'p, 'src> {
                             reaches.insert(caller_id, builtin);
                         }
                         worklist.push(caller_id);
+                    }
+                }
+            }
+            // The refined dispatch edges into this member (B143). The anchor
+            // is the runtime crossing the edge charges — the entry call that
+            // selected the member, or the dispatch site on a conservative
+            // fallback — so the const-subtree cut applies to it exactly as to
+            // a direct site.
+            for (caller, anchor) in refined_callers.get(&member).into_iter().flatten() {
+                if self.in_const_subtree(*anchor) {
+                    continue;
+                }
+                match *caller {
+                    RefinedCaller::TopLevel => boundary_errors.push((*anchor, member)),
+                    RefinedCaller::Node(caller_id) => {
+                        if Some(caller_id) == main_id {
+                            boundary_errors.push((*anchor, member));
+                        } else if in_r.insert(caller_id) {
+                            if let Some(&builtin) = reaches.get(&member) {
+                                reaches.insert(caller_id, builtin);
+                            }
+                            worklist.push(caller_id);
+                        }
                     }
                 }
             }

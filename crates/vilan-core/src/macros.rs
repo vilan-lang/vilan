@@ -750,11 +750,26 @@ fn compile_world(
     macro_std: &PackageSpec,
 ) -> Result<Arc<World>, Vec<Error>> {
     let worlds = WORLDS.get_or_init(|| Mutex::new(HashMap::default()));
-    if let Some(world) = worlds.lock().unwrap().get(&world_key) {
+    // Recover from poisoning rather than propagate it (backlog E97): these two
+    // maps are process-global and the language server CATCHES panics, so a
+    // propagated poison would turn one compiler bug into a session that answers
+    // "internal error" forever. Values are `Arc`s built whole before the lock is
+    // taken, so a recovered guard never observes a half-written world.
+    if let Some(world) = worlds
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&world_key)
+    {
         return Ok(world.clone());
     }
     let failures = FAILURES.get_or_init(|| Mutex::new(HashMap::default()));
-    if let Some(errors) = failures.lock().unwrap().get(&failure_key) {
+    // Recovering (E97), same reason; the clamp below reads a cloned `Arc`, so
+    // nothing in the map is mutated while the guard is held.
+    if let Some(errors) = failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&failure_key)
+    {
         // The cached spans are true for this definition layout; only a span
         // at the END of a since-shortened file could overshoot — clamp it.
         return Err(errors
@@ -809,7 +824,11 @@ fn compile_world(
                 })
                 .collect(),
         );
-        failures.lock().unwrap().insert(failure_key, errors.clone());
+        // Recovering (E97): the `Arc` is complete before the lock is taken.
+        failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(failure_key, errors.clone());
         return Err((*errors).clone());
     }
     let Some(program) = program else {
@@ -819,7 +838,11 @@ fn compile_world(
             span: (0..0).into(),
             msg: "the macro world failed to compile".to_string(),
         }]);
-        failures.lock().unwrap().insert(failure_key, errors.clone());
+        // Recovering (E97): the `Arc` is complete before the lock is taken.
+        failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(failure_key, errors.clone());
         return Err((*errors).clone());
     };
     // The world outlives this analysis (it's cached process-globally), so the
@@ -853,7 +876,11 @@ fn compile_world(
         Ok(transformed) => transformed,
         Err(error) => {
             let errors = Arc::new(vec![error]);
-            failures.lock().unwrap().insert(failure_key, errors.clone());
+            // Recovering (E97): the `Arc` is complete before the lock is taken.
+            failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(failure_key, errors.clone());
             return Err((*errors).clone());
         }
     };
@@ -867,7 +894,11 @@ fn compile_world(
         program: js_program,
         entries,
     });
-    worlds.lock().unwrap().insert(world_key, world.clone());
+    // Recovering (E97): the world is built and `Arc`-wrapped before the lock.
+    worlds
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(world_key, world.clone());
     Ok(world)
 }
 
@@ -1661,7 +1692,14 @@ fn cached_run(
         hasher.finish()
     };
     let expansions = EXPANSIONS.get_or_init(|| Mutex::new(HashMap::default()));
-    if let Some(raw) = expansions.lock().unwrap().get(&key).copied() {
+    // Recovering (E97): a poisoned expansion cache must not wedge the session,
+    // and the values are `&'static str`s leaked before the lock is taken.
+    if let Some(raw) = expansions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied()
+    {
         return Ok(raw);
     }
     let source = interpreter::run_entry(
@@ -1676,7 +1714,12 @@ fn cached_run(
     .map_err(|failure| failure.message)?;
     let leaked: &'static str = Box::leak(source.into_boxed_str());
     crate::leak_tally::record(crate::leak_tally::LeakSite::MacroExpansion, leaked.len());
-    expansions.lock().unwrap().insert(key, leaked);
+    // Recovering (E97): the text is leaked before the lock, so the entry is
+    // whole or absent.
+    expansions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, leaked);
     Ok(leaked)
 }
 
@@ -1763,11 +1806,22 @@ fn parse_cached(text: &str) -> Result<(&'static NodeList<'static>, &'static str)
         OnceLock::new();
     let key = content_key(text);
     let parses = PARSES.get_or_init(|| Mutex::new(HashMap::default()));
-    if let Some(cached) = parses.lock().unwrap().get(&key).copied() {
+    // Recovering (E97): a poisoned parse cache must not wedge the session, and
+    // both halves of the value are `'static` pointers, complete before the lock.
+    if let Some(cached) = parses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied()
+    {
         return Ok(cached);
     }
     let parsed = parse_generated(text)?;
-    parses.lock().unwrap().insert(key, parsed);
+    // Recovering (E97): the tree is parsed and leaked before the lock is taken.
+    parses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, parsed);
     Ok(parsed)
 }
 
@@ -1788,6 +1842,7 @@ fn parse_generated(source: &str) -> Result<(&'static NodeList<'static>, &'static
             // Expansion output walks like any other tree — its elements
             // desugar and its bare-`?` marks become lift regions here
             // (element-syntax.md §4, expression-lifting.md).
+            crate::css::rewrite_items(&mut root.0, source);
             crate::elements::rewrite_items(&mut root.0, source);
             crate::lift::rewrite_items(&mut root.0);
             let leaked: &'static crate::span::Spanned<NodeList<'static>> =

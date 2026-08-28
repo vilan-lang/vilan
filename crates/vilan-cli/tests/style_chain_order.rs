@@ -49,6 +49,7 @@ use vilan_core::token::Token;
 /// change what renders.
 const STYLE_SOURCES: &[&str] = &[
     "vilan/test/style.vl",
+    "vilan/test/theme.vl",
     "vilan/examples/todo/src/todos.vl",
     "vilan/examples/walkthrough/src/views.vl",
     "crates/vilan-cli/templates/browser/counter.vl",

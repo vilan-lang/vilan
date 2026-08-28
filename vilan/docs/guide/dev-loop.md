@@ -173,6 +173,58 @@ The rules are short:
   pipe the build.)
 - `vilan check` produces no artifacts, so it runs no hooks.
 
+Running on every round is right for a Tailwind pass and wrong for a step that
+downloads something, or generates a thousand files. A hook that should run
+only when its inputs move gets a name and says what it reads and writes:
+
+```toml
+[[build.hook]]
+name    = "icons"
+run     = "node scripts/generate-icons.mjs"
+inputs  = ["scripts/generate-icons.mjs", "icons.lock"]
+outputs = ["src/icons.vl"]
+```
+
+It runs on a clean checkout, and then it doesn't: while every `inputs` entry
+and every `outputs` entry still hashes to what it hashed last time, and the
+command itself hasn't changed, the build prints `Fresh   icons` and moves on.
+The rest of the rules:
+
+- **Content, never timestamps.** Rewriting a file with the same bytes is not a
+  change. Touching it isn't either.
+- **Declared paths only, and no globs.** A path is a file or a directory (a
+  directory hashes its whole tree, so `inputs = ["src/static"]` means what it
+  looks like it means). A pattern such as `src/**/*.css` is a manifest error,
+  not a match — it would hash as a file that is never there and freeze the
+  hook after its first run.
+- **A missing input is recorded as missing**, so creating it later re-runs the
+  hook. A missing or hand-edited output re-runs it too.
+- **A hook that declares neither `inputs` nor `outputs` runs every time**,
+  exactly like a `run = [...]` entry. That is the default, and `run` keeps
+  working unchanged.
+- **The record lives in `dist/.build-hooks.json`**, so `rm -rf dist` means
+  what you already think it means: rebuild everything, hooks included. Nothing
+  is cached outside your project. `vilan build --rerun-hooks` is the one-off
+  version, for a hook that reads something it forgot to declare.
+- Hooks run in declaration order, with every `run = [...]` command first.
+
+Freshness is about cost, never about safety: a skipped hook is code you
+already trusted to run, and skipping it buys time, not containment.
+
+A dependency's hooks are a different question, and the answer is still no. If
+a package you depend on declares one, the build says so — one dim `note:` line
+naming it, once per build — and does not run it. Granting one is a line in
+your own manifest, next to where the dependency comes from:
+
+```toml
+[package.dependencies]
+icons = { git = "https://example.com/icons.git", tag = "v1.2.0", build-hooks = true }
+```
+
+Absent means no, and today so does present: **no dependency's hooks run yet**,
+opted in or not. The key exists now so the grant is a reviewable line in a diff
+before there is any mechanism behind it.
+
 ## Freshness for a hand-rolled server
 
 A running server that reads a file once at boot (`fs::read_file_to_str`
@@ -401,7 +453,7 @@ Every build of a browser leg writes it, split or not — a leg that does not
 split gets `"chunks": []` and `"classic_script": false`. That is deliberate:
 an absent file cannot tell "did not split" from "was never built", and
 `build_of` needs the difference. `styles` is `null` when the leg compiled no
-`const style()`, which is the one thing an `fs::exists` probe could never
+`const style()`, which is the one thing an `fs::stat` probe could never
 answer in both directions.
 
 `examples/fullstack`'s server reads it with `build_of("client")` and hands

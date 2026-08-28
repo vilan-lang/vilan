@@ -18479,6 +18479,9 @@ impl<'src> Analyzer<'src> {
             // entity match is a pass bug, degraded like a parse error rather
             // than panicking an analysis.
             Node::Element(..) => Some(Expr::Error),
+            // Likewise for `css` blocks (css::rewrite_items, at every lift
+            // site): one reaching the entity match is a pass bug.
+            Node::Css(..) => Some(Expr::Error),
             Node::Error => Some(Expr::Error),
             Node::Void => Some(Expr::Void),
             Node::Null => Some(Expr::Null),
@@ -21182,7 +21185,29 @@ impl<'src> Analyzer<'src> {
                 let length = self.array_length_literal(length);
                 Some(Type::Array(element_type_id, length))
             }
-            x => unimplemented!("unhandled type node: {:?}", x),
+            // A parse-recovery hole (B142's depth stand-in is the one
+            // type-position producer): the parser already reported it, so the
+            // type degrades to the non-cascading `Unresolved` without a second
+            // diagnostic — the expression walk's `Node::Error => Expr::Error`
+            // arm is the same rule.
+            Node::Error => Some(Type::Unresolved),
+            // Nothing else reaches type position from today's type grammar
+            // (`parse_type_atom` produces only the shapes above), so this arm
+            // is a fence for the NEXT type-position variant: until a new shape
+            // is classified above, the walk refuses it with a diagnostic where
+            // a panic took the whole compile down (backlog B144).
+            _ => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: "this expression cannot be used as a type; write a type here — a \
+                          name, a generic application, a tuple, a closure type, a reference, \
+                          or a fixed-length array"
+                        .to_string(),
+                });
+                Some(Type::Unresolved)
+            }
         };
 
         if let Some(type_) = type_ {
@@ -33896,6 +33921,7 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
         .collect();
     let root: Box<crate::span::Spanned<NodeList<'static>>> = match tree {
         Some(mut root) => {
+            crate::css::rewrite_items(&mut root.0, text);
             crate::elements::rewrite_items(&mut root.0, text);
             crate::lift::rewrite_items(&mut root.0);
             Box::new(root)
@@ -34039,6 +34065,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     );
     let root: &'static crate::span::Spanned<NodeList<'static>> = match tree {
         Some(mut root) => {
+            crate::css::rewrite_items(&mut root.0, source);
             crate::elements::rewrite_items(&mut root.0, source);
             crate::lift::rewrite_items(&mut root.0);
             let leaked = &*Box::leak(Box::new(root));
@@ -35693,7 +35720,14 @@ fn interned_display_name(name: String) -> &'static str {
     use std::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let names = NAMES.get_or_init(|| Mutex::new(HashMap::default()));
-    let mut names = names.lock().unwrap();
+    // Recovering (E97): the last `.unwrap()` in this file's process-global
+    // caches — every neighbour recovers, and a name intern is the cheapest
+    // possible thing to wedge a language-server session on. `String` keys and
+    // `&'static str` values are complete before each insert, so a recovered
+    // guard cannot observe a half-written entry.
+    let mut names = names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = names.get(&name).copied() {
         return existing;
     }
@@ -38811,5 +38845,58 @@ mod fixpoint_progress_tests {
             analyzer.write_type_slot(type_id, type_);
         }
         assert_eq!(analyzer.type_map_writes, 2);
+    }
+}
+
+#[cfg(test)]
+mod walk_type_node_fence_tests {
+    //! B144: `walk_type_node`'s catch-all refuses with a diagnostic where it
+    //! used to `unimplemented!`. The arm is unreachable from today's type
+    //! grammar (`parse_type_atom` produces only the handled shapes, and
+    //! B142's `Node::Error` depth stand-in degrades silently), so it is
+    //! exercised at unit level: the fence's job is to turn the NEXT
+    //! type-position variant into a diagnostic instead of an abort.
+
+    use super::Analyzer;
+    use crate::node::Node;
+    use crate::type_::Type;
+
+    #[test]
+    fn a_non_type_node_in_type_position_is_a_diagnostic_not_a_panic() {
+        let mut analyzer = Analyzer::new();
+        let scope_id = analyzer.create_owned_scope(None).id;
+        let type_id = analyzer.walk_type_node(&(Node::Bool(true), (0..0).into()), scope_id);
+        assert_eq!(
+            analyzer.diagnostics.len(),
+            1,
+            "the catch-all must refuse exactly once: {:?}",
+            analyzer.diagnostics
+        );
+        assert!(
+            analyzer.diagnostics[0]
+                .msg
+                .contains("this expression cannot be used as a type; write a type here"),
+            "unexpected wording: {}",
+            analyzer.diagnostics[0].msg
+        );
+        // The refused slot degrades to the NON-CASCADING type (B32's rule for
+        // already-errored nodes), so downstream consumers stay silent instead
+        // of fanning a second error out of the same root cause.
+        assert_eq!(analyzer.get_type_by_type_id(type_id), Type::Unresolved);
+    }
+
+    #[test]
+    fn a_parse_recovery_hole_in_type_position_stays_silent() {
+        // `Node::Error` already carries the parser's own diagnostic; a second
+        // one here would point at recovered garbage.
+        let mut analyzer = Analyzer::new();
+        let scope_id = analyzer.create_owned_scope(None).id;
+        let type_id = analyzer.walk_type_node(&(Node::Error, (0..0).into()), scope_id);
+        assert!(
+            analyzer.diagnostics.is_empty(),
+            "a recovery hole must not re-report: {:?}",
+            analyzer.diagnostics
+        );
+        assert_eq!(analyzer.get_type_by_type_id(type_id), Type::Unresolved);
     }
 }

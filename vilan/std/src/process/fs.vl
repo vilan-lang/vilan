@@ -21,15 +21,20 @@
 // throws. Every other function in this module has the throwing posture, and a
 // caller who wants to branch on absence probes with `stat` first.
 //
-// Everything here is asynchronous except `exists`, which says at its own
-// declaration why it is not (proposal/filesystem.md §4: a sync variant of an
-// async operation must name the caller that cannot suspend). Nothing this file
-// gained in the write and directory slice has a sync twin, and none was asked
-// for.
+// Everything here is asynchronous — nothing in this module blocks. The last
+// synchronous entry (`exists`, bound to `existsSync`) was DELETED with the
+// handle slice (kolt.local 031 Q3, ruled 2026-08-27): its justification named
+// a category ("boot code") rather than a caller, all three of its callers were
+// already async, and `stat(path).is_some()` answers strictly more.
+// proposal/filesystem.md §4 is the standing rule — a sync variant of an async
+// operation must name the caller that cannot suspend, in a form a later
+// reader can look up and find missing in one grep.
 
 import pkg::bytes::Bytes;
 import pkg::crypto::random_uuid;
+import pkg::drop::Drop;
 import pkg::option::Option::{ None, Some, self };
+import pkg::task::{ CancelSignal, ambient_signal };
 
 /// Reads a file, decoded as text under `encoding` (a `node:fs` encoding name —
 /// `"utf8"`, `"latin1"`, …). Renamed off `read_file_bytes` (2026-08-11, F13):
@@ -67,21 +72,6 @@ async external fun write_file(path: str, contents: str): void;
 [extern("node:fs/promises", "writeFile")]
 async external fun write_bytes(path: str, contents: Bytes): void;
 
-/// Whether a path exists on disk (`node:fs` `existsSync`).
-///
-/// The one synchronous binding in this module, and NOT for the reason a sync
-/// function usually claims: no caller of it cannot suspend. Its callers in
-/// `std::build` (`build_of`, `load_build`) are both async and await their file
-/// reads a line or two later. It is synchronous because `node:fs/promises` has
-/// no `exists` at all — `existsSync` is the whole operation in one call — and
-/// because syncness is the ONLY thing that separates it from
-/// `stat(path).is_some()`, which is right below, is async, and is what to reach
-/// for on a request path. The cost is one blocking stat (node implements
-/// `existsSync` as exactly that): affordable for a boot-time branch, not for a
-/// per-request one.
-[extern("node:fs", "existsSync")]
-external fun exists(path: str): bool;
-
 /// Reads a UTF-8 text file to a string. Async (it awaits `readFile`), so callers
 /// implicitly await it.
 fun read_file_to_str(path: str): str {
@@ -107,7 +97,8 @@ async external fun rename(from: str, to: str): void;
 ///
 /// ATOMIC, NOT DURABLE. After a power loss the rename may not have reached the
 /// device. Durability needs `fsync`, which the host exposes only on an open
-/// file handle — std has no handle type yet (proposal/filesystem.md §5.2).
+/// file handle — `File::open(path)` then `file.sync()`, below
+/// (proposal/filesystem.md §5.2).
 ///
 /// The temporary is uniquely named because concurrent writers must not share
 /// one, so a crash can leave a `<path>.<uuid>.tmp` file behind: `vilan` has no
@@ -442,5 +433,413 @@ fun stat(path: str): Option<Stat> {
 	match raw_stat(path) {
 		Some(let raw) => Some(Stat { size = raw.size(), modified_at_ms = raw.mtime_ms(), is_directory = raw.is_directory() }),
 		None => None,
+	}
+}
+
+// --- the handle tier (kolt.local 031 S3, proposal/filesystem.md §3.2) -----
+
+/// An open file (`node:fs/promises`' `FileHandle`). A `resource`: it moves
+/// rather than copies, a stale binding is a compile error rather than an
+/// `EBADF`, and its `Drop` (below) closes the underlying host handle at the
+/// owner's scope end — `drop(file)` is the early form, and there is no
+/// `close()` to forget or to call twice. A module-level `File` is
+/// process-lifetime, loan-only, and never drops.
+///
+/// The handle is what makes a read-then-act sequence TOCTOU-free: `stat`,
+/// `read_at` and `write_at` address the OPEN FILE, not the path, so nothing
+/// re-resolves between the probe and the act — a rename or removal of the
+/// path changes nothing about what this handle reads.
+///
+/// Two container rules worth meeting here rather than in a diagnostic
+/// (destruction.md R9/R10): a closure cannot capture a `File` (`with_file`
+/// below hands the body its file as a per-call parameter instead), and
+/// `List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
+/// container, so "a pool of open files" is not expressible in v1.
+resource external struct File;
+
+/// The raw host open. Kept behind the five named constructors: node's flags
+/// string is an untyped eleven-member enum whose failure mode is a runtime
+/// `EINVAL`, and a typo in it is a typo the compiler cannot see — each
+/// constructor says in its name what it does to a file that already exists,
+/// which is the only thing anyone ever looks up
+/// (proposal/filesystem.md §3.3).
+[extern("node:fs/promises", "open")]
+async external fun open_with_flags(path: str, flags: str): File;
+
+/// One `FileHandle.read()` result (`{ bytesRead, buffer }`). Opaque and
+/// internal, exactly like `RawStat`: `read_at` copies the one field out, so
+/// no caller touches the host shape.
+external struct RawReadResult;
+
+impl RawReadResult {
+	[extern(get, "bytesRead")]
+	external fun bytes_read(self): i32;
+}
+
+/// One `FileHandle.write()` result (`{ bytesWritten, buffer }`).
+external struct RawWriteResult;
+
+impl RawWriteResult {
+	[extern(get, "bytesWritten")]
+	external fun bytes_written(self): i32;
+}
+
+impl File {
+	/// Opens `path` for reading (host mode `"r"`). The path must exist —
+	/// `ENOENT` otherwise, matching the module's throwing posture; probe with
+	/// `stat` first if absence is an ordinary outcome.
+	fun open(path: str): File {
+		open_with_flags(path, "r")
+	}
+
+	/// Creates `path` for writing, truncating anything already there (host
+	/// mode `"w"`) — the handle form of `write_file`'s posture.
+	fun create(path: str): File {
+		open_with_flags(path, "w")
+	}
+
+	/// Creates `path` for writing and FAILS (`EEXIST`) if anything is already
+	/// there (host mode `"wx"`) — the exclusive create: how one process
+	/// claims a name without racing another, and the second reading of
+	/// "write atomically" (`write_atomic` above is the first). The primitive
+	/// a lockfile package would be built from.
+	fun create_new(path: str): File {
+		open_with_flags(path, "wx")
+	}
+
+	/// Opens `path` for appending, creating it if missing (host mode `"a"`).
+	/// HOST SEMANTICS, kept rather than papered over: every write through an
+	/// append handle lands at the END of the file — `write_at`'s position is
+	/// IGNORED on this handle (POSIX `O_APPEND`).
+	fun append_to(path: str): File {
+		open_with_flags(path, "a")
+	}
+
+	/// Opens `path` for reading AND writing without truncating it (host mode
+	/// `"r+"`). The path must exist — the mode for editing in place.
+	fun modify(path: str): File {
+		open_with_flags(path, "r+")
+	}
+
+	[extern(method, "read")]
+	async external fun raw_read(self, buffer: Bytes, offset: i32, length: i32, position: i53): RawReadResult;
+
+	[extern(method, "write")]
+	async external fun raw_write(self, buffer: Bytes, offset: i32, length: i32, position: i53): RawWriteResult;
+
+	/// Reads into `buffer` from byte `position` of the file; returns the
+	/// number of bytes actually read — `buffer.len()` at most, fewer near the
+	/// end of the file, `0` at end of file. Short reads are normal and are
+	/// not an error.
+	///
+	/// Positional and stateless BY DESIGN: a `File` has no cursor, so two
+	/// loans of one handle cannot silently interleave through hidden
+	/// host-side position state — which is why the host's implicit-position
+	/// read mode is deliberately not bound (proposal/filesystem.md §3.4).
+	fun read_at(self, buffer: Bytes, position: i53): i32 {
+		self.raw_read(buffer, 0, buffer.len(), position).bytes_read()
+	}
+
+	/// Writes all of `buffer` at byte `position` of the file (extending it if
+	/// the write reaches past the end); returns the number of bytes written.
+	/// Positional and stateless, like `read_at` — and on an `append_to`
+	/// handle the position is ignored (see there).
+	fun write_at(self, buffer: Bytes, position: i53): i32 {
+		self.raw_write(buffer, 0, buffer.len(), position).bytes_written()
+	}
+
+	[extern(method, "stat")]
+	async external fun raw_handle_stat(self): RawStat;
+
+	/// This open file's metadata — `stat(path)` without the path, so there is
+	/// no missing-path case and no `Option`: the handle addresses the open
+	/// file itself, and a rename or removal of the path in between changes
+	/// nothing about what is measured.
+	fun stat(self): Stat {
+		let raw = self.raw_handle_stat();
+		Stat {
+			size = raw.size(),
+			modified_at_ms = raw.mtime_ms(),
+			is_directory = raw.is_directory(),
+		}
+	}
+
+	/// Truncates the file to `length` bytes — or extends it, zero-filled.
+	[extern(method, "truncate")]
+	async external fun truncate(self, length: i53): void;
+
+	/// Flushes this file's data AND metadata to the storage device (`fsync`)
+	/// — the durability primitive, and a capability nothing path-addressed in
+	/// this module has: `write_atomic` is atomic but not durable, and this is
+	/// what closes that gap (proposal/filesystem.md §5.2).
+	[extern(method, "sync")]
+	async external fun sync(self): void;
+
+	/// `fdatasync` — flushes the data only, not the metadata timestamps: the
+	/// cheaper sync for a log whose contents are all that matters.
+	[extern(method, "datasync")]
+	async external fun data_sync(self): void;
+}
+
+/// Closes the underlying host handle — the one host operation with no public
+/// surface. Reachable only from `File`'s `Drop` below, so there is no
+/// `close()` to fall out of sync with the destructor; `drop(file)` is the
+/// early form. THE ONE `File` EXCEPTION to destruction.md §5's "drop is
+/// synchronous": `FileHandle.close()` returns a promise a destructor cannot
+/// await, so the drop INITIATES the close without awaiting it — ruled
+/// 2026-08-27 (kolt.local 031 Q1: (a)+(c), scoped to `File` ALONE, not a
+/// general license for async teardown). What that costs, honestly: data
+/// already written is safe (a resolved `write_at` was handed to the OS) and
+/// the process cannot exit under a pending close, but the close's ERROR is
+/// unobservable here (the glue reports it to stderr), and dropping a handle
+/// then immediately re-opening or unlinking its path races the descriptor's
+/// release — benign on POSIX, not always on Windows. `with_file` below is
+/// the spelling in which the close is awaited and a failure observable.
+[extern("__fs_close")]
+external fun close_handle(file: File): void;
+
+impl File with Drop {
+	/// Runs at the owner's scope end (or at an explicit `drop(file)`):
+	/// initiates the close through the `&mut self` loan. Synchronous and
+	/// context-free, as a destructor must be — the close itself completes in
+	/// the background (see `close_handle`).
+	fun drop(&mut self) {
+		close_handle(self);
+	}
+}
+
+/// `with_file`'s close — AWAITED, unlike the destructor's, so a failure to
+/// close is a failure of `with_file` itself. Not a public `close()`: a free
+/// function the completion list never offers on a `File`, with `with_file`
+/// as its one caller.
+[extern("__fs_close_awaited")]
+async external fun close_awaited(file: File): void;
+
+/// Opens `path` for reading, runs `body` with the open file, closes it, and
+/// hands back what `body` returned — with the close AWAITED, which the
+/// destructor's close deliberately is not (kolt.local 031 Q1's ruling): the
+/// documented idiom for handle use, and the only spelling in which a failure
+/// to close is observable.
+///
+/// The file arrives as `body`'s PARAMETER — per-call, not a capture — which
+/// is why a closure can be handed a resource at all (destruction.md R9). And
+/// `body` is a plain value-returning closure, so it is asyncness-polymorphic
+/// (async-polymorphism.md): a body that awaits makes that `with_file` await
+/// too, with nothing to write at either site. Should `body` throw, the
+/// scope-end `Drop` still closes the handle — the safety net behind the
+/// awaited path; the host close is idempotent, so the net stays benign when
+/// both run.
+fun with_file<T>(path: str, body: |File| T): T {
+	let file = File::open(path);
+	let result = body(file);
+	close_awaited(file);
+	result
+}
+
+// --- the watch tier (kolt.local 020, which owns this surface whole) --------
+//
+// THE MECHANISM IS POLLING, deliberately, and this is the load-bearing choice
+// in the tier. `node:fs`'s own `watch` is the least portable thing the host
+// exposes: its events coalesce and also duplicate, its `"rename"` covers
+// creation, deletion and actual renaming with no way to tell which without a
+// `stat`, recursive watching is not available on every platform and every
+// version, macOS can report a null filename, and an `fs.watch` on a path that
+// does not exist yet throws instead of waiting for it. A watcher built on it
+// could therefore promise only "something changed under here, go look" — which
+// is why the design sketch this tier replaces (filesystem.md §8) had a
+// two-variant `ChangeKind { Changed, Renamed }`: an under-promise calibrated
+// to what every platform agrees on.
+//
+// Comparing two stats instead promises MORE, on every platform, for free: an
+// entry present now and absent before was Created, absent now and present
+// before was Removed, and one whose size or mtime moved was Modified. Nothing
+// is coalesced into an ambiguity and nothing is platform-conditional. It is
+// also the choice the compiler made for its own `--watch` loop
+// (proposal/watch-mode.md: "a dependency-free poll ... every ~300 ms ... If
+// trees ever grow enough to matter, swapping in an event-based watcher is a
+// localized change behind the same loop"), which has run that way since
+// 2026-07-02.
+//
+// What polling costs, stated rather than hidden: latency up to one interval
+// before a change is seen; a change that CANCELS OUT inside one interval (a
+// file created and deleted between two observations) is never reported at all,
+// because there is nothing left to compare; a rewrite that alters NEITHER the
+// size NOR the mtime is invisible, which is a real risk only where mtime is
+// second-granular (some filesystems still are — the size is compared as well
+// precisely because it is the half that never has granularity); and one `stat`
+// per watched entry per interval, which on a recursive watch of a large tree
+// is real syscall load. Watch the narrowest path that answers your question.
+
+/// A live watch on a path — the tier's resource, built on `File`'s model
+/// exactly (`Database` before it): it moves rather than copies, so a stale
+/// watcher is a compile error; a closure cannot capture one and no
+/// `List`/`Map`/`Set` can hold one (destruction.md R9/R10); and its `Drop`
+/// stops the watch at the owner's scope end. There is no public `stop()` to
+/// fall out of sync with the destructor — `drop(watcher)` is the early form.
+///
+/// UNLIKE `File`, ITS TEARDOWN IS GENUINELY SYNCHRONOUS. Stopping a poll is a
+/// `clearTimeout`, so `Drop` needs none of `File`'s async-close exception
+/// (kolt.local 031 Q1, which was ruled for `File` ALONE); destruction.md §5's
+/// "drop is synchronous in v1" holds here with nothing asked of it. This is
+/// `Database`'s situation, not `File`'s.
+///
+/// The stop is not decoration: a watcher polls on a host timer, and a pending
+/// host timer KEEPS THE PROCESS ALIVE — exactly as `std::time::Timer`
+/// documents for itself. A watcher that is never dropped is a program that
+/// never exits.
+resource external struct Watcher;
+
+/// What happened to a path between two observations. Three variants and no
+/// catch-all, because comparing two stats leaves no fourth possibility — the
+/// opposite call from `Entry`'s three booleans above, and for the opposite
+/// reason: a host dirent has NINE open-ended kinds, while a change is a closed
+/// three-way outcome the poller computes itself.
+///
+/// A rename arrives as `Removed` on the old path plus `Created` on the new
+/// one, in the same batch. That is what a rename IS to an observer comparing
+/// two directory listings, and it is strictly more than node's `fs.watch`
+/// reports (one `"rename"` event, sometimes only for one of the two paths).
+///
+/// An ordinary (unbacked) enum: the host poller hands its verdict across in
+/// the `Option` ARRAY FORM this module already uses at every other host
+/// boundary (`__fs_stat`, `__db_get`, `std::process::env`), so nothing has to
+/// leak a meaningless integer identity into a public type to get it here.
+enum ChangeKind {
+	Created,
+	Modified,
+	Removed,
+}
+
+/// One observed change: the path it happened to, and which of the three
+/// things it was.
+///
+/// `path` is ADDRESSABLE — the watched root joined with the entry's place
+/// under it, so it is exactly the string to hand to `read_file_to_str`,
+/// `stat` or `File::open`, with no joining at the call site. (`read_dir` and
+/// `read_dir_all` hand back bare names and relative paths because a listing's
+/// caller often wants the name itself; a change's caller always wants to act
+/// on it.) Watching a single FILE reports that file's own path back. Entries
+/// are `/`-separated on every host, like `read_dir_all`'s.
+///
+/// Deliberately NOT carrying the entry's kind. For a `Created` or `Modified`
+/// path, `stat(change.path)` answers live and answers more; for a `Removed`
+/// one the entry is gone and only a REMEMBERED kind exists, and this module
+/// does not hand back remembered facts dressed as current ones.
+struct Change {
+	path: str,
+	kind: ChangeKind,
+}
+
+/// The raw host change record. Opaque and internal, exactly like `RawStat` and
+/// `RawEntry` above — `next` copies the two fields into a plain `Change`, so
+/// no caller touches the host shape.
+external struct RawChange;
+
+impl RawChange {
+	[extern(get, "path")]
+	external fun path(self): str;
+
+	[extern(get, "kind")]
+	external fun kind(self): ChangeKind;
+}
+
+/// The raw start. Kept behind the two named constructors, the way
+/// `open_with_flags` is kept behind `File`'s five: the recursion flag and the
+/// poll interval are decisions the surface should make, not arguments a caller
+/// gets wrong. Async because the BASELINE is taken here — a watcher reports
+/// changes since the moment it was created, which requires reading the tree
+/// once before returning.
+///
+/// The whole poll lives host-side (`__fs_watch`, `transformer.rs`) for the
+/// same reason `__fs_stat` does: the loop must own a host timer and a queue,
+/// and it must survive a `stat` that fails on a path that vanished mid-walk,
+/// which `vilan` has no `try`/`catch` to express. It calls the same
+/// `fs.promises.stat` that `stat` above wraps, and compares the same
+/// `mtimeMs`/`size` that `Stat` exposes.
+[extern("__fs_watch")]
+async external fun start_watch(path: str, recursive: bool, interval_ms: i32): Watcher;
+
+impl Watcher {
+	/// Watches `path` and, when it is a directory, its IMMEDIATE entries —
+	/// `read_dir`'s reach. The path need not exist yet: a watcher on a path
+	/// that is not there reports `Created` when it appears, which is a thing
+	/// `fs.watch` cannot do at all (it throws on a missing path).
+	///
+	/// The interval is 300 ms, the number the compiler's own `--watch` loop
+	/// has used since it shipped (proposal/watch-mode.md). It is not a
+	/// parameter: no caller has asked for one, one number across the language
+	/// is worth more than a knob, and adding `watch_every` later is additive
+	/// rather than breaking.
+	fun watch(path: str): Watcher {
+		start_watch(path, false, 300)
+	}
+
+	/// Watches `path` and everything under it, however deep —
+	/// `read_dir_all`'s reach, and the `_all` suffix means the same thing it
+	/// means there. Costs one `stat` per entry in the tree per interval; on a
+	/// large tree that is the expensive call in this module.
+	fun watch_all(path: str): Watcher {
+		start_watch(path, true, 300)
+	}
+
+	[extern(method, "next_change")]
+	async external fun raw_next(self, signal: Option<CancelSignal>): RawChange;
+
+	/// The next change, awaiting one if nothing has happened yet — the pull
+	/// shape, and the whole surface for consuming a watch. Async, so a caller
+	/// awaits it implicitly and the ordinary spelling is a plain loop:
+	///
+	/// ```text
+	/// let watcher = Watcher::watch_all("src");
+	/// loop {
+	///     let change = watcher.next();
+	///     rebuild(change.path);
+	/// }
+	/// ```
+	///
+	/// PULL, NOT CALLBACK, and the reason is the language rather than
+	/// fashion. A `|Change| void` observer is a VOID channel, which
+	/// async-polymorphism.md makes fire-and-forget: a handler that wanted to
+	/// read the file it was just told about could not await the read, and
+	/// would drop the promise on the floor. (`Signal::sub` is that shape on
+	/// purpose; a watch handler is not.) Meanwhile R9 forbids a closure from
+	/// capturing a resource, so such a handler could not hold an open `File`
+	/// either, leaving it to re-open by path per event — a TOCTOU race and a
+	/// fresh open each time. `next` has neither problem: it returns a value
+	/// into a scope that can already own a `File`, and it reads exactly like
+	/// `BodyReader`'s chunk loop in `std::fetch`, which is the same problem
+	/// (a sequence of things arriving over time) already solved this way.
+	///
+	/// Changes are QUEUED, so nothing observed is lost while the caller is
+	/// busy — the poll runs on its own timer and does not wait to be asked.
+	/// Several changes seen in one interval arrive path-sorted and one at a
+	/// time; the order among them carries no timing information, because they
+	/// were observed together.
+	///
+	/// Inside a nursery's dynamic extent the wait carries the ambient cancel
+	/// signal, exactly as `sleep` and `Timer::wait` do. That is not a
+	/// nicety: without it a cancelled nursery whose body is parked on a change
+	/// that will never come could never drain.
+	fun next(self): Change {
+		let raw = self.raw_next(ambient_signal());
+		Change { path = raw.path(), kind = raw.kind() }
+	}
+}
+
+/// Stops the watch and clears its host timer — the one host operation with no
+/// public surface. Reachable only from `Watcher`'s `Drop` below, so there is
+/// no `stop()` to fall out of sync with the destructor; `drop(watcher)` is the
+/// early form. Synchronous and idempotent (a second stop is a no-op), which is
+/// why this resource needs no exception to destruction.md §5.
+[extern("__fs_watch_stop")]
+external fun stop_watch(watcher: Watcher): void;
+
+impl Watcher with Drop {
+	/// Runs at the owner's scope end (or at an explicit `drop(watcher)`):
+	/// stops the poll through the `&mut self` loan. Synchronous and
+	/// context-free, as a destructor must be — and genuinely synchronous, not
+	/// `File`'s initiated-and-abandoned close.
+	fun drop(&mut self) {
+		stop_watch(self);
 	}
 }

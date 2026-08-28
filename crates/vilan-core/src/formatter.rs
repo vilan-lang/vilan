@@ -481,7 +481,7 @@ pub fn sort_import_runs<'src>(tokens: &[Token<'src>]) -> Vec<Token<'src>> {
 // — layout, flexbox/grid, spacing, sizing, typography, backgrounds, borders,
 // effects, filters, tables, transitions/animation, transforms, interactivity,
 // svg, accessibility — with every CONDITION method after every property method,
-// in the axis order the selector nests them (media → dark → attribute →
+// in the axis order the selector nests them (media → relation → attribute →
 // pseudo): the same shape as Tailwind's plugin putting variant groups last.
 //
 // Two rules keep the reorder SEMANTICS-preserving, which is not optional: a
@@ -541,12 +541,14 @@ pub enum StyleCategory {
 
 /// The four condition axes, in the order the selector nests them (and therefore
 /// the order the condition combinators require at the call site — see
-/// `render_rule` in `vilan/std/src/style.vl`).
+/// `render_rule` in `vilan/std/src/style.vl`). `Relation` is the axis
+/// `within`/`children`/`divide` write (ui-styling.md §0bis.6) — it holds the
+/// grammar seat the deleted `dark` held.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ConditionAxis {
     Media,
-    Dark,
+    Relation,
     Attribute,
     Pseudo,
 }
@@ -679,7 +681,9 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("lg",        ConditionAxis::Media),
     ("xl",        ConditionAxis::Media),
     ("media",     ConditionAxis::Media),
-    ("dark",      ConditionAxis::Dark),
+    ("within",    ConditionAxis::Relation),
+    ("children",  ConditionAxis::Relation),
+    ("divide",    ConditionAxis::Relation),
     ("attribute", ConditionAxis::Attribute),
     ("hover",     ConditionAxis::Pseudo),
     ("focus",     ConditionAxis::Pseudo),
@@ -705,6 +709,7 @@ pub const STYLE_BARRIER_METHODS: &[&str] = &[
     "with_length",
     "with_color",
     "with_border",
+    "child_relation",
     "add",
     "class_list",
 ];
@@ -3101,6 +3106,26 @@ impl<'src> Printer<'src> {
         spans
     }
 
+    /// A `css { … }` block, reprinted VERBATIM from its source span — S2's
+    /// passthrough (proposal/css-block.md §8, §11). It exists so the bail set
+    /// stays empty: there are three `_ => self.bailed = true` fallbacks, the set
+    /// is asserted EMPTY by `parse_differential::formatter_never_silently_bails`,
+    /// and a bail returns the whole FILE unformatted while `--check` calls it
+    /// clean — so a grammar slice without a printer arm would silently stop
+    /// formatting every file containing a block. The canonical printer (one
+    /// declaration per line, nested rules at +1, canonical declaration order
+    /// shared with the chain sorter) is S3; until then the block's interior is
+    /// exactly what the author wrote, which satisfies the token-equality net
+    /// trivially — the slice re-lexes to the very tokens it came from.
+    ///
+    /// The comment cursor is advanced past the block without emitting: any `//`
+    /// inside it is already in the slice, and flushing it again would print it
+    /// twice.
+    fn print_css_verbatim(&mut self, span: Span) {
+        self.skip_comments_before(span.end);
+        self.out.push_str(&self.source[span.into_range()]);
+    }
+
     fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
         // A comment between the element's items forces the split — collapsed,
         // there is no line to keep it on — and the split loops below attach it
@@ -4135,6 +4160,7 @@ impl<'src> Printer<'src> {
                 self.out.push(')');
             }
             Node::Element(body) => self.print_element(body),
+            Node::Css(_) => self.print_css_verbatim(expr.1),
             _ => self.bailed = true,
         }
     }
@@ -4734,6 +4760,65 @@ mod bailing_constructs {
             format(expected),
             expected,
             "canonical form did not round-trip: {expected:?}"
+        );
+    }
+
+    // --- `css` blocks: S2's verbatim passthrough (css-block.md §8) -----------
+    // The canonical printer is S3. What S2 owes is that the bail set stays
+    // EMPTY: a bail returns the whole FILE unformatted while `--check` calls it
+    // clean, so a grammar slice with no printer arm silently stops formatting
+    // every file holding a block. `assert_construct` checks exactly that
+    // (token identity, no silent bail, the canonical form, idempotence, and
+    // the canonical form round-tripping) — with "canonical" meaning, this
+    // slice, "byte-for-byte what the author wrote".
+
+    #[test]
+    fn a_css_block_reprints_verbatim() {
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tgap: {space( 4 )};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tgap: {space( 4 )};\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_css_block_survives_reformatting_around_it() {
+        // The code OUTSIDE the block canonicalizes; the block's own interior —
+        // including a hole's inner spacing, which S3 will normalize — does not.
+        assert_construct(
+            "fun f(){let a=css{color:red;};a}\n",
+            "fun f() {\n\tlet a = css{color:red;};\n\ta\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_nested_css_rule_reprints_verbatim() {
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_a_css_block_is_printed_once() {
+        // The slice already carries the comment, so the comment cursor is
+        // advanced past the block without emitting — flushing it again would
+        // print it twice, which the token net cannot catch (comments are not
+        // tokens).
+        let source = "fun f() {\n\tcss {\n\t\t// a note\n\t\tcolor: red;\n\t}\n}\n";
+        assert_construct(source, source);
+        assert_eq!(format(source).matches("// a note").count(), 1);
+    }
+
+    #[test]
+    fn a_css_block_mixes_with_a_style_chain_in_one_file() {
+        // The chain sorter's two gates (`starts_style_builder` on tokens,
+        // `is_style_builder` on the AST) do not fire on a block — the formatter
+        // reparses source and never sees the desugar, and there is no
+        // `style ( )` token run in it — so the chain beside it sorts and the
+        // block does not. S3 gives the block its own canonical order.
+        assert_construct(
+            "fun f() {\n\tlet a = style().padding(x).display(y);\n\tlet b = css { color: red; };\n\tb\n}\n",
+            "fun f() {\n\tlet a = style().display(y).padding(x);\n\tlet b = css { color: red; };\n\tb\n}\n",
         );
     }
 
@@ -8273,15 +8358,29 @@ mod style_chain_order {
     }
 
     /// Among themselves the conditions follow the axis order the selector nests
-    /// them in — media, dark, attribute, pseudo — which is the order the
-    /// combinators already require when they are NESTED (`style.vl`'s
+    /// them in — media, the relation, attribute, pseudo — which is the order
+    /// the combinators already require when they are NESTED (`style.vl`'s
     /// `render_rule`). Written here in exactly the reverse.
     #[test]
     fn conditions_sort_in_the_axis_order_the_selector_nests() {
+        // The sorted chain is over the 100-column budget, so the canonical
+        // form is also the split form — one link per line.
         assert_construct(
-            "let s = const style().hover(a).attribute(\"data-open\", \"true\", b).dark(c).md(d);\n",
-            "let s = const style().md(d).dark(c).attribute(\"data-open\", \"true\", b).hover(a);\n",
+            "let s = const style().hover(a).attribute(\"data-open\", \"true\", b).within(\"data-theme\", \"dark\", c).md(d);\n",
+            "let s = const style()\n\t.md(d)\n\t.within(\"data-theme\", \"dark\", c)\n\t.attribute(\"data-open\", \"true\", b)\n\t.hover(a);\n",
         );
+    }
+
+    /// The three relations share one axis, so they keep their written order —
+    /// `children`/`divide` never cross `within` or each other.
+    #[test]
+    fn relations_keep_their_written_order() {
+        for chain in [
+            "let s = const style().children(a).divide(b);\n",
+            "let s = const style().divide(a).within(\"data-theme\", \"dark\", b);\n",
+        ] {
+            assert_construct(chain, chain);
+        }
     }
 
     /// Two conditions on the SAME axis keep their written order, which is what
