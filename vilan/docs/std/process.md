@@ -316,6 +316,23 @@ impl File {
 }
 
 fun with_file<T>(path: str, body: |File| T): T   // open, run, close — close AWAITED
+
+// the watch tier — a live watch, pulled one change at a time
+resource external struct Watcher
+
+enum ChangeKind { Created, Modified, Removed }
+
+struct Change {
+    path: str,          // the watched root joined with the entry — addressable as-is
+    kind: ChangeKind,
+}
+
+impl Watcher {
+    fun watch(path: str): Watcher      // the path and, if a directory, its immediate entries
+    fun watch_all(path: str): Watcher  // the path and everything under it, however deep
+
+    fun next(self): Change             // async — the next change, awaiting one if none is pending
+}
 ```
 
 Everything here throws host-side on any failure, missing path included —
@@ -498,6 +515,77 @@ fun main() {
 }
 main();
 ```
+
+Watching is the last tier, and it is a `resource` for the same reason a
+handle is. `Watcher::watch(path)` observes a path and, when it is a
+directory, its immediate entries; `watch_all` observes the whole tree
+beneath it — `read_dir` and `read_dir_all`'s reach, and the `_all` suffix
+means the same thing here. The path does not have to exist yet: a watch on
+something absent reports `Created` when it appears. You consume a watch by
+*pulling*:
+
+```vilan,norun
+import std::fs::{ Change, ChangeKind, Watcher };
+import std::print;
+
+fun describe(change: Change): str {
+	match change.kind {
+		ChangeKind::Created => i"created {change.path}",
+		ChangeKind::Modified => i"modified {change.path}",
+		ChangeKind::Removed => i"removed {change.path}",
+	}
+}
+
+fun main() {
+	let watcher = Watcher::watch_all("src");
+	print(describe(watcher.next()));
+	print(describe(watcher.next()));
+}
+main();
+```
+
+`next()` is async, so it reads like a plain call and suspends until
+something happens; `change.path` is the watched root joined with the
+entry, which means it is the string to hand straight to
+`read_file_to_str` or `File::open` with no joining of your own. There is
+no callback form, and the reason is the language rather than taste: a
+`|Change| void` observer is a *void* channel, so a handler could not await
+the read of the file it was just told about, and a closure cannot capture
+a `File` to hold one open across events either. A pull returns into a
+scope that can already own a handle.
+
+**The mechanism is polling, and the tier says so out loud.** Every 300 ms
+— the interval the compiler's own `--watch` has used since it shipped —
+the watcher stats what it is watching and compares. That buys an honest
+three-way answer on every platform, which the host's own `fs.watch`
+cannot give: it coalesces events and sometimes duplicates them, folds
+creation, deletion and renaming into one `"rename"` you have to `stat` to
+disambiguate, varies by platform and version on recursive watching, and
+throws outright on a path that is not there yet. What polling costs
+instead: up to one interval of latency; a change that *cancels out* inside
+one interval (a file created and deleted between two observations) is
+never reported, because nothing is left to compare; a modification that
+alters neither the size nor the mtime is invisible, which matters on
+filesystems whose mtime is second-granular; and one `stat` per watched
+entry per interval, so `watch_all` on a large tree is the expensive call
+in this module. Watch the narrowest path that answers your question.
+A rename arrives as `Removed` on the old path and `Created` on the new
+one — what a rename *is* to an observer comparing two listings. A
+directory reports `Created` and `Removed` but never `Modified`: its mtime
+moves whenever its contents do, and those entry changes are already
+reported one by one. Changes seen in the same interval arrive one pull at
+a time, path-sorted, and the order among them carries no timing
+information.
+
+A `Watcher` moves rather than copies, a closure cannot capture one, and
+`List`/`Map`/`Set` cannot hold one — `File`'s rules exactly. Its
+destructor stops the poll at scope end, `drop(watcher)` is the early form,
+and there is no `stop()` to forget or to call twice. That destructor is
+load-bearing rather than tidy: a pending host timer keeps the process
+alive, so **a watcher that is never dropped is a program that never
+exits.** Unlike `File`, its teardown is genuinely synchronous — stopping a
+poll is a `clearTimeout`, not a promise — so nothing here inherits the
+handle's asynchronous-close exception.
 
 ## std::build
 
@@ -729,6 +817,12 @@ A completed `main` ends the process; long-lived programs must hold it open
 fun is_watching(): bool     // is this a `vilan run --watch` child?
 fun force_refresh(): void   // ask every connected browser to reload once
 ```
+
+**This module is not a file watcher**, despite its name — that is
+[`std::fs`'s `Watcher`](#stdfs), above. `std::watch` is the dev-refresh
+channel: whether *this process* is a `vilan run --watch` child, and how to
+tell connected browsers to reload. The two never meet; a program can use
+both.
 
 `is_watching()` is defined under every run and is `true` only under
 `vilan run --watch`, so a program branches on it without knowing how it

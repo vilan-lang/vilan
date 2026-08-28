@@ -1,0 +1,31 @@
+import std::drop::drop;
+import std::fs::{ Change, ChangeKind, Watcher };
+import std::print;
+
+// The watch tier (kolt.local 020): the pull-shaped `next`, the three-variant
+// `ChangeKind` matched with no catch-all, and both spellings of teardown — an
+// early `drop(watcher)` and the scope-end `Drop` that fires `__fs_watch_stop`
+// inside a finally. This is where the poll helper's own bytes are held: it is
+// the largest runtime helper `std::fs` emits, and nothing else pins it whole.
+// Excluded from the macro interpreter gate — the filesystem is a host
+// capability, every call here awaits, and a watch never ends on its own.
+
+fun describe(change: Change): str {
+	match change.kind {
+		ChangeKind::Created => i"created {change.path}",
+		ChangeKind::Modified => i"modified {change.path}",
+		ChangeKind::Removed => i"removed {change.path}",
+	}
+}
+
+fun main() {
+	// A flat watch, stopped early by an explicit drop.
+	let flat = Watcher::watch("watch-corpus");
+	print(describe(flat.next()));
+	drop(flat);
+
+	// A recursive watch, stopped by the scope-end destructor.
+	let deep = Watcher::watch_all("watch-corpus");
+	print(describe(deep.next()));
+}
+main();

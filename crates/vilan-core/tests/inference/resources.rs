@@ -5269,6 +5269,287 @@ fn fs_exists_is_gone_and_the_import_says_so() {
     );
 }
 
+// --- kolt.local 020: `Watcher` — the watch tier, and std's third resource.
+// Designed to MATCH `File` by ruling (the owner, 2026-08-28: 020 owns the whole
+// watch surface, shape and mechanism both, and its resource follows
+// filesystem.md §5's lifetime model): `resource external struct`, construction
+// through associated funs over one raw async extern, release a module-level
+// free function reachable only from `Drop`, no public `stop()`. Where it
+// DIVERGES from `File` is the interesting half — stopping a poll is a
+// `clearTimeout`, so the teardown is genuinely synchronous and Q1's
+// async-close exception (ruled for `File` ALONE, deliberately) is NOT
+// inherited. Runtime behavior against real file activity is pinned in
+// `crates/vilan-cli/tests/fs.rs`; these pin the semantics and the emission.
+
+#[test]
+fn a_watcher_binding_moves_and_a_later_use_is_use_after_move() {
+    // R1 on the third std resource: a stale watcher is a compile error.
+    assert_use_after_move_noting(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch("src");
+            let heir = watcher;
+            watcher.next();
+        }
+        "#,
+        "watcher",
+        1,
+    );
+}
+
+#[test]
+fn a_list_of_watchers_is_rejected() {
+    // R10: no `List<Watcher>` either — "watch several trees" is not
+    // expressible in v1 any more than "a pool of open files" is.
+    assert_fails_with(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watchers: List<Watcher> = [];
+        }
+        "#,
+        "cannot hold the resource",
+    );
+}
+
+#[test]
+fn a_closure_cannot_capture_a_watcher() {
+    // R9 — the rule that decides the tier's shape. A callback-shaped watch
+    // would have to hand the handler a captured watcher (or a captured `File`
+    // to read what changed); neither is expressible, which is half the reason
+    // `next()` is a pull.
+    assert_fails_with(
+        r#"
+        import std::fs::Watcher;
+        fun run_it(body: || void) { body(); }
+        fun main() {
+            let watcher = Watcher::watch("src");
+            run_it(|| { watcher.next(); });
+        }
+        "#,
+        "cannot capture the resource",
+    );
+}
+
+#[test]
+fn a_watcher_has_no_public_stop() {
+    // The `Database`/`File` law, kept: the release has no public surface, so
+    // there is no second teardown path to fall out of sync with the
+    // destructor. `drop(watcher)` is the early form and the only one.
+    assert_fails_with(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch("src");
+            watcher.stop();
+        }
+        "#,
+        "Watcher has no method 'stop'",
+    );
+}
+
+#[test]
+fn a_module_level_watcher_initializer_is_refused_for_awaiting() {
+    // `File`'s structural divergence from `Database` carries to `Watcher` for
+    // the same reason and by a different route: the constructor is async
+    // because it takes the BASELINE before returning (a watcher reports
+    // changes since it was created), and a module-level initializer cannot
+    // await. A process-lifetime watcher is a local in `main`.
+    assert_fails_with(
+        r#"
+        import std::fs::Watcher;
+        let sources: Watcher = Watcher::watch_all("src");
+        fun main() {
+            sources.next();
+        }
+        "#,
+        "a module-level binding cannot await",
+    );
+}
+
+#[test]
+fn the_three_change_kinds_match_without_a_catch_all() {
+    // The surface's promise: comparing two stats leaves exactly three
+    // outcomes, so `ChangeKind` is exhaustive and a `match` over it needs no
+    // `_` arm. (The opposite call from `Entry`'s three booleans in the same
+    // module, and for the opposite reason — a host dirent has nine
+    // open-ended kinds.)
+    assert_compiles(
+        r#"
+        import std::print;
+        import std::fs::{ Change, ChangeKind, Watcher };
+        fun describe(change: Change): str {
+            match change.kind {
+                ChangeKind::Created => "created",
+                ChangeKind::Modified => "modified",
+                ChangeKind::Removed => "removed",
+            }
+        }
+        fun main() {
+            let watcher = Watcher::watch("src");
+            print(describe(watcher.next()));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_scope_end_watcher_drop_is_a_finally_that_stops_the_poll() {
+    // The teardown that matters: a watcher polls on a host timer, and a
+    // pending host timer keeps the process alive. The scope-end `finally`
+    // reaching `__fs_watch_stop` is what lets a watching program exit.
+    // Plant-proven end to end: removing `impl Watcher with Drop` from fs.vl
+    // turns `fs.rs`'s termination pin from a 1-second run into a hang.
+    let js = compile(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch("src");
+            watcher.next();
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("finally"),
+        "a local Watcher must get a scope-end teardown finally:\n{js}"
+    );
+    assert!(
+        js.contains("function __fs_watch_stop(watcher)"),
+        "the finally must reach the stop helper:\n{js}"
+    );
+}
+
+#[test]
+fn dropping_a_watcher_early_lowers_to_the_same_stop() {
+    // `drop(watcher)` is the early form (no public `stop()` exists to call);
+    // it lowers to the destructor, which reaches the same helper.
+    let js = compile(
+        r#"
+        import std::fs::Watcher;
+        import std::drop::drop;
+        fun main() {
+            let watcher = Watcher::watch("src");
+            watcher.next();
+            drop(watcher);
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("__fs_watch_stop("),
+        "an explicit drop(watcher) must reach the stop helper:\n{js}"
+    );
+}
+
+#[test]
+fn the_watchers_release_is_synchronous_and_inherits_no_file_exception() {
+    // The pin that records the ruling's scope. `File`'s `__fs_close` is a
+    // fire-and-forget over a promise, with a `.catch` because a destructor
+    // cannot await; `Watcher`'s release is `clearTimeout` behind a plain
+    // synchronous call, so destruction.md §5's "drop is synchronous in v1"
+    // holds here with nothing asked of it. Q1's exception was ruled for
+    // `File` ALONE and this tier does not quietly widen it.
+    let js = compile(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch("src");
+            watcher.next();
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("function __fs_watch_stop(watcher) {\n\twatcher.stop();\n}"),
+        "the stop helper must be a plain synchronous call:\n{js}"
+    );
+    assert!(
+        !js.contains("async function __fs_watch_stop"),
+        "the release must not be async — that is File's exception, not this tier's:\n{js}"
+    );
+}
+
+#[test]
+fn a_parked_watch_carries_the_ambient_cancel_signal() {
+    // Not a nicety: without the ambient signal a cancelled nursery whose body
+    // is parked on a change that will never come could never drain. `sleep`
+    // and `Timer::wait` bridge the same way (verified end to end: cancelling
+    // a nursery around a parked `next()` unwinds instead of hanging).
+    let js = compile(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch("src");
+            watcher.next();
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("next_change(ambient_signal("),
+        "the wait must carry the ambient cancel signal:\n{js}"
+    );
+}
+
+#[test]
+fn a_batch_of_changes_is_handed_over_path_sorted() {
+    // Changes seen in one poll were observed together and carry no ordering
+    // between them, so the batch is sorted by path rather than handed over in
+    // whatever order the host's `readdir` produced — one order on every host.
+    // Pinned HERE rather than end to end, honestly: the Linux host the e2e
+    // suite runs on already returns `readdir` entries sorted, so no runtime
+    // assertion there can tell a sorting poller from a non-sorting one
+    // (planted and confirmed — `fs.rs`'s batch pin says so at its site).
+    let js = compile(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch_all("src");
+            watcher.next();
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("changes.sort("),
+        "a batch must be handed over path-sorted:\n{js}"
+    );
+}
+
+#[test]
+fn starting_a_watch_on_a_browser_build_is_refused_by_coloring() {
+    // The browser leg refuses by COLORING, and this is the arm that actually
+    // fires — `File`'s arm and `Database`'s before it. `Watcher` the type is
+    // colorless; every way to OBTAIN one is seeded `@process` by definition
+    // site, so a browser-reachable path can never hold a watcher.
+    assert_fails_browser_with(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch("src");
+        }
+        "#,
+        "`watch` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → watch (std::fs)",
+    );
+}
+
+#[test]
+fn a_recursive_watch_on_a_browser_build_is_refused_too() {
+    // The other constructor, separately — a coloring seed is per definition
+    // site, so "one of them is refused" is not evidence about the other.
+    assert_fails_browser_with(
+        r#"
+        import std::fs::Watcher;
+        fun main() {
+            let watcher = Watcher::watch_all("src");
+        }
+        "#,
+        "`watch_all` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → watch_all (std::fs)",
+    );
+}
+
 #[test]
 fn a_module_level_resource_own_argument_is_rejected() {
     assert_fails_with(

@@ -34,6 +34,7 @@ import pkg::bytes::Bytes;
 import pkg::crypto::random_uuid;
 import pkg::drop::Drop;
 import pkg::option::Option::{ None, Some, self };
+import pkg::task::{ CancelSignal, ambient_signal };
 
 /// Reads a file, decoded as text under `encoding` (a `node:fs` encoding name —
 /// `"utf8"`, `"latin1"`, …). Renamed off `read_file_bytes` (2026-08-11, F13):
@@ -633,4 +634,212 @@ fun with_file<T>(path: str, body: |File| T): T {
 	let result = body(file);
 	close_awaited(file);
 	result
+}
+
+// --- the watch tier (kolt.local 020, which owns this surface whole) --------
+//
+// THE MECHANISM IS POLLING, deliberately, and this is the load-bearing choice
+// in the tier. `node:fs`'s own `watch` is the least portable thing the host
+// exposes: its events coalesce and also duplicate, its `"rename"` covers
+// creation, deletion and actual renaming with no way to tell which without a
+// `stat`, recursive watching is not available on every platform and every
+// version, macOS can report a null filename, and an `fs.watch` on a path that
+// does not exist yet throws instead of waiting for it. A watcher built on it
+// could therefore promise only "something changed under here, go look" — which
+// is why the design sketch this tier replaces (filesystem.md §8) had a
+// two-variant `ChangeKind { Changed, Renamed }`: an under-promise calibrated
+// to what every platform agrees on.
+//
+// Comparing two stats instead promises MORE, on every platform, for free: an
+// entry present now and absent before was Created, absent now and present
+// before was Removed, and one whose size or mtime moved was Modified. Nothing
+// is coalesced into an ambiguity and nothing is platform-conditional. It is
+// also the choice the compiler made for its own `--watch` loop
+// (proposal/watch-mode.md: "a dependency-free poll ... every ~300 ms ... If
+// trees ever grow enough to matter, swapping in an event-based watcher is a
+// localized change behind the same loop"), which has run that way since
+// 2026-07-02.
+//
+// What polling costs, stated rather than hidden: latency up to one interval
+// before a change is seen; a change that CANCELS OUT inside one interval (a
+// file created and deleted between two observations) is never reported at all,
+// because there is nothing left to compare; a rewrite that alters NEITHER the
+// size NOR the mtime is invisible, which is a real risk only where mtime is
+// second-granular (some filesystems still are — the size is compared as well
+// precisely because it is the half that never has granularity); and one `stat`
+// per watched entry per interval, which on a recursive watch of a large tree
+// is real syscall load. Watch the narrowest path that answers your question.
+
+/// A live watch on a path — the tier's resource, built on `File`'s model
+/// exactly (`Database` before it): it moves rather than copies, so a stale
+/// watcher is a compile error; a closure cannot capture one and no
+/// `List`/`Map`/`Set` can hold one (destruction.md R9/R10); and its `Drop`
+/// stops the watch at the owner's scope end. There is no public `stop()` to
+/// fall out of sync with the destructor — `drop(watcher)` is the early form.
+///
+/// UNLIKE `File`, ITS TEARDOWN IS GENUINELY SYNCHRONOUS. Stopping a poll is a
+/// `clearTimeout`, so `Drop` needs none of `File`'s async-close exception
+/// (kolt.local 031 Q1, which was ruled for `File` ALONE); destruction.md §5's
+/// "drop is synchronous in v1" holds here with nothing asked of it. This is
+/// `Database`'s situation, not `File`'s.
+///
+/// The stop is not decoration: a watcher polls on a host timer, and a pending
+/// host timer KEEPS THE PROCESS ALIVE — exactly as `std::time::Timer`
+/// documents for itself. A watcher that is never dropped is a program that
+/// never exits.
+resource external struct Watcher;
+
+/// What happened to a path between two observations. Three variants and no
+/// catch-all, because comparing two stats leaves no fourth possibility — the
+/// opposite call from `Entry`'s three booleans above, and for the opposite
+/// reason: a host dirent has NINE open-ended kinds, while a change is a closed
+/// three-way outcome the poller computes itself.
+///
+/// A rename arrives as `Removed` on the old path plus `Created` on the new
+/// one, in the same batch. That is what a rename IS to an observer comparing
+/// two directory listings, and it is strictly more than node's `fs.watch`
+/// reports (one `"rename"` event, sometimes only for one of the two paths).
+///
+/// An ordinary (unbacked) enum: the host poller hands its verdict across in
+/// the `Option` ARRAY FORM this module already uses at every other host
+/// boundary (`__fs_stat`, `__db_get`, `std::process::env`), so nothing has to
+/// leak a meaningless integer identity into a public type to get it here.
+enum ChangeKind {
+	Created,
+	Modified,
+	Removed,
+}
+
+/// One observed change: the path it happened to, and which of the three
+/// things it was.
+///
+/// `path` is ADDRESSABLE — the watched root joined with the entry's place
+/// under it, so it is exactly the string to hand to `read_file_to_str`,
+/// `stat` or `File::open`, with no joining at the call site. (`read_dir` and
+/// `read_dir_all` hand back bare names and relative paths because a listing's
+/// caller often wants the name itself; a change's caller always wants to act
+/// on it.) Watching a single FILE reports that file's own path back. Entries
+/// are `/`-separated on every host, like `read_dir_all`'s.
+///
+/// Deliberately NOT carrying the entry's kind. For a `Created` or `Modified`
+/// path, `stat(change.path)` answers live and answers more; for a `Removed`
+/// one the entry is gone and only a REMEMBERED kind exists, and this module
+/// does not hand back remembered facts dressed as current ones.
+struct Change {
+	path: str,
+	kind: ChangeKind,
+}
+
+/// The raw host change record. Opaque and internal, exactly like `RawStat` and
+/// `RawEntry` above — `next` copies the two fields into a plain `Change`, so
+/// no caller touches the host shape.
+external struct RawChange;
+
+impl RawChange {
+	[extern(get, "path")]
+	external fun path(self): str;
+
+	[extern(get, "kind")]
+	external fun kind(self): ChangeKind;
+}
+
+/// The raw start. Kept behind the two named constructors, the way
+/// `open_with_flags` is kept behind `File`'s five: the recursion flag and the
+/// poll interval are decisions the surface should make, not arguments a caller
+/// gets wrong. Async because the BASELINE is taken here — a watcher reports
+/// changes since the moment it was created, which requires reading the tree
+/// once before returning.
+///
+/// The whole poll lives host-side (`__fs_watch`, `transformer.rs`) for the
+/// same reason `__fs_stat` does: the loop must own a host timer and a queue,
+/// and it must survive a `stat` that fails on a path that vanished mid-walk,
+/// which `vilan` has no `try`/`catch` to express. It calls the same
+/// `fs.promises.stat` that `stat` above wraps, and compares the same
+/// `mtimeMs`/`size` that `Stat` exposes.
+[extern("__fs_watch")]
+async external fun start_watch(path: str, recursive: bool, interval_ms: i32): Watcher;
+
+impl Watcher {
+	/// Watches `path` and, when it is a directory, its IMMEDIATE entries —
+	/// `read_dir`'s reach. The path need not exist yet: a watcher on a path
+	/// that is not there reports `Created` when it appears, which is a thing
+	/// `fs.watch` cannot do at all (it throws on a missing path).
+	///
+	/// The interval is 300 ms, the number the compiler's own `--watch` loop
+	/// has used since it shipped (proposal/watch-mode.md). It is not a
+	/// parameter: no caller has asked for one, one number across the language
+	/// is worth more than a knob, and adding `watch_every` later is additive
+	/// rather than breaking.
+	fun watch(path: str): Watcher {
+		start_watch(path, false, 300)
+	}
+
+	/// Watches `path` and everything under it, however deep —
+	/// `read_dir_all`'s reach, and the `_all` suffix means the same thing it
+	/// means there. Costs one `stat` per entry in the tree per interval; on a
+	/// large tree that is the expensive call in this module.
+	fun watch_all(path: str): Watcher {
+		start_watch(path, true, 300)
+	}
+
+	[extern(method, "next_change")]
+	async external fun raw_next(self, signal: Option<CancelSignal>): RawChange;
+
+	/// The next change, awaiting one if nothing has happened yet — the pull
+	/// shape, and the whole surface for consuming a watch. Async, so a caller
+	/// awaits it implicitly and the ordinary spelling is a plain loop:
+	///
+	/// ```text
+	/// let watcher = Watcher::watch_all("src");
+	/// loop {
+	///     let change = watcher.next();
+	///     rebuild(change.path);
+	/// }
+	/// ```
+	///
+	/// PULL, NOT CALLBACK, and the reason is the language rather than
+	/// fashion. A `|Change| void` observer is a VOID channel, which
+	/// async-polymorphism.md makes fire-and-forget: a handler that wanted to
+	/// read the file it was just told about could not await the read, and
+	/// would drop the promise on the floor. (`Signal::sub` is that shape on
+	/// purpose; a watch handler is not.) Meanwhile R9 forbids a closure from
+	/// capturing a resource, so such a handler could not hold an open `File`
+	/// either, leaving it to re-open by path per event — a TOCTOU race and a
+	/// fresh open each time. `next` has neither problem: it returns a value
+	/// into a scope that can already own a `File`, and it reads exactly like
+	/// `BodyReader`'s chunk loop in `std::fetch`, which is the same problem
+	/// (a sequence of things arriving over time) already solved this way.
+	///
+	/// Changes are QUEUED, so nothing observed is lost while the caller is
+	/// busy — the poll runs on its own timer and does not wait to be asked.
+	/// Several changes seen in one interval arrive path-sorted and one at a
+	/// time; the order among them carries no timing information, because they
+	/// were observed together.
+	///
+	/// Inside a nursery's dynamic extent the wait carries the ambient cancel
+	/// signal, exactly as `sleep` and `Timer::wait` do. That is not a
+	/// nicety: without it a cancelled nursery whose body is parked on a change
+	/// that will never come could never drain.
+	fun next(self): Change {
+		let raw = self.raw_next(ambient_signal());
+		Change { path = raw.path(), kind = raw.kind() }
+	}
+}
+
+/// Stops the watch and clears its host timer — the one host operation with no
+/// public surface. Reachable only from `Watcher`'s `Drop` below, so there is
+/// no `stop()` to fall out of sync with the destructor; `drop(watcher)` is the
+/// early form. Synchronous and idempotent (a second stop is a no-op), which is
+/// why this resource needs no exception to destruction.md §5.
+[extern("__fs_watch_stop")]
+external fun stop_watch(watcher: Watcher): void;
+
+impl Watcher with Drop {
+	/// Runs at the owner's scope end (or at an explicit `drop(watcher)`):
+	/// stops the poll through the `&mut self` loan. Synchronous and
+	/// context-free, as a destructor must be — and genuinely synchronous, not
+	/// `File`'s initiated-and-abandoned close.
+	fun drop(&mut self) {
+		stop_watch(self);
+	}
 }

@@ -194,6 +194,11 @@ fun stat(path: str): Option<Stat>           // async — None if the path isn't 
 
 resource external struct File               // an open file — the handle tier
 fun with_file<T>(path: str, body: |File| T): T   // open, run, close (awaited)
+
+resource external struct Watcher            // a live watch — the watch tier
+fun Watcher::watch(path: str): Watcher      // the path, and a directory's own entries
+fun Watcher::watch_all(path: str): Watcher  // the whole tree beneath it
+fun Watcher::next(self): Change             // async — the next change
 ```
 
 `read_bytes` reads a file with no decode in between — the host's buffer
@@ -241,6 +246,45 @@ a failure to close is a failure of `with_file`; a `File` you hold
 yourself closes through its destructor instead, which starts the close
 without waiting on it. Full signatures:
 [the process reference](../std/process.md#stdfs).
+
+When you want to know that a file changed rather than to read it once,
+you open a *watch*. `Watcher::watch(path)` observes a path (and a
+directory's immediate entries); `Watcher::watch_all(path)` observes the
+whole tree under it. You pull changes out one at a time:
+
+```vilan,norun
+import std::fs::{ Change, ChangeKind, Watcher };
+import std::print;
+
+fun main() {
+	let watcher = Watcher::watch_all("content");
+	let change = watcher.next();
+	match change.kind {
+		ChangeKind::Created => print(i"new: {change.path}"),
+		ChangeKind::Modified => print(i"changed: {change.path}"),
+		ChangeKind::Removed => print(i"gone: {change.path}"),
+	}
+}
+main();
+```
+
+`next()` is async like everything else here, so it reads as a plain call
+and suspends until something happens, and `change.path` is ready to hand
+to `read_file_to_str`. There is no callback form: a `|Change| void`
+handler could not await the read of the file it was told about, and could
+not hold a `File` open across events either — a pull returns into a scope
+that can. Under the hood it *polls*, comparing stats every 300 ms, which
+is what lets it tell creation from modification from removal on every
+platform (the host's own `fs.watch` cannot); the costs are up to an
+interval of latency, blindness to a change that cancels itself out inside
+one interval, and a `stat` per watched entry per interval — so watch the
+narrowest path that answers your question. A `Watcher` is a `resource`
+like `File`, its destructor stops the poll, and that matters more than it
+does for a handle: a live poll holds the event loop open, so **a watcher
+that is never dropped is a program that never exits.**
+
+`std::watch` is a different thing wearing a similar name — the dev-refresh
+channel (`is_watching()`, `force_refresh()`), not a file watcher.
 
 What a server does *not* read by hand any more is its own build.
 `serve_build` knows the bundle's name, the stylesheet's, and every chunk's,

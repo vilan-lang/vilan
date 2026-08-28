@@ -49,6 +49,10 @@ const EXCLUDED: &[(&str, &str)] = &[
         "time.vl",
         "host clock + timers (`Date.now`, `Date#toISOString`, `setTimeout`)",
     ),
+    (
+        "watch.vl",
+        "async + host filesystem + a host timer (`std::fs::Watcher` polls, and a watch never ends on its own)",
+    ),
 ];
 
 /// How long a corpus program gets under node before the run is declared hung.
