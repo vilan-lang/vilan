@@ -724,7 +724,7 @@ fn a_parse_error_inside_a_package_module_fails_the_build_loudly() {
 // B74: a duplicate inherent STATIC across two modules. The cross-file half of
 // the diagnostic — the `by module '…'` clause and the note that carries its own
 // source — needs two files to be observable at all, so it lives here rather
-// than beside the single-source pins in `inference.rs`. This is also the shape
+// than beside the single-source pins in the `inference` suite. This is also the shape
 // the hazard actually takes in the wild: nobody writes two colliding `new`s on
 // one screen, they write one in each of two modules and never see that one is
 // dead.

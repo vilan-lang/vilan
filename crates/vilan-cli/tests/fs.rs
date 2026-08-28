@@ -1389,7 +1389,7 @@ fn with_file_returns_the_bodys_value_from_an_open_file() {
     // per-call parameter (R9's exemption), its value comes back out, and the
     // program continues past the awaited close. (That the close is AWAITED is
     // pinned on the emitted bytes — `with_file_awaits_the_close_before_
-    // returning` in inference.rs and the `file.vl` corpus golden — since the
+    // returning` in the `inference` suite and the `file.vl` corpus golden — since the
     // await IS the ordering.)
     let dir = temp_project("with_file");
     write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");

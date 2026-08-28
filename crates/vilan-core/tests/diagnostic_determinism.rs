@@ -448,7 +448,7 @@ fn the_overlay_cap_selects_the_same_diagnostics_every_time() {
 ///
 /// The interleaving itself was NOT constructible: a boundary tuple is keyed by
 /// a unique call id so it cannot repeat at all, and a sweep of the
-/// compiler-behaviour corpus (every program in `tests/inference.rs`) found no
+/// compiler-behaviour corpus (every program in `tests/inference/`) found no
 /// analysis where two of these tuples even shared a `span.start`. So this pins
 /// the PROPERTY the widened key guarantees rather than the flip — one
 /// diagnostic per site, in a stable order — which is what a future collector

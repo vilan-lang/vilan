@@ -323,7 +323,7 @@ fn no_corpus_golden_carries_hmr_instrumentation() {
 /// second and get the higher id — `alpha.vl`'s `let A = Z * 2;` against
 /// `zeta.vl`'s `let Z = 21;` — and an id sort then emits `A` first, which is
 /// exactly the TDZ miscompile. The topological sort is what makes the
-/// canonical tie-break safe; `inference.rs`'s
+/// canonical tie-break safe; the `inference` suite's
 /// `a_dependency_in_a_later_loading_module_is_declared_first` pins that shape.
 ///
 /// Non-vacuous by construction, in both halves:

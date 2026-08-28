@@ -154,7 +154,7 @@ fn extract_examples_from(text: &str, path: &Path) -> Vec<Example> {
 }
 
 /// Compile one example through the full pipeline on a large-stack worker
-/// (mirroring the CLI and `inference.rs`); a panic becomes an error rather
+/// (mirroring the CLI and the `inference` suite); a panic becomes an error rather
 /// than aborting the suite.
 fn compile(source: &str, platform: Platform) -> Result<(), Vec<String>> {
     let source = source.to_string();

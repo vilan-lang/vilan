@@ -7929,7 +7929,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The analyzer-level statement, pinned directly (`inference.rs`'s harness
+    // The analyzer-level statement, pinned directly (the `inference` suite's harness
     // exposes only compile success/failure, not `type_references` — this is the
     // LSP-layer pin the task calls for instead): a static accessor's module
     // SUBJECT records the SAME definition id in `type_references` as the
