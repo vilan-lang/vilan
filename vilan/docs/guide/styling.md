@@ -36,6 +36,14 @@ fun main() {
   prefix (see [Macros & const](../tour/macros-and-const.md)). The rules
   are emitted during the build.
 - `view.styled(card)` puts the style's classes on the element.
+- There is **no reset unless you ask for one**. Browser defaults are in
+  force, so `body` keeps its 8px margin and
+  `width(px(200)).padding(space(4))` measures 232px, not 200. Add
+  `let _reset = const preflight();` for the opinionated base stylesheet
+  (`box-sizing: border-box` everywhere, margins zeroed, form-control
+  chrome stripped) — it lives in its own cascade sub-layer, so every
+  style you write still wins against it. The
+  [reference](../std/style.md#declaration-blocks) has what it contains.
 
 ## Getting the stylesheet onto the page
 
