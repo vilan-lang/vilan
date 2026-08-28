@@ -57,6 +57,12 @@ enum Client {
 }
 
 fn stage(tag: &str, port: u16, client: Client, split: bool) -> PathBuf {
+    stage_serving(tag, client, split, server_source(port))
+}
+
+/// [`stage`] with the server file supplied, for the pins whose subject is what
+/// the server chain says (the caching hook) rather than what the build emits.
+fn stage_serving(tag: &str, client: Client, split: bool, server: String) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let staged = std::env::temp_dir().join(format!(
@@ -74,7 +80,7 @@ fn stage(tag: &str, port: u16, client: Client, split: bool) -> PathBuf {
         Client::Styled => STYLED_CLIENT.to_string(),
     };
     std::fs::write(staged.join("src/client.vl"), source).expect("write the client");
-    std::fs::write(staged.join("src/server.vl"), server_source(port)).expect("write the server");
+    std::fs::write(staged.join("src/server.vl"), server).expect("write the server");
     staged
 }
 
@@ -104,6 +110,35 @@ fn server_source(port: u16) -> String {
          \tServer::builder()\n\
          \t\t.port({port})\n\
          \t\t.serve_build(build)\n\
+         \t\t.on_request(|request| Response::builder().set_header(\"Content-Type\", \"text/html\").body(\"<div id=\\\"app\\\"></div>\").build())\n\
+         \t\t.on_start(|server| print(\"listening\"))\n\
+         \t\t.build()\n\
+         \t\t.start();\n\
+         }}\n"
+    )
+}
+
+/// [`server_source`] with the opt-in caching hook on the chain (kolt.local
+/// 025b): the two-tier policy every static layer converges on, written as one
+/// expression over the artifact's route — the stylesheet is treated as the
+/// fingerprinted tier (long-lived, no validator), everything else as the shell
+/// tier (revalidated, `no-cache`).
+fn cached_server_source(port: u16) -> String {
+    format!(
+        "import std::build::require_build;\n\
+         import std::http::{{ CachePolicy, Request, Response, Server }};\n\
+         import std::io::print;\n\
+         \n\
+         async fun main() {{\n\
+         \tlet build = require_build(\"client\");\n\
+         \tServer::builder()\n\
+         \t\t.port({port})\n\
+         \t\t.serve_build(build)\n\
+         \t\t.cache_build(|url| if url == \"/client.css\" {{\n\
+         \t\t\tCachePolicy::none().cache_control(\"public, max-age=31536000, immutable\")\n\
+         \t\t}} else {{\n\
+         \t\t\tCachePolicy::validated().cache_control(\"no-cache\")\n\
+         \t\t}})\n\
          \t\t.on_request(|request| Response::builder().set_header(\"Content-Type\", \"text/html\").body(\"<div id=\\\"app\\\"></div>\").build())\n\
          \t\t.on_start(|server| print(\"listening\"))\n\
          \t\t.build()\n\
@@ -166,6 +201,42 @@ fn wait_for_port(port: u16) -> bool {
     false
 }
 
+/// [`http_get_raw`] carrying `headers` verbatim on the wire — each line must
+/// be `\r\n`-terminated. For the conditional requests the caching pin makes.
+fn http_get_with(port: u16, path: &str, headers: &str) -> (String, Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for GET");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set a read timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n"
+    )
+    .expect("send GET");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let separator = b"\r\n\r\n";
+    match response
+        .windows(separator.len())
+        .position(|window| window == separator)
+    {
+        Some(at) => (
+            String::from_utf8_lossy(&response[..at]).into_owned(),
+            response[at + separator.len()..].to_vec(),
+        ),
+        None => (String::from_utf8_lossy(&response).into_owned(), Vec::new()),
+    }
+}
+
+/// The value of `name` in a response head, case-insensitively.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    let wanted = name.to_ascii_lowercase();
+    head.lines().skip(1).find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        (candidate.trim().to_ascii_lowercase() == wanted).then(|| value.trim().to_string())
+    })
+}
+
 /// A plain HTTP GET, returning `(status line + headers, RAW body bytes)`.
 ///
 /// The body is never decoded. That matters here and nowhere else in this file:
@@ -205,6 +276,34 @@ fn http_get(port: u16, path: &str) -> (String, String) {
     (head, String::from_utf8_lossy(&body).into_owned())
 }
 
+/// The headers the APPLICATION set, in wire order: the response head minus the
+/// status line and minus the ones node writes for every response whatever the
+/// handler did. What remains is exactly what `serve_build` chose to send, which
+/// is the only way to assert that it chose to send *nothing else*.
+fn response_headers(head: &str) -> Vec<String> {
+    const NODES_OWN: [&str; 5] = [
+        "date",
+        "connection",
+        "content-length",
+        "transfer-encoding",
+        "keep-alive",
+    ];
+    head.lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let name = line
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            !NODES_OWN.contains(&name.as_str())
+        })
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
 fn stop(server: &mut Child) {
     let _ = server.kill();
     let _ = server.wait();
@@ -227,6 +326,17 @@ fn serve_build_answers_every_artifact_and_leaves_the_rest_to_the_app() {
         body,
         std::fs::read_to_string(staged.join("dist/client.js")).expect("the bundle"),
         "and the bytes are the build's own"
+    );
+    // The DEFAULT is untouched by the opt-in caching hook (kolt.local 025b):
+    // a server that never called `cache_build` sends exactly the headers it
+    // sent before the hook existed. Asserted as a header COUNT and not only as
+    // two absences, so a policy leaking into the default path is caught
+    // whatever header it leaks — the `fullstack-dx.md` §5.10 fence is about
+    // defaults, and this is the pin on it.
+    assert_eq!(
+        response_headers(&head),
+        vec!["Content-Type: text/javascript; charset=utf-8".to_string()],
+        "no policy on the chain means no policy headers on the wire:\n{head}"
     );
 
     let (head, body) = http_get(port, "/client.css");
@@ -259,6 +369,116 @@ fn serve_build_answers_every_artifact_and_leaves_the_rest_to_the_app() {
     assert!(
         body.contains("id=\"app\""),
         "nothing but `/<file name>` is claimed"
+    );
+
+    stop(&mut server);
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+/// kolt.local 025b, the opted-in half: one `.cache_build(…)` on the chain and
+/// the served artifacts answer conditional requests and carry the policy the
+/// route asked for — the two-tier shape the motivating exhibit hand-rolled and
+/// then surrendered on. Pinned end to end over a real build, because every
+/// claim is about the wire: which status each arm answers with, which headers
+/// ride on each, and whether a 304 leaks a body.
+///
+/// The default half of the same ruling is pinned in
+/// `serve_build_answers_every_artifact_and_leaves_the_rest_to_the_app`: with no
+/// policy on the chain, `Content-Type` is the only header that goes out.
+#[test]
+fn an_opted_in_serve_build_revalidates_and_carries_its_per_route_cache_control() {
+    let port = free_port();
+    let staged = stage_serving("cached", Client::Styled, false, cached_server_source(port));
+    build(&staged);
+    let mut server = serve(&staged, &[]);
+    assert!(wait_for_port(port), "the server should bind {port}");
+
+    // The validating tier: a 200 with the validator, the content type, and the
+    // route's own Cache-Control.
+    let (head, body) = http_get_with(port, "/client.js", "");
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "an unconditional GET is a 200:\n{head}"
+    );
+    let etag = header_value(&head, "ETag").unwrap_or_else(|| {
+        panic!("the validating tier mints an ETag over the artifact's bytes:\n{head}")
+    });
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"') && etag.len() == 34,
+        "the validator is `etag_of`'s quoted 32-hex digest, not something re-invented here: {etag}"
+    );
+    assert_eq!(
+        header_value(&head, "Cache-Control").as_deref(),
+        Some("no-cache"),
+        "the route's policy header reaches the 200:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "Content-Type").as_deref(),
+        Some("text/javascript; charset=utf-8"),
+        "and the extension still types the body:\n{head}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        std::fs::read_to_string(staged.join("dist/client.js")).expect("the bundle"),
+        "the opted-in 200 serves the same bytes the default one did"
+    );
+
+    // The revalidation: the client comes back with what it was given.
+    let (head, body) = http_get_with(port, "/client.js", &format!("If-None-Match: {etag}\r\n"));
+    assert!(
+        head.starts_with("HTTP/1.1 304"),
+        "a matching If-None-Match answers 304:\n{head}"
+    );
+    assert!(body.is_empty(), "a 304 carries no body");
+    assert_eq!(
+        header_value(&head, "ETag").as_deref(),
+        Some(etag.as_str()),
+        "the 304 echoes the validator, so the NEXT conditional matches too:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "Cache-Control").as_deref(),
+        Some("no-cache"),
+        "and the policy rides the 304 arm as well — RFC 9110 §15.4.5, and the \
+         whole reason `etag_response` hands back an open builder:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "Content-Type"),
+        None,
+        "a 304 has no content to type:\n{head}"
+    );
+
+    // A stale validator gets the bytes back.
+    let (head, body) = http_get_with(port, "/client.js", "If-None-Match: \"0000\"\r\n");
+    assert!(
+        head.starts_with("HTTP/1.1 200") && !body.is_empty(),
+        "a stale validator gets the fresh representation:\n{head}"
+    );
+
+    // The OTHER tier, per route: fingerprinted-style caching, no validator.
+    // This is the pin that the policy is asked per artifact and not once.
+    let (head, _) = http_get_with(port, "/client.css", "");
+    assert_eq!(
+        header_value(&head, "Cache-Control").as_deref(),
+        Some("public, max-age=31536000, immutable"),
+        "the second tier gets its own header, keyed on the route:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "ETag"),
+        None,
+        "`CachePolicy::none()` mints no validator, so this tier spends no digest:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "Content-Type").as_deref(),
+        Some("text/css; charset=utf-8"),
+        "and the un-validated arm still types the body from the extension:\n{head}"
+    );
+
+    // A path the build does not claim is still the app's, policy or no policy.
+    let (head, body) = http_get_with(port, "/some/deep/link", "");
+    assert!(
+        header_value(&head, "Cache-Control").is_none()
+            && String::from_utf8_lossy(&body).contains("id=\"app\""),
+        "the hook covers the build's routes and nothing else:\n{head}"
     );
 
     stop(&mut server);

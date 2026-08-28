@@ -1604,6 +1604,158 @@ fun declare(selector: str, body: Declarations) {
 	emit("css", "@layer vilan{" + selector + "{" + body.text + "}}");
 }
 
+/// A base stylesheet — the opinionated reset (kolt.local 008) an app opts
+/// into with one `const preflight()` and opts out of by deleting the line.
+///
+/// **What it is.** Tailwind's preflight scope, adapted: `box-sizing:
+/// border-box` everywhere, the UA's margins zeroed, its form-control chrome
+/// stripped so a button inherits the page's font and colour instead of the
+/// platform's, replaced elements laid out as blocks that cannot overflow their
+/// container, list markers and heading sizes removed, and the ruling's own
+/// addition — **`a`, `button` and `select` are `display: block`**. That last
+/// one is the most visible: an anchor in running prose becomes a block, so a
+/// page that wants inline links styles them back. It is a deliberate,
+/// opinionated default, not a normalization.
+///
+/// **Why it is opt-in.** A reset baked into every build would be a breaking
+/// change for anyone styling against UA defaults, and there is no way to
+/// unsend one. So it is a std style asset the app EMITS, like `declare` — the
+/// only door into the stylesheet is a `const` expression, and a build that
+/// never calls this emits a byte-identical sheet. It deliberately is NOT a
+/// `Document::of` option: `Document` reads a build's manifest and writes one
+/// `<link>`, it has no channel into the sheet at all, and a browser-only
+/// project — the one that most wants a reset — has no server leg to call it
+/// from.
+///
+/// **Ordering, which is the whole design.** Every rule here goes in
+/// `@layer vilan.preflight`, a SUB-layer of the layer `declare` and the
+/// child-side relations use. That settles precedence by the cascade rather
+/// than by where a line lands in the sheet's sort, twice over and in the same
+/// direction each time:
+///
+/// - unlayered beats layered, so **every `Style` wins against every reset
+///   rule**, whatever either one's specificity — the same guarantee `declare`
+///   already gives, unchanged;
+/// - a layer's own rules beat its sub-layers', so **every `declare` block wins
+///   against every reset rule** too, and an app that resets `button` further
+///   does not have to out-specify std to do it.
+///
+/// The reset is therefore the weakest author-origin thing in the sheet, which
+/// is exactly what a reset should be — and it is still stronger than every UA
+/// default, because layers order AUTHOR declarations and the UA origin loses
+/// to all of them. Nothing above depends on the sheet's byte order, which
+/// matters because that order is a lexical sort with no notion of a reset
+/// (`const-eval.md` §3).
+///
+/// ```vilan,fragment
+/// let _reset = const preflight();
+/// // @layer vilan.preflight{*,::before,::after{box-sizing:border-box}}
+/// // …and one line per rule below, deduped and sorted with everything else
+/// ```
+fun preflight() {
+	// Structure. The universal box model is the one rule the whole system
+	// leans on: `width(px(200)).padding(space(4))` measures 200 under it and
+	// 232 without.
+	preflight_rule("*,::before,::after", declarations().raw("box-sizing", "border-box"));
+	preflight_rule("html", declarations()
+		.raw("line-height", "1.5")
+		.raw("-webkit-text-size-adjust", "100%")
+		.raw("tab-size", "4"));
+	preflight_rule("body", declarations().raw("margin", "0").raw("line-height", "inherit"));
+
+	// The UA's margins, gone — the block elements that carry one by default.
+	preflight_rule("blockquote,dl,dd,h1,h2,h3,h4,h5,h6,hr,figure,p,pre", declarations().raw("margin", "0"));
+	preflight_rule("fieldset", declarations().raw("margin", "0").raw("padding", "0"));
+	preflight_rule("legend", declarations().raw("padding", "0"));
+	preflight_rule("dialog", declarations().raw("padding", "0"));
+	preflight_rule("ol,ul,menu", declarations()
+		.raw("list-style", "none")
+		.raw("margin", "0")
+		.raw("padding", "0"));
+
+	// Typography: headings and small print stop having sizes of their own, so
+	// a type scale is the app's to state.
+	preflight_rule("h1,h2,h3,h4,h5,h6", declarations()
+		.raw("font-size", "inherit")
+		.raw("font-weight", "inherit"));
+	preflight_rule("b,strong", declarations().raw("font-weight", "bolder"));
+	preflight_rule("small", declarations().raw("font-size", "80%"));
+	preflight_rule("code,kbd,samp,pre", declarations()
+		.raw("font-family", "ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace")
+		.raw("font-size", "1em"));
+	preflight_rule("a", declarations().raw("color", "inherit").raw("text-decoration", "inherit"));
+	preflight_rule("table", declarations()
+		.raw("text-indent", "0")
+		.raw("border-color", "inherit")
+		.raw("border-collapse", "collapse"));
+	preflight_rule("hr", declarations()
+		.raw("height", "0")
+		.raw("color", "inherit")
+		.raw("border-top-width", "1px"));
+
+	// Form controls: the platform's chrome off, the page's typography on.
+	preflight_rule("button,input,optgroup,select,textarea", declarations()
+		.raw("font-family", "inherit")
+		.raw("font-size", "100%")
+		.raw("font-weight", "inherit")
+		.raw("line-height", "inherit")
+		.raw("color", "inherit")
+		.raw("margin", "0")
+		.raw("padding", "0")
+		.raw("border", "0")
+		.raw("background-color", "transparent"));
+	preflight_rule("button,select", declarations().raw("text-transform", "none"));
+	preflight_rule("button,[type=\"button\"],[type=\"reset\"],[type=\"submit\"]", declarations()
+		.raw("-webkit-appearance", "button")
+		.raw("background-image", "none"));
+	preflight_rule("[type=\"search\"]", declarations()
+		.raw("-webkit-appearance", "textfield")
+		.raw("outline-offset", "-2px"));
+	preflight_rule("::-webkit-search-decoration", declarations().raw("-webkit-appearance", "none"));
+	preflight_rule("::-webkit-file-upload-button", declarations()
+		.raw("-webkit-appearance", "button")
+		.raw("font", "inherit"));
+	preflight_rule("textarea", declarations().raw("resize", "vertical"));
+	preflight_rule("input::placeholder,textarea::placeholder", declarations()
+		.raw("opacity", "1")
+		.raw("color", "#9ca3af"));
+	preflight_rule("button,[role=\"button\"]", declarations().raw("cursor", "pointer"));
+	preflight_rule("progress", declarations().raw("vertical-align", "baseline"));
+	preflight_rule("summary", declarations().raw("display", "list-item"));
+
+	// Replaced elements lay out as blocks and cannot overflow their container.
+	preflight_rule("img,svg,video,canvas,audio,iframe,embed,object", declarations()
+		.raw("display", "block")
+		.raw("vertical-align", "middle"));
+	preflight_rule("img,video", declarations().raw("max-width", "100%").raw("height", "auto"));
+
+	// The ruling's own addition, stated on its own line so it reads as the
+	// decision it is: an anchor, a button and a select are BLOCKS here, where
+	// every reset this one is adapted from leaves them inline.
+	preflight_rule("a,button,select", declarations().raw("display", "block"));
+
+	// `[hidden]` last in reading order and strongest in the cascade — (0,1,0)
+	// against the element selectors above, so hiding still wins.
+	preflight_rule("[hidden]", declarations().raw("display", "none"));
+}
+
+/// One [`preflight`] rule, in the reset's own sub-layer. Internal to this
+/// module by the same convention `render_rule` and `check_selector` keep — the
+/// language has no privacy modifier here, so what makes it internal is that it
+/// is absent from the reference surface: `@layer vilan.preflight` is std's
+/// floor, not a third place an app puts declarations. `declare` is the app's
+/// door, and it deliberately lands one layer ABOVE this one.
+fun preflight_rule(selector: str, body: Declarations) {
+	check_selector(selector);
+	// Tokens spent in a rule declare themselves beside it, exactly as
+	// `declare` does. Nothing in the reset above spends one today; the loop
+	// is here so a later rule that does cannot leave a dangling `var()`.
+	for root in body.roots {
+		emit("css", root);
+	}
+	emit("css", "@layer vilan.preflight{" + selector + "{" + body.text + "}}");
+}
+
 /// What a declaration block's SELECTOR must avoid, in the const-time-refusal
 /// style the rest of this module validates in.
 ///

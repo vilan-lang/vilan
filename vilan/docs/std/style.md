@@ -295,6 +295,7 @@ minting no class, producing no `Style` and touching no slot key.
 ```vilan,fragment
 fun declarations(): Declarations                 // opens a declaration chain
 fun declare(selector: str, body: Declarations)   // puts the block in the stylesheet
+fun preflight()                                  // the opt-in base stylesheet (below)
 
 impl Declarations {
     fun raw<V: CssValue>(self, property: str, value: V): Declarations
@@ -353,6 +354,44 @@ declaration either, which includes std's own token lines (`--space-4`,
 `--gray-50`) and any hand-written CSS the page loads. Declare your own
 custom properties and read them back with `Color::var` / `Length::var` —
 that composes exactly, and it is what a theme wants anyway.
+
+**The base stylesheet: `preflight()`.** std ships no reset by default —
+UA defaults are fully in force, so `body` keeps its 8px margin and
+`width(px(200)).padding(space(4))` measures 232px. `const preflight()`
+opts in to one, and deleting the line opts back out; there is no build
+flag and nothing to switch off, because the only door into the stylesheet
+is a `const` expression:
+
+```vilan
+import std::style::preflight;
+
+let _reset = const preflight();
+
+fun main() {}
+```
+
+It is Tailwind's preflight scope, adapted: `box-sizing: border-box`
+everywhere, the UA's margins zeroed, its form-control chrome stripped so a
+button inherits the page's font and colour, replaced elements (`img`,
+`svg`, `video`, …) laid out as blocks that cannot overflow their
+container, list markers and heading sizes removed — **plus one addition
+that is not in any reset it is adapted from: `a`, `button` and `select`
+are `display: block`.** That is the most visible rule in it. An anchor in
+running prose becomes a block, so a page that wants inline links styles
+them back; this is an opinionated default, not a normalization.
+
+Ordering is the whole design, and it is settled by the layer rather than by
+where a line lands. Every reset rule emits inside `@layer vilan.preflight`,
+a **sub-layer** of the layer declaration blocks use, and the same cascade
+sentence applies twice in the same direction: unlayered beats layered, so
+every `Style` wins against every reset rule whatever the specificity; and a
+layer's own rules beat its sub-layers', so every `declare` block wins
+against every reset rule too. An app tightening one of the reset's own
+rules writes `declare("a", …)` and needs neither `!important` nor a longer
+selector. The reset is therefore the weakest author-origin thing in the
+sheet — which is what a reset should be — and still stronger than every UA
+default, because cascade layers order *author* declarations and the UA
+origin loses to all of them.
 
 ### Refusals
 

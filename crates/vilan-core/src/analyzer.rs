@@ -35715,7 +35715,14 @@ fn interned_display_name(name: String) -> &'static str {
     use std::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let names = NAMES.get_or_init(|| Mutex::new(HashMap::default()));
-    let mut names = names.lock().unwrap();
+    // Recovering (E97): the last `.unwrap()` in this file's process-global
+    // caches — every neighbour recovers, and a name intern is the cheapest
+    // possible thing to wedge a language-server session on. `String` keys and
+    // `&'static str` values are complete before each insert, so a recovered
+    // guard cannot observe a half-written entry.
+    let mut names = names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = names.get(&name).copied() {
         return existing;
     }

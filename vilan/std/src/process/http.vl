@@ -386,6 +386,64 @@ fun etag_response(request: Request, etag: str, body: Bytes, content_type: str): 
 		.body_bytes(body)
 }
 
+/// What `serve_build` should do about caching for ONE artifact — the opt-in
+/// half of kolt.local 025, handed over by `ServerBuilder::cache_build`.
+///
+/// Two axes, because those are the two a static layer actually chooses between
+/// (`fullstack-dx.md` §5.10): a **validator**, which spends a round trip to
+/// save a body, and **`Cache-Control`**, which spends staleness to save the
+/// round trip. They compose — a fingerprinted chunk wants a long `max-age` and
+/// no validator, a shell wants `no-cache` and a validator — and `none()` is
+/// both switched off, which is byte-for-byte what `serve_build` sends when no
+/// policy was installed at all.
+///
+/// A policy is a function of the artifact's ROUTE — the `/<file name>` the
+/// build claimed — and of nothing else. That is the whole shape: "which of my
+/// build's files is this?" is what a two-tier policy asks, the answer cannot
+/// change between two requests for the same url, and keeping the request out
+/// means a policy cannot quietly become a second request handler behind
+/// `serve_build`'s back. Anything genuinely per-request is `on_request`'s job,
+/// with `etag_response` to build it from. The url rather than the artifact is
+/// the same argument one level down: a policy needs to know which file this
+/// is, and needs nothing else `BuildAsset` carries.
+struct CachePolicy {
+	/// Answer conditional requests for this artifact: mint an `ETag` over the
+	/// bytes being served and reply `304` when the client already has them.
+	validate: bool,
+	/// The `Cache-Control` field value. Empty sends no header — the absence is
+	/// a real answer (it leaves the browser's heuristic freshness alone), not a
+	/// missing one.
+	cache_control: str,
+}
+
+impl CachePolicy {
+	/// No validator and no `Cache-Control` — every byte `serve_build` sends
+	/// for this artifact is what it sends with no policy installed. The base
+	/// of a chain (`CachePolicy::none().cache_control(…)`) and the honest
+	/// answer for an artifact a two-tier policy wants to leave alone.
+	fun none(): CachePolicy {
+		CachePolicy { validate = false, cache_control = "" }
+	}
+
+	/// Revalidate: the first response carries an `ETag`, and every later
+	/// request that still names it gets a `304` with no body. Costs a round
+	/// trip per load and saves the artifact's bytes — the shell tier.
+	fun validated(): CachePolicy {
+		CachePolicy { validate = true, cache_control = "" }
+	}
+
+	/// Set the `Cache-Control` field value, on either base: the fingerprinted
+	/// tier is `CachePolicy::none().cache_control("public, max-age=31536000,
+	/// immutable")`, the shell tier is
+	/// `CachePolicy::validated().cache_control("no-cache")`. The value goes out
+	/// verbatim — this is not a directive builder, and a policy vocabulary is
+	/// not something std should be inventing above RFC 9111's.
+	fun cache_control(own self, value: str): CachePolicy {
+		self.cache_control = value;
+		self
+	}
+}
+
 // --- Server ---
 
 struct Server {
@@ -425,6 +483,14 @@ struct ServerBuilder {
 	/// the chain was written, and the app's own handler still gets every path
 	/// they do not claim.
 	assets: List<BuildAsset>,
+	/// The caching policy `cache_build` installed, `None` until an app hands
+	/// one over. `None` IS the default, and it is a branch rather than a
+	/// neutral policy: with nothing installed the asset routes take the exact
+	/// code path they took before this field existed, so the un-opted response
+	/// is byte-identical by construction and not by a policy that happens to
+	/// add no headers (kolt.local 025b — §5.10's fence is about defaults, and
+	/// this is the hook, not a default).
+	asset_cache: Option<|str| CachePolicy>,
 }
 
 impl Server {
@@ -437,6 +503,7 @@ impl Server {
 			upgrade_handler = None,
 			services = [],
 			assets = [],
+			asset_cache = None,
 		}
 	}
 
@@ -583,6 +650,38 @@ impl ServerBuilder {
 		self
 	}
 
+	/// Opt the served artifacts into caching (kolt.local 025b): `policy` is
+	/// asked, per artifact, what `serve_build` should send beyond the bytes —
+	/// a validator, a `Cache-Control`, or both. The two-tier policy every
+	/// static layer converges on is one expression:
+	///
+	///	.serve_build(build)
+	///	.cache_build(|url| if url.starts_with("/chunk-") {
+	///		CachePolicy::none().cache_control("public, max-age=31536000, immutable")
+	///	} else {
+	///		CachePolicy::validated().cache_control("no-cache")
+	///	})
+	///
+	/// **Nothing changes for a server that does not call this.** The default
+	/// stays exactly what it was — one `Content-Type` header and the bytes —
+	/// because `serve_build` serves a build and not a directory, and caching is
+	/// a policy an application owns rather than one std guesses (the
+	/// `fullstack-dx.md` §5.10 fence, which this hook is scoped to leave
+	/// standing). One call opts in; deleting it opts back out; there is no
+	/// third state.
+	///
+	/// Repeatable, last-wins, and it covers every artifact of every
+	/// `serve_build` on the chain — order is irrelevant, since the policy is
+	/// consulted per request and the artifacts are matched by url. A validator
+	/// is minted over the bytes ACTUALLY being served, so it stays correct
+	/// under `run --watch`, where an edit changes them between requests; the
+	/// price is one sha-256 per hit on a validating artifact, which is the same
+	/// trade `etag_of` documents for a per-request digest.
+	fun cache_build(own self, policy: |str| CachePolicy): ServerBuilder {
+		self.asset_cache = Some(policy);
+		self
+	}
+
 	/// Fold the installed services and build assets in front of
 	/// `request_handler` (`fullstack-dx.md` §4.2 and §5.4) and hand the result
 	/// to `Server`. Services answer first (their mounts are the most specific
@@ -593,10 +692,11 @@ impl ServerBuilder {
 	/// unaffected down to the wire.
 	fun build(self): Server {
 		let assets = self.assets;
+		let cache = self.asset_cache;
 		let fallback = self.request_handler;
 		Server {
 			port = self.port,
-			request_handler = fold_service_requests(self.services, |request| respond_from_build(assets, fallback, request)),
+			request_handler = fold_service_requests(self.services, |request| respond_from_build(assets, cache, fallback, request)),
 			on_start = self.on_start,
 			on_stop = self.on_stop,
 			upgrade_handler = fold_service_upgrades(self.services, self.upgrade_handler),
@@ -609,11 +709,20 @@ impl ServerBuilder {
 /// `build()`'s fold.
 fun respond_from_build(
 	assets: List<BuildAsset>,
+	cache: Option<|str| CachePolicy>,
 	fallback: async |Request| Response,
 	request: Request,
 ): Response {
 	match asset_for(assets, request.path()) {
-		Some(let asset) => asset_response(asset),
+		// Two arms, deliberately, rather than one arm under a neutral policy:
+		// with no `cache_build` on the chain the response is produced by the
+		// same call it always was, so "un-opted is unchanged" is a property of
+		// the control flow and not of what `CachePolicy::none()` happens to add
+		// (kolt.local 025b).
+		Some(let asset) => match cache {
+			Some(let policy) => cached_asset_response(asset, policy(asset.url), request),
+			None => asset_response(asset),
+		},
 		None => fallback(request),
 	}
 }
@@ -633,4 +742,32 @@ fun asset_response(asset: BuildAsset): Response {
 		.set_header("Content-Type", asset.content_type)
 		.body_bytes(asset_body(asset))
 		.build()
+}
+
+/// [`asset_response`] under an installed [`CachePolicy`] — the opted-in arm of
+/// `serve_build` (kolt.local 025b).
+///
+/// It is a composition and nothing more: the validating half is exactly
+/// `etag_response`, the same function an application writes by hand for a page
+/// it renders itself, over the same bytes `asset_response` would have sent and
+/// the same content type the extension named. `etag_response` handing back a
+/// still-open builder is what makes that work — `Cache-Control` chains onto
+/// whichever arm answered, so the `304` carries the policy headers its `200`
+/// would have carried (RFC 9110 §15.4.5), which is the point of returning a
+/// builder rather than a `Response` and is why nothing here re-derives it.
+///
+/// The bytes are taken ONCE and both the validator and the body come from that
+/// one read: under `run --watch` `asset_body` re-reads per request, and hashing
+/// a second read could mint a tag for a file that had already changed again.
+fun cached_asset_response(asset: BuildAsset, policy: CachePolicy, request: Request): Response {
+	let body = asset_body(asset);
+	mut response = if policy.validate {
+		etag_response(request, etag_of(body), body, asset.content_type)
+	} else {
+		Response::builder().set_header("Content-Type", asset.content_type).body_bytes(body)
+	};
+	if policy.cache_control != "" {
+		response = response.set_header("Cache-Control", policy.cache_control);
+	}
+	response.build()
 }

@@ -470,6 +470,16 @@ struct Backend {
     /// the union of their importers' views, and stale targets get explicit
     /// empties. Locked only around synchronous planning, never across an
     /// await.
+    ///
+    /// Every lock of this mutex — and of [`Backend::config`] below — RECOVERS
+    /// from poisoning with `PoisonError::into_inner` (backlog E97, the tree's
+    /// one posture). This server is the exact architecture the posture is for:
+    /// `fenced` CATCHES a per-request panic so one bad request answers its
+    /// fallback instead of locking the user out, and a propagated poison would
+    /// undo that by wedging every later request on a mutex the caught panic left
+    /// behind. This is the one shared structure here that a panic could leave
+    /// *stale* rather than merely absent, which is why `plan_publish` drops the
+    /// re-planning owner's entry before it computes the new one — see there.
     publish_state: Arc<std::sync::Mutex<PublishState>>,
     /// `std` files don't change during a session, so cache their line indices
     /// rather than re-reading the file on every cross-file definition/reference.
@@ -477,7 +487,9 @@ struct Backend {
     /// The client's feature settings, seeded from `initializationOptions` and
     /// updated live by `workspace/didChangeConfiguration`. Read per request
     /// (`inlay_hint`, `semantic_tokens_full`, …) so a toggle takes effect without
-    /// re-registering capabilities.
+    /// re-registering capabilities. Poison-recovering like `publish_state`
+    /// (E97); every write is a whole-value assignment, so a recovered guard
+    /// reads either the old `Config` or the new one, never a mixture.
     config: Arc<std::sync::RwLock<Config>>,
     /// Whether the client can render snippet completions (`$1`/`${1:name}`
     /// tab-stops). Captured from `ClientCapabilities` at `initialize` (fixed for

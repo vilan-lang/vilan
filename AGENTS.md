@@ -178,10 +178,28 @@ Rust workspace, six crates, plus the language's own tree:
   server, a watcher, an editor surface) fences at its own boundary —
   catch, degrade to an honest internal-error answer, details left to
   stderr; a new one-shot entry takes the CLI's stance. Either way,
-  write which and why at the site, and mind E97's open question before
-  holding a global lock across fenced code — a *caught* panic is
-  exactly how a poisoned mutex would outlive the request that poisoned
-  it.
+  write which and why at the site.
+- **Every lock RECOVERS from poisoning — no exceptions, and a test
+  holds the line** (E97, ruled 2026-08-28: "do the safe thing, prevent
+  a poisoned cache"). `.lock()`, `.read()` and `.write()` are followed
+  by `.unwrap_or_else(std::sync::PoisonError::into_inner)` at every
+  site in every crate's `src/`, because a *caught* panic (the fence
+  above is four of them) is exactly how a poisoned mutex outlives the
+  request that poisoned it — and one poisoned process-global turns a
+  one-shot compiler bug into a language server that answers "internal
+  error" for the rest of the session. The defect this closed was
+  DRIFT, not absence (one file defended a cache in one function and
+  not in its neighbour thirty lines later), so
+  `every_lock_in_the_workspace_recovers_from_poisoning`
+  (`crates/vilan-core/src/lib.rs`) scans the sources and fails on the
+  next `.unwrap()`-ing lock anyone adds; an in-`src` test that must
+  acquire a lock says `.expect("…")`. Recovery is only safe because
+  these guards are held over whole-value inserts — build the value
+  BEFORE you take the lock, or the recovered guard hands the next
+  reader a half-written entry. Where a guard is held across
+  panic-prone code, clear the entry before rebuilding it rather than
+  leaving a stale one behind (`publish.rs`'s `plan_publish` is the
+  worked example).
 - **Git is scoped to your worktree.** A lane works in its own git worktree under
   `.claude/worktrees/<lane>`, on its own branch off `next`, and commits there —
   `git add <paths>` naming each file explicitly (never `-A`), with a

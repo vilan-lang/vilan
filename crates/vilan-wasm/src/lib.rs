@@ -347,7 +347,17 @@ fn interned_entry(source: &str) -> &'static str {
     source.hash(&mut hasher);
     let key = hasher.finish();
     let entries = ENTRIES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(existing) = entries.lock().unwrap().get(&key).copied() {
+    // Recovering (E97): the playground fences its compiles, so a caught panic
+    // must not leave this cache poisoned for the rest of the instance's life —
+    // an instance that answers "internal error" forever is the exact failure the
+    // fence exists to prevent. Values are `&'static str`s leaked before the
+    // lock, so a recovered guard never sees a half-written entry.
+    if let Some(existing) = entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied()
+    {
         return existing;
     }
     let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
@@ -355,7 +365,11 @@ fn interned_entry(source: &str) -> &'static str {
         vilan_core::leak_tally::LeakSite::WasmEntryText,
         leaked.len(),
     );
-    entries.lock().unwrap().insert(key, leaked);
+    // Recovering (E97): the text is leaked before the lock is taken.
+    entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, leaked);
     leaked
 }
 

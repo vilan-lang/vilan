@@ -483,6 +483,14 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// watch loop's action closure. Accumulative across rounds: a path a later
 /// round no longer reads stays watched, which costs at most one round whose
 /// legs then verify by content and skip.
+///
+/// Both locks below RECOVER from poisoning (backlog E97, the tree's one
+/// posture). This changes nothing about the CLI's *panic* stance — a compiler
+/// panic in a one-shot `vilan build` is still loud and fatal (AGENTS.md's fence
+/// note) — but `--watch` is a long-lived loop, and a watch set that could stop
+/// being readable would leave the loop silently blind to every `asset::read`
+/// input. An unwind can only ever leave this set holding a subset of one
+/// round's paths, which the next round re-records.
 static CONST_INPUT_PATHS: std::sync::Mutex<BTreeSet<PathBuf>> =
     std::sync::Mutex::new(BTreeSet::new());
 
@@ -491,7 +499,9 @@ fn record_const_inputs(inputs: &[(PathBuf, Option<u64>)]) {
     if inputs.is_empty() {
         return;
     }
-    let mut paths = CONST_INPUT_PATHS.lock().unwrap();
+    let mut paths = CONST_INPUT_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     paths.extend(inputs.iter().map(|(path, _)| path.clone()));
 }
 
@@ -501,7 +511,11 @@ fn record_const_inputs(inputs: &[(PathBuf, Option<u64>)]) {
 /// fires a round.
 fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
     let mut files = scan_vl(roots);
-    for path in CONST_INPUT_PATHS.lock().unwrap().iter() {
+    for path in CONST_INPUT_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
         if let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) {
             files.insert(path.clone(), modified);
         }

@@ -2747,6 +2747,129 @@ fn a_declaration_block_leaves_the_atomic_sheet_byte_identical() {
 }
 
 #[test]
+fn preflight_emits_its_reset_only_when_the_program_asks_for_it() {
+    // kolt.local 008, the opt-in half. The reset is a std style asset the app
+    // EMITS, so the request is a call and the opt-out is its absence — there is
+    // no build flag, no `Document` option, and nothing to switch off.
+    const STYLED: &str = r##"
+        import std::style::{ style, space, Color, Style };
+        fun card(): Style {
+            style().padding(space(4)).color(Color::gray(700))
+        }
+        let _card = const card();
+        "##;
+    let without = style_css(&format!("{STYLED}\nfun main() {{}}\nmain();\n"));
+    assert!(
+        !without.contains("preflight"),
+        "a program that does not ask for the reset gets none of it:\n{without}"
+    );
+
+    let with = style_css(&format!(
+        r##"{STYLED}
+        import std::style::preflight;
+        let _reset = const preflight();
+        fun main() {{}}
+        main();
+        "##
+    ));
+    // Every reset rule is in the reset's own sub-layer, and NOTHING else is.
+    let reset_lines: Vec<&str> = with
+        .lines()
+        .filter(|line| line.starts_with("@layer vilan.preflight{"))
+        .collect();
+    assert!(
+        reset_lines.len() > 20,
+        "the reset is Tailwind-preflight scope, not a box-sizing line: {}",
+        reset_lines.len()
+    );
+    for rule in [
+        "@layer vilan.preflight{*,::before,::after{box-sizing:border-box}}",
+        "@layer vilan.preflight{body{margin:0;line-height:inherit}}",
+        "@layer vilan.preflight{img,video{max-width:100%;height:auto}}",
+        "@layer vilan.preflight{h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}}",
+        // The ruling's own addition, verbatim: buttons, anchors and selects.
+        "@layer vilan.preflight{a,button,select{display:block}}",
+        // …and the UA chrome the form controls carry, stripped.
+        "@layer vilan.preflight{button,input,optgroup,select,textarea{font-family:inherit;\
+font-size:100%;font-weight:inherit;line-height:inherit;color:inherit;margin:0;padding:0;\
+border:0;background-color:transparent}}",
+    ] {
+        assert!(with.contains(rule), "the reset must carry {rule}:\n{with}");
+    }
+
+    // ADDS ONLY: strip the reset's lines and the styled sheet is byte-identical
+    // to the one the same program emits without it — same class names, same
+    // rules, same order. The reset moves nothing, exactly as `declare` moves
+    // nothing.
+    let stripped = with
+        .lines()
+        .filter(|line| !line.starts_with("@layer vilan.preflight{"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    assert_eq!(without, stripped, "with the reset:\n{with}");
+}
+
+#[test]
+fn a_reset_rule_loses_to_a_style_and_to_a_declaration_block() {
+    // The ordering ruling, read off the RESOLVED cascade rather than off the
+    // sheet's byte order — which is the point, because that order is a lexical
+    // sort with no notion of a reset (const-eval.md §3).
+    //
+    // Three tiers on ONE property, each strictly beating the next by a rule
+    // that does not consult specificity or source position:
+    //
+    //   unlayered `.sX{display:…}`               — a Style, always wins
+    //   `@layer vilan{…}`                        — a declare block
+    //   `@layer vilan.preflight{…}`              — the reset, always loses
+    //
+    // css-cascade-5 §6.4.3: unlayered rules sort after layered ones "within the
+    // same parent layer (if any)" — applied at the top level that is
+    // Style-beats-layer, and applied inside `vilan` it is
+    // declare-beats-its-sublayer. One rule, twice, in the same direction.
+    let css = style_css(
+        r##"
+        import std::style::{ style, declare, declarations, preflight, Display, Style };
+        fun s(): Style {
+            style().display(Display::Flex)
+        }
+        fun blocks() {
+            declare("a", declarations().raw("display", "inline-block"));
+        }
+        let _reset = const preflight();
+        let _blocks = const blocks();
+        let _style = const s();
+        fun main() {}
+        main();
+        "##,
+    );
+    // All three claim `display`, on purpose: this is the collision.
+    let (styled, _) = rule_for(&css, "display:flex");
+    let (declared, _) = rule_for(&css, "display:inline-block");
+    assert!(
+        styled.starts_with(".s") && !styled.contains("@layer"),
+        "a Style rule is UNLAYERED, so it beats every layer whatever the \
+         specificity: {styled}"
+    );
+    assert!(
+        declared.starts_with("@layer vilan{") && !declared.starts_with("@layer vilan.preflight{"),
+        "a declaration block is in `vilan` itself, so it beats the sub-layer \
+         below it: {declared}"
+    );
+    assert!(
+        css.contains("@layer vilan.preflight{a,button,select{display:block}}"),
+        "and the reset's own `display` rule is in the SUB-layer, so it loses to \
+         both of them — an app resetting `a` further needs no !important and no \
+         longer selector:\n{css}"
+    );
+    // The claim this test is really making: none of the above is a statement
+    // about where the lines landed. Nothing here reads an offset.
+    assert!(
+        css.lines().filter(|line| line.contains("display:")).count() >= 3,
+        "the three tiers are all present in one sheet:\n{css}"
+    );
+}
+
+#[test]
 fn a_declaration_block_is_layered_and_a_style_rule_is_not() {
     // The ordering ruling, read off the sheet: the block is inside
     // `@layer vilan`, the atomic rules are unlayered, and unlayered wins the

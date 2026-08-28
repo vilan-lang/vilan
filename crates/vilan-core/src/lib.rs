@@ -267,10 +267,27 @@ pub fn parse_clean_cached(
     let broken = PARSE_CLEAN_BROKEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
 
     let key = content_hash(source);
-    if let Some(cached) = cache.lock().unwrap().get(&key) {
+    // Recover from poisoning rather than propagate it (backlog E97): this map is
+    // process-global and the long-lived surfaces CATCH panics (the four fences),
+    // so a propagated poison would outlive the request that caused it and answer
+    // "the compiler panicked" for the rest of the session. Every value here is a
+    // fully-built `'static` pointer inserted in one step, so a recovered guard
+    // cannot hand back a half-written entry — the worst a panic can do is leave
+    // an entry absent, which re-parses.
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
         return Some(*cached);
     }
-    if broken.lock().unwrap().contains(&key) {
+    // Same posture: a poisoned known-broken set must not wedge the session, and
+    // a `u64` key set has no torn state to observe.
+    if broken
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&key)
+    {
         return None;
     }
 
@@ -284,7 +301,12 @@ pub fn parse_clean_cached(
     // source is "clean" — and cacheable — exactly when it produced no diagnostics.
     let (tree, errors) = parsing::parse(leaked);
     let Some(mut root) = tree.filter(|_| errors.is_empty()) else {
-        broken.lock().unwrap().insert(key);
+        // Recovering (E97): the insert is one step over a `Copy` key, so a
+        // recovered guard sees a well-formed set either way.
+        broken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
         return None;
     };
     elements::rewrite_items(&mut root.0, leaked);
@@ -294,7 +316,12 @@ pub fn parse_clean_cached(
         leak_tally::LeakSite::ParseCleanCacheAst,
         std::mem::size_of_val(leaked_root),
     );
-    cache.lock().unwrap().insert(key, (leaked_root, leaked));
+    // Recovering (E97): the tree and its text are both leaked and complete
+    // BEFORE the lock is taken, so the entry is whole or absent, never torn.
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, (leaked_root, leaked));
     Some((leaked_root, leaked))
 }
 
@@ -845,4 +872,151 @@ pub(crate) fn phase_timing_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("VILAN_PHASE_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// backlog E97 — the tree's ONE posture on mutex poisoning: every lock of a
+    /// shared cache recovers with `PoisonError::into_inner` rather than
+    /// propagating. The long-lived surfaces CATCH panics (the four fences), so a
+    /// propagated poison outlives the request that caused it and answers
+    /// "internal error" for the rest of the session.
+    ///
+    /// Poisoned exactly the way a caught panic poisons: an unwind out of code
+    /// holding the guard, caught, with the process still running afterwards.
+    #[test]
+    fn a_poisoned_parse_cache_recovers_instead_of_wedging_the_session() {
+        let source = "fun poisoned_cache_probe() {}\n";
+        let first = parse_clean_cached(source).expect("a clean source caches");
+        let cache = PARSE_CLEAN_CACHE
+            .get()
+            .expect("the clean-parse cache is live");
+        let broken = PARSE_CLEAN_BROKEN
+            .get()
+            .expect("the known-broken set is live");
+
+        let poison = |mutex: &dyn Fn()| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(mutex));
+            assert!(outcome.is_err(), "the probe panic must have unwound");
+        };
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        poison(&|| {
+            let _guard = cache.lock().expect("not poisoned yet");
+            panic!("a compiler panic inside the fence");
+        });
+        poison(&|| {
+            let _guard = broken.lock().expect("not poisoned yet");
+            panic!("a compiler panic inside the fence");
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(
+            cache.is_poisoned(),
+            "the probe poisoned the clean-parse cache"
+        );
+        assert!(
+            broken.is_poisoned(),
+            "the probe poisoned the known-broken set"
+        );
+
+        // A hit still hits: the identical `'static` pointer comes back, which is
+        // how reuse is proven without timing.
+        let again = parse_clean_cached(source).expect("the poisoned cache still serves");
+        assert!(
+            std::ptr::eq(first.0, again.0) && std::ptr::eq(first.1, again.1),
+            "a recovered guard serves the cached tree, not a fresh parse"
+        );
+        // A miss still inserts through the recovered guard...
+        let other = "fun poisoned_cache_probe_two() {}\n";
+        let inserted = parse_clean_cached(other).expect("a fresh clean source caches");
+        assert!(
+            std::ptr::eq(inserted.0, parse_clean_cached(other).expect("cached").0),
+            "the entry written under a recovered guard is readable back"
+        );
+        // ...and the known-broken half records through its own recovered guard.
+        assert!(
+            parse_clean_cached("fun (").is_none(),
+            "a broken source is still refused, not panicked on"
+        );
+        assert!(
+            parse_clean_cached("fun (").is_none(),
+            "and it is served from the recovered known-broken set the second time"
+        );
+
+        // Leave the globals as they were found: the posture makes a poisoned
+        // mutex harmless, but a later test reading `is_poisoned` should not
+        // inherit this one's probe.
+        cache.clear_poison();
+        broken.clear_poison();
+    }
+
+    /// The posture is only worth having if it is UNIFORM — the defect E97 filed
+    /// was "defended in one function and not in its neighbour thirty lines
+    /// later", which is a drift bug, not a missing-defense bug. So the gate is
+    /// on the drift: no lock in any crate's sources may propagate a poison.
+    ///
+    /// Deliberately a source scan rather than a per-site pin. A poison pin can
+    /// only reach a cache a test can name, and most of these are private to the
+    /// function that owns them; the thing worth holding is that the NEXT lock
+    /// added anywhere in the workspace joins the posture, and that is a property
+    /// of the text.
+    ///
+    /// Scoped to each crate's `src/` — the separate `tests/` binaries are out,
+    /// where a lock is a single-threaded arrangement with no session to wedge.
+    /// An in-`src` test that must ACQUIRE a lock (this file's neighbour above
+    /// poisons one on purpose) spells `.expect("…")`, so a deliberate assertion
+    /// reads as one and the gate stays a signal rather than noise.
+    #[test]
+    fn every_lock_in_the_workspace_recovers_from_poisoning() {
+        // Assembled rather than written literally, so the gate does not match
+        // its own needles when it scans this file.
+        let needles: Vec<String> = ["lock", "read", "write"]
+            .iter()
+            .map(|method| format!(".{method}().{}()", "unwrap"))
+            .collect();
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/");
+        let mut offenders = Vec::new();
+        let mut scanned = 0;
+        let mut directories: Vec<std::path::PathBuf> = std::fs::read_dir(crates)
+            .expect("a readable crates/ tree")
+            .map(|entry| entry.expect("a readable entry").path().join("src"))
+            .filter(|source_root| source_root.is_dir())
+            .collect();
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).expect("a readable source directory") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                scanned += 1;
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                // Whitespace-stripped, so rustfmt's multi-line chain reads the
+                // same as the one-liner. `.unwrap_or_else(…)` does not match.
+                let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                for needle in &needles {
+                    if flat.contains(needle) {
+                        offenders.push(format!(
+                            "{} propagates a poison at `{needle}`",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(scanned > 0, "the scan found no Rust sources — wrong root?");
+        assert!(
+            offenders.is_empty(),
+            "backlog E97: every lock recovers with `.unwrap_or_else(std::sync::PoisonError::into_inner)`, \
+             so a caught panic cannot wedge a long-lived session. Offending sites:\n{}",
+            offenders.join("\n")
+        );
+    }
 }
