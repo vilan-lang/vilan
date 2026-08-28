@@ -5,7 +5,8 @@
 //! every other kind lexical by line — G5), a kind that stops emitting loses
 //! its file on the next build (the per-kind prune, G6) — and, per hmr.md §11
 //! S0, `vilan run` / `run --watch` write the same sidecar each round so the
-//! dev loop serves fresh assets. A kind naming a file the build writes
+//! dev loop serves fresh assets, and SWEEP it when the source stops emitting
+//! styles, like `build` does (G8). A kind naming a file the build writes
 //! itself never reaches the filesystem at all (G7).
 
 use std::path::{Path, PathBuf};
@@ -463,6 +464,59 @@ fn workspace_run_writes_fresh_dist_css() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same program with the styles taken out — `run`'s round after the edit
+/// that G8 is about.
+fn styleless_program(marker: &str) -> String {
+    format!("import std::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\nmain();\n")
+}
+
+#[test]
+fn run_sweeps_the_stale_sidecar() {
+    // G8: `sweep_stale_sidecar` hung off `write_chunks`, which `vilan build`
+    // reaches and `vilan run` does not — so `app.css` survived a `run` whose
+    // source no longer emitted a single style, and the same tree built with
+    // `vilan build` had it removed. Measured before the fix: build → `app.css`
+    // present; delete the styles; `run` → `app.css` STILL present with the old
+    // bytes; `build` → gone. The sweep now lives in `write_assets`, which every
+    // flushing path calls, so `run` answers like `build`.
+    let dir = temp_project("run_sweep");
+    write(&dir, "app.vl", &quick_exit_program("rSw"));
+    // An unrelated user file beside the entry — the sweep names ONE file,
+    // `<entry>.css`, and everything else in the directory is not its business.
+    write(&dir, "notes.txt", "user notes\n");
+    let entry = dir.join("app.vl");
+    let output = vilan(&["build", entry.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("app.css")).ok().as_deref(),
+        Some(".rSw{color:red}\n")
+    );
+
+    write(&dir, "app.vl", &styleless_program("rSw"));
+    let output = vilan(&["run", entry.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "run failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dir.join("app.css").exists(),
+        "`vilan run` must sweep the sidecar its source stopped emitting"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.txt"))
+            .ok()
+            .as_deref(),
+        Some("user notes\n"),
+        "a user file beside the entry is not the sweep's to remove"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Polls for `path` to hold `expected`, up to a bounded deadline. Returns the last
 /// content seen (for a helpful assert message) if it never matches.
 fn wait_for_contents(path: &Path, expected: &str, deadline: Duration) -> Result<(), String> {
@@ -524,5 +578,39 @@ fn watch_round_refreshes_the_sidecar() {
     round_two
         .map_err(|last| format!("watch round did not refresh the sidecar; last saw: {last:?}"))
         .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_single_file_watch_round_sweeps_the_stale_sidecar() {
+    // G8's other half, and the one that hurts most: the single-file watch
+    // round writes assets on its own path (not through `build`), so before the
+    // fix a session kept `app.css` on disk round after round with the styles
+    // long deleted — kolt.local 007's resurrection shape, which is exactly why
+    // `sweep_stale_sidecar` exists. Bounded end-to-end, like its sibling
+    // above: wait for round 1's sidecar, edit the styles out, wait for the
+    // round it triggers to remove the file.
+    let dir = temp_project("watch_sweep");
+    let entry = dir.join("app.vl");
+    write(&dir, "app.vl", &quick_exit_program("wSw"));
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", entry.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let css = dir.join("app.css");
+    let deadline = support::WATCH_LIVENESS;
+    let round_one = wait_for_contents(&css, ".wSw{color:red}\n", deadline);
+
+    std::fs::write(&entry, styleless_program("wSw")).unwrap();
+    let round_two = wait_for_gone(&css, deadline);
+
+    support::kill_watcher(&mut watcher);
+
+    round_one.expect("round 1 should have written the sidecar");
+    round_two.expect("the round after the edit should have swept the stale sidecar");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2631,6 +2631,16 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
 /// absence is the fact a shell cannot see today (`fullstack-dx.md` §5.2, F1/F2):
 /// the manifest states it positively instead of leaving a server to probe the
 /// filesystem for it.
+///
+/// This is also where the previous flush's leftovers go, BOTH mechanisms
+/// together (backlog G8): the per-kind prune for every recordable kind, and
+/// [`sweep_stale_sidecar`] for `css`. The sidecar sweep used to live only in
+/// [`write_chunks`], which `build` calls and `run` / the single-file watch
+/// round do not — so a `<entry>.css` survived `vilan run` after the styles
+/// that produced it were deleted, while `vilan build` on the same tree removed
+/// it. The flush is the one place that knows what this round emitted, so it is
+/// where BOTH prunes belong; `write_chunks` keeps its own call for the HMR
+/// watch loop, which writes its sidecar directly rather than through here.
 fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Option<String> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
     let leg = output_js
@@ -2667,6 +2677,7 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Opt
                 .map(|name| name.to_string_lossy().into_owned());
         }
     }
+    sweep_stale_sidecar(output_js, styles.as_deref());
     styles
 }
 
@@ -3019,6 +3030,9 @@ fn write_chunks(
     // build that wrote a manifest where this one will not (a leg retargeted off
     // the browser) is, and the sweep takes it.
     sweep_stale_chunks(output_js, chunks, is_browser);
+    // For the HMR watch loop, which writes its sidecar straight into `dist/`
+    // rather than through [`write_assets`] — every other caller has already
+    // swept there, and a second call on the same `styles` is a no-op (G8).
     sweep_stale_sidecar(output_js, styles);
     for chunk in chunks {
         let path = directory.join(&chunk.file);
@@ -3169,6 +3183,13 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], write
 /// browser then RE-INJECTS the deleted stylesheet, which is resurrection, not
 /// staleness). A failed removal is reported and otherwise ignored, exactly as
 /// the chunk sweep treats a stray.
+///
+/// Called from [`write_assets`] — every path that flushes assets, `build` and
+/// `run` and both watch loops alike (backlog G8; before that it hung off
+/// [`write_chunks`], which only `build` reaches) — and once more from
+/// [`write_chunks`] for the HMR loop, which never flushes through
+/// `write_assets`. It touches ONE name, `<leg>.css`, so a user file beside the
+/// entry is not in its reach.
 fn sweep_stale_sidecar(output_js: &std::path::Path, styles: Option<&str>) {
     if styles.is_some() {
         return;
