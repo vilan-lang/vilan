@@ -29095,6 +29095,65 @@ fn sha256_digests_the_empty_input_and_mints_a_fingerprint_prefix() {
 }
 
 #[test]
+fn etag_of_mints_a_quoted_truncated_sha256_validator() {
+    // kolt.local 025c. The value is pinned against the FIPS 180-4 "abc"
+    // vector (the same one the digest pins hold): the first 32 hex digits of
+    // sha256("abc"), with the RFC 9110 quotes as part of the string — 34
+    // characters in all. The format is documented surface, so a change to the
+    // width or the quoting is a breaking change, not a tweak.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::http::etag_of;
+        import std::bytes::encode_utf8;
+        async fun main() {
+            let tag = etag_of(encode_utf8("abc"));
+            print(tag);
+            print(i"{tag.len()}");
+        }
+        main();
+        "#,
+        "\"ba7816bf8f01cfea414140de5dae2223\"\n34\n",
+    );
+}
+
+#[test]
+fn if_none_match_handles_the_exact_list_star_and_weak_forms() {
+    // kolt.local 025c: the RFC 9110 §13.1.2 forms, one leg per case. Weak
+    // comparison is pinned in BOTH directions (a `W/` candidate against a
+    // strong tag, and a weak tag against a strong candidate), because the RFC
+    // mandates weak comparison for If-None-Match and a strong-only drift
+    // would silently stop revalidating through a tag-weakening proxy. The
+    // last two legs pin the documented limits: quotes are part of the tag
+    // (a bare `abc123` names nothing), and a comma-bearing tag's split
+    // fragments must not false-positive against a well-formed target.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::http::if_none_match_matches;
+        fun main() {
+            let tag = "\"abc123\"";
+            print(i"exact={if_none_match_matches("\"abc123\"", tag)}");
+            print(i"mismatch={if_none_match_matches("\"zzz\"", tag)}");
+            print(i"list={if_none_match_matches("\"a\", \"abc123\", \"b\"", tag)}");
+            print(i"list_absent={if_none_match_matches("\"a\", \"b\"", tag)}");
+            print(i"star={if_none_match_matches("*", tag)}");
+            print(i"weak_candidate={if_none_match_matches("W/\"abc123\"", tag)}");
+            print(i"weak_target={if_none_match_matches("\"abc123\"", "W/\"abc123\"")}");
+            print(i"padded={if_none_match_matches("  \"abc123\"  ", tag)}");
+            print(i"empty={if_none_match_matches("", tag)}");
+            print(i"unquoted={if_none_match_matches("abc123", tag)}");
+            print(i"fragment={if_none_match_matches("\"abc,123\"", "\"abc\"")}");
+        }
+        main();
+        "#,
+        "exact=true\nmismatch=false\nlist=true\nlist_absent=false\nstar=true\n\
+         weak_candidate=true\nweak_target=true\npadded=true\nempty=false\n\
+         unquoted=false\nfragment=false\n",
+    );
+}
+
+#[test]
 fn a_jwt_round_trips_signs_and_verifies() {
     assert_compiles_and_runs(
         r#"

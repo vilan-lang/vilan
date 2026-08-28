@@ -86,33 +86,59 @@ impl ResponseStream {
 	fun close(self)                     // end the response
 	fun on_close(self, handler: || void)   // the client went away
 }
+
+// conditional requests (ETag / If-None-Match)
+fun etag_of(body: Bytes): str          // async — a strong validator, quoted
+fun if_none_match_matches(header: str, etag: str): bool
+fun etag_response(request: Request, etag: str, body: Bytes, content_type: str): ResponseBuilder
 ```
 
-`Request::header` reads one header off the request, which is what a
-conditional request needs — the validator arrives as `If-None-Match`, and
-the response side (`code(304)` + `set_header`) could already express the
-answer:
+`Request::header` reads one header off the request, and the conditional
+request built on it ships whole. `etag_of` mints a **strong validator** for
+a body: the first 32 hex digits of its sha-256 with the quotes included,
+because an entity-tag *is* quoted on the wire — 128 bits is enough that
+colliding with a body you did not choose is a second preimage, at half the
+header weight of the full digest. `etag_response` then answers the request:
+a `304 Not Modified` with the ETag echoed and no body when the request's
+`If-None-Match` already names the tag, or the full `200` with `ETag`,
+`Content-Type` and the bytes. It hands back the `ResponseBuilder` still
+open, so your policy headers chain after it and land on **whichever arm
+answered** — which is exactly what a 304 needs, since it carries the
+headers its 200 would have carried:
 
 ```vilan,norun
-import std::http::{ Response, Server };
-import std::option::Option::{ None, Some, self };
+import std::bytes::encode_utf8;
+import std::http::{ Server, etag_of, etag_response };
 
-fun main() {
+async fun main() {
+	let page = encode_utf8("<h1>hello</h1>");
+	let tag = etag_of(page);   // once, where the bytes settle
+
 	Server::builder()
 		.on_request(|request| {
-			let tag = "\"v1\"";
-			match request.header("If-None-Match") {
-				Some(let seen) => if seen == tag {
-					ret Response::builder().code(304).build();
-				},
-				None => {}
-			}
-			Response::builder().set_header("ETag", tag).body("hello").build()
+			etag_response(request, tag, page, "text/html; charset=utf-8")
+				.set_header("Cache-Control", "no-cache")
+				.build()
 		})
 		.build()
 		.start();
 }
 ```
+
+The matching is RFC 9110's, all three forms of the field: a single
+entity-tag, a comma-separated list of them, and `*` (which matches any
+representation the server holds). Comparison is **weak**, as the RFC
+mandates for `If-None-Match` — a `W/` marker on either side is ignored — so
+a client revalidating through a proxy that weakened the tag it forwarded
+still gets its 304. Only `GET` and `HEAD` revalidate: on any other method a
+matching `If-None-Match` means `412 Precondition Failed`, a state-changing
+route's protocol, so there the header is not consulted and the full
+response goes out. One documented limit: the list form is split on commas,
+so an `etag` that itself embeds a comma cannot be found in a list — no tag
+`etag_of` mints does. `if_none_match_matches(header, etag)` is the
+comparison half on its own, for a handler that wants to build both arms
+itself. Task-oriented usage — the two-tier cache policy this slots into —
+is in [the guide](../guide/persistence.md#caching-etag-and-304).
 
 Header names are **case-insensitive**: node lowercases every name it parses
 off the wire, and `header` lowers `name` to match, so the casing you write
