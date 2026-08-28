@@ -18,6 +18,16 @@
 #                       a §7.3 patch cut tags a release/0.MINOR branch, not HEAD
 #   --out FILE          write the proposed CHANGELOG to FILE and do nothing
 #                       else (implies --dry-run) - the seam the pins use
+#   --allow-red-ci      cut although CI is not verifiably green on the commit
+#                       (printed loudly; the L17 escape hatch, not a shortcut)
+#
+# Before any of it, the commit's CI (releases.md §7.2 step 4, backlog L17):
+# ci.yml must be GREEN on origin for the commit that will become the tag, the
+# verdict read from `gh run list` at that exact sha. Red, still running,
+# absent, or unreadable (no gh, no origin, offline) REFUSES the cut - the rule
+# is fail-closed, because unverified is not green. v0.37.0 was tagged over a
+# Windows CI leg that had been red for days: the only suite anyone had run was
+# local, and local is one platform.
 #
 # Part (a), mechanized. Entries carry no sha, so provenance is derived: the
 # oldest commit in the repository that introduced the entry's bold head into
@@ -57,6 +67,7 @@ DO_COMMIT=0
 SECTION_DATE=""
 AGAINST="HEAD"
 OUT=""
+ALLOW_RED_CI=0
 INVOKED_FROM="$PWD"
 TAB="$(printf '\t')"
 
@@ -69,13 +80,15 @@ run() {
 
 usage() {
     say "usage: scripts/cut-release.sh [--dry-run] [--commit] [--date YYYY-MM-DD]"
-    say "                              [--against <commit>] [--out FILE] <X.Y.Z>"
+    say "                              [--against <commit>] [--out FILE]"
+    say "                              [--allow-red-ci] <X.Y.Z>"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --commit) DO_COMMIT=1 ;;
+        --allow-red-ci) ALLOW_RED_CI=1 ;;
         --date)
             SECTION_DATE="${2:?--date needs a YYYY-MM-DD argument}"
             shift
@@ -351,6 +364,67 @@ say "cut v$VERSION — $SECTION_DATE"
 say "against $(git rev-parse --short "$TARGET")  $(git log -1 --format=%s "$TARGET")"
 say ""
 
+# ---------------------------------------------------------------------------
+# The commit's CI - releases.md §7.2 step 4, backlog L17. The tag push hands
+# this exact tree to release.yml, whose gate authorizes five publish channels,
+# several of them one-way; a local suite run is one platform and does not
+# stand in for CI's. The verdict comes from `gh run list` at the sha (the
+# trustworthy read - §7.2 step 9 already records that the Pages builds API
+# lags, and run lists do not), and the rule is fail-closed: green proceeds;
+# red, still running, absent, or UNVERIFIABLE (no gh, no origin, unreachable)
+# refuses. `--allow-red-ci` overrides a bad verdict loudly, for the day the
+# gate itself is what is broken - never silently.
+# ---------------------------------------------------------------------------
+say "ci (§7.2 step 4, backlog L17) — ci.yml on origin, at the commit that becomes the tag"
+say ""
+CI_RED=0
+TARGET_SHORT="$(git rev-parse --short "$TARGET")"
+ci_verdict=""
+if ! command -v gh > /dev/null 2>&1; then
+    ci_verdict="gh is not installed, so the commit's CI state cannot be read - and unverified is not green. Install gh (or cut from the machine that has it)"
+elif ! git config --get remote.origin.url > /dev/null 2>&1; then
+    ci_verdict="no 'origin' remote, so there is no CI to verify $TARGET_SHORT against"
+else
+    CI_REPO="$(git config --get remote.origin.url |
+        sed -e 's#\.git$##' -e 's#^git@[^:]*:##' -e 's#^[a-z+]*://[^/]*/##')"
+    ci_state="$(gh run list -R "$CI_REPO" --workflow ci.yml --commit "$TARGET" \
+        --limit 20 --json status,conclusion,headSha \
+        --jq "[.[] | select(.headSha == \"$TARGET\")] | first | \
+              if . == null then \"none\" else .status + \" \" + (.conclusion // \"\") end" \
+        2> /dev/null || echo "unreachable")"
+    case "$ci_state" in
+        "completed success")
+            say "  ok    ci.yml is green on origin at $TARGET_SHORT"
+            ;;
+        none)
+            ci_verdict="ci.yml has NO run at $TARGET_SHORT - push the commit and let CI finish before cutting"
+            ;;
+        unreachable)
+            ci_verdict="could not read ci.yml's runs from $CI_REPO (offline, or gh unauthenticated?) - unverifiable is not green"
+            ;;
+        "completed"*)
+            ci_verdict="ci.yml concluded '${ci_state#completed }', not success, at $TARGET_SHORT - fix the tree and wait for green; tagging over red CI is exactly how v0.37.0 shipped (L17)"
+            ;;
+        *)
+            ci_verdict="ci.yml is still '${ci_state%% *}' at $TARGET_SHORT - wait for it to finish; pending is not green"
+            ;;
+    esac
+fi
+if [ -n "$ci_verdict" ]; then
+    if [ "$ALLOW_RED_CI" = 1 ]; then
+        say "  !!    OVERRIDDEN by --allow-red-ci: $ci_verdict"
+        say "  !!"
+        say "  !!    this cut rides CI this script could not verify green - the L17 shape,"
+        say "  !!    chosen deliberately this time. release.yml's own gate (the full suite,"
+        say "  !!    ubuntu and windows) still stands between the tag and the publish."
+    else
+        say "  RED   $ci_verdict"
+        say "        (--allow-red-ci overrides this check, loudly, if the gate itself is what is broken)"
+        CI_RED=1
+    fi
+fi
+say ""
+
 REFUSED="$AWK_STATUS"
 if [ "$REFUSED" = 3 ]; then
     say 'REFUSED — the section is not in the shape §7.2 step 3 asks for, and this script never guesses.'
@@ -511,7 +585,7 @@ if [ "$REFUSED" != 3 ]; then
     say ""
 fi
 
-if [ "$REFUSED" = 3 ] || [ "$SWEEP_RED" != 0 ] || [ "$LIFE_RED" != 0 ]; then
+if [ "$REFUSED" = 3 ] || [ "$SWEEP_RED" != 0 ] || [ "$LIFE_RED" != 0 ] || [ "$CI_RED" != 0 ]; then
     fail "refusing to cut - fix the reds above (nothing was changed)"
 fi
 
