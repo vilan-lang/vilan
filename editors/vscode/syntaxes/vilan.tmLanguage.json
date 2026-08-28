@@ -305,9 +305,9 @@
      "match": "\\b(let|mut|own|external|export|async|const|resource)\\b"
     },
     {
-     "comment": "`with` (trait impl / bound) and the `borrows` return clause.",
+     "comment": "`with` (trait impl / bound), the `borrows` return clause, and `css` (the head of a `css { … }` block).",
      "name": "keyword.other.vilan",
-     "match": "\\b(with|borrows)\\b"
+     "match": "\\b(with|borrows|css)\\b"
     },
     {
      "comment": "The `context` CLAUSE on a closure type \u2014 `(|| void) context owner_scope`, multi `context (a, b)`. It is a contextual keyword (a value or module may be NAMED `context`), and the clause only ever follows a parenthesized closure type \u2014 so the guard is: keyword only right after a `)`.",

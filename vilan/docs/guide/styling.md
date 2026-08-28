@@ -103,11 +103,11 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   variable (see dynamic values below), and
   `Length::calc("100% - 2rem")` when the value is arithmetic — you write
   the expression, not the `calc(..)` wrapper.
-- **`Length::css(..)`** is the verbatim escape, `Color::hex`'s twin: a
+- **`Length::raw(..)`** is the verbatim escape, `Color::hex`'s twin: a
   complete CSS value written as text, for the functional forms `Length`
-  does not model — `Length::css("clamp(1100px, 100vw, 1920px)")`,
+  does not model — `Length::raw("clamp(1100px, 100vw, 1920px)")`,
   `min()`, `max()`, `env()`, `fit-content()`. Use `calc` when you are
-  writing *arithmetic* and want the wrapper supplied; use `css` when the
+  writing *arithmetic* and want the wrapper supplied; use `raw` when the
   value is already whole, which is also what lets one named expression be
   reused across several properties. An empty value stops the build.
 - **`Color`** has `Color::white()`, `Color::black()`,
@@ -199,9 +199,9 @@ and stay available; they are `raw` at those two value types.
 
 Reach for the value, not its text. A token is a *pair* — the reference
 (`var(--space-4)`) and the `:root` line that declares it — and reading the
-`.css` field of one hands over the reference alone, so `space(4).css` puts a
+`.text` field of one hands over the reference alone, so `space(4).text` puts a
 `var()` on the sheet that nothing defines. (That is the field, not the
-`Length::css(..)` constructor above, which is a value in its own right and
+`Length::raw(..)` constructor above, which is a value in its own right and
 declares nothing to lose.) Passing `space(4)` itself keeps the pair together.
 
 The typed surface grows by demand — if you find yourself reaching for `raw`

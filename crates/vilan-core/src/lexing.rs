@@ -62,6 +62,7 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("async", Token::Async),
     ("await", Token::Await),
     ("const", Token::Const),
+    ("css", Token::Css),
     ("else", Token::Else),
     ("enum", Token::Enum),
     ("export", Token::Export),

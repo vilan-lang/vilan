@@ -207,6 +207,11 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
         "spec/const.html#91-the-const-expression",
     ),
     (
+        "css",
+        "Reserved for the `css { … }` block, CSS declarations that build a `Style`.",
+        "guide/styling.html#the-model",
+    ),
+    (
         "import",
         "Loads a module and binds the named items into this module's scope.",
         "spec/names.html#43-imports",
@@ -359,6 +364,7 @@ pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
         Token::Async => "async",
         Token::Await => "await",
         Token::Const => "const",
+        Token::Css => "css",
         Token::Else => "else",
         Token::Enum => "enum",
         Token::Export => "export",

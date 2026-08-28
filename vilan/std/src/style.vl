@@ -52,41 +52,41 @@ import pkg::range::Range;
 /// A CSS length: a token's IDENTITY (`var(--space-4)`) or a literal unit.
 /// `root` carries the token's `:root` declaration ("" when none).
 struct Length {
-	css: str,
+	text: str,
 	root: str,
 }
 
 impl Length {
 	fun px(value: f64): Length {
-		Length { css = i"{value}px", root = "" }
+		Length { text = i"{value}px", root = "" }
 	}
 
 	fun rem(value: f64): Length {
-		Length { css = i"{value}rem", root = "" }
+		Length { text = i"{value}rem", root = "" }
 	}
 
 	/// Relative to the element's own font size — the unit `letter_spacing`
 	/// and optical spacing are written in.
 	fun em(value: f64): Length {
-		Length { css = i"{value}em", root = "" }
+		Length { text = i"{value}em", root = "" }
 	}
 
 	fun pct(value: f64): Length {
-		Length { css = i"{value}%", root = "" }
+		Length { text = i"{value}%", root = "" }
 	}
 
 	/// Viewport units. `min_height(Length::vh(100.0))` is the full-height
 	/// shell.
 	fun vh(value: f64): Length {
-		Length { css = i"{value}vh", root = "" }
+		Length { text = i"{value}vh", root = "" }
 	}
 
 	fun vw(value: f64): Length {
-		Length { css = i"{value}vw", root = "" }
+		Length { text = i"{value}vw", root = "" }
 	}
 
 	fun auto(): Length {
-		Length { css = "auto", root = "" }
+		Length { text = "auto", root = "" }
 	}
 
 	/// Bare `0` — the unit-less zero CSS accepts for any length, and what the
@@ -94,7 +94,7 @@ impl Length {
 	/// written as. `space(0)` renders `var(--space-0)` and `Length::px(0.0)`
 	/// renders `0px`; all three compute the same, and this one is the spelling.
 	fun zero(): Length {
-		Length { css = "0", root = "" }
+		Length { text = "0", root = "" }
 	}
 
 	/// A `calc()` expression, written WITHOUT the wrapper:
@@ -103,30 +103,30 @@ impl Length {
 	/// model — rides a string. Composes with tokens through their rendered
 	/// form, e.g. `Length::calc("100vh - var(--space-16)")`.
 	///
-	/// Sugar over `css`: `Length::calc(e)` is `Length::css("calc(" + e + ")")`.
+	/// Sugar over `raw`: `Length::calc(e)` is `Length::raw("calc(" + e + ")")`.
 	fun calc(expression: str): Length {
 		check_not_blank("Length::calc", expression);
-		Length { css = i"calc({expression})", root = "" }
+		Length { text = i"calc({expression})", root = "" }
 	}
 
 	/// A complete CSS value, verbatim — `Color::hex`'s twin for lengths, and
 	/// the escape for the functional values the representation does not model:
-	/// `Length::css("clamp(120px, 100vw, 1920px)")`, `min()`, `max()`, `env()`,
+	/// `Length::raw("clamp(120px, 100vw, 1920px)")`, `min()`, `max()`, `env()`,
 	/// `fit-content()`. Use `calc` when you are writing ARITHMETIC and want the
 	/// wrapper supplied; use this when the value is already whole, which is also
 	/// what lets one named expression be reused across properties.
 	///
 	/// (`clamp`/`min`/`max` also nest inside `calc()`, so `calc` reaches them
 	/// too — at the cost of a wrapper the author did not write.)
-	fun css(expression: str): Length {
-		check_not_blank("Length::css", expression);
-		Length { css = expression, root = "" }
+	fun raw(expression: str): Length {
+		check_not_blank("Length::raw", expression);
+		Length { text = expression, root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel: pairs with
 	/// `view.style_var(name, signal)` writing the custom property at runtime.
 	fun var(name: str): Length {
-		Length { css = i"var({name})", root = "" }
+		Length { text = i"var({name})", root = "" }
 	}
 }
 
@@ -149,35 +149,35 @@ fun space(step: i32): Length {
 		24 => "6rem",
 		_ => panic(i"unknown spacing step {step} (the scale has 0-6, 8, 10, 12, 16, 20, 24)"),
 	};
-	Length { css = i"var(--space-{step})", root = i":root\{--space-{step}:{value}\}" }
+	Length { text = i"var(--space-{step})", root = i":root\{--space-{step}:{value}\}" }
 }
 
 /// A CSS color: a ramp token's identity (`var(--gray-50)`) or a literal.
 struct Color {
-	css: str,
+	text: str,
 	root: str,
 }
 
 fun ramp(name: str, step: i32, value: str): Color {
-	Color { css = i"var(--{name}-{step})", root = i":root\{--{name}-{step}:{value}\}" }
+	Color { text = i"var(--{name}-{step})", root = i":root\{--{name}-{step}:{value}\}" }
 }
 
 impl Color {
 	fun white(): Color {
-		Color { css = "#ffffff", root = "" }
+		Color { text = "#ffffff", root = "" }
 	}
 
 	fun black(): Color {
-		Color { css = "#000000", root = "" }
+		Color { text = "#000000", root = "" }
 	}
 
 	fun transparent(): Color {
-		Color { css = "transparent", root = "" }
+		Color { text = "transparent", root = "" }
 	}
 
 	/// The typed arbitrary-value escape.
 	fun hex(value: str): Color {
-		Color { css = value, root = "" }
+		Color { text = value, root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel for colours — `Length::var`'s
@@ -188,7 +188,7 @@ impl Color {
 	/// `rgb(from var(..) r g b / a)`, so a variable-backed colour
 	/// translucifies exactly like a ramp token.
 	fun var(name: str): Color {
-		Color { css = i"var({name})", root = "" }
+		Color { text = i"var({name})", root = "" }
 	}
 
 	fun gray(step: i32): Color {
@@ -263,7 +263,7 @@ impl Color {
 		check_channel("green", green);
 		check_channel("blue", blue);
 		check_alpha(alpha);
-		Color { css = i"rgba({red}, {green}, {blue}, {alpha})", root = "" }
+		Color { text = i"rgba({red}, {green}, {blue}, {alpha})", root = "" }
 	}
 
 	/// A perceptual literal — OKLCH, Oklab's polar form: `lightness` 0.0-1.0
@@ -277,7 +277,7 @@ impl Color {
 	/// `.alpha()` composes over the result like over any other colour.
 	fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
 		check_oklch(lightness, chroma, hue);
-		Color { css = i"oklch({lightness} {chroma} {hue})", root = "" }
+		Color { text = i"oklch({lightness} {chroma} {hue})", root = "" }
 	}
 
 	/// This color at `alpha` (0.0-1.0). Renders the RELATIVE color form,
@@ -289,7 +289,7 @@ impl Color {
 	/// percentage, and `0.07 * 100.0` is `7.000000000000001`.)
 	fun alpha(self, value: f64): Color {
 		check_alpha(value);
-		Color { css = i"rgb(from {self.css} r g b / {value})", root = self.root }
+		Color { text = i"rgb(from {self.text} r g b / {value})", root = self.root }
 	}
 }
 
@@ -415,7 +415,7 @@ impl Gradient {
 		if color.root != "" {
 			roots.push(color.root);
 		}
-		let rendered = i"{color.css} {percent}%";
+		let rendered = i"{color.text} {percent}%";
 		Gradient {
 			function = self.function,
 			geometry = self.geometry,
@@ -473,7 +473,7 @@ impl str with CssValue {
 /// A length — a token's identity plus the `:root` line that defines it.
 impl Length with CssValue {
 	fun css_text(self): str {
-		self.css
+		self.text
 	}
 
 	fun css_root(self): str {
@@ -484,7 +484,7 @@ impl Length with CssValue {
 /// A color — `Length`'s twin, same token discipline.
 impl Color with CssValue {
 	fun css_text(self): str {
-		self.css
+		self.text
 	}
 
 	fun css_root(self): str {
@@ -1028,7 +1028,7 @@ impl Style {
 		if color.root != "" {
 			emit("css", color.root);
 		}
-		self.rule("", "", property, i"{property}:{width.css} solid {color.css}")
+		self.rule("", "", property, i"{property}:{width.text} solid {color.text}")
 	}
 
 	fun border(self, width: Length, color: Color): Style {

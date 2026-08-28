@@ -111,11 +111,11 @@ fun main() {
 	print(const style().border(Length::px(1), Color::gray(300)).border_none().class_list());
 
 	// The remainder's value surfaces (ui-styling.md §0bis.5). `zero()` is a bare
-	// `0`, not `0px`; `css()` is verbatim where `calc()` wraps — the golden is
+	// `0`, not `0px`; `raw()` is verbatim where `calc()` wraps — the golden is
 	// where that pair is proven in bytes. Additions again: nothing above moves.
 	let zeroed = const style()
 		.inset(Length::zero())
-		.left(Length::css("clamp(120px, 30%, 185px)"))
+		.left(Length::raw("clamp(120px, 30%, 185px)"))
 		.min_width(Length::zero())
 		.max_width(Length::calc("100% - 2rem"));
 	print(zeroed.class_list());

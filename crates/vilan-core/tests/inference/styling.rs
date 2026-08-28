@@ -1491,8 +1491,8 @@ fn the_a23_value_surfaces_emit_their_declarations() {
             style()
                 .inset(Length::zero())
                 .min_width(Length::zero())
-                .left(Length::css("clamp(120px, 30%, 185px)"))
-                .width(Length::css("min(400px, 70%)"))
+                .left(Length::raw("clamp(120px, 30%, 185px)"))
+                .width(Length::raw("min(400px, 70%)"))
                 .line_height_length(Length::px(24))
                 .background_image("url(data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=)")
                 .background_size("120px 120px")
@@ -1508,7 +1508,7 @@ fn the_a23_value_surfaces_emit_their_declarations() {
         // `inset:0` and `min-width:0` idioms are written in.
         "{inset:0}",
         "{min-width:0}",
-        // `css` is verbatim — no `calc(..)` wrapper, unlike `calc`.
+        // `raw` is verbatim — no `calc(..)` wrapper, unlike `calc`.
         "{left:clamp(120px, 30%, 185px)}",
         "{width:min(400px, 70%)}",
         "{line-height:24px}",
@@ -1522,18 +1522,18 @@ fn the_a23_value_surfaces_emit_their_declarations() {
     }
 }
 
-/// `calc` is now sugar over `css` and must stay byte-identical: it wraps, `css`
+/// `calc` is now sugar over `raw` and must stay byte-identical: it wraps, `raw`
 /// does not, and the same text through both differs by exactly the wrapper.
 #[test]
-fn calc_still_wraps_and_css_does_not() {
+fn calc_still_wraps_and_raw_does_not() {
     let assets = collected_assets(
         r#"
         import std::style::{ style, Style, Length };
         fun s(): Style {
             style()
                 .width(Length::calc("100% - 2rem"))
-                .height(Length::css("calc(100% - 2rem)"))
-                .max_width(Length::css("100% - 2rem"))
+                .height(Length::raw("calc(100% - 2rem)"))
+                .max_width(Length::raw("100% - 2rem"))
         }
         let _s = const s();
         fun main() {}
@@ -1543,9 +1543,9 @@ fn calc_still_wraps_and_css_does_not() {
     let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
     for expected in [
         "{width:calc(100% - 2rem)}",
-        // Spelling the wrapper by hand through `css` reaches the same value.
+        // Spelling the wrapper by hand through `raw` reaches the same value.
         "{height:calc(100% - 2rem)}",
-        // And `css` adds nothing of its own.
+        // And `raw` adds nothing of its own.
         "{max-width:100% - 2rem}",
     ] {
         assert!(
@@ -1663,12 +1663,12 @@ fn a_blank_css_escape_fails_the_build() {
         (
             r#"
             import std::style::{ style, Style, Length };
-            fun s(): Style { style().width(Length::css("")) }
+            fun s(): Style { style().width(Length::raw("")) }
             let _s = const s();
             fun main() {}
             main();
             "#,
-            "Length::css was given an empty value",
+            "Length::raw was given an empty value",
         ),
         (
             r#"
@@ -3060,7 +3060,7 @@ fn a_runtime_declare_is_rejected() {
 // is a verbatim CSS value, a `Length`/`Color` is a value that may be a THEME
 // TOKEN, and a token owes the sheet the `:root` line that defines it. Before
 // the widening the only way to get a token into `raw` was to reach for its
-// `.css` field, which hands over the text and throws the line away: the
+// `.text` field, which hands over the text and throws the line away: the
 // emitted stylesheet then referenced a custom property nothing declared.
 
 #[test]
@@ -3111,8 +3111,8 @@ fn raw_carries_a_color_tokens_root_line() {
 }
 
 #[test]
-fn the_css_field_route_declares_no_token() {
-    // The hazard the widening removes, pinned as the contrast it is. A `.css`
+fn the_text_field_route_declares_no_token() {
+    // The hazard the widening removes, pinned as the contrast it is. A `.text`
     // field access hands over a `str`; a `str` carries no token, so the sheet
     // gets `var(--space-4)` with nothing declaring it. This is not a bug in
     // `raw` — it is what asking for the text alone MEANS — and it is exactly
@@ -3120,7 +3120,7 @@ fn the_css_field_route_declares_no_token() {
     let css = style_css(
         r##"
         import std::style::{ style, space };
-        let _padded = const style().raw("padding", space(4).css);
+        let _padded = const style().raw("padding", space(4).text);
         fun main() {}
         main();
         "##,
@@ -3354,13 +3354,13 @@ fn a_non_css_value_in_a_declaration_names_the_trait() {
 #[test]
 fn a_typed_declaration_value_is_checked_like_a_str_one() {
     // `check_declaration` guards the RESOLVED text, so the line-granular
-    // channel's rules reach a typed value too — a `Length::css` carrying a
+    // channel's rules reach a typed value too — a `Length::raw` carrying a
     // newline is refused exactly as the `str` spelling is.
     assert_run_panics(
         r##"
         import std::style::{ declare, declarations, Length };
         fun tokens() {
-            declare(":root", declarations().raw("--pad", Length::css("1rem\n2rem")));
+            declare(":root", declarations().raw("--pad", Length::raw("1rem\n2rem")));
         }
         let _tokens = const tokens();
         fun main() {}
@@ -3389,7 +3389,7 @@ fn emit_reached_through_a_bounded_generic_is_const_only() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         trait Emitter {
             fun text(self): str;
@@ -3397,14 +3397,14 @@ fn emit_reached_through_a_bounded_generic_is_const_only() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         fun render<V: Emitter>(value: V): str {
             value.text()
         }
         fun main() {
-            print(render(Token { css = "var(--p)" }));
+            print(render(Token { value = "var(--p)" }));
         }
         main();
         "##,
@@ -3423,7 +3423,7 @@ fn a_clean_impl_through_the_same_bounded_generic_stays_admitted() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         struct Plain {
             text_value: str,
@@ -3434,7 +3434,7 @@ fn a_clean_impl_through_the_same_bounded_generic_stays_admitted() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         impl Plain with Emitter {
@@ -3463,7 +3463,7 @@ fn a_bounded_generic_is_charged_per_call_site_not_per_function() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         struct Plain {
             text_value: str,
@@ -3474,7 +3474,7 @@ fn a_bounded_generic_is_charged_per_call_site_not_per_function() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         impl Plain with Emitter {
@@ -3487,7 +3487,7 @@ fn a_bounded_generic_is_charged_per_call_site_not_per_function() {
         }
         fun main() {
             print(render(Plain { text_value = "clean" }));
-            print(render(Token { css = "var(--p)" }));
+            print(render(Token { value = "var(--p)" }));
         }
         main();
         "##;
@@ -3519,7 +3519,7 @@ fn a_forwarding_wrapper_charges_the_entry_that_resolves_it() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         trait Emitter {
             fun text(self): str;
@@ -3527,7 +3527,7 @@ fn a_forwarding_wrapper_charges_the_entry_that_resolves_it() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         fun render<V: Emitter>(value: V): str {
@@ -3537,7 +3537,7 @@ fn a_forwarding_wrapper_charges_the_entry_that_resolves_it() {
             render(value)
         }
         fun main() {
-            print(wrapper(Token { css = "var(--p)" }));
+            print(wrapper(Token { value = "var(--p)" }));
         }
         main();
         "##;
@@ -3561,7 +3561,7 @@ fn a_second_generic_parameter_still_charges_its_entry() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         struct Plain {
             text_value: str,
@@ -3572,7 +3572,7 @@ fn a_second_generic_parameter_still_charges_its_entry() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         impl Plain with Emitter {
@@ -3584,7 +3584,7 @@ fn a_second_generic_parameter_still_charges_its_entry() {
             first.text() + second.text()
         }
         fun main() {
-            print(render_pair(Plain { text_value = "clean" }, Token { css = "tok" }));
+            print(render_pair(Plain { text_value = "clean" }, Token { value = "tok" }));
         }
         main();
         "##,
@@ -3599,7 +3599,7 @@ fn a_clean_two_parameter_generic_dispatch_stays_admitted() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         struct Plain {
             text_value: str,
@@ -3610,7 +3610,7 @@ fn a_clean_two_parameter_generic_dispatch_stays_admitted() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         impl Plain with Emitter {
@@ -3640,7 +3640,7 @@ fn a_generic_dispatch_reaching_emit_inside_const_stays_legal() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         trait Emitter {
             fun text(self): str;
@@ -3648,14 +3648,14 @@ fn a_generic_dispatch_reaching_emit_inside_const_stays_legal() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         fun render<V: Emitter>(value: V): str {
             value.text()
         }
         fun main() {
-            let styled = const render(Token { css = "var(--p)" });
+            let styled = const render(Token { value = "var(--p)" });
             print(styled);
         }
         main();
@@ -3675,7 +3675,7 @@ fn an_inherited_trait_default_reaching_emit_is_refused_on_a_concrete_receiver() 
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         trait Report {
             fun report(self): str {
@@ -3685,7 +3685,7 @@ fn an_inherited_trait_default_reaching_emit_is_refused_on_a_concrete_receiver() 
         }
         impl Token with Report {}
         fun main() {
-            print(Token { css = "x" }.report());
+            print(Token { value = "x" }.report());
         }
         main();
         "##,
@@ -3703,7 +3703,7 @@ fn a_module_level_initializer_entry_is_a_boundary_for_generic_dispatch() {
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         trait Emitter {
             fun text(self): str;
@@ -3711,13 +3711,13 @@ fn a_module_level_initializer_entry_is_a_boundary_for_generic_dispatch() {
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         fun render<V: Emitter>(value: V): str {
             value.text()
         }
-        let STYLED = render(Token { css = "top" });
+        let STYLED = render(Token { value = "top" });
         fun main() {
             print(STYLED);
         }
@@ -3742,7 +3742,7 @@ fn a_shared_default_self_call_refuses_conservatively_even_for_a_clean_receiver()
         import std::print;
         import std::asset::emit;
         struct Token {
-            css: str,
+            value: str,
         }
         struct Plain {
             text_value: str,
@@ -3756,7 +3756,7 @@ fn a_shared_default_self_call_refuses_conservatively_even_for_a_clean_receiver()
         impl Token with Emitter {
             fun text(self): str {
                 emit("css", ":root{--p:1rem}");
-                self.css
+                self.value
             }
         }
         impl Plain with Emitter {
@@ -4760,4 +4760,115 @@ fn a_neutral_instantiation_is_admitted_despite_a_colored_impl() {
         }
         "#,
     );
+}
+
+// --- K2c: `css` is a hard keyword (proposal/css-block.md §5.4, Q3) -------------
+// The word was promoted so the block — and, later, the headed form, which needs
+// a token two-token lookahead cannot give — has a grammar seat. The promotion
+// took three names out of `std::style`: `Length::css(…)` became `Length::raw(…)`
+// and the `css` field of a `Length` and a `Color` became `text`. Every position
+// that used to spell the word now refuses, and the refusal NAMES both renames —
+// a bare "found `css`, expected an identifier" would leave the reader to guess
+// what their `.css` became. One pin per position, because each reaches the rule
+// through a different seam in the parser: a member access, a `::` path, a
+// binding, a struct field declaration and a struct-initializer field.
+
+/// The rename the refusal has to name, in the wording every position shares.
+const CSS_RENAME_NOTE: &str = "`Length::css(…)` is now `Length::raw(…)`";
+
+#[test]
+fn a_css_member_access_refuses_naming_the_rename() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::style::space;
+        fun main() {
+            print(space(4).css);
+        }
+        main();
+        "#,
+        CSS_RENAME_NOTE,
+    );
+}
+
+#[test]
+fn a_css_path_segment_refuses_naming_the_rename() {
+    // The `::` seam recovers OVER the word rather than rolling the `::` back:
+    // rolled back, the failure surfaces at the operator as a missing `;` and
+    // the word the reader has to change is never named.
+    assert_fails_with(
+        r#"
+        import std::style::{ Length, style };
+        let _x = const style().left(Length::css("1px"));
+        fun main() {}
+        main();
+        "#,
+        CSS_RENAME_NOTE,
+    );
+}
+
+#[test]
+fn a_binding_named_css_refuses_naming_the_rename() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let css = 1;
+            print(css);
+        }
+        main();
+        "#,
+        CSS_RENAME_NOTE,
+    );
+}
+
+#[test]
+fn a_struct_field_named_css_refuses_naming_the_rename() {
+    // A struct body whose first token is the keyword commits to nothing, so
+    // nothing inside is noted and the delimiter recovery would otherwise name
+    // the struct body instead of the word.
+    assert_fails_with(
+        r#"
+        struct Token {
+            css: str,
+        }
+        fun main() {}
+        main();
+        "#,
+        CSS_RENAME_NOTE,
+    );
+}
+
+#[test]
+fn a_struct_initializer_field_named_css_refuses_naming_the_rename() {
+    assert_fails_with(
+        r#"
+        struct Token {
+            value: str,
+        }
+        fun main() {
+            let _token = Token { css = "x" };
+        }
+        main();
+        "#,
+        CSS_RENAME_NOTE,
+    );
+}
+
+#[test]
+fn the_renamed_length_surface_is_what_compiles_instead() {
+    // The other half of the promotion: the two names it minted both work, and
+    // `raw` is the same verbatim value `css` was — no wrapper, unlike `calc`.
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Length };
+        let _s = const style()
+            .left(Length::raw("clamp(120px, 30%, 185px)"))
+            .width(Length::raw(space(4).text));
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{left:clamp(120px, 30%, 185px)}"), "{css}");
+    assert!(css.contains("{width:var(--space-4)}"), "{css}");
 }

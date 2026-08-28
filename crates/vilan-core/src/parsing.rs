@@ -136,6 +136,18 @@ pub enum Found {
 /// so a set that mixes it with others still renders.
 const TERMINATOR_EXPECTED: &str = "';'";
 
+/// The rule a program written before the `css` promotion breaks. Curated
+/// (diagnostics-standard.md B6 — the prohibition explains itself and names the
+/// sanctioned spelling): `css` became a hard keyword with the `css { … }` block
+/// (proposal/css-block.md §5.4, Q3 ruled 2026-08-28), so every place that wanted
+/// a NAME and found the word is a member the promotion renamed out of its way.
+/// Both renames are spelled here, because a bare "found `css`, expected an
+/// identifier" would leave the reader to guess what their `.css` became.
+const CSS_IS_A_KEYWORD: &str = "`css` is a keyword: it begins a `css { … }` block. The style values that used \
+     to spell it were renamed out of its way — `Length::css(…)` is now \
+     `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now \
+     `.text`";
+
 /// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
 /// `resource` modifiers that lead one. An item is never part of an expression, so
 /// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
@@ -924,6 +936,23 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// and delimiter recovery (which surfaces the real inner error, not a claim the
     /// region was unclosed).
     fn emit_failure(&mut self, position: usize, expected: Vec<String>, context: Vec<&'static str>) {
+        // A failure ON the `css` keyword outranks every other reading of it,
+        // the missing-terminator anchor included: `css` became a hard keyword
+        // with the block (proposal/css-block.md §5.4, Q3), so a parse that
+        // stopped there is almost always a pre-promotion spelling — a field, a
+        // path segment or a binding that used to be named `css` — and the gap
+        // anchor would point at the `::` before it and ask for a `;`. A `css`
+        // BLOCK whose body is malformed fails INSIDE the body, which is farther
+        // on, so this arm never steals a body diagnostic.
+        if matches!(self.tokens.get(position), Some((Token::Css, _))) {
+            self.errors.push(ParseError {
+                span: self.token_span(position),
+                reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
+                context,
+                hint: None,
+            });
+            return;
+        }
         // A missing statement terminator is not a "found X expected Y" — the token
         // at `position` is a perfectly good next statement, and the mistake is in
         // the whitespace before it (`editing-dx.md` §4.4). It reports at the gap,
@@ -1304,6 +1333,21 @@ impl<'a, 'src> Parser<'a, 'src> {
         // production-namer, pinned at `render_names_the_unclosed_delimiter`.)
         match self.take_failure_within(start, end) {
             Some(failure) => self.emit_failure(failure.position, failure.expected, failure.context),
+            // A region that committed to nothing but holds a misused `css` (the
+            // word not heading a block) garbled BECAUSE of it: `struct S { css:
+            // str }` declines at its first token, so nothing inside was noted
+            // and the fallback would name the struct body instead of the word.
+            None if self.css_misuse_within(start, end).is_some() => {
+                let span = self
+                    .css_misuse_within(start, end)
+                    .expect("just matched as present");
+                self.errors.push(ParseError {
+                    span,
+                    reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+            }
             None => self.errors.push(ParseError {
                 span,
                 reason: ParseErrorReason::Unbalanced {
@@ -1315,6 +1359,26 @@ impl<'a, 'src> Parser<'a, 'src> {
             }),
         }
         Some(span)
+    }
+
+    /// The span of the first MISUSED `css` in the token range `start..end`: the
+    /// keyword written anywhere but at the head of a `css { … }` block, which is
+    /// the only shape it has. Definitively an error wherever it appears, so a
+    /// recovery that has nothing better to say says this
+    /// (proposal/css-block.md §5.4, Q3).
+    fn css_misuse_within(&self, start: usize, end: usize) -> Option<Span> {
+        self.tokens
+            .get(start..end)?
+            .iter()
+            .enumerate()
+            .find(|(offset, (token, _))| {
+                *token == Token::Css
+                    && !matches!(
+                        self.tokens.get(start + offset + 1),
+                        Some((Token::Ctrl('{'), _))
+                    )
+            })
+            .map(|(_, (_, span))| *span)
     }
 
     /// Scan a balanced `open..close` region starting at token index `start` (which
@@ -2230,6 +2294,25 @@ impl<'a, 'src> Parser<'a, 'src> {
                     );
                 }
                 None => {
+                    // `Length::css(…)` — the spelling the keyword promotion
+                    // renamed. RECOVER over the word rather than rolling the
+                    // `::` back: rolled back, the failure surfaces at the
+                    // operator as a missing `;` and the word the reader has to
+                    // change is never named. Consuming it into an error
+                    // stand-in lets the enclosing statement parse, so the rule
+                    // is the one diagnostic the mistake raises.
+                    if self.peek_is(&Token::Css) {
+                        let span = self.here_span();
+                        self.bump();
+                        self.errors.push(ParseError {
+                            span,
+                            reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
+                            context: self.context_stack.clone(),
+                            hint: None,
+                        });
+                        current = (Node::Error, self.span_from(start));
+                        continue;
+                    }
                     self.position = save;
                     break;
                 }
