@@ -1476,6 +1476,14 @@ fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
 /// the fresh connection id, and rebind each mirror positionally (the
 /// `__attach` reply is ordered by the service's exposed-field order). The
 /// generated `connect` pushes one `on_reconnect` hook calling this.
+///
+/// Either round-trip can fail, and the two failures are NOT the same. An
+/// UNREACHABLE server is a delay: the socket is already dying, the next drop
+/// cycle redials, and this run leaves the mirrors alone. A server that answers
+/// and REFUSES — a drifted contract, or an `__attach` it will not honour — is
+/// a desync: the mirrors can never be rebound on this connection, so the
+/// duplex goes to the terminal `Closed` rather than reporting Connected over
+/// the previous connection's dead channel ids.
 fun reattach_mirrors(
 	socket: SocketDuplex,
 	transport: SocketTransport,
@@ -1494,7 +1502,16 @@ fun reattach_mirrors(
 					|serializer: Serializer| connection.describe(serializer),
 				]);
 				match attached {
-					Err(let _failed) => {},
+					// No fresh channel ids, so there is nothing to rebind to:
+					// every mirror would stay pointed at the dead connection's
+					// channels while the socket claimed to be live. The same
+					// typed desync the drift branch below refuses, only
+					// quieter. Close for good; the app restarts on its own
+					// terms.
+					Err(let _failed) => {
+						socket.state.set(ConnectionState::Closed);
+						socket.socket.read().close();
+					},
 					Ok(let channels) => {
 						mut index = 0;
 						for rebind in rebinds {
