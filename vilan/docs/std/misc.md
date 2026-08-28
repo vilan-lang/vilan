@@ -204,6 +204,17 @@ the kind files it wrote (`.vilan-asset-kinds`, beside the outputs), and
 the next build removes a recorded file whose kind emitted nothing —
 only recorded files, never a file it merely found.
 
+Because the kind becomes a filename, it must **be** a filename: one path
+segment, so a kind carrying `/`, `\`, or `..` is refused. It must also
+not be a name the build already writes there. Refused for that reason:
+`vl` (the entry source — a lone package's outputs sit exactly where its
+entry does, so this kind would overwrite the program), `js` and `mjs`
+(the compiled bundle), `chunks.json` (the build manifest), and anything
+ending in `.js` (the route-chunk namespace, which the build also
+sweeps). `css` is the exception — the build owns that file *and* `emit`
+is how it is written. Both refusals are compile errors at the `const`
+expression, and each names the file the kind would have taken.
+
 `read` is the channel's input direction: it returns a project file's
 text at build time, so its result can fold into the output —
 `const markdown::parse(asset::read("pages/intro.md"))` bakes a parsed

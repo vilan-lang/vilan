@@ -5,7 +5,8 @@
 //! every other kind lexical by line — G5), a kind that stops emitting loses
 //! its file on the next build (the per-kind prune, G6) — and, per hmr.md §11
 //! S0, `vilan run` / `run --watch` write the same sidecar each round so the
-//! dev loop serves fresh assets.
+//! dev loop serves fresh assets. A kind naming a file the build writes
+//! itself never reaches the filesystem at all (G7).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -84,6 +85,44 @@ main();
     assert_eq!(
         css,
         ".bC7{background:blue}\n.pA3{padding:1rem}\n@media (min-width: 768px){.mX{padding:2rem}}\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_kind_colliding_with_the_build_namespace_never_reaches_the_filesystem() {
+    // G7, the probe inverted end to end. `emit("vl", …)` passed E94's shape
+    // fence (one path segment) and `write_assets` then wrote `<leg>.vl` —
+    // which in a BARE build is the entry source itself, because a lone
+    // package's outputs sit exactly where its entry does. The measured
+    // before-state: exit 0, `app.vl` replaced by the emitted line, and the
+    // `Emitted  …/app.vl` line printed as if that were a build product.
+    //
+    // The inference pins hold the diagnostic; this holds the FILESYSTEM,
+    // which is the part that cannot be inferred from a green analyzer — the
+    // fence has to bite before the flush, not merely before the exit code.
+    let dir = temp_project("owned_kind");
+    let source = "import std::print;\nimport std::asset::emit;\n\nfun clobber(): i32 {\n\temit(\"vl\", \"CLOBBERED\");\n\t1\n}\n\nlet _c = const clobber();\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write(&dir, "app.vl", source);
+    let entry = dir.join("app.vl");
+    let output = vilan(&["build", entry.to_str().unwrap()]);
+    assert!(
+        !output.status.success(),
+        "a kind naming the build's own namespace must fail the build"
+    );
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        report.contains("collides with the entry source"),
+        "the refusal should name what the kind collides with; got:\n{report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&entry).ok().as_deref(),
+        Some(source),
+        "the entry source must be byte-identical — the whole defect"
+    );
+    assert!(
+        !dir.join("app.mjs").exists(),
+        "a refused build writes no bundle"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

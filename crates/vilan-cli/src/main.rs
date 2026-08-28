@@ -2680,21 +2680,29 @@ fn asset_kind_path(directory: &std::path::Path, leg: &str, kind: &str) -> PathBu
 }
 
 /// Whether the per-kind prune records — and so may later remove — `kind`'s
-/// file. The refusals mirror the names a leg's build already owns through
-/// OTHER machinery, plus the one it must never touch: `css` belongs to
-/// [`sweep_stale_sidecar`], the bundle (`js`/`mjs`), the manifest
-/// (`chunks.json`) and the `<arm>.js` route-chunk shapes to [`write_chunks`]'s
-/// sweeps, and `vl` is the SOURCE — a bare build's outputs sit exactly where
-/// its entry does. A kind carrying a separator or a line break cannot ride
-/// the record's `leg/kind` line format and is refused on both sides.
-/// Refusal means "never pruned", not "never written": E94 decides what
-/// `emit` accepts; this only decides what the prune may touch.
+/// file. Two refusals, from two different places:
+///
+/// - **The names a leg's build already owns through OTHER machinery**, which
+///   is [`vilan_core::const_eval::build_owned_emit_kind`] — `css` belongs to
+///   [`sweep_stale_sidecar`], the bundle (`js`/`mjs`), the manifest
+///   (`chunks.json`) and the `<arm>.js` route-chunk shapes to
+///   [`write_chunks`]'s sweeps, and `vl` is the SOURCE. That list is NOT
+///   written here: since G7 the emit-time fence refuses the same list (all of
+///   it but `css`, which `emit` is the sanctioned writer of), and two copies
+///   of a list are how the write side and the prune side come to disagree
+///   about what the build owns. One list, two consumers.
+/// - **The record's own line format**: a kind carrying a separator or a line
+///   break cannot ride a `leg/kind` line, and that is this consumer's
+///   constraint alone.
+///
+/// Refusal means "never pruned", not "never written". Since G7 the emit fence
+/// makes the first half unreachable in practice — a reserved kind never
+/// reaches a flush at all — and it stays as the prune's own guard, because
+/// what the prune may DELETE should not depend on a check made elsewhere.
 fn recordable_emit_kind(kind: &str) -> bool {
-    let reserved = ["css", "vl", "js", "mjs", "chunks.json"];
     !kind.is_empty()
         && !kind.contains(['/', '\\', '\n', '\r'])
-        && !reserved.contains(&kind)
-        && !kind.ends_with(".js")
+        && vilan_core::const_eval::build_owned_emit_kind(kind).is_none()
 }
 
 /// The build's own record of the non-`css` asset kinds each leg's last flush
