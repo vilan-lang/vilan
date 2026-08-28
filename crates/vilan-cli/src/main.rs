@@ -754,7 +754,7 @@ fn hmr_round(
     // shim-inclusive bytes would differ every round and misclassify everything
     // as a swap).
     let mut next = Vec::new();
-    let mut other_assets: Vec<(String, String, String)> = Vec::new();
+    let mut other_assets: Vec<(String, BTreeMap<String, String>)> = Vec::new();
     for (unit, platform) in &members {
         if platform.is_none() {
             continue;
@@ -818,10 +818,11 @@ fn hmr_round(
         // Any non-css asset kind still lands on disk each round, exactly as
         // `write_assets` would put it (uniform with the build/run paths); it
         // just doesn't participate in classification — css is the only kind
-        // the dev runtime knows how to hot-swap.
-        for (kind, content) in assembled {
-            other_assets.push((unit.name.clone(), kind, content));
-        }
+        // the dev runtime knows how to hot-swap. Pushed even when EMPTY: a
+        // compiled leg with no non-css kinds is how the write phase below
+        // learns a kind stopped emitting and prunes its file (backlog G6) —
+        // only a SKIPPED leg, whose files are still current, stays out.
+        other_assets.push((unit.name.clone(), assembled));
         next.push(hmr::LegArtifact {
             name: unit.name.clone(),
             is_browser: matches!(platform, Platform::Browser),
@@ -929,14 +930,22 @@ fn hmr_round(
             leg.is_browser,
         );
     }
-    for (name, kind, content) in &other_assets {
-        let asset_path = dist.join(format!("{name}.{kind}"));
-        if let Err(error) = fs::write(&asset_path, content) {
-            eprintln!(
-                "{} cannot write {}: {error}",
-                paint::error_prefix(),
-                asset_path.display()
-            );
+    for (name, kinds) in &other_assets {
+        let flushed: BTreeSet<String> = kinds
+            .keys()
+            .filter(|kind| recordable_emit_kind(kind))
+            .cloned()
+            .collect();
+        prune_and_record_asset_kinds(&dist, name, &flushed);
+        for (kind, content) in kinds {
+            let asset_path = asset_kind_path(&dist, name, kind);
+            if let Err(error) = fs::write(&asset_path, content) {
+                eprintln!(
+                    "{} cannot write {}: {error}",
+                    paint::error_prefix(),
+                    asset_path.display()
+                );
+            }
         }
     }
 
@@ -2623,9 +2632,21 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
 /// the manifest states it positively instead of leaving a server to probe the
 /// filesystem for it.
 fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Option<String> {
+    let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
+    let leg = output_js
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let assembled = vilan_core::const_eval::assemble_assets(assets);
+    let flushed: BTreeSet<String> = assembled
+        .keys()
+        .filter(|kind| recordable_emit_kind(kind))
+        .cloned()
+        .collect();
+    prune_and_record_asset_kinds(directory, &leg, &flushed);
     let mut styles = None;
-    for (kind, content) in vilan_core::const_eval::assemble_assets(assets) {
-        let path = output_js.with_extension(kind.as_str());
+    for (kind, content) in assembled {
+        let path = asset_kind_path(directory, &leg, &kind);
         let is_styles = kind.as_str() == "css" && !content.is_empty();
         if let Err(error) = fs::write(&path, content) {
             eprintln!(
@@ -2647,6 +2668,146 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Opt
         }
     }
     styles
+}
+
+/// The file a leg's `kind` flush writes: `<leg>.<kind>` beside the bundle.
+/// This is THE kind-to-file mapping — the flush writes through it and the
+/// per-kind prune removes through it, so the two can never name different
+/// files. E94 fences a kind to one path segment, so the result is always one
+/// file directly in `directory`.
+fn asset_kind_path(directory: &std::path::Path, leg: &str, kind: &str) -> PathBuf {
+    directory.join(format!("{leg}.{kind}"))
+}
+
+/// Whether the per-kind prune records — and so may later remove — `kind`'s
+/// file. The refusals mirror the names a leg's build already owns through
+/// OTHER machinery, plus the one it must never touch: `css` belongs to
+/// [`sweep_stale_sidecar`], the bundle (`js`/`mjs`), the manifest
+/// (`chunks.json`) and the `<arm>.js` route-chunk shapes to [`write_chunks`]'s
+/// sweeps, and `vl` is the SOURCE — a bare build's outputs sit exactly where
+/// its entry does. A kind carrying a separator or a line break cannot ride
+/// the record's `leg/kind` line format and is refused on both sides.
+/// Refusal means "never pruned", not "never written": E94 decides what
+/// `emit` accepts; this only decides what the prune may touch.
+fn recordable_emit_kind(kind: &str) -> bool {
+    let reserved = ["css", "vl", "js", "mjs", "chunks.json"];
+    !kind.is_empty()
+        && !kind.contains(['/', '\\', '\n', '\r'])
+        && !reserved.contains(&kind)
+        && !kind.ends_with(".js")
+}
+
+/// The build's own record of the non-`css` asset kinds each leg's last flush
+/// wrote — one `leg/kind` line per file, sorted, beside the outputs (in
+/// `dist/` for a workspace, beside the entry for a bare build). Unambiguous
+/// because neither half can contain `/` (a leg name is a manifest-checked
+/// identifier or a file stem; E94 fences kinds). It exists exactly while some
+/// leg flushes a recordable kind; [`write_asset_kind_record`] removes it with
+/// its last entry, so the record never becomes its own stale artifact.
+///
+/// This is what lets the NEXT build prune a kind's file when the kind stops
+/// emitting (backlog G6; `build-hooks.md` §10 Q7's per-kind half) without
+/// guessing: the flush is the one place that knows which files it named
+/// ([`asset_kind_path`]), so it writes that fact down, and the pruner acts
+/// ONLY on what the record says — a file the record does not name is never
+/// touched, however kind-shaped its name. The general "delete whatever this
+/// build did not write" sweep is deliberately NOT built here (E92 carries
+/// it): deleting unrecorded files needs its own ruling.
+const ASSET_KIND_RECORD: &str = ".vilan-asset-kinds";
+
+/// The record's `(leg, kind)` rows. A missing or unreadable record reads as
+/// empty — nothing is pruned, because pruning without a record would mean
+/// guessing at filenames. A row that does not parse, or names a kind the
+/// prune may not touch, is dropped on the same principle.
+fn read_asset_kind_record(directory: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(text) = fs::read_to_string(directory.join(ASSET_KIND_RECORD)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (leg, kind) = line.split_once('/')?;
+            (!leg.is_empty() && recordable_emit_kind(kind))
+                .then(|| (leg.to_string(), kind.to_string()))
+        })
+        .collect()
+}
+
+/// Writes the record back — sorted, so its bytes are a function of the set of
+/// rows — or removes it when nothing is left to record. A failure is reported
+/// and otherwise ignored, like the sweeps': the record is bookkeeping for the
+/// NEXT build's tidiness, never this build's correctness.
+fn write_asset_kind_record(directory: &std::path::Path, mut entries: Vec<(String, String)>) {
+    entries.sort();
+    entries.dedup();
+    let path = directory.join(ASSET_KIND_RECORD);
+    if entries.is_empty() {
+        if path.is_file() {
+            if let Err(error) = fs::remove_file(&path) {
+                eprintln!(
+                    "{} cannot remove the asset-kind record {}: {error}",
+                    paint::warning_prefix(),
+                    path.display()
+                );
+            }
+        }
+        return;
+    }
+    let mut text = entries
+        .iter()
+        .map(|(leg, kind)| format!("{leg}/{kind}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    if let Err(error) = fs::write(&path, text) {
+        eprintln!(
+            "{} cannot write the asset-kind record {}: {error}",
+            paint::warning_prefix(),
+            path.display()
+        );
+    }
+}
+
+/// Removes the kind files `leg`'s previous flush wrote and this one did not —
+/// the per-kind prune (backlog G6): a kind that stops emitting stops
+/// shipping, because a stale flush in `dist/` SHIPS, which is worse than a
+/// missing file under "a built app needs nothing but `dist/`". Then
+/// re-records what this flush did write, so the next build can do the same.
+///
+/// Only `leg`'s own rows move. A skipped watch round never reaches here (its
+/// files are still current), and another leg's rows — including a leg no
+/// longer in the workspace, whose leftovers are E92's general-sweep
+/// territory — carry through untouched. A failed removal is reported and
+/// otherwise ignored, exactly as the chunk sweep treats a stray.
+fn prune_and_record_asset_kinds(
+    directory: &std::path::Path,
+    leg: &str,
+    flushed: &BTreeSet<String>,
+) {
+    if leg.is_empty() {
+        return;
+    }
+    let mut entries = read_asset_kind_record(directory);
+    for (recorded_leg, kind) in &entries {
+        if recorded_leg != leg || flushed.contains(kind) {
+            continue;
+        }
+        let path = asset_kind_path(directory, leg, kind);
+        if !path.is_file() {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!(
+                "{} cannot remove the stale asset {}: {error}",
+                paint::warning_prefix(),
+                path.display()
+            );
+        }
+    }
+    entries.retain(|(recorded_leg, _)| recorded_leg != leg);
+    for kind in flushed {
+        entries.push((leg.to_string(), kind.clone()));
+    }
+    write_asset_kind_record(directory, entries);
 }
 
 /// Copies every file `const asset::bundle` registered into the build's output

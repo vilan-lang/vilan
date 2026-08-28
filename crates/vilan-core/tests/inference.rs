@@ -24709,6 +24709,98 @@ fn asset_kinds_stay_separate() {
 }
 
 #[test]
+fn a_non_css_kind_keeps_lexical_order_for_media_looking_lines() {
+    // G5 (build-hooks.md §5.2a, probe P2 inverted into a pin): the cascade
+    // comparator is css's alone. A non-css kind holding a line that happens
+    // to parse as a media rule must NOT have it forced last — lexical order
+    // puts '@' (0x40) before 'z' (0x7A).
+    let assets = collected_assets(
+        r#"
+        import std::asset::emit;
+        fun entries(): i32 {
+            emit("manifest", "zebra: last by bytes");
+            emit("manifest", "@media (min-width: 768px){.mX{padding:2rem}}");
+            1
+        }
+        let _e = const entries();
+        fun main() {}
+        main();
+        "#,
+    );
+    let assembled = vilan_core::const_eval::assemble_assets(&assets);
+    let manifest = assembled.get("manifest").expect("a manifest asset");
+    assert_eq!(
+        manifest,
+        "@media (min-width: 768px){.mX{padding:2rem}}\nzebra: last by bytes\n"
+    );
+}
+
+#[test]
+fn non_css_media_looking_lines_sort_by_bytes_not_by_width() {
+    // G5's second half: B35's ascending-min-width override is a CSS cascade
+    // property. Between two media-looking lines of a non-css kind the order
+    // is lexical — '1' < '6' puts 1024px first — where the css kind would
+    // sort 640px first.
+    let assets = collected_assets(
+        r#"
+        import std::asset::emit;
+        fun entries(): i32 {
+            emit("manifest", "@media (min-width: 640px){.a{width:1rem}}");
+            emit("manifest", "@media (min-width: 1024px){.c{width:3rem}}");
+            1
+        }
+        let _e = const entries();
+        fun main() {}
+        main();
+        "#,
+    );
+    let assembled = vilan_core::const_eval::assemble_assets(&assets);
+    let manifest = assembled.get("manifest").expect("a manifest asset");
+    assert_eq!(
+        manifest,
+        "@media (min-width: 1024px){.c{width:3rem}}\n\
+         @media (min-width: 640px){.a{width:1rem}}\n"
+    );
+}
+
+#[test]
+fn the_cascade_comparator_stays_css_scoped_in_a_mixed_flush() {
+    // One flush, two kinds: css keeps the cascade order (media last,
+    // ascending min-width) while the sibling kind sorts the SAME lines
+    // lexically. Pins that the rule is per kind, not per flush.
+    let assets = collected_assets(
+        r#"
+        import std::asset::emit;
+        fun both(): i32 {
+            emit("css", "zx{color:red}");
+            emit("css", "@media (min-width: 1024px){.c{width:3rem}}");
+            emit("css", "@media (min-width: 640px){.a{width:1rem}}");
+            emit("manifest", "zx{color:red}");
+            emit("manifest", "@media (min-width: 1024px){.c{width:3rem}}");
+            emit("manifest", "@media (min-width: 640px){.a{width:1rem}}");
+            1
+        }
+        let _b = const both();
+        fun main() {}
+        main();
+        "#,
+    );
+    let assembled = vilan_core::const_eval::assemble_assets(&assets);
+    assert_eq!(
+        assembled.get("css").expect("a css asset"),
+        "zx{color:red}\n\
+         @media (min-width: 640px){.a{width:1rem}}\n\
+         @media (min-width: 1024px){.c{width:3rem}}\n"
+    );
+    assert_eq!(
+        assembled.get("manifest").expect("a manifest asset"),
+        "@media (min-width: 1024px){.c{width:3rem}}\n\
+         @media (min-width: 640px){.a{width:1rem}}\n\
+         zx{color:red}\n"
+    );
+}
+
+#[test]
 fn a_runtime_emit_is_rejected() {
     assert_fails_spanning(
         r#"

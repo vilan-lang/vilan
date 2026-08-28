@@ -29,6 +29,16 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**Non-`css` `emit` kinds order lexically by line, not by the CSS cascade.** The asset flush applied its one comparator — `(Option<min-width>, line)`, the CSS cascade rule with B35's ascending-width override — to *every* accumulated kind, so a kind named `manifest` holding a line that happened to parse as a media rule had that line forced last whatever its first byte: a plain line starting `z` (0x7A) sorted before an `@media` line (`@` is 0x40). The comparator is now fenced to the one kind whose semantics justify it. `css` keeps its cascade order byte-for-byte (the corpus gate holds every golden unchanged), and every other kind sorts lexically by line — the kind-specific rule `const-eval.md` §3 promised, a pure function of the set of contributions, and exactly the order the proposed `emit_keyed(kind, line, line)` desugar would give an un-keyed `emit`, so these bytes hold if that surface lands. Found by Order 16's build-hooks probes (P2). (backlog G5)
+
+---
+
+<!-- family: tooling -->
+**A kind that stops emitting stops shipping.** Accumulator flushes write one `<leg>.<kind>` file per kind — and a build whose flush held no contributions for a kind a previous build wrote left the old file in place, so `dist/` kept serving output no current build produced (probe P8: delete the last `emit("routes", …)` and `dist/server.routes` survived, unchanged and unmentioned — worse than a missing file under "a built app needs nothing but `dist/`", because it ships). Every flush now records the kind files it wrote (`.vilan-asset-kinds` beside the outputs, removed with its last entry) and the next build prunes a recorded file whose kind emitted nothing. The pruner acts only on its own record — never on a filename it merely finds, so user-placed files and other legs' outputs are untouched — and the general "delete whatever this build did not write" sweep stays filed with E92. Every build path shares the one helper: `build`, `run`, watch rounds, and the dev loop's `dist/` writes. (backlog G6)
+
+---
+
 ## v0.37.0 — 2026-08-27
 
 > **Upgrade if you are on v0.36.0 or earlier: this release fixes two
