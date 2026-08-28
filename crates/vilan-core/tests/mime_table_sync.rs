@@ -76,9 +76,33 @@ const END_MARKER: &str = "// END GENERATED(mime-table)";
 /// move alone (gate 3). Growing `serve_build`'s reach is a decision, not a
 /// consequence of `mime-db` publishing.
 const CURATED: &[&str] = &[
-    "apng", "avif", "bmp", "csv", "css", "gif", "htm", "html", "ico", "jpeg", "jpg", "js", "json",
-    "map", "mjs", "otf", "pdf", "png", "svg", "ttf", "txt", "wasm", "webmanifest", "webp", "woff",
-    "woff2", "xml",
+    "apng",
+    "avif",
+    "bmp",
+    "csv",
+    "css",
+    "gif",
+    "htm",
+    "html",
+    "ico",
+    "jpeg",
+    "jpg",
+    "js",
+    "json",
+    "map",
+    "mjs",
+    "otf",
+    "pdf",
+    "png",
+    "svg",
+    "ttf",
+    "txt",
+    "wasm",
+    "webmanifest",
+    "webp",
+    "woff",
+    "woff2",
+    "xml",
 ];
 
 /// The rows that predate the generated table, with the media types they were
@@ -157,7 +181,9 @@ fn served_type(media_type: &str) -> String {
 /// The `match` arms the dataset implies, in dataset order, indented as the two
 /// levels of `content_type_of`'s body require.
 fn generated_arms(rows: &[Row]) -> Vec<String> {
-    let mut lines = vec![format!("\t\t{BEGIN_MARKER}: from {DATASET}, itself derived from")];
+    let mut lines = vec![format!(
+        "\t\t{BEGIN_MARKER}: from {DATASET}, itself derived from"
+    )];
     lines.push(format!(
         "\t\t// {PINNED_MIME_DB} — regenerate: {REGENERATE_COMMAND}"
     ));
@@ -438,10 +464,14 @@ fn every_row_says_where_its_media_type_came_from() {
     // per-extension preference tweak.
     let mut overrides = Vec::new();
     for row in dataset() {
-        let registry = matches!(row.provenance.as_str(), "iana" | "apache" | "nginx" | "none");
+        let registry = matches!(
+            row.provenance.as_str(),
+            "iana" | "apache" | "nginx" | "none"
+        );
         if !registry {
             assert!(
-                row.provenance.starts_with("override: ") && row.provenance.len() > "override: ".len(),
+                row.provenance.starts_with("override: ")
+                    && row.provenance.len() > "override: ".len(),
                 "`.{}` records its media type's provenance as `{}`, which is neither a mime-db \
                  registry nor a named `override: <why>`",
                 row.extension,
