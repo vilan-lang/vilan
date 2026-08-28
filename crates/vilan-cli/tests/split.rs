@@ -942,7 +942,7 @@ fn a_split_builds_chunks_are_servable_through_the_manifest() {
              fun route_chunks(leg: str): List<ChunkFile> {{\n\
              \tmut files: List<ChunkFile> = [];\n\
              \tlet manifest_path = i\"dist/{{leg}}.chunks.json\";\n\
-             \tif !fs::exists(manifest_path) {{\n\
+             \tif fs::stat(manifest_path).is_none() {{\n\
              \t\tret files;\n\
              \t}}\n\
              \tlet manifest = parse_json_value(fs::read_file_to_str(manifest_path));\n\

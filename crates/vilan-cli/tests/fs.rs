@@ -401,18 +401,18 @@ fn rename_moves_a_file_and_replaces_an_existing_destination() {
         &dir,
         "probe.vl",
         r#"import std::print;
-import std::fs::{ exists, read_file_to_str, rename };
+import std::fs::{ read_file_to_str, rename, stat };
 
 fun main() {
 	rename("data/from.txt", "data/to.txt");
-	print(exists("data/from.txt"));
+	print(stat("data/from.txt").is_none());
 	print(read_file_to_str("data/to.txt"));
 }
 main();
 "#,
     );
     let stdout = run_ok(&dir, "probe.vl");
-    assert_eq!(stdout, "false\nnew contents\n");
+    assert_eq!(stdout, "true\nnew contents\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1010,5 +1010,484 @@ main();
          outside the three must be all three false"
     );
     drop(_socket);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- the handle tier (kolt.local 031 S3, filesystem.md §3.2/§5) ------------
+//
+// `File` against the real host `FileHandle`. Two spellings matter beyond the
+// ordinary surface: the postfix-off-an-awaited-call idiom (B141's historically
+// broken shape, fixed in Order 13 and pinned POSITIVE here — pre-fix these
+// printed `undefined` with a clean exit), and the two close paths (Q1's
+// ruling: `drop` initiates the close without awaiting it, `with_file` awaits).
+
+#[test]
+fn read_at_reads_positionally_with_short_reads_and_zero_at_eof() {
+    // The positional primitive's three answers: a full buffer, a short read
+    // near the end (normal, not an error), and 0 at end of file.
+    let dir = temp_project("file_read_at");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::{ Bytes, decode_utf8 };
+import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::open("data/ten.txt");
+	let buffer = Bytes::alloc(4);
+	print(file.read_at(buffer, 3));
+	print(decode_utf8(buffer.slice(0, 4)));
+	print(file.read_at(buffer, 8));
+	print(decode_utf8(buffer.slice(0, 2)));
+	print(file.read_at(buffer, 100));
+	drop(file);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "4\n3456\n2\n89\n0\n",
+        "read_at must fill from the position, read short near the end, and \
+         answer 0 (not throw) past it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_postfix_read_and_stat_off_the_awaited_constructor_read_the_value() {
+    // B141's spellings as POSITIVE runtime tests (filesystem.md §11.1 made
+    // the fix S3's prerequisite; this inverts that argument into a gate): a
+    // postfix chain straight off the implicitly-awaited `File::open`. Before
+    // the Order 13 fix, both printed `undefined` and exited 0.
+    let dir = temp_project("file_postfix");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::Bytes;
+import std::fs::File;
+
+fun main() {
+	let buffer = Bytes::alloc(4);
+	print(File::open("data/ten.txt").read_at(buffer, 0));
+	print(File::open("data/ten.txt").stat().size);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "4\n10\n",
+        "the postfix-off-an-awaited-constructor idiom must read the VALUE, \
+         not the promise"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_truncates_what_was_there_and_write_at_lands_at_the_position() {
+    let dir = temp_project("file_create");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/out.txt", "stale contents that must vanish");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::bytes::encode_utf8;
+import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::create("data/out.txt");
+	file.write_at(encode_utf8("fresh"), 0);
+	file.write_at(encode_utf8("!"), 5);
+	drop(file);
+}
+main();
+"#,
+    );
+    run_ok(&dir, "probe.vl");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/out.txt")).unwrap(),
+        "fresh!",
+        "create must truncate, and each write must land at its position"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn modify_edits_in_place_without_truncating() {
+    // "r+": read and write through one handle, nothing truncated on open.
+    let dir = temp_project("file_modify");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::{ Bytes, encode_utf8 };
+import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::modify("data/ten.txt");
+	let buffer = Bytes::alloc(2);
+	print(file.read_at(buffer, 0));
+	print(file.write_at(encode_utf8("AB"), 1));
+	drop(file);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(stdout, "2\n2\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/ten.txt")).unwrap(),
+        "0AB3456789",
+        "modify must edit in place: bytes outside the write untouched"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_new_claims_a_name_exclusively_and_refuses_a_second_claim() {
+    // "wx" — the exclusive create: the primitive a lockfile package would be
+    // built from (filesystem.md §3.3/§9). The refusal must leave the first
+    // claimant's file intact.
+    let dir = temp_project("file_create_new");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::bytes::encode_utf8;
+import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::create_new("data/claim.txt");
+	file.write_at(encode_utf8("mine"), 0);
+	drop(file);
+}
+main();
+"#,
+    );
+    run_ok(&dir, "probe.vl");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/claim.txt")).unwrap(),
+        "mine"
+    );
+
+    write(
+        &dir,
+        "again.vl",
+        r#"import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::create_new("data/claim.txt");
+	drop(file);
+}
+main();
+"#,
+    );
+    let stderr = run_err(&dir, "again.vl");
+    assert!(
+        stderr.contains("EEXIST"),
+        "a second exclusive claim must refuse with EEXIST; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/claim.txt")).unwrap(),
+        "mine",
+        "the refused claim must not have touched the first claimant's file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn append_to_appends_and_ignores_write_at_position() {
+    // The host-semantics honesty note pinned (POSIX `O_APPEND`, and the doc
+    // comment says so): on an append handle every write lands at the END —
+    // `write_at`'s position is ignored.
+    let dir = temp_project("file_append_to");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/log.txt", "one\n");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::bytes::encode_utf8;
+import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::append_to("data/log.txt");
+	file.write_at(encode_utf8("two\n"), 0);
+	drop(file);
+}
+main();
+"#,
+    );
+    run_ok(&dir, "probe.vl");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/log.txt")).unwrap(),
+        "one\ntwo\n",
+        "an append handle must append even when the write names position 0"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_open_on_a_missing_path_throws_enoent() {
+    // The module's throwing posture holds for the handle tier: `open` means
+    // "this must exist" — a caller for whom absence is ordinary probes with
+    // `stat` first.
+    let dir = temp_project("file_open_missing");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::open("nothing/here.txt");
+	drop(file);
+}
+main();
+"#,
+    );
+    let stderr = run_err(&dir, "probe.vl");
+    assert!(
+        stderr.contains("ENOENT"),
+        "opening a missing path must surface the host ENOENT; stderr was:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn truncate_and_stat_report_through_the_handle() {
+    let dir = temp_project("file_truncate");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::modify("data/ten.txt");
+	print(file.stat().size);
+	file.truncate(4);
+	print(file.stat().size);
+	file.truncate(6);
+	print(file.stat().size);
+	drop(file);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "10\n4\n6\n",
+        "truncate must shrink and extend, and the handle's stat must see each"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("data/ten.txt")).unwrap(),
+        b"0123\0\0",
+        "the extension past the truncated end must be zero-filled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sync_and_data_sync_complete_without_error() {
+    // Durability against power loss is not host-testable; what is pinned is
+    // that the two bindings reach the real host calls and succeed — `sync` is
+    // the capability nothing path-addressed in the module has.
+    let dir = temp_project("file_sync");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::encode_utf8;
+import std::fs::File;
+import std::drop::drop;
+
+fun main() {
+	let file = File::create("data/durable.txt");
+	file.write_at(encode_utf8("payload"), 0);
+	file.sync();
+	file.data_sync();
+	print("synced");
+	drop(file);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(stdout, "synced\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/durable.txt")).unwrap(),
+        "payload"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_open_handle_survives_removal_of_its_path() {
+    // The TOCTOU-free read-then-act the tier exists for (filesystem.md §3.2):
+    // the handle addresses the OPEN FILE, not the path, so once open, nothing
+    // re-resolves — remove the path and the handle still stats and reads the
+    // file it holds. (Unix-guarded: unlink-while-open is the POSIX promise.)
+    let dir = temp_project("file_toctou");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::{ Bytes, decode_utf8 };
+import std::fs::{ File, remove, stat };
+import std::drop::drop;
+
+fun main() {
+	let file = File::open("data/ten.txt");
+	remove("data/ten.txt");
+	print(stat("data/ten.txt").is_none());
+	print(file.stat().size);
+	let buffer = Bytes::alloc(10);
+	print(file.read_at(buffer, 0));
+	print(decode_utf8(buffer.slice(0, 10)));
+	drop(file);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "true\n10\n10\n0123456789\n",
+        "the path is gone (stat None) while the handle still measures and \
+         reads the open file — no re-resolution between probe and act"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn with_file_returns_the_bodys_value_from_an_open_file() {
+    // The documented idiom end-to-end: the body receives the open file as a
+    // per-call parameter (R9's exemption), its value comes back out, and the
+    // program continues past the awaited close. (That the close is AWAITED is
+    // pinned on the emitted bytes — `with_file_awaits_the_close_before_
+    // returning` in inference.rs and the `file.vl` corpus golden — since the
+    // await IS the ordering.)
+    let dir = temp_project("with_file");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::{ Bytes, decode_utf8 };
+import std::fs::with_file;
+
+fun main() {
+	let head = with_file("data/ten.txt", |file| {
+		let buffer = Bytes::alloc(4);
+		file.read_at(buffer, 0);
+		decode_utf8(buffer.slice(0, 4))
+	});
+	print(head);
+	print("after");
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(stdout, "0123\nafter\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dropped_file_closes_the_underlying_descriptor() {
+    // The safety net proven at RUNTIME, not just in the emitted bytes: a
+    // dropped handle's descriptor really is released. The drop only INITIATES
+    // the close (Q1's ruling), so the probe polls /proc/self/fd — bounded —
+    // until the count settles back to its baseline; and `with_file`'s count
+    // is back to baseline IMMEDIATELY, its close having been awaited.
+    // Plant-proven: with `impl File with Drop` removed from fs.vl, the
+    // descriptor never closes and the poll times out red.
+    //
+    // The WARM-UP block before the baseline is load-bearing, and each line of
+    // it was found by a real failure mode: the process's first
+    // descriptor-based fs op can lazily create process-lifetime
+    // infrastructure descriptors (io_uring on modern node/linux), and the
+    // first PRINT on a PIPED stdout — which is what the test harness gives
+    // the child — materializes the stream's own persistent handle. Either
+    // one, first created after the baseline, holds the count one above it
+    // forever, with the file itself long closed.
+    let dir = temp_project("file_drop_closes");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::fs::{ File, read_dir, with_file };
+import std::drop::drop;
+import std::range::Range;
+import std::time::sleep;
+
+fun fd_count(): i32 {
+	read_dir("/proc/self/fd").len()
+}
+
+fun settled_count(baseline: i32): i32 {
+	for _attempt in Range::new(0, 200) {
+		if fd_count() == baseline {
+			ret baseline;
+		}
+		sleep(10);
+	}
+	fd_count()
+}
+
+fun main() {
+	let warm = File::open("data/ten.txt");
+	drop(warm);
+	print("warm");
+	sleep(300);
+
+	let baseline = fd_count();
+	let file = File::open("data/ten.txt");
+	print(fd_count() - baseline);
+	drop(file);
+	print(settled_count(baseline) - baseline);
+
+	let with_baseline = fd_count();
+	let size = with_file("data/ten.txt", |f| f.stat().size);
+	print(size);
+	print(fd_count() - with_baseline);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "warm\n1\n0\n10\n0\n",
+        "open holds one descriptor; drop releases it (within the poll); \
+         with_file's is already released when it returns"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

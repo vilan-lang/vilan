@@ -1,0 +1,38 @@
+import std::bytes::{ Bytes, decode_utf8 };
+import std::drop::drop;
+import std::fs;
+import std::fs::{ File, with_file };
+import std::print;
+
+// The handle tier (kolt.local 031 S3, proposal/filesystem.md §3.2): positional
+// reads off an open file, the postfix-off-an-awaited-call spellings the tier
+// was gated on (B141 — fixed in Order 13, pinned here as the tier's intended
+// idiom), and the two close paths: with_file's AWAITED close, and the
+// scope-end Drop that fires the fire-and-forget close inside a finally.
+// Excluded from the macro interpreter gate — the filesystem is a host
+// capability, and every call here awaits.
+
+fun main() {
+	fs::write_file("file-corpus.txt", "0123456789");
+
+	// A held handle: positional read, handle stat, early drop.
+	let file = File::open("file-corpus.txt");
+	let buffer = Bytes::alloc(4);
+	print(file.read_at(buffer, 3));
+	print(decode_utf8(buffer.slice(0, 4)));
+	print(file.stat().size);
+	drop(file);
+
+	// B141's historically-broken spellings, positive: a postfix chain straight
+	// off the implicitly-awaited constructor call.
+	print(File::open("file-corpus.txt").read_at(buffer, 0));
+	print(File::open("file-corpus.txt").stat().size);
+
+	// The documented idiom: the body gets the file as a per-call parameter,
+	// and the close is awaited before with_file returns.
+	let size = with_file("file-corpus.txt", |f| f.stat().size);
+	print(size);
+
+	fs::remove("file-corpus.txt");
+}
+main();

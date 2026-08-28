@@ -29459,20 +29459,20 @@ fn a_neutral_instantiation_is_admitted_despite_a_colored_impl() {
 
 #[test]
 fn a_platform_fence_rejects_an_off_platform_reach() {
-    // Checked on a NODE build (which itself admits `exists`) and with main
+    // Checked on a NODE build (which itself admits `stat`) and with main
     // never calling the fenced function — the fence alone carries the check.
     assert_fails_spanning(
         r#"
-        import std::fs::exists;
+        import std::fs::stat;
 
         [platform("browser")]
         fun probe_cache(): bool {
-            exists("cache")
+            stat("cache").is_some()
         }
 
         fun main() {}
         "#,
-        r#"exists("cache")"#,
+        r#"stat("cache")"#,
         "reachable from `probe_cache`, fenced `[platform(\"browser\")]`",
     );
 }
@@ -29480,11 +29480,11 @@ fn a_platform_fence_rejects_an_off_platform_reach() {
 #[test]
 fn a_satisfied_fence_compiles_on_every_build_target() {
     let source = r#"
-        import std::fs::exists;
+        import std::fs::stat;
 
         [platform("@process")]
         fun probe_cache(): bool {
-            exists("cache")
+            stat("cache").is_some()
         }
 
         fun main() {}
@@ -29530,7 +29530,7 @@ fn a_fence_on_a_generic_promises_every_instantiation() {
     // deliberate conservatism (the fence promises for every possible T).
     assert_fails_browser_with(
         r#"
-        import std::fs::exists;
+        import std::fs::stat;
 
         trait Check {
             fun check(self): bool;
@@ -29540,7 +29540,7 @@ fn a_fence_on_a_generic_promises_every_instantiation() {
 
         impl DiskProbe with Check {
             fun check(self): bool {
-                exists(self.path)
+                stat(self.path).is_some()
             }
         }
 
@@ -29559,14 +29559,14 @@ fn a_fence_on_a_generic_promises_every_instantiation() {
 fn a_fence_on_a_method_checks_like_a_functions() {
     assert_fails_browser_with(
         r#"
-        import std::fs::exists;
+        import std::fs::stat;
 
         struct Store { path: str }
 
         impl Store {
             [platform("browser")]
             fun probe(self): bool {
-                exists(self.path)
+                stat(self.path).is_some()
             }
         }
 
@@ -29662,9 +29662,13 @@ fn instantiation_bindings_compose_through_nested_generics() {
 fn a_never_instantiated_impls_globals_leave_no_residue() {
     // The emission side moves with the refinement (emitted ⊆ admitted): a
     // binding referenced only by the impl no instantiation selects is
-    // dropped, its callees — and their `node:` imports — with it.
+    // dropped, its callees — and their `node:` imports — with it. The global
+    // must be a SYNCHRONOUS `@process` call carrying a `node:` import, so a
+    // module-level `Database` stands in for the deleted `fs::exists`
+    // (kolt.local 031 Q3): `Database::open` is sync and statically imports
+    // `node:sqlite`.
     let source = r#"
-        import std::fs::exists;
+        import std::db::Database;
 
         trait Save {
             fun save(self): bool;
@@ -29673,14 +29677,17 @@ fn a_never_instantiated_impls_globals_leave_no_residue() {
         struct MemStore { last: str }
         struct DiskStore { path: str }
 
-        let disk_ready = exists("state");
+        let disk_db: Database = Database::open("state");
 
         impl MemStore with Save {
             fun save(self): bool { true }
         }
 
         impl DiskStore with Save {
-            fun save(self): bool { disk_ready }
+            fun save(self): bool {
+                disk_db.exec("SELECT 1");
+                true
+            }
         }
 
         fun save_it<T: Save>(store: T): bool {
@@ -29941,17 +29948,21 @@ fn an_unreached_function_still_knows_its_requirement() {
 
 #[test]
 fn a_module_initializers_call_colors_the_referencing_entry() {
+    // `std::process::env` — synchronous, so the initializer is legal on the
+    // node build and ONLY the coloring is under test. (`fs::exists`, this
+    // pin's original subject, was deleted by kolt.local 031's Q3 ruling; the
+    // fs module now has no synchronous entry a module initializer could call.)
     assert_fails_browser_with(
         r#"
-        import std::fs::exists;
+        import std::process::env;
 
-        let cache = exists("cache.txt");
+        let cache = env("CACHE");
 
         fun main() {
             let content = cache;
         }
         "#,
-        "`exists` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → cache → exists (std::fs)",
+        "`env` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → cache → env (std::process)",
     );
 }
 
@@ -29980,10 +29991,10 @@ fn an_initializer_violation_anchors_at_the_initializer_call() {
 fn an_initializer_reaching_a_user_function_colors_through_it() {
     assert_fails_browser_with(
         r#"
-        import std::fs::exists;
+        import std::process::env;
 
         fun boot_check(): bool {
-            exists("state")
+            env("STATE").is_some()
         }
 
         let ready = boot_check();
@@ -29992,7 +30003,7 @@ fn an_initializer_reaching_a_user_function_colors_through_it() {
             let r = ready;
         }
         "#,
-        "reachable from the entry: main → ready → boot_check → exists (std::fs)",
+        "reachable from the entry: main → ready → boot_check → env (std::process)",
     );
 }
 
@@ -30000,16 +30011,16 @@ fn an_initializer_reaching_a_user_function_colors_through_it() {
 fn a_global_referencing_a_colored_global_chains_through_both() {
     assert_fails_browser_with(
         r#"
-        import std::fs::exists;
+        import std::process::env;
 
-        let raw = exists("data.txt");
+        let raw = env("DATA");
         let copy = raw;
 
         fun main() {
             let c = copy;
         }
         "#,
-        "reachable from the entry: main → copy → raw → exists (std::fs)",
+        "reachable from the entry: main → copy → raw → env (std::process)",
     );
 }
 
@@ -30235,15 +30246,17 @@ fn a_dropped_bindings_initializer_leaves_no_residue_in_the_bundle() {
     // reference inside an ELIDED unused local doesn't count as running the
     // initializer — emission drops both, and admission merely
     // over-approximates in the safe direction by still checking it.)
+    // `env` rather than an fs read: a module initializer cannot await, and
+    // the fs module's last synchronous entry was deleted (kolt.local 031 Q3).
     let node = compile(
         r#"
         import std::print;
-        import std::fs::exists;
+        import std::process::env;
 
-        let cache = exists("cache.txt");
+        let cache = env("cache.txt");
 
         fun main() {
-            print(cache);
+            print(cache.is_some());
         }
         "#,
     )
@@ -44722,6 +44735,220 @@ fn a_module_level_data_binding_overwrite_is_accepted() {
         }
         fun main() { tick(); print(i"{counter}"); }
         "#,
+    );
+}
+
+// --- kolt.local 031 S3: `File` — the second std resource (filesystem.md §3.2,
+// §5). The `Database` template followed exactly: `resource external struct`,
+// construction through associated funs (over one raw async extern rather than
+// an extern-new — `fsPromises.open` is a module function, not a constructor),
+// release a module-level free function reachable only from `Drop`, no public
+// `close()`. The one `File` divergence is RULED (Q1, 2026-08-27, (a)+(c)
+// scoped to `File` alone): `FileHandle.close()` is async, so `drop` INITIATES
+// the close without awaiting it and `with_file` is the idiom whose close IS
+// awaited. Runtime behavior is pinned end-to-end in
+// `crates/vilan-cli/tests/fs.rs`; these pin the semantics and the emission.
+
+#[test]
+fn a_file_binding_moves_and_a_later_use_is_use_after_move() {
+    // R1 on the second std resource: `File` moves on binding, and a stale
+    // handle is a compile error rather than a runtime `EBADF`.
+    assert_use_after_move_noting(
+        r#"
+        import std::fs::File;
+        fun main() {
+            let handle = File::open("data.txt");
+            let heir = handle;
+            handle.stat();
+        }
+        "#,
+        "handle",
+        1,
+    );
+}
+
+#[test]
+fn a_list_of_files_is_rejected() {
+    // R10: no `List<File>` — `Option<File>` is the sanctioned container, so
+    // "a pool of open files" is not expressible in v1 (the docs say so out
+    // loud, per filesystem.md §5's request).
+    assert_fails_with(
+        r#"
+        import std::fs::File;
+        fun main() {
+            let files: List<File> = [];
+        }
+        "#,
+        "cannot hold the resource",
+    );
+}
+
+#[test]
+fn a_closure_cannot_capture_a_file() {
+    // R9 with the real type — the rule that shapes the whole fs surface
+    // (`with_file` hands the body its file as a per-call PARAMETER instead,
+    // and the watch design in filesystem.md §8 is pull-based because of it).
+    assert_fails_with(
+        r#"
+        import std::fs::File;
+        fun run_it(body: || void) { body(); }
+        fun main() {
+            let file = File::open("data.txt");
+            run_it(|| { file.stat(); });
+        }
+        "#,
+        "cannot capture the resource",
+    );
+}
+
+#[test]
+fn a_module_level_file_initializer_is_refused_for_awaiting() {
+    // Where `File` genuinely diverges from `Database`, and the divergence is
+    // structural, not chosen: every constructor is async (`fsPromises.open`),
+    // and a module-level initializer cannot await (§J.3). So `Database`'s
+    // module-level serve-forever idiom is NOT expressible for `File` — the
+    // process-lifetime handle lives in `main`'s scope instead (owning a
+    // resource across awaits is legal, and `main` never returning keeps it
+    // open). filesystem.md §5 claimed the module-level idiom carried over;
+    // this pin records that it does not.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::fs::File;
+        let log: File = File::append_to("app.log");
+        fun main() {
+            print(log.stat().size);
+        }
+        "#,
+        "a module-level binding cannot await",
+    );
+}
+
+#[test]
+fn the_handles_postfix_idiom_typechecks_off_the_awaited_constructor() {
+    // B141's historically-broken spellings as POSITIVE tests (filesystem.md
+    // §11.1 named the fix S3's prerequisite; Order 13 shipped it): a postfix
+    // straight off the implicitly-awaited constructor call. The typing half —
+    // the emitted programs run in `fs.rs`'s e2e pins and the corpus golden
+    // `file.vl` holds the emitted parenthesization.
+    assert_compiles(
+        r#"
+        import std::print;
+        import std::bytes::Bytes;
+        import std::fs::File;
+        fun main() {
+            let buffer = Bytes::alloc(8);
+            print(File::open("data.txt").read_at(buffer, 0));
+            print(File::open("data.txt").stat().size);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_scope_end_file_drop_is_a_finally_that_initiates_the_close() {
+    // The safety net (Q1's (a)): a locally-owned `File` gets the same
+    // try/finally teardown `Database` does, and the finally reaches
+    // `__fs_close`, whose helper starts `close()` WITHOUT awaiting it and
+    // routes a close failure to console.error instead of an unhandled
+    // rejection. Plant-proven: removing `impl File with Drop` from fs.vl
+    // reddens both assertions (and the `file.vl` corpus golden).
+    let js = compile(
+        r#"
+        import std::print;
+        import std::fs::File;
+        fun main() {
+            let file = File::open("data.txt");
+            print(file.stat().size);
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("finally"),
+        "a local File must get a scope-end teardown finally:\n{js}"
+    );
+    assert!(
+        js.contains("function __fs_close(file)") && js.contains("file.close().catch("),
+        "the finally must reach the fire-and-forget close helper:\n{js}"
+    );
+}
+
+#[test]
+fn dropping_a_local_file_early_lowers_to_the_same_close() {
+    // `drop(file)` is the early form (no public `close()` exists to call);
+    // it lowers to the destructor, which reaches the same helper.
+    let js = compile(
+        r#"
+        import std::fs::File;
+        import std::drop::drop;
+        fun main() {
+            let file = File::open("data.txt");
+            file.stat();
+            drop(file);
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("__fs_close("),
+        "an explicit drop(file) must reach the close helper:\n{js}"
+    );
+}
+
+#[test]
+fn with_file_awaits_the_close_before_returning() {
+    // Q1's (c), the half the destructor cannot give: `with_file`'s close is
+    // AWAITED, so it completes — and can fail observably — before `with_file`
+    // returns. The emitted `await` IS the ordering, so it is pinned on the
+    // bytes. Plant-proven: dropping the `close_awaited(file)` line from
+    // `with_file` in fs.vl reddens this (and the corpus golden).
+    let js = compile(
+        r#"
+        import std::print;
+        import std::fs::with_file;
+        fun main() {
+            let size = with_file("data.txt", |file| file.stat().size);
+            print(size);
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("await (__fs_close_awaited(file))"),
+        "with_file must AWAIT its close (kolt.local 031 Q1):\n{js}"
+    );
+}
+
+#[test]
+fn opening_a_file_on_a_browser_build_is_refused_by_coloring() {
+    // The browser leg refuses by COLORING (the arm that actually fires —
+    // probed, and it is `Database`'s arm exactly): `File` the type is
+    // colorless, but every way to OBTAIN one is seeded `@process` by
+    // definition site, so a browser-reachable path can never hold a handle.
+    assert_fails_browser_with(
+        r#"
+        import std::fs::File;
+        fun main() {
+            let file = File::open("data.txt");
+        }
+        "#,
+        "`open` requires the `process` layer of `std` and cannot run on `browser`\n  reachable from the entry: main → open (std::fs)",
+    );
+}
+
+#[test]
+fn fs_exists_is_gone_and_the_import_says_so() {
+    // kolt.local 031 Q3, ruled 2026-08-27: `fs::exists` is DELETED — its
+    // justification named a category ("boot code") rather than a caller, all
+    // three callers were already async, and `stat(path).is_some()` answers
+    // strictly more. The module's last synchronous entry went with it.
+    assert_fails_with(
+        r#"
+        import std::fs::exists;
+        fun main() {}
+        "#,
+        "cannot find 'exists' in the imported path",
     );
 }
 

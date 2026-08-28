@@ -1647,8 +1647,8 @@ fn presence_client_source(asset_kind: &str) -> String {
 /// page's markup ONCE, at boot, and serves that snapshot for the life of the
 /// process. Here the boot-time decision is the one that matters to kolt.local
 /// 007 — whether to render a `<link>` for the client leg's style sidecar, which
-/// `fs::exists` answers (the module's one blocking call, "sized for a
-/// boot-time branch"). Booted in a round that emitted no stylesheet, the page
+/// `fs::stat(..).is_some()` answers (the probe that replaced the deleted
+/// `fs::exists`). Booted in a round that emitted no stylesheet, the page
 /// it serves carries the app's own hand-written `theme.css` and NOTHING for
 /// `client.css`; and since a css-only round never restarts this server
 /// (hmr.md §6, `classify`), it never will.
@@ -1660,7 +1660,7 @@ fn presence_client_source(asset_kind: &str) -> String {
 fn boot_rendered_page_server_source() -> String {
     "import std::fs;\nimport std::http::{ Server, Response };\nimport std::print;\nimport std::process;\n\n\
      fun main() {\n\
-     \tlet sidecar = if fs::exists(\"dist/client.css\") { \"<link rel=\\\"stylesheet\\\" href=\\\"/client.css\\\">\" } else { \"\" };\n\
+     \tlet sidecar = if fs::stat(\"dist/client.css\").is_some() { \"<link rel=\\\"stylesheet\\\" href=\\\"/client.css\\\">\" } else { \"\" };\n\
      \tlet page = i\"<!doctype html><head><link rel=\\\"stylesheet\\\" href=\\\"/theme.css\\\">{sidecar}</head><body><script src=\\\"/client.js\\\"></script></body>\";\n\
      \tServer::builder()\n\
      \t\t.port(0)\n\

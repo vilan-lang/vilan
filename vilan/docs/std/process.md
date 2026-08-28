@@ -235,7 +235,6 @@ side: [Services & RPC](../guide/services.md) and the
 fun read_file_to_str(path: str): str            // async, UTF-8
 fun read_file_encoded(path: str, encoding: str): str   // async — decode with any host encoding
 fun read_bytes(path: str): Bytes                // async, true binary read
-fun exists(path: str): bool                     // sync — the one blocking call here
 fun stat(path: str): Option<Stat>               // async — None if `path` doesn't exist; every other failure throws
 
 // writing
@@ -271,6 +270,26 @@ struct Entry {
     is_file: bool,
     is_symlink: bool,
 }
+
+// the handle tier — an open file, positional and stateless
+resource external struct File
+
+impl File {
+    fun open(path: str): File        // "r"  — read; must exist
+    fun create(path: str): File      // "w"  — create, truncating what was there
+    fun create_new(path: str): File  // "wx" — create; FAIL if it already exists
+    fun append_to(path: str): File   // "a"  — every write lands at the end
+    fun modify(path: str): File      // "r+" — read/write in place; must exist
+
+    fun read_at(self, buffer: Bytes, position: i53): i32   // bytes read; 0 at EOF
+    fun write_at(self, buffer: Bytes, position: i53): i32  // bytes written
+    fun stat(self): Stat             // no Option — the handle is already open
+    fun truncate(self, length: i53)  // shrink, or extend zero-filled
+    fun sync(self)                   // fsync — the durability primitive
+    fun data_sync(self)              // fdatasync — data only
+}
+
+fun with_file<T>(path: str, body: |File| T): T   // open, run, close — close AWAITED
 ```
 
 Everything here throws host-side on any failure, missing path included —
@@ -284,15 +303,17 @@ is a no-op. Any *other* failure of either — a permissions error, a busy
 directory — still throws. If you need to know whether a thing was there,
 `stat` before you act.
 
-There is no synchronous read. There used to be one, justified by a caller
-that could not suspend; no such caller existed, so it is gone. Async *is*
-the calling convention here — `read_file_to_str(path)` is implicitly
-awaited and reads like a plain call — so a sync variant buys a caller
-nothing and costs the event loop the length of the read. `exists` is the
-module's one blocking call, and it blocks for a different reason:
-`node:fs/promises` has no `exists`, and syncness is the only thing
-separating it from `stat(path).is_some()`. It is sized for a boot-time
-branch; on a request path, call `stat`.
+Nothing here is synchronous, and that is the whole calling convention:
+`read_file_to_str(path)` is implicitly awaited and reads like a plain
+call, so a sync variant buys a caller nothing and costs the event loop the
+length of the operation. There used to be two synchronous entries, and
+both are gone — a sync read justified by a caller that could not suspend
+(no such caller existed), and `exists`, which outlived it by one release:
+its justification named a category ("boot code") rather than a caller,
+every caller it actually had was already async, and
+`stat(path).is_some()` answers strictly more. That is the probe now —
+`stat(path).is_some()` for "is this here", `stat(path).is_none()` for the
+guard clause.
 
 Three directory listings, one honesty policy. `read_dir` is deliberately
 flat: immediate entry *names*, not path-joined, no file-vs-directory
@@ -349,8 +370,8 @@ previous file intact or the complete new one, never a mix. Use it for
 anything the program reads back later — a JSON store, a cache, a config
 the app rewrites. Atomic is not durable, though: after a *power* loss the
 rename may not have reached the device, and closing that last gap needs
-`fsync`, which the host exposes only on an open file handle — std has no
-handle type yet. The temporary is a sibling because a rename across
+`fsync`, which the host exposes only on an open file handle — that is
+`File::open(path)` then `file.sync()`, below. The temporary is a sibling because a rename across
 filesystems is not atomic and would fail outright, which also means a
 crashed run can strand a `<path>.<uuid>.tmp` file beside the target;
 `vilan` has no `try`/`catch` to sweep it up. `rename` is the primitive
@@ -393,6 +414,46 @@ of an async operation has to name the caller that cannot suspend, and in
 this module there is exactly one such caller in the whole language — a
 module-level `let`, which cannot await — so the bar is a name, not a
 category.
+
+Everything above is a complete operation on a path — open, act, close, in
+one call. What needs more than one act on the *same* open file is the
+handle tier. `File` is a `resource`: it moves rather than copies, a stale
+binding is a compile error rather than an `EBADF`, and its destructor
+closes the underlying handle at the owner's scope end — there is no
+`close()` to forget or to call twice, and `drop(file)` is the early form.
+The five constructors replace node's flags string ("wx" and friends —
+an untyped enum whose failure mode is a runtime `EINVAL`): each says in
+its name what it does to a file that already exists, which is the only
+thing anyone ever looks up. `create_new` is the exclusive create — how a
+process claims a name without racing another — and `append_to` carries
+the host's own rule, kept rather than papered over: on an append handle
+every write lands at the end, position ignored.
+
+Reads and writes are positional and stateless *by design*. A `File` has
+no cursor, so two loans of one handle cannot silently interleave through
+hidden position state; `read_at` answers with the byte count — short near
+the end of the file, `0` at end of file, neither an error. The handle is
+also what makes read-then-act sequences TOCTOU-free: `file.stat()`
+answers `Stat` with no `Option`, because the handle addresses the *open
+file*, not the path — rename or remove the path and the handle still
+reads the file it holds. And `sync()` is the durability primitive nothing
+path-addressed can offer: `write_atomic` guarantees you a whole file or
+the old one, `sync` is what makes it survive the power going out.
+
+The documented idiom is `with_file(path, |file| …)`: the body receives
+the open file as a per-call parameter, the value comes back out, and the
+close is *awaited* — which the destructor's close deliberately is not.
+`FileHandle.close()` is asynchronous on the host and a destructor cannot
+await, so a dropped `File` *initiates* its close without waiting: written
+data is safe either way, but only `with_file` can observe a close
+failure. Scope-end `Drop` stays underneath as the safety net. Two shapes
+to know before reaching for a handle: a closure cannot capture a `File`
+(hand it in as a parameter, which is exactly what `with_file` does), and
+`List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
+container, so "a pool of open files" is not expressible today. A
+module-level `File` is not expressible either — every constructor is
+async and a module-level `let` cannot await — so a process-lifetime
+handle is a local in `main`, held across whatever `main` awaits.
 
 Reading a build's assets, rewriting one, and putting the result somewhere
 new is the shape most of this is for:

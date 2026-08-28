@@ -6,7 +6,7 @@
 //! split. §10.3 made it the leg's BUILD MANIFEST — *what this leg's build
 //! emitted* — so it is written on every build of a browser leg, carrying `leg`,
 //! `entry`, `styles`, `classic_script` and `chunks`. What that buys is the
-//! thing `std::build::build_of` needs and `fs::exists` cannot give: the
+//! thing `std::build::build_of` needs and a filesystem probe cannot give: the
 //! difference between "this leg emitted no stylesheet" and "this leg was never
 //! built".
 //!
@@ -131,9 +131,9 @@ fn a_browser_leg_that_does_not_split_still_writes_its_build_manifest() {
 fn the_manifest_names_the_style_sidecar_exactly_when_the_build_emitted_one() {
     // F1/F2, answered by the build instead of by a filesystem probe: `styles`
     // is `null` for a leg with no `const style()` and names the sidecar for one
-    // that has it. `fs::exists("dist/client.css")` — what the `vilan init`
-    // template does today — cannot tell either case from a stale file a
-    // previous build left behind.
+    // that has it. A `fs::stat("dist/client.css")` probe — what the `vilan
+    // init` template did before serve_build — cannot tell either case from a
+    // stale file a previous build left behind.
     let without = two_leg_project("nostyles", false);
     let built = vilan(&without, &["build", "."]);
     assert!(

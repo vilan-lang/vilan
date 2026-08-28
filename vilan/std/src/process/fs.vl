@@ -21,14 +21,18 @@
 // throws. Every other function in this module has the throwing posture, and a
 // caller who wants to branch on absence probes with `stat` first.
 //
-// Everything here is asynchronous except `exists`, which says at its own
-// declaration why it is not (proposal/filesystem.md §4: a sync variant of an
-// async operation must name the caller that cannot suspend). Nothing this file
-// gained in the write and directory slice has a sync twin, and none was asked
-// for.
+// Everything here is asynchronous — nothing in this module blocks. The last
+// synchronous entry (`exists`, bound to `existsSync`) was DELETED with the
+// handle slice (kolt.local 031 Q3, ruled 2026-08-27): its justification named
+// a category ("boot code") rather than a caller, all three of its callers were
+// already async, and `stat(path).is_some()` answers strictly more.
+// proposal/filesystem.md §4 is the standing rule — a sync variant of an async
+// operation must name the caller that cannot suspend, in a form a later
+// reader can look up and find missing in one grep.
 
 import pkg::bytes::Bytes;
 import pkg::crypto::random_uuid;
+import pkg::drop::Drop;
 import pkg::option::Option::{ None, Some, self };
 
 /// Reads a file, decoded as text under `encoding` (a `node:fs` encoding name —
@@ -67,21 +71,6 @@ async external fun write_file(path: str, contents: str): void;
 [extern("node:fs/promises", "writeFile")]
 async external fun write_bytes(path: str, contents: Bytes): void;
 
-/// Whether a path exists on disk (`node:fs` `existsSync`).
-///
-/// The one synchronous binding in this module, and NOT for the reason a sync
-/// function usually claims: no caller of it cannot suspend. Its callers in
-/// `std::build` (`build_of`, `load_build`) are both async and await their file
-/// reads a line or two later. It is synchronous because `node:fs/promises` has
-/// no `exists` at all — `existsSync` is the whole operation in one call — and
-/// because syncness is the ONLY thing that separates it from
-/// `stat(path).is_some()`, which is right below, is async, and is what to reach
-/// for on a request path. The cost is one blocking stat (node implements
-/// `existsSync` as exactly that): affordable for a boot-time branch, not for a
-/// per-request one.
-[extern("node:fs", "existsSync")]
-external fun exists(path: str): bool;
-
 /// Reads a UTF-8 text file to a string. Async (it awaits `readFile`), so callers
 /// implicitly await it.
 fun read_file_to_str(path: str): str {
@@ -107,7 +96,8 @@ async external fun rename(from: str, to: str): void;
 ///
 /// ATOMIC, NOT DURABLE. After a power loss the rename may not have reached the
 /// device. Durability needs `fsync`, which the host exposes only on an open
-/// file handle — std has no handle type yet (proposal/filesystem.md §5.2).
+/// file handle — `File::open(path)` then `file.sync()`, below
+/// (proposal/filesystem.md §5.2).
 ///
 /// The temporary is uniquely named because concurrent writers must not share
 /// one, so a crash can leave a `<path>.<uuid>.tmp` file behind: `vilan` has no
@@ -443,4 +433,204 @@ fun stat(path: str): Option<Stat> {
 		Some(let raw) => Some(Stat { size = raw.size(), modified_at_ms = raw.mtime_ms(), is_directory = raw.is_directory() }),
 		None => None,
 	}
+}
+
+// --- the handle tier (kolt.local 031 S3, proposal/filesystem.md §3.2) -----
+
+/// An open file (`node:fs/promises`' `FileHandle`). A `resource`: it moves
+/// rather than copies, a stale binding is a compile error rather than an
+/// `EBADF`, and its `Drop` (below) closes the underlying host handle at the
+/// owner's scope end — `drop(file)` is the early form, and there is no
+/// `close()` to forget or to call twice. A module-level `File` is
+/// process-lifetime, loan-only, and never drops.
+///
+/// The handle is what makes a read-then-act sequence TOCTOU-free: `stat`,
+/// `read_at` and `write_at` address the OPEN FILE, not the path, so nothing
+/// re-resolves between the probe and the act — a rename or removal of the
+/// path changes nothing about what this handle reads.
+///
+/// Two container rules worth meeting here rather than in a diagnostic
+/// (destruction.md R9/R10): a closure cannot capture a `File` (`with_file`
+/// below hands the body its file as a per-call parameter instead), and
+/// `List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
+/// container, so "a pool of open files" is not expressible in v1.
+resource external struct File;
+
+/// The raw host open. Kept behind the five named constructors: node's flags
+/// string is an untyped eleven-member enum whose failure mode is a runtime
+/// `EINVAL`, and a typo in it is a typo the compiler cannot see — each
+/// constructor says in its name what it does to a file that already exists,
+/// which is the only thing anyone ever looks up
+/// (proposal/filesystem.md §3.3).
+[extern("node:fs/promises", "open")]
+async external fun open_with_flags(path: str, flags: str): File;
+
+/// One `FileHandle.read()` result (`{ bytesRead, buffer }`). Opaque and
+/// internal, exactly like `RawStat`: `read_at` copies the one field out, so
+/// no caller touches the host shape.
+external struct RawReadResult;
+
+impl RawReadResult {
+	[extern(get, "bytesRead")]
+	external fun bytes_read(self): i32;
+}
+
+/// One `FileHandle.write()` result (`{ bytesWritten, buffer }`).
+external struct RawWriteResult;
+
+impl RawWriteResult {
+	[extern(get, "bytesWritten")]
+	external fun bytes_written(self): i32;
+}
+
+impl File {
+	/// Opens `path` for reading (host mode `"r"`). The path must exist —
+	/// `ENOENT` otherwise, matching the module's throwing posture; probe with
+	/// `stat` first if absence is an ordinary outcome.
+	fun open(path: str): File {
+		open_with_flags(path, "r")
+	}
+
+	/// Creates `path` for writing, truncating anything already there (host
+	/// mode `"w"`) — the handle form of `write_file`'s posture.
+	fun create(path: str): File {
+		open_with_flags(path, "w")
+	}
+
+	/// Creates `path` for writing and FAILS (`EEXIST`) if anything is already
+	/// there (host mode `"wx"`) — the exclusive create: how one process
+	/// claims a name without racing another, and the second reading of
+	/// "write atomically" (`write_atomic` above is the first). The primitive
+	/// a lockfile package would be built from.
+	fun create_new(path: str): File {
+		open_with_flags(path, "wx")
+	}
+
+	/// Opens `path` for appending, creating it if missing (host mode `"a"`).
+	/// HOST SEMANTICS, kept rather than papered over: every write through an
+	/// append handle lands at the END of the file — `write_at`'s position is
+	/// IGNORED on this handle (POSIX `O_APPEND`).
+	fun append_to(path: str): File {
+		open_with_flags(path, "a")
+	}
+
+	/// Opens `path` for reading AND writing without truncating it (host mode
+	/// `"r+"`). The path must exist — the mode for editing in place.
+	fun modify(path: str): File {
+		open_with_flags(path, "r+")
+	}
+
+	[extern(method, "read")]
+	async external fun raw_read(self, buffer: Bytes, offset: i32, length: i32, position: i53): RawReadResult;
+
+	[extern(method, "write")]
+	async external fun raw_write(self, buffer: Bytes, offset: i32, length: i32, position: i53): RawWriteResult;
+
+	/// Reads into `buffer` from byte `position` of the file; returns the
+	/// number of bytes actually read — `buffer.len()` at most, fewer near the
+	/// end of the file, `0` at end of file. Short reads are normal and are
+	/// not an error.
+	///
+	/// Positional and stateless BY DESIGN: a `File` has no cursor, so two
+	/// loans of one handle cannot silently interleave through hidden
+	/// host-side position state — which is why the host's implicit-position
+	/// read mode is deliberately not bound (proposal/filesystem.md §3.4).
+	fun read_at(self, buffer: Bytes, position: i53): i32 {
+		self.raw_read(buffer, 0, buffer.len(), position).bytes_read()
+	}
+
+	/// Writes all of `buffer` at byte `position` of the file (extending it if
+	/// the write reaches past the end); returns the number of bytes written.
+	/// Positional and stateless, like `read_at` — and on an `append_to`
+	/// handle the position is ignored (see there).
+	fun write_at(self, buffer: Bytes, position: i53): i32 {
+		self.raw_write(buffer, 0, buffer.len(), position).bytes_written()
+	}
+
+	[extern(method, "stat")]
+	async external fun raw_handle_stat(self): RawStat;
+
+	/// This open file's metadata — `stat(path)` without the path, so there is
+	/// no missing-path case and no `Option`: the handle addresses the open
+	/// file itself, and a rename or removal of the path in between changes
+	/// nothing about what is measured.
+	fun stat(self): Stat {
+		let raw = self.raw_handle_stat();
+		Stat {
+			size = raw.size(),
+			modified_at_ms = raw.mtime_ms(),
+			is_directory = raw.is_directory(),
+		}
+	}
+
+	/// Truncates the file to `length` bytes — or extends it, zero-filled.
+	[extern(method, "truncate")]
+	async external fun truncate(self, length: i53): void;
+
+	/// Flushes this file's data AND metadata to the storage device (`fsync`)
+	/// — the durability primitive, and a capability nothing path-addressed in
+	/// this module has: `write_atomic` is atomic but not durable, and this is
+	/// what closes that gap (proposal/filesystem.md §5.2).
+	[extern(method, "sync")]
+	async external fun sync(self): void;
+
+	/// `fdatasync` — flushes the data only, not the metadata timestamps: the
+	/// cheaper sync for a log whose contents are all that matters.
+	[extern(method, "datasync")]
+	async external fun data_sync(self): void;
+}
+
+/// Closes the underlying host handle — the one host operation with no public
+/// surface. Reachable only from `File`'s `Drop` below, so there is no
+/// `close()` to fall out of sync with the destructor; `drop(file)` is the
+/// early form. THE ONE `File` EXCEPTION to destruction.md §5's "drop is
+/// synchronous": `FileHandle.close()` returns a promise a destructor cannot
+/// await, so the drop INITIATES the close without awaiting it — ruled
+/// 2026-08-27 (kolt.local 031 Q1: (a)+(c), scoped to `File` ALONE, not a
+/// general license for async teardown). What that costs, honestly: data
+/// already written is safe (a resolved `write_at` was handed to the OS) and
+/// the process cannot exit under a pending close, but the close's ERROR is
+/// unobservable here (the glue reports it to stderr), and dropping a handle
+/// then immediately re-opening or unlinking its path races the descriptor's
+/// release — benign on POSIX, not always on Windows. `with_file` below is
+/// the spelling in which the close is awaited and a failure observable.
+[extern("__fs_close")]
+external fun close_handle(file: File): void;
+
+impl File with Drop {
+	/// Runs at the owner's scope end (or at an explicit `drop(file)`):
+	/// initiates the close through the `&mut self` loan. Synchronous and
+	/// context-free, as a destructor must be — the close itself completes in
+	/// the background (see `close_handle`).
+	fun drop(&mut self) {
+		close_handle(self);
+	}
+}
+
+/// `with_file`'s close — AWAITED, unlike the destructor's, so a failure to
+/// close is a failure of `with_file` itself. Not a public `close()`: a free
+/// function the completion list never offers on a `File`, with `with_file`
+/// as its one caller.
+[extern("__fs_close_awaited")]
+async external fun close_awaited(file: File): void;
+
+/// Opens `path` for reading, runs `body` with the open file, closes it, and
+/// hands back what `body` returned — with the close AWAITED, which the
+/// destructor's close deliberately is not (kolt.local 031 Q1's ruling): the
+/// documented idiom for handle use, and the only spelling in which a failure
+/// to close is observable.
+///
+/// The file arrives as `body`'s PARAMETER — per-call, not a capture — which
+/// is why a closure can be handed a resource at all (destruction.md R9). And
+/// `body` is a plain value-returning closure, so it is asyncness-polymorphic
+/// (async-polymorphism.md): a body that awaits makes that `with_file` await
+/// too, with nothing to write at either site. Should `body` throw, the
+/// scope-end `Drop` still closes the handle — the safety net behind the
+/// awaited path; the host close is idempotent, so the net stays benign when
+/// both run.
+fun with_file<T>(path: str, body: |File| T): T {
+	let file = File::open(path);
+	let result = body(file);
+	close_awaited(file);
+	result
 }

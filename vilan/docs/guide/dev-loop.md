@@ -401,7 +401,7 @@ Every build of a browser leg writes it, split or not — a leg that does not
 split gets `"chunks": []` and `"classic_script": false`. That is deliberate:
 an absent file cannot tell "did not split" from "was never built", and
 `build_of` needs the difference. `styles` is `null` when the leg compiled no
-`const style()`, which is the one thing an `fs::exists` probe could never
+`const style()`, which is the one thing an `fs::stat` probe could never
 answer in both directions.
 
 `examples/fullstack`'s server reads it with `build_of("client")` and hands
