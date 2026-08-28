@@ -29,6 +29,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**An `asset::emit` reached only through trait dispatch escaped the const-only check — a clean compile, then a `ReferenceError` at run time.** The check propagates "compile-time-only" over call edges, and a bounded generic's `value.text()` has none: an emitting impl behind it was invisible, so while both concrete spellings of the same call were refused, the generic one landed in the emitted JavaScript as a live `__emit_asset(...)` with no runtime binding. The check now follows the analyzer's recorded dispatch — the same refinement the context coverage check uses, extracted into a shared `dispatch_refine` module: a generic call is charged at the entry whose substitution selects an emitting impl, so the refusal is per call site and a clean impl of the same trait member through the same generic stays legal; an inherited trait default re-dispatched onto a concrete receiver narrows by the receiver's head; module-level initializer entries are boundaries like any other; and anything the compiler cannot resolve — a shared default body's `self` call — refuses every receiver, conservatively, because the alternative is the silent crash. Inside a `const` nothing changes: the interpreter makes the call, which is the whole styling shape. Pinned in both directions, with plants confirming the escape pins and the clean-admission pins each redden alone. (backlog B143)
+
+---
+
 ## v0.37.0 — 2026-08-27
 
 > **Upgrade if you are on v0.36.0 or earlier: this release fixes two

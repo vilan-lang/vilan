@@ -28490,14 +28490,19 @@ fn a_typed_declaration_value_is_checked_like_a_str_one() {
     );
 }
 
+// --- B143: the const-only check follows refined trait dispatch --------------
+// `check_const_only` propagates over call edges, and a bounded generic's
+// trait dispatch is not one — an `emit` inside a trait impl was invisible to
+// the check, compiled clean, and reached the emitted JS as a live
+// `__emit_asset` call with no runtime binding (a `ReferenceError` at run
+// time). The check now follows `dispatch_refine`'s edges: an `OnConstraint`
+// site is charged at the ENTRY whose recorded substitution selects an
+// R-member, so refusal is per call site and a clean instantiation of the same
+// generic stays admitted; every unresolvable shape (a receiver-less `OnType`,
+// an opaque binding) widens to the whole candidate list — over-refusal is the
+// deliberate fallback direction, an escape is not.
+
 #[test]
-#[ignore = "pre-existing: the const-only capability check follows call edges and \
-            cannot follow a bounded generic's trait dispatch, so an `emit` reached \
-            only through an impl escapes it and reaches the emitted JS as a live \
-            `__emit_asset` with no runtime binding. Un-ignore when const_eval's \
-            check_const_only learns generic dispatch. Found while designing \
-            `CssValue` (proposal/css-block.md §6); it is why the trait describes a \
-            value rather than emitting for it."]
 fn emit_reached_through_a_bounded_generic_is_const_only() {
     assert_fails_with(
         r##"
@@ -28524,6 +28529,374 @@ fn emit_reached_through_a_bounded_generic_is_const_only() {
         main();
         "##,
         "compile-time-only",
+    );
+}
+
+#[test]
+fn a_clean_impl_through_the_same_bounded_generic_stays_admitted() {
+    // The refinement, not a blanket union: a SIBLING impl of the same trait
+    // member reaches `emit`, and the clean instantiation still compiles and
+    // runs — the entry's recorded substitution selects `Plain::text`, which
+    // reaches nothing.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        struct Plain {
+            text_value: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        impl Plain with Emitter {
+            fun text(self): str {
+                self.text_value
+            }
+        }
+        fun render<V: Emitter>(value: V): str {
+            value.text()
+        }
+        fun main() {
+            print(render(Plain { text_value = "clean" }));
+        }
+        main();
+        "##,
+        "clean\n",
+    );
+}
+
+#[test]
+fn a_bounded_generic_is_charged_per_call_site_not_per_function() {
+    // One generic, two entries: the `Token` entry is refused at ITS call, the
+    // `Plain` entry draws no diagnostic at all. This is the property that
+    // separates the refinement from putting `render` itself in R.
+    let source = r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        struct Plain {
+            text_value: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        impl Plain with Emitter {
+            fun text(self): str {
+                self.text_value
+            }
+        }
+        fun render<V: Emitter>(value: V): str {
+            value.text()
+        }
+        fun main() {
+            print(render(Plain { text_value = "clean" }));
+            print(render(Token { css = "var(--p)" }));
+        }
+        main();
+        "##;
+    let diagnostics = failure_diagnostics(source);
+    let token_call = source.find("render(Token").unwrap();
+    let plain_call = source.find("render(Plain").unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, range)| message.contains("compile-time-only")
+                && range.start == token_call),
+        "no refusal at the Token entry: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|(_, range)| range.start != plain_call),
+        "the clean Plain entry must draw no diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_forwarding_wrapper_charges_the_entry_that_resolves_it() {
+    // The dispatch sits two generics deep; the constraint chases through the
+    // wrapper's own parameter to the entry that grounds it, and the refusal
+    // anchors at main's call — the outermost runtime crossing, exactly where
+    // the concrete spelling anchors.
+    let source = r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        fun render<V: Emitter>(value: V): str {
+            value.text()
+        }
+        fun wrapper<W: Emitter>(value: W): str {
+            render(value)
+        }
+        fun main() {
+            print(wrapper(Token { css = "var(--p)" }));
+        }
+        main();
+        "##;
+    let diagnostics = failure_diagnostics(source);
+    let entry = source.find("wrapper(Token").unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, range)| message.contains("compile-time-only") && range.start == entry),
+        "no refusal anchored at the resolving entry: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_second_generic_parameter_still_charges_its_entry() {
+    // Multi-parameter shape: the emitting type arrives through the SECOND
+    // constraint while the first stays clean — each parameter's binding
+    // resolves independently at the entry.
+    assert_fails_with(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        struct Plain {
+            text_value: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        impl Plain with Emitter {
+            fun text(self): str {
+                self.text_value
+            }
+        }
+        fun render_pair<A: Emitter, B: Emitter>(first: A, second: B): str {
+            first.text() + second.text()
+        }
+        fun main() {
+            print(render_pair(Plain { text_value = "clean" }, Token { css = "tok" }));
+        }
+        main();
+        "##,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_clean_two_parameter_generic_dispatch_stays_admitted() {
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        struct Plain {
+            text_value: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        impl Plain with Emitter {
+            fun text(self): str {
+                self.text_value
+            }
+        }
+        fun render_pair<A: Emitter, B: Emitter>(first: A, second: B): str {
+            first.text() + second.text()
+        }
+        fun main() {
+            print(render_pair(Plain { text_value = "a" }, Plain { text_value = "b" }));
+        }
+        main();
+        "##,
+        "ab\n",
+    );
+}
+
+#[test]
+fn a_generic_dispatch_reaching_emit_inside_const_stays_legal() {
+    // The whole styling shape: inside a `const` the interpreter makes the
+    // call, so the restriction lifts entirely — the refined edges anchor at
+    // runtime crossings and a `const` entry is not one.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        fun render<V: Emitter>(value: V): str {
+            value.text()
+        }
+        fun main() {
+            let styled = const render(Token { css = "var(--p)" });
+            print(styled);
+        }
+        main();
+        "##,
+        "var(--p)\n",
+    );
+}
+
+#[test]
+fn an_inherited_trait_default_reaching_emit_is_refused_on_a_concrete_receiver() {
+    // The `OnType` half of the same hole: the emitting body is the TRAIT's
+    // default, the impl inherits it, and the call re-dispatches per receiver
+    // — no call edge either. The receiver's head narrows to the inherited
+    // default, which is in R.
+    assert_fails_with(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        trait Report {
+            fun report(self): str {
+                emit("css", ".report{}");
+                "reported"
+            }
+        }
+        impl Token with Report {}
+        fun main() {
+            print(Token { css = "x" }.report());
+        }
+        main();
+        "##,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_module_level_initializer_entry_is_a_boundary_for_generic_dispatch() {
+    // Initializers own no graph node; the refined edge charges the entry as
+    // TopLevel and the refusal lands on the initializer's call, exactly where
+    // a direct call to an R-function lands.
+    assert_fails_with(
+        r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        fun render<V: Emitter>(value: V): str {
+            value.text()
+        }
+        let STYLED = render(Token { css = "top" });
+        fun main() {
+            print(STYLED);
+        }
+        main();
+        "##,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_shared_default_self_call_refuses_conservatively_even_for_a_clean_receiver() {
+    // DELIBERATE over-refusal, pinned as the chosen posture: `loud`'s body
+    // dispatches `self.text()` with no recorded receiver (`OnType(None)` — a
+    // shared default body), so the site cannot know which impl a given
+    // receiver selects and widens to every candidate. `Token::text` reaches
+    // `emit`, so `loud` joins R, and even `Plain`'s clean receiver is refused
+    // — the fallback direction is refusal, never escape, because the failure
+    // mode being fenced is a clean compile that throws `ReferenceError` at
+    // run time. If per-receiver refinement of shared default bodies ever
+    // ships, this pin is the one to revisit.
+    let source = r##"
+        import std::print;
+        import std::asset::emit;
+        struct Token {
+            css: str,
+        }
+        struct Plain {
+            text_value: str,
+        }
+        trait Emitter {
+            fun text(self): str;
+            fun loud(self): str {
+                self.text()
+            }
+        }
+        impl Token with Emitter {
+            fun text(self): str {
+                emit("css", ":root{--p:1rem}");
+                self.css
+            }
+        }
+        impl Plain with Emitter {
+            fun text(self): str {
+                self.text_value
+            }
+        }
+        fun main() {
+            print(Plain { text_value = "clean" }.loud());
+        }
+        main();
+        "##;
+    let diagnostics = failure_diagnostics(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("compile-time-only")),
+        "the conservative posture: a shared default whose self-dispatch could select an \
+         emitting impl is refused for EVERY receiver, clean ones included — over-refusal \
+         is the deliberate fallback, an emitted `ReferenceError` is not: {diagnostics:#?}"
     );
 }
 
