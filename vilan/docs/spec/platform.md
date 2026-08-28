@@ -77,18 +77,38 @@ The manifest declares what a directory builds. Sections:
   (paths in it resolve against the **project root**). Inheritance is
   per dependency and opt-in (nothing is inherited implicitly), and
   `project = true` combines with no other key.
-- **`[build]`**: `run`, plus codegen options: `preset` (`"debug"` |
-  `"release"`) and the per-feature overrides `indent`, `spaces`,
-  `debug-names`. The **codegen options** never change program semantics
-  (§7.6), only the emitted text; `run` is not one of them. `run` is a
-  command line (or a list of them) executed through the host shell
-  **before** each build (each `--watch` round included), in the
-  manifest's directory, in order; a non-zero exit fails the build. It
-  runs with the invoking user's privileges and environment — no
-  sandbox, no allowlist, no timeout, no prompt — and the implementation
-  prints each command before spawning it. Only the manifest being built
-  contributes hooks: a dependency's `[build] run` is never executed.
-  `vilan check` builds nothing and runs none.
+- **`[build]`**: `run` and `[[build.hook]]`, plus codegen options:
+  `preset` (`"debug"` | `"release"`) and the per-feature overrides
+  `indent`, `spaces`, `debug-names`. The **codegen options** never
+  change program semantics (§7.6), only the emitted text; the hooks are
+  not among them. `run` is a command line (or a list of them) executed
+  through the host shell **before** each build (each `--watch` round
+  included), in the manifest's directory, in order; a non-zero exit
+  fails the build. It runs with the invoking user's privileges and
+  environment — no sandbox, no allowlist, no timeout, no prompt — and
+  the implementation prints each command before spawning it. Only the
+  manifest being built contributes hooks: a dependency's are never
+  executed, whatever they declare, and a dependency that declares one
+  is reported rather than passed over in silence. `vilan check` builds
+  nothing and runs none.
+  `[[build.hook]]` is the same execution with a `name` and, optionally,
+  declared `inputs` and `outputs`: file or directory paths, relative to
+  the manifest, matched literally (there is no glob matching, and a
+  pattern is an error). Such a hook is **skipped** when it has a
+  recorded stamp and every declared input and output hashes, by
+  content, to the value recorded when it last ran, with the command
+  string unchanged; a declared input that was absent is recorded as
+  absent, so its appearance invalidates. A hook declaring neither
+  `inputs` nor `outputs` is never fresh and always runs. Skipping is a
+  cost optimization over code already trusted to run, never a security
+  property. Where the stamp is recorded, and its format, are
+  implementation-defined; that it is inside the project — so deleting
+  the build output directory re-runs every hook — is not.
+- **Dependency trust**: a dependency declaration takes `build-hooks`, a
+  boolean granting *that one dependency* permission to run its own
+  build hooks. Absent means no. Nothing runs a dependency's hooks in
+  this version, granted or not; the key records the grant so it is a
+  reviewable line before there is a mechanism behind it.
 - **`[macro]`**: the compile-time interpreter budget: `fuel` (steps
   per macro/const run) and `depth` (nested expansion), §9.3/§10.4.
 

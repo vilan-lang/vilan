@@ -76,6 +76,11 @@ enum Command {
         /// Rebuild whenever a watched `.vl` source file changes (Ctrl-C to stop).
         #[arg(long)]
         watch: bool,
+        /// Run every `[[build.hook]]` even if it is fresh. Freshness compares
+        /// the hook's declared `inputs` and `outputs`, so this is the escape
+        /// for a hook that reads something it did not declare.
+        #[arg(long)]
+        rerun_hooks: bool,
     },
     /// Type-check, reporting diagnostics without writing output. With no path,
     /// checks the project entry from the nearest `vilan.toml`.
@@ -227,13 +232,14 @@ fn run_cli() -> ExitCode {
             backend,
             debug,
             watch,
+            rerun_hooks,
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error(&message),
             Ok(_backend) => {
                 PRINT_CHUNKS.store(print_chunks, std::sync::atomic::Ordering::Relaxed);
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
-                    build_once(file.clone(), stdout, platform.clone(), debug)
+                    build_once(file.clone(), stdout, platform.clone(), debug, rerun_hooks)
                 })
             }
         },
@@ -293,9 +299,10 @@ fn build_once(
     stdout: bool,
     platform: Option<String>,
     debug: bool,
+    rerun_hooks: bool,
 ) -> ExitCode {
     with_project(file, |project| {
-        if let Err(code) = run_build_hooks(&project) {
+        if let Err(code) = run_build_hooks(&project, rerun_hooks) {
             return code;
         }
         match project {
@@ -316,17 +323,96 @@ fn build_once(
     })
 }
 
-/// Runs the project's `[build] run` hooks before it is built (A9), reporting
-/// and failing on the first that fails. `vilan check` deliberately doesn't call
+/// Runs the project's build hooks before it is built (A9), reporting and
+/// failing on the first that fails. `vilan check` deliberately doesn't call
 /// this: it produces no artifacts, so there is nothing for a hook to feed.
-fn run_build_hooks(project: &Project) -> Result<(), ExitCode> {
+///
+/// `rerun` is `vilan build --rerun-hooks`: run every declared hook whether or
+/// not it is fresh. It is the escape hatch `build-hooks.md` §3.2 names for the
+/// staleness predicate's one accepted unsoundness — a hook that reads a file it
+/// did not declare.
+fn run_build_hooks(project: &Project, rerun: bool) -> Result<(), ExitCode> {
     let Some(hooks) = project.hooks() else {
         return Ok(());
     };
-    hooks.run().map_err(|message| {
+    // Before the hooks that DO run, because it is a statement about the ones
+    // that do not — and because a first-party hook failing must not swallow it.
+    note_refused_dependency_hooks(project);
+    hooks.run(rerun).map_err(|message| {
         eprintln!("{} {message}", paint::error_prefix());
         ExitCode::FAILURE
     })
+}
+
+/// Says, once per build, that a dependency asked for build-time execution and
+/// did not get it — tier 2's boundary made audible (`build-trust.md` §3,
+/// `build-hooks.md` §4.3, ruled as Q4 on 2026-08-28).
+///
+/// Until now this was **silent**: `Project::hooks` reads the addressed
+/// manifest and no other, so a dependency's `[build] run` produced no output,
+/// no warning and no note (the paper's probe P5). "Absent means no" and "the
+/// toolchain never looked" are indistinguishable from the terminal, and the
+/// two readers that silence fails are the two who most need the line — one
+/// debugs the dependency, the shell and their PATH before suspecting a policy
+/// nobody told them about; the other never learns that a package in their
+/// graph is asking to run code on their machine.
+///
+/// A **note, never a warning**, in either case. §3's own words forbid making
+/// the refusal an error to be dismissed, and the opted-in case is not a
+/// mistake either — it is a correct, forward-looking declaration the toolchain
+/// simply does not honor yet. Neither line changes the exit code.
+fn note_refused_dependency_hooks(project: &Project) {
+    let mut reported: BTreeMap<PathBuf, vilan_core::manifest::DependencyHooks> = BTreeMap::new();
+    for unit in project.units() {
+        let Some(package_dir) = &unit.package_dir else {
+            continue;
+        };
+        // A resolution failure is the COMPILE's to report, with its own
+        // message and its own exit code. Reading it here is only how the
+        // question gets asked, so a failure means the question goes
+        // unanswered — never that the build says something twice.
+        //
+        // **Cache-only, deliberately**, where the compile that follows fetches:
+        // asking a question must not reorder the build. Under the fetching
+        // policy this pass would pull a git dependency over the network
+        // *before* the first-party hooks run, and a hook that prepares the
+        // environment a fetch needs would suddenly run too late. The cost is
+        // that a not-yet-fetched dependency goes unmentioned on the build that
+        // first fetches it, and is named on the next one — a note arriving one
+        // build later, against a hook that never ran either way.
+        let Ok((_, declarations)) = vilan_core::manifest::resolve_workspace_with_hook_report(
+            package_dir,
+            &git_deps_cached(),
+        ) else {
+            continue;
+        };
+        for declaration in declarations {
+            // Once per build, not once per member: two legs depending on the
+            // same package name it once, and a grant written by either one
+            // counts.
+            reported
+                .entry(vilan_core::util::canonical_path(&declaration.directory))
+                .and_modify(|recorded| recorded.opted_in |= declaration.opted_in)
+                .or_insert(declaration);
+        }
+    }
+    for declaration in reported.values() {
+        let line = if declaration.opted_in {
+            format!(
+                "note: `{}` declares build hooks and is opted in (`build-hooks = true`), \
+                 but no dependency's hooks run yet — this one did not.",
+                declaration.name
+            )
+        } else {
+            format!(
+                "note: `{}` declares build hooks; they did not run. A dependency's build \
+                 code needs `build-hooks = true` on its declaration — and even then, \
+                 nothing runs it yet.",
+                declaration.name
+            )
+        };
+        eprintln!("{}", paint::err(paint::Style::DIM, &line));
+    }
 }
 
 /// Type-checks the project once. A standalone `[library]` has no fixed platform, so
@@ -353,7 +439,10 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> E
 /// Node leg to run in a multi-node workspace (A15).
 fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> ExitCode {
     with_project(file, |project| {
-        if let Err(code) = run_build_hooks(&project) {
+        // `--rerun-hooks` is a `vilan build` flag: `run` is the dev loop, where
+        // the whole point of the staleness gate is that an expensive hook stops
+        // costing anything per round.
+        if let Err(code) = run_build_hooks(&project, false) {
             return code;
         }
         match project {
@@ -709,7 +798,7 @@ fn hmr_round(
     // (A9) — a Tailwind bridge regenerates its CSS from the sources that just
     // changed. A failing hook fails the round like a failing compile: report,
     // overlay, keep the last good build.
-    if let Err(message) = hooks.run() {
+    if let Err(message) = hooks.run(false) {
         eprintln!("{} {message}", paint::error_prefix());
         state.failed = true;
         channel.push("error", Some("build failed; see the terminal"));
@@ -1105,7 +1194,7 @@ fn build_and_spawn_run(
         }
     };
     // The plain (non-HMR) watch round builds too, so its hooks run first (A9).
-    if run_build_hooks(&project).is_err() {
+    if run_build_hooks(&project, false).is_err() {
         return None;
     }
     let launch =
@@ -1419,7 +1508,153 @@ struct BuildHooks {
     /// The manifest's directory — the hooks' working directory, so a command's
     /// relative paths mean what they say in the file that declares them.
     dir: PathBuf,
+    /// `[build] run` — the undeclared commands. They name no inputs and no
+    /// outputs, so they can never be fresh and run on every build, exactly as
+    /// they always have (`build-hooks.md` §3.1).
     commands: Vec<String>,
+    /// `[[build.hook]]` — the named hooks, which the staleness predicate may
+    /// skip. They run after every `run = [...]` command, in declaration order
+    /// (§2.3).
+    declared: Vec<DeclaredHook>,
+}
+
+/// One `[[build.hook]]`: a name, its commands, and what it says it reads and
+/// writes. The declaration is the whole of the staleness input — §3.2 accepts,
+/// in as many words, that a hook reading a file it did not declare can be
+/// skipped when it should have run, and records why that trade is the right
+/// one: the failure is a stale artifact rather than a wrong program (the
+/// compiler hashes what it actually read), `--rerun-hooks` is the escape, and
+/// the comparison is not against a sound system but against a hook that runs
+/// every single time.
+#[derive(Debug, Clone)]
+struct DeclaredHook {
+    name: String,
+    commands: Vec<String>,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+}
+
+impl DeclaredHook {
+    /// Whether this hook declared anything to be stale *about*. A hook with no
+    /// `inputs` and no `outputs` is **never fresh** (§3.1) — that is today's
+    /// behavior, and it is the default, so a manifest that adopts the table
+    /// form without declaring paths changes nothing but the reporting.
+    fn is_skippable(&self) -> bool {
+        !self.inputs.is_empty() || !self.outputs.is_empty()
+    }
+
+    /// This hook's freshness fingerprint as the tree stands right now, or
+    /// `None` when there is no honest answer — a declared **output** that is
+    /// missing (§3.1 requires every one to exist), or a path that could not be
+    /// read. `None` is never fresh and is never recorded, so the next build
+    /// re-runs the hook: the one direction in which being wrong is only
+    /// expensive.
+    ///
+    /// Content, never mtime. Not a new rule here: the watch loop's leg reuse
+    /// already decides by content and says why, and a hook stamp that trusted
+    /// mtime would reintroduce the bug the watcher refused.
+    fn fingerprint(&self, dir: &Path) -> Option<HookFingerprint> {
+        let mut inputs = BTreeMap::new();
+        for declared in &self.inputs {
+            // A declared input that is MISSING is recorded as missing rather
+            // than skipped, so its later *appearance* invalidates — the same
+            // way `asset::read`'s reader records its misses.
+            inputs.insert(declared.clone(), file_digest(&dir.join(declared))?);
+        }
+        let mut outputs = BTreeMap::new();
+        for declared in &self.outputs {
+            outputs.insert(declared.clone(), file_digest(&dir.join(declared))??);
+        }
+        Some(HookFingerprint {
+            command: digest_of(self.commands.join("\n").as_bytes()),
+            inputs,
+            outputs,
+        })
+    }
+}
+
+/// What a hook's stamp entry records, and what freshness compares (§3.1): the
+/// digest of the command string, of every declared input (`None` for one that
+/// was missing), and of every declared output. Equality of the whole structure
+/// is the predicate — so adding, removing or renaming a declared path is a
+/// change too, without a rule of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookFingerprint {
+    command: String,
+    inputs: BTreeMap<String, Option<String>>,
+    outputs: BTreeMap<String, String>,
+}
+
+/// The SHA-256 of `bytes`, lowercase hex — the same digest the release path
+/// already verifies downloads with, so the toolchain hashes with one thing.
+fn digest_of(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A declared path's content digest: `Some(None)` for a path that is not there,
+/// `Some(Some(hex))` for one that is, and `None` when it could not be read at
+/// all (a permission error, a broken link) — which is not a fingerprint and
+/// must not be recorded as one.
+///
+/// A **directory** digests as its whole tree: the sorted relative paths and
+/// their contents, so declaring `inputs = ["src/static"]` means what a reader
+/// expects it to mean. That is the shape the copy case (§2.1) needs, and it is
+/// why this design refuses glob patterns rather than growing a matcher.
+fn file_digest(path: &Path) -> Option<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
+    };
+    if metadata.is_dir() {
+        let mut entries = Vec::new();
+        collect_tree(path, Path::new(""), &mut entries)?;
+        entries.sort();
+        let mut joined = String::new();
+        for (relative, digest) in entries {
+            joined.push_str(&relative);
+            joined.push('\0');
+            joined.push_str(&digest);
+            joined.push('\n');
+        }
+        return Some(Some(digest_of(joined.as_bytes())));
+    }
+    Some(Some(digest_of(&fs::read(path).ok()?)))
+}
+
+/// Every file under `root`, as `(slash-joined relative path, digest)`. The
+/// separator is normalized to `/` so a stamp written on one platform describes
+/// the same tree on another. A symlink is digested as its *target path*, never
+/// followed: following one could walk out of the tree or into a cycle, and the
+/// link itself is the declared content.
+fn collect_tree(root: &Path, prefix: &Path, out: &mut Vec<(String, String)>) -> Option<()> {
+    let mut children: Vec<PathBuf> = fs::read_dir(root)
+        .ok()?
+        .map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Option<Vec<_>>>()?;
+    children.sort();
+    for child in children {
+        let name = child.file_name()?.to_string_lossy().into_owned();
+        let relative = prefix.join(&name);
+        let metadata = fs::symlink_metadata(&child).ok()?;
+        let key = relative.to_string_lossy().replace('\\', "/");
+        if metadata.is_symlink() {
+            let target = fs::read_link(&child).ok()?;
+            out.push((key, digest_of(target.to_string_lossy().as_bytes())));
+        } else if metadata.is_dir() {
+            collect_tree(&child, &relative, out)?;
+        } else {
+            out.push((key, digest_of(&fs::read(&child).ok()?)));
+        }
+    }
+    Some(())
 }
 
 impl BuildHooks {
@@ -1427,7 +1662,30 @@ impl BuildHooks {
         BuildHooks {
             dir: dir.to_path_buf(),
             commands: manifest.build_hooks().to_vec(),
+            declared: manifest
+                .declared_hooks()
+                .iter()
+                .map(|hook| DeclaredHook {
+                    // `validate` has already refused a hook with no name, so
+                    // the fallback is unreachable rather than a policy.
+                    name: hook.name.clone().unwrap_or_default(),
+                    commands: hook.commands().to_vec(),
+                    inputs: hook.inputs().to_vec(),
+                    outputs: hook.outputs().to_vec(),
+                })
+                .collect(),
         }
+    }
+
+    /// Where this project's hook stamps live: `dist/.build-hooks.json` in the
+    /// project's own directory (`build-hooks.md` §3.3, ruled by the owner as
+    /// Q2 on 2026-08-28). Not `~/.vilan/`: a machine-global cache keyed on a
+    /// project path is the thing nobody can reason about from a fresh clone,
+    /// and a stale one is unreachable to `rm -rf`. Here, `rm -rf dist` means
+    /// *rebuild everything, hooks included* — the sentence a user already
+    /// believes.
+    fn stamp_path(&self) -> PathBuf {
+        self.dir.join("dist").join(".build-hooks.json")
     }
 
     /// Runs every hook, in order, stopping at the first failure. Each command
@@ -1446,42 +1704,394 @@ impl BuildHooks {
     /// is the whole honesty budget: the terminal always names what ran. A
     /// first-run consent gate was proposed and **declined**; don't add one.
     /// Only the addressed manifest contributes hooks ([`Project::hooks`]) — a
-    /// dependency's `[build] run` is never reached, which is what keeps this
-    /// tier first-party. When dependencies *can* carry hooks (kolt.local 027's
-    /// `vilan install`, the registry), that is the other tier: it does not run
-    /// by default and needs an explicit per-dependency opt-in in the manifest.
-    fn run(&self) -> Result<(), String> {
+    /// dependency's are never reached, which is what keeps this tier
+    /// first-party. That is the other tier, and it is now spelled rather than
+    /// merely reserved: a dependency grants it with `build-hooks = true` on
+    /// its own declaration, absent means no, **nothing honors the grant yet**,
+    /// and [`note_refused_dependency_hooks`] says so out loud
+    /// (`build-hooks.md` §4.3, §8's S2; the owner's Q6 ruling of 2026-08-28).
+    ///
+    /// The `[build] run` commands above run unconditionally; the
+    /// `[[build.hook]]` tables below may be **skipped**, and the freshness
+    /// predicate is [`DeclaredHook::fingerprint`] compared against the stamp.
+    /// Freshness is a cost optimization over code that is already trusted to
+    /// run, and must never be described as a security property: if a hook is
+    /// dangerous, running it once is the whole of the damage.
+    fn run(&self, rerun: bool) -> Result<(), String> {
         for command in &self.commands {
-            eprintln!("{} {command}", paint::err(paint::Style::CYAN, "Running"));
-            let spawned = shell_command(command).current_dir(&self.dir).spawn();
-            let mut child = match spawned {
-                // The Job object costs nothing here and buys the Windows
-                // tree-kill: a hook that spawns a watcher of its own dies with
-                // this process instead of outliving the session.
-                Ok(child) => ManagedChild::adopt(child),
-                Err(error) => {
-                    return Err(format!(
-                        "`[build] run` could not start `{command}`: {error}"
-                    ));
+            self.spawn(command, "`[build] run`")?;
+        }
+        // A bare file has no manifest directory, so it has neither hooks nor a
+        // `dist/` to stamp in — and resolving `dist/.build-hooks.json` against
+        // an empty path would name one in the working directory.
+        if self.dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        // Deliberately NOT short-circuited on an empty declaration list: the
+        // stamp is a function of what the manifest says today, so a manifest
+        // that drops its last `[[build.hook]]` has to take the stamp with it.
+        // The write path removes rather than creates when there is nothing to
+        // record, so a `run = [...]`-only project still grows no `dist/`.
+        let stamp_path = self.stamp_path();
+        let mut recorded = read_hook_stamp(&stamp_path);
+        // Built from the CURRENT declarations only, so a hook removed from the
+        // manifest takes its entry with it and the file stays a function of
+        // what the manifest says today.
+        let mut next: BTreeMap<String, HookFingerprint> = BTreeMap::new();
+        for hook in &self.declared {
+            let label = format!("`[[build.hook]]` `{}`", hook.name);
+            let before = hook.fingerprint(&self.dir);
+            let fresh = !rerun
+                && hook.is_skippable()
+                && before.is_some()
+                && recorded.remove(&hook.name) == before;
+            if fresh {
+                eprintln!(
+                    "{}",
+                    paint::err(paint::Style::DIM, &format!("Fresh   {}", hook.name))
+                );
+                // A skipped hook keeps its stamp: skipping is not a reason to
+                // forget why it was skipped.
+                next.insert(
+                    hook.name.clone(),
+                    before.expect("fresh implies a fingerprint"),
+                );
+                continue;
+            }
+            for command in &hook.commands {
+                if let Err(error) = self.spawn(command, &label) {
+                    // A failing hook leaves NO stamp of its own, so the next
+                    // build re-runs it — but the hooks that already succeeded
+                    // this round keep theirs, because they did happen.
+                    write_hook_stamp(&stamp_path, &next);
+                    return Err(error);
                 }
+            }
+            // Fingerprinted AFTER the run: the outputs recorded are the ones
+            // the run actually produced. A hook that did not produce a
+            // declared output records nothing and re-runs next build.
+            if let Some(after) = hook.fingerprint(&self.dir) {
+                next.insert(hook.name.clone(), after);
+            }
+        }
+        write_hook_stamp(&stamp_path, &next);
+        Ok(())
+    }
+
+    /// Runs one command through the platform shell, echoing it first. `label`
+    /// is the manifest key at fault, so a failure names the form the user
+    /// actually wrote rather than always blaming `[build] run`.
+    fn spawn(&self, command: &str, label: &str) -> Result<(), String> {
+        eprintln!("{} {command}", paint::err(paint::Style::CYAN, "Running"));
+        let spawned = shell_command(command).current_dir(&self.dir).spawn();
+        let mut child = match spawned {
+            // The Job object costs nothing here and buys the Windows
+            // tree-kill: a hook that spawns a watcher of its own dies with
+            // this process instead of outliving the session.
+            Ok(child) => ManagedChild::adopt(child),
+            Err(error) => {
+                return Err(format!("{label} could not start `{command}`: {error}"));
+            }
+        };
+        match child.wait() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!(
+                "{label} command failed ({}): {command}",
+                status
+                    .code()
+                    .map(|code| format!("exit code {code}"))
+                    .unwrap_or_else(|| "killed by a signal".to_string())
+            )),
+            Err(error) => Err(format!("{label} lost `{command}`: {error}")),
+        }
+    }
+}
+
+/// The stamp's format version. It is a *string* so the reader below never has
+/// to understand JSON numbers; bump it when the recorded shape changes, and an
+/// older or newer stamp then reads as no stamp — every hook re-runs once,
+/// which is the only direction in which being wrong is merely expensive.
+const HOOK_STAMP_VERSION: &str = "1";
+
+/// Reads `dist/.build-hooks.json`. **Every failure reads as "no stamp"** — a
+/// missing file, a truncated write, a hand edit, a version this binary does not
+/// know. That is deliberate and it is what makes the whole feature safe to
+/// ship: the worst a corrupt stamp can do is make the build run the hooks it
+/// would have run before any of this existed.
+fn read_hook_stamp(path: &Path) -> BTreeMap<String, HookFingerprint> {
+    let mut stamps = BTreeMap::new();
+    let Ok(text) = fs::read_to_string(path) else {
+        return stamps;
+    };
+    let Some(Json::Object(root)) = parse_json(&text) else {
+        return stamps;
+    };
+    if root.get("version") != Some(&Json::Text(HOOK_STAMP_VERSION.to_string())) {
+        return stamps;
+    }
+    let Some(Json::Object(hooks)) = root.get("hooks") else {
+        return stamps;
+    };
+    for (name, entry) in hooks {
+        let Json::Object(entry) = entry else {
+            return BTreeMap::new();
+        };
+        let (Some(Json::Text(command)), Some(Json::Object(inputs)), Some(Json::Object(outputs))) = (
+            entry.get("command"),
+            entry.get("inputs"),
+            entry.get("outputs"),
+        ) else {
+            return BTreeMap::new();
+        };
+        let mut recorded_inputs = BTreeMap::new();
+        for (declared, digest) in inputs {
+            match digest {
+                Json::Text(digest) => {
+                    recorded_inputs.insert(declared.clone(), Some(digest.clone()))
+                }
+                Json::Null => recorded_inputs.insert(declared.clone(), None),
+                _ => return BTreeMap::new(),
             };
-            match child.wait() {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    return Err(format!(
-                        "`[build] run` command failed ({}): {command}",
-                        status
-                            .code()
-                            .map(|code| format!("exit code {code}"))
-                            .unwrap_or_else(|| "killed by a signal".to_string())
-                    ));
+        }
+        let mut recorded_outputs = BTreeMap::new();
+        for (declared, digest) in outputs {
+            let Json::Text(digest) = digest else {
+                return BTreeMap::new();
+            };
+            recorded_outputs.insert(declared.clone(), digest.clone());
+        }
+        stamps.insert(
+            name.clone(),
+            HookFingerprint {
+                command: command.clone(),
+                inputs: recorded_inputs,
+                outputs: recorded_outputs,
+            },
+        );
+    }
+    stamps
+}
+
+/// Writes the stamp back, or removes it when nothing is left to record — the
+/// same rule the asset-kind record follows, so the stamp never becomes its own
+/// stale artifact. A failure is reported and otherwise ignored: the stamp is
+/// bookkeeping for the NEXT build's cost, never this build's correctness.
+///
+/// `dist/` is created if it is not there. That happens only when the manifest
+/// declares a `[[build.hook]]`, so a project that writes only `run = [...]`
+/// grows no directory it did not have before.
+fn write_hook_stamp(path: &Path, stamps: &BTreeMap<String, HookFingerprint>) {
+    if stamps.is_empty() {
+        if path.is_file() {
+            if let Err(error) = fs::remove_file(path) {
+                eprintln!(
+                    "{} cannot remove the hook stamp {}: {error}",
+                    paint::warning_prefix(),
+                    path.display()
+                );
+            }
+        }
+        return;
+    }
+    let entries = stamps
+        .iter()
+        .map(|(name, fingerprint)| {
+            let inputs = fingerprint
+                .inputs
+                .iter()
+                .map(|(declared, digest)| {
+                    format!(
+                        "\t\t\t\t{}: {}",
+                        json_string(declared),
+                        digest
+                            .as_deref()
+                            .map_or_else(|| "null".to_string(), json_string)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",\n");
+            let outputs = fingerprint
+                .outputs
+                .iter()
+                .map(|(declared, digest)| {
+                    format!("\t\t\t\t{}: {}", json_string(declared), json_string(digest))
+                })
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!(
+                "\t\t{}: {{\n\t\t\t\"command\": {},\n\t\t\t\"inputs\": {},\n\t\t\t\"outputs\": {}\n\t\t}}",
+                json_string(name),
+                json_string(&fingerprint.command),
+                wrap_json_object(&inputs),
+                wrap_json_object(&outputs),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let text = format!(
+        "{{\n\t\"version\": {},\n\t\"hooks\": {{\n{entries}\n\t}}\n}}\n",
+        json_string(HOOK_STAMP_VERSION)
+    );
+    if let Some(directory) = path.parent() {
+        if let Err(error) = fs::create_dir_all(directory) {
+            eprintln!(
+                "{} cannot create {}: {error}",
+                paint::warning_prefix(),
+                directory.display()
+            );
+            return;
+        }
+    }
+    if let Err(error) = fs::write(path, text) {
+        eprintln!(
+            "{} cannot write the hook stamp {}: {error}",
+            paint::warning_prefix(),
+            path.display()
+        );
+    }
+}
+
+/// `{}` for an empty body, or the rows wrapped and closed at the entry's
+/// indentation.
+fn wrap_json_object(rows: &str) -> String {
+    if rows.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{\n{rows}\n\t\t\t}}")
+    }
+}
+
+/// The JSON subset the hook stamp is written in: objects, strings and `null`
+/// (arrays are parsed too, so the reader does not choke on a future field it
+/// merely has to ignore). Numbers and booleans are deliberately absent —
+/// nothing writes them, and refusing them costs a re-run rather than a wrong
+/// answer, which is why the stamp's own version is a string.
+///
+/// Hand-rolled rather than pulling a JSON crate into the `vilan` binary: the
+/// tree already hand-writes JSON here (`json_string`, whose comment records the
+/// same "correct, not clever" standard), the grammar this has to read is one
+/// this file also writes, and a parse failure has a safe answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Json {
+    Null,
+    Text(String),
+    Array(Vec<Json>),
+    Object(BTreeMap<String, Json>),
+}
+
+/// Parses `text` as one JSON value, requiring the whole input to be consumed.
+/// `None` for anything that does not parse.
+fn parse_json(text: &str) -> Option<Json> {
+    let mut characters = text.chars().peekable();
+    let value = parse_json_value(&mut characters, 0)?;
+    skip_json_whitespace(&mut characters);
+    characters.peek().is_none().then_some(value)
+}
+
+/// Guards the one unbounded thing in the grammar. A stamp is two levels deep;
+/// a file crafted to be a thousand is not a stamp, and recursing on it would
+/// be the parser's problem rather than the format's.
+const JSON_MAX_DEPTH: usize = 16;
+
+fn skip_json_whitespace(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while characters.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+}
+
+fn parse_json_value(
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    depth: usize,
+) -> Option<Json> {
+    if depth > JSON_MAX_DEPTH {
+        return None;
+    }
+    skip_json_whitespace(characters);
+    match characters.peek()? {
+        '"' => parse_json_string(characters).map(Json::Text),
+        'n' => {
+            for expected in "null".chars() {
+                if characters.next()? != expected {
+                    return None;
                 }
-                Err(error) => {
-                    return Err(format!("`[build] run` lost `{command}`: {error}"));
+            }
+            Some(Json::Null)
+        }
+        '[' => {
+            characters.next();
+            let mut items = Vec::new();
+            skip_json_whitespace(characters);
+            if characters.next_if_eq(&']').is_some() {
+                return Some(Json::Array(items));
+            }
+            loop {
+                items.push(parse_json_value(characters, depth + 1)?);
+                skip_json_whitespace(characters);
+                match characters.next()? {
+                    ',' => {}
+                    ']' => return Some(Json::Array(items)),
+                    _ => return None,
                 }
             }
         }
-        Ok(())
+        '{' => {
+            characters.next();
+            let mut fields = BTreeMap::new();
+            skip_json_whitespace(characters);
+            if characters.next_if_eq(&'}').is_some() {
+                return Some(Json::Object(fields));
+            }
+            loop {
+                skip_json_whitespace(characters);
+                let key = parse_json_string(characters)?;
+                skip_json_whitespace(characters);
+                if characters.next()? != ':' {
+                    return None;
+                }
+                fields.insert(key, parse_json_value(characters, depth + 1)?);
+                skip_json_whitespace(characters);
+                match characters.next()? {
+                    ',' => {}
+                    '}' => return Some(Json::Object(fields)),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// One JSON string literal, undoing exactly the escapes [`json_string`] emits
+/// plus the rest of the standard set, so a stamp written by this binary always
+/// round-trips.
+fn parse_json_string(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    if characters.next()? != '"' {
+        return None;
+    }
+    let mut text = String::new();
+    loop {
+        match characters.next()? {
+            '"' => return Some(text),
+            '\\' => match characters.next()? {
+                '"' => text.push('"'),
+                '\\' => text.push('\\'),
+                '/' => text.push('/'),
+                'b' => text.push('\u{8}'),
+                'f' => text.push('\u{c}'),
+                'n' => text.push('\n'),
+                'r' => text.push('\r'),
+                't' => text.push('\t'),
+                'u' => {
+                    let mut code = 0u32;
+                    for _ in 0..4 {
+                        code = code * 16 + characters.next()?.to_digit(16)?;
+                    }
+                    // A lone surrogate is not a character; the stamp never
+                    // writes one, so refusing is the right answer.
+                    text.push(char::from_u32(code)?);
+                }
+                _ => return None,
+            },
+            character => text.push(character),
+        }
     }
 }
 
@@ -1558,6 +2168,21 @@ impl Project {
             Project::Single { hooks, .. } | Project::Workspace { hooks, .. } => Some(hooks),
             Project::Library { .. } => None,
         }
+    }
+
+    /// The build units this project compiles — the one place that knows how to
+    /// see past the two workspace shapes, so a question asked of "every package
+    /// in this build" is asked once. A `[library]` addressed on its own is not
+    /// built, so it has none.
+    fn units(&self) -> impl Iterator<Item = &Unit> {
+        let (single, members) = match self {
+            Project::Single { unit, .. } => (Some(unit), [].as_slice()),
+            Project::Workspace { members, .. } => (None, members.as_slice()),
+            Project::Library { .. } => (None, [].as_slice()),
+        };
+        single
+            .into_iter()
+            .chain(members.iter().map(|(unit, _)| unit))
     }
 }
 
@@ -1942,6 +2567,15 @@ fn resolve_workspace(unit: &Unit) -> Result<Workspace, String> {
 fn git_deps() -> vilan_core::git_dep::GitDeps {
     vilan_core::git_dep::GitDeps::fetching(vilan_embedded_std::default_git_dep_root())
         .reporting(|message| eprintln!("{}", paint::err(paint::Style::DIM, message)))
+}
+
+/// The same cache root, read-only — for a resolution the build only *asks a
+/// question* of, and which must therefore not fetch. The compile's own
+/// resolution ([`git_deps`]) is what materializes a dependency; a reporting
+/// pass that fetched would move the network ahead of the `[build]` hooks and
+/// change what the build does in order to describe it.
+fn git_deps_cached() -> vilan_core::git_dep::GitDeps {
+    vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root())
 }
 
 /// Resolves a unit's workspace and compiles its entry for `platform`, returning the
