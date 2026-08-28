@@ -29,6 +29,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**Formatting is a gate now: `cargo fmt --all --check` runs in CI, on a pinned toolchain.** `cargo fmt` after every Rust change is this repository's own rule, and the tree had still drifted four hunks out of true — enough that three lanes in one cycle each hit the churn, reverted it, and reported it. The drift is reformatted away (whitespace-only, proven by comparing the whitespace-stripped byte streams before and after), and a `fmt` job in `ci.yml` holds the line from here, feeding the required `check` like every other leg. What makes the check *stable* is the new `rust-toolchain.toml`: rustfmt's default layout moves between stables, so the gate runs the exact pinned toolchain — the stable the tree builds with today — and a toolchain bump becomes a deliberate commit that lands the pin and its reformat together, rather than a surprise for whoever runs `cargo fmt` next. The suite and release-build legs deliberately keep proving the tree against *current* stable: they declare `RUSTUP_TOOLCHAIN=stable` explicitly, because the toolchain file would otherwise outrank the toolchain their action installs — and on the cross-compiling legs, silently drop their targets. (backlog N21; the clippy and cargo-audit legs the item also names are follow-up, not part of this change)
+
+---
+
 ## v0.37.0 — 2026-08-27
 
 > **Upgrade if you are on v0.36.0 or earlier: this release fixes two
