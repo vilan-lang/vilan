@@ -34,6 +34,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**`walk_type_node`'s catch-all no longer panics — an unclassified node in type position draws a diagnostic.** The analyzer's twelve-variant match on user-input-driven `Node` in type position ended in `unimplemented!` where every neighbouring path degrades into a diagnostic. Probed unreachable today — the type grammar's single door produces only the handled shapes, and B142's `Node::Error` depth stand-in never survives to the walk — so this is hardening, not a live crash: the next type-position variant now draws "this expression cannot be used as a type; write a type here — …" and the slot degrades to the non-cascading `Unresolved`, the same rule already-errored expressions follow, while a parse-recovery `Node::Error` stays silent because its diagnostic already exists at the parser. Pinned at unit level (the arm is unreachable through source), with the old panic planted to prove the pin reddens. (backlog B144)
+
+---
+
 ## v0.37.0 — 2026-08-27
 
 > **Upgrade if you are on v0.36.0 or earlier: this release fixes two
