@@ -347,9 +347,16 @@ fn keyword_hover_links_resolve_to_a_heading_in_the_book() {
 }
 
 /// The proof of [`mdbook_heading_ids`]: build the book with the real
-/// renderer and compare every heading id of every page. Needs `mdbook` on
-/// PATH (`cargo install mdbook`); run with
+/// renderer and compare every heading id of every page. Needs the PINNED
+/// mdBook on PATH (`cargo install mdbook --version 0.5.4 --locked` — the
+/// same v0.5.4 `scripts/regen-markdown-golden.py` refuses to run without
+/// and the pages repo fetches by sha256); run with
 /// `cargo test -p vilan-lsp book_sync -- --ignored`.
+///
+/// This test does not itself CHECK the version, which is a known gap: run
+/// under a different renderer its verdict is undefined in both directions
+/// — a false red against a correct parser, or a green blessing an anchor
+/// change the published site (built with v0.5.4) would not make.
 #[test]
 #[ignore = "needs `mdbook` on PATH: builds the book and compares every heading id to mdbook_heading_ids"]
 fn mdbook_heading_ids_match_the_built_book() {

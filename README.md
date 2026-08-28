@@ -166,7 +166,8 @@ From there, read the book. It starts with
 ends with the full-stack walkthrough:
 
 - **Rendered** (search + sidebar): https://vilan-lang.org/docs/
-  (or locally, `cargo install mdbook && mdbook serve vilan/docs`).
+  (or locally, `cargo install mdbook --version 0.5.4 --locked && mdbook serve
+  vilan/docs` — the renderer is pinned, see `vilan/docs/README.md`).
 - **As files**: start at [vilan/docs/README.md](vilan/docs/README.md).
 - **What changed**: the [changelog](CHANGELOG.md), one section per release.
 

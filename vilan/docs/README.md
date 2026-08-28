@@ -34,8 +34,16 @@ to and the one most readers want.
 The source is markdown in the
 [repository](https://github.com/vilan-lang/vilan) under `vilan/docs/`, so
 everything also reads fine as plain files. If you have the repository
-checked out, `cargo install mdbook` once and then `mdbook serve
-vilan/docs` gives you the same site locally with live reload.
+checked out, `cargo install mdbook --version 0.5.4 --locked` once and then
+`mdbook serve vilan/docs` gives you the same site locally with live reload.
+
+The version is a **pin, not a suggestion**: mdBook's heading-id algorithm
+decides every anchor on the published site, and three things in this tree are
+held to v0.5.4's answer — `std::markdown`'s parser (the book-wide anchor
+golden, `crates/vilan-core/tests/markdown_anchors.golden`), the language
+server's keyword-hover deep links (`book_sync.rs`), and the site build itself
+(the pages repo fetches the v0.5.4 release by sha256). A newer renderer can
+move an anchor, and a moved anchor is a broken link.
 
 ## Conventions
 
