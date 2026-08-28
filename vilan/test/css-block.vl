@@ -1,0 +1,123 @@
+import std::print;
+import std::style::{ Color, Length, Style, space, style };
+
+// The `css` block (proposal/css-block.md): CSS-shaped sugar over the `style()`
+// chain, lowered before analysis. There is no third emission channel and no
+// new emitter code — `Style::rule` is still the one chokepoint — so every
+// class name below is a content hash of the same slot key and declaration a
+// chain would have produced, and the golden beside this file is the proof in
+// bytes.
+
+// The one rule: an undotted `property: value;` is a declaration and lowers to
+// `.raw(property, value)`; a dotted `.name { … }` is a condition combinator
+// and lowers to `.name(style() … )`. The dot is the whole disambiguator, so
+// the grammar never consults `Style`'s method list.
+fun card(): Style {
+	css {
+		display: flex;
+		flex-direction: column;
+		gap: {space(4)};
+		padding: {space(4)};
+		background-color: {Color::gray(50)};
+		border-radius: {Length::px(8)};
+
+		// Written in the chain's canonical order — media before the
+		// pseudo-class — so the twin below needs no reordering to match it
+		// and `vilan fmt` is a no-op on both. (The block's own canonical
+		// order is S3; S2 prints it back verbatim.)
+		.md {
+			padding: {space(6)};
+		}
+
+		.hover {
+			background-color: {Color::gray(100)};
+		}
+	}
+}
+
+// The SAME style as a chain. Both spellings emit byte-identical CSS and
+// byte-identical JS — the block builds exactly the node shapes a written chain
+// parses to — so this pair adds no line to the golden at all: every class it
+// mints is one `card()` already minted.
+fun card_as_a_chain(): Style {
+	style()
+		.raw("display", "flex")
+		.raw("flex-direction", "column")
+		.raw("gap", space(4))
+		.raw("padding", space(4))
+		.raw("background-color", Color::gray(50))
+		.raw("border-radius", Length::px(8))
+		.md(style().raw("padding", space(6)))
+		.hover(style().raw("background-color", Color::gray(100)))
+}
+
+// Values are TOKEN RUNS and holes, not a typed grammar. A value that is
+// exactly one hole passes its expression through untouched (so a `Length` or a
+// `Color` keeps its `:root` line); anything else is the value's own source
+// slice as a `str`, holes interpolated — the same tree an i-string builds.
+fun values(): Style {
+	css {
+		// Dimensions already lex as one token, so CSS's own value shape was
+		// a vilan token before this feature existed.
+		line-height: 1.5;
+		width: 50%;
+		max-width: 37px;
+		// Commas, parens and quoted strings ride through verbatim.
+		grid-template-columns: repeat(3, 1fr);
+		background-image: url("tile.png");
+		// A mixed value interpolates: text, hole, text.
+		transition-duration: {150}ms;
+		// A custom property is span-adjacency, nothing new: `--brand-ink` is
+		// five tokens the parser joins and the desugar slices.
+		--brand-ink: {Color::gray(900)};
+	}
+}
+
+// The relation axis reads as nesting, and nesting order IS combinator order:
+// media outermost, then the relation, then the attribute, then the
+// pseudo-class. The shape that is legal is the shape that reads correctly.
+fun conditions(): Style {
+	css {
+		color: {Color::gray(900)};
+
+		.within("data-theme", "dark") {
+			color: {Color::gray(50)};
+
+			.hover {
+				color: {Color::gray(100)};
+			}
+		}
+
+		.children {
+			margin-top: {space(2)};
+		}
+
+		.divide {
+			margin-top: {space(4)};
+		}
+
+		.md {
+			.within("data-theme", "dark") {
+				.attribute("data-open", "true") {
+					.hover {
+						color: {Color::gray(50)};
+					}
+				}
+			}
+		}
+	}
+}
+
+fun main() {
+	let block = const card();
+	let chain = const card_as_a_chain();
+	// The two spellings resolve the SAME slots to the same classes.
+	print(block.class_list());
+	print(chain.class_list());
+	print(const values().class_list());
+	print(const conditions().class_list());
+	// A block is an ordinary expression: `+` still combines, and last wins.
+	let wider = const css { padding: {space(6)}; };
+	print((block + wider).class_list());
+}
+main();

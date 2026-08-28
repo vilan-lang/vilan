@@ -3313,6 +3313,7 @@ fn compile_to_js(
                 // before analysis (element-syntax.md §4, expression-lifting.md);
                 // the cached path gets both inside `parse_clean_cached`, so
                 // each runs exactly once here.
+                vilan_core::css::rewrite_items(&mut items, src.as_str());
                 vilan_core::elements::rewrite_items(&mut items, src.as_str());
                 vilan_core::lift::rewrite_items(&mut items);
                 (items, span)

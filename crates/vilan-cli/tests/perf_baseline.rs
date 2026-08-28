@@ -4,7 +4,7 @@
 //! benchmark framework, per the house's minimal-dependency taste:
 //!
 //! 1. **Phases.** The four pipeline stages called as the library entry points
-//!    they already are — `parsing::parse` (+ the `elements` / `lift` desugars),
+//!    they already are — `parsing::parse` (+ the `css` / `elements` / `lift` desugars),
 //!    `analyzer::analyze`, `post_analysis_passes`, `transformer::transform` —
 //!    the same seam `VILAN_PHASE_TIMING` marks. Each corpus is measured **cold**
 //!    and **warm**, and the difference is *forced*, never assumed: a cold
@@ -58,7 +58,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use vilan_core::{
-    BuildOptions, PackageSpec, Platform, Workspace, analyze, elements, lift, parsing,
+    BuildOptions, PackageSpec, Platform, Workspace, analyze, css, elements, lift, parsing,
     post_analysis_passes, transform,
 };
 
@@ -251,6 +251,7 @@ fn measure_phases(
     let parse_started = Instant::now();
     let (tree, _parse_errors) = parsing::parse(leaked);
     let mut root = tree.expect("the frontend always returns a tree");
+    css::rewrite_items(&mut root.0, leaked);
     elements::rewrite_items(&mut root.0, leaked);
     lift::rewrite_items(&mut root.0);
     let parse = parse_started.elapsed();

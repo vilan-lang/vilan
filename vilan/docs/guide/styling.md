@@ -37,6 +37,75 @@ fun main() {
   are emitted during the build.
 - `view.styled(card)` puts the style's classes on the element.
 
+## The `css` block
+
+The chain has a second spelling that reads like the CSS you already
+know. A `css { … }` block **is** a `Style` — it is sugar over the chain
+above, lowered before anything else in the compiler sees it — so the two
+forms mix freely in one file, one function, one expression, and both
+emit exactly the same stylesheet.
+
+```vilan,fragment
+let card = const css {
+	display: flex;
+	flex-direction: column;
+	gap: {space(2)};
+	padding: {space(4)};
+	background-color: {Color::gray(100)};
+
+	.hover {
+		background-color: {Color::gray(200)};
+	}
+};
+```
+
+**One rule, and the whole feature falls out of it.** An undotted
+`property: value;` is a declaration and becomes `.raw(property, value)`;
+a dotted `.name { … }` is a condition combinator and becomes
+`.name(style() … )`, with the block's own chain as its last argument.
+The dot is the only thing the grammar looks at, so every condition
+method works inside a block — `.hover`, `.md`, `.within("data-theme",
+"dark")`, `.children`, `.attribute("data-open", "true")` — including
+ones added later, and nesting order is combinator order: media outside,
+then the relation, then the attribute, then the pseudo-class.
+
+```vilan,fragment
+let panel = const css {
+	color: {Color::gray(900)};
+
+	.within("data-theme", "dark") {
+		color: {Color::gray(50)};
+	}
+
+	.children {
+		margin-top: {space(2)};
+	}
+};
+```
+
+Values are text and **holes**. Anything you can write in CSS rides
+through verbatim — `repeat(3, 1fr)`, `url("tile.png")`, `50%`, `1.5rem`
+— and `{expression}` drops a typed vilan value in. A value that is
+*exactly* one hole keeps its type, which is what carries a token's
+`:root` line onto the sheet, so write `gap: {space(4)};` rather than
+`gap: 1rem;` when you mean the scale.
+
+Four things the block does not do, each on purpose:
+
+- **The `;` is required**, including after the last declaration.
+- **`#` and `@` are not vilan characters.** A colour is
+  `{Color::hex("#663399")}` — which routes it through `Color`, so its
+  `:root` line travels with it — and a media query is `.md { … }`.
+  There are no at-rules; a declaration block under a selector of your
+  own is [`declare`](../std/style.md#declaration-blocks).
+- **`!important` is refused.** Merging a style is a record update, so a
+  later declaration on the same property already wins.
+- **A block is brace-initial**, like a struct literal, so a condition,
+  a `for … in` iterable and a `match` subject take one only in
+  parentheses: `if (css { … }).class_list() != "" { … }`.
+
+`vilan fmt` currently prints a block back exactly as you wrote it.
+
 ## Getting the stylesheet onto the page
 
 The build writes every emitted rule into a sidecar beside the bundle —

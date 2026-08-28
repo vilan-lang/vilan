@@ -56,10 +56,10 @@ use std::cell::Cell;
 
 use crate::lexing;
 use crate::node::{
-    BackingLiteral, BinaryOp, Closure, Convention, ElementBody, ElementChild, ElementHeadItem,
-    EnumVariant, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
-    ImportBranch, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField,
-    TupleBound,
+    BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration, CssItem, CssNested,
+    CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExternBinding, Func,
+    GenericArguments, GenericParameter, GenericParameters, If, ImportBranch, MatchLeg, Node,
+    NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -147,6 +147,28 @@ const CSS_IS_A_KEYWORD: &str = "`css` is a keyword: it begins a `css { … }` bl
      to spell it were renamed out of its way — `Length::css(…)` is now \
      `Length::raw(…)`, and the `.css` field of a `Length` or a `Color` is now \
      `.text`";
+
+/// The rule a `css` block in condition position breaks. Curated
+/// (diagnostics-standard.md B6): the block is brace-initial, so it occupies the
+/// same shape a struct literal does and is suppressed where one is — a `{`
+/// after a bare head in an `if`/`for`/`match` head is the BLOCK
+/// (proposal/css-block.md §4.2) — and the sanctioned spelling is the one a
+/// struct literal takes there.
+const CSS_BLOCK_IS_BRACE_INITIAL: &str = "a `css { … }` block is brace-initial, so it is suppressed in a condition, a `for … in` \
+     iterable and a `match` subject, exactly as a struct literal is — parenthesize it: \
+     `(css { … })`";
+
+/// What a `css` block's body admits — the dot rule, spelled for the reader
+/// (proposal/css-block.md §3).
+const CSS_ITEM_EXPECTED: &str =
+    "a declaration (`property: value;`) or a nested rule (`.name { … }`)";
+
+/// The rule `!important` breaks inside a `css` block. Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling — which is "nothing at all", because a later
+/// declaration on the same property already wins (proposal/css-block.md §10).
+const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
+     declaration on the same property already wins — remove it";
 
 /// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
 /// `resource` modifiers that lead one. An item is never part of an expression, so
@@ -941,13 +963,23 @@ impl<'a, 'src> Parser<'a, 'src> {
         // with the block (proposal/css-block.md §5.4, Q3), so a parse that
         // stopped there is almost always a pre-promotion spelling — a field, a
         // path segment or a binding that used to be named `css` — and the gap
-        // anchor would point at the `::` before it and ask for a `;`. A `css`
-        // BLOCK whose body is malformed fails INSIDE the body, which is farther
-        // on, so this arm never steals a body diagnostic.
+        // anchor would point at the `::` before it and ask for a `;`. A block
+        // whose body is malformed never reaches here: its body COMMITS, and
+        // reports at the item that broke.
         if matches!(self.tokens.get(position), Some((Token::Css, _))) {
+            // A `{` after the word means the author wrote a BLOCK, in a
+            // position that suppresses one: a `css` block is brace-initial, so
+            // condition mode excludes it exactly as it excludes a struct
+            // literal (§4.2), and the fix is a pair of parentheses, not a
+            // rename.
+            let block = matches!(self.tokens.get(position + 1), Some((Token::Ctrl('{'), _)));
             self.errors.push(ParseError {
                 span: self.token_span(position),
-                reason: ParseErrorReason::Rule(CSS_IS_A_KEYWORD),
+                reason: ParseErrorReason::Rule(if block {
+                    CSS_BLOCK_IS_BRACE_INITIAL
+                } else {
+                    CSS_IS_A_KEYWORD
+                }),
                 context,
                 hint: None,
             });
@@ -1691,6 +1723,11 @@ impl<'a, 'src> Parser<'a, 'src> {
     const ELEMENT_NESTING_REFUSAL: &'static str = "this element nests more than 500 levels deep, \
          which parsing refuses; lift inner elements into components of their own";
 
+    /// [`Parser::NESTING_REFUSAL`] for the `css` block grammar. The flattening
+    /// on offer is the one the model already has: styles combine with `+`.
+    const CSS_NESTING_REFUSAL: &'static str = "this `css` block nests more than 500 levels deep, \
+         which parsing refuses; name the inner blocks and combine them with `+`";
+
     /// One level deeper into a nested grammar, against
     /// [`Parser::NESTING_DEPTH_LIMIT`] — the parser's own depth bound (B142).
     /// `stand_in` builds what the grammar hands back for a subtree it refuses to
@@ -2339,11 +2376,28 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// The chain head: in expression mode a struct initializer is tried first, then
-    /// the plain atom; in condition mode (`no_struct`) only the plain atom, so a `{`
-    /// after a bare name is a block, not a literal (§H.1).
+    /// The chain head: in expression mode a `css { … }` block, then a struct
+    /// initializer, then the plain atom; in condition mode (`no_struct`) only the
+    /// plain atom, so a `{` after a bare name is a block, not a literal (§H.1).
+    ///
+    /// The `css` block sits HERE rather than in [`Parser::parse_atom`] for the
+    /// one reason the atom cannot serve it: an atom does not know `no_struct`,
+    /// and a `css` block is BRACE-INITIAL. Unlike an element — which begins with
+    /// `<`, a byte no expression could start, so `element-syntax.md` could
+    /// truthfully leave the condition mode untouched — `css { … }` occupies the
+    /// same shape a struct literal does, and is suppressed in condition position
+    /// for the same reason (proposal/css-block.md §4.2). Parenthesize to use one
+    /// there.
     fn parse_chain_head(&mut self, no_struct: bool) -> Option<Spanned<Node<'src>>> {
         if !no_struct {
+            // `css` + `{` — two tokens, and the second is what separates a
+            // block from a bare keyword. Without the `{` the word falls
+            // through to the atom, whose failure is the promotion's own
+            // refusal (a pre-promotion `.css` / `Length::css`), which is
+            // strictly the better message.
+            if self.peek_is(&Token::Css) && self.peek_at_is_ctrl(1, '{') {
+                return self.parse_css_atom();
+            }
             if let Some(initializer) = self.parse_struct_initializer() {
                 return Some(initializer);
             }
@@ -2619,6 +2673,324 @@ impl<'a, 'src> Parser<'a, 'src> {
             let operand = parser.parse_expression()?;
             Some((Node::Spread(Box::new(operand)), parser.span_from(start)))
         })
+    }
+
+    // --- `css` blocks (proposal/css-block.md §4.3) ---------------------------
+
+    /// A `css { … }` block in atom position. The body commits and recovers per
+    /// item, so this declines only on a block that never closes — the mid-edit
+    /// shape — and then falls back on the element grammar's delimiter recovery
+    /// so a half-typed block does not flatten the enclosing statement to an
+    /// error atom.
+    fn parse_css_atom(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        if let Some(block) = self.attempt(Self::parse_css_block) {
+            return Some(block);
+        }
+        self.bump();
+        if self
+            .recover_delimited("css block", '{', '}', &[('(', ')'), ('[', ']')])
+            .is_some()
+        {
+            return Some((Node::Error, self.span_from(start)));
+        }
+        self.position = start;
+        None
+    }
+
+    /// `css { item* }` — the whole block. The keyword is the atom's own token;
+    /// the body is [`Parser::parse_css_body`], shared with every nested rule.
+    fn parse_css_block(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        self.expect(&Token::Css)?;
+        let body = self.parse_css_body()?;
+        Some((Node::Css(body), self.span_from(start)))
+    }
+
+    /// `{ item* }` — a block's or a nested rule's body, in written order.
+    /// Nothing is reordered, deduped or merged here: what you write is the
+    /// chain you get (§3).
+    ///
+    /// The `{` COMMITS, so a broken item is reported and skipped rather than
+    /// declining — E49's lesson, taken from the element head: declining would
+    /// hand the whole block to `parse_css_atom`'s delimiter recovery, whose
+    /// last-resort message ("unclosed `{` in css block") is a claim about a
+    /// region that plainly closed, and would throw away the missing-`;` the
+    /// author actually needs to read. Recovering here also keeps the items
+    /// around the mistake in the tree, which is what lets the language server
+    /// still answer inside a block under construction. Only running out of
+    /// input declines.
+    fn parse_css_body(&mut self) -> Option<CssBody<'src>> {
+        let start = self.position;
+        self.expect_ctrl('{')?;
+        let mut items = Vec::new();
+        loop {
+            if self.eat_ctrl('}') {
+                break;
+            }
+            if self.at_end() {
+                self.note_expected("'}'");
+                return None;
+            }
+            let item_start = self.position;
+            let error_count = self.errors.len();
+            match self.parse_css_item() {
+                Some(item) => items.push(item),
+                None => {
+                    // Every committed item reports for itself (see
+                    // `parse_css_declaration`); this covers the one that
+                    // declined before committing to anything.
+                    if self.errors.len() == error_count {
+                        let context = self.context_stack.clone();
+                        self.emit_failure(item_start, vec![CSS_ITEM_EXPECTED.to_string()], context);
+                    }
+                    self.skip_broken_css_item();
+                }
+            }
+        }
+        Some(CssBody {
+            items,
+            braces: self.span_from(start),
+        })
+    }
+
+    /// Report a `css` item's own failure AT the token that stopped it, straight
+    /// into the error list.
+    ///
+    /// The farthest-failure channel cannot serve here, and the reason is worth
+    /// recording: a `css` block in statement position is parsed TWICE — once by
+    /// `parse_assignment`'s speculative place probe, once for real — and the
+    /// speculative pass leaves `farthest_failure` sitting at the enclosing
+    /// statement's own terminator note, which is farther along than anything
+    /// inside the block. The real pass's note then never advances past it, and
+    /// a missing `:` reads as a missing `;` from the line below. An item is a
+    /// COMMITTED production once its property name or its dot is read, so it
+    /// reports for itself; `parse_css_body` recovers around it, which is what
+    /// keeps the error on the surviving branch.
+    fn report_css_failure(&mut self, expected: &str) {
+        let context = self.context_stack.clone();
+        self.emit_failure(self.position, vec![expected.to_string()], context);
+    }
+
+    /// Skip past a broken item: to just after the next `;` at brace depth 0, or
+    /// to the `}` that closes the body (left unconsumed, for the loop to take).
+    fn skip_broken_css_item(&mut self) {
+        let mut depth = 0usize;
+        while !self.at_end() {
+            if self.peek_is_ctrl('{') {
+                depth += 1;
+            } else if self.peek_is_ctrl('}') {
+                if depth == 0 {
+                    return;
+                }
+                depth -= 1;
+            } else if depth == 0 && self.peek_is_ctrl(';') {
+                self.bump();
+                return;
+            }
+            self.bump();
+        }
+    }
+
+    /// One item. The dot decides, and decides alone (§3): dotted is a condition
+    /// combinator, undotted is a declaration — so the grammar never consults
+    /// `Style`'s method list, and a method added to `Style` can never change
+    /// what existing `css` means.
+    fn parse_css_item(&mut self) -> Option<CssItem<'src>> {
+        if self.peek_is_ctrl('.') {
+            return self.parse_css_nested().map(CssItem::Nested);
+        }
+        self.parse_css_declaration().map(CssItem::Declaration)
+    }
+
+    /// `.name { … }` / `.name(a, b) { … }` — a condition combinator. Only the
+    /// OUTERMOST block arrives through the atom; every nested rule re-enters
+    /// here directly, so the nesting needs its own depth level (B142).
+    fn parse_css_nested(&mut self) -> Option<CssNested<'src>> {
+        self.parse_nested_as(
+            Self::CSS_NESTING_REFUSAL,
+            |parser, _span| {
+                // Consume, for the reason every other stand-in does: the item
+                // loop pushes and continues, so a refusal that consumed nothing
+                // would spin.
+                parser.bump();
+                None
+            },
+            Self::parse_css_nested_inner,
+        )
+    }
+
+    /// [`Parser::parse_css_nested`]'s body, past the depth bound.
+    fn parse_css_nested_inner(&mut self) -> Option<CssNested<'src>> {
+        let start = self.position;
+        self.expect_ctrl('.')?;
+        let name_span = self.here_span();
+        let Some(name) = self.eat_ident() else {
+            self.report_css_failure(
+                "a condition combinator (`.hover { … }`, `.within(\"a\", \"b\") { … }`)",
+            );
+            return None;
+        };
+        // The head's arguments are ORDINARY vilan expressions, so
+        // `.within("data-theme", "dark") { … }` and `.pseudo("first-child") { … }`
+        // work with no special casing (§4.3).
+        let arguments = if self.peek_is_ctrl('(') {
+            self.parse_argument_list()?.0
+        } else {
+            Vec::new()
+        };
+        let head = self.span_from(start);
+        let body = self.parse_css_body()?;
+        Some(CssNested {
+            name: (name, name_span),
+            arguments,
+            body,
+            head,
+            span: self.span_from(start),
+        })
+    }
+
+    /// `property: value;` — one declaration. The `;` is REQUIRED, including
+    /// after the last: the formatter may never invent a token (the token
+    /// equality net), and a required terminator makes value scanning decidable
+    /// in one pass (§4.3).
+    fn parse_css_declaration(&mut self) -> Option<CssDeclaration<'src>> {
+        let start = self.position;
+        let Some(property) = self.parse_css_property() else {
+            self.report_css_failure(CSS_ITEM_EXPECTED);
+            return None;
+        };
+        if !self.peek_is_op(":") {
+            self.report_css_failure("':'");
+            return None;
+        }
+        self.bump();
+        let (value, value_span) = self.parse_css_value()?;
+        // The `;` reports as a MISSING TERMINATOR, gap-anchored: the mistake is
+        // in the whitespace before the next item, not on it, and the message is
+        // the one the language server already carries an "Insert `;`" quickfix
+        // for (`editing-dx.md` §4.4).
+        if !self.peek_is_ctrl(';') {
+            self.report_css_failure(TERMINATOR_EXPECTED);
+            return None;
+        }
+        self.bump();
+        Some(CssDeclaration {
+            property,
+            value,
+            value_span,
+            span: self.span_from(start),
+        })
+    }
+
+    /// A property name — `{ "-" } NAME { "-" NAME }`, span-adjacent, so
+    /// `flex-direction` is three tokens and `--color-ink` is five, and
+    /// `data - id` is a name and an operator rather than a name. Returns the
+    /// SPAN; the text is sliced at desugar, exactly as an element's tag is.
+    fn parse_css_property(&mut self) -> Option<Span> {
+        let start = self.position;
+        let start_offset = self.here_span().start;
+        // The custom-property prefix. `--` fuses into no operator token (it is
+        // not in `TWO_CHARACTER_OPERATORS`), so a leading run is one `-` per
+        // token, each adjacent to the next.
+        let mut cursor = start_offset;
+        while matches!(self.peek(), Some(Token::Op("-")))
+            && self.here_span().start == cursor
+            && self.tokens_adjacent(0, 1)
+        {
+            cursor = self.here_span().end;
+            self.bump();
+        }
+        // The name proper reuses the element grammar's hyphen joiner — the same
+        // span-adjacency rule, minted for `aria-label`.
+        let Some((name, _)) = self.parse_element_name() else {
+            self.position = start;
+            return None;
+        };
+        if name.start != cursor {
+            // A leading `-` that did not touch the name: not a property.
+            self.position = start;
+            return None;
+        }
+        Some((start_offset..name.end).into())
+    }
+
+    /// A declaration's value: everything up to the `;` at brace depth 0, as a
+    /// run of source-text pieces and `{expression}` holes. There is no typed
+    /// value grammar — typed values arrive through holes, which is where the
+    /// type system already lives (§10).
+    fn parse_css_value(&mut self) -> Option<(Vec<CssValuePiece<'src>>, Span)> {
+        let start_offset = self.here_span().start;
+        let mut pieces = Vec::new();
+        // The pieces PARTITION the value's span: a text run is the source
+        // between one hole's `}` and the next hole's `{`, whitespace included.
+        // Slicing from the first TOKEN of a run instead would drop the space a
+        // hole is separated by, and `calc({w} + 2px)` would render `calc(w+
+        // 2px)` — the i-string this lowers to keeps that space, so this must.
+        let mut text_from = start_offset;
+        let mut end = start_offset;
+        loop {
+            if self.at_end() || self.peek_is_ctrl(';') || self.peek_is_ctrl('}') {
+                break;
+            }
+            if self.peek_is_ctrl('{') {
+                let open = self.here_span();
+                if text_from < open.start {
+                    pieces.push(CssValuePiece::Text((text_from..open.start).into()));
+                }
+                self.bump();
+                let Some(expression) = self.parse_expression() else {
+                    self.report_css_failure("an expression");
+                    return None;
+                };
+                let close = self.here_span();
+                if !self.peek_is_ctrl('}') {
+                    self.report_css_failure("'}'");
+                    return None;
+                }
+                self.bump();
+                pieces.push(CssValuePiece::Hole(
+                    expression,
+                    (open.start..close.end).into(),
+                ));
+                text_from = close.end;
+                end = close.end;
+                continue;
+            }
+            // `!important` is refused permanently and with its fix: merge is a
+            // record update, so a `Style` that needed it would be a `Style` that
+            // had lost the property the whole model is for (§10). Consumed with
+            // its span excised from the value, so the declaration still lowers
+            // and the block raises one diagnostic rather than cascading.
+            if self.peek_is_op("!") && matches!(self.peek_at(1), Some(Token::Ident("important"))) {
+                let start = self.here_span().start;
+                let stop = self.tokens[self.position + 1].1.end;
+                self.errors.push(ParseError {
+                    span: (start..stop).into(),
+                    reason: ParseErrorReason::Rule(IMPORTANT_HAS_NO_PLACE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+                if text_from < start {
+                    pieces.push(CssValuePiece::Text((text_from..start).into()));
+                }
+                self.bump();
+                self.bump();
+                text_from = stop;
+                end = stop;
+                continue;
+            }
+            end = self.here_span().end;
+            self.bump();
+        }
+        if text_from < end {
+            pieces.push(CssValuePiece::Text((text_from..end).into()));
+        }
+        if pieces.is_empty() {
+            self.note_expected("a value");
+            return None;
+        }
+        Some((pieces, (start_offset..end).into()))
     }
 
     // --- Elements (proposal/element-syntax.md) -------------------------------

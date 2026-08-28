@@ -208,8 +208,8 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "css",
-        "Reserved for the `css { … }` block, CSS declarations that build a `Style`.",
-        "guide/styling.html#the-model",
+        "Begins a `css { … }` block: CSS declarations that build a `Style`.",
+        "guide/styling.html#the-css-block",
     ),
     (
         "import",

@@ -277,7 +277,11 @@ impl<'src> Lexer<'src> {
         self.errors.push(LexError {
             position: self.position,
             character,
-            rule: None,
+            rule: match character {
+                '#' => Some(HASH_IS_NOT_A_TOKEN),
+                '@' => Some(AT_IS_NOT_A_TOKEN),
+                _ => None,
+            },
         });
         self.position += character.len_utf8();
     }
@@ -870,6 +874,25 @@ enum IStringEnd {
     LineBreak(usize),
     Unterminated,
 }
+
+/// The rule a `#` breaks. It is in no charset, so it cannot lex — and lexing is
+/// context-free by spec (`lexical.md` §7) and by construction, so a `css` block
+/// cannot make it lex there either (proposal/css-block.md §4.1). The byte's one
+/// realistic use is a hex colour, and the refusal is the right one: the vilan
+/// spelling routes the value through `Color`, which carries its own `:root`
+/// line, where a raw hex would be the one spelling that can silently produce a
+/// literal outside the token system. Curated (diagnostics-standard.md B6).
+const HASH_IS_NOT_A_TOKEN: &str = "`#` is not a vilan token; in a `css` block a colour is a hole — \
+     `color: {Color::hex(\"#333\")};` — which routes it through the `Color` type that carries its \
+     own `:root` line";
+
+/// The rule an `@` breaks — [`HASH_IS_NOT_A_TOKEN`]'s twin, and the reason a
+/// `css` block has no at-rules of any kind (proposal/css-block.md §10). A media
+/// query's spelling is the breakpoint combinator; `@supports`, `@font-face` and
+/// `@keyframes` have none yet.
+const AT_IS_NOT_A_TOKEN: &str = "`@` is not a vilan token; a `css` block has no at-rules — a media query is a \
+     breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is \
+     `std::style::declare`";
 
 /// The rule an unescaped `}` in an interpolated string breaks. Curated
 /// (diagnostics-standard.md B6): the braces are the hole's, and the sanctioned
@@ -1599,13 +1622,43 @@ mod tests {
         let (tokens, errors) = tokenize("x@y");
         let bare: Vec<Token> = tokens.into_iter().map(|(token, _)| token).collect();
         assert_eq!(bare, vec![Token::Ident("x"), Token::Ident("y")]);
+        // `@` carries its curated rule (`css`'s at-rule refusal): the character
+        // is un-lexable wherever it appears, and the one place an author writes
+        // one on purpose is a `css` block.
         assert_eq!(
             errors,
             vec![LexError {
                 position: 1,
                 character: '@',
-                rule: None,
+                rule: Some(AT_IS_NOT_A_TOKEN),
             }]
+        );
+    }
+
+    // The two bytes a `css` block makes an author reach for
+    // (proposal/css-block.md §4.1/§7.3): neither lexes — lexing is
+    // context-free — so each carries a curated rule naming the vilan spelling,
+    // the `UNESCAPED_BRACE` precedent. Every OTHER un-lexable character keeps
+    // the generic "found X expected a token".
+    #[test]
+    fn the_css_bytes_carry_their_own_rules() {
+        let (_, hash) = tokenize("color: #333");
+        assert_eq!(
+            hash.iter().map(|error| error.rule).collect::<Vec<_>>(),
+            vec![Some(HASH_IS_NOT_A_TOKEN)]
+        );
+        assert!(HASH_IS_NOT_A_TOKEN.contains("Color::hex"), "names the fix");
+        let (_, at) = tokenize("@media");
+        assert_eq!(
+            at.iter().map(|error| error.rule).collect::<Vec<_>>(),
+            vec![Some(AT_IS_NOT_A_TOKEN)]
+        );
+        assert!(AT_IS_NOT_A_TOKEN.contains(".md"), "names the fix");
+        let (_, other) = tokenize("x\\y");
+        assert_eq!(
+            other.iter().map(|error| error.rule).collect::<Vec<_>>(),
+            vec![None],
+            "an unrelated un-lexable byte keeps the generic message"
         );
     }
 

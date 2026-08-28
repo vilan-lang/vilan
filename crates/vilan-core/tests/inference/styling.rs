@@ -4872,3 +4872,396 @@ fn the_renamed_length_surface_is_what_compiles_instead() {
     assert!(css.contains("{left:clamp(120px, 30%, 185px)}"), "{css}");
     assert!(css.contains("{width:var(--space-4)}"), "{css}");
 }
+
+// --- K2d: the `css` block, S2 (proposal/css-block.md §5, §11) -----------------
+// CSS-shaped sugar over the `style()` chain, lowered before analysis. There is
+// no third emission channel and no new emitter code — `Style::rule` is still
+// the one chokepoint — and the arc's HEADLINE GATE is what that buys: the same
+// program written as a block and as the chain it desugars to emits byte-
+// identical CSS and byte-identical JS. The tree-level half of the same claim
+// (the desugar builds the very node shapes a written chain parses to) is pinned
+// beside the pass, in `vilan_core::css`'s own tests.
+
+/// The exhibit, in both spellings. `{TWIN}` is substituted with the body so the
+/// two programs differ in NOTHING but the style's spelling — a stray difference
+/// elsewhere would make the byte comparison pass for the wrong reason.
+const TWIN_PROGRAM: &str = r#"
+    import std::print;
+    import std::style::{ Color, Length, Style, space, style };
+    fun card(): Style {
+        {TWIN}
+    }
+    fun main() {
+        print(const card().class_list());
+    }
+    main();
+"#;
+
+const TWIN_BLOCK: &str = r#"css {
+            display: flex;
+            gap: {space(4)};
+            padding: {space(4)};
+            background-color: {Color::gray(50)};
+            border-radius: {Length::px(8)};
+            grid-template-columns: repeat(3, 1fr);
+            .md {
+                padding: {space(6)};
+            }
+            .hover {
+                background-color: {Color::gray(100)};
+            }
+            .within("data-theme", "dark") {
+                color: {Color::gray(50)};
+            }
+            .children {
+                margin-top: {space(2)};
+            }
+        }"#;
+
+const TWIN_CHAIN: &str = r#"style()
+            .raw("display", "flex")
+            .raw("gap", space(4))
+            .raw("padding", space(4))
+            .raw("background-color", Color::gray(50))
+            .raw("border-radius", Length::px(8))
+            .raw("grid-template-columns", "repeat(3, 1fr)")
+            .md(style().raw("padding", space(6)))
+            .hover(style().raw("background-color", Color::gray(100)))
+            .within("data-theme", "dark", style().raw("color", Color::gray(50)))
+            .children(style().raw("margin-top", space(2)))"#;
+
+fn twin(spelling: &str) -> String {
+    TWIN_PROGRAM.replace("{TWIN}", spelling)
+}
+
+#[test]
+fn a_css_block_emits_byte_identical_css_against_the_chain() {
+    // Class names are content hashes of the slot key and the declaration, so
+    // this is not a weak check: a block that changed one declaration, one
+    // selector or one condition moves a hash and the sheets diverge.
+    let block = style_css(&twin(TWIN_BLOCK));
+    let chain = style_css(&twin(TWIN_CHAIN));
+    assert_eq!(block, chain);
+    // Non-vacuity: the sheet is real, not two empty strings.
+    assert!(block.contains("{display:flex}"), "{block}");
+    assert!(block.contains("@layer vilan{"), "{block}");
+    assert!(block.contains("[data-theme=\"dark\"] "), "{block}");
+    assert!(block.contains("@media (min-width: 768px)"), "{block}");
+}
+
+#[test]
+fn a_css_block_emits_byte_identical_js_against_the_chain() {
+    // The stylesheet is an over-approximation — every rule a chain builds is
+    // emitted, including one a later link overrides — so the CSS gate alone
+    // would not catch a lowering that resolved a different SLOT. The whole
+    // emitted module must match to the byte, and the const-folded class list
+    // in it is exactly which slots survived, in which order.
+    let block = compile(&twin(TWIN_BLOCK)).expect("the block spelling compiles");
+    let chain = compile(&twin(TWIN_CHAIN)).expect("the chain spelling compiles");
+    assert_eq!(block, chain);
+    // Non-vacuity: the fold really happened and really resolved ten slots.
+    let folded = block
+        .lines()
+        .find(|line| line.starts_with("console.log(\""))
+        .unwrap_or_else(|| panic!("no folded class list in:\n{block}"));
+    assert_eq!(
+        folded.split(' ').count(),
+        10,
+        "ten slots survive the merge: {folded}"
+    );
+}
+
+#[test]
+fn a_css_block_is_an_ordinary_expression() {
+    // It evaluates to a `Style`, so `+` still combines and last wins — the
+    // §1.2 requirement, that the form compose natively, met by lowering to the
+    // chain that composes natively.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space };
+        fun main() {
+            let base = const css { padding: {space(4)}; };
+            let wider = const css { padding: {space(6)}; };
+            print((base + wider).class_list());
+        }
+        main();
+        "#,
+        "s1ufvsw\n",
+    );
+}
+
+#[test]
+fn a_one_hole_value_carries_its_tokens_root_line() {
+    // The row that keeps a `Length` a `Length`. Reaching for `.text` instead
+    // would put a `var()` on the sheet that nothing declares — the hazard S1
+    // closed, restated for the block.
+    let css = style_css(
+        r#"
+        import std::style::{ style, space };
+        let _s = const css { gap: {space(4)}; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{gap:var(--space-4)}"), "{css}");
+    assert!(css.contains(":root{--space-4:1rem}"), "{css}");
+}
+
+#[test]
+fn a_hole_free_value_is_its_own_source_slice() {
+    // A value is a TOKEN RUN, not a typed grammar: commas, parens and a quoted
+    // string ride through verbatim, and the quotes survive the round trip into
+    // the emitted stylesheet.
+    let css = style_css(
+        r#"
+        import std::style::style;
+        let _s = const css {
+            grid-template-columns: repeat(3, 1fr);
+            background-image: url("tile.png");
+            width: 50%;
+            line-height: 1.5;
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        css.contains("{grid-template-columns:repeat(3, 1fr)}"),
+        "{css}"
+    );
+    assert!(
+        css.contains("{background-image:url(\"tile.png\")}"),
+        "{css}"
+    );
+    assert!(css.contains("{width:50%}"), "{css}");
+    assert!(css.contains("{line-height:1.5}"), "{css}");
+}
+
+#[test]
+fn a_custom_property_is_span_adjacency_and_nothing_new() {
+    let css = style_css(
+        r#"
+        import std::style::{ style, Color };
+        let _s = const css { --brand-ink: {Color::gray(900)}; };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("{--brand-ink:var(--gray-900)}"), "{css}");
+    assert!(css.contains(":root{--gray-900:#111827}"), "{css}");
+}
+
+#[test]
+fn nested_rules_lower_to_the_shipped_relation_combinators() {
+    // The desugar is NAME-BLIND: a dotted head is always a method call with
+    // the block's own chain last, so every combinator that exists works on the
+    // day it ships and the grammar never consults `Style`'s method list.
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Color };
+        let _s = const css {
+            .within("data-theme", "dark") {
+                color: {Color::gray(50)};
+            }
+            .children {
+                margin-top: {space(2)};
+            }
+            .divide {
+                margin-top: {space(4)};
+            }
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(css.contains("[data-theme=\"dark\"] "), "{css}");
+    assert!(
+        css.contains("@layer vilan{") && css.contains(" > *{"),
+        "{css}"
+    );
+    assert!(css.contains(" > :not(:first-child){"), "{css}");
+}
+
+#[test]
+fn nesting_order_is_combinator_order() {
+    // Textual nesting IS the outside-in call order the model requires —
+    // media, then the relation, then the attribute, then the pseudo-class —
+    // so the shape that is legal is the shape that reads correctly.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Color };
+        let _s = const css {
+            .md {
+                .within("data-theme", "dark") {
+                    .attribute("data-open", "true") {
+                        .hover {
+                            color: {Color::gray(50)};
+                        }
+                    }
+                }
+            }
+        };
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        css.contains("@media (min-width: 768px){[data-theme=\"dark\"] ")
+            && css.contains("[data-open=\"true\"]:hover{color:var(--gray-50)}"),
+        "{css}"
+    );
+}
+
+#[test]
+fn a_misnested_condition_still_refuses_by_name() {
+    // The block does not add validation — the const-time fences are the
+    // chain's own, reached through the same calls.
+    assert_run_panics(
+        r#"
+        import std::style::{ style, Color };
+        let _s = const css {
+            .hover {
+                .md {
+                    color: {Color::gray(50)};
+                }
+            }
+        };
+        fun main() {}
+        main();
+        "#,
+        "cannot wrap a media-conditioned style",
+    );
+}
+
+#[test]
+fn a_macro_generated_css_block_desugars() {
+    // The pass runs at every parse entry, `parse_generated` included, so a
+    // block emitted by a macro lowers like a hand-written one — the coverage
+    // elements had to have.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space };
+        fun main() {
+            let made = macro {
+                import macro_std::source;
+                source("const css { padding: {space(4)}; .hover { color: red; } }")
+            };
+            print(made.class_list());
+        }
+        main();
+        "#,
+        "s1ufvr2 sh41dyk\n",
+    );
+}
+
+#[test]
+fn a_css_block_inside_markup_desugars() {
+    // A block can sit in an element's head, so the css pass descends into
+    // markup itself — it runs BEFORE the element desugar, and a block left
+    // there would reach the analyzer as a `Node::Css`.
+    assert_compiles(
+        r#"
+        import std::ui::{ View, view };
+        import std::style::{ style, space };
+        fun main() {
+            let _card = <div .styled(const css { padding: {space(4)}; }) />;
+        }
+        "#,
+    );
+}
+
+// The refusals, each with its fix named (§4.1, §7.3, §10).
+
+#[test]
+fn a_bare_hex_colour_refuses_naming_the_hole() {
+    // `#` is in no charset, so this is a LEX error and cannot be anything
+    // else: lexing is context-free by spec and finishes before the parser
+    // exists. The mitigation is the `UNESCAPED_BRACE` precedent — a rule code
+    // on the `LexError` naming the vilan spelling.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let _s = const css { color: #333; };
+        fun main() {}
+        main();
+        "#,
+        "Color::hex",
+    );
+}
+
+#[test]
+fn an_at_rule_refuses_naming_the_breakpoint_combinator() {
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let _s = const css { @media (min-width: 768px) { color: red; } };
+        fun main() {}
+        main();
+        "#,
+        "a media query is a breakpoint combinator",
+    );
+}
+
+#[test]
+fn important_refuses_permanently_and_says_why() {
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let _s = const css { color: red !important; };
+        fun main() {}
+        main();
+        "#,
+        "`!important` has no place in a `css` block",
+    );
+}
+
+#[test]
+fn a_missing_terminator_asks_for_the_semicolon() {
+    // The `;` is required after every declaration, including the last: the
+    // formatter may never invent a token, and a required terminator makes
+    // value scanning decidable in one pass.
+    assert_fails_with(
+        r#"
+        import std::style::style;
+        let _s = const css { color: red };
+        fun main() {}
+        main();
+        "#,
+        "expected `;` to end this statement",
+    );
+}
+
+#[test]
+fn a_block_in_condition_position_asks_for_parentheses() {
+    // Unlike an element — which begins with a byte no expression could start
+    // — a `css` block is BRACE-INITIAL, so it is suppressed where a struct
+    // literal is, and takes the same escape hatch.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            if css { color: red; } { print("x"); }
+        }
+        main();
+        "#,
+        "parenthesize it",
+    );
+}
+
+#[test]
+fn a_parenthesized_block_is_admitted_in_a_condition() {
+    // The other half of the rule: the escape hatch works.
+    assert_compiles(
+        r#"
+        import std::print;
+        import std::style::style;
+        fun main() {
+            if (const css { color: red; }).class_list() != "" {
+                print("styled");
+            }
+        }
+        "#,
+    );
+}
