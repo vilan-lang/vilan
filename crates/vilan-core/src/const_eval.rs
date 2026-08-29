@@ -6,7 +6,7 @@
 //! enum), or an immutable binding whose initializer is a literal or another
 //! `const` expression.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -142,6 +142,72 @@ struct ProjectReader {
     /// Insertion-ordered and deduplicated by name, so bundling one file from
     /// two call sites registers it once.
     bundled: RefCell<Vec<BundleRow>>,
+    /// The `const` site currently evaluating — stamped onto every fact below.
+    /// [`State::evaluate_one`] sets it before each explicit run, so the reader
+    /// never has to know what a `const` expression is: it only has to know
+    /// which one it is answering.
+    site: Cell<(SourceId, Span)>,
+    /// What the channel did, with the site that did it — see [`ConstFact`].
+    facts: RefCell<Vec<ConstFact>>,
+}
+
+/// One thing the compile-time asset channel did, and the `const` site that did
+/// it — the PROVENANCE half of the record, beside the operational halves
+/// ([`Evaluated::assets`], [`Evaluated::bundled`], [`Evaluated::input_files`])
+/// that the build already writes, copies and watches by.
+///
+/// It exists for `vilan build --explain` (backlog G11), which answers "where
+/// did this `dist/` file come from?" — a question the compiler could always
+/// have answered and never wrote down. The operational halves cannot answer
+/// it: they are deduplicated, sorted and merged precisely so that a build's
+/// bytes are a function of the SET of contributions and never of call order,
+/// which is the property that erases who contributed. So the site rides
+/// beside them rather than inside them, and nothing about how a build is
+/// written changes.
+///
+/// The site is the enclosing **`const` expression**, not the `emit` /
+/// `bundle` / `read` call itself. That is the granularity the record has: the
+/// interpreter evaluates a LOWERED tree whose frames carry function names and
+/// no spans (its failure traces are names for that reason), so a per-call
+/// location would mean threading spans through the whole evaluator. The const
+/// site is what the const pass knows, it is what a const-eval diagnostic
+/// already points at, and it is the unit a reader edits — so it is what the
+/// record keeps and what `--explain` prints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstFact {
+    pub what: ConstFactKind,
+    /// The file the `const` site sits in, exactly as a diagnostic locates one.
+    pub source: SourceId,
+    /// The `const` expression's span. Deliberately NOT resolved to a line
+    /// here: that needs the source TEXT, which this pass does not hold and
+    /// which only a consumer that is actually going to print something should
+    /// pay to re-read.
+    pub span: Span,
+}
+
+/// What a [`ConstFact`] records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstFactKind {
+    /// `asset::emit` / `asset::emit_keyed` contributed to this kind — one
+    /// fact per (site, kind), however many lines the site emitted into it.
+    Emitted { kind: String },
+    /// `asset::bundle` / `asset::bundle_as` registered a copy: the resolved
+    /// file, the name its copy takes in the output directory, and the
+    /// spelling the program wrote.
+    Bundled {
+        source: PathBuf,
+        name: String,
+        function: &'static str,
+    },
+    /// A tracked build input the channel touched, and the call that touched
+    /// it: `asset::read`, `asset::read_dir`, `asset::read_dir_all`,
+    /// `asset::digest`, or the source read of an `asset::bundle`. Misses are
+    /// recorded like hits, for the reason [`Evaluated::input_files`] records
+    /// them: a file that was not there is still a dependency.
+    Read {
+        path: PathBuf,
+        function: &'static str,
+    },
 }
 
 /// One registered bundle: the file the build copies, the name its copy takes,
@@ -321,6 +387,31 @@ pub fn directory_input_hash(directory: &Path) -> Option<u64> {
     Some(crate::content_hash(&names.join("\n")))
 }
 
+impl ProjectReader {
+    /// Points every fact recorded from here on at `site` — the `const`
+    /// expression whose evaluation is about to run.
+    fn enter_site(&self, source: SourceId, span: Span) {
+        self.site.set((source, span));
+    }
+
+    /// Records one fact against the site currently evaluating.
+    fn record(&self, what: ConstFactKind) {
+        let (source, span) = self.site.get();
+        self.facts
+            .borrow_mut()
+            .push(ConstFact { what, source, span });
+    }
+
+    /// Records one touched file as a tracked build input — BOTH halves, in one
+    /// place, so the watched set and the provenance record cannot come to
+    /// disagree about what this build read. `hash` is `None` for a miss, which
+    /// is a dependency exactly as a hit is (its appearance must invalidate).
+    fn track(&self, path: PathBuf, hash: Option<u64>, function: &'static str) {
+        self.inputs.borrow_mut().push((path.clone(), hash));
+        self.record(ConstFactKind::Read { path, function });
+    }
+}
+
 impl interpreter::AssetReader for ProjectReader {
     fn read(&self, path: &str) -> Result<String, String> {
         // Relative, inside the root, by construction: the channel reads THE
@@ -332,13 +423,11 @@ impl interpreter::AssetReader for ProjectReader {
         let resolved = self.root.join(requested);
         match crate::util::read_source(&resolved) {
             Ok(text) => {
-                self.inputs
-                    .borrow_mut()
-                    .push((resolved, Some(crate::content_hash(&text))));
+                self.track(resolved, Some(crate::content_hash(&text)), "asset::read");
                 Ok(text)
             }
             Err(error) => {
-                self.inputs.borrow_mut().push((resolved.clone(), None));
+                self.track(resolved.clone(), None, "asset::read");
                 Err(format!(
                     "cannot read `{path}` (resolved against the package root to `{}`): {error}",
                     resolved.display()
@@ -382,12 +471,14 @@ impl interpreter::AssetReader for ProjectReader {
         // APPEARANCE must invalidate the compile that failed on it.
         match std::fs::read(&resolved) {
             Ok(bytes) => {
-                self.inputs
-                    .borrow_mut()
-                    .push((resolved.clone(), Some(crate::content_hash_bytes(&bytes))));
+                self.track(
+                    resolved.clone(),
+                    Some(crate::content_hash_bytes(&bytes)),
+                    function,
+                );
             }
             Err(error) => {
-                self.inputs.borrow_mut().push((resolved.clone(), None));
+                self.track(resolved.clone(), None, function);
                 return Err(format!(
                     "cannot bundle `{path}` (resolved against the package root to `{}`): {error}",
                     resolved.display()
@@ -410,12 +501,28 @@ impl interpreter::AssetReader for ProjectReader {
                     existing.requested
                 ));
             }
+            // The registry deduplicates a name and the PROVENANCE does not: a
+            // second site naming the same copy is a second answer to "where
+            // did this come from", and dropping it here would make `--explain`
+            // name whichever site happened to evaluate first.
+            drop(bundled);
+            self.record(ConstFactKind::Bundled {
+                source: resolved,
+                name: name.clone(),
+                function,
+            });
             return Ok(format!("/{name}"));
         }
         bundled.push(BundleRow {
-            source: resolved,
+            source: resolved.clone(),
             name: name.clone(),
             requested: path.to_string(),
+        });
+        drop(bundled);
+        self.record(ConstFactKind::Bundled {
+            source: resolved,
+            name: name.clone(),
+            function,
         });
         Ok(format!("/{name}"))
     }
@@ -455,9 +562,11 @@ impl interpreter::AssetReader for ProjectReader {
         let resolved = self.root.join(requested);
         match std::fs::read(&resolved) {
             Ok(bytes) => {
-                self.inputs
-                    .borrow_mut()
-                    .push((resolved, Some(crate::content_hash_bytes(&bytes))));
+                self.track(
+                    resolved,
+                    Some(crate::content_hash_bytes(&bytes)),
+                    "asset::digest",
+                );
                 let mut hasher = Sha256::new();
                 hasher.update(&bytes);
                 let hex: String = hasher
@@ -468,7 +577,7 @@ impl interpreter::AssetReader for ProjectReader {
                 Ok((hex, bytes.len() as u64))
             }
             Err(error) => {
-                self.inputs.borrow_mut().push((resolved.clone(), None));
+                self.track(resolved.clone(), None, "asset::digest");
                 Err(format!(
                     "cannot digest `{path}` (resolved against the package root to `{}`): {error}",
                     resolved.display()
@@ -498,16 +607,14 @@ impl ProjectReader {
         directory: &Path,
         prefix: &str,
         recursive: bool,
-        function: &str,
+        function: &'static str,
         spelled: &str,
         out: &mut Vec<String>,
     ) -> Result<(), String> {
         let entries = match sorted_entries(directory) {
             Ok(entries) => entries,
             Err(error) => {
-                self.inputs
-                    .borrow_mut()
-                    .push((directory.to_path_buf(), None));
+                self.track(directory.to_path_buf(), None, function);
                 return Err(format!(
                     "cannot list `{spelled}` with `{function}` (resolved against the \
                      package root to `{}`): {error}",
@@ -519,10 +626,11 @@ impl ProjectReader {
             .iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        self.inputs.borrow_mut().push((
+        self.track(
             directory.to_path_buf(),
             Some(crate::content_hash(&names.join("\n"))),
-        ));
+            function,
+        );
         for ((name, path), lossy) in entries.iter().zip(&names) {
             let Some(name) = name.to_str() else {
                 return Err(format!(
@@ -564,6 +672,10 @@ pub struct Evaluated {
     /// Every file `asset::bundle` registered, as (resolved source, the name it
     /// takes in the output directory) — the build OUTPUTS the caller copies.
     pub bundled: Vec<(PathBuf, String)>,
+    /// What the channel did and which `const` site did it, in the order the
+    /// program asked — the provenance `vilan build --explain` reads (G11).
+    /// Nothing consumes it during a build; see [`ConstFact`].
+    pub facts: Vec<ConstFact>,
 }
 
 pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) -> Evaluated {
@@ -582,12 +694,18 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
             errors: Vec::new(),
             input_files: Vec::new(),
             bundled: Vec::new(),
+            facts: Vec::new(),
         };
     }
     let reader = ProjectReader {
         root: program.pkg_root.clone(),
         inputs: RefCell::new(Vec::new()),
         bundled: RefCell::new(Vec::new()),
+        // Overwritten before any site runs. The entry's first byte is the
+        // honest stand-in for "no site has entered yet", and nothing records
+        // against it: every channel call happens inside an explicit `const`.
+        site: Cell::new((SourceId(0), Span::default())),
+        facts: RefCell::new(Vec::new()),
     };
     let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(program, Mode::Explicit, HashSet::default(), Some(&reader));
@@ -606,10 +724,12 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     let mut inputs = reader.inputs.into_inner();
     inputs.sort();
     inputs.dedup();
+    let facts = reader.facts.into_inner();
     Evaluated {
         results,
         assets,
         errors,
+        facts,
         input_files: inputs,
         // Insertion order, NOT sorted: a build log that names the files in the
         // order the program asked for them reads as the program does, and the
@@ -1384,6 +1504,15 @@ impl<'p, 'src> State<'p, 'src> {
             return match self.mode {
                 Mode::Explicit => {
                     let interp_started = crate::PhaseClock::now();
+                    // Every fact this run records belongs to THIS site, so it
+                    // is stamped once here rather than threaded through the
+                    // interpreter — which evaluates a lowered tree carrying
+                    // function names and no spans (its failure traces are
+                    // names for exactly that reason) and must not start
+                    // carrying them for a report.
+                    if let Some(recorder) = self.reader {
+                        recorder.enter_site(self.source_of(expr_id), self.span_of(expr_id));
+                    }
                     let reader = self
                         .reader
                         .map(|reader| reader as &dyn interpreter::AssetReader);
@@ -1393,6 +1522,20 @@ impl<'p, 'src> State<'p, 'src> {
                         Ok(outcome) => {
                             FUEL_MAX.with(|cell| cell.set(cell.get().max(outcome.fuel_used)));
                             self.results.insert(expr_id, outcome.value);
+                            // One fact per KIND this site contributed to, not
+                            // per line: the report names contributing sites,
+                            // and a site that emitted four hundred rules into
+                            // one sheet contributed to it once.
+                            if let Some(recorder) = self.reader {
+                                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                                for asset in &outcome.assets {
+                                    if seen.insert(&asset.kind) {
+                                        recorder.record(ConstFactKind::Emitted {
+                                            kind: asset.kind.clone(),
+                                        });
+                                    }
+                                }
+                            }
                             self.assets.extend(outcome.assets);
                             true
                         }

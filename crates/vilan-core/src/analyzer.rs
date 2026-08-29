@@ -33422,6 +33422,11 @@ pub struct Program<'src> {
     /// build OUTPUTS a build must copy so `dist/` is self-sufficient
     /// (kolt.local 029). Filled by `post_analysis_passes`.
     pub const_bundled_files: Vec<(PathBuf, String)>,
+    /// What the compile-time asset channel did, with the `const` site that did
+    /// it — the provenance `vilan build --explain` prints (backlog G11).
+    /// Nothing in a build consumes it; see `const_eval::ConstFact`. Filled by
+    /// `post_analysis_passes`.
+    pub const_facts: Vec<crate::const_eval::ConstFact>,
     /// The package root the entry resolved under — the base `asset::read`
     /// paths resolve against (never the process working directory), the same
     /// base module imports resolve under.
@@ -38762,6 +38767,7 @@ fn analyze_over_world<'src>(
         const_assets: Vec::new(),
         const_input_files: Vec::new(),
         const_bundled_files: Vec::new(),
+        const_facts: Vec::new(),
         pkg_root: pkg_root.to_path_buf(),
         context_new_fn_id,
         context_run_fn_id,

@@ -10,6 +10,7 @@ README.md h3 specification
 appendix/cli.md h1 the-cli
 appendix/cli.md h2 vilan-init-name
 appendix/cli.md h2 vilan-build-file
+appendix/cli.md h3 vilan-build---explain
 appendix/cli.md h2 vilan-check-file
 appendix/cli.md h2 vilan-run-file-args
 appendix/cli.md h2 vilan-fmt-paths
