@@ -6,10 +6,7 @@ function $b($c) {
 }
 let $a = undefined;
 const guard = [ "teardown" ];
-try {
-	console.log("body");
-	$a = 7;
-} finally {
-	$b(guard);
-}
+$b(guard);
+console.log("body");
+$a = 7;
 process.exit($a);

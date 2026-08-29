@@ -2817,11 +2817,11 @@ fn a_view_write_of_the_same_variant_width_drops_the_old_payload() {
     // The owned twin first, so the expectation below is its answer verbatim.
     assert_compiles_and_runs(
         &program(r#"holder = Holder::Full(Guard { label = "second" });"#),
-        "before\ndropped first\nafter\ndropped second\n",
+        "before\ndropped first\ndropped second\nafter\n",
     );
     assert_compiles_and_runs(
         &program("holder.swap();"),
-        "before\ndropped first\nafter\ndropped second\n",
+        "before\ndropped first\ndropped second\nafter\n",
     );
 }
 
@@ -2848,7 +2848,7 @@ fn a_view_write_that_grows_the_variant_drops_the_old_payload() {
             print("after");
         }
         "#,
-        "before\ndropped small\nafter\ndropped big\n",
+        "before\ndropped small\ndropped big\nafter\n",
     );
 }
 
@@ -2871,7 +2871,7 @@ fn a_view_write_to_a_struct_pointee_drops_the_old_value() {
             print("after");
         }
         "#,
-        "before\ndropped old\nafter\ndropped new\n",
+        "before\ndropped old\ndropped new\nafter\n",
     );
 }
 
@@ -3114,6 +3114,11 @@ fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
     // that the drop planner enrolled as an owner, and the emitted program
     // destroyed the borrowed value twice ("dropped held" printed twice, on the
     // struct pointee as well as the enum one).
+    //
+    // S3 (lifetimes.md §6) moved WHEN, never how many: the owner's last use is
+    // the loan itself and `v` is never read, so the extension rule extends
+    // nothing and the owner drops before "hi". Exactly one teardown, which is
+    // the whole of what this pin holds.
     let program = |declaration: &str, borrow: &str| {
         format!(
             r#"
@@ -3135,17 +3140,17 @@ fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
             r#"mut holder = Holder::Full(Guard { label = "held" });"#,
             "&mut holder",
         ),
-        "hi\ndropped held\n",
+        "dropped held\nhi\n",
     );
     assert_compiles_and_runs(
         &program(r#"mut guard = Guard { label = "held" };"#, "&mut guard"),
-        "hi\ndropped held\n",
+        "dropped held\nhi\n",
     );
     // The read-only loan too — `&` was never writable, but it was just as
     // wrongly enrolled as an owner.
     assert_compiles_and_runs(
         &program(r#"mut guard = Guard { label = "held" };"#, "&guard"),
-        "hi\ndropped held\n",
+        "dropped held\nhi\n",
     );
 }
 
@@ -3306,7 +3311,7 @@ fn an_element_write_drops_the_old_value() {
         }
         "#,
         ),
-        "before\ndropped one\nafter\ndropped two\ndropped three\n",
+        "before\ndropped one\ndropped two\ndropped three\nafter\n",
     );
 }
 
@@ -3401,8 +3406,8 @@ fn a_component_write_drops_in_the_owned_twins_order() {
         }
         "#,
     );
-    assert_compiles_and_runs(component, "before\ndropped one\nafter\ndropped two\n");
-    assert_compiles_and_runs(binding, "before\ndropped one\nafter\ndropped two\n");
+    assert_compiles_and_runs(component, "before\ndropped one\ndropped two\nafter\n");
+    assert_compiles_and_runs(binding, "before\ndropped one\ndropped two\nafter\n");
 }
 
 #[test]

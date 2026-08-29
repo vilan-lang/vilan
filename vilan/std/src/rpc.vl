@@ -328,7 +328,7 @@ external fun new_web_socket(url: str): WebSocket;
 [extern("__hmr_active")]
 external fun hmr_active(): bool;
 
-[extern("__hmr_register_teardown")]
+[extern("__hmr_register_teardown", retains)]
 external fun hmr_register_teardown(cleanup: || void): void;
 
 external struct SocketMessage;
@@ -365,14 +365,14 @@ impl WebSocket {
 	[extern(set, "binaryType")]
 	external fun set_binary_type(self, kind: str);
 
-	[extern(set, "onmessage")]
+	[extern(set, "onmessage", retains)]
 	external fun set_on_message(self, handler: |SocketMessage| void);
 
 	/// Failure events — a dial that never opens, or a live connection dropping.
-	[extern(set, "onclose")]
+	[extern(set, "onclose", retains)]
 	external fun set_on_close(self, handler: || void);
 
-	[extern(set, "onerror")]
+	[extern(set, "onerror", retains)]
 	external fun set_on_error(self, handler: || void);
 
 	[extern(method, "close")]

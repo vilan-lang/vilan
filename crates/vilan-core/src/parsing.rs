@@ -4226,7 +4226,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_function(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let deprecated = self.parse_deprecated_attribute();
-        let extern_binding = self.parse_extern_attribute();
+        let (extern_binding, extern_retains) = match self.parse_extern_attribute() {
+            Some((binding, retains)) => (Some(binding), retains),
+            None => (None, false),
+        };
         let must_use = self.eat_marker_attribute("must_use");
         let rpc = self.eat_marker_attribute("rpc");
         let trait_only = self.eat_marker_attribute("trait_only");
@@ -4306,6 +4309,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 external,
                 deprecated,
                 extern_binding,
+                extern_retains,
                 must_use,
                 rpc,
                 trait_only,
@@ -4981,7 +4985,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// or `None` when no extern attribute leads. Args are bare words or quoted
     /// strings, interpreted by [`extern_binding_from_args`] (a malformed attribute
     /// lowers to an empty global symbol, exactly as the oracle does).
-    fn parse_extern_attribute(&mut self) -> Option<ExternBinding<'src>> {
+    fn parse_extern_attribute(&mut self) -> Option<(ExternBinding<'src>, bool)> {
         self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("extern")) {
@@ -4993,7 +4997,21 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parser.comma_list(Self::parse_extern_arg, |parser| parser.peek_is_ctrl(')'))?;
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
-            Some(extern_binding_from_args(&args))
+            // `retains` is a FLAG, not a form: stripped before the positional
+            // match so it composes with every binding shape
+            // (`[extern(method, "addEventListener", retains)]`) instead of
+            // needing an arm per combination. Recognized in TRAILING position
+            // only — the one place a flag can sit without displacing a form
+            // word, and what lets the formatter reprint it exactly where it was
+            // written. Anywhere else it is an unknown argument, and the
+            // attribute lowers to the empty global symbol exactly as every
+            // other malformed extern attribute does.
+            let mut binding = args;
+            let retains = matches!(binding.last(), Some(ExternArg::Word("retains")));
+            if retains {
+                binding.pop();
+            }
+            Some((extern_binding_from_args(&binding), retains))
         })
     }
 

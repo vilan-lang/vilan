@@ -2661,7 +2661,7 @@ impl<'src> Printer<'src> {
     /// body block, or a `;` for a signature with no body.
     fn print_func(&mut self, func: &Func<'src>) {
         if let Some(binding) = &func.extern_binding {
-            self.print_extern_attribute(binding);
+            self.print_extern_attribute(binding, func.extern_retains);
             self.line();
         }
         if func.must_use {
@@ -2718,7 +2718,7 @@ impl<'src> Printer<'src> {
     }
 
     /// Prints a `[extern(..)]` host-binding attribute in its canonical form.
-    fn print_extern_attribute(&mut self, binding: &ExternBinding<'src>) {
+    fn print_extern_attribute(&mut self, binding: &ExternBinding<'src>, retains: bool) {
         self.out.push_str("[extern(");
         match binding {
             ExternBinding::Function {
@@ -2768,6 +2768,11 @@ impl<'src> Printer<'src> {
                 self.out.push_str(symbol);
                 self.out.push('"');
             }
+        }
+        // The retention flag reprints LAST, whatever position it was written in
+        // — one canonical form for the round trip.
+        if retains {
+            self.out.push_str(", retains");
         }
         self.out.push_str(")]");
     }
@@ -4791,6 +4796,28 @@ mod reformats {
         assert_eq!(format(source), expected);
         // The output must be a fixed point — formatting it again is a no-op.
         assert_eq!(format(expected), expected, "output is not idempotent");
+    }
+
+    // The extern retention flag (`lifetimes.md` §6.4) round-trips. It is
+    // recognized in TRAILING position only — the one place a flag can sit
+    // without displacing a form word — so the printer reprints it exactly where
+    // it was written and the round trip is byte-exact for every binding shape
+    // it composes with.
+    #[test]
+    fn the_extern_retention_flag_round_trips_last() {
+        assert_formats(
+            "[extern(\"queueMicrotask\", retains)]\nexternal fun queue(callback: || void);\n",
+            "[extern(\"queueMicrotask\", retains)]\nexternal fun queue(callback: || void);\n",
+        );
+        assert_formats(
+            "[extern(method, \"addEventListener\", retains)]\nexternal fun on(self, event: str, handler: || void): void;\n",
+            "[extern(method, \"addEventListener\", retains)]\nexternal fun on(self, event: str, handler: || void): void;\n",
+        );
+        // An unmarked extern is untouched.
+        assert_formats(
+            "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
+            "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
+        );
     }
 
     // `async`/`sync` closure-type markers round-trip (they used to BAIL,

@@ -226,8 +226,8 @@
        "match": "\\b(derive|service|extern|must_use|rpc|trait_only|doc|expose|platform|deprecated)\\b"
       },
       {
-       "comment": "The `method`/`get`/`set` words inside `[extern(..)]`.",
-       "match": "\\b(method|get|set)\\b",
+       "comment": "The form words and the `retains` flag inside `[extern(..)]`.",
+       "match": "\\b(method|get|set|new|retains)\\b",
        "name": "support.constant.attribute.vilan"
       },
       {

@@ -627,7 +627,8 @@ information.
 
 A `Watcher` moves rather than copies, a closure cannot capture one, and
 `List`/`Map`/`Set` cannot hold one — `File`'s rules exactly. Its
-destructor stops the poll at scope end, `drop(watcher)` is the early form,
+destructor stops the poll after its last use, `drop(watcher)` is the
+explicit form,
 and there is no `stop()` to forget or to call twice. That destructor is
 load-bearing rather than tidy: a pending host timer keeps the process
 alive, so **a watcher that is never dropped is a program that never

@@ -32,15 +32,12 @@ function take_resource() {
 	let opt = [ 0, [ "taken" ] ];
 	try {
 		const moved = __option_take(opt);
-		try {
-			console.log("take-res in-block");
-		} finally {
-			$f(moved);
-		}
-		console.log("take-res after-block");
+		$f(moved);
+		console.log("take-res in-block");
 	} finally {
 		$f(opt);
 	}
+	console.log("take-res after-block");
 }
 function conditional_teardown() {
 	let full = [ 0, [ "cond" ] ];
@@ -61,30 +58,30 @@ function conditional_teardown() {
 			$k = undefined;
 		}
 		$k;
-		console.log("cond after-some");
-		let empty = [ 1 ];
-		try {
-			const $l = __option_take(empty);
-			let $m = null;
-			if ($l[0] === 0) {
-				let c2 = $l[1];
-				try {
-					$h(c2);
-					$m = c2 = null;
-				} finally {
-					if (c2 !== null) {
-						$h(c2);
-					}
-				}
-			} else {
-				$m = console.log("cond none-arm");
-			}
-			return $m;
-		} finally {
-			$f(empty);
-		}
 	} finally {
 		$f(full);
+	}
+	console.log("cond after-some");
+	let empty = [ 1 ];
+	try {
+		const $l = __option_take(empty);
+		let $m = null;
+		if ($l[0] === 0) {
+			let c2 = $l[1];
+			try {
+				$h(c2);
+				$m = c2 = null;
+			} finally {
+				if (c2 !== null) {
+					$h(c2);
+				}
+			}
+		} else {
+			$m = console.log("cond none-arm");
+		}
+		return $m;
+	} finally {
+		$f(empty);
 	}
 }
 function sink(r) {
@@ -185,10 +182,10 @@ function destructure_drop() {
 	const n = $v[1];
 	try {
 		console.log("destructure " + r[0] + " " + n);
-		console.log("destructure after");
 	} finally {
 		$h(r);
 	}
+	console.log("destructure after");
 }
 function $a(self, fallback) {
 	const $b = self;
@@ -226,35 +223,35 @@ try {
 	console.log("passthrough returned");
 	$h(back);
 	back = null;
-	console.log("--");
-	$h(passthrough([ "unbound" ]));
-	console.log("unbound dropped");
-	console.log("--");
-	match_move();
-	console.log("--");
-	match_leg_drop();
-	console.log("--");
-	match_leg_pair();
-	console.log("--");
-	match_leg_guard("kept");
-	console.log("--");
-	match_leg_guard("other");
-	console.log("--");
-	destructure_drop();
-	console.log("--");
-	let db = [ "immediate" ];
-	try {
-		console.log("before drop");
-		$h(db);
-		db = null;
-		console.log("after drop");
-	} finally {
-		if (db !== null) {
-			$h(db);
-		}
-	}
 } finally {
 	if (back !== null) {
 		$h(back);
 	}
 }
+console.log("--");
+$h(passthrough([ "unbound" ]));
+console.log("unbound dropped");
+console.log("--");
+match_move();
+console.log("--");
+match_leg_drop();
+console.log("--");
+match_leg_pair();
+console.log("--");
+match_leg_guard("kept");
+console.log("--");
+match_leg_guard("other");
+console.log("--");
+destructure_drop();
+console.log("--");
+let db = [ "immediate" ];
+try {
+	console.log("before drop");
+	$h(db);
+	db = null;
+} finally {
+	if (db !== null) {
+		$h(db);
+	}
+}
+console.log("after drop");

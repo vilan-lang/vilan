@@ -19,12 +19,12 @@ external fun hmr_active(): bool;
 
 /// Join the current swap's teardown list (a shim global). Runs, and is cleared,
 /// once before the next bundle evaluates.
-[extern("__hmr_register_teardown")]
+[extern("__hmr_register_teardown", retains)]
 external fun hmr_register_teardown(cleanup: || void): void;
 
 /// Stash `value` under `key` for the next swap to recover (a shim global; the
 /// shim namespaces the key so it can never collide with a binding key).
-[extern("__hmr_stash")]
+[extern("__hmr_stash", retains)]
 external fun hmr_stash<T>(key: str, value: T): void;
 
 /// Recover a stashed value. The shim returns the `Option` runtime encoding

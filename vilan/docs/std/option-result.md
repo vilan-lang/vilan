@@ -72,7 +72,7 @@ the value out of the `Option`, so they must own it (`docs/spec/memory.md` R3).
 For plain data that is invisible — `own` copies, and `opt.unwrap()` leaves
 `opt` perfectly readable. For an `Option<SomeResource>` it is the affine rule
 biting: `opt.unwrap()` *moves* `opt`, a later use of `opt` is a
-use-after-move error, and `opt` is not torn down at scope end (the payload
+use-after-move error, and `opt` is not torn down at all (the payload
 you now hold is). The pure predicates — `is_some`, `is_none` — keep a
 borrowing `self` and never consume, so they stay free on a resource.
 

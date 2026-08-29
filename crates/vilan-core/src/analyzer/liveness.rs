@@ -58,22 +58,87 @@
 //! net — a traversal gap becomes a refusal, never a wrong answer); or when it
 //! is loaned somewhere the loan cannot be followed (below). Opacity is applied
 //! at query time, so one pass suffices.
+//!
+//! **S3's second answer: [`DropExtent`].** Disposal asks a coarser question
+//! than elision does — not "is THIS read the last one?" but "which STATEMENT of
+//! the declaring scope holds the last read?", because a `finally` region has to
+//! end at a statement boundary (`temporary-drop.md` §6.1's honest floor). The
+//! walk therefore also records, for each binding's last read, the chain of
+//! enclosing STATEMENTS from the outermost block inward
+//! ([`Liveness::statement_stack`]); the transformer picks the element of that
+//! chain that is a direct statement of the scope it is emitting, and closes the
+//! teardown `finally` after it. Three answers, and the refusals fall back to the
+//! law that shipped:
+//!
+//! - [`DropExtent::Declaration`] — the binding is never read; it drops right
+//!   after its own declaration.
+//! - [`DropExtent::Statement`] — the chain above.
+//! - [`DropExtent::ScopeEnd`] — opaque, or last read in a scope's TAIL (which
+//!   *is* the scope's end). Today's law, unchanged.
+//!
+//! Because a `finally` covers a lexical region, a last read inside a branch
+//! yields the BRANCH statement, so the drop lands at the join and every path —
+//! taken, not-taken, `ret`, `jump` — releases through the one `finally`
+//! (`lifetimes.md` §6.3's drop specialization, flaglessly).
+//!
+//! **Parameters are walked too** (they reach expression position as
+//! `Expr::Local` of the parameter's id), because an `own` resource parameter is
+//! one of the three teardown classes §6 moves. They are declared at their
+//! function's entry, which a backward walk reaches last. Elision does not read
+//! their answers (`is_elidable_copy` gates on `variables`), and
+//! `compute_view_origins` never keys a parameter, so nothing about the elision
+//! answers moves when they join the walk.
 
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 
 use super::{Analyzer, Expr, ExprIfBranch, ExprPattern};
 
+/// Where a binding's teardown region ENDS (`lifetimes.md` §6, slice S3).
+///
+/// The transformer turns this into the point at which the drop `finally`
+/// closes. Every variant is a STATEMENT boundary, because that is what a
+/// `try`/`finally` can be cut at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DropExtent {
+    /// The binding is never read: it drops immediately after its own
+    /// declaration. This is the shape that fixes the serve-forever `main` —
+    /// a handle nothing reads again is released now, not at a scope end that
+    /// never arrives.
+    Declaration,
+    /// The last read sits inside this chain of enclosing statements, outermost
+    /// first. The consumer picks the element that is a direct statement of the
+    /// scope it is emitting and closes the region after it.
+    Statement(Vec<Id>),
+    /// The declaring scope's end — the law `destruction.md` §5 shipped, kept
+    /// for an opaque binding (the refusal set) and for a last read in a scope's
+    /// tail, where the two answers coincide anyway.
+    ScopeEnd,
+}
+
 /// The dataflow's answer, keyed by USE SITE (an `Expr::Local` expression id).
 ///
-/// Empty by default — an analyzer that has not run the pass elides nothing,
-/// which is the safe direction.
+/// Empty by default — an analyzer that has not run the pass elides nothing and
+/// drops nothing early, which is the safe direction on both counts.
 #[derive(Clone, Debug, Default)]
 pub(super) struct LastUse {
     /// Every read that is the last use of its binding on every path out of it.
     last_uses: HashSet<Id>,
     /// Bindings the pass refuses to answer for (see the module doc).
     opaque: HashSet<Id>,
+    /// Per binding, the enclosing-statement chain of its LAST read (outermost
+    /// first). Absent = never read. Empty = read in a scope's tail.
+    last_use_statements: HashMap<Id, Vec<Id>>,
+    /// Per binding, the enclosing-statement chain of its DECLARATION. Every
+    /// declaring form feeds it — `let`, a destructure, an `is` capture that
+    /// binds into the surrounding scope, a `for` item — so the consumer can ask
+    /// "which statement of this block brings this name into existence?" without
+    /// enumerating the forms.
+    declaration_statements: HashMap<Id, Vec<Id>>,
+    /// Bindings with a read the walk never reached (the completeness net). The
+    /// only refusal the SYNTACTIC answer honours: a chain it did not see every
+    /// read of cannot be trusted to name the last one.
+    unreached: HashSet<Id>,
 }
 
 impl LastUse {
@@ -81,6 +146,61 @@ impl LastUse {
     /// the question rule 2 and (later) §6's drop placement both ask.
     pub(super) fn is_last_use(&self, use_id: Id, binding_id: Id) -> bool {
         !self.opaque.contains(&binding_id) && self.last_uses.contains(&use_id)
+    }
+
+    /// Where `binding_id`'s teardown region ends — §6's disposal answer.
+    /// An opaque binding falls back to the scope end it has always had; the
+    /// pass never guesses a drop point it cannot stand behind.
+    pub(super) fn drop_extent(&self, binding_id: Id) -> DropExtent {
+        if self.opaque.contains(&binding_id) {
+            return DropExtent::ScopeEnd;
+        }
+        self.syntactic_extent(binding_id)
+    }
+
+    /// The same coordinate asked SYNTACTICALLY — the last statement that
+    /// mentions the name, with opacity ignored.
+    ///
+    /// This is the question emitted JS *scoping* asks, and it is a different
+    /// question from disposal's. A `const` declared inside a `try` dies at that
+    /// block's brace, so a teardown region may not close while a name declared
+    /// inside it is still read afterwards — whether or not the dataflow can
+    /// say anything about that name's liveness. Opacity is a claim about when a
+    /// value may be destroyed; block scope is a claim about where a name can be
+    /// written down, and only the completeness net (a read the walk never saw)
+    /// can make the syntactic answer wrong.
+    pub(super) fn syntactic_extent(&self, binding_id: Id) -> DropExtent {
+        if self.unreached.contains(&binding_id) {
+            return DropExtent::ScopeEnd;
+        }
+        match self.last_use_statements.get(&binding_id) {
+            None => DropExtent::Declaration,
+            Some(chain) if chain.is_empty() => DropExtent::ScopeEnd,
+            Some(chain) => DropExtent::Statement(chain.clone()),
+        }
+    }
+
+    /// Per declaring STATEMENT, the syntactic extents of the bindings it brings
+    /// into existence — what a teardown region must cover before it may close,
+    /// because those names live in the emitted block the region becomes.
+    ///
+    /// Keyed on the outermost enclosing statement, so a name declared in a
+    /// nested block keys the statement that block belongs to; its own last read
+    /// is inside that same statement, so it never widens anything by itself.
+    /// A binding declared in a scope's tail, or at a function's entry (a
+    /// parameter), keys nothing — neither can be read past a statement region.
+    pub(super) fn declared_binding_extents(&self) -> HashMap<Id, Vec<DropExtent>> {
+        let mut declared: HashMap<Id, Vec<DropExtent>> = HashMap::default();
+        for (binding_id, chain) in &self.declaration_statements {
+            let Some(statement) = chain.first().copied() else {
+                continue;
+            };
+            declared
+                .entry(statement)
+                .or_default()
+                .push(self.syntactic_extent(*binding_id));
+        }
+        declared
     }
 
     /// Run the pass over every region of the program.
@@ -94,6 +214,9 @@ impl LastUse {
             dry: false,
             region: Id(0),
             last_uses: HashSet::default(),
+            statement_stack: Vec::new(),
+            last_use_statements: HashMap::default(),
+            declaration_statements: HashMap::default(),
             walked_uses: HashMap::default(),
             use_region: HashMap::default(),
             declaration_region: HashMap::default(),
@@ -107,6 +230,13 @@ impl LastUse {
             if function.has_body {
                 walk.enter(function.id);
                 walk.walk_block(&function.body.0, function.body.1);
+                // Parameters come into existence at the body's entry, which a
+                // BACKWARD walk reaches last — an `own` resource parameter is
+                // one of §6's three teardown classes and needs the same
+                // declaration kill every local gets.
+                for parameter_id in &function.parameters {
+                    walk.record_declaration(*parameter_id);
+                }
             }
         }
         // Module bodies (module-level bindings live here; a function READING
@@ -128,6 +258,9 @@ impl LastUse {
         }
 
         let mut opaque = walk.conflicted;
+        // The completeness net's own half, kept separate: it is the ONE refusal
+        // the syntactic answer honours (see [`LastUse::syntactic_extent`]).
+        let mut unreached: HashSet<Id> = HashSet::default();
         // The completeness net: every `Expr::Local` naming a variable that
         // exists in the program must have been REACHED by the walk. A form the
         // traversal does not know about would otherwise hide a use and turn a
@@ -137,7 +270,9 @@ impl LastUse {
             let Expr::Local(binding_id) = expr else {
                 continue;
             };
-            if !analyzer.variables.contains_key(binding_id) {
+            if !analyzer.variables.contains_key(binding_id)
+                && !analyzer.parameters.contains_key(binding_id)
+            {
                 continue;
             }
             let reached = walk
@@ -146,6 +281,7 @@ impl LastUse {
                 .is_some_and(|sites| sites.contains(expr_id));
             if !reached {
                 opaque.insert(*binding_id);
+                unreached.insert(*binding_id);
             }
         }
         // A binding whose declaration the walk never reached, or that is read
@@ -183,6 +319,9 @@ impl LastUse {
         LastUse {
             last_uses: walk.last_uses,
             opaque,
+            last_use_statements: walk.last_use_statements,
+            declaration_statements: walk.declaration_statements,
+            unreached,
         }
     }
 }
@@ -204,6 +343,15 @@ struct Liveness<'a, 'src> {
     /// The region root the walk is inside (a function, module or closure id).
     region: Id,
     last_uses: HashSet<Id>,
+    /// The chain of block STATEMENTS the walk is inside, outermost first — the
+    /// statement-boundary coordinate a `finally` region can be cut at.
+    statement_stack: Vec<Id>,
+    /// Per binding, the statement chain of its LAST read. The walk runs
+    /// backward, so the FIRST chain recorded is the last one in program order
+    /// and later writes are dropped.
+    last_use_statements: HashMap<Id, Vec<Id>>,
+    /// Per binding, the statement chain of its DECLARATION.
+    declaration_statements: HashMap<Id, Vec<Id>>,
     /// Every read site the walk reached, per binding — the completeness net.
     walked_uses: HashMap<Id, HashSet<Id>>,
     use_region: HashMap<Id, Id>,
@@ -218,6 +366,20 @@ impl Liveness<'_, '_> {
         self.region = region;
         self.live.clear();
         self.repeat_carry = None;
+        self.statement_stack.clear();
+    }
+
+    /// Remember where `binding_id`'s last read sits, as a statement chain. The
+    /// walk is backward, so the first answer recorded is the last read in
+    /// program order — `or_insert_with` is the "latest wins" it looks like the
+    /// opposite of.
+    fn record_statement_chain(&mut self, binding_id: Id) {
+        if self.dry {
+            return;
+        }
+        self.last_use_statements
+            .entry(binding_id)
+            .or_insert_with(|| self.statement_stack.clone());
     }
 
     /// A read of `binding_id` at `use_id`. Records the answer, then marks the
@@ -242,13 +404,17 @@ impl Liveness<'_, '_> {
                 .or_default()
                 .insert(use_id);
         }
+        self.record_statement_chain(binding_id);
         self.live.insert(binding_id);
         // §6.1, the loan-extension rule: a `borrows` projection extends its
         // owner's last use to the last use of any view rooted at it. Reading
-        // the VIEW is therefore a read of every root it projects from.
-        if let Some(roots) = self.view_origins.get(&binding_id) {
+        // the VIEW is therefore a read of every root it projects from — for the
+        // drop point as much as for liveness, or the owner would be torn down
+        // under a live projection (the one unsoundness shape §6.1 names).
+        if let Some(roots) = self.view_origins.get(&binding_id).cloned() {
             for root in roots {
-                self.live.insert(*root);
+                self.record_statement_chain(root);
+                self.live.insert(root);
             }
         }
     }
@@ -258,6 +424,9 @@ impl Liveness<'_, '_> {
     /// body itself declares a genuine last use.
     fn record_declaration(&mut self, binding_id: Id) {
         if !self.dry {
+            self.declaration_statements
+                .entry(binding_id)
+                .or_insert_with(|| self.statement_stack.clone());
             match self.declaration_region.get(&binding_id) {
                 Some(_) => {
                     self.conflicted.insert(binding_id);
@@ -274,6 +443,9 @@ impl Liveness<'_, '_> {
     /// that IS a `ret` makes everything after it unreachable, which is what
     /// lets the guard-clause shape (`if bad { ret e }; …`) answer per path.
     fn walk_block(&mut self, statements: &[Id], tail: Id) {
+        // The tail is not a statement: a read there is a read at the scope's
+        // END, which is exactly `DropExtent::ScopeEnd` and is recorded as the
+        // empty chain by leaving the stack alone.
         self.walk(tail);
         for statement_id in statements.iter().rev() {
             if matches!(
@@ -282,7 +454,9 @@ impl Liveness<'_, '_> {
             ) {
                 self.live.clear();
             }
+            self.statement_stack.push(*statement_id);
             self.walk(*statement_id);
+            self.statement_stack.pop();
         }
     }
 
@@ -369,8 +543,11 @@ impl Liveness<'_, '_> {
             // --- the leaves that matter ---
             Expr::Local(binding_id) => {
                 // A `Local` also names functions, enums and modules; only a
-                // value binding has liveness.
-                if self.analyzer.variables.contains_key(&binding_id) {
+                // value binding — a local or a PARAMETER, which reaches
+                // expression position under this same node — has liveness.
+                if self.analyzer.variables.contains_key(&binding_id)
+                    || self.analyzer.parameters.contains_key(&binding_id)
+                {
                     self.record_use(expr_id, binding_id);
                 }
             }
@@ -593,10 +770,16 @@ impl Analyzer<'_> {
     /// loaned binding.
     ///
     /// A loan handed to a RESOLVED callee is call-bounded and needs no
-    /// refusal — §6.4's rule, whose declared-retention escape hatch is S4's
-    /// business. A loan handed to a callee this analysis cannot resolve
-    /// (dispatched, generic) is refused, because "call-bounded" is a claim
-    /// about a signature nobody has read.
+    /// refusal — §6.4's rule. A loan handed to a callee this analysis cannot
+    /// resolve (dispatched, generic) is refused, because "call-bounded" is a
+    /// claim about a signature nobody has read.
+    ///
+    /// **The retention contract** (§6.4, RULED 2026-08-28): an extern declared
+    /// `[extern(…, retains)]` KEEPS what it is handed, so the call bound does
+    /// not apply to it and every argument's root is refused outright — the
+    /// binding keeps its whole scope, which is the conservative envelope the
+    /// probes showed is needed. Under the call bound alone the host reads a
+    /// value the caller has already destroyed (`tag=["<FREED>"]`, reproduced).
     fn collect_unfollowable_loans(
         &self,
         view_origins: &HashMap<Id, Vec<Id>>,
@@ -632,6 +815,36 @@ impl Analyzer<'_> {
                     projected_anchors.insert(*subject_id);
                 }
                 _ => {}
+            }
+        }
+        for expr in self.expr_id_to_expr_map.values() {
+            let Expr::Call(call_id) = expr else {
+                continue;
+            };
+            let Some(function_call) = self.function_calls.get(call_id) else {
+                continue;
+            };
+            if !self.callee_retains(function_call.subject_id) {
+                continue;
+            }
+            for argument_id in &function_call.argument_ids {
+                // `&place` is the ordinary spelling at a loan position, so the
+                // reference is looked through to the place it names.
+                let place_id = match self.expr_id_to_expr_map.get(argument_id) {
+                    Some(Expr::Reference(operand_id, _)) => *operand_id,
+                    _ => *argument_id,
+                };
+                let roots = match self.expr_id_to_expr_map.get(&place_id) {
+                    Some(Expr::Local(binding_id)) => view_origins
+                        .get(binding_id)
+                        .cloned()
+                        .unwrap_or_else(|| vec![*binding_id]),
+                    _ => self
+                        .place_root(place_id)
+                        .map(|root| vec![root])
+                        .unwrap_or_default(),
+                };
+                opaque.extend(roots);
             }
         }
         for (expr_id, expr) in &self.expr_id_to_expr_map {
