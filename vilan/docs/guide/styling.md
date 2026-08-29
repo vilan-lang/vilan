@@ -53,18 +53,36 @@ above, lowered before anything else in the compiler sees it — so the two
 forms mix freely in one file, one function, one expression, and both
 emit exactly the same stylesheet.
 
-```vilan,fragment
+Here is one style written both ways, in one program. `card` and
+`card_as_a_chain` mint the *same classes*: the block does not emit
+beside the chain, it becomes the chain.
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+import std::style::{ style, space, Style, Color };
+
 let card = const css {
 	display: flex;
-	flex-direction: column;
 	gap: {space(2)};
 	padding: {space(4)};
 	background-color: {Color::gray(100)};
-
 	.hover {
 		background-color: {Color::gray(200)};
 	}
 };
+
+let card_as_a_chain = const style()
+	.raw("display", "flex")
+	.raw("gap", space(2))
+	.raw("padding", space(4))
+	.raw("background-color", Color::gray(100))
+	.hover(style().raw("background-color", Color::gray(200)));
+
+fun main() {
+	let _root = mount_root("app", || {
+		view("div").styled(card).child(view("p").text("hello"))
+	});
+}
 ```
 
 **One rule, and the whole feature falls out of it.** An undotted
@@ -112,7 +130,31 @@ Four things the block does not do, each on purpose:
   a `for … in` iterable and a `match` subject take one only in
   parentheses: `if (css { … }).class_list() != "" { … }`.
 
-`vilan fmt` currently prints a block back exactly as you wrote it.
+**`vilan fmt` orders a block, and orders it exactly as it orders the
+chain.** One item per line, nested rules one level in, holes tidied like
+any other vilan expression — and the items sorted into the canonical
+order: properties in Tailwind's category sequence, then the condition
+rules in the order the selector nests them (media, relation, attribute,
+pseudo-class). So the two spellings of one style format alike, and
+grouping declarations by hand is not a thing you have to maintain.
+
+Two carve-outs worth knowing. A property no `Style` method writes — a
+vendor prefix, a custom property like `--brand-ink` — is a **barrier**:
+it holds its place and nothing sorts across it, because the formatter
+cannot know what it is entangled with. And a block containing a
+**comment** is never reordered at all; it still prints canonically, but
+the items stay where you wrote them, so a comment can never end up
+explaining the wrong declaration.
+
+```vilan,fragment
+// formats as: display, padding, then `.md` before `.hover`
+let button = const css {
+	.hover { background-color: {Color::gray(200)}; }
+	padding: {space(2)};
+	.md { padding: {space(4)}; }
+	display: flex;
+};
+```
 
 ## Getting the stylesheet onto the page
 

@@ -70,7 +70,11 @@ enum Command {
         /// The emitter backend: `js` (the only backend today).
         #[arg(long)]
         backend: Option<String>,
-        /// Also emit `.parse.out` / `.analyze.out` / `.callgraph.out` debug dumps.
+        /// Also emit debug dumps beside the source, one per pipeline stage:
+        /// `.parse-raw.out` (the tree the parser produced), `.parse.out` (the
+        /// same tree after the `css` / element / lift desugars — what analysis
+        /// receives), `.analyze.out` (the analyzed program) and
+        /// `.callgraph.out` (the call graph the post-analysis passes shared).
         #[arg(short, long)]
         debug: bool,
         /// Rebuild whenever a watched `.vl` source file changes (Ctrl-C to stop).
@@ -95,7 +99,11 @@ enum Command {
         /// The emitter backend: `js` (the only backend today).
         #[arg(long)]
         backend: Option<String>,
-        /// Also emit `.parse.out` / `.analyze.out` / `.callgraph.out` debug dumps.
+        /// Also emit debug dumps beside the source, one per pipeline stage:
+        /// `.parse-raw.out` (the tree the parser produced), `.parse.out` (the
+        /// same tree after the `css` / element / lift desugars — what analysis
+        /// receives), `.analyze.out` (the analyzed program) and
+        /// `.callgraph.out` (the call graph the post-analysis passes shared).
         #[arg(short, long)]
         debug: bool,
         /// Re-check whenever a watched `.vl` source file changes (Ctrl-C to stop).
@@ -1585,6 +1593,22 @@ impl DeclaredHook {
             outputs,
         })
     }
+
+    /// The declared outputs that are not on disk, in declaration order — the
+    /// ONE reason [`DeclaredHook::fingerprint`] returns `None` that is the
+    /// user's mistake rather than the filesystem's, separated out so the run
+    /// can say it out loud.
+    ///
+    /// Only a path that is genuinely absent counts (`Some(None)`): one that
+    /// could not be *read* is a permission error or a broken link, which is
+    /// not "the hook did not write it".
+    fn missing_outputs(&self, dir: &Path) -> Vec<&str> {
+        self.outputs
+            .iter()
+            .filter(|declared| file_digest(&dir.join(declared)) == Some(None))
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// What a hook's stamp entry records, and what freshness compares (§3.1): the
@@ -1780,6 +1804,23 @@ impl BuildHooks {
                     write_hook_stamp(&stamp_path, &next);
                     return Err(error);
                 }
+            }
+            // A hook that succeeded and left a declared output missing is the
+            // one way this design can go quiet: nothing is stamped, so it
+            // re-runs forever, and the build fails later at whatever was
+            // supposed to consume the file — an import error with no path back
+            // to its cause. The manifest said what this hook produces; when it
+            // does not, say so here, where the reason is still known. A note,
+            // not an error: the hook itself succeeded, and the build's own
+            // outcome is the compile's to decide.
+            for missing in hook.missing_outputs(&self.dir) {
+                eprintln!(
+                    "{} `[[build.hook]]` `{}` did not write its declared `outputs` entry \
+                     `{missing}`: nothing is recorded for a hook whose output is missing, so \
+                     it re-runs on every build — write the file, or drop it from `outputs`",
+                    paint::warning_prefix(),
+                    hook.name
+                );
             }
             // Fingerprinted AFTER the run: the outputs recorded are the ones
             // the run actually produced. A hook that did not produce a
@@ -2616,9 +2657,9 @@ enum CompileGoal {
 /// JavaScript say so by not mentioning the rest.
 struct Compiled {
     javascript: String,
-    /// The `(kind, line)` pairs `asset::emit` accumulated — `write_assets`
-    /// deduplicates and orders them into `<output>.<kind>`.
-    assets: Vec<(String, String)>,
+    /// The contributions `asset::emit` / `asset::emit_keyed` accumulated —
+    /// `write_assets` deduplicates and orders them into `<output>.<kind>`.
+    assets: Vec<vilan_core::const_eval::EmittedAsset>,
     /// The files `asset::bundle` registered: (resolved source, the name it
     /// takes in the output directory). `write_bundled` copies them.
     bundled: Vec<(PathBuf, String)>,
@@ -3289,7 +3330,10 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
 /// it. The flush is the one place that knows what this round emitted, so it is
 /// where BOTH prunes belong; `write_chunks` keeps its own call for the HMR
 /// watch loop, which writes its sidecar directly rather than through here.
-fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Option<String> {
+fn write_assets(
+    output_js: &std::path::Path,
+    assets: &[vilan_core::const_eval::EmittedAsset],
+) -> Option<String> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
     let leg = output_js
         .file_stem()
@@ -4019,6 +4063,22 @@ fn compile_to_js(
 
     if let Some(root) = root {
         if emit_debug {
+            // Two dumps, and they BRACKET the desugars hooked at every parse
+            // entry — `css`, `elements`, `lift` (backlog E99). `parse-raw.out`
+            // is the tree the frontend produced; `parse.out` is the tree
+            // analysis receives, which is the rewritten one and always was, so
+            // a node in one and not the other is something a desugar added or
+            // removed — the split needed to tell a parser bug from a desugar's.
+            //
+            // The raw tree comes from a fresh parse of the entry's own text
+            // rather than from the branch above, so a clean-parse cache HIT
+            // dumps one too: the cache is content-keyed, so this parse
+            // reproduces exactly the tree the cached entry was built from. It
+            // is one extra parse, paid only under `-d`.
+            let (raw_root, _) = vilan_core::parsing::parse(source_ref);
+            if let Some(raw_root) = raw_root {
+                write_debug(file, "parse-raw.out", &format!("{raw_root:#?}"));
+            }
             write_debug(file, "parse.out", &format!("{root:#?}"));
         }
 

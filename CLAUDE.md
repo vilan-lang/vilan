@@ -17,7 +17,7 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
 - **Prove a feature before implementing it.** A new feature should be *proven* first: a formal
   definition of its semantics, then unit tests and regression tests that pin that behavior down.
   Design on paper (a proposal in the `proposals` sibling repo,
-  `proposals/proposal/…`), settle the semantics, then build.
+  `proposals/projects/vilan/proposal/…`), settle the semantics, then build.
 - **Fix root causes, not symptoms.** A bug fix must address the underlying cause. Do not paper
   over a failure with a special-case patch that handles one input — find why the *general* path is
   wrong and fix that. Special cases are a smell; prefer general code that subsumes them.
@@ -33,7 +33,7 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
 
 - Regression test files live in `vilan/test/`. Their `.mjs` goldens are a **byte-identical** gate, enforced by `cargo test -p vilan-cli --test corpus` (part of the full suite — it builds every corpus program with the current binary and compares bytes): a change that alters them is either a bug or a deliberate, verified improvement — regenerate a golden only after confirming the new output is correct (and rebuild the debug binary first, or a stale binary writes wrong goldens).
 - **Add unit tests for critical code.** Any change to a critical subsystem — the type solver / analyzer (`crates/vilan-core/src/analyzer.rs`), the transformer / codegen (`src/transformer.rs`), the language server (`crates/vilan-lsp/`), and the lexer/parser — must come with unit tests that pin its behavior, including the **edge cases** (the multi-parameter, nested, mixed, and ordering-sensitive forms — not just the happy path). The compiler-behavior harness lives in `crates/vilan-core/tests/inference/support.rs` (`assert_compiles`, `assert_compiles_and_runs`, `assert_fails`) and the pins beside it in the subject modules of that directory — one test binary, `cargo test -p vilan-core --test inference`, so a new pin goes in the subject module that owns its area (B145 split the old single 69k-line `tests/inference.rs`). A known-but-unfixed bug is pinned as an `#[ignore]`d test and un-ignored when fixed.
-- **Docs are gated and part of done.** Every fenced example in `vilan/docs/` is compiled by `cargo test --test docs`; a change to std, a framework, or the language updates the affected docs page **in the same commit** (see `proposals/proposal/documentation.md`).
+- **Docs are gated and part of done.** Every fenced example in `vilan/docs/` is compiled by `cargo test --test docs`; a change to std, a framework, or the language updates the affected docs page **in the same commit** (see `proposals/projects/vilan/proposal/documentation.md`).
 - **"Fixed" and "closed" require a pinned test — per case, not per example.** Do not claim a bug fixed, or a class of bugs closed, on the strength of a green suite plus one representative program. Each distinct case needs its own passing (or, if still open, `#[ignore]`d) test. Edge cases without a test are how a "closed" item silently regresses or turns out never to have been covered.
 
 ## Running the suite
@@ -43,7 +43,7 @@ the full crate, a ~100-program corpus built through the debug binary, a docs
 gate compiling every fence, and e2e legs that bind ports and spawn servers.
 nextest interleaves every binary's tests across all cores (fail-fast is off
 via the committed `.config/nextest.toml`), which is what took the suite from
-131 s to ~64 s (E21/E25–E27, `proposals/proposal/suite-speed.md`) — still expensive.
+131 s to ~64 s (E21/E25–E27, `proposals/projects/vilan/proposal/suite-speed.md`) — still expensive.
 Run it when it is the right instrument, not as a way of finding out what you
 just did. Two instrument notes: nextest does not run doc-tests (all empty
 today; CI's `cargo test --workspace --doc` leg guards the gap), and plain

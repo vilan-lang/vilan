@@ -12,6 +12,11 @@ import std::style::{ Color, Length, Style, space, style };
 // `.raw(property, value)`; a dotted `.name { … }` is a condition combinator
 // and lowers to `.name(style() … )`. The dot is the whole disambiguator, so
 // the grammar never consults `Style`'s method list.
+//
+// Every block in this file is written in the CANONICAL order `vilan fmt`
+// produces (S3): properties in Tailwind's category sequence, then the
+// conditions in the axis order the selector nests them. `style_chain_order.rs`
+// holds the file to it in both spellings.
 fun card(): Style {
 	css {
 		display: flex;
@@ -20,15 +25,9 @@ fun card(): Style {
 		padding: {space(4)};
 		background-color: {Color::gray(50)};
 		border-radius: {Length::px(8)};
-
-		// Written in the chain's canonical order — media before the
-		// pseudo-class — so the twin below needs no reordering to match it
-		// and `vilan fmt` is a no-op on both. (The block's own canonical
-		// order is S3; S2 prints it back verbatim.)
 		.md {
 			padding: {space(6)};
 		}
-
 		.hover {
 			background-color: {Color::gray(100)};
 		}
@@ -55,15 +54,20 @@ fun card_as_a_chain(): Style {
 // exactly one hole passes its expression through untouched (so a `Length` or a
 // `Color` keeps its `:root` line); anything else is the value's own source
 // slice as a `str`, holes interpolated — the same tree an i-string builds.
+//
+// The order here is the sorter's, and it shows both of its rules: the five
+// ranked declarations sort into category order, and the two the table cannot
+// rank — a property no `Style` method writes, and a custom property — are
+// BARRIERS that hold their index absolutely.
 fun values(): Style {
 	css {
+		// Commas, parens and quoted strings ride through verbatim.
+		grid-template-columns: repeat(3, 1fr);
+		width: 50%;
+		max-width: 37px;
 		// Dimensions already lex as one token, so CSS's own value shape was
 		// a vilan token before this feature existed.
 		line-height: 1.5;
-		width: 50%;
-		max-width: 37px;
-		// Commas, parens and quoted strings ride through verbatim.
-		grid-template-columns: repeat(3, 1fr);
 		background-image: url("tile.png");
 		// A mixed value interpolates: text, hole, text.
 		transition-duration: {150}ms;
@@ -75,27 +79,11 @@ fun values(): Style {
 
 // The relation axis reads as nesting, and nesting order IS combinator order:
 // media outermost, then the relation, then the attribute, then the
-// pseudo-class. The shape that is legal is the shape that reads correctly.
+// pseudo-class. The shape that is legal is the shape that reads correctly —
+// and it is also the shape the formatter sorts sibling conditions into.
 fun conditions(): Style {
 	css {
 		color: {Color::gray(900)};
-
-		.within("data-theme", "dark") {
-			color: {Color::gray(50)};
-
-			.hover {
-				color: {Color::gray(100)};
-			}
-		}
-
-		.children {
-			margin-top: {space(2)};
-		}
-
-		.divide {
-			margin-top: {space(4)};
-		}
-
 		.md {
 			.within("data-theme", "dark") {
 				.attribute("data-open", "true") {
@@ -104,6 +92,18 @@ fun conditions(): Style {
 					}
 				}
 			}
+		}
+		.within("data-theme", "dark") {
+			color: {Color::gray(50)};
+			.hover {
+				color: {Color::gray(100)};
+			}
+		}
+		.children {
+			margin-top: {space(2)};
+		}
+		.divide {
+			margin-top: {space(4)};
 		}
 	}
 }

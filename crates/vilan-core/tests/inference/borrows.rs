@@ -2817,11 +2817,11 @@ fn a_view_write_of_the_same_variant_width_drops_the_old_payload() {
     // The owned twin first, so the expectation below is its answer verbatim.
     assert_compiles_and_runs(
         &program(r#"holder = Holder::Full(Guard { label = "second" });"#),
-        "before\ndropped first\nafter\ndropped second\n",
+        "before\ndropped first\ndropped second\nafter\n",
     );
     assert_compiles_and_runs(
         &program("holder.swap();"),
-        "before\ndropped first\nafter\ndropped second\n",
+        "before\ndropped first\ndropped second\nafter\n",
     );
 }
 
@@ -2848,7 +2848,7 @@ fn a_view_write_that_grows_the_variant_drops_the_old_payload() {
             print("after");
         }
         "#,
-        "before\ndropped small\nafter\ndropped big\n",
+        "before\ndropped small\ndropped big\nafter\n",
     );
 }
 
@@ -2871,7 +2871,7 @@ fn a_view_write_to_a_struct_pointee_drops_the_old_value() {
             print("after");
         }
         "#,
-        "before\ndropped old\nafter\ndropped new\n",
+        "before\ndropped old\ndropped new\nafter\n",
     );
 }
 
@@ -3114,6 +3114,11 @@ fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
     // that the drop planner enrolled as an owner, and the emitted program
     // destroyed the borrowed value twice ("dropped held" printed twice, on the
     // struct pointee as well as the enum one).
+    //
+    // S3 (lifetimes.md §6) moved WHEN, never how many: the owner's last use is
+    // the loan itself and `v` is never read, so the extension rule extends
+    // nothing and the owner drops before "hi". Exactly one teardown, which is
+    // the whole of what this pin holds.
     let program = |declaration: &str, borrow: &str| {
         format!(
             r#"
@@ -3135,17 +3140,17 @@ fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
             r#"mut holder = Holder::Full(Guard { label = "held" });"#,
             "&mut holder",
         ),
-        "hi\ndropped held\n",
+        "dropped held\nhi\n",
     );
     assert_compiles_and_runs(
         &program(r#"mut guard = Guard { label = "held" };"#, "&mut guard"),
-        "hi\ndropped held\n",
+        "dropped held\nhi\n",
     );
     // The read-only loan too — `&` was never writable, but it was just as
     // wrongly enrolled as an owner.
     assert_compiles_and_runs(
         &program(r#"mut guard = Guard { label = "held" };"#, "&guard"),
-        "hi\ndropped held\n",
+        "dropped held\nhi\n",
     );
 }
 
@@ -3306,7 +3311,7 @@ fn an_element_write_drops_the_old_value() {
         }
         "#,
         ),
-        "before\ndropped one\nafter\ndropped two\ndropped three\n",
+        "before\ndropped one\ndropped two\ndropped three\nafter\n",
     );
 }
 
@@ -3401,8 +3406,8 @@ fn a_component_write_drops_in_the_owned_twins_order() {
         }
         "#,
     );
-    assert_compiles_and_runs(component, "before\ndropped one\nafter\ndropped two\n");
-    assert_compiles_and_runs(binding, "before\ndropped one\nafter\ndropped two\n");
+    assert_compiles_and_runs(component, "before\ndropped one\ndropped two\nafter\n");
+    assert_compiles_and_runs(binding, "before\ndropped one\ndropped two\nafter\n");
 }
 
 #[test]
@@ -6748,5 +6753,299 @@ fn shared_write_is_a_view_not_a_value() {
         import std::shared::Shared;
         fun main() { let c = Shared::new(5); let x: i32 = c.write(); }
         "#,
+    );
+}
+
+// --- The capture rule (spec §6.9, lifetimes.md §4) ----------------------------
+//
+// A closure captures BINDINGS, not values. The tour said the opposite ("by
+// value at the moment they are created — Vilan copies, remember") and the
+// lifetime-model session measured it false in both halves: the capture aliases
+// the outer binding, and the one copy is B64's, taken per CALL at the closure's
+// return (pinned above). These five pin the aliasing itself, so the spec
+// sentence has teeth: nothing may quietly start copying at capture time.
+
+#[test]
+fn a_capture_sees_a_later_write_to_the_captured_binding() {
+    // c01 — mutation flows IN. Under a by-value capture this would print 1.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut count = 1;
+            let read = || count;
+            count = 2;
+            print(read());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_write_inside_a_closure_reaches_the_captured_binding() {
+    // c02 — writes flow OUT, the same aliasing read from the other side.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut total = 0;
+            let bump = || { total = total + 5; };
+            bump();
+            print(total);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn a_captured_aggregates_field_write_is_visible_through_the_capture() {
+    // c03 — an in-place component write on a captured aggregate. This is the
+    // spelling §6.1 says a PATTERN capture cannot see; a closure capture can,
+    // because it holds the binding rather than a copy of what it held.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Box { n: i32 }
+        fun main() {
+            mut box = Box { n = 1 };
+            let peek = || box.n;
+            box.n = 9;
+            print(peek());
+        }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn a_rebinding_after_the_capture_is_visible_through_it() {
+    // c04 — the sharpest case, and the spec's fence: a whole-binding REBINDING
+    // installs a fresh value, and the capture still sees it. §6.1's pattern
+    // capture keeps the old value here; a closure capture does not, because the
+    // binding is the same binding.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut label = "before";
+            let show = || label;
+            label = "after";
+            print(show());
+        }
+        "#,
+        "after\n",
+    );
+}
+
+#[test]
+fn a_captured_shared_cell_aliases_through_the_capture() {
+    // c05 — the sanctioned shared-mutable idiom, and the one the tour's
+    // corrected paragraph still points at: a `Shared` cell aliases by design,
+    // so it survives any capture rule the language might have picked.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(1);
+            let write = || { cell.write() = 4; };
+            write();
+            print(cell.read());
+        }
+        "#,
+        "4\n",
+    );
+}
+
+// --- C12: rule 3's capture ban, enforced --------------------------------------
+//
+// `memory.md` said a view "may not be captured by a closure that outlives the
+// place" and nothing enforced it: probe q05 returned a closure over a view of a
+// dead local and read through it (memory-safe on the JS backend only because
+// the host boxes the place and traces it — a use-after-free anywhere else).
+// The census across std, the corpus, the docs, the examples, the website and
+// kolt found ZERO view captures, so the ban is enforced rather than specified
+// under a liveness rule that does not exist yet.
+
+#[test]
+fn a_returned_closure_may_not_capture_a_view_of_a_dead_local() {
+    // q05, red-first: this compiled and printed 7 on 0.38.0.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun make_reader(): || i32 {
+            mut n = 7;
+            let view = &mut n;
+            || *view
+        }
+        fun main() { print(make_reader()()); }
+        "#,
+        "a closure cannot capture the view 'view'",
+    );
+}
+
+#[test]
+fn a_closure_may_not_capture_a_view_even_when_it_does_not_escape() {
+    // The ban is at the CAPTURE, not at the escape: proving "this closure does
+    // not outlive the place" needs the liveness machinery lifetimes.md §6 is
+    // only now building, so the surveyable interval stays lexical and a view
+    // does not enter a closure body at all.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            mut n = 1;
+            let view = &mut n;
+            let read = || *view;
+            print(read());
+        }
+        "#,
+        "a closure cannot capture the view 'view'",
+    );
+}
+
+#[test]
+fn a_closure_may_not_capture_a_for_each_view() {
+    // A `for e in &mut list` binding is a view with no `&` in sight.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            mut rows = [ 1, 2 ];
+            for row in &mut rows {
+                let peek = || *row;
+                print(peek());
+            }
+        }
+        "#,
+        "a closure cannot capture the view 'row'",
+    );
+}
+
+#[test]
+fn a_closure_may_not_capture_a_borrows_call_result() {
+    // The third way a view binding arises: a `borrows` projection's result
+    // (`Shared::write`), which has no local root at all.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(1);
+            let slot = cell.write();
+            let read = || *slot;
+            print(read());
+        }
+        "#,
+        "a closure cannot capture the view 'slot'",
+    );
+}
+
+#[test]
+fn a_view_declared_inside_a_closure_is_not_a_capture() {
+    // The boundary the ban must not cross: the closure's own frame owns the
+    // place, so the view is an ordinary short-lived local.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let f = || {
+                mut n = 4;
+                let view = &mut n;
+                *view
+            };
+            print(f());
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn a_closure_may_still_capture_a_view_parameter_of_its_enclosing_function() {
+    // The other boundary, and the reason the ban is scoped to view BINDINGS: a
+    // `&mut self` parameter views the CALLER's place, which outlives the call,
+    // so the capture can only dangle if the CLOSURE escapes — which P4c already
+    // refuses (`a_returned_closure_over_a_view_parameter_is_refused`, below).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { items: List<i32> }
+        impl Bag {
+            fun fill(&mut self) {
+                let add = || { self.items.push(1); };
+                add();
+            }
+        }
+        fun main() {
+            mut bag = Bag { items = [] };
+            bag.fill();
+            print(bag.items.len());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_returned_closure_over_a_view_parameter_is_refused() {
+    // P4c, unchanged and re-pinned here as the parameter half's control: the
+    // capture is legal, the ESCAPE is not.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun make(v: &mut i32): || i32 { || *v }
+        fun main() { mut n = 3; print(make(&mut n)()); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn reading_the_value_out_before_the_closure_is_the_fix_the_message_names() {
+    // Both fixes the diagnostic offers, proven to compile: `*` out first, or
+    // take the view as a closure PARAMETER (a per-call loan, never a capture).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut n = 1;
+            let view = &mut n;
+            let value = *view;
+            let read = || value;
+            print(read());
+            mut m = 2;
+            let peek = |v: &mut i32| *v;
+            print(peek(&mut m));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+#[ignore = "P4c residue: the escape rule does not follow a closure through an ordinary call (spec §6.9's honesty limit). Not C12's hole — the capture here is a view PARAMETER — and closing it needs the closure-escape analysis rule 4's dynamic remainder is future work for."]
+fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
+    // Measured on this tree: prints 3. `make` captures its `&mut` parameter,
+    // hands the closure to an ordinary function, and `keep` stores it in a
+    // struct it returns — so `outer` hands back a closure reading a view of
+    // its own dead local. `check_view_escape` sees a closure in an ARGUMENT
+    // position, which it skips on purpose (an ordinary callee only borrows
+    // for the call), and never learns that this one is stored.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun make(v: &mut i32): Holder { keep(|| *v) }
+        fun outer(): Holder {
+            mut n = 3;
+            make(&mut n)
+        }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+        "a view cannot escape its scope",
     );
 }

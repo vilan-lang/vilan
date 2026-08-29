@@ -183,10 +183,36 @@ expression when the body can reach it, and from every `ret`, which have
 to agree — a body that only ever leaves by `ret` is typed by those
 `ret`s. A `ret` that disagrees is reported at that `ret`.
 
-Closures capture their surroundings **by value** at the moment they are
-created. Vilan copies, remember. When a closure needs to share mutable
-state with its creator, they hold a `Shared` cell together. The
-[memory model](memory-model.md) explains that pattern.
+A closure captures the **bindings** around it, not their values — the
+one alias in Vilan you get without asking for one. The closure and its
+creator share the binding, so a write on either side shows up on the
+other, and even reassigning the whole binding is visible inside:
+
+```vilan
+import std::print;
+
+fun main() {
+	mut label = "before";
+	let show = || label;
+	label = "after";
+	print(show());        // after — same binding, not a copy of it
+}
+```
+
+That is usually what you want: it is how a click handler reads the
+counter you just bumped. Three things it does not extend to. A
+**resource** cannot be captured at all — a closure would be a second
+owner of it. A **view** (`&x`, `&mut x`) cannot either: the closure may
+outlive the place, so read the value out with `*` first, or take the
+view as a parameter of the closure. And an ambient
+[context](../spec/contexts.md) value is the one thing genuinely copied
+when the closure is made, so a deferred body reads the context it was
+written in.
+
+When two closures need to share mutable state that outlives the frame
+they were made in, they hold a `Shared` cell together. The
+[memory model](memory-model.md) explains that pattern, and
+[spec §6.9](../spec/memory.md) is the rule.
 
 ## Named functions as closures
 

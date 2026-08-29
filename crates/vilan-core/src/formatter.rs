@@ -75,15 +75,22 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
-/// nothing but trivia and the two canonical orders. Three order-insensitivities
+/// nothing but trivia and the three canonical orders. Four order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
 /// (dropped), the canonical ordering of a top-level import run (see the
-/// canonical-import-order section below), and the canonical ordering of a
-/// `style()` builder chain's links (see the canonical-style-chain-order section).
-/// Everything else must match token for token, so the net still catches every
-/// *other* reordering.
+/// canonical-import-order section below), the canonical ordering of a `style()`
+/// builder chain's links (see the canonical-style-chain-order section), and the
+/// canonical ordering of a `css` block's items (see the canonical-css-block-order
+/// section). Everything else must match token for token, so the net still catches
+/// every *other* reordering.
+///
+/// The css pass runs LAST so that a `style()` chain inside a hole is already
+/// canonical when a block's items are permuted around it — the block scan then
+/// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    sort_style_chains(sort_import_runs(&drop_trailing_commas(tokens)))
+    sort_css_blocks(sort_style_chains(sort_import_runs(&drop_trailing_commas(
+        tokens,
+    ))))
 }
 
 /// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
@@ -724,16 +731,24 @@ enum StyleLinkRank {
     Condition(ConditionAxis),
 }
 
+/// The rank a slot FAMILY sorts at: the position of the family's FIRST row in
+/// [`STYLE_PROPERTY_METHODS`]. Every method — and, in a `css` block, every CSS
+/// property — that writes a slot entangled with the family's carries this one
+/// rank, which is what makes a stable sort unable to separate two entangled
+/// slots.
+fn style_family_rank(family: &str) -> usize {
+    STYLE_PROPERTY_METHODS
+        .iter()
+        .position(|row| row.family == family)
+        .expect("a family is named by a row of the table it is read from")
+}
+
 /// The canonical rank of a chain link called `name`, or `None` when the name is
 /// a BARRIER — an unknown method (a user `impl Style` extension) or one of
 /// [`STYLE_BARRIER_METHODS`].
 fn style_link_rank(name: &str) -> Option<StyleLinkRank> {
     if let Some(method) = STYLE_PROPERTY_METHODS.iter().find(|row| row.name == name) {
-        let family_rank = STYLE_PROPERTY_METHODS
-            .iter()
-            .position(|row| row.family == method.family)
-            .expect("the row itself carries the family");
-        return Some(StyleLinkRank::Property(family_rank));
+        return Some(StyleLinkRank::Property(style_family_rank(method.family)));
     }
     STYLE_CONDITION_METHODS
         .iter()
@@ -741,25 +756,27 @@ fn style_link_rank(name: &str) -> Option<StyleLinkRank> {
         .map(|(_, axis)| StyleLinkRank::Condition(*axis))
 }
 
-/// The canonical permutation of a `style()` chain's link `names`, or `None` when
-/// the chain is already canonical (so every caller can leave an unchanged chain
-/// on its existing code path, byte for byte).
+/// The canonical permutation of a sequence of ranked links, or `None` when the
+/// sequence is already canonical (so every caller can leave an unchanged
+/// construct on its existing code path, byte for byte).
 ///
-/// Each maximal run of KNOWN links between barriers sorts on its own; a barrier
-/// keeps its index. The sort is stable, so links sharing a family — which share
-/// a rank — keep their written order.
+/// Each maximal run of KNOWN links between barriers (`None`) sorts on its own; a
+/// barrier keeps its index. The sort is stable, so links sharing a rank — two
+/// methods of one family, two conditions on one axis — keep their written order.
 ///
-/// This is the ONE implementation of the order: the printer permutes an AST
-/// spine with it and the safety net permutes a token slice with it, so the two
-/// cannot disagree about what canonical means.
-fn style_chain_permutation(names: &[&str]) -> Option<Vec<usize>> {
-    let mut order: Vec<usize> = (0..names.len()).collect();
+/// This is the ONE implementation of the order. Four callers reduce to it: the
+/// printer permuting a chain's AST spine, the safety net permuting a chain's
+/// token slice, and the same pair for a `css` block's items — so a block and the
+/// chain it desugars to cannot disagree about what canonical means, and neither
+/// can the printer and the net.
+fn canonical_permutation(ranks: &[Option<StyleLinkRank>]) -> Option<Vec<usize>> {
+    let mut order: Vec<usize> = (0..ranks.len()).collect();
     let mut run_start = 0;
-    for index in 0..=names.len() {
-        let is_barrier = index == names.len() || style_link_rank(names[index]).is_none();
+    for index in 0..=ranks.len() {
+        let is_barrier = index == ranks.len() || ranks[index].is_none();
         if is_barrier {
             order[run_start..index]
-                .sort_by_key(|link| style_link_rank(names[*link]).expect("run holds known links"));
+                .sort_by_key(|link| ranks[*link].expect("a run holds only ranked links"));
             run_start = index + 1;
         }
     }
@@ -768,6 +785,13 @@ fn style_chain_permutation(names: &[&str]) -> Option<Vec<usize>> {
         .enumerate()
         .any(|(at, link)| at != *link)
         .then_some(order)
+}
+
+/// The canonical permutation of a `style()` chain's link `names`.
+fn style_chain_permutation(names: &[&str]) -> Option<Vec<usize>> {
+    let ranks: Vec<Option<StyleLinkRank>> =
+        names.iter().map(|name| style_link_rank(name)).collect();
+    canonical_permutation(&ranks)
 }
 
 /// Whether the tokens at `index` open a `style()` builder — the bare call
@@ -819,25 +843,33 @@ fn style_chain_links<'src>(
         if !matches!(tokens.get(cursor + 2), Some(Token::Ctrl('('))) {
             break;
         }
-        let mut scan = cursor + 2;
-        let mut depth = 0usize;
-        loop {
-            match tokens.get(scan)? {
-                Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
-                Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            scan += 1;
-        }
+        let scan = balanced_end(tokens, cursor + 2)?;
         links.push((*name, cursor..scan + 1));
         cursor = scan + 1;
     }
     Some(links)
+}
+
+/// The index of the delimiter closing the one that opens at `open`, counting
+/// every bracket kind together (the token stream is already known to balance —
+/// it came from a file that parsed). `None` when the stream runs out first,
+/// which is how a malformed slice declines rather than panicking.
+fn balanced_end(tokens: &[Token<'_>], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut scan = open;
+    loop {
+        match tokens.get(scan)? {
+            Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+            Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(scan);
+                }
+            }
+            _ => {}
+        }
+        scan += 1;
+    }
 }
 
 /// Reorders the `.name(…)` links of every `style()` builder chain into the
@@ -880,6 +912,226 @@ pub fn sort_style_chains<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
                 .map(|(_, range)| range.end)
                 .expect("a permutation implies at least two links");
             continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+// --- Canonical `css` block order ---------------------------------------------
+//
+// A headless `css { … }` block gets the SAME canonical order a `style()` chain
+// gets (`proposal/css-block.md` §8; Q2 ruled 2026-08-28: the formatter sorts).
+// It has to: the block lowers to that chain, so a block that formatted
+// differently from the chain it desugars to would be a wart with two canonical
+// spellings of one style.
+//
+// Neither of the chain sorter's gates fires on a block — the formatter reparses
+// SOURCE and never sees the desugar, and there is no `style ( )` token run in a
+// block — so the block needs its own pair of gates. What it deliberately does
+// NOT get is a table of its own. The rank tables are keyed by METHOD name and a
+// block writes CSS PROPERTY names, so the property rank is DERIVED from the very
+// same rows: each already carries the slot family its properties belong to, held
+// to `style.vl` by `crates/vilan-core/tests/style_table_sync.rs`, which also
+// gates that no property is claimed by two families (or this derivation would
+// not be well defined). One order function ([`canonical_permutation`]), one set
+// of tables, four callers.
+//
+// Two differences from the chain, both in the block's favour and both earned:
+//
+//   * `raw` is a BARRIER in a chain because the slot it writes is an argument
+//     the formatter cannot evaluate. In a block the property is a TOKEN, right
+//     there in the source, so a declaration ranks by what it actually writes.
+//     A property no row writes — `-webkit-mask-composite`, a custom property —
+//     is a barrier, exactly as an unknown method is: nothing crosses it.
+//   * The dot decides which table to read, as it decides everything else about
+//     an item (§3). Undotted ranks by property, dotted by condition axis. The
+//     order function never has to guess.
+//
+// Refused outright: reordering ANY block that contains a comment. A reordered
+// body would carry its comments to the wrong item and the comment cursor only
+// moves forward — the same refusal, for the same reason, that
+// [`Printer::style_sorted_links`] makes for a chain. Such a block still prints
+// canonically (one item per line, nested rules at +1); only the reorder is off.
+
+/// The canonical rank of a CSS PROPERTY as written in a `css` block —
+/// `flex-direction`, `padding-left`, `--brand-ink`. Read out of
+/// [`STYLE_PROPERTY_METHODS`]'s `properties` column rather than a fourth
+/// hand-maintained table; `None` for a property no row writes, which is a
+/// BARRIER.
+fn css_property_rank(property: &str) -> Option<StyleLinkRank> {
+    STYLE_PROPERTY_METHODS
+        .iter()
+        .find(|row| row.properties.contains(&property))
+        .map(|row| StyleLinkRank::Property(style_family_rank(row.family)))
+}
+
+/// The canonical rank of one `css` block item. `dotted` is the grammar's own
+/// disambiguator (§3): a dotted item is a condition combinator and ranks by its
+/// axis, an undotted one is a declaration and ranks by its property.
+fn css_item_rank(dotted: bool, name: &str) -> Option<StyleLinkRank> {
+    if dotted {
+        return STYLE_CONDITION_METHODS
+            .iter()
+            .find(|(condition, _)| *condition == name)
+            .map(|(_, axis)| StyleLinkRank::Condition(*axis));
+    }
+    css_property_rank(name)
+}
+
+/// One item of a `css` body as the TOKEN scan sees it, for the safety net's half
+/// of the canonicalization.
+struct CssTokenItem {
+    rank: Option<StyleLinkRank>,
+    /// The whole item: a declaration through its `;`, a nested rule through its
+    /// closing `}`.
+    range: std::ops::Range<usize>,
+    /// A nested rule's body `{`, so the recursion reaches its items too.
+    body_open: Option<usize>,
+}
+
+/// The items of the `css` body whose `{` sits at `open`, in written order, and
+/// the index of the `}` that closes it.
+///
+/// `None` for a body that does not scan. The net then leaves the block's tokens
+/// exactly as they came, which is the correct degradation: an unsorted stream on
+/// both sides still compares equal.
+fn css_body_items(tokens: &[Token<'_>], open: usize) -> Option<(Vec<CssTokenItem>, usize)> {
+    let mut items = Vec::new();
+    let mut cursor = open + 1;
+    loop {
+        match tokens.get(cursor)? {
+            Token::Ctrl('}') => return Some((items, cursor)),
+            // `.name { … }` / `.name(a, b) { … }` — a condition combinator.
+            Token::Ctrl('.') => {
+                let Some(Token::Ident(name)) = tokens.get(cursor + 1) else {
+                    return None;
+                };
+                let mut scan = cursor + 2;
+                if matches!(tokens.get(scan), Some(Token::Ctrl('('))) {
+                    scan = balanced_end(tokens, scan)? + 1;
+                }
+                if !matches!(tokens.get(scan), Some(Token::Ctrl('{'))) {
+                    return None;
+                }
+                let body_open = scan;
+                let end = balanced_end(tokens, body_open)?;
+                items.push(CssTokenItem {
+                    rank: css_item_rank(true, name),
+                    range: cursor..end + 1,
+                    body_open: Some(body_open),
+                });
+                cursor = end + 1;
+            }
+            // `property: value;` — the property is span-adjacent name and `-`
+            // tokens (`flex-direction` is three, `--color-ink` is five), which
+            // the parser has already proved adjacent by accepting the file.
+            _ => {
+                let mut property = String::new();
+                let mut scan = cursor;
+                while let Some(token) = tokens.get(scan) {
+                    match token {
+                        Token::Op("-") => property.push('-'),
+                        Token::Op(_)
+                        | Token::Ctrl(_)
+                        | Token::String(_)
+                        | Token::MultilineString(_)
+                        | Token::Number(..) => break,
+                        // An identifier, or any keyword — CSS property names are
+                        // not vilan's reserved words (`for`, `type`, `css`).
+                        name => property.push_str(&name.to_string()),
+                    }
+                    scan += 1;
+                }
+                if property.is_empty() || !matches!(tokens.get(scan), Some(Token::Op(":"))) {
+                    return None;
+                }
+                // The value runs to the `;` at brace depth zero; a `{expr}` hole
+                // and a `calc(…)` both nest, and a `;` inside a string is a
+                // `Token::String`, not a `Ctrl`.
+                let mut depth = 0usize;
+                loop {
+                    match tokens.get(scan)? {
+                        Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+                        Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                            depth = depth.checked_sub(1)?
+                        }
+                        Token::Ctrl(';') if depth == 0 => break,
+                        _ => {}
+                    }
+                    scan += 1;
+                }
+                items.push(CssTokenItem {
+                    rank: css_item_rank(false, &property),
+                    range: cursor..scan + 1,
+                    body_open: None,
+                });
+                cursor = scan + 1;
+            }
+        }
+    }
+}
+
+/// The body at `open` with its items in canonical order — `{` and `}` included
+/// — and the index just past the `}`.
+fn sorted_css_body<'src>(tokens: &[Token<'src>], open: usize) -> Option<(Vec<Token<'src>>, usize)> {
+    let (items, close) = css_body_items(tokens, open)?;
+    let ranks: Vec<Option<StyleLinkRank>> = items.iter().map(|item| item.rank).collect();
+    let order =
+        canonical_permutation(&ranks).unwrap_or_else(|| (0..items.len()).collect::<Vec<usize>>());
+    let mut body = vec![Token::Ctrl('{')];
+    for at in order {
+        let item = &items[at];
+        match item.body_open {
+            // A nested rule: its HEAD may hold a block of its own
+            // (`.within(css_name(), …)`), and its body sorts by the same rule.
+            Some(body_open) => {
+                body.extend(sort_css_blocks(
+                    tokens[item.range.start..body_open].to_vec(),
+                ));
+                let (inner, _) = sorted_css_body(tokens, body_open)?;
+                body.extend(inner);
+            }
+            // A declaration: a hole is an ordinary expression and may hold a
+            // block of its own.
+            None => body.extend(sort_css_blocks(tokens[item.range.clone()].to_vec())),
+        }
+    }
+    body.push(Token::Ctrl('}'));
+    Some((body, close + 1))
+}
+
+/// Reorders the items of every `css { … }` block into the canonical order, so
+/// that a source block and the printer's reordered reprint reduce to the same
+/// token sequence. Every other token keeps its position, so the net still
+/// catches every other reordering.
+///
+/// A `style()` chain inside a hole is already canonical by the time this runs —
+/// [`normalize`] applies [`sort_style_chains`] to the whole stream first, and
+/// that scan walks straight through a block's tokens.
+// `pub` (doc-hidden) only so the external corpus tripwire in
+// `tests/parse_differential.rs` mirrors the net's css-block canonicalization
+// through this ONE implementation rather than a divergent copy — the same
+// "cannot disagree" guarantee [`sort_style_chains`] carries. Not part of the
+// supported API.
+#[doc(hidden)]
+pub fn sort_css_blocks<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
+    let mut result: Vec<Token<'src>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        // The block's own two-token gate, the one the parser uses: the keyword
+        // and a `{`. Every other `css` is a parse error today, so nothing else
+        // can reach here in a file that formatted.
+        if matches!(tokens.get(index), Some(Token::Css))
+            && matches!(tokens.get(index + 1), Some(Token::Ctrl('{')))
+        {
+            if let Some((body, past)) = sorted_css_body(&tokens, index + 1) {
+                result.push(Token::Css);
+                result.extend(body);
+                index = past;
+                continue;
+            }
         }
         result.push(tokens[index].clone());
         index += 1;
@@ -2409,7 +2661,7 @@ impl<'src> Printer<'src> {
     /// body block, or a `;` for a signature with no body.
     fn print_func(&mut self, func: &Func<'src>) {
         if let Some(binding) = &func.extern_binding {
-            self.print_extern_attribute(binding);
+            self.print_extern_attribute(binding, func.extern_retains);
             self.line();
         }
         if func.must_use {
@@ -2466,7 +2718,7 @@ impl<'src> Printer<'src> {
     }
 
     /// Prints a `[extern(..)]` host-binding attribute in its canonical form.
-    fn print_extern_attribute(&mut self, binding: &ExternBinding<'src>) {
+    fn print_extern_attribute(&mut self, binding: &ExternBinding<'src>, retains: bool) {
         self.out.push_str("[extern(");
         match binding {
             ExternBinding::Function {
@@ -2516,6 +2768,11 @@ impl<'src> Printer<'src> {
                 self.out.push_str(symbol);
                 self.out.push('"');
             }
+        }
+        // The retention flag reprints LAST, whatever position it was written in
+        // — one canonical form for the round trip.
+        if retains {
+            self.out.push_str(", retains");
         }
         self.out.push_str(")]");
     }
@@ -3106,24 +3363,176 @@ impl<'src> Printer<'src> {
         spans
     }
 
-    /// A `css { … }` block, reprinted VERBATIM from its source span — S2's
-    /// passthrough (proposal/css-block.md §8, §11). It exists so the bail set
-    /// stays empty: there are three `_ => self.bailed = true` fallbacks, the set
-    /// is asserted EMPTY by `parse_differential::formatter_never_silently_bails`,
-    /// and a bail returns the whole FILE unformatted while `--check` calls it
-    /// clean — so a grammar slice without a printer arm would silently stop
-    /// formatting every file containing a block. The canonical printer (one
-    /// declaration per line, nested rules at +1, canonical declaration order
-    /// shared with the chain sorter) is S3; until then the block's interior is
-    /// exactly what the author wrote, which satisfies the token-equality net
-    /// trivially — the slice re-lexes to the very tokens it came from.
+    /// A `css { … }` block, printed canonically (proposal/css-block.md §8, §11
+    /// S3 — this arm replaced S2's verbatim source-slice passthrough).
     ///
-    /// The comment cursor is advanced past the block without emitting: any `//`
-    /// inside it is already in the slice, and flushing it again would print it
-    /// twice.
-    fn print_css_verbatim(&mut self, span: Span) {
-        self.skip_comments_before(span.end);
-        self.out.push_str(&self.source[span.into_range()]);
+    /// One item per line, a nested rule's own items one level further in, and
+    /// the items in the canonical order the chain sorter uses — derived from the
+    /// same tables, through the same order function (see the canonical-css-block
+    /// -order section). Blank lines between items are trivia and do not survive:
+    /// a sorted body's paragraph gaps would land between items that no longer
+    /// belong together, and one canonical shape is the formatter's whole design.
+    ///
+    /// Whether the file formats at all still rides on this arm existing. There
+    /// are three `_ => self.bailed = true` fallbacks, the bail set is asserted
+    /// EMPTY by `parse_differential::formatter_never_silently_bails`, and a bail
+    /// returns the whole FILE unformatted while `--check` calls it clean.
+    fn print_css(&mut self, body: &crate::node::CssBody<'src>) {
+        self.out.push_str("css");
+        self.print_css_body(body, true);
+    }
+
+    /// The items of `body` in the order they print: canonical, or — for a block
+    /// holding a comment — exactly as written.
+    ///
+    /// Refused OUTRIGHT: reordering a body with a comment anywhere inside it,
+    /// nested rules included. A permuted body would carry its comments to the
+    /// wrong item, because the comment cursor only ever moves forward; this is
+    /// the same refusal [`Self::style_sorted_links`] makes for a chain, for the
+    /// same reason. Such a block still prints canonically — only the reorder is
+    /// off, which is also why the token net needs no comment knowledge: it sorts
+    /// both sides and they meet.
+    fn css_ordered_items<'ast>(
+        &self,
+        body: &'ast crate::node::CssBody<'src>,
+    ) -> Vec<&'ast crate::node::CssItem<'src>> {
+        let items: Vec<&'ast crate::node::CssItem<'src>> = body.items.iter().collect();
+        let braces = body.braces.into_range();
+        if self.has_comment_in(braces.start, braces.end) {
+            return items;
+        }
+        let ranks: Vec<Option<StyleLinkRank>> = items
+            .iter()
+            .map(|item| match item {
+                crate::node::CssItem::Declaration(declaration) => {
+                    css_item_rank(false, &self.source[declaration.property.into_range()])
+                }
+                crate::node::CssItem::Nested(nested) => css_item_rank(true, nested.name.0),
+            })
+            .collect();
+        match canonical_permutation(&ranks) {
+            Some(order) => order.into_iter().map(|at| items[at]).collect(),
+            None => items,
+        }
+    }
+
+    /// A block's or a nested rule's `{ … }`.
+    ///
+    /// The outer block collapses onto its line when it earns it — one
+    /// declaration, no comment, and the rendering stays within the budget, which
+    /// is the shape `let active = const css { padding: {space(6)}; };` wants. A
+    /// NESTED rule never collapses (`inline_allowed` is false for one): a rule
+    /// whose declarations share its line is not CSS, and one shape per construct
+    /// beats a shape that depends on how much a rule happens to declare.
+    fn print_css_body(&mut self, body: &crate::node::CssBody<'src>, inline_allowed: bool) {
+        let items = self.css_ordered_items(body);
+        let braces = body.braces.into_range();
+        let holds_comment = self.has_comment_in(braces.start, braces.end);
+        if items.is_empty() && !holds_comment {
+            self.out.push_str(" {}");
+            return;
+        }
+        // More than one item reads as CSS one per line, and a nested rule has a
+        // body of its own that never belongs on someone else's line — the same
+        // two forcings a split element makes for its children.
+        let must_split = !inline_allowed
+            || items.len() > 1
+            || items
+                .iter()
+                .any(|item| matches!(item, crate::node::CssItem::Nested(_)))
+            || holds_comment;
+        if !must_split {
+            let start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_css_inline(&items);
+            if !self.out[start..].contains('\n') && !self.current_line_over_budget() {
+                return;
+            }
+            self.out.truncate(start);
+            self.cursor = comment_cursor;
+        }
+        self.print_css_split(&items, braces);
+    }
+
+    fn print_css_inline(&mut self, items: &[&crate::node::CssItem<'src>]) {
+        self.out.push_str(" {");
+        for item in items {
+            self.out.push(' ');
+            self.print_css_item(item);
+        }
+        self.out.push_str(" }");
+    }
+
+    /// One item per line at +1, `}` back at the block's own indent. A comment
+    /// attaches to the item it precedes, found through the item's own span —
+    /// which is what the parser carried per item from the first commit.
+    fn print_css_split(
+        &mut self,
+        items: &[&crate::node::CssItem<'src>],
+        braces: std::ops::Range<usize>,
+    ) {
+        self.out.push_str(" {");
+        self.indent += 1;
+        let mut prev_end = braces.start;
+        for item in items {
+            let span = item.span().into_range();
+            self.flush_element_comments(span.start, prev_end);
+            self.line();
+            self.print_css_item(item);
+            prev_end = span.end;
+        }
+        // A comment after the last item still belongs inside the braces.
+        self.flush_element_comments(braces.end, prev_end);
+        self.indent -= 1;
+        self.line();
+        self.out.push('}');
+    }
+
+    fn print_css_item(&mut self, item: &crate::node::CssItem<'src>) {
+        match item {
+            crate::node::CssItem::Declaration(declaration) => {
+                self.print_css_declaration(declaration)
+            }
+            crate::node::CssItem::Nested(nested) => self.print_css_nested(nested),
+        }
+    }
+
+    /// `property: value;`. The property is a source slice (it spans several
+    /// tokens carrying no joined text), and so is every stretch of the value
+    /// between holes: a value is CSS, not vilan, so the formatter does not
+    /// respace it — a `url("a  b")` would lose its own bytes. What IS
+    /// canonicalized is each hole, which is an ordinary vilan expression:
+    /// `{space( 4 )}` prints `{space(4)}`.
+    fn print_css_declaration(&mut self, declaration: &crate::node::CssDeclaration<'src>) {
+        self.out
+            .push_str(&self.source[declaration.property.into_range()]);
+        self.out.push_str(": ");
+        for piece in &declaration.value {
+            match piece {
+                crate::node::CssValuePiece::Text(text) => {
+                    self.out.push_str(&self.source[text.into_range()])
+                }
+                crate::node::CssValuePiece::Hole(expression, _) => {
+                    self.out.push('{');
+                    self.print_expr(expression);
+                    self.out.push('}');
+                }
+            }
+        }
+        self.out.push(';');
+    }
+
+    /// `.name { … }` / `.name(a, b) { … }`. The head's arguments are ordinary
+    /// vilan expressions, so they print as any call's do.
+    fn print_css_nested(&mut self, nested: &crate::node::CssNested<'src>) {
+        self.out.push('.');
+        self.out.push_str(nested.name.0);
+        if !nested.arguments.is_empty() {
+            self.out.push('(');
+            self.print_expression_list(&nested.arguments);
+            self.out.push(')');
+        }
+        self.print_css_body(&nested.body, false);
     }
 
     fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
@@ -4160,7 +4569,7 @@ impl<'src> Printer<'src> {
                 self.out.push(')');
             }
             Node::Element(body) => self.print_element(body),
-            Node::Css(_) => self.print_css_verbatim(expr.1),
+            Node::Css(body) => self.print_css(body),
             _ => self.bailed = true,
         }
     }
@@ -4387,6 +4796,28 @@ mod reformats {
         assert_eq!(format(source), expected);
         // The output must be a fixed point — formatting it again is a no-op.
         assert_eq!(format(expected), expected, "output is not idempotent");
+    }
+
+    // The extern retention flag (`lifetimes.md` §6.4) round-trips. It is
+    // recognized in TRAILING position only — the one place a flag can sit
+    // without displacing a form word — so the printer reprints it exactly where
+    // it was written and the round trip is byte-exact for every binding shape
+    // it composes with.
+    #[test]
+    fn the_extern_retention_flag_round_trips_last() {
+        assert_formats(
+            "[extern(\"queueMicrotask\", retains)]\nexternal fun queue(callback: || void);\n",
+            "[extern(\"queueMicrotask\", retains)]\nexternal fun queue(callback: || void);\n",
+        );
+        assert_formats(
+            "[extern(method, \"addEventListener\", retains)]\nexternal fun on(self, event: str, handler: || void): void;\n",
+            "[extern(method, \"addEventListener\", retains)]\nexternal fun on(self, event: str, handler: || void): void;\n",
+        );
+        // An unmarked extern is untouched.
+        assert_formats(
+            "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
+            "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
+        );
     }
 
     // `async`/`sync` closure-type markers round-trip (they used to BAIL,
@@ -4763,62 +5194,199 @@ mod bailing_constructs {
         );
     }
 
-    // --- `css` blocks: S2's verbatim passthrough (css-block.md §8) -----------
-    // The canonical printer is S3. What S2 owes is that the bail set stays
-    // EMPTY: a bail returns the whole FILE unformatted while `--check` calls it
+    // --- `css` blocks: the canonical printer (css-block.md §8, §11 S3) -------
+    // S2 shipped a verbatim source-slice passthrough so the bail set could stay
+    // EMPTY — a bail returns the whole FILE unformatted while `--check` calls it
     // clean, so a grammar slice with no printer arm silently stops formatting
-    // every file holding a block. `assert_construct` checks exactly that
-    // (token identity, no silent bail, the canonical form, idempotence, and
-    // the canonical form round-tripping) — with "canonical" meaning, this
-    // slice, "byte-for-byte what the author wrote".
+    // every file holding a block. S3 replaces it with the real printer: one item
+    // per line, nested rules at +1, and the block's items in the SAME canonical
+    // order the chain sorter gives the chain it desugars to.
+    //
+    // Every form below is pinned through `assert_construct`, which asserts the
+    // whole contract at once: the output re-lexes to the same tokens as the
+    // input (module the canonical orders `normalize` folds in), the formatter did
+    // not silently bail, the output is the canonical spelling, formatting is
+    // idempotent, and the canonical form round-trips unchanged. The bail set
+    // itself stays asserted empty over the whole corpus by
+    // `parse_differential::formatter_never_silently_bails` — that gate is the
+    // real one.
 
     #[test]
-    fn a_css_block_reprints_verbatim() {
+    fn a_css_block_prints_one_declaration_per_line() {
+        // A hole is an ordinary vilan expression and canonicalizes as one; the
+        // value text around it is CSS and does not.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tgap: {space( 4 )};\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tgap: {space( 4 )};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay:flex;\n\t\tgap: {space( 4 )};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t}\n}\n",
         );
     }
 
     #[test]
-    fn a_css_block_survives_reformatting_around_it() {
-        // The code OUTSIDE the block canonicalizes; the block's own interior —
-        // including a hole's inner spacing, which S3 will normalize — does not.
+    fn a_one_declaration_block_collapses_onto_its_line() {
+        // The `let active = const css { padding: {space(6)}; };` shape (§2):
+        // one declaration, no comment, and it fits — so it stays on the line.
         assert_construct(
             "fun f(){let a=css{color:red;};a}\n",
-            "fun f() {\n\tlet a = css{color:red;};\n\ta\n}\n",
+            "fun f() {\n\tlet a = css { color: red; };\n\ta\n}\n",
         );
     }
 
     #[test]
-    fn a_nested_css_rule_reprints_verbatim() {
+    fn an_empty_block_prints_as_a_pair_of_braces() {
+        assert_construct("fun f() {\n\tcss {\n\t}\n}\n", "fun f() {\n\tcss {}\n}\n");
+    }
+
+    #[test]
+    fn a_nested_rule_always_takes_its_own_lines() {
+        // A rule whose declarations share its line is not CSS, so a nested body
+        // never collapses — not even the one-declaration one the OUTER block
+        // would have collapsed. The head's arguments print as any call's do.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss { .within(\"data-theme\",\"dark\") { color: red; } }\n}\n",
             "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n",
         );
     }
 
     #[test]
-    fn a_comment_inside_a_css_block_is_printed_once() {
-        // The slice already carries the comment, so the comment cursor is
-        // advanced past the block without emitting — flushing it again would
-        // print it twice, which the token net cannot catch (comments are not
-        // tokens).
-        let source = "fun f() {\n\tcss {\n\t\t// a note\n\t\tcolor: red;\n\t}\n}\n";
+    fn a_block_sorts_into_the_canonical_order() {
+        // Properties in Tailwind's category sequence, then conditions in the
+        // axis order the selector nests them — the chain's order, reached
+        // through the chain's own tables: `padding` (spacing) after `display`
+        // (layout), `.md` (media) before `.hover` (pseudo), every condition
+        // after every declaration.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tcolor: blue;\n\t\t}\n\t\tpadding: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t\tdisplay: flex;\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t\t.hover {\n\t\t\tcolor: blue;\n\t\t}\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_unknown_property_is_a_barrier_nothing_crosses() {
+        // `raw`'s escape hatch reaches the block whole, so a property no row
+        // writes — a vendor property, a custom property — cannot be ranked and
+        // holds its index absolutely, exactly as an unknown METHOD does in a
+        // chain. `padding` may not cross it to reach `display`.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t--brand-ink: red;\n\t\tdisplay: flex;\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t--brand-ink: red;\n\t\tdisplay: flex;\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn entangled_properties_keep_their_written_order() {
+        // The rule that makes the reorder SAFE. `padding` and `padding-left`
+        // are one family, so they share a rank and a stable sort can never swap
+        // them — `padding-left` then `padding` means something the reverse does
+        // not. `display` still crosses both, because its slot is independent.
+        //
+        // The LONGHAND is written first on purpose. Rank a property by its own
+        // row's index rather than by its FAMILY's — the plausible mistake, since
+        // `padding-left` is first written by the `padding_x` row — and the two
+        // swap, which is exactly the miscompile the family rule exists to
+        // prevent. Written the other way round this pin would pass either way.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tpadding-left: {space(6)};\n\t\tpadding: {space(4)};\n\t\tdisplay: flex;\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding-left: {space(6)};\n\t\tpadding: {space(4)};\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_nested_rules_own_items_sort_too() {
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tpadding: {space(4)};\n\t\t\tdisplay: flex;\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tdisplay: flex;\n\t\t\tpadding: {space(4)};\n\t\t}\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_block_holding_a_comment_is_never_reordered() {
+        // Refused outright. A permuted body would carry its comments to the
+        // wrong item — the comment cursor only moves forward — so a block with
+        // a comment anywhere inside it prints canonically in WRITTEN order.
+        // `padding` would otherwise sort after `display`.
+        let source = "fun f() {\n\tcss {\n\t\t// a note\n\t\tpadding: {space(4)};\n\t\tdisplay: flex;\n\t}\n}\n";
         assert_construct(source, source);
         assert_eq!(format(source).matches("// a note").count(), 1);
+        // Anti-vacuity, built the way
+        // `a_declarations_chain_is_never_reordered_by_the_style_chain_sort` was:
+        // the SAME body without the comment must reorder, or this pin would pass
+        // on a body that was canonical all along.
+        let commentless = source.replace("\t\t// a note\n", "");
+        assert_eq!(
+            format(&commentless),
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "the fixture must be out of canonical order, or the refusal proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_comment_in_a_nested_rule_pins_the_whole_block() {
+        // The refusal is by the block's own braces, so a comment buried in a
+        // nested rule pins the outer body too: reordering around it would move
+        // the rule the comment is inside away from the comment above it.
+        let source = "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\t// a note\n\t\t\tcolor: red;\n\t\t}\n\t\tdisplay: flex;\n\t}\n}\n";
+        assert_construct(source, source);
+    }
+
+    #[test]
+    fn a_comment_attaches_to_the_item_it_precedes() {
+        // Attachment is by ITEM SPAN, the anchor the parser carried from the
+        // first commit — so a comment written above the second declaration
+        // prints above the second declaration, not below the statement.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// about the padding\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// about the padding\n\t\tpadding: {space(4)};\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_after_the_last_item_stays_inside_the_braces() {
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// trailing\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// trailing\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_blank_line_between_declarations_does_not_survive() {
+        // Paragraph gaps are trivia here. A sorted body's gaps would land
+        // between items that no longer belong together, so the block has one
+        // shape: item, item, item.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t}\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_mixed_value_keeps_its_own_spacing() {
+        // A value is CSS, not vilan: the text between holes is a source slice,
+        // because respacing it would rewrite the bytes inside a `url("a  b")`.
+        // Only the holes canonicalize.
+        assert_construct(
+            "fun f() {\n\tcss {\n\t\tpadding: calc({ a } + 2px);\n\t\tbackground-image: url(\"tile.png\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding: calc({a} + 2px);\n\t\tbackground-image: url(\"tile.png\");\n\t}\n}\n",
+        );
     }
 
     #[test]
     fn a_css_block_mixes_with_a_style_chain_in_one_file() {
-        // The chain sorter's two gates (`starts_style_builder` on tokens,
-        // `is_style_builder` on the AST) do not fire on a block — the formatter
-        // reparses source and never sees the desugar, and there is no
-        // `style ( )` token run in it — so the chain beside it sorts and the
-        // block does not. S3 gives the block its own canonical order.
+        // Two spellings, one canonical order — which is the whole reason the
+        // block sorts (§8). The chain sorter's gates still do not fire on a
+        // block (the formatter reparses SOURCE and there is no `style ( )` token
+        // run in one); the block has its own pair, reading the same tables.
         assert_construct(
-            "fun f() {\n\tlet a = style().padding(x).display(y);\n\tlet b = css { color: red; };\n\tb\n}\n",
-            "fun f() {\n\tlet a = style().display(y).padding(x);\n\tlet b = css { color: red; };\n\tb\n}\n",
+            "fun f() {\n\tlet a = style().padding(x).display(y);\n\tlet b = css {\n\t\tpadding: x;\n\t\tdisplay: y;\n\t};\n\tb\n}\n",
+            "fun f() {\n\tlet a = style().display(y).padding(x);\n\tlet b = css {\n\t\tdisplay: y;\n\t\tpadding: x;\n\t};\n\tb\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_block_inside_an_element_head_prints_canonically() {
+        // The two sugars compose: a block in a head item is still a block.
+        assert_construct(
+            "fun f() {\n\t<div .styled(const css{color:red;}) />\n}\n",
+            "fun f() {\n\t<div .styled(const css { color: red; }) />\n}\n",
         );
     }
 
@@ -8298,8 +8866,8 @@ mod style_chain_order {
     //! proves the reorder leaves the emitted CSS byte-identical.
     use super::bailing_constructs::assert_construct;
     use super::{
-        STYLE_BARRIER_METHODS, STYLE_CONDITION_METHODS, STYLE_PROPERTY_METHODS, format,
-        style_chain_permutation,
+        STYLE_BARRIER_METHODS, STYLE_CONDITION_METHODS, STYLE_PROPERTY_METHODS, css_item_rank,
+        format, style_chain_permutation, style_link_rank,
     };
 
     // --- The ruling: Tailwind's category order -------------------------------
@@ -8579,6 +9147,72 @@ mod style_chain_order {
             "let s = const (style().color(a).display(b) + base);\n",
             "let s = const (style().display(b).color(a) + base);\n",
         );
+    }
+
+    // --- One order, two spellings (css-block.md §8, S3) ----------------------
+
+    /// The block does not get a table. It gets the SAME rows, read by the CSS
+    /// property they write instead of by the method name that writes it — so a
+    /// declaration and the typed method it could have been spelled as rank
+    /// identically, for every row in the table.
+    ///
+    /// This is what makes `css { padding: x; display: y; }` and
+    /// `style().padding(x).display(y)` format into the same order. If the two
+    /// ever disagree, one canonical style would have two canonical spellings.
+    #[test]
+    fn a_declaration_ranks_exactly_where_its_typed_method_does() {
+        for method in STYLE_PROPERTY_METHODS {
+            let by_method = style_link_rank(method.name);
+            assert!(
+                by_method.is_some(),
+                "{} is in the property table but does not rank",
+                method.name
+            );
+            for property in method.properties {
+                assert_eq!(
+                    css_item_rank(false, property),
+                    by_method,
+                    "the block ranks `{property}` somewhere other than where the chain ranks \
+                     `{}`, so the two spellings would format differently",
+                    method.name
+                );
+            }
+        }
+    }
+
+    /// A dotted item reads the condition table, and reads it whole.
+    #[test]
+    fn a_nested_rule_ranks_exactly_where_its_combinator_does() {
+        for (condition, _) in STYLE_CONDITION_METHODS {
+            assert_eq!(
+                css_item_rank(true, condition),
+                style_link_rank(condition),
+                "the block ranks `.{condition}` somewhere other than where the chain ranks it"
+            );
+        }
+    }
+
+    /// The dot is the disambiguator on this side too. A condition NAME in
+    /// property position is not a property, and a property name in dotted
+    /// position is not a condition — both are barriers, so neither can be
+    /// mistaken for the other and reordered across something it depends on.
+    #[test]
+    fn the_dot_decides_which_table_an_item_reads() {
+        assert_eq!(css_item_rank(false, "hover"), None);
+        assert_eq!(css_item_rank(true, "padding"), None);
+        // …and a property no row writes is a barrier, which is `raw`'s escape
+        // hatch surviving into the block whole.
+        assert_eq!(css_item_rank(false, "-webkit-mask-composite"), None);
+        assert_eq!(css_item_rank(false, "--brand-ink"), None);
+    }
+
+    /// A `Style` method's name is not a CSS property, and the block must not
+    /// accidentally rank one as if it were: `flex_direction` is spelled
+    /// `flex-direction` in CSS, and only the hyphenated form ranks.
+    #[test]
+    fn a_method_name_is_not_a_css_property() {
+        assert_eq!(css_item_rank(false, "flex_direction"), None);
+        assert!(css_item_rank(false, "flex-direction").is_some());
     }
 
     // --- Idempotence ---------------------------------------------------------

@@ -302,7 +302,7 @@ postfix = "." member
 atom    = literal | IDENT | IDENT generic-args
         | "(" expression ")" | tuple | list
         | tuple-comprehension | macro-invocation | macro-block
-        | element ;
+        | element | css-block ;
 tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
 entry   = spread | expression ;
 spread  = ".." expression ;
@@ -317,6 +317,17 @@ head-item    = "." member                          (* a chain link, verbatim *)
                                           (* attribute; bare name = boolean *)
 element-name = NAME { "-" NAME } ;   (* NAME: an identifier or any keyword *)
 child        = element | STRING | ISTRING | "{" expression "}" ;
+
+css-block    = "css" css-body ;        (* atom position; excluded in conditions *)
+css-body     = "{" { css-item } "}" ;
+css-item     = css-declaration | css-rule ;
+css-declaration = css-property ":" css-value ";" ;
+css-property = { "-" } element-name ;  (* span-adjacent, as an element name is *)
+css-rule     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
+               css-body ;
+css-value    = css-piece { css-piece } ;   (* to the ";" at brace depth 0 *)
+css-piece    = "{" expression "}"          (* a hole *)
+             | TOKEN ;                     (* any token but ";", "{", "}" *)
 ```
 
 `Name<Args>` is read as a generic path head only when `::` immediately
@@ -352,6 +363,34 @@ view chain (`view("tag")` with one method call per head item and a
 `.child(…)` per child), and postfix suffixes apply to it
 (`<div />.show(flag)`).
 
+A **`css` block** is the same shape on the style side, and it appears in
+atom position too — but where an element occupies grammar space nothing
+else could want, a `css` block is **brace-initial**, so it is excluded
+from condition operands exactly as a struct initializer is (§3.8).
+`css` is a reserved word (lexical spec §2.2); the block is the keyword
+followed immediately by `{`.
+
+Inside the body the **dot decides, and decides alone**: an undotted item
+is a *declaration* and a dotted one is a *condition rule*, so the
+grammar never consults any method list and a method added to `Style`
+cannot change what an existing block means. A property name is a
+span-adjacent name-`-`-name run, the element-name rule (so
+`flex-direction` is three tokens and `--color-ink` is five, while
+`data - id` is arithmetic). The `;` is **required** after every
+declaration, the last one included: the formatter may never invent a
+token, and a required terminator makes value scanning decidable in one
+pass. A value is a run of tokens and `{expression}` holes — there is no
+typed value grammar, and typed values arrive through the holes. A
+condition rule's parenthesized arguments are ordinary expressions
+(`.within("data-theme", "dark") { … }`).
+
+Like an element, a block is an ordinary expression that desugars before
+analysis — to the `std::style` chain: `style()`, then `.raw(property,
+value)` per declaration and `.name(args…, style() … )` per condition
+rule, with the rule's own chain appended as the final argument, in
+written order. `#` and `@` do not lex at all, so there are no hex
+literals and no at-rules inside one (lexical spec §2.4).
+
 ## 3.7 Operator precedence
 
 From tightest to loosest; every binary level is left-associative:
@@ -382,7 +421,7 @@ expression     = "const" expression        (* weak prefix: captures to the end *
 secondary-expr = closure | block | if-expr | for-expr | match-expr
                | jump | let | ret | assignment
                | operator-expr ;           (* §3.7 levels 1–12 *)
-condition-expr = secondary-expr ;          (* struct-init excluded from operands *)
+condition-expr = secondary-expr ;    (* struct-init and css-block excluded *)
 
 struct-init   = IDENT [ generic-args ]
                 "{" [ init-field { "," init-field } [ "," ] ] "}" ;
@@ -400,7 +439,10 @@ Two consequences of the tier split are normative:
   condition, a `for … in` iterable, and a `match` subject parse
   `condition-expr`, whose operands exclude struct initializers, so the
   `{` after `if Foo` is the block. Parenthesize a literal to use it in a
-  condition (`if p == (Point { x = 1 }) { … }`).
+  condition (`if p == (Point { x = 1 }) { … }`). A **`css` block**
+  (§3.6) is brace-initial for the same reason and is excluded in the
+  same three places, with the same escape: `if (css { … }).class_list()
+  != "" { … }`.
 - `const` captures **weakly**: everything to the end of the expression
   (up to the enclosing bracket or comma) folds; parenthesize to narrow
   (§9).

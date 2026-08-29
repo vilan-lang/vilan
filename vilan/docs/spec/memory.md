@@ -74,7 +74,10 @@ no claims; rule 3 (§6.3) is the static column's interval requirement; rule
 4 (§6.4) is the static invalidation cell; `borrows` (§6.5) makes a claim's
 origin explicit; the escape hatches (§6.7) are the dynamic column; and
 resources (§6.8) are the static **death** cell, where use-after-move is the
-compile-time twin of a stale handle's `None`.
+compile-time twin of a stale handle's `None`. §6.9 is the one section
+outside the table: a closure capture aliases a *binding* rather than a
+place inside an owner, so it is not a claim, and its rule is which of
+this chapter's values may take part.
 
 ## 6.1 Rule 1 — values are copied; copies are semantic
 
@@ -213,6 +216,9 @@ that is itself a **view** (`Some(let v)` over an `Option<&mut T>`) takes none
 either, for the reason a view exists: it aliases on purpose, and copying it
 would mean writes through it stopped reaching the value it borrows.
 
+All of this is the **pattern** capture. A **closure** capture is a different
+mechanism and copies nothing at all: §6.9.
+
 ## 6.2 Rule 2 — elision is an optimization, never observable
 
 An implementation may skip a copy (reuse the storage) when no conforming
@@ -234,8 +240,8 @@ deliberately second-class; a view may not outlive the thing it views:
   carry the same convention.
 - A view may **not** be stored in a struct field, a collection element,
   or a `Signal`/`Shared` payload; may not be returned except through a
-  `borrows` projection; may not be captured by a closure that outlives
-  the place; may not cross an `await` (§6.6).
+  `borrows` projection; may not be **captured by a closure** (§6.9); may
+  not cross an `await` (§6.6).
 
 Mutating through a view writes the viewed place; reading its value
 requires an explicit `*`. A view in **value position** (passed where a
@@ -431,6 +437,15 @@ references above.
 existing second-class view (`self` / `&` / `&mut` conventions, §6.3), which
 changes no ownership and is policed by rule 4.
 
+*A note on the numbering, because two of them collide.* R1–R12 below are the
+**affine** rules — they are about ownership, and every one of them is about a
+resource. The design record carries a second, unrelated R1–R8 in
+[transparent references](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/transparent-references.md), the **view**
+surface §6.3 states here; the two namespaces are disjoint and R7 means "no
+conditional moves" in one and "no rebinding a view" in the other. Where a
+discussion spans both, write **mR7** for this section's and **tR7** for the
+view surface's. Unqualified `R`*n* on this page always means the affine rule.
+
 - **R1: binding moves.** `let b = a;` transfers ownership; any later use of
   `a` is a compile error naming the move site. No copies ever fire for a
   resource.
@@ -469,6 +484,15 @@ changes no ownership and is policed by rule 4.
   pointee out (R5, R6), and a binding its owner already moved out of is dead,
   so lending it is use-after-move (R1). The drop runs the same per-type glue
   in the same order the owned spelling does.
+
+  **The new value is computed before the old one is destroyed.** "Drops the
+  old value first" orders the destructor against the *write*, not against the
+  right-hand side's own evaluation: the assignment evaluates its new value,
+  then destroys what the place holds, then stores. So a right-hand side that
+  panics leaves the place holding its original value — still live, still
+  owned, and dropped exactly once at the scope end — rather than a value the
+  overwrite had already destroyed. Where the right-hand side has effects of
+  its own, they are observable before the outgoing value's `drop` body runs.
 
   The rule is read over the **place**, all the way down: writing over a
   resource-typed *component* — a field, a tuple element, a fixed-array
@@ -654,19 +678,46 @@ resource mechanism).
 
 ### Drop timing and order
 
-At the owner's scope end, still-owned resource locals drop in **reverse
-declaration order** — a pattern capture (R6) counts as a local of the arm
-that bound it, declared before that arm's own statements and so destroyed
-after them. A value's own `drop` body runs **before its fields**,
-and the fields drop in reverse field order; an enum's payload drops with the
-value. **Every exit runs drops**: fall-through, `ret`, `jump break`, `jump
-continue` (out of the scopes they leave), and panic unwinding, because a
-resource-owning scope lowers to a `try`/`finally` and every exit flows
-through the `finally`. Concrete `own` resource *parameters* drop at scope
-end like locals (a generic `own T` is required to move out instead, per
-R11) — and the same split holds for pattern captures: a concrete one drops
-at its arm's end, while inside a generic body no `T`-typed capture may be
-left owning at all.
+*(amended 2026-08-28 — disposal moved from scope end to last use;
+`proposal/lifetimes.md` §6. The previous law read "at the owner's scope
+end, still-owned resource locals drop in reverse declaration order".)*
+
+A still-owned resource is destroyed **after its last use** — the last
+statement of its declaring scope that reads it — and **simultaneous
+discharges run in reverse declaration order**, so two resources last read
+in the same statement are destroyed second-declared-first, as they always
+were. A pattern capture (R6) counts as a local of the arm that bound it,
+declared before that arm's own statements. A value's own `drop` body runs
+**before its fields**, and the fields drop in reverse field order; an
+enum's payload drops with the value. **Every exit runs drops**:
+fall-through, `ret`, `jump break`, `jump continue` (out of the scopes they
+leave), and panic unwinding, because the region between an acquisition and
+its last use lowers to a `try`/`finally` and every exit flows through the
+`finally`. Concrete `own` resource *parameters* drop at their last use like
+locals (a generic `own T` is required to move out instead, per R11) — and
+the same split holds for pattern captures: a concrete one drops at its
+last use, while inside a generic body no `T`-typed capture may be left
+owning at all.
+
+Three clauses make "its last use" total:
+
+- **Nothing reads it ⇒ it drops at its declaration.** A handle the program
+  never names again is released immediately, not at a scope end that a
+  `main` which never returns would never reach. Binding a value is how the
+  language says *keep this*; reading it is how it says *still*.
+- **A loan extends its owner.** A view keeps the storage it names alive to
+  the view's OWN last use, so an owner is never destroyed under a live
+  projection. `let v = &mut holder; use(v)` holds `holder` to `use(v)`,
+  even though `holder`'s own last read was the `&mut`.
+- **A last use inside a branch or a loop is the branch's or the loop's.**
+  The drop lands at the join, which every path reaches, so the arm that
+  read the resource and the arm that did not both release exactly once —
+  and no runtime flag decides which (R7's doctrine, intact).
+
+Where the compiler cannot stand behind an answer — a binding read from
+more than one region, a loan it cannot follow to its end — the resource
+keeps the **scope-end** teardown, which is the previous law. The fallback
+is never a guess.
 
 - **A loan takes no teardown.** Only an owner destroys. A view *binding* of a
   resource (`let v = &mut holder`) names storage another binding still owns,
@@ -687,8 +738,63 @@ left owning at all.
   about *loans*, not ownership. Under cancellation a bridged operation
   rejects, the frame unwinds, and drops run.
 - **Exit after finally.** When a value-returning `main` owns a resource, its
-  process exit is sequenced *after* the teardown `finally` runs, so scope-end
-  drops are never skipped by process termination.
+  process exit is sequenced *after* the teardown `finally` runs, so drops are
+  never skipped by process termination.
+
+### Temporaries
+
+*(added 2026-08-28 — `proposal/temporary-drop.md`, backlog C11. A resource
+born and consumed inside one expression was previously neither destroyed nor
+rejected.)*
+
+A resource-typed value that is neither bound nor moved is an **owning
+temporary**: it is owned by the statement in which it is constructed, and
+destroyed at that statement's end, before any enclosing scope's drops and in
+reverse construction order among the temporaries of that statement. This is
+the same law read at its narrowest — a temporary's last use *is* its
+statement.
+
+```vilan,fragment
+print(File::open(path).stat().size);   // the handle closes here
+let held = File::open(path);           // this one lives to ITS last use
+print(held.stat().size);
+```
+
+A resource that is bound (`let f = …`) or moved (into an `own` parameter,
+into `drop`, into `ret`, into an aggregate) is not a temporary and is
+unaffected. `try`/`finally` is emitted per resource-owning scope **or
+statement**; only scopes and statements that own resources pay.
+
+**R7, extended to temporaries.** A resource temporary must be constructed on
+every path through its drop region or on none. A resource constructor on a
+conditionally-evaluated operand — the right of `&&` or `||` — is rejected:
+there is no statement that can destroy it, and the alternative would be v1's
+first runtime drop flag. This refuses a *spelling*, never a program; the fix
+is a `let`, and the diagnostic names it. A branch arm needs no such refusal:
+an arm is a scope with statements of its own, so a temporary there has a
+statement to belong to.
+
+### Externs and retention
+
+*(added 2026-08-28 — `proposal/lifetimes.md` §6.4.)*
+
+An `[extern]` receives loans under the same conventions any function does
+(R3), and those loans are **call-bounded**: the compiler assumes the host
+reads what it is handed only until the call returns, which is what lets the
+caller's binding be destroyed at its last use. A host that *keeps* what it
+is handed — an event listener, a stashed value, a request body — breaks that
+assumption, so the declaration must say so:
+
+```vilan,fragment
+[extern(method, "addEventListener", retains)]
+external fun on(self, event: str, handler: || void): void;
+```
+
+`retains` is a trailing flag on the `[extern(..)]` attribute, and it
+composes with every binding form. An argument to a retaining extern keeps
+its liveness for the whole of its binding's scope — the conservative
+envelope. Module-level bindings are exempt by construction: they never drop
+at all.
 
 ### `Option.take` and `Option.replace`
 
@@ -723,6 +829,12 @@ a still-abstract type `T` has no concrete destructor (a generic body is
 emitted once, erased), so R11 rejects it **under a resource instantiation**
 ("whose erased body has no concrete destructor; destroy at a concrete type, or move the value out to the caller"); a data
 instantiation keeps the legitimate no-op consume.
+
+`drop(x)` moves the teardown earlier; it does not remove the scope's safety
+net. The owner's scope end still covers the window between the acquisition
+and the `drop(x)`, so a panic that never reaches the explicit call releases
+the resource on the way out exactly as an implicit scope-end drop would — and
+the two never both fire, so a fall-through path destroys exactly once.
 
 ### `OwnedNursery`
 
@@ -774,3 +886,79 @@ The following are recorded limits the model does not promise, not bugs:
   A cross-file instantiation may anchor its *primary* span imprecisely (the
   body note carries the correct source). A module-*initializer* global →
   global move is not scanned (benign, since module globals never drop).
+
+## 6.9 Closures capture bindings
+
+*(Design: [the lifetime model](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lifetimes.md) §4.)*
+
+**A closure captures bindings, not values.** A captured binding is the
+same binding: a write on either side is visible on the other, and a later
+**rebinding** is visible through the capture. This is the one alias in
+the chapter that is not a claim (§6.0) and needs no hatch: the
+environment holds the binding itself, not a path into an owner, so there
+is no epoch to outlive.
+
+Read against §6.1 the contrast is exact, and it is the whole rule. A
+**pattern** capture is a binding, so it copies, and it copies at the
+moment the pattern matches. A **closure** capture is not a new binding at
+all, so it copies nothing and has no moment to copy at:
+
+```vilan
+import std::print;
+
+fun main() {
+	mut label = "before";
+	let show = || label;      // captures the binding, not "before"
+	label = "after";          // a rebinding installs a fresh value
+	print(show());            // after — the capture is the same binding
+}
+```
+
+§6.1's other three spellings behave the same way through a capture, where
+a pattern capture sees none of them: an assignment through a view, a
+component write (`box.n = 9`), and a `&mut self` call all reach the
+captured binding.
+
+The one copy a closure takes is §6.1's **return** copy, and a closure
+takes it **per call**: a place the closure returns, rooted at a binding it
+did not declare, is storage the closure's own frame does not own, so the
+return copies it out. `|| items` hands back an independent list on every
+call, and pushing to one is invisible to `items` and to the next call's.
+
+Three kinds of value do not take part, each for a reason already stated
+elsewhere:
+
+- **A resource may not be captured** (§6.8's R9): the capture would be a
+  second owner. A closure that *references* a module-level resource loans
+  it per call instead — a loan is not a capture.
+- **An ambient context value is snapshotted when the closure is
+  created** (§8.4) — the one true capture-time copy in the language, so a
+  deferred body reads the context it was written in rather than the one
+  it happens to run in.
+- **A view may not be captured** (§6.3). A view is second-class and a
+  closure is not: the closure may outlive the frame its place lives in,
+  and lexical liveness — the surveyable interval §6.0's static regime
+  proves against — says nothing about when a closure body runs. The two
+  ways to write the same code are to read the value out (`*v`) before the
+  closure, or to take the view as a closure **parameter**, which is a
+  per-call loan exactly like a function's. The enclosing function's own
+  `&`/`&mut` **parameter** may be named inside a closure — it views the
+  *caller's* place, which outlives the call — but that closure is then
+  second-class itself and may not escape, by §6.3's list read of the
+  closure.
+
+A closure's environment keeps the bindings it captured alive for as long
+as the closure itself lives, which is why the three exclusions are the
+shape they are: what an environment cannot carry is a *claim* — a path
+into an owner it does not hold. Two closures that must share mutable
+state neither of them declared hold a `Shared` cell (§6.7), which aliases
+by design and survives every copy the model takes; capture is not a
+substitute for it, and not a hatch.
+
+**Honesty limit.** The view exclusion is enforced at the capture for view
+*bindings* and by the escape rule for a captured view *parameter*, and
+the escape rule does not follow a closure through an ordinary call: a
+closure over a `&mut` parameter, handed to a function that stores it,
+leaves the frame whose place the view names. Nothing in std does this,
+and the shape needs the closure-escape analysis §6.4's dynamic remainder
+is future work for.

@@ -50,6 +50,9 @@ use vilan_core::token::Token;
 const STYLE_SOURCES: &[&str] = &[
     "vilan/test/style.vl",
     "vilan/test/theme.vl",
+    // Both spellings in one file: the `css` blocks the block sorter orders, and
+    // the chain twin they are pinned byte-identical against.
+    "vilan/test/css-block.vl",
     "vilan/examples/todo/src/todos.vl",
     "vilan/examples/walkthrough/src/views.vl",
     "crates/vilan-cli/templates/browser/counter.vl",
@@ -285,6 +288,25 @@ fn project_root(source: &Path, root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// A scratch directory nothing else in this binary can be using.
+///
+/// The process id ALONE is not enough, and the failure it produced is worth
+/// recording: two tests here sweep the same fixture list, nextest runs them
+/// concurrently in ONE process, and the second one's `remove_dir_all` deleted
+/// the tree the first was mid-build in ("copy a file: NotFound"). The counter is
+/// what makes each call's tree its own.
+fn scratch_directory(label: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "{label}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    directory
+}
+
 fn build_both_ways(relative: &str) -> Twins {
     let root = repo_root();
     let source = root.join(relative);
@@ -300,12 +322,10 @@ fn build_both_ways(relative: &str) -> Twins {
     let inner = source
         .strip_prefix(&tree)
         .expect("the fixture sits under its own tree");
-    let temporary = std::env::temp_dir().join(format!(
-        "vilan-style-order-{}-{}",
-        std::process::id(),
+    let temporary = scratch_directory(&format!(
+        "vilan-style-order-{}",
         relative.replace(['/', '.'], "-")
     ));
-    let _ = std::fs::remove_dir_all(&temporary);
     let written_dir = temporary.join("written");
     let sorted_dir = temporary.join("sorted");
     copy_tree(&tree, &written_dir);
@@ -433,6 +453,13 @@ fn every_tracked_fixture_is_already_in_canonical_order() {
             "{relative} carries a `style()` chain that is not in canonical order — run \
              `vilan fmt` on it."
         );
+        // The block spelling's half of the same gate (css-block.md §8, S3).
+        assert_eq!(
+            vilan_core::formatter::sort_css_blocks(plain.clone()),
+            plain,
+            "{relative} carries a `css` block whose items are not in canonical order — run \
+             `vilan fmt` on it."
+        );
     }
 }
 
@@ -511,42 +538,124 @@ const ORDER_SENSITIVE: &str = concat!(
     "main();\n",
 );
 
-#[test]
-fn an_order_sensitive_fixture_resolves_the_same_slots() {
-    let temporary = std::env::temp_dir().join(format!(
-        "vilan-style-order-sensitive-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&temporary);
+/// One deliberately-unsorted fixture, built as written and built formatted.
+/// Refuses to run on a fixture the formatter leaves alone — a fixture that does
+/// not reorder proves nothing.
+fn order_sensitive_twins(label: &str, fixture: &str) -> Twins {
+    let temporary = scratch_directory(&format!("vilan-style-order-sensitive-{label}"));
     let written_dir = temporary.join("written");
     let sorted_dir = temporary.join("sorted");
     std::fs::create_dir_all(&written_dir).expect("create the written directory");
     std::fs::create_dir_all(&sorted_dir).expect("create the sorted directory");
     let written_source = written_dir.join("sensitive.vl");
     let sorted_source = sorted_dir.join("sensitive.vl");
-    let formatted = vilan_core::formatter::format(ORDER_SENSITIVE);
+    let formatted = vilan_core::formatter::format(fixture);
     assert_ne!(
-        formatted, ORDER_SENSITIVE,
-        "the order-sensitive fixture did not reorder, so it proves nothing"
+        formatted, fixture,
+        "the {label} order-sensitive fixture did not reorder, so it proves nothing"
     );
-    std::fs::write(&written_source, ORDER_SENSITIVE).expect("write the fixture");
+    std::fs::write(&written_source, fixture).expect("write the fixture");
     std::fs::write(&sorted_source, &formatted).expect("write the sorted twin");
 
-    let written = build(&written_source, &written_dir, false)
-        .unwrap_or_else(|error| panic!("the order-sensitive fixture did not build:\n{error}"));
+    let written = build(&written_source, &written_dir, false).unwrap_or_else(|error| {
+        panic!("the {label} order-sensitive fixture did not build:\n{error}")
+    });
     let sorted = build(&sorted_source, &sorted_dir, false)
-        .unwrap_or_else(|error| panic!("the sorted twin did not build:\n{error}"));
+        .unwrap_or_else(|error| panic!("the {label} sorted twin did not build:\n{error}"));
     let _ = std::fs::remove_dir_all(&temporary);
+    Twins { written, sorted }
+}
 
+#[test]
+fn an_order_sensitive_fixture_resolves_the_same_slots() {
+    let twins = order_sensitive_twins("chain", ORDER_SENSITIVE);
     assert_eq!(
-        written.1, sorted.1,
+        twins.written.1, twins.sorted.1,
         "the canonical order changed the emitted CSS of the order-sensitive fixture"
     );
     assert_eq!(
-        sort_map_entries(&written.0),
-        sort_map_entries(&sorted.0),
+        sort_map_entries(&twins.written.0),
+        sort_map_entries(&twins.sorted.0),
         "the canonical order changed which slots resolve in the order-sensitive fixture — a \
          dependent pair crossed. This is the fixture the family and barrier rules exist for."
+    );
+}
+
+/// The same demonstration for a `css` BLOCK (proposal/css-block.md §8, S3). The
+/// block sorts by the same order function, reading the same tables through the
+/// CSS property names its declarations write — so it needs the same proof, in
+/// the same adversarial shapes, or the derivation from `properties` to `family`
+/// would be an argument rather than a fact.
+///
+/// The one shape the chain fixture cannot carry: in a chain, `raw` is a BARRIER,
+/// so nothing crosses a shorthand written as `.raw("padding", …)`. In a block
+/// the property is a token, so `padding:` really does rank — which is what makes
+/// the entangled-pair cases below load-bearing here in a way they are not there.
+const CSS_ORDER_SENSITIVE: &str = concat!(
+    "import std::print;\n",
+    "import std::style::{ Color, Length, space, style };\n",
+    "\n",
+    "fun main() {\n",
+    // The shorthand LAST wins the whole box; the longhand last wins one edge.
+    // Both must survive the sort, and only the family rule makes them.
+    "\tlet a = const css { color: {Color::gray(900)}; padding-left: {space(1)}; ",
+    "padding: {space(4)}; };\n",
+    "\tlet b = const css { color: {Color::gray(900)}; padding: {space(4)}; ",
+    "padding-left: {space(1)}; };\n",
+    // `size` writes width and height; `width` writes one of them. In a block
+    // there is no `size` property, so the pair is `width`/`height` themselves.
+    "\tlet c = const css { gap: {space(2)}; width: 32px; height: 16px; };\n",
+    // `border-color` is one of `border`'s longhands.
+    "\tlet e = const css { display: flex; border-color: {Color::gray(300)}; ",
+    "border: 1px solid {Color::gray(500)}; };\n",
+    "\tlet f = const css { display: flex; border: 1px solid {Color::gray(500)}; ",
+    "border-color: {Color::gray(300)}; };\n",
+    // A property the table does not write is a BARRIER: `padding-top` must not
+    // cross it to reach `display`, or the vendor rule stops landing where it was
+    // written.
+    "\tlet h = const css { padding-top: {space(1)}; -webkit-mask-composite: source-in; ",
+    "display: flex; color: {Color::gray(900)}; };\n",
+    // Conditions sort after every declaration, and among themselves by axis —
+    // media, relation, attribute, pseudo — which is the order the selector nests
+    // them in, so a wrong axis would change what the rule matches.
+    "\tlet i = const css {\n",
+    "\t\t.hover { color: {Color::gray(50)}; }\n",
+    "\t\tpadding: {space(2)};\n",
+    "\t\t.within(\"data-theme\", \"dark\") { color: {Color::gray(100)}; }\n",
+    "\t\tdisplay: flex;\n",
+    "\t\t.md { padding: {space(6)}; }\n",
+    "\t};\n",
+    // A nested rule's own body sorts too, with the same rules inside it.
+    "\tlet j = const css {\n",
+    "\t\t.hover { padding-left: {space(1)}; padding: {space(4)}; display: flex; }\n",
+    "\t};\n",
+    "\tprint(a.class_list());\n",
+    "\tprint(b.class_list());\n",
+    "\tprint(c.class_list());\n",
+    "\tprint(e.class_list());\n",
+    "\tprint(f.class_list());\n",
+    "\tprint(h.class_list());\n",
+    "\tprint(i.class_list());\n",
+    "\tprint(j.class_list());\n",
+    "}\n",
+    "main();\n",
+);
+
+#[test]
+fn an_order_sensitive_css_block_resolves_the_same_slots() {
+    let twins = order_sensitive_twins("css-block", CSS_ORDER_SENSITIVE);
+    assert_eq!(
+        twins.written.1, twins.sorted.1,
+        "the canonical order changed the emitted CSS of the order-sensitive `css` block fixture. \
+         Class names are content hashes of the slot and the declaration, so a moved hash means a \
+         block rendered differently."
+    );
+    assert_eq!(
+        sort_map_entries(&twins.written.0),
+        sort_map_entries(&twins.sorted.0),
+        "the canonical order changed which slots resolve in the order-sensitive `css` block \
+         fixture — a dependent pair crossed. The block ranks a declaration by the CSS PROPERTY it \
+         writes, so this is where the `properties`-to-`family` derivation is proved."
     );
 }
 

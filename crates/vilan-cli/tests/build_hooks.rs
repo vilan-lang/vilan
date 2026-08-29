@@ -216,6 +216,67 @@ fn a_deleted_output_reruns_the_hook() {
 }
 
 #[test]
+fn a_hook_that_does_not_write_a_declared_output_says_so() {
+    // A hook that SUCCEEDS and leaves a declared output missing is the one
+    // silent failure the predicate can produce: `fingerprint` refuses to
+    // record it (§3.1 requires every declared output to exist), so nothing is
+    // stamped and the hook re-runs forever — while the build goes on to fail
+    // somewhere else entirely, at the import of the module the hook was
+    // supposed to write. The manifest said what it would produce; when it does
+    // not, the build has to name that, or the user reads a `cannot find` error
+    // with no path back to its cause.
+    let dir = temp_project("output_never_written");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"gen\"\nrun = {}\n\
+             inputs = \"input.txt\"\noutputs = \"generated.txt\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+
+    let first = build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "the hook ran:\n{first}");
+    assert!(
+        first.contains("`gen`") && first.contains("generated.txt"),
+        "a hook that did not write its declared output is named, with the \
+         output it promised:\n{first}"
+    );
+
+    // Still only a note: the hook itself succeeded, so the build's own outcome
+    // is unchanged — and the next build re-runs it, because nothing was
+    // stamped.
+    let second = build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "an unwritten output leaves no stamp, so the hook re-runs:\n{second}"
+    );
+    assert!(
+        !second.contains("Fresh"),
+        "and it is never fresh:\n{second}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_written_output_draws_no_note() {
+    // The other half of the pin above: the note fires on the missing output,
+    // not on every hook that declares one. Non-vacuity in the file rather than
+    // in a comment.
+    let dir = declared_hook_project("output_written");
+    let text = build(&dir);
+    assert!(
+        !text.contains("did not write"),
+        "a hook that produced its declared output is not warned about:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_hand_edited_output_reruns_the_hook() {
     let dir = declared_hook_project("output_edited");
     build(&dir);

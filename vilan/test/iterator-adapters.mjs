@@ -72,7 +72,7 @@ function $j(self) {
 		let $n = null;
 		if ($m[0] === 0) {
 			if (self[1]($m[1])) {
-				found = [ 0, __clone($m[1]) ];
+				found = [ 0, $m[1] ];
 				searching = false;
 			}
 			$n = undefined;

@@ -346,6 +346,59 @@ fn keyword_hover_links_resolve_to_a_heading_in_the_book() {
     );
 }
 
+/// The mdBook this book's anchors are pinned to — the exact line
+/// `mdbook --version` prints. Two other places in the fleet hold the same pin:
+/// `scripts/regen-markdown-golden.py` (as `PINNED_MDBOOK`, a hard refusal) and
+/// the pages repo's `docs.yml` (a tarball fetched by sha256). This constant is
+/// the third consumer, and until N28 it was the one that shelled out
+/// unversioned.
+const PINNED_MDBOOK: &str = "mdbook v0.5.4";
+
+/// The version `<program> --version` reported, or the refusal to fail with
+/// (N28). Absence and mismatch both REFUSE — loudly, naming the pin and how to
+/// install it — rather than skipping, which is this harness's convention for a
+/// missing tool (`crates/vilan-cli/tests/git_deps.rs`: "a missing `git` fails
+/// loudly rather than skipping silently") and the only honest answer here:
+/// under an unpinned renderer this test's verdict is undefined in BOTH
+/// directions.
+///
+/// Takes the program to run rather than always spelling `mdbook`, so the pins
+/// below can drive it at a planted shim without touching `PATH`. `PATH` is
+/// process-global: nextest gives every test its own process, but plain
+/// `cargo test` does not, and this harness has to be honest under both.
+fn pinned_mdbook_or_refusal(program: &std::ffi::OsStr) -> Result<String, String> {
+    let named = program.to_string_lossy().into_owned();
+    let install = "install it with `cargo install mdbook --version 0.5.4 --locked`";
+    let reported = match Command::new(program).arg("--version").output() {
+        Err(error) => {
+            return Err(format!(
+                "this test builds the book with the PINNED renderer and `{named} --version` \
+                 would not run ({error}) — {install}"
+            ));
+        }
+        Ok(output) if !output.status.success() => {
+            return Err(format!(
+                "`{named} --version` failed: {} — {install}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    };
+    if reported != PINNED_MDBOOK {
+        return Err(format!(
+            "the book's heading ids are pinned to {PINNED_MDBOOK}; `{named}` is {reported:?}. \
+             This test's verdict under any other renderer is undefined in BOTH directions — a \
+             false red against a correct parser, or a green blessing an anchor change the \
+             published site (built with the pin) would never make — so it refuses rather than \
+             guess. Either {install}, or move the pin deliberately: PINNED_MDBOOK here, the \
+             constant of the same name in scripts/regen-markdown-golden.py, the references in \
+             vilan/std/src/markdown.vl and crates/vilan-core/tests/markdown_golden.rs, and the \
+             pages repo's docs.yml tarball."
+        ));
+    }
+    Ok(reported)
+}
+
 /// The proof of [`mdbook_heading_ids`]: build the book with the real
 /// renderer and compare every heading id of every page. Needs the PINNED
 /// mdBook on PATH (`cargo install mdbook --version 0.5.4 --locked` — the
@@ -353,13 +406,16 @@ fn keyword_hover_links_resolve_to_a_heading_in_the_book() {
 /// and the pages repo fetches by sha256); run with
 /// `cargo test -p vilan-lsp book_sync -- --ignored`.
 ///
-/// This test does not itself CHECK the version, which is a known gap: run
-/// under a different renderer its verdict is undefined in both directions
-/// — a false red against a correct parser, or a green blessing an anchor
-/// change the published site (built with v0.5.4) would not make.
+/// N28: it CHECKS that version before shelling out, because an unversioned
+/// run's verdict is undefined in both directions — a false red against a
+/// correct parser, or a green blessing an anchor change the published site
+/// (built with v0.5.4) would not make. Absent or wrong, it refuses loudly.
 #[test]
-#[ignore = "needs `mdbook` on PATH: builds the book and compares every heading id to mdbook_heading_ids"]
+#[ignore = "needs the pinned `mdbook` v0.5.4 on PATH: builds the book and compares every heading id to mdbook_heading_ids"]
 fn mdbook_heading_ids_match_the_built_book() {
+    if let Err(refusal) = pinned_mdbook_or_refusal(std::ffi::OsStr::new("mdbook")) {
+        panic!("{refusal}");
+    }
     let output = std::env::temp_dir().join(format!("vilan-book-sync-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&output);
     let build = Command::new("mdbook")
@@ -400,6 +456,93 @@ fn mdbook_heading_ids_match_the_built_book() {
         mismatches.is_empty(),
         "mdbook_heading_ids disagrees with the built book:\n{}",
         mismatches.join("\n")
+    );
+}
+
+/// A `mdbook` shim printing `line` for `--version`, at its own path under a
+/// fresh temp directory. Named rather than placed on `PATH`: see
+/// [`pinned_mdbook_or_refusal`] for why this harness will not mutate `PATH`.
+#[cfg(unix)]
+fn planted_mdbook(tag: &str, line: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        std::env::temp_dir().join(format!("vilan-mdbook-shim-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("create the shim directory");
+    let shim = directory.join("mdbook");
+    std::fs::write(&shim, format!("#!/bin/sh\necho '{line}'\n")).expect("write the shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("make the shim executable");
+    shim
+}
+
+// N28's pin: a renderer that is not the pin is refused, by name, with the
+// version it found — the anchors are a compatibility surface (LSP hovers,
+// cross-page links) and the golden's authority is the pinned renderer, so a
+// build under any other one has nothing to say.
+//
+// unix-only: the plant is a shell script, and the Windows leg of CI has no
+// shell to run one with (`tests/brew_formula.rs` and `tests/release_scripts.rs`
+// are gated the same way).
+#[test]
+#[cfg(unix)]
+fn a_renderer_that_is_not_the_pin_is_refused_by_name() {
+    let shim = planted_mdbook("wrong", "mdbook v0.4.40");
+    let refusal = pinned_mdbook_or_refusal(shim.as_os_str())
+        .expect_err("a renderer that is not the pin must be refused, not accepted");
+    assert!(
+        refusal.contains(PINNED_MDBOOK) && refusal.contains("v0.4.40"),
+        "the refusal must name both the pin and what it found: {refusal}"
+    );
+    assert!(
+        refusal.contains("cargo install mdbook --version 0.5.4 --locked"),
+        "the refusal must say how to get the pin: {refusal}"
+    );
+    let _ = std::fs::remove_dir_all(shim.parent().expect("the shim's directory"));
+}
+
+// …and the pin ADMITS the pin, so the refusal above cannot be a checker that
+// refuses everything — which would fail this test's own subject closed and
+// look identical from the outside.
+#[test]
+#[cfg(unix)]
+fn the_pinned_renderer_is_admitted() {
+    let shim = planted_mdbook("right", PINNED_MDBOOK);
+    assert_eq!(
+        pinned_mdbook_or_refusal(shim.as_os_str()).as_deref(),
+        Ok(PINNED_MDBOOK),
+        "the pinned renderer must be admitted"
+    );
+    let _ = std::fs::remove_dir_all(shim.parent().expect("the shim's directory"));
+}
+
+// An ABSENT renderer refuses too, rather than skipping: the harness's
+// convention for a missing tool, and the half of N28 that says the old
+// `.expect("run mdbook (is it on PATH?)")` was already nearly right — it just
+// had nothing to say about the version of the one it did find.
+#[test]
+fn an_absent_renderer_is_refused_with_the_install_line() {
+    let absent = std::env::temp_dir().join("vilan-mdbook-that-is-not-there");
+    let _ = std::fs::remove_file(&absent);
+    let refusal = pinned_mdbook_or_refusal(absent.as_os_str())
+        .expect_err("a renderer that is not there must be refused, not skipped");
+    assert!(
+        refusal.contains("cargo install mdbook --version 0.5.4 --locked"),
+        "the refusal must say how to get the pin: {refusal}"
+    );
+}
+
+// The pin is held in three places and this is one of them, so hold it to the
+// nearest sibling: `scripts/regen-markdown-golden.py`, whose `PINNED_MDBOOK`
+// governs the golden this crate's reimplementation is proven against. A tree
+// where the two disagree has one of them blessing a renderer the other refuses.
+#[test]
+fn the_pin_agrees_with_the_golden_regeneration_script() {
+    let script = read(&repo_root().join("scripts/regen-markdown-golden.py"));
+    assert!(
+        script.contains(&format!("PINNED_MDBOOK = \"{PINNED_MDBOOK}\"")),
+        "scripts/regen-markdown-golden.py does not pin {PINNED_MDBOOK} — the golden's \
+         renderer and this test's renderer have drifted apart"
     );
 }
 

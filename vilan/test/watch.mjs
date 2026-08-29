@@ -158,9 +158,16 @@ function $g($h) {
 	drop($h);
 }
 (async () => {
-	const flat = await (watch("watch-corpus"));
-	console.log(describe(await (next(flat, [ 1 ]))));
-	$g(flat);
+	let flat = await (watch("watch-corpus"));
+	try {
+		console.log(describe(await (next(flat, [ 1 ]))));
+		$g(flat);
+		flat = null;
+	} finally {
+		if (flat !== null) {
+			$g(flat);
+		}
+	}
 	const deep = await (watch_all("watch-corpus"));
 	try {
 		console.log(describe(await (next(deep, [ 1 ]))));

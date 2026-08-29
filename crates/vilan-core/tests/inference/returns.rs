@@ -72,6 +72,185 @@ fn bare_ret_in_a_value_returning_function_is_rejected() {
     );
 }
 
+// --- B152: a tail that LEAVES emits the statement, not a wrapped value ---------
+//
+// `ret` is an expression of the never type, so it may sit in a function's tail
+// position — but JS `return` is a STATEMENT. Every seam that wrapped or assigned
+// a walked tail used to do so blindly, emitting `return return 1;` (and
+// `const y = return 1;`): a bundle that does not PARSE, so the failure is loud —
+// `node` refuses the file rather than running it wrong. Each pin below runs the
+// emitted bundle through `node`, which cannot happen unless it parses.
+
+// The filed one-liner: a bare `ret <expr>` as the whole body.
+#[test]
+fn ret_in_tail_position_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(): i32 { ret 1 }
+
+        fun main() {
+        	print(a());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// The void form: a bare `ret` as the whole body emitted `return return;`.
+#[test]
+fn bare_void_ret_in_tail_position_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a() { ret }
+
+        fun main() {
+        	a();
+        	print("done");
+        }
+        "#,
+        "done\n",
+    );
+}
+
+// `ret { <expr> }` — the returned VALUE is a block, so the tail walks to a
+// `return` through the block's own tail; the outer seam wrapped it again.
+#[test]
+fn ret_of_a_block_value_in_tail_position_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(): i32 { ret { 1 } }
+
+        fun main() {
+        	print(a());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// A nested block whose tail leaves: the block reports no value and the `ret`
+// lands in the enclosing block, where it is legal.
+#[test]
+fn ret_inside_a_nested_block_tail_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(): i32 { { ret 1 } }
+
+        fun main() {
+        	print(a());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// …at any depth — the leak was the block's tail, so it composes.
+#[test]
+fn ret_inside_a_doubly_nested_block_tail_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(): i32 { { { ret 1 } } }
+
+        fun main() {
+        	print(a());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// The value-position sibling: a leaving block bound by a `let` emitted
+// `const y = return 1;`. The binding is unreachable, so the run never sees it.
+#[test]
+fn ret_inside_a_block_bound_by_a_let_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(): i32 {
+        	let y = { ret 1 };
+        	y
+        }
+
+        fun main() {
+        	print(a());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+// The two sibling forms the filing named, which went through the arm seam's
+// divergence check and were ALREADY correct — pinned so they stay that way.
+#[test]
+fn ret_in_both_if_tail_arms_emits_one_return_each() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(flag: bool): i32 { if flag { ret 1 } else { ret 2 } }
+
+        fun main() {
+        	print(a(true));
+        	print(a(false));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn ret_in_a_match_arm_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(n: i32): i32 {
+        	match n {
+        		1 => ret 10,
+        		_ => ret 20,
+        	}
+        }
+
+        fun main() {
+        	print(a(1));
+        	print(a(2));
+        }
+        "#,
+        "10\n20\n",
+    );
+}
+
+// The two seams composed: a nested leaving block INSIDE a value-position arm.
+// The arm's result temp is still named (so sibling arms and later temps keep
+// their names) but nothing is assigned to it on the leaving path.
+#[test]
+fn ret_inside_a_nested_block_in_an_if_arm_emits_one_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun a(flag: bool): i32 { if flag { { ret 1 } } else { 2 } }
+
+        fun main() {
+        	print(a(true));
+        	print(a(false));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
 // --- Malformed frames are decode errors, never crashes -------------------------
 
 // The JSON codec's reader must arrive PRE-POISONED on text that is not JSON at

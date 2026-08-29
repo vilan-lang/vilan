@@ -385,17 +385,17 @@ fn formatter_output_token_matches_input() {
     // successful reprint matches by the formatter's contract). This catches any
     // token-drifting output that slips the formatter's internal safety net.
     //
-    // The formatter canonicalizes TWO orders — a file's top-level import runs,
-    // and the `.name(…)` links of a `style()` builder chain (kolt.local 006) —
-    // so a reprint's tokens may legitimately differ from the input's by those
-    // reorders alone. We check order-sensitively FIRST (the strong, independent
-    // test that most files pass trivially); only when the raw streams differ do
-    // we fall back to the net's own canonicalizations
-    // (`formatter::sort_import_runs` and `formatter::sort_style_chains`, the
-    // shared implementations) to confirm the difference is those two orders and
-    // nothing else. Both fallbacks leave every other token in place, so a
-    // genuine reordering elsewhere still diverges and still fires this
-    // tripwire.
+    // The formatter canonicalizes THREE orders — a file's top-level import
+    // runs, the `.name(…)` links of a `style()` builder chain (kolt.local 006),
+    // and the items of a `css { … }` block (css-block.md §8) — so a reprint's
+    // tokens may legitimately differ from the input's by those reorders alone.
+    // We check order-sensitively FIRST (the strong, independent test that most
+    // files pass trivially); only when the raw streams differ do we fall back to
+    // the net's own canonicalizations (`formatter::sort_import_runs`,
+    // `formatter::sort_style_chains` and `formatter::sort_css_blocks`, the
+    // shared implementations) to confirm the difference is those three orders
+    // and nothing else. All three leave every other token in place, so a genuine
+    // reordering elsewhere still diverges and still fires this tripwire.
     let files = formattable_files();
     assert!(
         files.len() > 150,
@@ -420,10 +420,13 @@ fn formatter_output_token_matches_input() {
         if input_tokens == output_tokens {
             continue; // token-equal modulo trailing commas — no import reorder
         }
-        // The streams differ: the only legitimate causes are import-run and
-        // style-chain reordering.
-        let canonical =
-            |tokens: &Vec<_>| formatter::sort_style_chains(formatter::sort_import_runs(tokens));
+        // The streams differ: the only legitimate causes are import-run,
+        // style-chain and css-block reordering.
+        let canonical = |tokens: &Vec<_>| {
+            formatter::sort_css_blocks(formatter::sort_style_chains(formatter::sort_import_runs(
+                tokens,
+            )))
+        };
         if canonical(&input_tokens) != canonical(&output_tokens) {
             mismatches.push(label(path));
         }

@@ -319,6 +319,26 @@ through a sync-looking function that reaches something async.
 with `let`; assigning through it (`v = …`) already writes the target.
 → [The memory model](../tour/memory-model.md)
 
+**"a closure cannot capture the view '…': a view is second-class and the closure may outlive the place it views. …"**
+A closure body named a view binding (`let v = &mut x`, a `for e in &mut
+list` item, or the result of a view-returning call) declared outside it.
+A closure captures the *binding*, and nothing says when the closure runs,
+so the capture would outlive the place. The two fixes are the two ways it
+stops being a capture: read the value out first (`let n = *v;`, then
+capture `n`), or take the view as a **parameter** of the closure
+(`|v: &mut i32| *v`), which is a per-call loan. A `&`/`&mut` parameter of
+the *enclosing function* may be named inside a closure — it views the
+caller's place — but that closure may not then escape. An async closure
+gets the sharper message below instead.
+→ [Functions and closures](../tour/functions-and-closures.md), [spec §6.9](../spec/memory.md)
+
+**"an async closure cannot capture the view '…': the capture would be held across the closure's suspension points. …"**
+The rule above, at a closure that suspends: on top of outliving the
+place, the capture would be live across an `await`, where any turn may
+invalidate it. Re-acquire the view inside the closure after the
+suspension, or pass a value or a `Shared`/`Handle` in.
+→ [The memory model](../tour/memory-model.md), [Async](../tour/async.md)
+
 ## Resources
 
 A `resource` type has a single owner and moves rather than copies; a
@@ -327,12 +347,13 @@ containment (`Option<Database>` is a resource, `Option<i32>` is not). A
 resource *moves* on binding (`let b = a`), on `own`-passing, on return, and
 into a constructor; it is *loaned* (no ownership change) through `self`,
 `&`, and `&mut`. The `Drop` destructor trait and its restrictions are below.
-At each scope end the compiler runs the destructor on the still-owned resource
-locals, in reverse declaration order. Destruction goes through
-`try`/`finally`, so `ret`, `jump`, and a thrown panic all run it on the way
-out; a resource without a `Drop` impl still has its fields destroyed. A
-module-level resource lives for
-the process and never drops. A drop that panics while a panic is already
+After a resource's last use the compiler runs its destructor; resources
+whose last use is the same statement discharge in reverse declaration
+order. Destruction goes through `try`/`finally`, so `ret`, `jump`, and a
+thrown panic all run it on the way out; a resource without a `Drop` impl
+still has its fields destroyed. A resource built inside one expression and
+never bound is owned by its statement and destroyed at that statement's
+end. A module-level resource lives for the process and never drops. A drop that panics while a panic is already
 unwinding replaces the in-flight error (JS `finally` semantics). The tutorial
 is [Resources](../tour/resources.md); the normative rules are spec
 [§6.8](../spec/memory.md).
@@ -371,8 +392,8 @@ serve-forever server's `Database`). Consuming it (moving it into a local,
 passing it to an `own` parameter, or `drop(x)`) would hand a
 process-lifetime resource to a droppable owner and close the shared handle
 out from under the rest of the program. Reach it by loan only: method calls,
-`&x`, `&mut x`. To own a database that closes at a scope's end, open it in a
-local instead.
+`&x`, `&mut x`. To own a database that closes after its last use, open it
+in a local instead.
 → [Resources](../tour/resources.md)
 
 **"a closure cannot capture the resource `…`; …"**
@@ -629,13 +650,23 @@ draft's next push already does.
 **"`asset::emit` outside a `const` expression"**
 Styles (and other build assets) are constructed at compile time. Build
 the `Style` in a `const` (`let card = const style()…`); select and merge
-already-built styles at runtime. The channel's input direction,
-`asset::read`, is compile-time-only the same way.
+already-built styles at runtime. The channel's other directions —
+`asset::emit_keyed` and `asset::read` — are compile-time-only the same
+way.
 → [Styling](../guide/styling.md), [Macros & const](../tour/macros-and-const.md)
+
+**"`asset::emit_keyed` cannot order the `css` kind: the style sidecar is
+ordered by the CSS cascade, not by a contribution's key"**
+The stylesheet's order is decided by the cascade — base rules before
+`@media` blocks, media blocks by ascending min-width — so a sort key
+handed to it would have nowhere to apply. Write the rule with
+`asset::emit("css", …)`, or let [`std::style`](../std/style.md) own the
+sheet. `emit_keyed` is for a kind of the program's own.
 
 **"… is compile-time-only; evaluate this call inside a `const` expression"**
 The same rule, caught statically: some function on this call path reaches
-`asset::emit` or `asset::read`, and the call itself sits in runtime code.
+`asset::emit`, `asset::emit_keyed` or `asset::read`, and the call itself
+sits in runtime code.
 The span is the outermost runtime crossing — the call that leaves ordinary
 code and enters compile-time territory — so wrap *that* call in a `const`.
 A crossing through trait dispatch counts too: a generic call is charged at

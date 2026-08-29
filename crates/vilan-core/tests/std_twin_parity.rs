@@ -124,6 +124,26 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
+        "write_back_value",
+        Side::BrowserOnly,
+        "A private helper, not a surface, and the SHAPE is the fix \
+         (proposal/lifetimes.md §5, V3): `bind_value`'s write-back listener has \
+         to be born in a scope that never held an element, because a JS closure \
+         captures its whole enclosing scope and a listener written inline beside \
+         the effect would reach the element the effect captured — the one cycle \
+         that straddles the language/host boundary. The process twin renders an \
+         input's value and drops the listener (its `bind_value` documents that), \
+         so there is no listener to place.",
+    ),
+    (
+        "ui",
+        "write_back_draft",
+        Side::BrowserOnly,
+        "With `write_back_value`: the same scope split for `bind_draft`, whose \
+         effect captures the element to compare before writing it.",
+    ),
+    (
+        "ui",
         "chunk_arm",
         Side::BrowserOnly,
         "A route-chunk host intrinsic. Splitting is opt-in per BROWSER entry \

@@ -253,8 +253,8 @@ When one open file needs more than one act — read a header, then seek
 into the middle; write, then `sync` for durability — you open a handle.
 `File::open(path)` (and `create`, `create_new`, `append_to`, `modify`)
 hands back a *resource*: it moves rather than copies, and its destructor
-closes the handle at scope end, so there is no `close()` to forget —
-`drop(file)` closes early. Reads and writes are positional
+closes the handle after its last use, so there is no `close()` to forget —
+`drop(file)` closes early, at the same point the compiler would have. Reads and writes are positional
 (`file.read_at(buffer, position)`, `file.write_at(buffer, position)`),
 `file.stat()` answers with no `Option` (the handle is already open, and
 nothing re-resolves the path between probe and act), and `file.sync()` is

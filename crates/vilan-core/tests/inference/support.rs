@@ -853,8 +853,27 @@ pub fn assert_emits_containing(source: &str, needle: &str) {
     }
 }
 
-/// The `(kind, line)` assets a program's const evaluation emitted.
+/// The `(kind, line)` view of what a program's const evaluation emitted — what
+/// a pin about an asset's CONTENT reads. [`collected_keyed_assets`] is the same
+/// run with each contribution's sort key kept (build-hooks.md §5.3), and
+/// [`assembled_assets`] is the flush's own answer for a pin about ORDER.
 pub fn collected_assets(source: &str) -> Vec<(String, String)> {
+    collected_keyed_assets(source)
+        .into_iter()
+        .map(|asset| (asset.kind, asset.line))
+        .collect()
+}
+
+/// The per-kind files a program's contributions assemble into — kind to
+/// newline-terminated content, exactly as the build writes them.
+pub fn assembled_assets(source: &str) -> std::collections::BTreeMap<String, String> {
+    vilan_core::const_eval::assemble_assets(&collected_keyed_assets(source))
+}
+
+/// Every contribution a program's const evaluation made, keys included, in the
+/// order the calls happened — which is exactly the order the flush must not
+/// read.
+pub fn collected_keyed_assets(source: &str) -> Vec<vilan_core::const_eval::EmittedAsset> {
     let source = source.to_string();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)

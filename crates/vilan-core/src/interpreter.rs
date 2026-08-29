@@ -242,7 +242,7 @@ pub trait AssetReader {
 /// budget constant can be sized against real workloads instead of estimates.
 struct ConstRun {
     value: ConstValue,
-    assets: Vec<(String, String)>,
+    assets: Vec<crate::const_eval::EmittedAsset>,
     stdout: String,
     exited: Option<i32>,
     fuel_used: u64,
@@ -288,7 +288,7 @@ fn run_const<'a>(
 /// the const pass for the `VILAN_PHASE_TIMING` line).
 pub struct ConstOutcome {
     pub value: ConstValue,
-    pub assets: Vec<(String, String)>,
+    pub assets: Vec<crate::const_eval::EmittedAsset>,
     pub fuel_used: u64,
 }
 
@@ -401,7 +401,32 @@ fn check_reach(imports: &[String], helpers: &[&'static str]) -> Result<(), Failu
     Ok(())
 }
 
-/// `asset::emit`'s kind is an output-path segment, so it must BE one (E94).
+/// Which spelling of the channel's line-output direction is emitting.
+///
+/// The two differ in exactly one thing — whether the contribution carries its
+/// own sort key (build-hooks.md §5.3) — and the fence below differs with them
+/// in exactly one place, `css`. Everything else about a kind is the same
+/// question for both, which is why they share one function rather than two.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmitSpelling {
+    /// `asset::emit(kind, line)` — the line is its own key.
+    Unkeyed,
+    /// `asset::emit_keyed(kind, key, line)` — the contributor computed the key.
+    Keyed,
+}
+
+impl EmitSpelling {
+    /// The `std::asset` path a diagnostic names this spelling by.
+    fn name(self) -> &'static str {
+        match self {
+            EmitSpelling::Unkeyed => "asset::emit",
+            EmitSpelling::Keyed => "asset::emit_keyed",
+        }
+    }
+}
+
+/// An emitted kind is an output-path segment, so it must BE one (E94) — for
+/// either spelling, since both name the same file the same way.
 ///
 /// The kind names the file the build writes beside its JavaScript —
 /// `write_assets` does `output_js.with_extension(kind)` — so a kind carrying a
@@ -436,7 +461,19 @@ fn check_reach(imports: &[String], helpers: &[&'static str]) -> Result<(), Failu
 /// path to reach here: `asset::emit` is const-only (the const pass refuses any
 /// runtime call to it, and `__emit_asset` is a capability miss outside
 /// `eval_const`), so the value is always known where this runs.
-fn check_emit_kind(kind: &str) -> Result<(), Failure> {
+///
+/// **`css` is where the two spellings part (build-hooks.md §5.3/§5.6).** The
+/// flush orders the style sidecar by the CSS CASCADE — `assemble_assets`'s
+/// comparator reads the line and never the contribution's key — so a
+/// `emit_keyed("css", …)` would have its key silently dropped, which is a
+/// wrong answer where a refusal costs nothing. The un-keyed spelling stays
+/// admitted for the reason G7 admits it: the whole styling system reaches
+/// `<leg>.css` through `emit("css", …)`. Refusing the keyed form now is also
+/// what keeps §5.3's noted migration open — if `Style::rule` ever passes a
+/// band character as its key, the comparator and this arm change together;
+/// a key that had been quietly ignored could not be given a meaning later.
+fn check_emit_kind(kind: &str, spelling: EmitSpelling) -> Result<(), Failure> {
+    let function = spelling.name();
     let one_segment = !kind.is_empty() && !kind.contains('/') && !kind.contains('\\') && {
         let mut components = std::path::Path::new(kind).components();
         matches!(components.next(), Some(std::path::Component::Normal(_)))
@@ -446,23 +483,34 @@ fn check_emit_kind(kind: &str) -> Result<(), Failure> {
         return Err(Failure::new(
             FailureKind::Thrown,
             format!(
-                "`asset::emit` kinds name one file beside the build output; \
+                "`{function}` kinds name one file beside the build output; \
                  `{kind}` is not one path segment — pass a bare kind like `css`"
             ),
         ));
     }
-    if let Some(owned) = crate::const_eval::build_owned_emit_kind(kind)
-        && owned != crate::const_eval::BuildOwnedKind::StyleSidecar
-    {
-        return Err(Failure::new(
-            FailureKind::Thrown,
-            format!(
-                "`asset::emit` kinds name one file beside the build output, and \
-                 `{kind}` collides with {} — pass a kind of the program's own, \
-                 like `routes`",
-                owned.collides_with()
-            ),
-        ));
+    if let Some(owned) = crate::const_eval::build_owned_emit_kind(kind) {
+        if owned != crate::const_eval::BuildOwnedKind::StyleSidecar {
+            return Err(Failure::new(
+                FailureKind::Thrown,
+                format!(
+                    "`{function}` kinds name one file beside the build output, and \
+                     `{kind}` collides with {} — pass a kind of the program's own, \
+                     like `routes`",
+                    owned.collides_with()
+                ),
+            ));
+        }
+        if spelling == EmitSpelling::Keyed {
+            return Err(Failure::new(
+                FailureKind::Thrown,
+                format!(
+                    "`asset::emit_keyed` cannot order the `{kind}` kind: the style \
+                     sidecar is ordered by the CSS cascade, not by a contribution's \
+                     key — write a rule with `asset::emit`, or let `std::style` own \
+                     the sheet"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -644,8 +692,10 @@ struct Interpreter<'a> {
     /// frame (node exits the whole process from anywhere); `run_program`
     /// checks this first and converts the unwind back into success.
     exited: Option<i32>,
-    /// `(kind, line)` pairs `asset::emit` accumulated (const-eval.md §3).
-    assets: Vec<(String, String)>,
+    /// The contributions `asset::emit` / `asset::emit_keyed` accumulated
+    /// (const-eval.md §3, build-hooks.md §5.3), in call order — which is
+    /// exactly what the flush must NOT read, and does not.
+    assets: Vec<crate::const_eval::EmittedAsset>,
     /// `asset::emit` is live only under `eval_const`; anywhere else it is a
     /// capability miss.
     allow_assets: bool,
@@ -1476,20 +1526,51 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(old))))
             }
-            // `asset::emit` — the const-only compile-time effect: live only
-            // under `eval_const` (const-eval.md §3); anywhere else (macro
-            // expansion, the equivalence runner) it is a capability miss.
-            "__emit_asset" => {
+            // `asset::emit` / `asset::emit_keyed` — the const-only
+            // compile-time effect: live only under `eval_const`
+            // (const-eval.md §3); anywhere else (macro expansion, the
+            // equivalence runner) it is a capability miss.
+            //
+            // ONE ARM ON PURPOSE (build-hooks.md §5.3). `emit(kind, line)` IS
+            // `emit_keyed(kind, line, line)`, and this is where that identity
+            // is spelled: one fence call, one push, one place a key can be
+            // recorded — so an existing kind's bytes cannot move, because
+            // there is no second path for them to move along. A second arm
+            // would be a second implementation of the same rule, and the two
+            // would drift the way G7's write side and prune side drifted.
+            "__emit_asset" | "__emit_asset_keyed" => {
+                let spelling = if name == "__emit_asset_keyed" {
+                    EmitSpelling::Keyed
+                } else {
+                    EmitSpelling::Unkeyed
+                };
                 if !self.allow_assets {
-                    return Err(Failure::unsupported(
-                        "`asset::emit` outside a `const` expression",
-                    ));
+                    return Err(Failure::unsupported(format!(
+                        "`{}` outside a `const` expression",
+                        spelling.name()
+                    )));
                 }
                 let kind = expect_str(&take(0))?;
-                let line = expect_str(&take(1))?;
+                // The key is data the CONTRIBUTOR computed and the flush never
+                // re-derives; the un-keyed spelling contributes the line as its
+                // own key. No rule of its own beyond `emit`'s rules for a line
+                // — which are none — precisely because of that identity: a key
+                // validated more strictly than a line would start refusing
+                // `emit(kind, line)` calls that have always been legal.
+                let (key, line) = match spelling {
+                    EmitSpelling::Keyed => (expect_str(&take(1))?, expect_str(&take(2))?),
+                    EmitSpelling::Unkeyed => {
+                        let line = expect_str(&take(1))?;
+                        (line.clone(), line)
+                    }
+                };
                 // The kind becomes a filename (E94) — fenced before it is kept.
-                check_emit_kind(&kind)?;
-                self.assets.push((kind.to_string(), line.to_string()));
+                check_emit_kind(&kind, spelling)?;
+                self.assets.push(crate::const_eval::EmittedAsset {
+                    kind: kind.to_string(),
+                    key: key.to_string(),
+                    line: line.to_string(),
+                });
                 Ok(Value::Undefined)
             }
             // `asset::read` — the channel's input direction (docs-port.md

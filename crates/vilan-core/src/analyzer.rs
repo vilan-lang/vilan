@@ -16,6 +16,10 @@ use crate::target::{Platform, PlatformPattern};
 use crate::type_::{SubstitutionContext, Type, TypeId};
 use crate::util::{join_with, plural};
 
+mod liveness;
+
+pub use liveness::DropExtent;
+
 /// Distinguishes the recursive type operations that resolve generics through a
 /// substitution context, so each [`TypeCycleGuard`] tracks its own active path (the
 /// operations can nest, and one's in-flight generic must not bail the other's).
@@ -550,6 +554,13 @@ pub struct ExternalFunction<'src> {
     // The `[extern(..)]` host binding, if any — lowers calls to a JS
     // import/call, method, or property access.
     pub extern_binding: Option<ExternBinding<'src>>,
+    /// Declared `[extern(…, retains)]` (`lifetimes.md` §6.4, RULED
+    /// 2026-08-28): the host KEEPS what this hands it and may read it after
+    /// the call returns. An extern loan is CALL-BOUNDED unless a declaration
+    /// says otherwise, so every argument to one of these keeps its liveness to
+    /// the binding's whole scope — the conservative envelope, which is the
+    /// scope-end teardown that shipped.
+    pub retains: bool,
     // The projected parameter positions of the returned view (receiver =
     // position 0) — the `borrows` root-set. An extern has no body to infer from,
     // so this is exactly its declared `borrows <param>` clause resolved to a
@@ -718,6 +729,16 @@ fn async_view_parameter_message(form: &str) -> String {
 fn async_view_capture_message(name: &str) -> String {
     format!(
         "an async closure cannot capture the view '{name}': the capture would be held across the closure's suspension points. Re-acquire the view inside, or pass a value/handle."
+    )
+}
+
+/// C12's closure-capture diagnostic (`lifetimes.md` §4, spec §6.9): rule 3's
+/// ban on capturing a view BINDING, enforced. The two fixes are the two ways
+/// the capture stops being one — take the value out of the view before the
+/// closure, or hand the view in per call as a parameter.
+fn view_capture_message(name: &str) -> String {
+    format!(
+        "a closure cannot capture the view '{name}': a view is second-class and the closure may outlive the place it views. Read the value out with '*' before the closure, or take the view as a closure parameter."
     )
 }
 
@@ -2236,6 +2257,30 @@ pub struct Analyzer<'src> {
     /// unconditional per-scope `try`/`finally` teardown, no runtime drop flags.
     /// Empty on resource-free programs, so their output stays byte-identical.
     dropped_bindings: HashSet<Id>,
+    /// S3 (`lifetimes.md` §6): for each enrolled binding, where its teardown
+    /// region ENDS — its last use rather than its scope's end. Filled by
+    /// `plan_last_use_drop_extents` once the last-use dataflow has run over the
+    /// final tree; a binding the dataflow refuses to answer for is absent and
+    /// keeps the scope-end teardown that shipped.
+    drop_extents: HashMap<Id, liveness::DropExtent>,
+    /// C11 (`temporary-drop.md`): resource-valued expressions that are neither
+    /// bound nor moved — owning TEMPORARIES, destroyed at the end of the
+    /// statement that constructs them, in reverse construction order. Filled by
+    /// `plan_resource_drops`; read by the transformer, which lifts each to a
+    /// minted `const` and wraps the rest of the statement in its `finally`.
+    resource_temporaries: HashMap<Id, TypeId>,
+    /// S3: per declaring STATEMENT, the syntactic extents of the names it
+    /// brings into existence. A teardown region lowers to a JS block, so it may
+    /// not close while a `const` declared inside it is still read afterwards —
+    /// this is what the transformer widens a region against. Filled beside
+    /// `drop_extents`; empty on a program that drops nothing.
+    declared_binding_extents: HashMap<Id, Vec<liveness::DropExtent>>,
+    /// B150: the enrolled bindings an explicit `drop(x)` destroys early. Their
+    /// teardown is emitted as a PAIR — the sink empties the slot, the scope's
+    /// `finally` destroys only a slot that is still full — so a panic before
+    /// the sink still releases the resource and the fall-through path still
+    /// destroys exactly once. Filled by `plan_resource_drops`.
+    explicit_drop_bindings: HashSet<Id>,
     /// Assignment expression ids that overwrite a live resource — the old value
     /// drops first, then the new one moves in (R2) — mapped to the type of the
     /// value being overwritten. Two shapes share the map: a still-owned resource
@@ -2715,6 +2760,10 @@ pub struct Analyzer<'src> {
     prepped_uses: Vec<(Vec<(&'src str, Span)>, &'src str, Id, Span, Span, SourceId)>,
     prepped_type_static_accessors: Vec<(TypeId, TypeId, &'src str, Span)>,
     reference_count: HashMap<Id, u32>,
+    /// The last-use liveness dataflow (`liveness.rs`, `lifetimes.md` §6/S2) —
+    /// filled once the tree is final (after the view-assignment rewrite) and
+    /// read by rule 2's elision. Empty until then, which elides nothing.
+    last_use: liveness::LastUse,
     resolved_types: HashMap<Id, TypeId>,
     // B70 (`variadic-generics.md` §T.8): the type of every ELEMENT of a tuple
     // construction, keyed by the element's expr id — the type the tuple rule
@@ -2774,6 +2823,7 @@ pub struct Analyzer<'src> {
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
     asset_emit_fn_id: Option<Id>,
+    asset_emit_keyed_fn_id: Option<Id>,
     asset_read_fn_id: Option<Id>,
     asset_bundle_fn_id: Option<Id>,
     // `const`-marked expression ids, in walk order (innermost-first for
@@ -3211,6 +3261,10 @@ impl<'src> Analyzer<'src> {
             reported_container_structures: HashSet::default(),
             resource_value_places: HashSet::default(),
             dropped_bindings: HashSet::default(),
+            drop_extents: HashMap::default(),
+            declared_binding_extents: HashMap::default(),
+            resource_temporaries: HashMap::default(),
+            explicit_drop_bindings: HashSet::default(),
             overwrite_drops: HashMap::default(),
             drop_methods: HashMap::default(),
             drop_glue: HashMap::default(),
@@ -3318,6 +3372,7 @@ impl<'src> Analyzer<'src> {
             prepped_type_static_accessors: Vec::new(),
             prepped_uses: Vec::new(),
             reference_count: HashMap::default(),
+            last_use: liveness::LastUse::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             scope_id: 0,
@@ -3334,6 +3389,7 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
             asset_emit_fn_id: None,
+            asset_emit_keyed_fn_id: None,
             asset_read_fn_id: None,
             asset_bundle_fn_id: None,
             const_exprs: Vec::new(),
@@ -7647,9 +7703,11 @@ impl<'src> Analyzer<'src> {
             .collect();
         let place_overwrites =
             self.collect_place_overwrites(&bindings, &self.resource_value_places);
+        let explicitly_dropped = self.explicitly_dropped_bindings(&owned_bindings);
         let resources = ResourceOwnership {
             owned_bindings,
             place_overwrites,
+            explicitly_dropped,
         };
         // The resource types reached by a `drop(db)` sink call, per enclosing scan
         // root (destruction.md §8 platform coloring): a sink call is invisible to
@@ -7657,16 +7715,21 @@ impl<'src> Analyzer<'src> {
         // owning function/closure needs a synthetic edge to that destructor. Same
         // source of truth as the scope-end drops (`owned_by_root`).
         let drop_sink_by_root = self.drop_sink_types_by_root();
-        if resources.owned_bindings.is_empty()
-            && resources.place_overwrites.is_empty()
-            && drop_sink_by_root.is_empty()
-        {
+        // A program with no `resource` declaration anywhere plans nothing and
+        // keeps its bytes. The three sets above are NOT enough to decide that
+        // since C11: `File::open(p).read_at(b, 0)` binds nothing, overwrites
+        // nothing and calls no sink, and is exactly the program whose temporary
+        // must be found.
+        if !self.declares_a_resource() {
             return;
         }
-        let mut dropped: HashSet<Id> = HashSet::default();
-        let mut overwrites: HashMap<Id, TypeId> = HashMap::default();
+        self.explicit_drop_bindings = resources.explicitly_dropped.clone();
+        let mut plan = DropPlan::default();
         // Per scan-root, the resource types it drops (for the §8 coloring edges).
         let mut owned_by_root: HashMap<Id, HashSet<TypeId>> = HashMap::default();
+        // Per scan-root, the temporary POSITIONS it owns — typed after the scan
+        // (which runs as `&self`), then merged into the same coloring map.
+        let mut temporaries_by_root: Vec<(Id, HashSet<Id>)> = Vec::new();
         // Function bodies: the tail is the return value, so it is consuming — a
         // resource returned out of the body is moved, not dropped. An `own`
         // resource parameter of CONCRETE type is owned at entry, so one that is
@@ -7700,10 +7763,9 @@ impl<'src> Analyzer<'src> {
                 )
             })
             .collect();
-        for (root, statements, tail, own_params) in &bodies {
+        for (root_id, statements, tail, own_params) in &bodies {
             let mut owned: HashSet<Id> = own_params.iter().copied().collect();
-            let mut root_dropped: HashSet<Id> = HashSet::default();
-            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::default();
+            let mut root = DropPlan::default();
             self.plan_scope(
                 &[],
                 statements,
@@ -7711,20 +7773,25 @@ impl<'src> Analyzer<'src> {
                 true,
                 &resources,
                 &mut owned,
-                &mut root_dropped,
-                &mut root_overwrites,
+                &mut root,
             );
             // An own resource parameter still owned at the fall-through end was
             // never moved out, so it drops here (`plan_scope` removes only the
-            // scope's own declared locals, never parameters).
+            // scope's own declared locals, never parameters) — and so does one
+            // an explicit `drop(x)` moved out, which stays enrolled (B150).
             for parameter in own_params {
-                if owned.contains(parameter) {
-                    root_dropped.insert(*parameter);
+                if owned.contains(parameter) || resources.explicitly_dropped.contains(parameter) {
+                    root.dropped.insert(*parameter);
                 }
             }
-            self.record_root_drop_types(*root, &root_dropped, &root_overwrites, &mut owned_by_root);
-            dropped.extend(root_dropped);
-            overwrites.extend(root_overwrites);
+            self.record_root_drop_types(
+                *root_id,
+                &root.dropped,
+                &root.overwrites,
+                &mut owned_by_root,
+            );
+            temporaries_by_root.push((*root_id, root.temporaries.clone()));
+            plan.absorb(root);
         }
         // Closure bodies are their own scan roots (the return value is consuming);
         // the root is the closure's own node id.
@@ -7733,21 +7800,18 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|(id, closure)| (*id, closure.return_))
             .collect();
-        for (root, return_id) in closures {
+        for (root_id, return_id) in closures {
             let mut owned: HashSet<Id> = HashSet::default();
-            let mut root_dropped: HashSet<Id> = HashSet::default();
-            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::default();
-            self.plan_expr(
-                return_id,
-                true,
-                &resources,
-                &mut owned,
-                &mut root_dropped,
-                &mut root_overwrites,
+            let mut root = DropPlan::default();
+            self.plan_expr(return_id, true, &resources, &mut owned, &mut root);
+            self.record_root_drop_types(
+                root_id,
+                &root.dropped,
+                &root.overwrites,
+                &mut owned_by_root,
             );
-            self.record_root_drop_types(root, &root_dropped, &root_overwrites, &mut owned_by_root);
-            dropped.extend(root_dropped);
-            overwrites.extend(root_overwrites);
+            temporaries_by_root.push((root_id, root.temporaries.clone()));
+            plan.absorb(root);
         }
         // The §8 coloring edges for `drop(db)` sink calls (the transformer-side
         // teardown reachability cannot see) — merged into the same per-root type
@@ -7755,9 +7819,136 @@ impl<'src> Analyzer<'src> {
         for (root, types) in drop_sink_by_root {
             owned_by_root.entry(root).or_default().extend(types);
         }
-        self.dropped_bindings = dropped;
-        self.overwrite_drops = overwrites;
+        self.dropped_bindings = plan.dropped;
+        self.overwrite_drops = plan.overwrites;
+        self.record_resource_temporaries(plan.temporaries);
+        self.reject_conditional_temporaries(&plan.conditional_temporaries);
+        // §8 coloring, extended from "a SCOPE owning a droppable T" to "a
+        // STATEMENT owning one": a temporary's destructor runs in the body that
+        // constructs it, so that body must reach the drop impl in the call graph
+        // or a `@process`-needing drop behind a temporary is invisible to
+        // platform reachability. The refused conditional temporaries are already
+        // out of `resource_temporaries` by the time this reads it.
+        for (root_id, positions) in temporaries_by_root {
+            let types: HashSet<TypeId> = positions
+                .iter()
+                .filter_map(|expr_id| self.resource_temporaries.get(expr_id).copied())
+                .collect();
+            if !types.is_empty() {
+                owned_by_root.entry(root_id).or_default().extend(types);
+            }
+        }
         self.drop_owned_types_by_root = owned_by_root;
+    }
+
+    /// `temporary-drop.md` §7.3, RULED: refuse a resource temporary constructed
+    /// on a conditionally-evaluated operand.
+    ///
+    /// `cond && File::open(p).stat().size > 0` builds a handle only on the
+    /// paths where `cond` held, so no statement position can own its teardown:
+    /// the only lowerings are a runtime liveness flag — which mR7's doctrine
+    /// bans for exactly this reason — or a refusal. This refuses a SPELLING,
+    /// never a program: `let f = File::open(p); cond && f.stat().size > 0` is
+    /// the fix, and the message names it.
+    ///
+    /// Deliberately narrower than the paper's stated set. §7.3 also named
+    /// ternary and non-block `match`-arm expressions, which it had to under the
+    /// lowering it was pricing; under S3's, an `if`/`match` arm emits as a JS
+    /// BLOCK with its own statement list, so a temporary there has a statement
+    /// position of its own and needs no refusal. Only `&&`/`||` evaluate their
+    /// operand inline with no block to hold it.
+    fn reject_conditional_temporaries(&mut self, conditional: &HashSet<Id>) {
+        let mut offenders: Vec<Id> = conditional
+            .iter()
+            .copied()
+            .filter(|expr_id| self.resource_temporaries.contains_key(expr_id))
+            .collect();
+        offenders.sort_by_key(|id| id.0);
+        for expr_id in offenders {
+            // Refusing it is the point; leaving it in the map as well would
+            // have the transformer lift a value the program no longer has.
+            self.resource_temporaries.remove(&expr_id);
+            let span = **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN);
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: "this resource would be created only on some paths: the right of \
+                      `&&`/`||` is evaluated conditionally, so no statement owns it \
+                      and nothing can destroy it. Bind it first (`let handle = ...`) \
+                      and use the binding here"
+                    .to_string(),
+            });
+        }
+    }
+
+    /// Whether any type in the loaded world is declared `resource`. The drop
+    /// scan's gate: a world without one plans nothing, and its emitted bytes
+    /// cannot move.
+    ///
+    /// It replaced a narrower gate (no owned bindings, no overwrites, no sink
+    /// calls) that C11 made unsound as a gate: `File::open(p).read_at(b, 0)`
+    /// binds nothing, overwrites nothing and calls no sink, and is precisely
+    /// the program whose temporary the scan has to find.
+    fn declares_a_resource(&self) -> bool {
+        self.structs.values().any(|struct_| struct_.resource)
+            || self.enums.values().any(|enum_| enum_.resource)
+    }
+
+    /// Type C11's temporary candidates and keep the ones that actually own a
+    /// resource (`temporary-drop.md` §1: a value that is neither bound nor
+    /// moved). The scan collects positions as `&self`; typing needs `&mut self`,
+    /// exactly as B68's sink-argument typing does, and takes the same
+    /// never-silent stance on an unresolved answer — an argument the solver
+    /// cannot type is left unrecorded rather than silently destroyed.
+    fn record_resource_temporaries(&mut self, candidates: HashSet<Id>) {
+        // Deterministic order: the ids are a HashSet and `infer_type` memoizes
+        // into shared state.
+        let mut candidates: Vec<Id> = candidates.into_iter().collect();
+        candidates.sort_by_key(|id| id.0);
+        for expr_id in candidates {
+            let inferred =
+                self.infer_type(expr_id, &Type::Unknown, &SubstitutionContext::default());
+            if matches!(inferred, Type::Unresolved | Type::Unknown) {
+                continue;
+            }
+            let type_id = inferred.get_type_id(self);
+            if self.type_is_resource(type_id) {
+                self.resource_temporaries.insert(expr_id, type_id);
+            }
+        }
+    }
+
+    /// S3 (`lifetimes.md` §6): ask the last-use dataflow where each enrolled
+    /// binding's teardown region ends. Runs after `liveness::LastUse::compute`,
+    /// which needs the FINAL tree, so it cannot be folded into
+    /// `plan_resource_drops` (which runs much earlier, and whose answer — WHICH
+    /// bindings drop — this does not touch: only WHERE moves).
+    ///
+    /// **Module-level bindings never drop** (`memory.md` §6.8, unchanged), so
+    /// they are not in `dropped_bindings` and nothing here reaches them.
+    ///
+    /// **An explicit `drop(x)` needs no exception.** Moving into the sink is a
+    /// USE, and R7 rejects a conditional one, so the sink's statement *is* the
+    /// binding's last use and B150's guarded `finally` simply closes there
+    /// instead of at the scope end. The net still covers the whole window
+    /// between acquisition and the sink — which is the only thing it was ever
+    /// for — and P6's identity holds as stated: the point the pass infers is
+    /// the point the human wrote.
+    fn plan_last_use_drop_extents(&mut self) {
+        if self.dropped_bindings.is_empty() {
+            return;
+        }
+        let bindings: Vec<Id> = self.dropped_bindings.iter().copied().collect();
+        for binding in bindings {
+            let extent = self.last_use.drop_extent(binding);
+            if !matches!(extent, liveness::DropExtent::ScopeEnd) {
+                self.drop_extents.insert(binding, extent);
+            }
+        }
+        if !self.drop_extents.is_empty() {
+            self.declared_binding_extents = self.last_use.declared_binding_extents();
+        }
     }
 
     /// R2's two **static** halves — the writes whose outgoing value has no owner
@@ -7899,8 +8090,7 @@ impl<'src> Analyzer<'src> {
         consuming: bool,
         resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
-        dropped: &mut HashSet<Id>,
-        overwrites: &mut HashMap<Id, TypeId>,
+        plan: &mut DropPlan,
     ) {
         let mut declared_here: Vec<Id> = Vec::new();
         for capture in captures {
@@ -7933,15 +8123,21 @@ impl<'src> Analyzer<'src> {
                 }
                 _ => {}
             }
-            self.plan_expr(*statement, false, resources, owned, dropped, overwrites);
+            self.plan_expr(*statement, false, resources, owned, plan);
         }
-        self.plan_expr(tail, consuming, resources, owned, dropped, overwrites);
+        self.plan_expr(tail, consuming, resources, owned, plan);
         // Scope end: a resource local declared here and still owning its value
         // drops here. Either way it leaves scope, so it no longer counts as owned
         // for any enclosing scope.
+        //
+        // B150: a binding an explicit `drop(x)` moved out enrolls too. The sink
+        // is not the last word on whether the value is still alive at the scope
+        // end — a panic between the acquisition and the `drop(x)` never reaches
+        // it — so the teardown `finally` stays, and the transformer makes the
+        // pair idempotent (the sink empties the slot, the `finally` tests it).
         for variable_id in &declared_here {
-            if owned.remove(variable_id) {
-                dropped.insert(*variable_id);
+            if owned.remove(variable_id) || resources.explicitly_dropped.contains(variable_id) {
+                plan.dropped.insert(*variable_id);
             }
         }
     }
@@ -7956,8 +8152,7 @@ impl<'src> Analyzer<'src> {
         consuming: bool,
         resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
-        dropped: &mut HashSet<Id>,
-        overwrites: &mut HashMap<Id, TypeId>,
+        plan: &mut DropPlan,
     ) {
         let Some(expr) = self.expr_id_to_expr_map.get(&expr_id).cloned() else {
             return;
@@ -7973,19 +8168,19 @@ impl<'src> Analyzer<'src> {
             // the root binding (a consuming field read is R5's rejected partial
             // move, already diagnosed; treat it as a loan for planning).
             Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => {
-                self.plan_expr(subject, false, resources, owned, dropped, overwrites);
+                self.plan_expr(subject, false, resources, owned, plan);
             }
             Expr::Index(subject, index) => {
-                self.plan_expr(subject, false, resources, owned, dropped, overwrites);
-                self.plan_expr(index, false, resources, owned, dropped, overwrites);
+                self.plan_expr(subject, false, resources, owned, plan);
+                self.plan_expr(index, false, resources, owned, plan);
             }
             Expr::Reference(operand, _) | Expr::Dereference(operand) => {
-                self.plan_expr(operand, false, resources, owned, dropped, overwrites);
+                self.plan_expr(operand, false, resources, owned, plan);
             }
             // `let b = init` moves the initializer in; `b` then owns its value.
             Expr::Variable(variable_id) => {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
-                    self.plan_expr(initial, true, resources, owned, dropped, overwrites);
+                    self.plan_expr(initial, true, resources, owned, plan);
                 }
                 if resources.owned_bindings.contains(&variable_id) {
                     owned.insert(variable_id);
@@ -7997,7 +8192,7 @@ impl<'src> Analyzer<'src> {
             // &value` loans instead: the subject is never consumed and stays the
             // owner, so its captures own nothing and must not enroll.
             Expr::Destructure(value_id, pattern) => {
-                self.plan_expr(value_id, true, resources, owned, dropped, overwrites);
+                self.plan_expr(value_id, true, resources, owned, plan);
                 if !self.pattern_subject_is_loan(value_id) {
                     let mut captures = Vec::new();
                     Self::collect_pattern_captures(&pattern, &mut captures);
@@ -8016,7 +8211,7 @@ impl<'src> Analyzer<'src> {
             // COMPONENT belongs to (B99). The second kind is always live, so it
             // was settled statically before the scan began.
             Expr::Assignment(target_id, value_id) => {
-                self.plan_expr(value_id, true, resources, owned, dropped, overwrites);
+                self.plan_expr(value_id, true, resources, owned, plan);
                 match self.expr_id_to_expr_map.get(&target_id) {
                     // The OWNED half: liveness is this scan's own answer, since
                     // this body is the one that could have moved the value out.
@@ -8024,16 +8219,16 @@ impl<'src> Analyzer<'src> {
                         if owned.contains(binding)
                             && let Some(type_id) = self.dropped_binding_type_id(*binding)
                         {
-                            overwrites.insert(expr_id, type_id);
+                            plan.overwrites.insert(expr_id, type_id);
                         }
                         owned.insert(*binding);
                     }
                     // The STATIC halves (B94's loan, B99's component).
                     _ => {
                         if let Some(&type_id) = resources.place_overwrites.get(&expr_id) {
-                            overwrites.insert(expr_id, type_id);
+                            plan.overwrites.insert(expr_id, type_id);
                         }
-                        self.plan_expr(target_id, false, resources, owned, dropped, overwrites);
+                        self.plan_expr(target_id, false, resources, owned, plan);
                     }
                 }
             }
@@ -8047,122 +8242,128 @@ impl<'src> Analyzer<'src> {
                 let argument_ids = function_call.argument_ids;
                 if self.call_is_variant_constructor(call_id) {
                     for argument_id in &argument_ids {
-                        self.plan_expr(*argument_id, true, resources, owned, dropped, overwrites);
+                        self.plan_expr(*argument_id, true, resources, owned, plan);
                     }
                 } else if let Some(conventions) = self.callee_conventions(subject_id) {
                     for (index, argument_id) in argument_ids.iter().enumerate() {
                         let is_own = conventions.get(index).copied() == Some(Convention::Own);
-                        self.plan_expr(*argument_id, is_own, resources, owned, dropped, overwrites);
+                        self.plan_expr(*argument_id, is_own, resources, owned, plan);
+                        // C11's other half of P5's predicate: "neither a place
+                        // nor MOVED anywhere". A temporary survives the call only
+                        // where the position is a loan the caller still owns
+                        // after it — see `argument_leaves_ownership_with_caller`.
+                        if !self.argument_leaves_ownership_with_caller(subject_id, index) {
+                            plan.temporaries.remove(argument_id);
+                            plan.conditional_temporaries.remove(argument_id);
+                        }
                     }
                 } else {
                     for argument_id in &argument_ids {
-                        self.plan_expr(*argument_id, false, resources, owned, dropped, overwrites);
+                        self.plan_expr(*argument_id, false, resources, owned, plan);
+                        // An unresolved callee's conventions are a signature
+                        // nobody has read: claim nothing.
+                        plan.temporaries.remove(argument_id);
+                        plan.conditional_temporaries.remove(argument_id);
                     }
                 }
                 if !matches!(
                     self.expr_id_to_expr_map.get(&subject_id),
                     Some(Expr::Local(_))
                 ) {
-                    self.plan_expr(subject_id, false, resources, owned, dropped, overwrites);
+                    self.plan_expr(subject_id, false, resources, owned, plan);
                 }
+                // C11: a call result nobody binds and nobody moves is owned by
+                // the statement it is constructed in. The transformer's implicit
+                // await sits ON this node, so this is also the id whose emitted
+                // value is the resolved one.
+                plan.record_temporary(expr_id, consuming);
             }
             // A return moves its value out (consuming).
             Expr::FunctionReturn(Some(value_id)) => {
-                self.plan_expr(value_id, true, resources, owned, dropped, overwrites);
+                self.plan_expr(value_id, true, resources, owned, plan);
             }
             Expr::FunctionReturn(None) => {}
             // Constructors move their operands in.
             Expr::StructInitializer(_, fields) => {
                 for value_id in fields.values() {
-                    self.plan_expr(*value_id, true, resources, owned, dropped, overwrites);
+                    self.plan_expr(*value_id, true, resources, owned, plan);
                 }
+                plan.record_temporary(expr_id, consuming);
             }
+            // NOT candidates for C11's temporary rule: `List<Resource>` is
+            // R10-rejected outright, and an unbound aggregate LITERAL of a
+            // resource has no idiom asking for it. Recording them would put a
+            // literal through `infer_type` against `Unknown`, which locks a list
+            // literal's element type — the solver's answer is a side effect, so
+            // only the shapes that need the question get asked it.
             Expr::Tuple(ids) | Expr::List(ids) => {
                 for id in &ids {
-                    self.plan_expr(*id, true, resources, owned, dropped, overwrites);
+                    self.plan_expr(*id, true, resources, owned, plan);
                 }
             }
             Expr::Repeat(value_id, _length) => {
-                self.plan_expr(value_id, true, resources, owned, dropped, overwrites);
+                self.plan_expr(value_id, true, resources, owned, plan);
             }
             // Control flow.
             Expr::Block((statements, tail)) => {
-                self.plan_scope(
-                    &[],
-                    &statements,
-                    tail,
-                    consuming,
-                    resources,
-                    owned,
-                    dropped,
-                    overwrites,
-                );
+                self.plan_scope(&[], &statements, tail, consuming, resources, owned, plan);
             }
             Expr::If(branch) => {
-                self.plan_if(&branch, consuming, resources, owned, dropped, overwrites);
+                self.plan_if(&branch, consuming, resources, owned, plan);
             }
             Expr::Match(subject_id, legs) => {
-                self.plan_match(
-                    subject_id, &legs, consuming, resources, owned, dropped, overwrites,
-                );
+                self.plan_match(subject_id, &legs, consuming, resources, owned, plan);
             }
             Expr::For(condition, (statements, tail)) => {
-                self.plan_loop(
-                    condition,
-                    &statements,
-                    tail,
-                    resources,
-                    owned,
-                    dropped,
-                    overwrites,
-                );
+                self.plan_loop(condition, &statements, tail, resources, owned, plan);
             }
             Expr::ForEach(iterable, _item, (statements, tail)) => {
-                self.plan_expr(iterable, false, resources, owned, dropped, overwrites);
-                self.plan_loop(
-                    None,
-                    &statements,
-                    tail,
-                    resources,
-                    owned,
-                    dropped,
-                    overwrites,
-                );
+                self.plan_expr(iterable, false, resources, owned, plan);
+                self.plan_loop(None, &statements, tail, resources, owned, plan);
             }
             // Pass-through: the value's role flows to the inner expression.
             Expr::Await(inner) | Expr::TryAssert(inner) => {
-                self.plan_expr(inner, consuming, resources, owned, dropped, overwrites);
+                self.plan_expr(inner, consuming, resources, owned, plan);
+                // The wrapper takes the record over: capturing the inner call
+                // would capture a PROMISE and hand the destructor one.
+                if plan.temporaries.remove(&inner) {
+                    plan.conditional_temporaries.remove(&inner);
+                    plan.record_temporary(expr_id, consuming);
+                }
             }
-            Expr::Binary(_, lhs, rhs) => {
-                self.plan_expr(lhs, false, resources, owned, dropped, overwrites);
-                self.plan_expr(rhs, false, resources, owned, dropped, overwrites);
+            // The right of `&&`/`||` runs only on some paths through the
+            // statement, so a resource constructed there has no static drop
+            // point — `temporary-drop.md` §7.3's residue, refused below.
+            Expr::Binary(operator, lhs, rhs) => {
+                self.plan_expr(lhs, false, resources, owned, plan);
+                let short_circuits = matches!(operator, BinaryOp::And | BinaryOp::Or);
+                if short_circuits {
+                    plan.short_circuit_depth += 1;
+                }
+                self.plan_expr(rhs, false, resources, owned, plan);
+                if short_circuits {
+                    plan.short_circuit_depth -= 1;
+                }
             }
             Expr::Unary(_, operand) => {
-                self.plan_expr(operand, false, resources, owned, dropped, overwrites);
+                self.plan_expr(operand, false, resources, owned, plan);
             }
             Expr::Is(subject, _pattern) => {
-                self.plan_expr(subject, false, resources, owned, dropped, overwrites);
+                self.plan_expr(subject, false, resources, owned, plan);
             }
             Expr::Lift(subject, _binder, continuation) => {
-                self.plan_expr(subject, false, resources, owned, dropped, overwrites);
-                self.plan_expr(
-                    continuation,
-                    consuming,
-                    resources,
-                    owned,
-                    dropped,
-                    overwrites,
-                );
+                self.plan_expr(subject, false, resources, owned, plan);
+                self.plan_expr(continuation, consuming, resources, owned, plan);
             }
             Expr::LiftRegion(steps, body) => {
                 for (step_id, _binder, _is_split) in &steps {
-                    self.plan_expr(*step_id, false, resources, owned, dropped, overwrites);
+                    self.plan_expr(*step_id, false, resources, owned, plan);
                 }
-                self.plan_expr(body, consuming, resources, owned, dropped, overwrites);
+                self.plan_expr(body, consuming, resources, owned, plan);
             }
             Expr::TupleComprehension(_binder, source, body) => {
-                self.plan_expr(source, false, resources, owned, dropped, overwrites);
-                self.plan_expr(body, false, resources, owned, dropped, overwrites);
+                self.plan_expr(source, false, resources, owned, plan);
+                self.plan_expr(body, false, resources, owned, plan);
             }
             // Closures / spawns are their own scan roots (walked from
             // `plan_resource_drops`); the rest are leaves with no resource move.
@@ -8204,8 +8405,7 @@ impl<'src> Analyzer<'src> {
         consuming: bool,
         resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
-        dropped: &mut HashSet<Id>,
-        overwrites: &mut HashMap<Id, TypeId>,
+        plan: &mut DropPlan,
     ) {
         let mut conditions: Vec<Id> = Vec::new();
         let mut arms: Vec<PlanArm> = Vec::new();
@@ -8240,11 +8440,9 @@ impl<'src> Analyzer<'src> {
             }
         }
         for condition in &conditions {
-            self.plan_expr(*condition, false, resources, owned, dropped, overwrites);
+            self.plan_expr(*condition, false, resources, owned, plan);
         }
-        self.plan_branches(
-            &arms, !has_else, consuming, resources, owned, dropped, overwrites,
-        );
+        self.plan_branches(&arms, !has_else, consuming, resources, owned, plan);
     }
 
     /// Plan a `match`: by-value matching consumes the subject; `match &x` loans
@@ -8267,22 +8465,14 @@ impl<'src> Analyzer<'src> {
         consuming: bool,
         resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
-        dropped: &mut HashSet<Id>,
-        overwrites: &mut HashMap<Id, TypeId>,
+        plan: &mut DropPlan,
     ) {
         let subject_is_loan = self.pattern_subject_is_loan(subject_id);
-        self.plan_expr(
-            subject_id,
-            !subject_is_loan,
-            resources,
-            owned,
-            dropped,
-            overwrites,
-        );
+        self.plan_expr(subject_id, !subject_is_loan, resources, owned, plan);
         let mut arms: Vec<PlanArm> = Vec::new();
         for leg in legs {
             if let Some(guard) = leg.guard {
-                self.plan_expr(guard, false, resources, owned, dropped, overwrites);
+                self.plan_expr(guard, false, resources, owned, plan);
             }
             let mut captures = Vec::new();
             if !subject_is_loan {
@@ -8294,9 +8484,7 @@ impl<'src> Analyzer<'src> {
                 tail: leg.body,
             });
         }
-        self.plan_branches(
-            &arms, false, consuming, resources, owned, dropped, overwrites,
-        );
+        self.plan_branches(&arms, false, consuming, resources, owned, plan);
     }
 
     /// Whether a pattern's subject is matched by LOAN rather than consumed — the
@@ -8321,8 +8509,7 @@ impl<'src> Analyzer<'src> {
         consuming: bool,
         resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
-        dropped: &mut HashSet<Id>,
-        overwrites: &mut HashMap<Id, TypeId>,
+        plan: &mut DropPlan,
     ) {
         let entry = owned.clone();
         let mut live_arms: Vec<HashSet<Id>> = Vec::new();
@@ -8335,8 +8522,7 @@ impl<'src> Analyzer<'src> {
                 consuming,
                 resources,
                 &mut arm_owned,
-                dropped,
-                overwrites,
+                plan,
             );
             if !self.block_diverges(&arm.statements, arm.tail) {
                 live_arms.push(arm_owned);
@@ -8366,25 +8552,15 @@ impl<'src> Analyzer<'src> {
         tail: Id,
         resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
-        dropped: &mut HashSet<Id>,
-        overwrites: &mut HashMap<Id, TypeId>,
+        plan: &mut DropPlan,
     ) {
         if let Some(condition) = condition {
-            self.plan_expr(condition, false, resources, owned, dropped, overwrites);
+            self.plan_expr(condition, false, resources, owned, plan);
         }
         // A `for` binder is a single identifier, never a pattern (`ForEach` holds
         // an `Option<Id>`), so a loop body owns no captures at entry.
         let snapshot = owned.clone();
-        self.plan_scope(
-            &[],
-            statements,
-            tail,
-            false,
-            resources,
-            owned,
-            dropped,
-            overwrites,
-        );
+        self.plan_scope(&[], statements, tail, false, resources, owned, plan);
         *owned = snapshot;
     }
 
@@ -8406,6 +8582,37 @@ impl<'src> Analyzer<'src> {
             .keys()
             .filter_map(|call_id| self.drop_sink_argument_of(*call_id))
             .filter_map(|argument_id| self.drop_sink_argument_type_id(argument_id))
+            .collect()
+    }
+
+    /// B150: the bindings an explicit `drop(x)` destroys early — the sink calls
+    /// whose argument is a bare place rather than a value. Each stays enrolled
+    /// in `dropped_bindings`, so its scope keeps the teardown `finally` a panic
+    /// before the sink has to flow through; the transformer pairs the two so
+    /// the fall-through path still destroys exactly once.
+    ///
+    /// No control flow is consulted, and none is needed: R7 rejects a
+    /// conditional move outright, so an accepted `drop(x)` runs on every path
+    /// through its scope. Recognition goes through `drop_sink_argument_of`, the
+    /// one place the sink is identified, so this cannot drift from the glue
+    /// seeding or the §8 coloring edges. A `drop(f(x))` names no binding and is
+    /// absent here: the value it destroys was never enrolled to begin with.
+    fn explicitly_dropped_bindings(&self, owned_bindings: &HashSet<Id>) -> HashSet<Id> {
+        if self.drop_fn_id.is_none() {
+            return HashSet::default();
+        }
+        self.function_calls
+            .keys()
+            .filter_map(|call_id| self.drop_sink_argument_of(*call_id))
+            .filter_map(
+                |argument_id| match self.expr_id_to_expr_map.get(&argument_id) {
+                    // A parameter in expression position is an `Expr::Local` of the
+                    // parameter's id, so both spellings arrive through this arm.
+                    Some(Expr::Local(binding) | Expr::Parameter(binding)) => Some(*binding),
+                    _ => None,
+                },
+            )
+            .filter(|binding| owned_bindings.contains(binding))
             .collect()
     }
 
@@ -8597,6 +8804,19 @@ impl<'src> Analyzer<'src> {
         // arg's `expr_type_id`) is present. The type is read the same way the
         // transformer will read it, so a concrete argument's id matches.
         for type_id in self.drop_sink_argument_types() {
+            worklist.push(type_id);
+        }
+        // C11: an owning TEMPORARY is destroyed at its statement's end, and its
+        // type may reach the program no other way — `File::open(p).read_at(b,
+        // 0)` binds nothing, so without this the glue the lift looks up does not
+        // exist and the temporary would silently keep leaking.
+        let mut temporaries: Vec<(Id, TypeId)> = self
+            .resource_temporaries
+            .iter()
+            .map(|(expr_id, type_id)| (*expr_id, *type_id))
+            .collect();
+        temporaries.sort_unstable_by_key(|(expr_id, _)| expr_id.0);
+        for (_, type_id) in temporaries {
             worklist.push(type_id);
         }
         let mut glue: HashMap<TypeId, DropGlue> = HashMap::default();
@@ -9251,6 +9471,57 @@ impl<'src> Analyzer<'src> {
     /// The declared parameter conventions of a directly-resolved callee
     /// (`subject -> Local(callee)`), including the `self` receiver at index 0.
     /// `None` for a dispatched / generic / closure-valued callee.
+    /// C11: whether argument `index` of the call through `subject_id` leaves
+    /// its value's ownership with the CALLER — the position where an unbound
+    /// resource is a temporary the statement must destroy.
+    ///
+    /// Two positions qualify: an explicit `&` / `&mut` view, and a bare `self`
+    /// RECEIVER (`File::open(p).read_at(b, 0)` — C11's whole idiom). R3 says
+    /// bare parameters are loans generally, but this stops short of the general
+    /// rule on purpose: `Option::replace`'s intrinsic surface declares
+    /// `value: T` bare and then KEEPS the value, so recording a temporary there
+    /// destroys something the callee stored. Where a declaration understates,
+    /// the failure direction has to be a leak, not a double destruction. (The
+    /// declaration is the real defect and is reported; widening this predicate
+    /// is what should follow it being fixed.)
+    fn argument_leaves_ownership_with_caller(&self, subject_id: Id, index: usize) -> bool {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return false;
+        };
+        let parameter_ids = self
+            .functions
+            .get(callee_id)
+            .map(|function| &function.parameters)
+            .or_else(|| {
+                self.external_functions
+                    .get(callee_id)
+                    .map(|external| &external.parameters)
+            });
+        let Some(parameter) = parameter_ids
+            .and_then(|ids| ids.get(index))
+            .and_then(|parameter_id| self.parameters.get(parameter_id))
+        else {
+            return false;
+        };
+        match parameter.convention {
+            Convention::Ref | Convention::RefMut => true,
+            Convention::Bare => parameter.name == "self",
+            Convention::Own => false,
+        }
+    }
+
+    /// Whether the call through `subject_id` reaches an extern declared
+    /// `[extern(…, retains)]` — the host keeps what it is handed
+    /// (`lifetimes.md` §6.4).
+    fn callee_retains(&self, subject_id: Id) -> bool {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return false;
+        };
+        self.external_functions
+            .get(callee_id)
+            .is_some_and(|external| external.retains)
+    }
+
     fn callee_conventions(&self, subject_id: Id) -> Option<Vec<Convention>> {
         let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return None;
@@ -10409,8 +10680,7 @@ impl<'src> Analyzer<'src> {
         // happens to take no `own T`. `fun clear<T>(slot: &mut Option<T>) { slot
         // = None }` owes R2's drop and declares no `own` parameter at all.
         let mut owned: HashSet<Id> = own_params.iter().copied().collect();
-        let mut dropped: HashSet<Id> = HashSet::default();
-        let mut overwrites: HashMap<Id, TypeId> = HashMap::default();
+        let mut plan = DropPlan::default();
         // A loan owns nothing (B94), here as much as in the whole-program plan:
         // a `&mut T` binding in the body is not a value this instantiation would
         // have to destroy — so it is not an owner, and B101's point is that it is
@@ -10426,6 +10696,15 @@ impl<'src> Analyzer<'src> {
                 .collect(),
             place_overwrites: self
                 .collect_place_overwrites(resource_bindings, resource_value_places),
+            // Empty here, deliberately: B150's enrollment answers "does this
+            // scope still owe a teardown on the panicking path", which is a
+            // codegen question, and this scan asks the R11 one — "would this
+            // erased body owe a destruction it cannot emit". A `drop(x)` sink
+            // IS the destruction site, so it must keep exempting the binding,
+            // exactly as it did before. (A `drop(x)` on a still-abstract `T` is
+            // separately rejected under a resource instantiation, so no
+            // delta-resource binding reaches the guarded pair anyway.)
+            explicitly_dropped: HashSet::default(),
         };
         self.plan_scope(
             &[],
@@ -10434,8 +10713,7 @@ impl<'src> Analyzer<'src> {
             true,
             &resources,
             &mut owned,
-            &mut dropped,
-            &mut overwrites,
+            &mut plan,
         );
         for parameter in &own_params {
             if owned.contains(parameter) {
@@ -10455,10 +10733,11 @@ impl<'src> Analyzer<'src> {
             return;
         }
         // Sorted by span (C1: deterministic order; both sets are HashSets).
-        let mut leaked: Vec<(Id, Id, GenericLeak)> = dropped
+        let mut leaked: Vec<(Id, Id, GenericLeak)> = plan
+            .dropped
             .into_iter()
             .map(|binding| (binding, binding, GenericLeak::ScopeEndDrop))
-            .chain(overwrites.into_keys().filter_map(|assignment| {
+            .chain(plan.overwrites.into_keys().filter_map(|assignment| {
                 let Some(&Expr::Assignment(target_id, _)) =
                     self.expr_id_to_expr_map.get(&assignment)
                 else {
@@ -14768,7 +15047,11 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a closure body references a `&` / `&mut` parameter — necessarily
     /// one captured from an enclosing function, since closure parameters are
-    /// always bare. (Capturing an outer view *binding* is deferred.)
+    /// always bare. That capture stays legal (the parameter views the CALLER's
+    /// place, which outlives the call); making the closure second-class is the
+    /// whole of its policing. An outer view *BINDING* is a different matter and
+    /// no longer reaches here at all: `check_closure_view_capture_ban` refuses
+    /// it at the capture (C12), so nothing is left for the escape rule to catch.
     fn closure_captures_view_param(&self, closure_id: Id) -> bool {
         let Some(closure) = self.closures.get(&closure_id) else {
             return false;
@@ -15624,7 +15907,7 @@ impl<'src> Analyzer<'src> {
             Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
         self.view_suspension_checks = pending;
-        self.check_async_closure_captures(&view_bindings);
+        self.check_closure_view_capture_ban(&view_bindings);
         for violation in violations {
             let (anchor, msg) = match violation {
                 InvalidationViolation::Reassignment { anchor, root } => {
@@ -15700,12 +15983,27 @@ impl<'src> Analyzer<'src> {
             }));
     }
 
-    /// E3's closure half: an `async { .. }` (or any closure whose body
-    /// suspends) may not CAPTURE a view from an enclosing scope — the capture
-    /// is live across the closure's awaits. Views declared inside the closure
-    /// are the body scan's business; nested closures are walked too (a sync
-    /// closure inside the async one still holds the capture at its awaits).
-    fn check_async_closure_captures(&mut self, view_bindings: &HashSet<Id>) {
+    /// Rule 3's capture ban, enforced (C12, `lifetimes.md` §4 → spec §6.9): a
+    /// closure may not CAPTURE a view binding from an enclosing scope. The
+    /// binding is a local of a frame the closure can outlive, so the capture
+    /// escapes the surveyable interval §6.0 needs — memory-safe on the JS
+    /// backend only because the host boxes the place and traces it, and a
+    /// use-after-free on any backend that does not. Views declared inside the
+    /// closure are the body scan's business; nested closures are walked too.
+    ///
+    /// The scope is exactly the deferral this closes: `view_bindings` holds
+    /// view *locals* (`compute_view_bindings` ∪ `compute_view_origins`'s keys),
+    /// never parameters. A closure naming an enclosing `&`/`&mut` PARAMETER
+    /// (`|| self.items.push(x)` inside a `&mut self` method) stays legal — the
+    /// parameter views the CALLER's place, which outlives the call — and is
+    /// policed by P4c instead: `check_view_escape` makes such a closure
+    /// second-class, so it cannot be returned or stored.
+    ///
+    /// E3's async half keeps its own, sharper text where the closure suspends:
+    /// the token settles it here, and B119's call-graph answer settles the rest
+    /// in the post-pass, which now emits one message or the other rather than
+    /// dropping the capture when the body turns out not to suspend.
+    fn check_closure_view_capture_ban(&mut self, view_bindings: &HashSet<Id>) {
         // S1: the capture diagnostic anchors inside the closure's own body.
         let closure_ids: Vec<Id> = self
             .closures
@@ -15744,9 +16042,12 @@ impl<'src> Analyzer<'src> {
                     .get(binding_id)
                     .map(|v| v.name)
                     .unwrap_or("the view");
-                // The token settles it here; without one the closure may still
-                // suspend by calling something that does (B119) — a candidate
-                // `check_view_suspensions` decides against the call graph.
+                // The capture is refused either way; what the `await` token
+                // decides is the TEXT. With one, E3's async message is settled
+                // here. Without one the closure may still suspend by calling
+                // something that does (B119), so the choice waits for the call
+                // graph — `check_view_suspensions` picks the async text or the
+                // plain capture ban and emits one of them.
                 if saw_await {
                     errors.push((reference_id, name));
                 } else {
@@ -16882,6 +17183,35 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// A `css { … }` block lowers to `std::style::style` (css-block.md §5.1,
+    /// S4): an unresolved `style` whose span is the `css` KEYWORD — the one
+    /// span the block's desugar gives a generated accessor on purpose, so the
+    /// squiggle lands on the word that asked for a `Style` — gets the
+    /// explanation as a note.
+    ///
+    /// Without it the report is honest but disjointed: `css` is underlined and
+    /// the message talks about `style`, with nothing drawing the line between
+    /// them. Every other generated accessor in the desugar is zero-width, so
+    /// this test cannot fire on one of them; a hand-written `style` accessor's
+    /// span is its own ident, which does not read `css`.
+    fn css_style_import_note(&self, id: Id, name: &str) -> Option<Note> {
+        if name != "style" {
+            return None;
+        }
+        let span = **self.span_map.get(&id)?;
+        let source = self.source_of_id(id).unwrap_or(SourceId(0));
+        let text = self.source_text(source)?;
+        if text.get(span.into_range())? != "css" {
+            return None;
+        }
+        Some(Note::here(
+            span,
+            "a `css { … }` block lowers to a std::style::style chain; add \
+             `import std::style::style;`"
+                .to_string(),
+        ))
+    }
+
     /// Element-syntax S4: `<div text("hi")>` — an undotted `text(…)` head item
     /// is an ATTRIBUTE (it lowers to `.attr("text", …)` and sets a `text`
     /// attribute), while the author almost certainly meant the `.text(…)`
@@ -17095,7 +17425,6 @@ impl<'src> Analyzer<'src> {
     /// literal's element/field/payload, and an `own` argument (which is how
     /// `List::push` declares that it keeps what it is given).
     fn compute_clone_sites(&mut self, shared_captures: &HashSet<Id>) -> HashMap<Id, CopyDecision> {
-        let repeatable = self.collect_repeatable_interiors();
         // Phase 1 — the candidate positions, collected before any classifying
         // so the (`&mut`, memoizing) resource query can run over them.
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
@@ -17109,7 +17438,7 @@ impl<'src> Analyzer<'src> {
                 // draws.
                 && !analyzer.assignment_target_is_view(value_id)
                 && !analyzer.resource_value_places.contains(&value_id)
-                && !analyzer.is_elidable_copy(value_id, &repeatable, shared_captures)
+                && !analyzer.is_elidable_copy(value_id, shared_captures)
             {
                 if let Some(type_id) = type_id {
                     candidates.push((value_id, type_id));
@@ -17506,17 +17835,16 @@ impl<'src> Analyzer<'src> {
             classified.push((capture_id, subject_id, copy));
         }
         // Phase 3 — the MOVE elision, rule 2's dead-source form: a subject
-        // that is a local read exactly once (a `?`-lift temp holding a fresh
-        // call result, say) donates its elements — the captures take
-        // ownership of a corpse, no copy needed. `is_elidable_copy` already
-        // refuses parameters (they alias the caller's value, which outlives
-        // the call — the `unwrap` leak), loop/closure repeats, and — with
-        // phase 2's set in hand — a SHARED capture, which owns nothing to
-        // donate.
-        let repeatable = self.collect_repeatable_interiors();
+        // whose read here is its LAST (a `?`-lift temp holding a fresh call
+        // result, say) donates its elements — the captures take ownership of a
+        // corpse, no copy needed. `is_elidable_copy` already refuses parameters
+        // (they alias the caller's value, which outlives the call — the
+        // `unwrap` leak), a subject still live across a back edge or read from
+        // a closure, and — with phase 2's set in hand — a SHARED capture, which
+        // owns nothing to donate.
         let mut sites = HashMap::default();
         for (capture_id, subject_id, copy) in classified {
-            if !self.is_elidable_copy(subject_id, &repeatable, &shared) {
+            if !self.is_elidable_copy(subject_id, &shared) {
                 sites.insert(capture_id, copy);
             }
         }
@@ -17659,205 +17987,41 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Rule 2 (elision): whether a copy of an aggregate place can be downgraded
-    /// to a move because the aliasing can never be observed. Sound, not complete
-    /// — we only elide when the source is a local read *exactly once* (so there
-    /// is no later read, and no closure capture, which would be a second read)
-    /// and that read is not inside a loop or closure, where it could repeat and
-    /// the alias would persist into the next iteration. A parameter is never
-    /// elided: it aliases the caller's value, which outlives the call.
+    /// to a move because the aliasing can never be observed. Sound, not
+    /// complete. The source must be a plain local binding — a field/element
+    /// source (`mut b = a.field`) is conservatively always copied — and this
+    /// read must be the binding's **last use on every path**, the question
+    /// `analyzer/liveness.rs` answers (`lifetimes.md` §6, slice S2).
     ///
-    /// Nor is a SHARED pattern capture (B53): the share elision left it
+    /// That dataflow replaces `reference_count == 1`, a syntactic whole-program
+    /// use count, and its `collect_repeatable_interiors` guard, a lexical set of
+    /// every id inside a loop or closure. Both are gone: the liveness rule
+    /// subsumes them and is strictly better at each of the three jobs they did.
+    /// A later read now refuses the elision *because it is a later read*, not
+    /// because the count says two; a closure capture refuses it because the
+    /// capture reads the binding from another region (§4 — a closure captures
+    /// BINDINGS); and the loop rule asks "live across the back edge" **relative
+    /// to the declaration**, so a binding the loop body itself declares — fresh
+    /// on every iteration — elides at its last use where the lexical set
+    /// refused it. §3 fact 3 priced the difference: 25.4% of entities failed the
+    /// old test, half of them with exactly two uses.
+    ///
+    /// A parameter is still never elided: it aliases the caller's value, which
+    /// outlives the call, so it is not in `variables` and the dataflow is not
+    /// asked. Nor is a SHARED pattern capture (B53): the share elision left it
     /// aliasing its subject's element, so it has no storage of its own to
     /// donate — `let (xs, n) = pair; mut ys = xs; ys.push(9)` would grow
     /// `pair.0` through two elisions that are each sound alone. Refusing here
     /// makes the second binding copy, which restores the invariant every other
     /// elision rests on: only an OWNER moves.
-    fn is_elidable_copy(
-        &self,
-        value_id: Id,
-        repeatable: &HashSet<Id>,
-        shared_captures: &HashSet<Id>,
-    ) -> bool {
-        if repeatable.contains(&value_id) {
-            return false;
-        }
+    fn is_elidable_copy(&self, value_id: Id, shared_captures: &HashSet<Id>) -> bool {
         let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&value_id) else {
-            // Only a simple binding alias is elided; a field/element source
-            // (`mut b = a.field`) is conservatively always copied.
             return false;
         };
         if shared_captures.contains(binding_id) {
             return false;
         }
-        self.variables.contains_key(binding_id)
-            && self.reference_count.get(binding_id).copied() == Some(1)
-    }
-
-    /// Entity ids inside a loop or closure body — code that may run a different
-    /// number of times than its enclosing scope, so a copy there cannot be
-    /// elided (the alias would survive into the next repetition). Every function,
-    /// module, and closure body is walked; closures are also roots (at depth 1)
-    /// so a copy inside any closure is treated as repeatable.
-    fn collect_repeatable_interiors(&self) -> HashSet<Id> {
-        let mut interior = HashSet::default();
-        let mut visited = HashSet::default();
-        for function in self.functions.values() {
-            if function.has_body {
-                for statement in &function.body.0 {
-                    self.mark_repeatable(*statement, 0, &mut interior, &mut visited);
-                }
-                self.mark_repeatable(function.body.1, 0, &mut interior, &mut visited);
-            }
-        }
-        for module in self.modules.values() {
-            for statement in &module.body.0 {
-                self.mark_repeatable(*statement, 0, &mut interior, &mut visited);
-            }
-        }
-        for closure in self.closures.values() {
-            self.mark_repeatable(closure.return_, 1, &mut interior, &mut visited);
-        }
-        interior
-    }
-
-    /// Walks the expression tree from `id`, recording every id reached at
-    /// `depth > 0` (inside a loop or closure) in `interior`. Mirrors the call
-    /// graph's traversal; `visited` guards against shared sub-expressions.
-    fn mark_repeatable(
-        &self,
-        id: Id,
-        depth: u32,
-        interior: &mut HashSet<Id>,
-        visited: &mut HashSet<Id>,
-    ) {
-        if !visited.insert(id) {
-            return;
-        }
-        if depth > 0 {
-            interior.insert(id);
-        }
-        let Some(expr) = self.expr_id_to_expr_map.get(&id) else {
-            return;
-        };
-        match expr {
-            Expr::Variable(variable_id) => {
-                if let Some(initial) = self
-                    .variables
-                    .get(variable_id)
-                    .and_then(|variable| variable.initial)
-                {
-                    self.mark_repeatable(initial, depth, interior, visited);
-                }
-            }
-            Expr::Closure(closure_id) | Expr::Async(closure_id) => {
-                if let Some(closure) = self.closures.get(closure_id) {
-                    self.mark_repeatable(closure.return_, depth + 1, interior, visited);
-                }
-            }
-            Expr::Field(subject_id, _, _) | Expr::TupleIndex(subject_id, _, _) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited)
-            }
-            Expr::Index(subject_id, index_id) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited);
-                self.mark_repeatable(*index_id, depth, interior, visited);
-            }
-            Expr::FunctionReturn(Some(value_id)) => {
-                self.mark_repeatable(*value_id, depth, interior, visited)
-            }
-            Expr::Binary(_, lhs, rhs) => {
-                self.mark_repeatable(*lhs, depth, interior, visited);
-                self.mark_repeatable(*rhs, depth, interior, visited);
-            }
-            Expr::Unary(_, operand) | Expr::Reference(operand, _) | Expr::Dereference(operand) => {
-                self.mark_repeatable(*operand, depth, interior, visited)
-            }
-            Expr::Assignment(target_id, value_id) => {
-                self.mark_repeatable(*target_id, depth, interior, visited);
-                self.mark_repeatable(*value_id, depth, interior, visited);
-            }
-            Expr::Call(call_id) => {
-                if let Some(function_call) = self.function_calls.get(call_id) {
-                    self.mark_repeatable(function_call.subject_id, depth, interior, visited);
-                    for argument_id in &function_call.argument_ids {
-                        self.mark_repeatable(*argument_id, depth, interior, visited);
-                    }
-                }
-            }
-            Expr::Await(inner) => self.mark_repeatable(*inner, depth, interior, visited),
-            Expr::Block((statements, tail)) => {
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth, interior, visited);
-            }
-            Expr::For(condition, (statements, tail)) => {
-                if let Some(condition) = condition {
-                    self.mark_repeatable(*condition, depth + 1, interior, visited);
-                }
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth + 1, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth + 1, interior, visited);
-            }
-            Expr::ForEach(iterable, _item, (statements, tail)) => {
-                self.mark_repeatable(*iterable, depth, interior, visited);
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth + 1, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth + 1, interior, visited);
-            }
-            Expr::If(branch) => self.mark_repeatable_if(branch, depth, interior, visited),
-            Expr::Is(subject_id, _pattern) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited)
-            }
-            Expr::Match(subject_id, legs) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited);
-                for leg in legs {
-                    if let Some(guard) = leg.guard {
-                        self.mark_repeatable(guard, depth, interior, visited);
-                    }
-                    self.mark_repeatable(leg.body, depth, interior, visited);
-                }
-            }
-            Expr::List(ids) | Expr::Tuple(ids) => {
-                for id in ids {
-                    self.mark_repeatable(*id, depth, interior, visited);
-                }
-            }
-            Expr::StructInitializer(_, fields) => {
-                for value_id in fields.values() {
-                    self.mark_repeatable(*value_id, depth, interior, visited);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn mark_repeatable_if(
-        &self,
-        branch: &ExprIfBranch,
-        depth: u32,
-        interior: &mut HashSet<Id>,
-        visited: &mut HashSet<Id>,
-    ) {
-        match branch {
-            ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.mark_repeatable(*condition, depth, interior, visited);
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth, interior, visited);
-                if let Some(else_branch) = else_branch {
-                    self.mark_repeatable_if(else_branch, depth, interior, visited);
-                }
-            }
-            ExprIfBranch::Else((statements, tail)) => {
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth, interior, visited);
-            }
-        }
+        self.variables.contains_key(binding_id) && self.last_use.is_last_use(value_id, *binding_id)
     }
 
     /// Resolves a value-name USE at a byte offset, honoring positional
@@ -19118,6 +19282,7 @@ impl<'src> Analyzer<'src> {
                             parameters,
                             return_type_id,
                             extern_binding: function.extern_binding.clone(),
+                            retains: function.extern_retains,
                             borrows,
                             returns_mut_view: matches!(
                                 return_type_node.map(|spanned| &spanned.0),
@@ -30173,7 +30338,9 @@ impl<'src> Analyzer<'src> {
                             }
                         },
                     );
-                    let note = note.or_else(|| self.element_view_import_note(id, name));
+                    let note = note
+                        .or_else(|| self.element_view_import_note(id, name))
+                        .or_else(|| self.css_style_import_note(id, name));
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note,
@@ -32928,6 +33095,56 @@ struct WrittenRoots {
     in_place: HashSet<Id>,
 }
 
+/// The drop scan's outputs, carried as one value so the walk's signature stays
+/// readable ([`Analyzer::plan_expr`] threads it through every arm).
+///
+/// Each scan ROOT fills a fresh one and the whole-program plan absorbs it, so a
+/// root's answers attribute to the node that owns them
+/// ([`Analyzer::record_root_drop_types`] reads them per root before the merge).
+#[derive(Default)]
+struct DropPlan {
+    /// Resource bindings whose declaring scope destroys them.
+    dropped: HashSet<Id>,
+    /// Assignments that overwrite a live resource, by the outgoing type (R2).
+    overwrites: HashMap<Id, TypeId>,
+    /// C11 (`temporary-drop.md`): constructed values that are neither bound
+    /// nor moved anywhere — candidate owning TEMPORARIES. The scan runs as
+    /// `&self`, so it records the POSITIONS and a later `&mut self` pass types
+    /// them and keeps the resource-valued ones; the key space is the
+    /// expression's own id, which is what B68's `drop_sink_value_types`
+    /// already uses for an unbound resource value.
+    temporaries: HashSet<Id>,
+    /// The subset born under a SHORT-CIRCUIT operand — the right of `&&`/`||`,
+    /// which JS evaluates inline and conditionally. `temporary-drop.md` §7.3
+    /// refuses these rather than admitting v1's first runtime drop flag.
+    conditional_temporaries: HashSet<Id>,
+    /// How many short-circuit right operands the walk is inside.
+    short_circuit_depth: usize,
+}
+
+impl DropPlan {
+    fn absorb(&mut self, other: DropPlan) {
+        self.dropped.extend(other.dropped);
+        self.overwrites.extend(other.overwrites);
+        self.temporaries.extend(other.temporaries);
+        self.conditional_temporaries
+            .extend(other.conditional_temporaries);
+    }
+
+    /// Record a constructed value left in a non-consuming position. A
+    /// pass-through wrapper (`await`, `try`) HANDS the record upward — the
+    /// value that must be captured and destroyed is the awaited one, never the
+    /// promise beneath it.
+    fn record_temporary(&mut self, expr_id: Id, consuming: bool) {
+        if !consuming {
+            self.temporaries.insert(expr_id);
+            if self.short_circuit_depth > 0 {
+                self.conditional_temporaries.insert(expr_id);
+            }
+        }
+    }
+}
+
 /// The static inputs of the drop scan ([`Analyzer::plan_resource_drops`]) —
 /// two answers to the one question R2 asks of an assignment, *who owns the
 /// value being overwritten*.
@@ -32951,6 +33168,12 @@ struct ResourceOwnership {
     /// [`Analyzer::collect_place_overwrites`] for why neither asks a liveness
     /// question.
     place_overwrites: HashMap<Id, TypeId>,
+    /// B150: the bindings an explicit `drop(x)` destroys early. They stay
+    /// ENROLLED in the scope-end teardown even though the sink moved them out,
+    /// because a panic between the acquisition and the `drop(x)` must still
+    /// release the resource; the emitted pair is made idempotent instead (the
+    /// sink empties the slot, the `finally` destroys only a full one).
+    explicitly_dropped: HashSet<Id>,
 }
 
 /// What `compute_capture_clone_sites` settles about a program's pattern
@@ -33092,6 +33315,11 @@ pub struct Program<'src> {
     pub drop_fn_id: Option<Id>,
     /// `std::asset::emit` — the const-only compile-time effect (const-eval.md).
     pub asset_emit_fn_id: Option<Id>,
+    /// `std::asset::emit_keyed` — `emit`'s ordered spelling, where the
+    /// contribution carries its own sort key (build-hooks.md §5.3):
+    /// const-only exactly like `emit`, and held separately only so a
+    /// diagnostic can name the spelling the program actually wrote.
+    pub asset_emit_keyed_fn_id: Option<Id>,
     /// `std::asset::read` — the channel's input direction (docs-port.md §3.3):
     /// const-only exactly like `emit`.
     pub asset_read_fn_id: Option<Id>,
@@ -33103,9 +33331,10 @@ pub struct Program<'src> {
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
     /// the transformer serializes these in place of the expressions.
     pub const_results: HashMap<Id, crate::interpreter::ConstValue>,
-    /// `(kind, line)` pairs `asset::emit` accumulated during const evaluation;
-    /// the build deduplicates, orders, and writes them beside the output.
-    pub const_assets: Vec<(String, String)>,
+    /// The contributions `asset::emit` / `asset::emit_keyed` accumulated
+    /// during const evaluation; the build deduplicates, orders, and writes
+    /// them beside the output.
+    pub const_assets: Vec<crate::const_eval::EmittedAsset>,
     /// Every file `asset::read` touched during const evaluation, resolved, with
     /// the content hash it read (`None` for a file that could not be read —
     /// still a dependency: its APPEARANCE must invalidate as surely as a
@@ -33388,6 +33617,30 @@ pub struct Program<'src> {
     /// scope in `try`/`finally`, dropping them in reverse declaration order.
     /// Filled by `plan_resource_drops`; empty on resource-free programs.
     pub dropped_bindings: HashSet<Id>,
+    /// S3 (`lifetimes.md` §6): where each enrolled binding's teardown region
+    /// ENDS. The transformer closes the `finally` after the statement named
+    /// here rather than at the scope's end; a binding the last-use dataflow
+    /// refuses to answer for is absent from the map and keeps the scope-end
+    /// teardown. Empty on resource-free programs.
+    pub drop_extents: HashMap<Id, DropExtent>,
+    /// C11 (`temporary-drop.md`): resource-valued expressions that are neither
+    /// bound nor moved. The transformer lifts each to a minted `const` at its
+    /// statement's position and closes a `finally` around the rest of the
+    /// statement — reverse construction order among the temporaries of one
+    /// statement. Empty on a program whose resources are all bound.
+    pub resource_temporaries: HashMap<Id, TypeId>,
+    /// S3: per declaring statement, the syntactic extents of the names it
+    /// declares — what a teardown region must cover before it may close, since
+    /// the region lowers to a JS block and its `const`s die at the brace.
+    /// Empty unless some binding drops before its scope's end.
+    pub declared_binding_extents: HashMap<Id, Vec<DropExtent>>,
+    /// B150: the enrolled bindings an explicit `drop(x)` destroys early. The
+    /// transformer emits their teardown as a pair — the sink empties the slot,
+    /// the scope-end `finally` destroys only a slot that is still full — so a
+    /// panic before the `drop(x)` still releases the resource while the
+    /// fall-through path destroys exactly once. Empty unless a program calls
+    /// the sink on a binding.
+    pub explicit_drop_bindings: HashSet<Id>,
     /// Destruction (R2): assignment expression ids that overwrite a live
     /// resource — the old value drops before the new one moves in — mapped to
     /// the type of the value being overwritten. Covers both the owned binding
@@ -37246,15 +37499,20 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
     }
-    // Remember `asset::emit`, `asset::read` and `asset::bundle` — the
-    // const-only compile-time channel: lines out, text in, and whole files out
-    // (const-eval.md §2-3, docs-port.md §3.3, kolt.local 029); the const pass
+    // Remember `asset::emit`, `asset::emit_keyed`, `asset::read` and
+    // `asset::bundle` — the const-only compile-time channel: lines out (in
+    // both spellings), text in, and whole files out (const-eval.md §2-3,
+    // docs-port.md §3.3, build-hooks.md §5.3, kolt.local 029); the const pass
     // enforces that no runtime call path reaches any of them.
     if let Some(asset_scope_id) = module_scopes.get("asset") {
         analyzer.asset_emit_fn_id = analyzer
             .scopes
             .get(asset_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("emit").copied());
+        analyzer.asset_emit_keyed_fn_id = analyzer
+            .scopes
+            .get(asset_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("emit_keyed").copied());
         analyzer.asset_read_fn_id = analyzer
             .scopes
             .get(asset_scope_id)
@@ -38069,6 +38327,15 @@ fn analyze_over_world<'src>(
     // Transparent references (R5): rewrite bare assignments to a view into the
     // write-through deref form before codegen reads the targets.
     analyzer.rewrite_view_assignment_targets();
+    // The last-use dataflow (`analyzer/liveness.rs`, lifetimes.md §6/S2), run
+    // once the tree is FINAL — the rewrite above moves reads, and a liveness
+    // answer about a tree that no longer exists is worse than none. Every
+    // elision below reads it.
+    analyzer.last_use = liveness::LastUse::compute(&analyzer);
+    // S3 (`lifetimes.md` §6): the same answers, asked for DISPOSAL — where each
+    // enrolled binding's teardown `finally` closes. Must follow the dataflow;
+    // `plan_resource_drops` (which bindings drop) ran long before it.
+    analyzer.plan_last_use_drop_extents();
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
@@ -38347,6 +38614,7 @@ fn analyze_over_world<'src>(
         panic_fn_id: analyzer.panic_fn_id,
         drop_fn_id: analyzer.drop_fn_id,
         asset_emit_fn_id: analyzer.asset_emit_fn_id,
+        asset_emit_keyed_fn_id: analyzer.asset_emit_keyed_fn_id,
         asset_read_fn_id: analyzer.asset_read_fn_id,
         asset_bundle_fn_id: analyzer.asset_bundle_fn_id,
         const_exprs: analyzer.const_exprs.clone(),
@@ -38413,6 +38681,10 @@ fn analyze_over_world<'src>(
         materialized_captures: capture_plan.materialized,
         resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
+        drop_extents: std::mem::take(&mut analyzer.drop_extents),
+        declared_binding_extents: std::mem::take(&mut analyzer.declared_binding_extents),
+        resource_temporaries: std::mem::take(&mut analyzer.resource_temporaries),
+        explicit_drop_bindings: std::mem::take(&mut analyzer.explicit_drop_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
         drop_glue: std::mem::take(&mut analyzer.drop_glue),
         drop_sink_value_types: std::mem::take(&mut analyzer.drop_sink_value_types),
@@ -38523,16 +38795,21 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
             *parameter_id,
         ));
     }
+    // A captured view is refused either way (C12): the call graph only decides
+    // WHICH message it earns — E3's sharper async text when the closure turns
+    // out to suspend, rule 3's plain capture ban when it does not.
     for (closure_id, reference_id, name) in &checks.captures {
-        if !body_suspends(*closure_id) {
-            continue;
-        }
+        let msg = if body_suspends(*closure_id) {
+            async_view_capture_message(name)
+        } else {
+            view_capture_message(name)
+        };
         violations.push(program.anchored(
             Error {
                 trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(reference_id).unwrap_or(&&EMPTY_SPAN),
-                msg: async_view_capture_message(name),
+                msg,
             },
             *reference_id,
         ));

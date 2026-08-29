@@ -1,9 +1,3 @@
-function __clone(value) {
-	if (Array.isArray(value)) return value.map(__clone);
-	if (value instanceof Set) return new Set([ ...value ].map(__clone));
-	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
-	return value;
-}
 function eq(self, b) {
 	return self[0] === b[0] && self[1] === b[1];
 }
@@ -50,9 +44,9 @@ console.log($c(p1, p3));
 console.log($d(5, 5));
 console.log($d(5, 9));
 console.log($e(5, 9));
-const some_a = [ 0, __clone(p1) ];
-const some_b = [ 0, __clone(p2) ];
-const some_c = [ 0, __clone(p3) ];
+const some_a = [ 0, p1 ];
+const some_b = [ 0, p2 ];
+const some_c = [ 0, p3 ];
 console.log($f(some_a, some_b));
 console.log($f(some_a, some_c));
 console.log(!($f(some_a, some_c)));

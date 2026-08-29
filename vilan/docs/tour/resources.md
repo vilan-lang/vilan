@@ -81,8 +81,9 @@ fun main() {
 ```
 
 A loan changes no ownership, so `g` is still yours after each call: the
-program prints `inspecting g` twice, then `done`, then `dropped g` when
-`main` ends. Method calls are loans too — a bare `self` receiver, like
+program prints `inspecting g` twice, then `dropped g` — the second
+`inspect(&g)` is the last thing that reads it — and then `done`. Method
+calls are loans too — a bare `self` receiver, like
 `&self` and `&mut self`, borrows — and that is how a resource's own methods
 reach it without consuming it.
 
@@ -90,18 +91,30 @@ The exception is a method that declares **`own self`**: it takes the
 receiver by value, so the call is a *move*. `Option::unwrap(own self)` is
 the one you will meet first — `option.unwrap()` hands you the payload and
 ends `option`'s ownership, so reading `option` afterwards is a
-use-after-move error and `option` is not torn down at scope end. That
+use-after-move error and `option` is not torn down at all. That
 symmetry is the whole rule: a body may only consume what it owns, so a
 function that moves its parameter out has to say `own`.
 
-## Teardown happens on every exit
+## Teardown happens at the last use — and on every exit
 
-Because teardown is tied to the owner's scope, it runs however the scope
-ends: falling off the bottom, an early `ret`, a `jump` out of a loop,
-even a panic unwinding through. There are no drop flags and nothing to remember:
-if a binding still owns a resource when control leaves the scope, it drops.
+A resource is destroyed after the **last statement that reads it**, not at
+the end of its scope. A handle nothing reads again is released right where
+it was acquired; two resources last read in the same statement are
+destroyed in reverse declaration order, as they always were. A loan counts
+as a read of what it names, so an owner is never destroyed while a view
+into it is still in use.
 
-It runs on **overwrites** too, not only at scope ends. Assigning onto a
+The point of tying it to the last use rather than the scope is a scope that
+does not end: a server's `main` never returns, and under the older rule
+every handle it opened was released never.
+
+Teardown still runs however control leaves: falling off the bottom, an
+early `ret`, a `jump` out of a loop, even a panic unwinding through. There
+are no drop flags and nothing to remember — including at a branch, where a
+resource read in one arm is released at the join, on the arm that read it
+and the arm that did not alike.
+
+It runs on **overwrites** too, not only at last uses. Assigning onto a
 place that still holds a resource drops the old value first — and the
 place is what decides, so `holder = Holder::Empty` on an owned binding,
 `slot.held = Holder::Empty` on a field or a tuple element, and the same

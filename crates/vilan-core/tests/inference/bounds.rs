@@ -4213,7 +4213,7 @@ fn assets_deduplicate_and_sort_in_cascade_order() {
     // Two consts emit overlapping lines and a media block; the assembled file
     // dedups and sorts — '.' < '@', so media rules take the LATER cascade
     // position they need (the CSS-soundness argument in assemble_assets).
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::asset::emit;
         fun base(): i32 {
@@ -4232,7 +4232,6 @@ fn assets_deduplicate_and_sort_in_cascade_order() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     let css = assembled.get("css").expect("a css asset");
     assert_eq!(
         css,
@@ -4247,7 +4246,7 @@ fn media_rules_sort_by_ascending_min_width() {
     // both medias match and specificity ties) the narrow rule won the
     // cascade. Emission order here is widest-first to prove the sort, not
     // the collection order, decides.
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::asset::emit;
         fun wide(): i32 {
@@ -4267,7 +4266,6 @@ fn media_rules_sort_by_ascending_min_width() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     let css = assembled.get("css").expect("a css asset");
     assert_eq!(
         css,
@@ -4284,7 +4282,7 @@ fn a_sm_lg_pair_renders_the_lg_value_on_a_wide_viewport() {
     // The B35 field case: two breakpoints on the SAME property. The sm rule
     // must precede the lg rule in the assembled stylesheet so the widest
     // matching breakpoint wins the cascade tie.
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::style::{ style, space, Style };
         fun s(): Style {
@@ -4295,7 +4293,6 @@ fn a_sm_lg_pair_renders_the_lg_value_on_a_wide_viewport() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     let css = assembled.get("css").expect("a css asset");
     let sm = css
         .find("@media (min-width: 640px)")
@@ -4311,7 +4308,7 @@ fn a_sm_lg_pair_renders_the_lg_value_on_a_wide_viewport() {
 
 #[test]
 fn asset_kinds_stay_separate() {
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::asset::emit;
         fun both(): i32 {
@@ -4324,7 +4321,6 @@ fn asset_kinds_stay_separate() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     assert_eq!(assembled.get("css").map(String::as_str), Some(".a{}\n"));
     assert_eq!(assembled.get("txt").map(String::as_str), Some("hello\n"));
 }
@@ -4335,7 +4331,7 @@ fn a_non_css_kind_keeps_lexical_order_for_media_looking_lines() {
     // comparator is css's alone. A non-css kind holding a line that happens
     // to parse as a media rule must NOT have it forced last — lexical order
     // puts '@' (0x40) before 'z' (0x7A).
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::asset::emit;
         fun entries(): i32 {
@@ -4348,7 +4344,6 @@ fn a_non_css_kind_keeps_lexical_order_for_media_looking_lines() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     let manifest = assembled.get("manifest").expect("a manifest asset");
     assert_eq!(
         manifest,
@@ -4362,7 +4357,7 @@ fn non_css_media_looking_lines_sort_by_bytes_not_by_width() {
     // property. Between two media-looking lines of a non-css kind the order
     // is lexical — '1' < '6' puts 1024px first — where the css kind would
     // sort 640px first.
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::asset::emit;
         fun entries(): i32 {
@@ -4375,7 +4370,6 @@ fn non_css_media_looking_lines_sort_by_bytes_not_by_width() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     let manifest = assembled.get("manifest").expect("a manifest asset");
     assert_eq!(
         manifest,
@@ -4389,7 +4383,7 @@ fn the_cascade_comparator_stays_css_scoped_in_a_mixed_flush() {
     // One flush, two kinds: css keeps the cascade order (media last,
     // ascending min-width) while the sibling kind sorts the SAME lines
     // lexically. Pins that the rule is per kind, not per flush.
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::asset::emit;
         fun both(): i32 {
@@ -4406,7 +4400,6 @@ fn the_cascade_comparator_stays_css_scoped_in_a_mixed_flush() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     assert_eq!(
         assembled.get("css").expect("a css asset"),
         "zx{color:red}\n\
@@ -5147,6 +5140,402 @@ fn an_emit_kind_the_build_does_not_own_stays_admitted() {
     // the program's own is exactly what the refusal tells the user to pass, so
     // it had better still compile.
     assert_compiles(&emitting_program("routes"));
+}
+
+// --- build-hooks S3: `emit_keyed` — the contribution carries its key ---------
+//
+// `asset::emit_keyed(kind, key, line)` is `emit`'s ORDERED spelling
+// (build-hooks.md §5.3; §10 Q3 ruled 2026-08-28). The flush orders a kind's
+// contributions by `(key, line)` and deduplicates by that same pair. The key is
+// data the CONTRIBUTOR computes — a route's path, an icon's name, a zero-padded
+// rank — and the flush neither writes it nor re-derives it from the line, which
+// is the whole reason it is a parameter rather than a comparator: a flush-side
+// rule would have to parse the line back, the invented second source of truth
+// this tree refuses on principle (§11's rejected alternative).
+//
+// The slice rests on ONE identity: `emit(kind, line)` IS
+// `emit_keyed(kind, line, line)`. G5 chose the non-css lexical order precisely
+// so it would hold, and the interpreter records both spellings through one arm
+// — one fence call, one push — so it holds by construction rather than by
+// inspection. `an_unkeyed_emit_records_the_line_as_its_own_key` pins the
+// recording end of it and
+// `the_two_spellings_of_one_line_set_assemble_to_the_same_bytes` the flush end;
+// between them, an existing kind's bytes have no path along which to move.
+
+/// A program whose `const` initializer makes each `(key, line)` contribution
+/// under `kind`, through the keyed spelling.
+fn keyed_program(kind: &str, contributions: &[(&str, &str)]) -> String {
+    let calls = contributions
+        .iter()
+        .map(|(key, line)| format!("            emit_keyed(\"{kind}\", \"{key}\", \"{line}\");\n"))
+        .collect::<String>();
+    format!(
+        r#"
+        import std::asset::emit_keyed;
+        fun contribute(): i32 {{
+{calls}            1
+        }}
+        let _c = const contribute();
+        fun main() {{}}
+        main();
+        "#
+    )
+}
+
+#[test]
+fn a_key_orders_a_kind_against_its_lines_own_order() {
+    // THE case plain `emit` cannot express, and the reason the parameter
+    // exists: the keys order the lines the opposite way their bytes would.
+    // `emit` on these two lines can only ever produce `aaa` then `zzz`.
+    let assembled = assembled_assets(&keyed_program(
+        "routes",
+        &[("0", "zzz-emitted-first"), ("1", "aaa-emitted-second")],
+    ));
+    assert_eq!(
+        assembled.get("routes").map(String::as_str),
+        Some("zzz-emitted-first\naaa-emitted-second\n")
+    );
+}
+
+#[test]
+fn one_key_over_several_lines_falls_back_to_the_line() {
+    // The secondary sort. A key shared by several contributions still orders
+    // them by CONTENT — never by the order the calls happened — so §5.1's rule
+    // (the bytes are a function of the set) survives a coarse key. Emitted
+    // last-first to prove the sort decides.
+    let assembled = assembled_assets(&keyed_program(
+        "routes",
+        &[("shared", "second"), ("shared", "first")],
+    ));
+    assert_eq!(
+        assembled.get("routes").map(String::as_str),
+        Some("first\nsecond\n")
+    );
+}
+
+#[test]
+fn one_line_under_two_keys_survives_twice() {
+    // Dedup is per PAIR, not per line (§5.3: the output is a function of the
+    // set of `(key, line)` pairs). Two contributions of one line under two keys
+    // are two contributions — a ranked list repeating an entry is the shape —
+    // and the file holds it once per key.
+    let assembled = assembled_assets(&keyed_program(
+        "routes",
+        &[("a", "same-line"), ("b", "same-line")],
+    ));
+    assert_eq!(
+        assembled.get("routes").map(String::as_str),
+        Some("same-line\nsame-line\n")
+    );
+}
+
+#[test]
+fn identical_keyed_contributions_deduplicate() {
+    // The other half of dedup-per-pair, and the property that lets independent
+    // const code compose: the same contribution made twice is one line, exactly
+    // as an un-keyed `emit` of one line twice has always been.
+    let assembled = assembled_assets(&keyed_program(
+        "routes",
+        &[("a", "once"), ("a", "once"), ("a", "once")],
+    ));
+    assert_eq!(assembled.get("routes").map(String::as_str), Some("once\n"));
+}
+
+#[test]
+fn a_key_computed_at_const_time_orders_the_flush() {
+    // The key is const-time DATA, not a literal — which is the point of §5.3's
+    // "the contributor is the only code that knows it". A zero-padded rank is
+    // the paper's own example, and it is computed here rather than written.
+    let assembled = assembled_assets(
+        r#"
+        import std::asset::emit_keyed;
+        fun rank(index: i32): str {
+            if index < 10 { i"0{index}" } else { i"{index}" }
+        }
+        fun contribute(): i32 {
+            emit_keyed("routes", rank(9), "ninth");
+            emit_keyed("routes", rank(10), "tenth");
+            emit_keyed("routes", rank(2), "second");
+            1
+        }
+        let _c = const contribute();
+        fun main() {}
+        main();
+        "#,
+    );
+    // Unpadded, "10" would sort before "2" and before "9" — the padding is what
+    // the contributor computes to make a lexical order a numeric one.
+    assert_eq!(
+        assembled.get("routes").map(String::as_str),
+        Some("second\nninth\ntenth\n")
+    );
+}
+
+#[test]
+fn a_key_never_reaches_the_file() {
+    // Only the LINE is written. A key leaking into the output would be its own
+    // defect class — an accumulator whose file depends on a value the author
+    // chose for ordering alone.
+    let assembled = assembled_assets(&keyed_program("routes", &[("KEY-SENTINEL", "the line")]));
+    assert_eq!(
+        assembled.get("routes").map(String::as_str),
+        Some("the line\n")
+    );
+}
+
+#[test]
+fn an_unkeyed_emit_records_the_line_as_its_own_key() {
+    // The desugar, at the recording end: `emit(kind, line)` IS
+    // `emit_keyed(kind, line, line)` (§5.3). This is what makes every shipped
+    // kind's bytes identical BY CONSTRUCTION — ordering and deduplicating by
+    // `(line, line)` is ordering and deduplicating by the line — so it is
+    // pinned on the contribution rather than inferred from the file.
+    let contributions = collected_keyed_assets(
+        r#"
+        import std::asset::emit;
+        fun contribute(): i32 {
+            emit("routes", "a line");
+            1
+        }
+        let _c = const contribute();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(
+        contributions,
+        vec![vilan_core::const_eval::EmittedAsset {
+            kind: "routes".to_string(),
+            key: "a line".to_string(),
+            line: "a line".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn the_two_spellings_of_one_line_set_assemble_to_the_same_bytes() {
+    // The slice's gate, as a differential rather than as a golden: the same
+    // lines contributed through `emit(kind, line)` and through
+    // `emit_keyed(kind, line, line)` produce byte-identical files. The corpus
+    // and the assets e2e hold the same property over every shipped kind; this
+    // holds the REASON, so a future change that moved the un-keyed spelling off
+    // the identity reddens here first and with the shortest explanation.
+    let lines = [
+        "zebra",
+        "@media (min-width: 1024px){.c{}}",
+        "apple",
+        "@media (min-width: 640px){.a{}}",
+        "zebra",
+    ];
+    let unkeyed = lines
+        .iter()
+        .map(|line| format!("            emit(\"routes\", \"{line}\");\n"))
+        .collect::<String>();
+    let keyed = lines
+        .iter()
+        .map(|line| format!("            emit_keyed(\"routes\", \"{line}\", \"{line}\");\n"))
+        .collect::<String>();
+    let program = |import: &str, calls: &str| {
+        format!(
+            r#"
+        import std::asset::{import};
+        fun contribute(): i32 {{
+{calls}            1
+        }}
+        let _c = const contribute();
+        fun main() {{}}
+        main();
+        "#
+        )
+    };
+    let through_emit = assembled_assets(&program("emit", &unkeyed));
+    let through_emit_keyed = assembled_assets(&program("emit_keyed", &keyed));
+    assert_eq!(
+        through_emit, through_emit_keyed,
+        "the two spellings of one line set must produce identical files"
+    );
+    // …and not vacuously: the file is the one lexical order the un-keyed
+    // spelling has always produced, dedup included.
+    assert_eq!(
+        through_emit.get("routes").map(String::as_str),
+        Some(
+            "@media (min-width: 1024px){.c{}}\n\
+             @media (min-width: 640px){.a{}}\n\
+             apple\n\
+             zebra\n"
+        )
+    );
+}
+
+#[test]
+fn the_two_spellings_interleave_within_one_kind() {
+    // A kind is not owned by one spelling. Because an un-keyed contribution
+    // keys itself by its line, the two sort into ONE `(key, line)` order — the
+    // keyed `"0"` lands ahead of an un-keyed line beginning `a`, and the keyed
+    // `"z…"` behind it, with no rule of its own for the mixture.
+    let assembled = assembled_assets(
+        r#"
+        import std::asset::{ emit, emit_keyed };
+        fun contribute(): i32 {
+            emit("routes", "apple");
+            emit_keyed("routes", "0", "keyed-first");
+            emit_keyed("routes", "zzz", "keyed-last");
+            1
+        }
+        let _c = const contribute();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert_eq!(
+        assembled.get("routes").map(String::as_str),
+        Some("keyed-first\napple\nkeyed-last\n")
+    );
+}
+
+#[test]
+fn emit_keyed_refuses_the_style_sidecar() {
+    // `css` is the one owned kind `emit` ADMITS (G7) and the one kind
+    // `emit_keyed` refuses — because the sheet's order is the CASCADE's, and
+    // `assemble_assets`'s comparator reads the line and never the key. A key
+    // accepted here would be silently dropped, which is a wrong answer where a
+    // refusal costs nothing; refusing is also what keeps §5.3's noted migration
+    // open, since a key that had been ignored could not be given a meaning
+    // later.
+    assert_fails_with(
+        &keyed_program("css", &[("band", ".a{color:red}")]),
+        "`asset::emit_keyed` cannot order the `css` kind: the style sidecar is \
+         ordered by the CSS cascade, not by a contribution's key",
+    );
+}
+
+#[test]
+fn emit_keyed_inherits_the_owned_kind_refusal() {
+    // ONE list, now three consumers (build_owned_emit_kind: the prune, `emit`,
+    // and this) — the keyed spelling is not a second door into the build's own
+    // output namespace. Every member, because an enumeration is what a shared
+    // list is worth: a fence that let `emit_keyed("vl", …)` through would
+    // overwrite the entry source exactly as G7's defect did.
+    for (kind, collides_with) in [
+        ("vl", "the entry source a build's outputs sit beside"),
+        ("mjs", "the compiled bundle"),
+        ("js", "the compiled bundle"),
+        ("chunks.json", "the build manifest"),
+        ("Route_Docs.js", "the build's route-chunk namespace"),
+    ] {
+        assert_fails_with(
+            &keyed_program(kind, &[("k", "x")]),
+            &format!(
+                "`asset::emit_keyed` kinds name one file beside the build output, \
+                 and `{kind}` collides with {collides_with}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn an_emit_keyed_kind_carrying_a_separator_is_refused() {
+    // E94's shape half, named for the spelling that tripped it. The kind is one
+    // file beside the build output whichever function put it there.
+    assert_fails_with(
+        &keyed_program("a/b", &[("k", "x")]),
+        "`asset::emit_keyed` kinds name one file beside the build output",
+    );
+}
+
+#[test]
+fn an_emit_keyed_kind_the_build_does_not_own_stays_admitted() {
+    // The green negative: the two refusals above must take those kinds and
+    // nothing else.
+    assert_compiles(&keyed_program("routes", &[("k", "x")]));
+}
+
+#[test]
+fn a_runtime_emit_keyed_is_rejected() {
+    // The const-only fence, the same machinery that colors `emit` (§2): the
+    // keyed spelling joins the const-only set, because a runtime path reaching
+    // it would compile clean and throw a `ReferenceError` on a helper with no
+    // runtime binding (B143's shape).
+    assert_fails_spanning(
+        r#"
+        import std::asset::emit_keyed;
+        fun main() {
+            emit_keyed("routes", "0", "x");
+        }
+        main();
+        "#,
+        r#"emit_keyed("routes", "0", "x")"#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_runtime_call_reaching_emit_keyed_is_named_for_the_spelling() {
+    // The R-fixpoint names WHICH builtin the path reaches, and the keyed
+    // spelling is its own name there — a reader told `asset::emit` would go
+    // looking for a call that isn't in the file.
+    assert_fails_with(
+        r#"
+        import std::asset::emit_keyed;
+        fun contribute(): i32 {
+            emit_keyed("routes", "0", "x");
+            1
+        }
+        fun main() {
+            let _x = contribute();
+        }
+        main();
+        "#,
+        "`contribute` (it reaches `asset::emit_keyed`) is compile-time-only",
+    );
+}
+
+#[test]
+fn a_function_reaching_emit_keyed_cannot_escape_as_a_value() {
+    // The value-form half of §2: a call THROUGH a value has no statically known
+    // callee, so the refusal sits where the value is made.
+    assert_fails_with(
+        r#"
+        import std::asset::emit_keyed;
+        fun contribute(): i32 {
+            emit_keyed("routes", "0", "x");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            let _x = apply(contribute);
+        }
+        main();
+        "#,
+        "no runtime value form",
+    );
+}
+
+#[test]
+fn emit_keyed_inside_a_const_stays_legal_through_a_value() {
+    // The green negative for the fence: inside a `const` the interpreter makes
+    // the call, so the restriction lifts for the keyed spelling exactly as it
+    // does for `emit`, and the contribution still flows.
+    let assembled = assembled_assets(
+        r#"
+        import std::print;
+        import std::asset::emit_keyed;
+        fun contribute(): i32 {
+            emit_keyed("routes", "0", "x");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            print(const apply(contribute));
+        }
+        main();
+        "#,
+    );
+    assert_eq!(assembled.get("routes").map(String::as_str), Some("x\n"));
 }
 
 #[test]

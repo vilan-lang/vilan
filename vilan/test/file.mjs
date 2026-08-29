@@ -26,7 +26,7 @@ function drop(self) {
 function $a($b) {
 	drop($b);
 }
-async function $c(path, body) {
+async function $e(path, body) {
 	const file = await (open2(path));
 	try {
 		const result = await (body(file));
@@ -38,20 +38,37 @@ async function $c(path, body) {
 }
 (async () => {
 	await (writeFile("file-corpus.txt", "0123456789"));
-	const file = await (open2("file-corpus.txt"));
-	const buffer = new Uint8Array(4);
-	console.log(await (read_at(file, buffer, 3)));
-	console.log(decode_utf8(buffer.slice(0, 4)));
-	console.log((await (stat(file)))[0]);
-	$a(file);
-	console.log(await (read_at(await (open2("file-corpus.txt")), buffer, 0)));
-	console.log((await (stat(await (open2("file-corpus.txt")))))[0]);
-	const size = await ($c("file-corpus.txt", async (f) => {
+	let file = await (open2("file-corpus.txt"));
+	try {
+		const buffer = new Uint8Array(4);
+		console.log(await (read_at(file, buffer, 3)));
+		console.log(decode_utf8(buffer.slice(0, 4)));
+		console.log((await (stat(file)))[0]);
+		$a(file);
+		file = null;
+		const $c = await (open2("file-corpus.txt"));
+		try {
+			console.log(await (read_at($c, buffer, 0)));
+		} finally {
+			$a($c);
+		}
+	} finally {
+		if (file !== null) {
+			$a(file);
+		}
+	}
+	const $d = await (open2("file-corpus.txt"));
+	try {
+		console.log((await (stat($d)))[0]);
+	} finally {
+		$a($d);
+	}
+	const size = await ($e("file-corpus.txt", async (f) => {
 		return (await (stat(f)))[0];
 	}));
 	console.log(size);
 	await (unlink("file-corpus.txt"));
-})().catch(($d) => {
-	console.error(String($d));
+})().catch(($f) => {
+	console.error(String($f));
 	process.exit(1);
 });

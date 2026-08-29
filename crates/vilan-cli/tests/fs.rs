@@ -1565,6 +1565,88 @@ main();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+// The INSTRUMENT is `/proc/self/fd`, which only Linux has — the emission
+// property this observes (a temporary's drop at its statement's end) is
+// pinned platform-independently in tests/inference/resources.rs; this is
+// its Linux-observable half, gated exactly as its descriptor-counting
+// sibling above is. (The v0.39.0-cycle Windows leg caught the ungated
+// first version — N26's lesson, third instance.)
+#[cfg(target_os = "linux")]
+fn a_temporary_handle_releases_its_descriptor_at_its_statements_end() {
+    // C11, measured — `temporary-drop.md` P6/P7's fd staircase made permanent.
+    // `File::open(p).read_at(b, 0)` was the fs tier's INTENDED idiom and leaked
+    // its descriptor on every path until process exit: ten of them climbed the
+    // count by ten and it never came back down (P6's "after 10 temporaries:
+    // 31"). Under statement-end ownership the count is back at its baseline
+    // before the next statement is observed, so a straight line of temporaries
+    // holds ONE descriptor at a time and a loop of them holds one per
+    // iteration.
+    //
+    // The counts are read IMMEDIATELY, with no settling poll, and that is the
+    // whole instrument: P10 measured that Q1's fire-and-forget close is back
+    // before the next statement runs, and a poll would let node's own
+    // FileHandle finalizer close a LEAKED descriptor and report zero.
+    // Plant-proven that way — with the temporary rule disabled the three
+    // readings are 1, 2 and 7 rather than 0, 0 and 0.
+    //
+    // The warm-up ahead of the baseline is load-bearing for the same reasons
+    // `a_dropped_file_closes_the_underlying_descriptor` documents: the first
+    // descriptor-based fs op can lazily create process-lifetime infrastructure
+    // (io_uring), and the first print on a piped stdout materializes that
+    // stream's own handle. Both must exist before the baseline is taken.
+    let dir = temp_project("file_temporary_closes");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::Bytes;
+import std::fs::{ File, read_dir };
+import std::drop::drop;
+import std::range::Range;
+import std::time::sleep;
+
+fun fd_count(): i32 {
+	read_dir("/proc/self/fd").len()
+}
+
+fun main() {
+	let warm = File::open("data/ten.txt");
+	drop(warm);
+	print("warm");
+	sleep(300);
+
+	let baseline = fd_count();
+	let buffer = Bytes::alloc(4);
+
+	// The straight-line staircase: two statements, each opening a temporary.
+	// Under the leak this climbed to baseline + 1, then + 2, and stayed.
+	print(File::open("data/ten.txt").read_at(buffer, 0));
+	print(fd_count() - baseline);
+	print(File::open("data/ten.txt").stat().size);
+	print(fd_count() - baseline);
+
+	// The loop: one per iteration, never N.
+	for _round in Range::new(0, 5) {
+		print(File::open("data/ten.txt").stat().size);
+	}
+	print(fd_count() - baseline);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "warm\n4\n0\n10\n0\n10\n10\n10\n10\n10\n0\n",
+        "every temporary handle is released at its own statement's end, so the \
+         descriptor count is back at its baseline before the next statement — \
+         straight-line and in a loop alike"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- the watch tier (kolt.local 020) -------------------------------------
 //
 // Against real file activity, because that is the only thing that proves a

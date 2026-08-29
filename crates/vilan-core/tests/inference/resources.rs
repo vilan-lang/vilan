@@ -715,7 +715,7 @@ fn r10_leaves_an_inferred_container_of_data_alone() {
         }
         "#,
         ),
-        "2\ndropped one\n",
+        "dropped one\n2\n",
     );
 }
 
@@ -733,7 +733,7 @@ fn r10_leaves_an_inferred_fixed_array_of_resources_alone() {
         }
         "#,
         ),
-        "end\ndropped two\ndropped one\n",
+        "dropped two\ndropped one\nend\n",
     );
 }
 
@@ -1314,7 +1314,7 @@ fn b60_reinitialization_after_a_consuming_call_compiles() {
             print("end");
         }
         "#,
-        "got first\nend\ndrop first\ndrop second\n",
+        "got first\ndrop first\ndrop second\nend\n",
     );
 }
 
@@ -1428,7 +1428,7 @@ fn b63_ok_or_at_a_resource_instantiation() {
             print("end");
         }
         "#,
-        "true\nend\ndrop b\n",
+        "true\ndrop b\nend\n",
     );
 }
 
@@ -1451,7 +1451,7 @@ fn b63_unzip_at_a_resource_instantiation() {
             print("end");
         }
         "#,
-        "9\nend\ndrop p\n",
+        "9\ndrop p\nend\n",
     );
 }
 
@@ -1474,7 +1474,7 @@ fn b63_inspect_at_a_resource_instantiation() {
             print("end");
         }
         "#,
-        "saw c\nend\ndrop c\n",
+        "saw c\ndrop c\nend\n",
     );
 }
 
@@ -1497,7 +1497,7 @@ fn b63_or_else_at_a_resource_instantiation() {
             print("end");
         }
         "#,
-        "end\ndrop e\n",
+        "drop e\nend\n",
     );
 }
 
@@ -3204,9 +3204,10 @@ fn drop_runs_at_scope_end() {
         fun main() {
             let r = Res { x = 1 };
             print("main-done");
+            print(r.x);
         }
         "#,
-        "main-done\nDROPPED\n",
+        "main-done\n1\nDROPPED\n",
     );
 }
 
@@ -3438,9 +3439,10 @@ fn drop_locals_drop_in_reverse_declaration_order() {
             let a = Res { tag = "a" };
             let b = Res { tag = "b" };
             print("body");
+            print(a.tag + b.tag);
         }
         "#,
-        "body\nb\na\n",
+        "body\nab\nb\na\n",
     );
 }
 
@@ -3461,7 +3463,7 @@ fn drop_body_runs_before_fields_which_drop_in_reverse() {
             print("body");
         }
         "#,
-        "body\nowner-body\nsecond\nfirst\n",
+        "owner-body\nsecond\nfirst\nbody\n",
     );
 }
 
@@ -3481,7 +3483,7 @@ fn drop_enum_payload_drops_with_the_value() {
             print("body");
         }
         "#,
-        "body\npayload\n",
+        "payload\nbody\n",
     );
 }
 
@@ -3498,10 +3500,10 @@ fn containment_only_resource_drops_its_fields() {
         resource struct Bag { item: Leaf }
         fun main() {
             let bag = Bag { item = Leaf { tag = "item" } };
-            print("body");
+            print(i"body {bag.item.tag}");
         }
         "#,
-        "body\nitem\n",
+        "body item\nitem\n",
     );
 }
 
@@ -3548,11 +3550,11 @@ fn b113_a_plain_struct_with_a_resource_field_drops_it_at_scope_end() {
         struct Bag { item: Leaf }
         fun main() {
             let bag = Bag { item = Leaf { tag = "leaf" } };
-            print("body");
+            print(i"body {bag.item.tag}");
         }
         "#,
         ),
-        "body\nleaf\n",
+        "body leaf\nleaf\n",
     );
 }
 
@@ -3570,7 +3572,7 @@ fn b113_a_plain_struct_drops_its_resource_fields_in_reverse_declaration_order() 
         }
         "#,
         ),
-        "body\nsecond\nfirst\n",
+        "second\nfirst\nbody\n",
     );
 }
 
@@ -3594,7 +3596,7 @@ fn b113_a_plain_struct_nested_in_a_plain_struct_drops_transitively() {
         }
         "#,
         ),
-        "body\ntail\ntwo\none\n",
+        "tail\ntwo\none\nbody\n",
     );
 }
 
@@ -3606,7 +3608,7 @@ fn b113_a_plain_containment_struct_moved_into_an_own_parameter_drops_in_the_call
         &b113_program(
             r#"
         struct Bag { item: Leaf }
-        fun sink(own bag: Bag) { print("in-sink"); }
+        fun sink(own bag: Bag) { print(i"in-sink {bag.item.tag}"); }
         fun main() {
             let bag = Bag { item = Leaf { tag = "leaf" } };
             sink(bag);
@@ -3614,7 +3616,7 @@ fn b113_a_plain_containment_struct_moved_into_an_own_parameter_drops_in_the_call
         }
         "#,
         ),
-        "in-sink\nleaf\nafter\n",
+        "in-sink leaf\nleaf\nafter\n",
     );
 }
 
@@ -3634,7 +3636,7 @@ fn b113_overwriting_a_plain_containment_struct_drops_the_old_value() {
         }
         "#,
         ),
-        "before\nfirst\nafter\nsecond\n",
+        "before\nfirst\nsecond\nafter\n",
     );
 }
 
@@ -3649,11 +3651,11 @@ fn b113_a_returned_plain_containment_struct_drops_at_the_callers_scope_end() {
         fun make(): Bag { Bag { item = Leaf { tag = "leaf" } } }
         fun main() {
             let bag = make();
-            print("body");
+            print(i"body {bag.item.tag}");
         }
         "#,
         ),
-        "body\nleaf\n",
+        "body leaf\nleaf\n",
     );
 }
 
@@ -3671,7 +3673,7 @@ fn b113_a_tuple_local_drops_its_resource_members_in_reverse_order() {
         }
         "#,
         ),
-        "body\nb\na\n",
+        "b\na\nbody\n",
     );
 }
 
@@ -3732,7 +3734,7 @@ fn drop_runs_on_early_ret() {
         fun run(stop: bool) {
             let r = Res { tag = "r" };
             if stop { print("stopping"); ret; }
-            print("continuing");
+            print(i"continuing {r.tag}");
         }
         fun main() {
             run(true);
@@ -3740,7 +3742,7 @@ fn drop_runs_on_early_ret() {
             run(false);
         }
         "#,
-        "stopping\nr\n--\ncontinuing\nr\n",
+        "stopping\nr\n--\ncontinuing r\nr\n",
     );
 }
 
@@ -3756,15 +3758,17 @@ fn drop_runs_on_jump_break_leaving_only_the_loop_scope() {
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
         fun main() {
             let outer = Res { tag = "outer" };
+            mut rounds = 0;
             for {
                 let inner = Res { tag = "inner" };
-                print("loop");
-                jump break;
+                rounds = rounds + 1;
+                if rounds > 0 { jump break; }
+                print(inner.tag);
             }
-            print("after-loop");
+            print(i"after-loop {outer.tag}");
         }
         "#,
-        "loop\ninner\nafter-loop\nouter\n",
+        "inner\nafter-loop outer\nouter\n",
     );
 }
 
@@ -3782,13 +3786,13 @@ fn drop_runs_on_jump_continue_each_iteration() {
             for i < 2 {
                 let r = Res { tag = "iter" };
                 i = i + 1;
-                print("body");
-                jump continue;
+                if i > 0 { jump continue; }
+                print(i"body {r.tag}");
             }
             print("done");
         }
         "#,
-        "body\niter\nbody\niter\ndone\n",
+        "iter\niter\ndone\n",
     );
 }
 
@@ -3806,9 +3810,10 @@ fn overwrite_drops_the_old_value_then_the_new_at_scope_end() {
             mut r = Res { tag = "old" };
             r = Res { tag = "new" };
             print("body");
+            print(r.tag);
         }
         "#,
-        "old\nbody\nnew\n",
+        "old\nbody\nnew\nnew\n",
     );
 }
 
@@ -3847,14 +3852,14 @@ fn a_resource_owned_across_an_await_drops_at_scope_end() {
             let r = Res { tag = "res" };
             print("before");
             await sleep(1);
-            print("after");
+            print(i"after {r.tag}");
         }
         async fun main() {
             await work();
             print("done");
         }
         "#,
-        "before\nafter\nres\ndone\n",
+        "before\nafter res\nres\ndone\n",
     );
 }
 
@@ -3980,12 +3985,12 @@ fn a_drop_runs_synchronously_at_the_scope_exit() {
         fun main() {
             {
                 let r = Res { tag = "dropped" };
-                print("in-scope");
+                print(i"in-scope {r.tag}");
             }
             print("after-scope");
         }
         "#,
-        "in-scope\ndropped\nafter-scope\n",
+        "in-scope dropped\ndropped\nafter-scope\n",
     );
 }
 
@@ -4086,7 +4091,7 @@ fn option_take_on_a_resource_moves_the_payload_out() {
             print("after-block");
         }
         "#,
-        "in-block\ndrop r\nafter-block\n",
+        "drop r\nin-block\nafter-block\n",
     );
 }
 
@@ -4108,7 +4113,7 @@ fn option_replace_returns_the_old_resource_for_the_caller_to_own() {
             print("replaced");
         }
         "#,
-        "replaced\ndrop old\ndrop new\n",
+        "drop old\ndrop new\nreplaced\n",
     );
 }
 
@@ -4400,14 +4405,14 @@ fn two_own_resource_parameters_drop_in_reverse_declaration_order() {
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun two(own a: Res, own b: Res) {
-            print("in-two");
+            print(i"in-two {a.tag}{b.tag}");
         }
         fun main() {
             two(Res { tag = "a" }, Res { tag = "b" });
             print("after");
         }
         "#,
-        "in-two\ndrop b\ndrop a\nafter\n",
+        "in-two ab\ndrop b\ndrop a\nafter\n",
     );
 }
 
@@ -4459,14 +4464,14 @@ fn an_async_own_resource_parameter_drops_after_the_await_at_scope_end() {
         fun work(own r: Res) {
             print(i"before-await {r.tag}");
             sleep(0);
-            print("after-await");
+            print(i"after-await {r.tag}");
         }
         fun main() {
             work(Res { tag = "x" });
             print("done");
         }
         "#,
-        "before-await x\nafter-await\ndrop x\ndone\n",
+        "before-await x\nafter-await x\ndrop x\ndone\n",
     );
 }
 
@@ -4714,7 +4719,7 @@ fn b67_an_is_refined_branch_may_leave_the_none_side_un_moved() {
             print("end");
         }
         "#,
-        "end\ndrop made\n",
+        "drop made\nend\n",
     );
 }
 
@@ -5595,5 +5600,1324 @@ fn dropping_a_module_level_resource_is_rejected() {
         fun main() { tear(); }
         "#,
         "module-level resource",
+    );
+}
+
+// --- Order 19 / drop-safety: the two error-path defects the lifetimes session's
+// probes found on 0.38.0 (lifetimes.md §6 names both, and its last-use lowering
+// subsumes them structurally later; these are the narrow, now-shaped fixes).
+//
+// B151 — the mR2 overwrite double-drops when the RHS throws. The overwrite
+// lowering pushed the old value's destructor BEFORE walking the new value's
+// expression, so a panic in the RHS left the scope-end `finally` destroying an
+// already-destroyed value: a double `close()` today, a double free on a native
+// backend. The fix is evaluation ORDER, not lifetimes — the new value is
+// computed into a temporary first, then the old value drops, then the write
+// lands. memory.md §6.8's R2 sentence promises "drops the old value first, then
+// moves the new one in", which is a claim about the drop and the WRITE, and it
+// still holds: the drop stays ahead of the store.
+
+#[test]
+fn an_overwrite_whose_new_value_panics_drops_the_old_value_exactly_once() {
+    // Red-first (B151, probe E3 inverted): before the fix this printed "old"
+    // TWICE — once from the overwrite's drop, once from the scope-end `finally`
+    // walking over the corpse.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        enum Holder { Full(Guard), Empty }
+        fun boom(): Holder {
+            panic("boom");
+            Holder::Empty
+        }
+        fun main() {
+            mut holder = Holder::Full(Guard { tag = "old" });
+            holder = boom();
+            print("unreachable");
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "old\n",
+        "a throwing right-hand side must leave EXACTLY one drop of the old value"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn an_overwrite_drops_the_old_value_before_the_new_one_is_stored() {
+    // R2's ordering sentence, unchanged: the old value is destroyed before the
+    // new one moves in (so "old" precedes the scope-end "new"). A literal
+    // right-hand side cannot throw, so its emission is untouched by the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun main() {
+            mut guard = Guard { tag = "old" };
+            guard = Guard { tag = "new" };
+            print("body");
+        }
+        "#,
+        "old\nnew\nbody\n",
+    );
+}
+
+#[test]
+fn an_overwrite_evaluates_an_effectful_new_value_before_dropping_the_old_one() {
+    // The half B151 moves: the right-hand side runs FIRST, so a panic inside it
+    // never reaches a slot whose value is already destroyed. R2 is unharmed —
+    // the drop still precedes the store — but the effects of computing the new
+    // value now precede the old value's destructor, and that order is the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun make(): Guard {
+            print("made");
+            Guard { tag = "new" }
+        }
+        fun main() {
+            mut guard = Guard { tag = "old" };
+            guard = make();
+            print("body");
+        }
+        "#,
+        "made\nold\nnew\nbody\n",
+    );
+}
+
+#[test]
+fn an_overwrite_through_a_view_also_evaluates_before_it_destroys() {
+    // R2's loan half (B94) takes the same ordering: a write through a `&mut`
+    // view destroys the pointee, so a throwing right-hand side must not leave
+    // the caller's `finally` a destroyed value to walk over.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        resource struct Slot { held: Guard }
+        fun boom(): Slot {
+            panic("boom");
+            Slot { held = Guard { tag = "never" } }
+        }
+        fun refill(slot: &mut Slot) {
+            slot = boom();
+        }
+        fun main() {
+            mut slot = Slot { held = Guard { tag = "held" } };
+            refill(&mut slot);
+            print("unreachable");
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "held\n",
+        "a throwing right-hand side must leave EXACTLY one drop through the view too"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+// B150 — `drop(x)` is not exception-safe. The explicit drop moved the binding
+// into the sink, so `plan_resource_drops` unenrolled it and the scope's
+// teardown `finally` disappeared: a panic between the acquisition and the
+// `drop(x)` leaked the resource permanently, where a scope-end drop would have
+// released it. The fix keeps the binding enrolled and makes the pair
+// idempotent — the sink empties the slot (`= null`, the moved-out state
+// `Option.take` leaves behind), and the `finally` destroys only a slot that is
+// still full. The test is the emitted machinery's, not the source language's:
+// mR7's ban on runtime drop flags is about CONDITIONAL moves, and R7 already
+// rejects a conditional `drop(x)` outright.
+
+#[test]
+fn a_panic_before_an_explicit_drop_still_releases_the_resource() {
+    // Red-first (B150, probe E2 inverted): before the fix stdout stopped at
+    // "acquired" — the `finally` was gone and "released" never printed.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun boom() { panic("boom"); }
+        fun leaky() {
+            let r = Res { tag = "released" };
+            print("acquired");
+            boom();
+            drop(r);
+            print("after");
+        }
+        fun main() { leaky(); }
+        "#,
+    );
+    assert_eq!(
+        stdout, "acquired\nreleased\n",
+        "a panic before the explicit drop must still run the scope's teardown"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn an_explicit_drop_on_the_normal_path_destroys_exactly_once() {
+    // The other half of the pair: with the `finally` back, the fall-through
+    // path must NOT drop twice. The early teardown still happens EARLY — the
+    // print after it observes a released resource.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun early() {
+            let r = Res { tag = "released" };
+            print("acquired");
+            drop(r);
+            print("after");
+        }
+        fun main() { early(); }
+        "#,
+        "acquired\nreleased\nafter\n",
+    );
+}
+
+#[test]
+fn an_explicit_drop_empties_the_slot_its_finally_tests() {
+    // The emitted machinery, pinned on the bytes: the sink writes the slot
+    // empty and the scope-end teardown reads that emptiness. Both halves must
+    // be present — either alone is a leak or a double drop.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun early() {
+            let r = Res { tag = "released" };
+            drop(r);
+            print("after");
+        }
+        fun main() { early(); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("= null"),
+        "the explicit drop must empty the slot:\n{js}"
+    );
+    assert!(
+        js.contains("!== null") && js.contains("finally"),
+        "the scope-end teardown must test the slot before destroying it:\n{js}"
+    );
+}
+
+#[test]
+fn a_resource_with_no_explicit_drop_keeps_its_unguarded_teardown() {
+    // The delta is scoped to the bindings an explicit `drop(x)` reaches: a
+    // scope that never calls the sink emits the same bare `finally` it always
+    // did, with no emptiness test and no rebindable slot.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun scoped() {
+            let r = Res { tag = "released" };
+            print(i"body {r.tag}");
+        }
+        fun main() { scoped(); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("finally"),
+        "the teardown must still be there:\n{js}"
+    );
+    assert!(
+        !js.contains("!== null"),
+        "an unguarded teardown must not grow an emptiness test:\n{js}"
+    );
+}
+
+#[test]
+fn a_panic_before_dropping_an_own_parameter_still_releases_it() {
+    // The same pair on an `own` resource PARAMETER, whose teardown wraps the
+    // whole body (destruction.md §6) rather than riding a `let`.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun boom() { panic("boom"); }
+        fun sink(own r: Res) {
+            print("entered");
+            boom();
+            drop(r);
+        }
+        fun main() { sink(Res { tag = "released" }); }
+        "#,
+    );
+    assert_eq!(
+        stdout, "entered\nreleased\n",
+        "an own parameter dropped explicitly must still drop when a panic beats the sink"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn an_own_parameter_dropped_explicitly_destroys_exactly_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun sink(own r: Res) {
+            print("entered");
+            drop(r);
+            print("after");
+        }
+        fun main() { sink(Res { tag = "released" }); }
+        "#,
+        "entered\nreleased\nafter\n",
+    );
+}
+
+#[test]
+fn a_panic_before_dropping_a_match_capture_still_releases_it() {
+    // The `match opt.take() { Some(let c) => drop(c), ... }` idiom memory.md
+    // §6.8 sanctions for conditional teardown: its capture owns the payload, so
+    // it owes the same exception safety a `let` does.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        import std::drop::drop;
+        import std::option::Option;
+        import std::option::Some;
+        import std::option::None;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun boom() { panic("boom"); }
+        fun teardown() {
+            mut full: Option<Res> = Some(Res { tag = "released" });
+            match full.take() {
+                Some(let c) => {
+                    print("captured");
+                    boom();
+                    drop(c);
+                },
+                None => {},
+            }
+        }
+        fun main() { teardown(); }
+        "#,
+    );
+    assert_eq!(
+        stdout, "captured\nreleased\n",
+        "a captured payload must drop even when a panic beats its explicit drop"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn a_match_capture_dropped_explicitly_destroys_exactly_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        import std::option::Option;
+        import std::option::Some;
+        import std::option::None;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun teardown() {
+            mut full: Option<Res> = Some(Res { tag = "released" });
+            match full.take() {
+                Some(let c) => drop(c),
+                None => {},
+            }
+            print("after");
+        }
+        fun main() { teardown(); }
+        "#,
+        "released\nafter\n",
+    );
+}
+
+#[test]
+fn a_binding_reassigned_after_its_explicit_drop_destroys_each_value_once() {
+    // The ordering-sensitive corner where the two halves meet: the sink empties
+    // the slot, the assignment refills it, and the guarded `finally` destroys
+    // the SECOND value only. No overwrite drop fires — the slot was empty.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun reuse() {
+            mut r = Res { tag = "one" };
+            drop(r);
+            r = Res { tag = "two" };
+            print("body");
+        }
+        fun main() { reuse(); }
+        "#,
+        "one\ntwo\nbody\n",
+    );
+}
+
+// ============================================================================
+// S3 — last-use disposal (`lifetimes.md` §6; the ordering amendment to
+// `memory.md` §6.8, RULED 2026-08-28)
+// ============================================================================
+//
+// Disposal moved from the owner's SCOPE END to its LAST USE. The pins above
+// hold every rule that did not move — which bindings drop, how many times, in
+// what order among simultaneous discharges, and that a loan owns nothing —
+// while the ones below hold the timing itself, per case:
+//
+// - the ordinary shape (drop after the last read, not at the scope's end);
+// - a binding nothing reads, which drops at its declaration — the shape that
+//   makes the fix total for a `main` that never returns (`lifetimes.md` §6,
+//   `temporary-drop.md` §5.3);
+// - branch-join specialization: a use in one arm releases on the taken AND the
+//   not-taken path, at the join, with no runtime flag anywhere;
+// - loops, in both directions (declared outside, declared inside);
+// - the loan-extension rule, which is the one unsoundness shape §6.1 names;
+// - the refusals — an opaque binding keeps the scope-end teardown it had, and
+//   a module-level resource is not reached at all.
+//
+// Every drop here still rides a `finally`, so `ret` / `jump` / a panic release
+// on the way out; `drop_runs_on_early_ret` and its neighbours above hold that.
+
+#[test]
+fn a_resource_drops_after_its_last_use_not_at_the_scope_end() {
+    // THE ruling. `r`'s last read is the first `print`, so the teardown fires
+    // between the two statements instead of after both.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let r = Res { tag = "r" };
+            print(r.tag);
+            print("after");
+        }
+        "#,
+        "r\ndrop r\nafter\n",
+    );
+}
+
+#[test]
+fn a_resource_nothing_reads_drops_at_its_declaration() {
+    // No read is not "read at the scope's end": a handle the program never
+    // names again is released now. This is what makes the serve-forever `main`
+    // fix total — under scope-end that release never arrives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let r = Res { tag = "r" };
+            print("body");
+        }
+        "#,
+        "drop r\nbody\n",
+    );
+}
+
+#[test]
+fn a_resource_used_after_a_never_ending_loop_would_start_is_released_before_it() {
+    // The shape `temporary-drop.md` §5.3 names as the case that separates the
+    // options, at unit scale: the handle's last read precedes the long-running
+    // tail, so it is released BEFORE the tail runs rather than after a scope
+    // end the tail never reaches. (The loop is bounded here so the pin can
+    // terminate; the point is the release ordering, not the loop.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun serve() {
+            let handle = Res { tag = "handle" };
+            print(handle.tag);
+            for round in [ 1, 2 ] {
+                print(i"serving {round}");
+            }
+            print("served");
+        }
+        fun main() { serve(); }
+        "#,
+        "handle\ndrop handle\nserving 1\nserving 2\nserved\n",
+    );
+}
+
+#[test]
+fn two_resources_last_used_in_one_statement_discharge_in_reverse_declaration_order() {
+    // The ordering amendment's second half: simultaneous discharges keep the
+    // reverse declaration order `memory.md` §6.8 always specified — `b` before
+    // `a` — and the pair still fires before the statement after it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let a = Res { tag = "a" };
+            let b = Res { tag = "b" };
+            print(a.tag + b.tag);
+            print("after");
+        }
+        "#,
+        "ab\ndrop b\ndrop a\nafter\n",
+    );
+}
+
+#[test]
+fn resources_last_used_in_different_statements_discharge_at_each_last_use() {
+    // Not simultaneous: `a` is read after `b` is finished with, so `b` goes
+    // first even though it was declared second. This is exactly what the
+    // amendment breaks — under the old law both waited for the scope end and
+    // came out in reverse declaration order.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let a = Res { tag = "a" };
+            let b = Res { tag = "b" };
+            print(b.tag);
+            print(a.tag);
+            print("after");
+        }
+        "#,
+        "b\ndrop b\na\ndrop a\nafter\n",
+    );
+}
+
+#[test]
+fn a_resource_used_in_one_branch_arm_releases_on_the_taken_and_the_not_taken_path() {
+    // Branch-join drop specialization (§6.3, RULED): the last read is inside
+    // one arm, so the drop lands at the JOIN — the point the not-taken path
+    // enters too. Both paths release exactly once, and no runtime flag decides
+    // which (mR7's doctrine, intact).
+    let program = |taken: &str| {
+        format!(
+            r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res {{ tag: str }}
+        impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
+        fun run(cond: bool) {{
+            let r = Res {{ tag = "r" }};
+            if cond {{
+                print(r.tag);
+            }}
+            print("join");
+        }}
+        fun main() {{ run({taken}); }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(&program("true"), "r\ndrop r\njoin\n");
+    assert_compiles_and_runs(&program("false"), "drop r\njoin\n");
+}
+
+#[test]
+fn a_resource_used_in_both_arms_still_releases_once_at_the_join() {
+    // The control for the specialization: a use on EVERY path is still one
+    // drop at one point, not one per arm.
+    let program = |taken: &str| {
+        format!(
+            r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res {{ tag: str }}
+        impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
+        fun run(cond: bool) {{
+            let r = Res {{ tag = "r" }};
+            if cond {{ print(i"yes {{r.tag}}"); }} else {{ print(i"no {{r.tag}}"); }}
+            print("join");
+        }}
+        fun main() {{ run({taken}); }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(&program("true"), "yes r\ndrop r\njoin\n");
+    assert_compiles_and_runs(&program("false"), "no r\ndrop r\njoin\n");
+}
+
+#[test]
+fn a_resource_used_inside_a_loop_drops_once_after_the_loop() {
+    // Declared OUTSIDE, read inside: the last read's statement is the loop, so
+    // the drop is at the loop's exit — once, not per iteration.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let r = Res { tag = "r" };
+            for round in [ 1, 2 ] {
+                print(i"{round} {r.tag}");
+            }
+            print("after");
+        }
+        "#,
+        "1 r\n2 r\ndrop r\nafter\n",
+    );
+}
+
+#[test]
+fn a_resource_declared_inside_a_loop_drops_at_its_last_use_each_iteration() {
+    // Declared INSIDE: fresh per iteration, so its last read in the body is a
+    // genuine last use and the release happens before the body's tail — the
+    // precision the old lexical "inside a loop" refusal could not reach.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            for round in [ 1, 2 ] {
+                let r = Res { tag = "r" };
+                print(i"{round} {r.tag}");
+                print("tail");
+            }
+            print("after");
+        }
+        "#,
+        "1 r\ndrop r\ntail\n2 r\ndrop r\ntail\nafter\n",
+    );
+}
+
+#[test]
+fn a_view_extends_its_owners_liveness_to_the_views_last_use() {
+    // §6.1's loan-extension rule, which is the one unsoundness shape the probe
+    // battery found: the owner's own last read is the `&`, but a view rooted at
+    // it is read later, so the owner must stay alive until the VIEW is done.
+    // Dropping at the owner's own last use would print "drop held" before the
+    // view reads through it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"drop {self.label}"); } }
+        fun main() {
+            mut held = Guard { label = "held" };
+            let view = &held;
+            print("between");
+            print(view.label);
+            print("after");
+        }
+        "#,
+        "between\nheld\ndrop held\nafter\n",
+    );
+}
+
+#[test]
+fn a_teardown_region_widens_over_a_name_a_later_closure_reads() {
+    // The scoping law again, in its expensive direction. `r`'s own last read is
+    // the first `print`, but `label` — declared inside the region that would
+    // close there — is read by a closure two statements later, and a name a
+    // `try` block declares dies at its brace. So the region grows to cover it,
+    // and `r` waits. This is the honest cost of statement-granular regions in a
+    // language that lowers them to JS blocks, and it is a hold, never a leak.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let r = Res { tag = "r" };
+            let label = "shown";
+            print(r.tag);
+            let show = || print(label);
+            show();
+            print("after");
+        }
+        "#,
+        "r\nshown\nafter\ndrop r\n",
+    );
+}
+
+#[test]
+fn a_resource_read_in_the_scopes_tail_keeps_the_scope_end_teardown() {
+    // Where the two answers coincide, the shipped one is what is emitted: a
+    // last read in the scope's TAIL *is* the scope's end, so the region is the
+    // whole scope and the bytes do not move. This is also the shape every
+    // refusal falls back to — the pass never guesses a drop point.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 7 } }
+        fun measure(): i32 {
+            let r = Res { tag = "r" };
+            print("body");
+            r.size()
+        }
+        fun main() { print(measure()); }
+        "#,
+        "body\ndrop r\n7\n",
+    );
+}
+
+#[test]
+fn last_use_disposal_does_not_reach_a_module_level_resource() {
+    // Module-level resources never drop (`memory.md` §6.8), and S3 changes
+    // nothing about that: they are not enrolled, so no last use is ever asked
+    // for. The read below would be the "last use" of a local — and still
+    // nothing is destroyed.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        let global = Res { tag = "global" };
+        fun main() {
+            print(global.tag);
+            print("after");
+        }
+        "#,
+        "global\nafter\n",
+    );
+}
+
+#[test]
+fn an_explicit_drop_coincides_with_the_point_the_pass_infers() {
+    // P6's identity. Moving into the sink is a USE and R7 rejects a conditional
+    // one, so `drop(r)`'s statement IS `r`'s last use: the explicit spelling and
+    // the inferred point are the same point, and B150's guarded `finally` — the
+    // net over the window between acquisition and the sink — closes there
+    // rather than at the scope end. The two programs print the same thing.
+    let sunk = r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let r = Res { tag = "r" };
+            print(r.tag);
+            drop(r);
+            print("after");
+        }
+        "#;
+    let inferred = r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let r = Res { tag = "r" };
+            print(r.tag);
+            print("after");
+        }
+        "#;
+    assert_compiles_and_runs(sunk, "r\ndrop r\nafter\n");
+    assert_compiles_and_runs(inferred, "r\ndrop r\nafter\n");
+}
+
+#[test]
+fn an_own_resource_parameter_drops_after_its_last_use() {
+    // The parameter class moves with the locals: an `own` parameter is declared
+    // before every statement and released after the statement holding its last
+    // read, not at the body's end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun sink(own r: Res) {
+            print(r.tag);
+            print("tail");
+        }
+        fun main() {
+            sink(Res { tag = "x" });
+            print("after");
+        }
+        "#,
+        "x\ndrop x\ntail\nafter\n",
+    );
+}
+
+#[test]
+fn a_last_use_drop_still_runs_when_a_later_statement_in_its_region_panics() {
+    // The drop rides a `finally`, so shortening the region never costs the
+    // safety net: a panic between the acquisition and the last use still
+    // releases on the way out.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let r = Res { tag = "r" };
+            print("before");
+            panic("boom");
+            print(r.tag);
+        }
+        "#,
+    );
+    assert_eq!(stdout, "before\ndrop r\n", "the teardown must still run");
+    assert_ne!(code, 0, "the panic must still leave a failing exit");
+}
+
+#[test]
+fn a_teardown_region_never_closes_over_a_name_read_after_it() {
+    // The scoping law the emitted `try` imposes, pinned because getting it
+    // wrong is a `ReferenceError` and not a leak: `value` is declared inside
+    // the region the owner's last use would close, so the region is widened to
+    // cover `value`'s own last read. Found by `OwnedNursery::enter`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 7 } }
+        fun main() {
+            let r = Res { tag = "r" };
+            let value = r.size();
+            print("between");
+            print(value);
+        }
+        "#,
+        "between\n7\ndrop r\n",
+    );
+}
+
+// ============================================================================
+// C11 — the resource temporary (`temporary-drop.md`, RULED 2026-08-28)
+// ============================================================================
+//
+// A resource born and consumed inside one expression was neither dropped nor
+// rejected: `collect_resource_bindings` enrolls BINDINGS, and a temporary has
+// no binding to enroll. It is now owned by the STATEMENT that constructs it —
+// the special case of S3's general rule, since a temporary's last use is its
+// statement — and lowered the same way a `let` is: a minted `const` outside the
+// `try`, the rest of the statement inside it, the destructor in the `finally`.
+//
+// The one shape with no statement to own it — a constructor on the right of a
+// short-circuit — is refused rather than flagged (§7.3), which is the single
+// place this arc turns a compiling program into an error.
+
+#[test]
+fn a_temporary_receiver_drops_at_its_statements_end() {
+    // THE C11 shape: a postfix straight off a constructor call. The handle has
+    // no name, so the lowering gives it one and destroys it before the next
+    // statement runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print(make("t").size());
+            print("after");
+        }
+        "#,
+        "3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn two_temporaries_in_one_statement_drop_in_reverse_construction_order() {
+    // §7.1's ordering clause: within a statement the temporaries discharge in
+    // reverse birth order, which the nested `finally`s give for free.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print(make("first").size() + make("second").size());
+            print("after");
+        }
+        "#,
+        "6\ndrop second\ndrop first\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_drops_before_a_later_statements_temporary_is_built() {
+    // The property statement-end buys and scope-end does not: the live count
+    // returns to its baseline inside the scope, so N temporaries in a
+    // straight-line scope hold ONE resource at a time, not N (P7).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print(make("one").size());
+            print(make("two").size());
+            print(make("three").size());
+        }
+        "#,
+        "3\ndrop one\n3\ndrop two\n3\ndrop three\n",
+    );
+}
+
+#[test]
+fn a_temporary_in_a_loop_body_drops_each_iteration() {
+    // P9: peak one, whatever the iteration count.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            for round in [ 1, 2 ] {
+                print(make("t").size());
+            }
+            print("after");
+        }
+        "#,
+        "3\ndrop t\n3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_bound_into_a_let_still_drops_and_leaves_the_name_readable() {
+    // The statement is itself a declaration, so the region would close over the
+    // very name the next statement reads. The declaration is split — `let n;`
+    // ahead of the region, the assignment inside it — and both halves hold: the
+    // handle is destroyed, and `n` survives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let n = make("t").size();
+            print("between");
+            print(n);
+        }
+        "#,
+        "drop t\nbetween\n3\n",
+    );
+}
+
+#[test]
+fn a_temporary_drops_when_its_statement_throws() {
+    // P8: the temporary rides a `finally` exactly as a `let` does, so a caught
+    // mid-statement throw releases it instead of leaking it permanently.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun boom(&self): i32 { panic("mid-statement"); 0 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print("before");
+            print(make("t").boom());
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "before\ndrop t\n",
+        "the temporary must still release"
+    );
+    assert_ne!(code, 0, "the panic must still leave a failing exit");
+}
+
+#[test]
+fn a_temporary_moved_into_an_own_parameter_is_not_dropped_twice() {
+    // P5 line 1, THE critical negative. A temporary moved into an `own`
+    // parameter belongs to the callee, which destroys it at ITS scope end; the
+    // caller's statement must not destroy it as well.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun sink(own r: Res) { print(i"in-sink {r.tag}"); }
+        fun main() {
+            sink(make("t"));
+            print("after");
+        }
+        "#,
+        "in-sink t\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_moved_into_the_drop_sink_is_not_dropped_twice() {
+    // P5 line 2: B68's sink already destroys an unbound resource value at the
+    // site. Recording it as a temporary too would destroy it twice.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            drop(make("t"));
+            print("after");
+        }
+        "#,
+        "drop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_returned_by_ret_is_not_dropped() {
+    // P5 line 3: a value moved OUT of a helper belongs to the caller's binding.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { ret Res { tag = tag }; }
+        fun main() {
+            let held = make("t");
+            print(held.size());
+            print("after");
+        }
+        "#,
+        "3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_bound_by_a_let_is_not_a_temporary() {
+    // The control that separates the two rules: binding it is how the language
+    // says "keep this", and a bound handle takes S3's last-use teardown rather
+    // than the statement's.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let held = make("t");
+            print("between");
+            print(held.size());
+            print("after");
+        }
+        "#,
+        "between\n3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_conditionally_constructed_resource_temporary_is_refused() {
+    // §7.3, RULED. The right of `&&` runs only on some paths, so no statement
+    // can own the handle: refuse rather than admit v1's first runtime drop
+    // flag. A refusal of the SPELLING — the message names the fix.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let ready = true;
+            print(ready && make("t").size() > 0);
+        }
+        "#,
+        "would be created only on some paths",
+    );
+}
+
+#[test]
+fn the_conditional_temporarys_refusal_names_binding_as_the_fix() {
+    // The fix the message steers to compiles and releases: one keystroke's
+    // worth of restructuring, exactly the shape R7 already asks for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let ready = true;
+            let handle = make("t");
+            print(ready && handle.size() > 0);
+        }
+        "#,
+        "true\ndrop t\n",
+    );
+}
+
+#[test]
+fn a_temporary_on_the_left_of_a_short_circuit_is_accepted() {
+    // The left operand always runs, so it has a statement to belong to and
+    // needs no refusal — the rule is about CONDITIONAL evaluation, not about
+    // the operator.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let ready = true;
+            print(make("t").size() > 0 && ready);
+        }
+        "#,
+        "true\ndrop t\n",
+    );
+}
+
+#[test]
+fn a_temporary_in_a_branch_arm_drops_inside_that_arm() {
+    // Narrower than `temporary-drop.md` §7.3's stated refusal set on purpose:
+    // an arm lowers to a JS BLOCK with its own statement list, so a temporary
+    // there has a statement position of its own. Only `&&`/`||` evaluate an
+    // operand inline with no block to hold it.
+    let program = |taken: &str| {
+        format!(
+            r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res {{ tag: str }}
+        impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
+        impl Res {{ fun size(&self): i32 {{ 3 }} }}
+        fun make(tag: str): Res {{ Res {{ tag = tag }} }}
+        fun main() {{
+            if {taken} {{
+                print(make("t").size());
+            }}
+            print("join");
+        }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(&program("true"), "3\ndrop t\njoin\n");
+    assert_compiles_and_runs(&program("false"), "join\n");
+}
+
+#[test]
+fn a_temporary_in_a_tail_position_drops_after_the_value_is_computed() {
+    // P11's shape: the return value must exist before any teardown runs, which
+    // is what a `finally` around the `return` gives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun measure(): i32 { make("t").size() }
+        fun main() {
+            print(measure());
+            print("after");
+        }
+        "#,
+        "drop t\n3\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_of_a_resource_with_no_destructor_is_not_lifted() {
+    // The byte-identity clause: a `resource` whose destruction is a complete
+    // no-op gets no `const`, no `try` and no `finally` — the same rule that
+    // keeps a bare `resource external` binding's scope free of them.
+    let js = compile(
+        r#"
+        resource struct Inert { tag: str }
+        impl Inert { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Inert { Inert { tag = tag } }
+        fun main() { make("t").size(); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        !js.contains("finally"),
+        "a no-op destruction must not grow a teardown:\n{js}"
+    );
+}
+
+// ============================================================================
+// S4 — the extern retention contract (`lifetimes.md` §6.4, RULED 2026-08-28)
+// ============================================================================
+//
+// The one place the probe battery showed last-use is WRONG: an `[extern]` that
+// stashes what it is handed and reads it after the call returns. The rule is
+// that an extern loan is CALL-BOUNDED unless the declaration says otherwise,
+// and `[extern(…, retains)]` is what says otherwise — it extends the argument's
+// liveness to the binding's whole scope, which is the conservative envelope and
+// also the teardown that shipped.
+//
+// The spelling settles as a trailing FLAG rather than a form word, so it
+// composes with every existing binding shape (`[extern(method, "…", retains)]`)
+// instead of needing an arm per combination; the formatter reprints it last.
+
+#[test]
+fn an_unmarked_extern_loan_is_call_bounded() {
+    // The rule's default half, and the red-first half of the pair: nothing in
+    // the declaration says the host keeps the value, so the binding is released
+    // at its last use like any other.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+
+        [extern("Boolean")]
+        external fun watch(r: &Res): bool;
+
+        fun main() {
+            let r = Res { tag = "r" };
+            print(watch(&r));
+            print("after");
+        }
+        "#,
+        "true\ndrop r\nafter\n",
+    );
+}
+
+#[test]
+fn a_retaining_extern_holds_its_argument_to_the_bindings_scope_end() {
+    // The same program with the contract declared. The host may read the value
+    // at any point after the call, so the compiler stops claiming to know when
+    // the last read was: the binding falls back to the scope-end teardown.
+    // Under the call bound alone this is where the probe battery read a freed
+    // value host-side (`tag=["<FREED>"]`).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+
+        [extern("Boolean", retains)]
+        external fun keep(r: &Res): bool;
+
+        fun main() {
+            let r = Res { tag = "r" };
+            print(keep(&r));
+            print("after");
+        }
+        "#,
+        "true\nafter\ndrop r\n",
+    );
+}
+
+#[test]
+fn a_retaining_extern_composes_with_every_binding_form() {
+    // The flag is not a form word: it rides alongside `method` / `get` / `set` /
+    // `new` and the plain symbol shapes alike, which is why it is stripped
+    // before the positional match rather than adding an arm per combination.
+    assert_compiles(
+        r#"
+        external struct Host;
+        impl Host {
+            [extern(method, "addEventListener", retains)]
+            external fun on(self, event: str, handler: || void): void;
+
+            [extern(set, "onmessage", retains)]
+            external fun set_on_message(self, handler: || void);
+        }
+        [extern("queueMicrotask", retains)]
+        external fun queue(callback: || void);
+        fun main() {}
+        "#,
     );
 }

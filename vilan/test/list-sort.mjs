@@ -71,7 +71,7 @@ console.log(__at(numeric, 0));
 console.log(__at(numeric, 2));
 const words = $e([ "pear", "apple", "fig" ]);
 console.log(__at(words, 0));
-const descending = __list_sort_by(__clone(xs), (a, b) => {
+const descending = __list_sort_by(xs, (a, b) => {
 	let $h = null;
 	if (a > b) {
 		$h = -1;
@@ -93,7 +93,7 @@ entries.push([ 0, "b" ]);
 entries.push([ 1, "c" ]);
 entries.push([ 0, "d" ]);
 let order = "";
-for (const entry of __list_sort_by(__clone(entries), (a, b) => {
+for (const entry of __list_sort_by(entries, (a, b) => {
 	return compare2(a[0], b[0]);
 })) {
 	order = order + entry[1];
