@@ -9,10 +9,13 @@ usage: [Persistence and the server](../guide/persistence.md).
 ```vilan,fragment
 resource external struct Database;       // a resource: moves, closes on drop
 
+struct Migration { name: str, sql: str }
+
 impl Database {
 	fun open(path: str): Database        // ":memory:" for an in-memory db
 	fun exec(self, sql: str)             // DDL / one-off statements
 	fun prepare(self, sql: str): Statement
+	fun migrate(self, migrations: List<Migration>): List<str>  // → the names applied
 }
 impl Statement {
 	fun run(self, parameters: List<any>): i32          // → last insert id
@@ -42,6 +45,27 @@ Being a resource, a `Database` cannot go into a `List` (use `Option` or a
 struct field), cross the wire (`[derive(Wire)]` rejects it), or be a field of a
 `[service]` struct (the generated dispatcher would capture the store; keep the
 database at module scope instead, next to the service).
+
+`migrate` carries a schema forward, which `CREATE TABLE IF NOT EXISTS`
+cannot: it applies the named steps this database has not seen, **in list
+order**, and records each in a `vilan_migrations` table it owns
+(`name TEXT PRIMARY KEY`, `applied_at_ms INTEGER`). Call it at boot,
+before the first query; a re-run applies nothing and returns an empty
+list. Each step runs in its own transaction *with* its record insert, so
+a step is recorded if and only if its SQL committed — which is why a step
+must never contain `BEGIN`/`COMMIT`/`ROLLBACK` of its own, or a statement
+SQLite refuses inside a transaction (`VACUUM`, `PRAGMA journal_mode`).
+
+Three conditions stop the boot with a `panic`, all of them before
+anything is applied: a step whose SQL **fails** (named, with the host's
+message, and nothing recorded for it); a **recorded step absent from the
+list**, meaning this database was migrated by a newer build; and an
+**unapplied step ordered before an applied one**, meaning a step was
+inserted into the past. Names must be unique and must never change once
+recorded; they need not sort in order, because the list's order is the
+one that counts. No down-migrations — roll forward with a new step. The
+task-oriented version, including carrying `.sql` files through the const
+channel, is in [Persistence](../guide/persistence.md#migrations-carrying-a-schema-forward).
 
 ## std::http: the server
 

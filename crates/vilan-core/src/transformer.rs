@@ -694,6 +694,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_column",
         "__db_is_null",
         "__db_close",
+        "__db_exec_guarded",
+        "__db_run_guarded",
         "__fs_close",
         "__fs_close_awaited",
         "__fs_stat",
@@ -959,6 +961,40 @@ fn helper_source(name: &str) -> &'static str {
         // `Database`'s `Drop` closes the handle (destruction.md §9). No public
         // `close()` surfaces this — the destructor is the only caller.
         "__db_close" => "function __db_close(database) {\n\tdatabase.close();\n}",
+        // The migrator's guard (`db-migrations.md` §6). `vilan` has no
+        // `try`/`catch`, and `Database.migrate` has to name the step that
+        // failed and roll its transaction back — so the catch lives here, in
+        // the same `Option` array form `__db_get` and `__fs_stat` already use
+        // at this boundary: `[ 1 ]` on success, `[ 0, message ]` on a throw.
+        //
+        // These are NOT public surface. Whether `std::db` should offer a
+        // `Result`-returning `try_exec` is a real question about the module's
+        // error posture — everything else in it throws — and it deserves its
+        // own answer rather than arriving as a side effect of migrations.
+        //
+        // `error.message` is what `node:sqlite` puts the SQLite diagnosis in
+        // (`no such table: taks`); the `String(error)` fallback covers a throw
+        // of something that is not an Error at all.
+        "__db_exec_guarded" => {
+            "function __db_exec_guarded(database, sql) {\n\
+             \ttry {\n\
+             \t\tdatabase.exec(sql);\n\
+             \t\treturn [ 1 ];\n\
+             \t} catch (error) {\n\
+             \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
+             \t}\n\
+             }"
+        }
+        "__db_run_guarded" => {
+            "function __db_run_guarded(statement, parameters) {\n\
+             \ttry {\n\
+             \t\tstatement.run(...parameters);\n\
+             \t\treturn [ 1 ];\n\
+             \t} catch (error) {\n\
+             \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
+             \t}\n\
+             }"
+        }
         // `File`'s `Drop` (filesystem.md §5.1; kolt.local 031 Q1, ruled
         // (a)+(c) and scoped to `File` alone). `FileHandle.close()` returns a
         // promise and a destructor cannot await, so the drop INITIATES the

@@ -64,6 +64,8 @@ guide/dev-loop.md h3 the-rest-of-the-rules
 guide/dev-loop.md h2 cleaning-up-strays
 guide/persistence.md h1 persistence-and-the-server
 guide/persistence.md h2 sqlite-stddb
+guide/persistence.md h3 migrations-carrying-a-schema-forward
+guide/persistence.md h4 carrying-the-sql-into-dist
 guide/persistence.md h2 serving-http-stdhttp
 guide/persistence.md h3 caching-etag-and-304
 guide/persistence.md h2 files-stdfs
