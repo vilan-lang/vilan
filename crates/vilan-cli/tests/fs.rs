@@ -1566,6 +1566,13 @@ main();
 }
 
 #[test]
+// The INSTRUMENT is `/proc/self/fd`, which only Linux has — the emission
+// property this observes (a temporary's drop at its statement's end) is
+// pinned platform-independently in tests/inference/resources.rs; this is
+// its Linux-observable half, gated exactly as its descriptor-counting
+// sibling above is. (The v0.39.0-cycle Windows leg caught the ungated
+// first version — N26's lesson, third instance.)
+#[cfg(target_os = "linux")]
 fn a_temporary_handle_releases_its_descriptor_at_its_statements_end() {
     // C11, measured — `temporary-drop.md` P6/P7's fd staircase made permanent.
     // `File::open(p).read_at(b, 0)` was the fs tier's INTENDED idiom and leaked
