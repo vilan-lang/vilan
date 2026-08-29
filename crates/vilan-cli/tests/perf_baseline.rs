@@ -79,6 +79,9 @@ struct Row {
     /// not say which it is invites exactly that confusion — so the harness
     /// stamps it rather than trusting the reader to remember.
     profile: &'static str,
+    /// The 1-minute loadavg when the row was summarized (backlog M13) — a
+    /// contended run carries its contention in the record.
+    load: String,
     runs: usize,
     min_ms: f64,
     median_ms: f64,
@@ -92,13 +95,15 @@ impl Row {
     fn json(&self) -> String {
         format!(
             "{{\"section\":\"{}\",\"corpus\":\"{}\",\"mode\":\"{}\",\"metric\":\"{}\",\
-             \"profile\":\"{}\",\"runs\":{},\"min_ms\":{:.2},\"median_ms\":{:.2},\
-             \"p95_ms\":{:.2},\"p99_ms\":{:.2},\"max_ms\":{:.2},\"note\":\"{}\"}}",
+             \"profile\":\"{}\",\"load\":\"{}\",\"runs\":{},\"min_ms\":{:.2},\
+             \"median_ms\":{:.2},\"p95_ms\":{:.2},\"p99_ms\":{:.2},\"max_ms\":{:.2},\
+             \"note\":\"{}\"}}",
             self.section,
             self.corpus,
             self.mode,
             self.metric,
             self.profile,
+            self.load,
             self.runs,
             self.min_ms,
             self.median_ms,
@@ -108,6 +113,17 @@ impl Row {
             self.note,
         )
     }
+}
+
+/// The 1-minute load average when the row was summarized, or `"?"` where the
+/// host does not expose one. Provenance, not measurement (backlog M13): run 3
+/// read a 4.5x regression under loadavg 18-46 and could not say so from the
+/// record, which is the finding this field closes.
+fn loadavg_1m() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Nearest-rank percentile over already-sorted samples. `percentile` is a
@@ -146,6 +162,7 @@ fn summarize(
         } else {
             "release"
         },
+        load: loadavg_1m(),
         runs: sorted.len(),
         min_ms: milliseconds(sorted[0]),
         median_ms: milliseconds(percentile(&sorted, 0.50)),
@@ -623,6 +640,26 @@ fn report(rows: &[Row]) {
     for row in rows {
         println!("PERF {}", row.json());
     }
+    // The run's own provenance row (backlog M13): how many subjects this
+    // binary measured and under what load the run ended, so a reduced
+    // (`-E`-filtered) or contended run stops being indistinguishable from
+    // the record it is compared against.
+    let subjects: std::collections::BTreeSet<&str> =
+        rows.iter().map(|row| row.corpus.as_str()).collect();
+    println!(
+        "PERF {{\"section\":\"run\",\"corpus\":\"vilan-cli\",\"mode\":\"-\",\
+         \"metric\":\"provenance\",\"profile\":\"{}\",\"load\":\"{}\",\"runs\":{},\
+         \"min_ms\":0.00,\"median_ms\":0.00,\"p95_ms\":0.00,\"p99_ms\":0.00,\
+         \"max_ms\":0.00,\"note\":\"{} subjects\"}}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        loadavg_1m(),
+        rows.len(),
+        subjects.len(),
+    );
     println!();
     println!(
         "{:<11} {:<16} {:<13} {:<12} {:>5} {:>10} {:>10} {:>10}",

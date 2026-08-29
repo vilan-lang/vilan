@@ -10649,6 +10649,15 @@ mod perf_baseline {
         }
     }
 
+    /// The 1-minute load average at report time, or `"?"` — the CLI
+    /// harness's provenance twin (backlog M13).
+    fn loadavg_1m() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| text.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string())
+    }
+
     /// Nearest-rank percentile over sorted samples.
     fn percentile(sorted: &[Duration], fraction: f64) -> f64 {
         let rank = (fraction * sorted.len() as f64).ceil().max(1.0) as usize;
@@ -10662,11 +10671,12 @@ mod perf_baseline {
         let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
         println!(
             "PERF {{\"section\":\"lsp_edit\",\"corpus\":\"{}\",\"mode\":\"warm\",\
-             \"metric\":\"analyze\",\"profile\":\"{}\",\"runs\":{},\"min_ms\":{:.2},\
-             \"median_ms\":{:.2},\"p95_ms\":{:.2},\"p99_ms\":{:.2},\"max_ms\":{:.2},\
-             \"note\":\"{}\"}}",
+             \"metric\":\"analyze\",\"profile\":\"{}\",\"load\":\"{}\",\"runs\":{},\
+             \"min_ms\":{:.2},\"median_ms\":{:.2},\"p95_ms\":{:.2},\"p99_ms\":{:.2},\
+             \"max_ms\":{:.2},\"note\":\"{}\"}}",
             corpus,
             profile(),
+            loadavg_1m(),
             samples.len(),
             milliseconds(samples[0]),
             percentile(samples, 0.50),
@@ -10763,6 +10773,7 @@ mod perf_baseline {
         });
         let mut samples = samples;
         report("synthetic", "15 lines, no macros", &mut samples);
+        let mut measured_subjects: usize = 1;
 
         for (name, variable, relative) in CORPORA {
             let Some(root) = std::env::var_os(variable).map(PathBuf::from) else {
@@ -10786,7 +10797,19 @@ mod perf_baseline {
             let mut samples =
                 on_big_stack(move || measure(move |i| corpus_text(&base, i), &entry, 10, 100));
             report(name, &format!("{lines} lines"), &mut samples);
+            measured_subjects += 1;
         }
+
+        // The run-provenance row, the CLI harness's twin (backlog M13).
+        println!(
+            "PERF {{\"section\":\"run\",\"corpus\":\"vilan-lsp\",\"mode\":\"-\",\
+             \"metric\":\"provenance\",\"profile\":\"{}\",\"load\":\"{}\",\
+             \"runs\":{measured_subjects},\"min_ms\":0.00,\"median_ms\":0.00,\
+             \"p95_ms\":0.00,\"p99_ms\":0.00,\"max_ms\":0.00,\
+             \"note\":\"{measured_subjects} subjects\"}}",
+            profile(),
+            loadavg_1m(),
+        );
     }
 
     /// The gate's pin on this half of the harness: it runs and produces an
