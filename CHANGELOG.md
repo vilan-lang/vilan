@@ -22,6 +22,13 @@ than a band: ..."). Two entries tripped this in one cycle before it was
 written down.
 -->
 
+## Unreleased
+
+<!-- family: tooling -->
+**One platform-coloring mistake now draws one diagnostic.** Constructing a `@process` resource in a browser build — `let file = File::open("data.txt")` — reported twice: the construction's rejection, and a second one for the compiler-inserted teardown, anchored inside `std`'s own `File::drop` at a position in a file the user cannot edit. `Database` showed it identically, so it was the resource class rather than `File`. Two causes, both general. The synthetic destruction edge (`destruction.md` §8) carried no site at all — the teardown is inserted by the transformer and has no spelling in the source — so its diagnostic fell back to the offending node's own definition, which is by construction inside the library that seeded the requirement. The edge now carries the CONSTRUCTION it answers to: the initializer behind a `let`, the assignment behind an overwrite, the argument behind an early `drop(x)`, the expression itself for an owning temporary, and the owner's site for a member reached through the drop glue. And coloring had no dedup at all: violations now collapse on `(anchor, layer, what the chain hangs from)`, and one raised beneath a teardown edge is dropped when the construction it answers to is already rejected for the same cause — which is what closes `Option::Some(File::open(p))`, the sanctioned container, where the rejected `open` sits *inside* the construction rather than at it. The same dedup fixes a third instance nobody had filed: a fence over a FAMILY is checked against every host in it, so `[platform("@process")]` reaching browser-only code drew three identical diagnostics differing only in which host was named — one broken promise, now reported once, with the fence still quoted so the family is not lost. Distinct mistakes still each report, which is the other half of the claim and pinned as such: two off-platform calls in one function, two fences broken the same way, and a resource whose only off-platform surface is its `Drop` standing beside an unrelated call. (backlog E98, found by Order 17's fs-handles lane)
+
+---
+
 ## v0.39.0 — 2026-08-29
 
 <!-- family: breaking -->

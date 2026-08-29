@@ -68,9 +68,51 @@ pub fn check(program: &mut Program, platform: Platform, graph: &CallGraph) {
         traversal.walk(entry, &SubstitutionContext::default(), None);
         diagnostics.extend(traversal.diagnostics);
     }
+    // A teardown is a CONSEQUENCE: it runs because something was constructed.
+    // When that construction is itself rejected for the same cause, the
+    // teardown's diagnostic restates the construction's — `let file =
+    // File::open(p)` in a browser build, where the rejected `File::open` sits
+    // inside the very construction `File::drop`'s edge hangs from (E98). Judged
+    // against the constructions only, so two teardowns never silence each other.
+    let constructions: Vec<(SourceId, Span, String)> = diagnostics
+        .iter()
+        .filter(|violation| violation.covers.is_none())
+        .map(|violation| {
+            (
+                violation.source,
+                violation.error.span,
+                violation.cause.clone(),
+            )
+        })
+        .collect();
+    diagnostics.retain(|violation| {
+        let Some((source, construction)) = violation.covers else {
+            return true;
+        };
+        !constructions.iter().any(|(rejected_in, rejected, cause)| {
+            *rejected_in == source
+                && *cause == violation.cause
+                && rejected.start >= construction.start
+                && rejected.end <= construction.end
+        })
+    });
     // Each violation goes in with the file its anchor span indexes into — the
-    // chain crosses files, so the anchor is regularly in a module (backlog E16).
-    for (error, source) in diagnostics {
+    // chain crosses files, so the anchor is regularly in a module (backlog E16)
+    // — and ONE per mistake (E98): the walk reaches a layer by as many edges as
+    // the program has, and a fence over a FAMILY re-walks per host, so the same
+    // site and the same cause arrive repeatedly. First wins, which keeps the
+    // shortest chain.
+    let mut seen: HashSet<(SourceId, Span, String)> = HashSet::default();
+    for Violation {
+        error,
+        source,
+        cause,
+        covers: _,
+    } in diagnostics
+    {
+        if !seen.insert((source, error.span, cause)) {
+            continue;
+        }
         program.push_diagnostic(error, source);
     }
 }
@@ -99,7 +141,7 @@ fn known_hosts() -> [Platform; 4] {
 /// a dependent build. A fence on a generic function walks unbound
 /// (dispatches consider every candidate): it promises for every possible
 /// instantiation.
-fn check_fences(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> {
+fn check_fences(program: &Program, graph: &CallGraph) -> Vec<Violation> {
     let mut diagnostics = Vec::new();
     for (id, function) in &program.functions {
         if function.platform_fence.is_empty() {
@@ -115,19 +157,22 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> 
         for (pattern_text, pattern_span) in &function.platform_fence {
             let Some(patterns) = crate::target::PlatformPattern::parse(pattern_text) else {
                 // The pattern is written in the fenced function's own file.
-                diagnostics.push((
-                    Error {
+                let msg = format!(
+                    "unknown platform pattern `{pattern_text}` in `[platform(…)]` \
+                     (expected `node`/`deno`/`bun`/`browser`, or a family like \
+                     `@process`)"
+                );
+                diagnostics.push(Violation {
+                    cause: msg.clone(),
+                    error: Error {
                         trace: Vec::new(),
                         note: None,
                         span: *pattern_span,
-                        msg: format!(
-                            "unknown platform pattern `{pattern_text}` in `[platform(…)]` \
-                             (expected `node`/`deno`/`bun`/`browser`, or a family like \
-                             `@process`)"
-                        ),
+                        msg,
                     },
-                    program.diagnostic_source_of(*id),
-                ));
+                    source: program.diagnostic_source_of(*id),
+                    covers: None,
+                });
                 continue;
             };
             for pattern in patterns {
@@ -155,6 +200,39 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> 
 enum Origin {
     Entry,
     Fence { function: String, fence: String },
+}
+
+impl Origin {
+    /// The origin's contribution to a violation's cause key — two fences are two
+    /// promises and each wants its own diagnostic, but the entry is one.
+    fn key(&self) -> String {
+        match self {
+            Origin::Entry => "entry".to_string(),
+            Origin::Fence { function, fence } => format!("fence {function} {fence}"),
+        }
+    }
+}
+
+/// A coloring diagnostic together with its CAUSE — what, beyond the anchor,
+/// makes two of them the same mistake. The anchor (file + span) says WHERE the
+/// user must act; the cause says what is wrong there: the layer the chain
+/// reaches, and what the chain hangs from.
+///
+/// The build platform is deliberately absent. A fence over a FAMILY is checked
+/// against every host in it, so `[platform("@process")]` reaching browser-only
+/// code used to draw three identical diagnostics differing only in which host
+/// was named — one broken promise, reported three times (E98).
+struct Violation {
+    error: Error,
+    source: SourceId,
+    cause: String,
+    /// Set when the chain crossed a synthetic teardown edge: the construction
+    /// that teardown answers to. A teardown runs *because* something was
+    /// constructed, so if the construction is itself rejected for the same
+    /// cause the teardown's diagnostic is that rejection restated — the case
+    /// behind E98, where `let file = File::open(p)` in a browser build drew the
+    /// construction's error and `File::drop`'s beside it.
+    covers: Option<(SourceId, Span)>,
 }
 
 /// The module-level bindings whose initializers run for a program entered at
@@ -192,6 +270,11 @@ struct Arrival {
     span: Span,
     source: SourceId,
     user_code: bool,
+    /// Whether this edge is a synthetic teardown (destruction.md §8) rather
+    /// than a call the user wrote — in which case `span` is the CONSTRUCTION
+    /// the teardown answers to, and a violation beneath it is a consequence of
+    /// that construction.
+    teardown: bool,
 }
 
 /// The contextual DFS shared by admission (`platform` set: check + prune +
@@ -209,7 +292,7 @@ struct Traversal<'a, 'src> {
     /// code. The file rides along with the span so a violation renders where it
     /// is anchored (backlog E16).
     trail: Vec<(Id, Option<Arrival>)>,
-    diagnostics: Vec<(Error, SourceId)>,
+    diagnostics: Vec<Violation>,
     module_bindings: HashSet<Id>,
     reached_bindings: HashSet<Id>,
     origin: Origin,
@@ -333,11 +416,14 @@ impl<'a, 'src> Traversal<'a, 'src> {
         // the teardown at each scope exit, so this walk can't see the call
         // otherwise. Walking to the resource's `drop` impl(s) here colors the
         // owning scope by a `@process`-needing drop. Context-free (the drop impl's
-        // platform requirement is on its own body, not the owner's `T`), no call
-        // site — like a created closure.
+        // platform requirement is on its own body, not the owner's `T`). The
+        // arrival is the CONSTRUCTION the teardown answers to: the scope exit has
+        // no spelling, and anchoring at the drop impl instead would point the user
+        // into the library's own source (E98).
         if let Some(drop_methods) = self.program.drop_call_edges.get(&node) {
-            for drop_method in drop_methods.clone() {
-                self.walk(drop_method, &SubstitutionContext::default(), None);
+            for (drop_method, site) in drop_methods.clone() {
+                let arrived = site.and_then(|site| self.arrival_by(site, true));
+                self.walk(drop_method, &SubstitutionContext::default(), arrived);
             }
         }
 
@@ -345,11 +431,16 @@ impl<'a, 'src> Traversal<'a, 'src> {
     }
 
     fn arrival(&self, site: Id) -> Option<Arrival> {
+        self.arrival_by(site, false)
+    }
+
+    fn arrival_by(&self, site: Id, teardown: bool) -> Option<Arrival> {
         let span = self.program.span_map.get(&site).map(|span| **span)?;
         Some(Arrival {
             span,
             source: self.program.diagnostic_source_of(site),
             user_code: is_user_code(self.program, site),
+            teardown,
         })
     }
 
@@ -630,7 +721,7 @@ fn violation(
     node: Id,
     requirement: Requirement,
     origin: &Origin,
-) -> (Error, SourceId) {
+) -> Violation {
     let chain = trail
         .iter()
         .map(|(id, _)| frame_label(program, *id))
@@ -657,8 +748,8 @@ fn violation(
             format!("reachable from `{function}`, fenced `[platform({fence})]`")
         }
     };
-    (
-        Error {
+    Violation {
+        error: Error {
             trace: Vec::new(),
             note: None,
             span: anchor.0,
@@ -671,8 +762,15 @@ fn violation(
                 chain
             ),
         },
-        anchor.1,
-    )
+        source: anchor.1,
+        cause: format!("{} | {}", requirement.label, origin.key()),
+        // The nearest construction a synthetic teardown on this chain answers
+        // to, if any — the nearest, so a teardown reached through another one
+        // is judged against its own owner rather than the outermost.
+        covers: trail.iter().rev().find_map(|(_, arrived)| {
+            arrived.and_then(|arrival| arrival.teardown.then_some((arrival.source, arrival.span)))
+        }),
+    }
 }
 
 fn name_of(program: &Program, id: Id) -> String {

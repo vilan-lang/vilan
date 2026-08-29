@@ -205,9 +205,67 @@ pub fn assert_fails_browser_with(source: &str, message_part: &str) {
     }
 }
 
+/// The browser twin of [`assert_fails_once_with`]: exactly one diagnostic
+/// containing `message_part`. Platform coloring reaches a layer by as many edges
+/// as the program has — a call, a synthetic teardown, a fence checked per host —
+/// and one mistake must still draw one diagnostic (E98).
+#[track_caller]
+pub fn assert_fails_browser_once_with(source: &str, message_part: &str) {
+    match compile_browser(source) {
+        Ok(_) => panic!("expected a browser compile error, but it compiled cleanly"),
+        Err(errors) => {
+            let matching = errors
+                .iter()
+                .filter(|error| error.contains(message_part))
+                .count();
+            assert_eq!(
+                matching, 1,
+                "expected exactly one browser diagnostic containing {message_part:?}; \
+                 got: {errors:#?}"
+            );
+        }
+    }
+}
+
+/// The browser twin of [`assert_fails_spanning`]. Only a browser build rejects
+/// the `@process` layer, so a coloring anchor can only be pinned there.
+#[track_caller]
+pub fn assert_fails_browser_spanning(source: &str, spanning: &str, message_part: &str) {
+    let expected_start = source
+        .find(spanning)
+        .expect("the `spanning` snippet must occur in the source");
+    let expected = expected_start..expected_start + spanning.len();
+    let diagnostics = failure_diagnostics_on(source, Platform::Browser);
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _)| message.contains(message_part))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "no browser diagnostic contains {message_part:?}; got: {diagnostics:#?}"
+    );
+    assert!(
+        matching.iter().any(|(_, range)| *range == expected),
+        "no {message_part:?} diagnostic spans {expected:?} ({spanning:?}); spans: {:#?}",
+        matching
+            .iter()
+            .map(|(message, range)| (message.as_str(), range.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The analyzer's diagnostics as `(message, span range)` pairs — the E7 span
 /// harness's raw material (`compile` keeps only the messages).
 pub fn failure_diagnostics(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    failure_diagnostics_on(source, Platform::default())
+}
+
+/// [`failure_diagnostics`] for a chosen build platform — a coloring anchor is
+/// only observable on the platform that rejects the layer.
+pub fn failure_diagnostics_on(
+    source: &str,
+    platform: Platform,
+) -> Vec<(String, std::ops::Range<usize>)> {
     let source = source.to_string();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -218,7 +276,7 @@ pub fn failure_diagnostics(source: &str) -> Vec<(String, std::ops::Range<usize>)
                 &std_spec(),
                 Path::new("."),
                 Path::new("test.vl"),
-                Some(Platform::default()),
+                Some(platform),
                 &Workspace::default(),
             );
             errors
