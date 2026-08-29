@@ -26,7 +26,7 @@ function drop(self) {
 function $a($b) {
 	drop($b);
 }
-async function $c(path, body) {
+async function $e(path, body) {
 	const file = await (open2(path));
 	try {
 		const result = await (body(file));
@@ -46,19 +46,29 @@ async function $c(path, body) {
 		console.log((await (stat(file)))[0]);
 		$a(file);
 		file = null;
-		console.log(await (read_at(await (open2("file-corpus.txt")), buffer, 0)));
+		const $c = await (open2("file-corpus.txt"));
+		try {
+			console.log(await (read_at($c, buffer, 0)));
+		} finally {
+			$a($c);
+		}
 	} finally {
 		if (file !== null) {
 			$a(file);
 		}
 	}
-	console.log((await (stat(await (open2("file-corpus.txt")))))[0]);
-	const size = await ($c("file-corpus.txt", async (f) => {
+	const $d = await (open2("file-corpus.txt"));
+	try {
+		console.log((await (stat($d)))[0]);
+	} finally {
+		$a($d);
+	}
+	const size = await ($e("file-corpus.txt", async (f) => {
 		return (await (stat(f)))[0];
 	}));
 	console.log(size);
 	await (unlink("file-corpus.txt"));
-})().catch(($d) => {
-	console.error(String($d));
+})().catch(($f) => {
+	console.error(String($f));
 	process.exit(1);
 });

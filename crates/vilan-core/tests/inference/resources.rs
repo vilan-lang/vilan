@@ -6455,3 +6455,380 @@ fn a_teardown_region_never_closes_over_a_name_read_after_it() {
         "between\n7\ndrop r\n",
     );
 }
+
+// ============================================================================
+// C11 — the resource temporary (`temporary-drop.md`, RULED 2026-08-28)
+// ============================================================================
+//
+// A resource born and consumed inside one expression was neither dropped nor
+// rejected: `collect_resource_bindings` enrolls BINDINGS, and a temporary has
+// no binding to enroll. It is now owned by the STATEMENT that constructs it —
+// the special case of S3's general rule, since a temporary's last use is its
+// statement — and lowered the same way a `let` is: a minted `const` outside the
+// `try`, the rest of the statement inside it, the destructor in the `finally`.
+//
+// The one shape with no statement to own it — a constructor on the right of a
+// short-circuit — is refused rather than flagged (§7.3), which is the single
+// place this arc turns a compiling program into an error.
+
+#[test]
+fn a_temporary_receiver_drops_at_its_statements_end() {
+    // THE C11 shape: a postfix straight off a constructor call. The handle has
+    // no name, so the lowering gives it one and destroys it before the next
+    // statement runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print(make("t").size());
+            print("after");
+        }
+        "#,
+        "3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn two_temporaries_in_one_statement_drop_in_reverse_construction_order() {
+    // §7.1's ordering clause: within a statement the temporaries discharge in
+    // reverse birth order, which the nested `finally`s give for free.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print(make("first").size() + make("second").size());
+            print("after");
+        }
+        "#,
+        "6\ndrop second\ndrop first\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_drops_before_a_later_statements_temporary_is_built() {
+    // The property statement-end buys and scope-end does not: the live count
+    // returns to its baseline inside the scope, so N temporaries in a
+    // straight-line scope hold ONE resource at a time, not N (P7).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print(make("one").size());
+            print(make("two").size());
+            print(make("three").size());
+        }
+        "#,
+        "3\ndrop one\n3\ndrop two\n3\ndrop three\n",
+    );
+}
+
+#[test]
+fn a_temporary_in_a_loop_body_drops_each_iteration() {
+    // P9: peak one, whatever the iteration count.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            for round in [ 1, 2 ] {
+                print(make("t").size());
+            }
+            print("after");
+        }
+        "#,
+        "3\ndrop t\n3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_bound_into_a_let_still_drops_and_leaves_the_name_readable() {
+    // The statement is itself a declaration, so the region would close over the
+    // very name the next statement reads. The declaration is split — `let n;`
+    // ahead of the region, the assignment inside it — and both halves hold: the
+    // handle is destroyed, and `n` survives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let n = make("t").size();
+            print("between");
+            print(n);
+        }
+        "#,
+        "drop t\nbetween\n3\n",
+    );
+}
+
+#[test]
+fn a_temporary_drops_when_its_statement_throws() {
+    // P8: the temporary rides a `finally` exactly as a `let` does, so a caught
+    // mid-statement throw releases it instead of leaking it permanently.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun boom(&self): i32 { panic("mid-statement"); 0 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            print("before");
+            print(make("t").boom());
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "before\ndrop t\n",
+        "the temporary must still release"
+    );
+    assert_ne!(code, 0, "the panic must still leave a failing exit");
+}
+
+#[test]
+fn a_temporary_moved_into_an_own_parameter_is_not_dropped_twice() {
+    // P5 line 1, THE critical negative. A temporary moved into an `own`
+    // parameter belongs to the callee, which destroys it at ITS scope end; the
+    // caller's statement must not destroy it as well.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun sink(own r: Res) { print(i"in-sink {r.tag}"); }
+        fun main() {
+            sink(make("t"));
+            print("after");
+        }
+        "#,
+        "in-sink t\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_moved_into_the_drop_sink_is_not_dropped_twice() {
+    // P5 line 2: B68's sink already destroys an unbound resource value at the
+    // site. Recording it as a temporary too would destroy it twice.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            drop(make("t"));
+            print("after");
+        }
+        "#,
+        "drop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_returned_by_ret_is_not_dropped() {
+    // P5 line 3: a value moved OUT of a helper belongs to the caller's binding.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { ret Res { tag = tag }; }
+        fun main() {
+            let held = make("t");
+            print(held.size());
+            print("after");
+        }
+        "#,
+        "3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_bound_by_a_let_is_not_a_temporary() {
+    // The control that separates the two rules: binding it is how the language
+    // says "keep this", and a bound handle takes S3's last-use teardown rather
+    // than the statement's.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let held = make("t");
+            print("between");
+            print(held.size());
+            print("after");
+        }
+        "#,
+        "between\n3\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_conditionally_constructed_resource_temporary_is_refused() {
+    // §7.3, RULED. The right of `&&` runs only on some paths, so no statement
+    // can own the handle: refuse rather than admit v1's first runtime drop
+    // flag. A refusal of the SPELLING — the message names the fix.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let ready = true;
+            print(ready && make("t").size() > 0);
+        }
+        "#,
+        "would be created only on some paths",
+    );
+}
+
+#[test]
+fn the_conditional_temporarys_refusal_names_binding_as_the_fix() {
+    // The fix the message steers to compiles and releases: one keystroke's
+    // worth of restructuring, exactly the shape R7 already asks for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let ready = true;
+            let handle = make("t");
+            print(ready && handle.size() > 0);
+        }
+        "#,
+        "true\ndrop t\n",
+    );
+}
+
+#[test]
+fn a_temporary_on_the_left_of_a_short_circuit_is_accepted() {
+    // The left operand always runs, so it has a statement to belong to and
+    // needs no refusal — the rule is about CONDITIONAL evaluation, not about
+    // the operator.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun main() {
+            let ready = true;
+            print(make("t").size() > 0 && ready);
+        }
+        "#,
+        "true\ndrop t\n",
+    );
+}
+
+#[test]
+fn a_temporary_in_a_branch_arm_drops_inside_that_arm() {
+    // Narrower than `temporary-drop.md` §7.3's stated refusal set on purpose:
+    // an arm lowers to a JS BLOCK with its own statement list, so a temporary
+    // there has a statement position of its own. Only `&&`/`||` evaluate an
+    // operand inline with no block to hold it.
+    let program = |taken: &str| {
+        format!(
+            r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res {{ tag: str }}
+        impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
+        impl Res {{ fun size(&self): i32 {{ 3 }} }}
+        fun make(tag: str): Res {{ Res {{ tag = tag }} }}
+        fun main() {{
+            if {taken} {{
+                print(make("t").size());
+            }}
+            print("join");
+        }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(&program("true"), "3\ndrop t\njoin\n");
+    assert_compiles_and_runs(&program("false"), "join\n");
+}
+
+#[test]
+fn a_temporary_in_a_tail_position_drops_after_the_value_is_computed() {
+    // P11's shape: the return value must exist before any teardown runs, which
+    // is what a `finally` around the `return` gives.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        impl Res { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Res { Res { tag = tag } }
+        fun measure(): i32 { make("t").size() }
+        fun main() {
+            print(measure());
+            print("after");
+        }
+        "#,
+        "drop t\n3\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_of_a_resource_with_no_destructor_is_not_lifted() {
+    // The byte-identity clause: a `resource` whose destruction is a complete
+    // no-op gets no `const`, no `try` and no `finally` — the same rule that
+    // keeps a bare `resource external` binding's scope free of them.
+    let js = compile(
+        r#"
+        resource struct Inert { tag: str }
+        impl Inert { fun size(&self): i32 { 3 } }
+        fun make(tag: str): Inert { Inert { tag = tag } }
+        fun main() { make("t").size(); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        !js.contains("finally"),
+        "a no-op destruction must not grow a teardown:\n{js}"
+    );
+}

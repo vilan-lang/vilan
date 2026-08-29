@@ -1741,6 +1741,11 @@ struct Transformer<'src> {
     // nothing. Collected here and turned into a hard compile error at assembly,
     // so the class cannot recur silently.
     unresolved_drop_sinks: Vec<Id>,
+    // C11 (`temporary-drop.md`): the resource temporaries lifted out of the
+    // statement currently being emitted, innermost last. Each records where its
+    // `const` landed in the statement list, so the emitter can close a
+    // `try`/`finally` around everything after it. Empty between statements.
+    pending_temporaries: Vec<PendingTemporary>,
     // Route-chunk partition (`bundle-splitting.md` S2): function id -> chunk
     // index, plus how many chunks there are. Empty for every build that did not
     // ask to split, which is what keeps single-file emission byte-identical —
@@ -1887,6 +1892,16 @@ enum TailDisposition {
     ResultOrDivergence(String),
 }
 
+/// One resource temporary lifted out of the statement being emitted
+/// (`temporary-drop.md` §7.1): the index of its minted `const` in that
+/// statement's node list, the name it was given, and the type whose destructor
+/// the closing `finally` calls.
+struct PendingTemporary {
+    at: usize,
+    name: String,
+    type_id: TypeId,
+}
+
 /// What a direct statement of a scope owes at the scope's end (destruction.md
 /// §7). Classified with `&self` so the (`&mut self`) emission can borrow freely.
 enum ScopeTeardown {
@@ -1958,6 +1973,7 @@ impl<'src> Transformer<'src> {
             bodyless_emissions: Vec::new(),
             bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
+            pending_temporaries: Vec::new(),
             chunk_members: HashMap::default(),
             chunk_count: 0,
             chunk_gate: None,
@@ -2458,15 +2474,88 @@ impl<'src> Transformer<'src> {
         block
     }
 
-    fn walk_entities(&mut self, ids: &[Id], mut block: &mut Vec<js::Node<'src>>) {
+    fn walk_entities(&mut self, ids: &[Id], block: &mut Vec<js::Node<'src>>) {
         for id in ids {
-            if let Some(node) = self.walk_entity(*id, &mut block) {
-                // A statement whose value is discarded and is `undefined` (e.g.
-                // the trailing void of a block used as a statement) is a no-op.
-                if matches!(node, js::Node::Void) {
-                    continue;
-                }
+            self.emit_statement(*id, block);
+        }
+    }
+
+    /// Emit one statement into `block`, then close the `finally` of every
+    /// resource temporary the statement lifted (C11) — the whole of what
+    /// "a temporary is owned by its statement" means, in one place.
+    ///
+    /// A statement that lifts nothing takes exactly the path it always did,
+    /// which is what keeps every resource-free program byte-identical.
+    fn emit_statement(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) {
+        let mark = self.pending_temporaries.len();
+        let base = block.len();
+        if let Some(node) = self.walk_entity(id, block) {
+            // A statement whose value is discarded and is `undefined` (e.g.
+            // the trailing void of a block used as a statement) is a no-op.
+            if !matches!(node, js::Node::Void) {
                 block.push(node);
+            }
+        }
+        self.close_temporaries(mark, base, block);
+    }
+
+    /// Give a resource temporary a name and remember where it landed.
+    ///
+    /// The `const` goes into the STATEMENT's node list rather than into the
+    /// expression, because a `finally` needs a statement to sit after — and it
+    /// goes there before the rest of the statement is emitted, so the value is
+    /// acquired outside the `try` it will be destroyed by (`destruction.md`
+    /// §7's mid-acquisition law, which a temporary obeys for the same reason a
+    /// `let` does). A type that destroys nothing is not lifted at all.
+    fn lift_resource_temporary(
+        &mut self,
+        type_id: TypeId,
+        node: js::Node<'src>,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if !self.type_drops_nontrivially(type_id) {
+            return node;
+        }
+        let name = self.ng.next_name();
+        block.push(js::Node::ConstVariable(js::Variable {
+            name: name.clone(),
+            value: Box::new(node),
+        }));
+        self.pending_temporaries.push(PendingTemporary {
+            at: block.len() - 1,
+            name: name.clone(),
+            type_id,
+        });
+        js::Node::Local(name)
+    }
+
+    /// Close every temporary lifted since `mark`, innermost first, by wrapping
+    /// everything after its `const` in a `try` whose `finally` destroys it.
+    ///
+    /// Popping in reverse is what gives §7.1's reverse construction order among
+    /// the temporaries of one statement, and it nests them correctly: the last
+    /// one born is the innermost `try` and the first one destroyed. Every exit
+    /// — a throw mid-statement included (P8) — leaves through the `finally`.
+    ///
+    /// An entry whose `const` did not land in THIS list belongs to an emitter
+    /// further out and is left for it.
+    fn close_temporaries(&mut self, mark: usize, base: usize, block: &mut Vec<js::Node<'src>>) {
+        if self.pending_temporaries.len() <= mark {
+            return;
+        }
+        self.hoist_declaration_out_of(mark, base, block);
+        while self.pending_temporaries.len() > mark {
+            let Some(pending) = self.pending_temporaries.pop() else {
+                return;
+            };
+            if pending.at < base || pending.at >= block.len() {
+                continue;
+            }
+            let tail = block.split_off(pending.at + 1);
+            let value = js::Node::Local(pending.name);
+            match self.resource_drop_of(pending.type_id, value) {
+                Some(drop) => block.push(js::Node::Try(tail, vec![drop])),
+                None => block.extend(tail),
             }
         }
     }
@@ -3146,6 +3235,16 @@ impl<'src> Transformer<'src> {
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
+        // C11 (`temporary-drop.md`): a resource value that is neither bound nor
+        // moved is owned by its STATEMENT. It has no name of its own, so it is
+        // given one here — a minted `const` at the statement's position — and
+        // the emitter closes a `finally` around the rest of the statement. This
+        // runs before the copy seams below on purpose: a resource never copies
+        // (R1), so it can take neither, and a lifted temporary must not be
+        // wrapped by them either.
+        if let Some(&type_id) = self.program.resource_temporaries.get(&id) {
+            return Some(self.lift_resource_temporary(type_id, node, block));
+        }
         // B108: the same seam for a leaf whose runtime representation is a
         // scalar `(base, key)` view — a `&mut i32` parameter forwarded straight
         // out, a scalar `borrows` call, a generic `&T` at a scalar
@@ -3726,6 +3825,7 @@ impl<'src> Transformer<'src> {
                         name: self.ng.name_for(*parameter_id),
                     })
                     .collect::<Vec<_>>();
+                let mark = self.pending_temporaries.len();
                 let mut body = self.parameter_entry_preludes(&closure.parameters);
                 // Tuple-parameter destructures run before the body proper.
                 let parameter_destructures = closure.parameter_destructures.clone();
@@ -3742,6 +3842,7 @@ impl<'src> Transformer<'src> {
                         body.push(js::Node::Return(Box::new(value)));
                     }
                 }
+                self.seal_pending_temporaries(mark, &mut body);
                 js::Node::Closure(js::Closure {
                     parameters,
                     body,
@@ -6319,6 +6420,13 @@ impl<'src> Transformer<'src> {
     ///    is done here rather than in [`Self::wrap_own_param_drops`] because by
     ///    the time that runs the statement boundaries are gone.
     fn walk_function_body(&mut self, function: &Function<'src>) -> Vec<js::Node<'src>> {
+        let mark = self.pending_temporaries.len();
+        let mut body = self.walk_function_body_nodes(function);
+        self.seal_pending_temporaries(mark, &mut body);
+        body
+    }
+
+    fn walk_function_body_nodes(&mut self, function: &Function<'src>) -> Vec<js::Node<'src>> {
         let statements = &function.body.0;
         let tail = function.body.1;
         if let Some(split) = self.own_param_split(function) {
@@ -7109,11 +7217,7 @@ impl<'src> Transformer<'src> {
             let teardown = self.statement_teardown(statement);
             if !matches!(teardown, ScopeTeardown::None) {
                 // Emit the declaration (outside its own `try`).
-                if let Some(node) = self.walk_entity(statement, &mut out) {
-                    if !matches!(node, js::Node::Void) {
-                        out.push(node);
-                    }
-                }
+                self.emit_statement(statement, &mut out);
                 let extent = self.teardown_extent(&teardown, statements, index, end);
                 let inner_tail = if extent == end { tail.take() } else { None };
                 // A binding nothing reads again drops right here, and an empty
@@ -7146,11 +7250,7 @@ impl<'src> Transformer<'src> {
                 index = extent;
                 continue;
             }
-            if let Some(node) = self.walk_entity(statement, &mut out) {
-                if !matches!(node, js::Node::Void) {
-                    out.push(node);
-                }
-            }
+            self.emit_statement(statement, &mut out);
             index += 1;
         }
         if let Some((tail, disposition)) = tail {
@@ -7295,6 +7395,7 @@ impl<'src> Transformer<'src> {
                 Some((tail, TailDisposition::Discard)),
             )
         } else {
+            let mark = self.pending_temporaries.len();
             let mut body = self.walk_list(statements);
             match self.program.entity_map.get(&tail) {
                 Some(Expr::Void) | None => {}
@@ -7306,6 +7407,7 @@ impl<'src> Transformer<'src> {
                     }
                 }
             }
+            self.seal_pending_temporaries(mark, &mut body);
             body
         }
     }
@@ -7342,6 +7444,7 @@ impl<'src> Transformer<'src> {
                 )
             }
         } else {
+            let mark = self.pending_temporaries.len();
             let mut body = self.walk_list(statements);
             if has_value {
                 let value = self.walk_entity(tail, &mut body);
@@ -7356,6 +7459,7 @@ impl<'src> Transformer<'src> {
                     self.push_result_or_divergence(&name, value, &mut body);
                 }
             }
+            self.seal_pending_temporaries(mark, &mut body);
             body
         }
     }
@@ -7369,18 +7473,35 @@ impl<'src> Transformer<'src> {
         disposition: TailDisposition,
         out: &mut Vec<js::Node<'src>>,
     ) {
+        // A temporary in TAIL position closes around the `return` / assignment
+        // the tail becomes, not before it: the value must be computed before any
+        // teardown runs (P11), which is exactly what `finally` gives.
+        let mark = self.pending_temporaries.len();
+        let base = out.len();
+        let emitted = self.emit_scope_tail_node(tail, disposition, out);
+        if emitted {
+            self.close_temporaries(mark, base, out);
+        }
+    }
+
+    fn emit_scope_tail_node(
+        &mut self,
+        tail: Id,
+        disposition: TailDisposition,
+        out: &mut Vec<js::Node<'src>>,
+    ) -> bool {
         let Some(node) = self.walk_entity(tail, out) else {
-            return;
+            return false;
         };
         if matches!(node, js::Node::Void) {
-            return;
+            return true;
         }
         // A tail that already leaves the scope (`ret` / `jump`) is emitted as the
         // statement it is under EVERY disposition — returning or assigning one
         // is B152's unparseable `return return 1;` / `t = return 1;`.
         if node.is_divergent() {
             out.push(node);
-            return;
+            return true;
         }
         match disposition {
             TailDisposition::Return => out.push(js::Node::Return(Box::new(node))),
@@ -7392,6 +7513,59 @@ impl<'src> Transformer<'src> {
             TailDisposition::ResultOrDivergence(name) => {
                 self.push_result_or_divergence(&name, node, out)
             }
+        }
+        true
+    }
+
+    /// The net under [`Self::close_temporaries`]: seal a freshly built BODY, so
+    /// a lifted `const` can never outlive the list it was declared in.
+    ///
+    /// Every statement list closes its own temporaries as it goes; this catches
+    /// the ones lifted out of a TAIL expression, where there is no next
+    /// statement to close them at. Sealing at the body's start gives the
+    /// longest correct region — the value is held until the body's own value
+    /// has been produced, which is what a tail-position temporary needs (P11)
+    /// and what the `finally` around a `return` already does.
+    fn seal_pending_temporaries(&mut self, mark: usize, body: &mut Vec<js::Node<'src>>) {
+        self.close_temporaries(mark, 0, body);
+    }
+
+    /// Split a statement's own declaration in two when a temporary's `try` is
+    /// about to close over it: `const n = f(t)` becomes `let n;` before the
+    /// region and `n = f(t)` inside it.
+    ///
+    /// Without this, `let size = File::open(p).stat().size` puts `size` inside
+    /// the block that destroys the handle and every later read of it is a
+    /// `ReferenceError`. The declaration goes to the START of the statement's
+    /// nodes — ahead of every lifted `const`, not just the innermost — so no
+    /// enclosing region can swallow it either; the pending indices shift with
+    /// it.
+    fn hoist_declaration_out_of(
+        &mut self,
+        mark: usize,
+        base: usize,
+        block: &mut Vec<js::Node<'src>>,
+    ) {
+        let (name, value) = match block.last() {
+            Some(js::Node::ConstVariable(variable) | js::Node::LetVariable(variable)) => {
+                (variable.name.clone(), variable.value.clone())
+            }
+            _ => return,
+        };
+        block.pop();
+        block.push(js::Node::Assignment(
+            Box::new(js::Node::Local(name.clone())),
+            value,
+        ));
+        block.insert(
+            base,
+            js::Node::LetVariable(js::Variable {
+                name,
+                value: Box::new(js::Node::Void),
+            }),
+        );
+        for pending in &mut self.pending_temporaries[mark..] {
+            pending.at += 1;
         }
     }
 
