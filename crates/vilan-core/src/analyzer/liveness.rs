@@ -770,10 +770,16 @@ impl Analyzer<'_> {
     /// loaned binding.
     ///
     /// A loan handed to a RESOLVED callee is call-bounded and needs no
-    /// refusal — §6.4's rule, whose declared-retention escape hatch is S4's
-    /// business. A loan handed to a callee this analysis cannot resolve
-    /// (dispatched, generic) is refused, because "call-bounded" is a claim
-    /// about a signature nobody has read.
+    /// refusal — §6.4's rule. A loan handed to a callee this analysis cannot
+    /// resolve (dispatched, generic) is refused, because "call-bounded" is a
+    /// claim about a signature nobody has read.
+    ///
+    /// **The retention contract** (§6.4, RULED 2026-08-28): an extern declared
+    /// `[extern(…, retains)]` KEEPS what it is handed, so the call bound does
+    /// not apply to it and every argument's root is refused outright — the
+    /// binding keeps its whole scope, which is the conservative envelope the
+    /// probes showed is needed. Under the call bound alone the host reads a
+    /// value the caller has already destroyed (`tag=["<FREED>"]`, reproduced).
     fn collect_unfollowable_loans(
         &self,
         view_origins: &HashMap<Id, Vec<Id>>,
@@ -809,6 +815,36 @@ impl Analyzer<'_> {
                     projected_anchors.insert(*subject_id);
                 }
                 _ => {}
+            }
+        }
+        for expr in self.expr_id_to_expr_map.values() {
+            let Expr::Call(call_id) = expr else {
+                continue;
+            };
+            let Some(function_call) = self.function_calls.get(call_id) else {
+                continue;
+            };
+            if !self.callee_retains(function_call.subject_id) {
+                continue;
+            }
+            for argument_id in &function_call.argument_ids {
+                // `&place` is the ordinary spelling at a loan position, so the
+                // reference is looked through to the place it names.
+                let place_id = match self.expr_id_to_expr_map.get(argument_id) {
+                    Some(Expr::Reference(operand_id, _)) => *operand_id,
+                    _ => *argument_id,
+                };
+                let roots = match self.expr_id_to_expr_map.get(&place_id) {
+                    Some(Expr::Local(binding_id)) => view_origins
+                        .get(binding_id)
+                        .cloned()
+                        .unwrap_or_else(|| vec![*binding_id]),
+                    _ => self
+                        .place_root(place_id)
+                        .map(|root| vec![root])
+                        .unwrap_or_default(),
+                };
+                opaque.extend(roots);
             }
         }
         for (expr_id, expr) in &self.expr_id_to_expr_map {

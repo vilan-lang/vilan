@@ -15,13 +15,13 @@ import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades 
 
 // --- Raw node:http bindings ---
 
-[extern("node:http", "createServer")]
+[extern("node:http", "createServer", retains)]
 external fun node_create_server(handler: |NodeRequest, NodeResponse| void): NodeServer;
 
 external struct NodeServer;
 
 impl NodeServer {
-	[extern(method)]
+	[extern(method, retains)]
 	external fun listen(self, port: i32, on_ready: || void);
 
 	/// The bound address, once listening — where a port-0 bind's ACTUAL port
@@ -32,13 +32,13 @@ impl NodeServer {
 
 	/// Subscribe to the server's `upgrade` event — a WebSocket handshake
 	/// arrives as `(request, raw socket, head)` instead of a normal request.
-	[extern(method, "on")]
+	[extern(method, "on", retains)]
 	external fun on_upgrade(self, event: str, handler: |NodeRequest, NodeSocket, Bytes| void);
 
 	/// Stop accepting new connections and close once existing ones end (node's
 	/// own `close([callback])`); `on_closed` fires once that has actually
 	/// happened — what `Server::stop` fires `on_stop` from (§9.1).
-	[extern(method, "close")]
+	[extern(method, "close", retains)]
 	external fun close(self, on_closed: || void);
 }
 
@@ -78,11 +78,11 @@ impl NodeSocket {
 	external fun write_bytes(self, data: Bytes);
 
 	/// Inbound chunks (`"data"` — node hands a Buffer, which IS a Uint8Array).
-	[extern(method, "on")]
+	[extern(method, "on", retains)]
 	external fun on_bytes(self, event: str, handler: |Bytes| void);
 
 	/// Lifecycle events with no payload (`"close"`, `"error"`).
-	[extern(method, "on")]
+	[extern(method, "on", retains)]
 	external fun on_signal(self, event: str, handler: || void);
 
 	[extern(method, "destroy")]
@@ -119,7 +119,7 @@ impl NodeResponse {
 
 	/// Subscribe to a response stream event (`"close"` fires when the connection
 	/// ends — for a never-`end`ed SSE response that means the client went away).
-	[extern(method, "on")]
+	[extern(method, "on", retains)]
 	external fun on_event(self, event: str, callback: || void);
 
 	/// End the response with a binary body (the host accepts a Uint8Array).

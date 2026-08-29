@@ -564,7 +564,7 @@ let chunk_pending_signal: Signal<bool> = Signal::new(false);
 let chunk_error_signal: Signal<Option<str>> = Signal::new(None);
 
 /// The route arm a value selects. See `swap_split`.
-[extern("__chunk_arm")]
+[extern("__chunk_arm", retains)]
 external fun chunk_arm<T>(value: T): i32;
 
 /// Whether `arm`'s code is already present — true for every arm of a build
@@ -575,7 +575,7 @@ external fun chunk_ready(arm: i32): bool;
 /// Fetches `arm`'s chunk and then calls `then` — or `failed` with the reason,
 /// which is also reported to the console. A failure is not remembered as in
 /// flight, so the next navigation to the arm refetches.
-[extern("__chunk_load")]
+[extern("__chunk_load", retains)]
 external fun chunk_load(arm: i32, then: || void, failed: |str| void): void;
 
 /// Starts `arm`'s chunk fetching without waiting for it. Failure is silent

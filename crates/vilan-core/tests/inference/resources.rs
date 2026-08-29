@@ -6832,3 +6832,92 @@ fn a_temporary_of_a_resource_with_no_destructor_is_not_lifted() {
         "a no-op destruction must not grow a teardown:\n{js}"
     );
 }
+
+// ============================================================================
+// S4 — the extern retention contract (`lifetimes.md` §6.4, RULED 2026-08-28)
+// ============================================================================
+//
+// The one place the probe battery showed last-use is WRONG: an `[extern]` that
+// stashes what it is handed and reads it after the call returns. The rule is
+// that an extern loan is CALL-BOUNDED unless the declaration says otherwise,
+// and `[extern(…, retains)]` is what says otherwise — it extends the argument's
+// liveness to the binding's whole scope, which is the conservative envelope and
+// also the teardown that shipped.
+//
+// The spelling settles as a trailing FLAG rather than a form word, so it
+// composes with every existing binding shape (`[extern(method, "…", retains)]`)
+// instead of needing an arm per combination; the formatter reprints it last.
+
+#[test]
+fn an_unmarked_extern_loan_is_call_bounded() {
+    // The rule's default half, and the red-first half of the pair: nothing in
+    // the declaration says the host keeps the value, so the binding is released
+    // at its last use like any other.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+
+        [extern("Boolean")]
+        external fun watch(r: &Res): bool;
+
+        fun main() {
+            let r = Res { tag = "r" };
+            print(watch(&r));
+            print("after");
+        }
+        "#,
+        "true\ndrop r\nafter\n",
+    );
+}
+
+#[test]
+fn a_retaining_extern_holds_its_argument_to_the_bindings_scope_end() {
+    // The same program with the contract declared. The host may read the value
+    // at any point after the call, so the compiler stops claiming to know when
+    // the last read was: the binding falls back to the scope-end teardown.
+    // Under the call bound alone this is where the probe battery read a freed
+    // value host-side (`tag=["<FREED>"]`).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+
+        [extern("Boolean", retains)]
+        external fun keep(r: &Res): bool;
+
+        fun main() {
+            let r = Res { tag = "r" };
+            print(keep(&r));
+            print("after");
+        }
+        "#,
+        "true\nafter\ndrop r\n",
+    );
+}
+
+#[test]
+fn a_retaining_extern_composes_with_every_binding_form() {
+    // The flag is not a form word: it rides alongside `method` / `get` / `set` /
+    // `new` and the plain symbol shapes alike, which is why it is stripped
+    // before the positional match rather than adding an arm per combination.
+    assert_compiles(
+        r#"
+        external struct Host;
+        impl Host {
+            [extern(method, "addEventListener", retains)]
+            external fun on(self, event: str, handler: || void): void;
+
+            [extern(set, "onmessage", retains)]
+            external fun set_on_message(self, handler: || void);
+        }
+        [extern("queueMicrotask", retains)]
+        external fun queue(callback: || void);
+        fun main() {}
+        "#,
+    );
+}

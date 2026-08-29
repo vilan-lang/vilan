@@ -53,7 +53,7 @@ enum FlushPolicy {
 // (recorded follow-on); the enum states intent and keeps the API stable.
 
 /// The host's microtask queue — the continuation-settling primitive.
-[extern("queueMicrotask")]
+[extern("queueMicrotask", retains)]
 external fun queue_microtask(callback: || void);
 
 struct Turn {

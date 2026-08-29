@@ -27,7 +27,7 @@ external fun history_push(state: str, title: str, path: str): void;
 external fun location_path(): str;
 
 /// `window.addEventListener` — the back/forward (`popstate`) subscription.
-[extern("window.addEventListener")]
+[extern("window.addEventListener", retains)]
 external fun window_listen(event: str, handler: || void): void;
 
 /// The path-signal singleton (the `std::reactive` module-state pattern) —

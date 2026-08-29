@@ -554,6 +554,13 @@ pub struct ExternalFunction<'src> {
     // The `[extern(..)]` host binding, if any — lowers calls to a JS
     // import/call, method, or property access.
     pub extern_binding: Option<ExternBinding<'src>>,
+    /// Declared `[extern(…, retains)]` (`lifetimes.md` §6.4, RULED
+    /// 2026-08-28): the host KEEPS what this hands it and may read it after
+    /// the call returns. An extern loan is CALL-BOUNDED unless a declaration
+    /// says otherwise, so every argument to one of these keeps its liveness to
+    /// the binding's whole scope — the conservative envelope, which is the
+    /// scope-end teardown that shipped.
+    pub retains: bool,
     // The projected parameter positions of the returned view (receiver =
     // position 0) — the `borrows` root-set. An extern has no body to infer from,
     // so this is exactly its declared `borrows <param>` clause resolved to a
@@ -9491,6 +9498,18 @@ impl<'src> Analyzer<'src> {
             Convention::Bare => parameter.name == "self",
             Convention::Own => false,
         }
+    }
+
+    /// Whether the call through `subject_id` reaches an extern declared
+    /// `[extern(…, retains)]` — the host keeps what it is handed
+    /// (`lifetimes.md` §6.4).
+    fn callee_retains(&self, subject_id: Id) -> bool {
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return false;
+        };
+        self.external_functions
+            .get(callee_id)
+            .is_some_and(|external| external.retains)
     }
 
     fn callee_conventions(&self, subject_id: Id) -> Option<Vec<Convention>> {
@@ -19231,6 +19250,7 @@ impl<'src> Analyzer<'src> {
                             parameters,
                             return_type_id,
                             extern_binding: function.extern_binding.clone(),
+                            retains: function.extern_retains,
                             borrows,
                             returns_mut_view: matches!(
                                 return_type_node.map(|spanned| &spanned.0),

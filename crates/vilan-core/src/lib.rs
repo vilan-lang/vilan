@@ -554,6 +554,7 @@ fn analyze_source_unfenced(
                     external: false,
                     deprecated: None,
                     extern_binding: None,
+                    extern_retains: false,
                     must_use: false,
                     platform_fence: Vec::new(),
                     rpc: false,

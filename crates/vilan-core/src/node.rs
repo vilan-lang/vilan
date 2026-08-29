@@ -87,6 +87,13 @@ pub struct Func<'src> {
     // method, or property access. `None` for a plain `external` (compiler
     // intrinsic) or an ordinary function.
     pub extern_binding: Option<ExternBinding<'src>>,
+    // Declared `[extern(…, retains)]` (`lifetimes.md` §6.4, RULED 2026-08-28):
+    // the host KEEPS what it is handed and may read it after the call returns.
+    // An extern loan is call-bounded unless this says otherwise, so an argument
+    // to a retaining extern keeps its liveness to the binding's whole scope —
+    // the conservative envelope. Meaningless (and inert) without an extern
+    // binding.
+    pub extern_retains: bool,
     // Declared `[must_use]`: dropping a call's result (a bare statement that
     // discards it) is a warning.
     pub must_use: bool,

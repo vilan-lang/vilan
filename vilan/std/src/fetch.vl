@@ -113,19 +113,19 @@ impl RequestInit {
 	[extern(set, "method")]
 	external fun set_method(self, value: str);
 
-	[extern(set, "body")]
+	[extern(set, "body", retains)]
 	external fun set_body(self, value: str);
 
 	/// A binary request body (the host accepts a Uint8Array directly).
-	[extern(set, "body")]
+	[extern(set, "body", retains)]
 	external fun set_body_bytes(self, value: Bytes);
 
-	[extern(set, "headers")]
+	[extern(set, "headers", retains)]
 	external fun set_headers(self, value: List<Header>);
 
 	/// The host abort signal (`{ signal }`): the request rejects with an
 	/// `AbortError` when it fires.
-	[extern(set, "signal")]
+	[extern(set, "signal", retains)]
 	external fun set_signal(self, value: CancelSignal);
 }
 

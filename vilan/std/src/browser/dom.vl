@@ -60,12 +60,12 @@ impl Element {
 	external fun set_style_property(self, name: str, value: str): void;
 
 	/// Appends `child` as the element's last child.
-	[extern(method, "appendChild")]
+	[extern(method, "appendChild", retains)]
 	external fun append(self, child: Element): void;
 
 	/// Appends a text node as the element's last child — the `Text` overload of
 	/// `append` (the same `appendChild` binding; the DOM takes any node).
-	[extern(method, "appendChild")]
+	[extern(method, "appendChild", retains)]
 	external fun append_text(self, child: Text): void;
 
 	/// Removes the element from the document (`element.remove()`).
@@ -90,14 +90,14 @@ impl Element {
 	external fun set_value(self, value: str): void;
 
 	/// Registers `handler` to run on `event` (e.g. `"click"`, `"input"`).
-	[extern(method, "addEventListener")]
+	[extern(method, "addEventListener", retains)]
 	external fun on(self, event: str, handler: || void): void;
 
 	/// Like `on`, but the handler receives the `Event` — for `prevent_default`,
 	/// modifier keys, and anything else on the event object. The same
 	/// `addEventListener` binding; the host always passes the event, `on` just
 	/// ignores it.
-	[extern(method, "addEventListener")]
+	[extern(method, "addEventListener", retains)]
 	external fun on_event(self, event: str, handler: |Event| void): void;
 }
 
