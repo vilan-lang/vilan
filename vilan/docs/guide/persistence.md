@@ -66,6 +66,111 @@ Two habits to keep:
 The API is synchronous, which fits rpc handlers (the dispatch path is
 synchronous too), and there is no connection pool to manage.
 
+### Migrations: carrying a schema forward
+
+`CREATE TABLE IF NOT EXISTS` is a schema **ensure**, and it is right
+exactly until the first schema **change**. Add a `description` column to
+`task` and the clause does nothing at all — the table exists, so the
+statement is a no-op, and the deployed database keeps the old shape while
+the code querying it has the new one. Deleting the file is not a
+deployment strategy.
+
+`db.migrate(migrations)` is the spelling for "carry this database
+forward". You give it named steps in order; it applies the ones this
+database has not seen and records them in a `vilan_migrations` table it
+owns. Call it at boot, unconditionally, before the first query:
+
+```vilan,norun
+import std::print;
+import std::db::{ Database, Migration };
+
+fun main() {
+	let db = Database::open("app.db");
+	let applied = db.migrate([
+		Migration {
+			name = "001-create-task",
+			sql = "CREATE TABLE task (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
+		},
+		Migration {
+			name = "002-task-description",
+			sql = "ALTER TABLE task ADD COLUMN description TEXT",
+		},
+	]);
+	print(i"applied {applied.len()} migrations");
+}
+```
+
+The first boot applies both and prints `applied 2 migrations`. Every boot
+after that applies nothing and prints `applied 0`. Append a third step and
+only the third one runs.
+
+**A step is recorded if and only if its SQL committed.** Each step runs
+in its own transaction *with* its record insert, so there is no window
+where the schema moved and the record did not. A process killed
+mid-migration leaves a database whose recorded set exactly describes its
+schema, and the next boot resumes from there.
+
+Three things stop the boot loudly, all of them before a single statement
+is applied — so a database `migrate` refuses is a database it did not
+touch:
+
+- **A step fails.** The message names the step and quotes SQLite's own
+  diagnosis (`migration '003-add-index' failed and was not applied: no
+  such table: taks`). Nothing is recorded for it. Fix the SQL, boot
+  again, and it resumes exactly there — the steps before it stay applied.
+- **The database is ahead of the code** — it records a step your list
+  does not contain. That is a rolled-back deploy: an older binary, whose
+  queries predate a schema change, about to run against a database that
+  already has it.
+- **A step was inserted into the past** — an unapplied step sits before
+  one that is already applied. That is two branches merged, and applying
+  it out of order would produce a schema no fresh database can reproduce.
+
+Rules for writing a step:
+
+- **The name is forever.** It is the row's key in `vilan_migrations`.
+  Renaming an applied step makes the database look like it is ahead of
+  the code; editing an applied step's SQL does nothing at all, because
+  it will never run again. To change a shipped migration, write a new one.
+- **Never manage transactions inside a step.** `migrate` supplies the
+  transaction. A step containing its own `COMMIT` commits that one out
+  from under it — the schema change lands permanently while its record is
+  still unwritten, which is the one way to break the invariant above.
+  For the same reason a step cannot use a statement SQLite refuses in a
+  transaction (`VACUUM`, `PRAGMA journal_mode`).
+- A step's SQL may hold as many statements as you like, separated by `;`.
+- Names must be unique, but they need not sort in order — the *list's*
+  order is what `migrate` applies. `001-slug` prefixes are a convention
+  worth keeping anyway, for the reason below.
+
+Vilan has no down-migrations. The recovery for a bad migration is a new
+migration that undoes it, which is what production uses in practice.
+
+#### Carrying the SQL into `dist/`
+
+Inline strings are fine for two steps and unpleasant for twenty. Keep the
+real SQL in files and pull them through the **const channel**, so the
+deployed app is still `dist/` and nothing else:
+
+```vilan,fragment
+// migrations/001-create-task.sql, 002-task-description.sql, ...
+db.migrate([
+	Migration { name = "001-create-task", sql = const asset::read("migrations/001-create-task.sql") },
+	Migration { name = "002-task-description", sql = const asset::read("migrations/002-task-description.sql") },
+]);
+```
+
+`asset::read` runs at compile time, so each file's *text* is compiled
+into the bundle. There is no runtime path to get wrong on the deployment
+machine, and every migration edit is a tracked build input — change a
+`.sql` file and the compile that read it is invalidated.
+
+The intended idiom, once the const `read_dir` recipe lands, is to write
+that loop once: list `migrations/`, sort by name, and turn each entry
+into a `Migration` named after its file. That is what makes the
+`NNN-slug.sql` convention pay — a name-sorted listing *is* the migration
+order.
+
 ## Serving http: `std::http`
 
 Every server in vilan is a `Server::builder()` chain — a port, a handler,

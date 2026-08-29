@@ -9,7 +9,10 @@
 // sites.
 
 import pkg::drop::Drop;
+import pkg::io::panic;
 import pkg::option::Option::{ None, Some, self };
+import pkg::set::Set;
+import pkg::time::now;
 
 /// An open database handle (`node:sqlite`'s DatabaseSync — synchronous, the
 /// right shape for a single-threaded server loop over local storage). A
@@ -122,5 +125,224 @@ impl Row {
 
 	fun is_null(self, name: str): bool {
 		column_is_null(self, name)
+	}
+}
+
+// --- Migrations (db-migrations.md, kolt.local 036) ----------------------------
+//
+// `CREATE TABLE IF NOT EXISTS` is an idempotent schema ENSURE, and it is right
+// exactly until the first schema CHANGE: add a column and the clause is a
+// no-op, so the running database keeps the old shape while the code querying
+// it has the new one. `migrate` is the spelling for "carry this database
+// forward" — an ordered list of named steps, the applied ones recorded in a
+// table this module owns.
+
+/// One migration step: a `name` that identifies it forever, and the `sql` that
+/// applies it. The name is the row's key in the applied table, so it must be
+/// unique within a list and must never change once a database has recorded it;
+/// the SQL is not stored, only the fact that it ran.
+///
+/// The SQL may hold any number of statements, but it must NOT contain `BEGIN`,
+/// `COMMIT` or `ROLLBACK`, nor a statement SQLite refuses inside a transaction
+/// (`VACUUM`, `PRAGMA journal_mode`): `migrate` wraps each step in its own
+/// transaction, and a step that commits itself commits that one under it —
+/// landing the schema change permanently while its record is still unwritten,
+/// which is the one way to break the invariant below. This is a documented
+/// requirement rather than a check because scanning SQL for those words is not
+/// parsing SQL: a comment, a string literal or a `commit_sha` column would all
+/// be refused wrongly, and a line break evades the scan anyway
+/// (`db-migrations.md` §5.5).
+struct Migration {
+	name: str,
+	sql: str,
+}
+
+/// `database.exec(sql)` / `statement.run(parameters)` with the host throw
+/// CAUGHT: `None` on success, `Some(message)` carrying the host's own
+/// diagnosis on failure. `vilan` has no `try`/`catch`, so the catch is glue
+/// (`__db_exec_guarded` / `__db_run_guarded`, `transformer.rs`) in the same
+/// "`Option` array form" `Database.first` and `std::fs::stat` already use at
+/// this boundary.
+///
+/// Deliberately not public surface: whether `std::db` should offer a
+/// `Result`-returning `try_exec` is a question about the module's error posture
+/// — everything else in it throws — and it wants its own answer rather than
+/// arriving as a side effect of migrations (`db-migrations.md` §6).
+[extern("__db_exec_guarded")]
+external fun exec_guarded(database: Database, sql: str): Option<str>;
+
+[extern("__db_run_guarded")]
+external fun run_guarded(statement: Statement, parameters: List<any>): Option<str>;
+
+impl Database {
+	/// Applies `migrations` in LIST ORDER, recording each in the
+	/// `vilan_migrations` table this module owns, and returns the names it
+	/// applied. A re-run applies nothing and returns an empty list — call it at
+	/// boot, unconditionally, before the first query.
+	///
+	/// Each step runs inside its own transaction WITH its record insert, which
+	/// buys the invariant everything else rests on: **a step is recorded if and
+	/// only if its SQL committed.** There is no window in which the schema
+	/// moved and the record did not. A process killed mid-migration leaves a
+	/// database whose recorded set exactly describes its schema, and the next
+	/// boot resumes from there. The transaction is per STEP and not per run: a
+	/// failure in the fifth step leaves the first four applied and recorded, so
+	/// fixing the SQL and re-running resumes at the failure instead of
+	/// re-running a prefix that may not be re-runnable (a `DROP`, a backfill
+	/// that would double).
+	///
+	/// Three conditions stop the boot LOUDLY, all of them before a single
+	/// statement is applied, so a database this refuses is a database it did
+	/// not touch:
+	///
+	/// - a step FAILS — the step is named alongside the host's message, its
+	///   transaction is rolled back, and nothing is recorded for it;
+	/// - a recorded step is absent from `migrations` — the database was
+	///   migrated by a build newer than this one (a rolled-back deploy running
+	///   its old queries against the new schema);
+	/// - an unapplied step is ordered before an applied one — a step was
+	///   inserted into the past (two branches merged), and applying it would
+	///   produce a schema no fresh database can reproduce.
+	///
+	/// How the list is COLLECTED is the const channel's business: `asset::read`
+	/// compiles each `.sql` file's text into the bundle, so the deployed app is
+	/// still `dist/` and every migration edit is a tracked build input.
+	fun migrate(self, migrations: List<Migration>): List<str> {
+		let names = migration_names(migrations);
+		self.exec("CREATE TABLE IF NOT EXISTS vilan_migrations (name TEXT PRIMARY KEY NOT NULL, applied_at_ms INTEGER NOT NULL)");
+		let recorded = self.recorded_migrations();
+		refuse_database_ahead(names, recorded, migrations.len());
+		refuse_inserted_migration(migrations, recorded);
+
+		mut applied: List<str> = [];
+		for step in migrations {
+			if !recorded.contains(step.name) {
+				self.apply_migration(step);
+				applied.push(step.name);
+			}
+		}
+		applied
+	}
+
+	/// The set of step names `vilan_migrations` records. A SET, not a list: the
+	/// table stores WHICH steps ran, and every ordering question is answered
+	/// against the list the caller passed (`db-migrations.md` §4).
+	fun recorded_migrations(self): Set<str> {
+		mut recorded: Set<str> = Set::new();
+		for row in self.prepare("SELECT name FROM vilan_migrations").all([]) {
+			recorded.insert(row.text("name"));
+		}
+		recorded
+	}
+
+	/// One step, in one transaction, with its record insert inside it. Every
+	/// host call is guarded so the failure can name the step; the ROLLBACK's
+	/// own failure is IGNORED, because SQLite aborts the transaction itself for
+	/// a handful of error classes (`SQLITE_FULL`, `SQLITE_IOERR`,
+	/// `SQLITE_BUSY`, `SQLITE_NOMEM`) and then reports "cannot rollback - no
+	/// transaction is active" — a message that means the rollback already
+	/// happened, and that would otherwise replace the real diagnosis.
+	fun apply_migration(self, step: Migration) {
+		match exec_guarded(self, "BEGIN") {
+			Some(let message) => panic(i"std::db migrate: could not begin a transaction for migration '{step.name}': {message}"),
+			None => {},
+		}
+		match exec_guarded(self, step.sql) {
+			Some(let message) => {
+				self.rollback_migration();
+				panic(i"std::db migrate: migration '{step.name}' failed and was not applied: {message}");
+			},
+			None => {},
+		}
+		// Sampled per step, inside the transaction: a step that never finishes
+		// records when it started applying, which is the more useful of the two
+		// readings for a stalled boot's table.
+		let recorder = self.prepare("INSERT INTO vilan_migrations (name, applied_at_ms) VALUES (?, ?)");
+		match run_guarded(recorder, [step.name, now().millis]) {
+			Some(let message) => {
+				self.rollback_migration();
+				panic(i"std::db migrate: migration '{step.name}' applied but could not be recorded: {message}");
+			},
+			None => {},
+		}
+		match exec_guarded(self, "COMMIT") {
+			Some(let message) => {
+				self.rollback_migration();
+				panic(i"std::db migrate: migration '{step.name}' could not be committed: {message}");
+			},
+			None => {},
+		}
+	}
+
+	/// Undoes the in-flight step's transaction, ignoring its own failure (see
+	/// `apply_migration`).
+	fun rollback_migration(self) {
+		let _ = exec_guarded(self, "ROLLBACK");
+	}
+}
+
+/// The list's names as a set, refusing an empty or a duplicate one first. This
+/// is a check on the ARGUMENT: it runs before the database is read, let alone
+/// written to. A name is a step's identity — an empty one names nothing, and
+/// two steps sharing one map to a single record, which would make "recorded if
+/// and only if applied" unstatable.
+fun migration_names(migrations: List<Migration>): Set<str> {
+	mut names: Set<str> = Set::new();
+	mut index = 0;
+	for index < migrations.len() {
+		let step = migrations[index];
+		if step.name == "" {
+			panic(i"std::db migrate: the migration at index {index} has an empty name — a name is a migration's identity in the applied table");
+		}
+		if names.contains(step.name) {
+			panic(i"std::db migrate: two migrations are named '{step.name}' — a migration's name must be unique within the list");
+		}
+		names.insert(step.name);
+		index += 1;
+	}
+	names
+}
+
+/// Drift (a): the database is AHEAD of the code. Every recorded step must
+/// still be in the list; one that is not means this database was migrated by a
+/// build that contains a step this one does not — the rolled-back deploy, whose
+/// queries predate a schema change the file already has. Also the "someone
+/// deleted a migration" case. Either way history disagrees, and the only safe
+/// move is to stop before touching anything.
+fun refuse_database_ahead(names: Set<str>, recorded: Set<str>, count: i32) {
+	for recorded_name in recorded.values() {
+		if !names.contains(recorded_name) {
+			panic(i"std::db migrate: the database has migration '{recorded_name}' applied, but it is not among the {count} migrations given — this database was migrated by a newer build");
+		}
+	}
+}
+
+/// Drift (b): a step was inserted INTO THE PAST. Find the last step in the list
+/// that is already applied; every step before it must be applied too. One that
+/// is not was added behind history — two branches merged, and the merge ordered
+/// a new step before one the shared database has already run. Applying it out
+/// of order would produce a schema no single ordering of this list reproduces,
+/// which is to say a schema no fresh database will ever have.
+///
+/// This is also why the surface does NOT require ascending names: on a database
+/// with history this refusal catches every misordering such a rule would, and
+/// on a fresh database any list order is self-consistent — it IS the history.
+fun refuse_inserted_migration(migrations: List<Migration>, recorded: Set<str>) {
+	mut last_applied = -1;
+	mut index = 0;
+	for index < migrations.len() {
+		if recorded.contains(migrations[index].name) {
+			last_applied = index;
+		}
+		index += 1;
+	}
+	mut earlier = 0;
+	for earlier < last_applied {
+		let pending = migrations[earlier].name;
+		if !recorded.contains(pending) {
+			let applied = migrations[last_applied].name;
+			panic(i"std::db migrate: migration '{pending}' is not applied, but '{applied}' after it in the list is — a migration was inserted before the applied history");
+		}
+		earlier += 1;
 	}
 }
