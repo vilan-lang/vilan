@@ -7863,10 +7863,10 @@ impl<'src> Analyzer<'src> {
                 trace: Vec::new(),
                 note: None,
                 span,
-                msg: "this resource would be created only on some paths — the right of \
-                      `&&`/`||` is evaluated conditionally, so there is no statement \
-                      that can destroy it; bind it first (`let handle = ...`) and use \
-                      the binding here"
+                msg: "this resource would be created only on some paths: the right of \
+                      `&&`/`||` is evaluated conditionally, so no statement owns it \
+                      and nothing can destroy it. Bind it first (`let handle = ...`) \
+                      and use the binding here"
                     .to_string(),
             });
         }
