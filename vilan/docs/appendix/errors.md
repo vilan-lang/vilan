@@ -319,6 +319,26 @@ through a sync-looking function that reaches something async.
 with `let`; assigning through it (`v = …`) already writes the target.
 → [The memory model](../tour/memory-model.md)
 
+**"a closure cannot capture the view '…': a view is second-class and the closure may outlive the place it views. …"**
+A closure body named a view binding (`let v = &mut x`, a `for e in &mut
+list` item, or the result of a view-returning call) declared outside it.
+A closure captures the *binding*, and nothing says when the closure runs,
+so the capture would outlive the place. The two fixes are the two ways it
+stops being a capture: read the value out first (`let n = *v;`, then
+capture `n`), or take the view as a **parameter** of the closure
+(`|v: &mut i32| *v`), which is a per-call loan. A `&`/`&mut` parameter of
+the *enclosing function* may be named inside a closure — it views the
+caller's place — but that closure may not then escape. An async closure
+gets the sharper message below instead.
+→ [Functions and closures](../tour/functions-and-closures.md), [spec §6.9](../spec/memory.md)
+
+**"an async closure cannot capture the view '…': the capture would be held across the closure's suspension points. …"**
+The rule above, at a closure that suspends: on top of outliving the
+place, the capture would be live across an `await`, where any turn may
+invalidate it. Re-acquire the view inside the closure after the
+suspension, or pass a value or a `Shared`/`Handle` in.
+→ [The memory model](../tour/memory-model.md), [Async](../tour/async.md)
+
 ## Resources
 
 A `resource` type has a single owner and moves rather than copies; a
