@@ -327,12 +327,13 @@ containment (`Option<Database>` is a resource, `Option<i32>` is not). A
 resource *moves* on binding (`let b = a`), on `own`-passing, on return, and
 into a constructor; it is *loaned* (no ownership change) through `self`,
 `&`, and `&mut`. The `Drop` destructor trait and its restrictions are below.
-At each scope end the compiler runs the destructor on the still-owned resource
-locals, in reverse declaration order. Destruction goes through
-`try`/`finally`, so `ret`, `jump`, and a thrown panic all run it on the way
-out; a resource without a `Drop` impl still has its fields destroyed. A
-module-level resource lives for
-the process and never drops. A drop that panics while a panic is already
+After a resource's last use the compiler runs its destructor; resources
+whose last use is the same statement discharge in reverse declaration
+order. Destruction goes through `try`/`finally`, so `ret`, `jump`, and a
+thrown panic all run it on the way out; a resource without a `Drop` impl
+still has its fields destroyed. A resource built inside one expression and
+never bound is owned by its statement and destroyed at that statement's
+end. A module-level resource lives for the process and never drops. A drop that panics while a panic is already
 unwinding replaces the in-flight error (JS `finally` semantics). The tutorial
 is [Resources](../tour/resources.md); the normative rules are spec
 [§6.8](../spec/memory.md).
@@ -371,8 +372,8 @@ serve-forever server's `Database`). Consuming it (moving it into a local,
 passing it to an `own` parameter, or `drop(x)`) would hand a
 process-lifetime resource to a droppable owner and close the shared handle
 out from under the rest of the program. Reach it by loan only: method calls,
-`&x`, `&mut x`. To own a database that closes at a scope's end, open it in a
-local instead.
+`&x`, `&mut x`. To own a database that closes after its last use, open it
+in a local instead.
 → [Resources](../tour/resources.md)
 
 **"a closure cannot capture the resource `…`; …"**

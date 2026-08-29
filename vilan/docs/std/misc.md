@@ -40,7 +40,7 @@ impl OwnedNursery {
 	fun enter<T>(&self, body: (|| T) context ambient_nursery): T  // spawns inside → owned
 	fun cancel(&self)                                             // early, idempotent
 }
-// `impl OwnedNursery with Drop` cancels the owned nursery at scope end.
+// `impl OwnedNursery with Drop` cancels the owned nursery after its last use.
 
 fun ambient_signal(): Option<CancelSignal>   // the enclosing nursery's, if any
 ```
@@ -70,7 +70,7 @@ deterministically. `new()` makes a detached owner; `enter(body)` runs
 `body` with the owner's nursery ambient, so every task spawned inside
 registers with it. Unlike `nursery`, `enter` does NOT join: it
 returns as soon as the body settles, leaving the tasks running.
-Dropping the owner (at scope end, or `drop(owner)`) cancels them, so
+Dropping the owner (after its last use, or `drop(owner)`) cancels them, so
 in-flight bridged IO aborts. Because the owner's nursery is never joined
 it runs **detached**: a child's REAL failure reports to the console with
 its spawn origin (as a free-floating task would) instead of being

@@ -141,7 +141,7 @@ types, `List`, `void`. Everything else is imported explicitly.
 [Spec §4](../spec/names.md).
 
 <a id="resource"></a>**resource**: a value with a single owner that *moves* instead of copying
-and is destroyed deterministically at scope end (a `Database`, an
+and is destroyed deterministically after its last use (a `Database`, an
 `OwnedNursery`). [Resources](../tour/resources.md).
 
 <a id="safe-integer"></a>**safe integer**: an integer JavaScript's 64-bit floats represent

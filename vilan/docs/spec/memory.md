@@ -663,19 +663,46 @@ resource mechanism).
 
 ### Drop timing and order
 
-At the owner's scope end, still-owned resource locals drop in **reverse
-declaration order** — a pattern capture (R6) counts as a local of the arm
-that bound it, declared before that arm's own statements and so destroyed
-after them. A value's own `drop` body runs **before its fields**,
-and the fields drop in reverse field order; an enum's payload drops with the
-value. **Every exit runs drops**: fall-through, `ret`, `jump break`, `jump
-continue` (out of the scopes they leave), and panic unwinding, because a
-resource-owning scope lowers to a `try`/`finally` and every exit flows
-through the `finally`. Concrete `own` resource *parameters* drop at scope
-end like locals (a generic `own T` is required to move out instead, per
-R11) — and the same split holds for pattern captures: a concrete one drops
-at its arm's end, while inside a generic body no `T`-typed capture may be
-left owning at all.
+*(amended 2026-08-28 — disposal moved from scope end to last use;
+`proposal/lifetimes.md` §6. The previous law read "at the owner's scope
+end, still-owned resource locals drop in reverse declaration order".)*
+
+A still-owned resource is destroyed **after its last use** — the last
+statement of its declaring scope that reads it — and **simultaneous
+discharges run in reverse declaration order**, so two resources last read
+in the same statement are destroyed second-declared-first, as they always
+were. A pattern capture (R6) counts as a local of the arm that bound it,
+declared before that arm's own statements. A value's own `drop` body runs
+**before its fields**, and the fields drop in reverse field order; an
+enum's payload drops with the value. **Every exit runs drops**:
+fall-through, `ret`, `jump break`, `jump continue` (out of the scopes they
+leave), and panic unwinding, because the region between an acquisition and
+its last use lowers to a `try`/`finally` and every exit flows through the
+`finally`. Concrete `own` resource *parameters* drop at their last use like
+locals (a generic `own T` is required to move out instead, per R11) — and
+the same split holds for pattern captures: a concrete one drops at its
+last use, while inside a generic body no `T`-typed capture may be left
+owning at all.
+
+Three clauses make "its last use" total:
+
+- **Nothing reads it ⇒ it drops at its declaration.** A handle the program
+  never names again is released immediately, not at a scope end that a
+  `main` which never returns would never reach. Binding a value is how the
+  language says *keep this*; reading it is how it says *still*.
+- **A loan extends its owner.** A view keeps the storage it names alive to
+  the view's OWN last use, so an owner is never destroyed under a live
+  projection. `let v = &mut holder; use(v)` holds `holder` to `use(v)`,
+  even though `holder`'s own last read was the `&mut`.
+- **A last use inside a branch or a loop is the branch's or the loop's.**
+  The drop lands at the join, which every path reaches, so the arm that
+  read the resource and the arm that did not both release exactly once —
+  and no runtime flag decides which (R7's doctrine, intact).
+
+Where the compiler cannot stand behind an answer — a binding read from
+more than one region, a loan it cannot follow to its end — the resource
+keeps the **scope-end** teardown, which is the previous law. The fallback
+is never a guess.
 
 - **A loan takes no teardown.** Only an owner destroys. A view *binding* of a
   resource (`let v = &mut holder`) names storage another binding still owns,
@@ -696,8 +723,63 @@ left owning at all.
   about *loans*, not ownership. Under cancellation a bridged operation
   rejects, the frame unwinds, and drops run.
 - **Exit after finally.** When a value-returning `main` owns a resource, its
-  process exit is sequenced *after* the teardown `finally` runs, so scope-end
-  drops are never skipped by process termination.
+  process exit is sequenced *after* the teardown `finally` runs, so drops are
+  never skipped by process termination.
+
+### Temporaries
+
+*(added 2026-08-28 — `proposal/temporary-drop.md`, backlog C11. A resource
+born and consumed inside one expression was previously neither destroyed nor
+rejected.)*
+
+A resource-typed value that is neither bound nor moved is an **owning
+temporary**: it is owned by the statement in which it is constructed, and
+destroyed at that statement's end, before any enclosing scope's drops and in
+reverse construction order among the temporaries of that statement. This is
+the same law read at its narrowest — a temporary's last use *is* its
+statement.
+
+```vilan,fragment
+print(File::open(path).stat().size);   // the handle closes here
+let held = File::open(path);           // this one lives to ITS last use
+print(held.stat().size);
+```
+
+A resource that is bound (`let f = …`) or moved (into an `own` parameter,
+into `drop`, into `ret`, into an aggregate) is not a temporary and is
+unaffected. `try`/`finally` is emitted per resource-owning scope **or
+statement**; only scopes and statements that own resources pay.
+
+**R7, extended to temporaries.** A resource temporary must be constructed on
+every path through its drop region or on none. A resource constructor on a
+conditionally-evaluated operand — the right of `&&` or `||` — is rejected:
+there is no statement that can destroy it, and the alternative would be v1's
+first runtime drop flag. This refuses a *spelling*, never a program; the fix
+is a `let`, and the diagnostic names it. A branch arm needs no such refusal:
+an arm is a scope with statements of its own, so a temporary there has a
+statement to belong to.
+
+### Externs and retention
+
+*(added 2026-08-28 — `proposal/lifetimes.md` §6.4.)*
+
+An `[extern]` receives loans under the same conventions any function does
+(R3), and those loans are **call-bounded**: the compiler assumes the host
+reads what it is handed only until the call returns, which is what lets the
+caller's binding be destroyed at its last use. A host that *keeps* what it
+is handed — an event listener, a stashed value, a request body — breaks that
+assumption, so the declaration must say so:
+
+```vilan,fragment
+[extern(method, "addEventListener", retains)]
+external fun on(self, event: str, handler: || void): void;
+```
+
+`retains` is a trailing flag on the `[extern(..)]` attribute, and it
+composes with every binding form. An argument to a retaining extern keeps
+its liveness for the whole of its binding's scope — the conservative
+envelope. Module-level bindings are exempt by construction: they never drop
+at all.
 
 ### `Option.take` and `Option.replace`
 
