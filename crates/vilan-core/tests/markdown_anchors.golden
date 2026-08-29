@@ -227,6 +227,7 @@ spec/memory.md h3 early-teardown--drop
 spec/memory.md h3 ownednursery
 spec/memory.md h3 services-and-resources
 spec/memory.md h3 honesty-limits
+spec/memory.md h2 69-closures-capture-bindings
 spec/names.md h1 spec-4--names-modules-and-packages
 spec/names.md h2 41-modules
 spec/names.md h2 42-the-three-namespaces

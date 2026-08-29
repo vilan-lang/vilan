@@ -721,6 +721,16 @@ fn async_view_capture_message(name: &str) -> String {
     )
 }
 
+/// C12's closure-capture diagnostic (`lifetimes.md` §4, spec §6.9): rule 3's
+/// ban on capturing a view BINDING, enforced. The two fixes are the two ways
+/// the capture stops being one — take the value out of the view before the
+/// closure, or hand the view in per call as a parameter.
+fn view_capture_message(name: &str) -> String {
+    format!(
+        "a closure cannot capture the view '{name}': a view is second-class and the closure may outlive the place it views. Read the value out with '*' before the closure, or take the view as a closure parameter."
+    )
+}
+
 /// The precomputed resource sets the affine move scan matches against
 /// (destruction.md §4, R1–R9): the resource-typed binding entities (variables
 /// and parameters), and the resource-typed *place* expressions (a `Field` /
@@ -14768,7 +14778,11 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a closure body references a `&` / `&mut` parameter — necessarily
     /// one captured from an enclosing function, since closure parameters are
-    /// always bare. (Capturing an outer view *binding* is deferred.)
+    /// always bare. That capture stays legal (the parameter views the CALLER's
+    /// place, which outlives the call); making the closure second-class is the
+    /// whole of its policing. An outer view *BINDING* is a different matter and
+    /// no longer reaches here at all: `check_closure_view_capture_ban` refuses
+    /// it at the capture (C12), so nothing is left for the escape rule to catch.
     fn closure_captures_view_param(&self, closure_id: Id) -> bool {
         let Some(closure) = self.closures.get(&closure_id) else {
             return false;
@@ -15624,7 +15638,7 @@ impl<'src> Analyzer<'src> {
             Self::record_pending_crossings(&mut pending, &view_origins, state);
         }
         self.view_suspension_checks = pending;
-        self.check_async_closure_captures(&view_bindings);
+        self.check_closure_view_capture_ban(&view_bindings);
         for violation in violations {
             let (anchor, msg) = match violation {
                 InvalidationViolation::Reassignment { anchor, root } => {
@@ -15700,12 +15714,27 @@ impl<'src> Analyzer<'src> {
             }));
     }
 
-    /// E3's closure half: an `async { .. }` (or any closure whose body
-    /// suspends) may not CAPTURE a view from an enclosing scope — the capture
-    /// is live across the closure's awaits. Views declared inside the closure
-    /// are the body scan's business; nested closures are walked too (a sync
-    /// closure inside the async one still holds the capture at its awaits).
-    fn check_async_closure_captures(&mut self, view_bindings: &HashSet<Id>) {
+    /// Rule 3's capture ban, enforced (C12, `lifetimes.md` §4 → spec §6.9): a
+    /// closure may not CAPTURE a view binding from an enclosing scope. The
+    /// binding is a local of a frame the closure can outlive, so the capture
+    /// escapes the surveyable interval §6.0 needs — memory-safe on the JS
+    /// backend only because the host boxes the place and traces it, and a
+    /// use-after-free on any backend that does not. Views declared inside the
+    /// closure are the body scan's business; nested closures are walked too.
+    ///
+    /// The scope is exactly the deferral this closes: `view_bindings` holds
+    /// view *locals* (`compute_view_bindings` ∪ `compute_view_origins`'s keys),
+    /// never parameters. A closure naming an enclosing `&`/`&mut` PARAMETER
+    /// (`|| self.items.push(x)` inside a `&mut self` method) stays legal — the
+    /// parameter views the CALLER's place, which outlives the call — and is
+    /// policed by P4c instead: `check_view_escape` makes such a closure
+    /// second-class, so it cannot be returned or stored.
+    ///
+    /// E3's async half keeps its own, sharper text where the closure suspends:
+    /// the token settles it here, and B119's call-graph answer settles the rest
+    /// in the post-pass, which now emits one message or the other rather than
+    /// dropping the capture when the body turns out not to suspend.
+    fn check_closure_view_capture_ban(&mut self, view_bindings: &HashSet<Id>) {
         // S1: the capture diagnostic anchors inside the closure's own body.
         let closure_ids: Vec<Id> = self
             .closures
@@ -15744,9 +15773,12 @@ impl<'src> Analyzer<'src> {
                     .get(binding_id)
                     .map(|v| v.name)
                     .unwrap_or("the view");
-                // The token settles it here; without one the closure may still
-                // suspend by calling something that does (B119) — a candidate
-                // `check_view_suspensions` decides against the call graph.
+                // The capture is refused either way; what the `await` token
+                // decides is the TEXT. With one, E3's async message is settled
+                // here. Without one the closure may still suspend by calling
+                // something that does (B119), so the choice waits for the call
+                // graph — `check_view_suspensions` picks the async text or the
+                // plain capture ban and emits one of them.
                 if saw_await {
                     errors.push((reference_id, name));
                 } else {
@@ -38523,16 +38555,21 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
             *parameter_id,
         ));
     }
+    // A captured view is refused either way (C12): the call graph only decides
+    // WHICH message it earns — E3's sharper async text when the closure turns
+    // out to suspend, rule 3's plain capture ban when it does not.
     for (closure_id, reference_id, name) in &checks.captures {
-        if !body_suspends(*closure_id) {
-            continue;
-        }
+        let msg = if body_suspends(*closure_id) {
+            async_view_capture_message(name)
+        } else {
+            view_capture_message(name)
+        };
         violations.push(program.anchored(
             Error {
                 trace: Vec::new(),
                 note: None,
                 span: **program.span_map.get(reference_id).unwrap_or(&&EMPTY_SPAN),
-                msg: async_view_capture_message(name),
+                msg,
             },
             *reference_id,
         ));

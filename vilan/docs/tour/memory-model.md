@@ -152,10 +152,9 @@ through to the list.
 
 ## `Shared<T>`: one cell, many holders
 
-When two places need to see the same mutable state (a closure and its
-creator, most commonly), reach for `Shared<T>`. It's a small
-heap cell. Copying the `Shared` value copies the *handle*, and both
-handles point at one cell. That's the point:
+When two places need to see the same mutable state, reach for
+`Shared<T>`. It's a small heap cell. Copying the `Shared` value copies
+the *handle*, and both handles point at one cell. That's the point:
 
 ```vilan
 import std::print;
@@ -182,7 +181,11 @@ Two methods, two behaviors, one trap:
 
 If you're reaching for `Shared` to "avoid a copy" on a hot path,
 don't: values are cheap, and the compiler already elides copies it can
-prove away.
+prove away. And you don't need one merely to let a closure write to its
+creator's binding — a closure captures the binding itself
+([Closures](functions-and-closures.md)). What the cell buys is state
+that outlives the frame the closure was made in, and state two closures
+reach that neither of them declared.
 
 ## `Arena` + `Handle`: graphs and cycles
 

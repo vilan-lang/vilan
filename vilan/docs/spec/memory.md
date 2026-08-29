@@ -74,7 +74,10 @@ no claims; rule 3 (§6.3) is the static column's interval requirement; rule
 4 (§6.4) is the static invalidation cell; `borrows` (§6.5) makes a claim's
 origin explicit; the escape hatches (§6.7) are the dynamic column; and
 resources (§6.8) are the static **death** cell, where use-after-move is the
-compile-time twin of a stale handle's `None`.
+compile-time twin of a stale handle's `None`. §6.9 is the one section
+outside the table: a closure capture aliases a *binding* rather than a
+place inside an owner, so it is not a claim, and its rule is which of
+this chapter's values may take part.
 
 ## 6.1 Rule 1 — values are copied; copies are semantic
 
@@ -213,6 +216,9 @@ that is itself a **view** (`Some(let v)` over an `Option<&mut T>`) takes none
 either, for the reason a view exists: it aliases on purpose, and copying it
 would mean writes through it stopped reaching the value it borrows.
 
+All of this is the **pattern** capture. A **closure** capture is a different
+mechanism and copies nothing at all: §6.9.
+
 ## 6.2 Rule 2 — elision is an optimization, never observable
 
 An implementation may skip a copy (reuse the storage) when no conforming
@@ -234,8 +240,8 @@ deliberately second-class; a view may not outlive the thing it views:
   carry the same convention.
 - A view may **not** be stored in a struct field, a collection element,
   or a `Signal`/`Shared` payload; may not be returned except through a
-  `borrows` projection; may not be captured by a closure that outlives
-  the place; may not cross an `await` (§6.6).
+  `borrows` projection; may not be **captured by a closure** (§6.9); may
+  not cross an `await` (§6.6).
 
 Mutating through a view writes the viewed place; reading its value
 requires an explicit `*`. A view in **value position** (passed where a
@@ -430,6 +436,15 @@ references above.
 *Move* transfers ownership and leaves the source binding dead; *loan* is the
 existing second-class view (`self` / `&` / `&mut` conventions, §6.3), which
 changes no ownership and is policed by rule 4.
+
+*A note on the numbering, because two of them collide.* R1–R12 below are the
+**affine** rules — they are about ownership, and every one of them is about a
+resource. The design record carries a second, unrelated R1–R8 in
+[transparent references](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/transparent-references.md), the **view**
+surface §6.3 states here; the two namespaces are disjoint and R7 means "no
+conditional moves" in one and "no rebinding a view" in the other. Where a
+discussion spans both, write **mR7** for this section's and **tR7** for the
+view surface's. Unqualified `R`*n* on this page always means the affine rule.
 
 - **R1: binding moves.** `let b = a;` transfers ownership; any later use of
   `a` is a compile error naming the move site. No copies ever fire for a
@@ -774,3 +789,79 @@ The following are recorded limits the model does not promise, not bugs:
   A cross-file instantiation may anchor its *primary* span imprecisely (the
   body note carries the correct source). A module-*initializer* global →
   global move is not scanned (benign, since module globals never drop).
+
+## 6.9 Closures capture bindings
+
+*(Design: [the lifetime model](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lifetimes.md) §4.)*
+
+**A closure captures bindings, not values.** A captured binding is the
+same binding: a write on either side is visible on the other, and a later
+**rebinding** is visible through the capture. This is the one alias in
+the chapter that is not a claim (§6.0) and needs no hatch: the
+environment holds the binding itself, not a path into an owner, so there
+is no epoch to outlive.
+
+Read against §6.1 the contrast is exact, and it is the whole rule. A
+**pattern** capture is a binding, so it copies, and it copies at the
+moment the pattern matches. A **closure** capture is not a new binding at
+all, so it copies nothing and has no moment to copy at:
+
+```vilan
+import std::print;
+
+fun main() {
+	mut label = "before";
+	let show = || label;      // captures the binding, not "before"
+	label = "after";          // a rebinding installs a fresh value
+	print(show());            // after — the capture is the same binding
+}
+```
+
+§6.1's other three spellings behave the same way through a capture, where
+a pattern capture sees none of them: an assignment through a view, a
+component write (`box.n = 9`), and a `&mut self` call all reach the
+captured binding.
+
+The one copy a closure takes is §6.1's **return** copy, and a closure
+takes it **per call**: a place the closure returns, rooted at a binding it
+did not declare, is storage the closure's own frame does not own, so the
+return copies it out. `|| items` hands back an independent list on every
+call, and pushing to one is invisible to `items` and to the next call's.
+
+Three kinds of value do not take part, each for a reason already stated
+elsewhere:
+
+- **A resource may not be captured** (§6.8's R9): the capture would be a
+  second owner. A closure that *references* a module-level resource loans
+  it per call instead — a loan is not a capture.
+- **An ambient context value is snapshotted when the closure is
+  created** (§8.4) — the one true capture-time copy in the language, so a
+  deferred body reads the context it was written in rather than the one
+  it happens to run in.
+- **A view may not be captured** (§6.3). A view is second-class and a
+  closure is not: the closure may outlive the frame its place lives in,
+  and lexical liveness — the surveyable interval §6.0's static regime
+  proves against — says nothing about when a closure body runs. The two
+  ways to write the same code are to read the value out (`*v`) before the
+  closure, or to take the view as a closure **parameter**, which is a
+  per-call loan exactly like a function's. The enclosing function's own
+  `&`/`&mut` **parameter** may be named inside a closure — it views the
+  *caller's* place, which outlives the call — but that closure is then
+  second-class itself and may not escape, by §6.3's list read of the
+  closure.
+
+A closure's environment keeps the bindings it captured alive for as long
+as the closure itself lives, which is why the three exclusions are the
+shape they are: what an environment cannot carry is a *claim* — a path
+into an owner it does not hold. Two closures that must share mutable
+state neither of them declared hold a `Shared` cell (§6.7), which aliases
+by design and survives every copy the model takes; capture is not a
+substitute for it, and not a hatch.
+
+**Honesty limit.** The view exclusion is enforced at the capture for view
+*bindings* and by the escape rule for a captured view *parameter*, and
+the escape rule does not follow a closure through an ordinary call: a
+closure over a `&mut` parameter, handed to a function that stores it,
+leaves the frame whose place the view names. Nothing in std does this,
+and the shape needs the closure-escape analysis §6.4's dynamic remainder
+is future work for.
