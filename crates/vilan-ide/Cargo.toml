@@ -1,6 +1,6 @@
 [package]
 name = "vilan-ide"
-version = "0.38.0"
+version = "0.39.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The editor-facing queries the language server and the playground share: a line index, the completion engine, and the navigation primitives it reads."
