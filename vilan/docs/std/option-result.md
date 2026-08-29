@@ -34,8 +34,8 @@ impl Option<type T> {
 
 	// in-place partial move — read/replace the slot through `&mut self`,
 	// always leaving a valid Option behind
-	fun take(&mut self): Option<T>               // Some(v) -> None here, Some(v) out
-	fun replace(&mut self, value: T): Option<T>  // value in, old contents out
+	fun take(&mut self): Option<T>                   // Some(v) -> None here, Some(v) out
+	fun replace(&mut self, own value: T): Option<T>  // value in, old contents out
 
 	// transformation
 	fun map<U>(own self, fn: |T| U): Option<U>

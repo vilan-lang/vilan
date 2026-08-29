@@ -4117,6 +4117,104 @@ fn option_replace_returns_the_old_resource_for_the_caller_to_own() {
     );
 }
 
+// --- B153: `replace` KEEPS what it is handed, so the position is `own` -------
+//
+// `external fun replace(&mut self, value: T)` declared the new value BARE — a
+// loan under R3 — and then stored it. A loan changes no ownership, so the
+// caller's binding stayed live and stayed readable, and the value was destroyed
+// twice: once by the slot, once by the caller. The honest declaration is `own
+// value: T`, which is also what let C11's temporary predicate go back to its
+// ruled width (only `own` moves).
+//
+// The sweep for the same shape across std ("a bare parameter the callee
+// stores") found three more and cleared two of them: `Shared::new(value: T)`
+// stores, but `r10_refuses_an_inferred_shared_of_a_resource` above shows no
+// resource can reach it; `Context::run(self, value: T, body)` binds its value
+// for the dynamic extent of `body` and hands it back, so a loan is the honest
+// reading there. The third, `NativeMap::insert`, is genuinely broken and is
+// pinned `#[ignore]`d below.
+
+#[test]
+fn option_replace_moves_the_new_value_in_rather_than_loaning_it() {
+    // B153's miscompile: `r` moves into the slot, so the slot is the one owner
+    // and the value is destroyed exactly once. Declared bare this printed
+    // `drop r` TWICE on an accepted program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            mut slot: Option<Res> = None;
+            let r = Res { tag = "r" };
+            let old = slot.replace(r);
+            print("after");
+        }
+        "#,
+        "drop r\nafter\n",
+    );
+}
+
+#[test]
+fn option_replace_rejects_a_read_of_the_value_it_was_handed() {
+    // The static half of the same defect: a loan leaves the name readable, so
+    // the move checker had nothing to say about a value the slot now owns.
+    // `own` restores the single-owner rule `List::push` has always enforced.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            mut slot: Option<Res> = None;
+            let r = Res { tag = "r" };
+            let old = slot.replace(r);
+            print(i"still readable: {r.tag}");
+        }
+        "#,
+        "use of `r` after it was moved",
+    );
+}
+
+#[test]
+#[ignore = "OPEN: R10's rejecting heads omit the internal `NativeMap`"]
+fn r10_refuses_a_native_map_of_a_resource() {
+    // The one sibling the sweep found still broken, filed rather than fixed
+    // here. `NativeMap::insert` stores a bare `value: V` exactly as `replace`
+    // did, and the measured consequence is worse: the caller destroys the value
+    // at the insert statement while the table goes on holding it (`drop r` then
+    // `after`, host-side use-after-free).
+    //
+    // The declaration fix (`own value: V`) is NOT the right one: `Map`/`Set`
+    // are built on `NativeMap` and pass a value they already own, so `own`
+    // buys a redundant `__clone` on every insert in the language and moves 12
+    // corpus goldens — a language-wide cost to close a hazard reachable only by
+    // importing `std::native_map` directly, which the module documents as not
+    // public surface. The zero-cost fix is R10: `List`/`Map`/`Set`/`Shared`/
+    // `Context`/`Promise`/`Task` all refuse a resource argument and the
+    // internal head simply is not in the list. It is a wider change than it
+    // looks (`Map<K, Res>` would then report through two heads, which the
+    // `assert_fails_once_with` pins read), so it is a ruling of its own.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::native_map::NativeMap;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            mut table: NativeMap<Res> = NativeMap::new();
+            print("built");
+        }
+        "#,
+        "`NativeMap` cannot hold the resource `Res`",
+    );
+}
+
 #[test]
 fn option_take_under_a_live_view_is_rejected() {
     // `take` is an invalidating mutation, so rule 4 / E2 fences it exactly as it
@@ -6628,6 +6726,87 @@ fn a_temporary_moved_into_an_own_parameter_is_not_dropped_twice() {
         }
         "#,
         "in-sink t\ndrop t\nafter\n",
+    );
+}
+
+// --- The predicate at its ruled width (B153 unlocked the widening) -----------
+//
+// C11 shipped with the predicate NARROWED to `&` / `&mut` / a bare `self`
+// receiver, because `Option::replace` declared a bare `value: T` and stored it:
+// a temporary recorded there would have been destroyed under the callee. With
+// that declaration corrected the spec's own rule holds — only `own` moves — so
+// a BARE non-`self` parameter is a loan like any other and a temporary in one
+// belongs to the statement.
+
+#[test]
+fn a_temporary_in_a_bare_loan_parameter_drops_at_its_statements_end() {
+    // R3's general rule, restored: `handle: Res` is a loan, the caller still
+    // owns the value after the call, and nobody bound it — so the statement
+    // does. Under the narrowed predicate this leaked: no drop ran at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun peek(handle: Res): str { handle.tag }
+        fun main() {
+            print(peek(Res { tag = "t" }));
+            print("after");
+        }
+        "#,
+        "t\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_in_a_bare_extern_parameter_drops_at_its_statements_end() {
+    // The same position at an `[extern]`, which is where B153 lived: a
+    // declaration with no body to read, so the convention is the only thing
+    // that speaks. Unmarked, the host's read is call-bounded, and the statement
+    // releases the handle straight after.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+
+        [extern("Boolean")]
+        external fun watch(r: Res): bool;
+
+        fun main() {
+            print(watch(Res { tag = "t" }));
+            print("after");
+        }
+        "#,
+        "true\ndrop t\nafter\n",
+    );
+}
+
+#[test]
+fn a_temporary_handed_to_a_retaining_extern_is_left_to_the_host() {
+    // The exemption the widening has to carry. `retains` says the host keeps
+    // what it is handed past the call, so the statement must NOT destroy it —
+    // the argument has no binding whose scope could hold it open, and freeing
+    // it at the statement's end would hand the host a dead value. It leaks
+    // instead, which is the direction this rule always fails.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+
+        [extern("Boolean", retains)]
+        external fun keep(r: Res): bool;
+
+        fun main() {
+            print(keep(Res { tag = "t" }));
+            print("after");
+        }
+        "#,
+        "true\nafter\n",
     );
 }
 

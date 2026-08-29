@@ -43,7 +43,12 @@ impl Option<type T> {
 	/// Put `value` in and return the old contents: the slot becomes `Some(value)`
 	/// and yields whatever was there before (`Some(old)` or `None`). The caller
 	/// then owns the old value.
-	external fun replace(&mut self, value: T): Option<T>;
+	///
+	/// `own value` because the slot KEEPS it (R3: only `own` transfers). Declared
+	/// bare it read as a loan the caller still owned, so a resource moved in here
+	/// was destroyed twice — once by the slot, once by the caller's binding — and
+	/// stayed readable after the move (B153).
+	external fun replace(&mut self, own value: T): Option<T>;
 
 	fun is_some(self): bool {
 		self is Some(_)

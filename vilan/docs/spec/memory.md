@@ -796,6 +796,12 @@ its liveness for the whole of its binding's scope — the conservative
 envelope. Module-level bindings are exempt by construction: they never drop
 at all.
 
+An argument with no binding is exempt too, and for the same reason read the
+other way: a resource temporary handed to a retaining extern is **not** its
+statement's to destroy, because there is no scope that could hold it open
+past the call. Such a temporary leaks rather than being freed under a host
+that is still reading it — the direction these rules always fail toward.
+
 ### `Option.take` and `Option.replace`
 
 Moving out of a place must leave a valid value behind. One intrinsic pair on
@@ -803,10 +809,14 @@ Moving out of a place must leave a valid value behind. One intrinsic pair on
 
 ```vilan,fragment
 impl Option<type T> {
-	fun take(&mut self): Option<T>;              // Some(v) -> None here, Some(v) out
-	fun replace(&mut self, value: T): Option<T>; // new value in, old contents out
+	fun take(&mut self): Option<T>;                  // Some(v) -> None here, Some(v) out
+	fun replace(&mut self, own value: T): Option<T>; // new value in, old contents out
 }
 ```
+
+`replace` takes its new value `own` because the slot **keeps** it: only `own`
+transfers (R3), so a bare declaration would have left the caller owning a
+value the slot also owned — readable after the move, and destroyed twice.
 
 `self.slot.take()` is how a resource field leaves a live aggregate (R5), and
 `match opt.take() { Some(let c) => drop(c), None => {} }` is the
