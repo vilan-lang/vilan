@@ -179,12 +179,13 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 ## std::asset
 
 ```vilan,fragment
-fun emit(kind: str, line: str)   // compile-time only: append to a build asset
-fun read(path: str): str         // compile-time only: read a project file
-fun bundle(path: str): str       // compile-time only: carry a file into the build
+fun emit(kind: str, line: str)               // compile-time only: append to a build asset
+fun emit_keyed(kind: str, key: str, line: str)  // …with the contribution's own sort key
+fun read(path: str): str                     // compile-time only: read a project file
+fun bundle(path: str): str                   // compile-time only: carry a file into the build
 ```
 
-All three callable only from `const` evaluation — a runtime call path
+All four callable only from `const` evaluation — a runtime call path
 to any of them is a compile error. `emit` is how `std::style` writes the CSS
 file (`emit("css", rule)`). Reach for it directly only for a shape std
 has no spelling for: a whole declaration block under a selector you
@@ -197,15 +198,45 @@ Each kind flushes to its own file — `<entry>.<kind>` — holding the
 kind's lines deduplicated and deterministically ordered. The order is
 kind-specific: `css` sorts in cascade order (base rules before `@media`
 blocks, media blocks by ascending min-width), and every other kind
-sorts lexically by line — either way the file is a function of the
-*set* of lines emitted, never of the order const evaluation reached
+sorts by `(key, line)` — either way the file is a function of the
+*set* of contributions, never of the order const evaluation reached
 them. A kind that stops being emitted stops shipping: the build records
 the kind files it wrote (`.vilan-asset-kinds`, beside the outputs), and
 the next build removes a recorded file whose kind emitted nothing —
 only recorded files, never a file it merely found.
 
+`emit_keyed` is where that key comes from. A line's position in its
+file is often not its own bytes — a route sorts by its path, an icon by
+its name, a ranked entry by its rank — and the code making the
+contribution is the only code that knows which. So it passes the key,
+the flush orders by it, and nothing has to recover an ordering by
+parsing lines back:
+
+```vilan,fragment
+// Ranks, not bytes: "02" before "09" before "10" whatever the lines say.
+fun routes(): i32 {
+	asset::emit_keyed("routes", "02", "GET /about");
+	asset::emit_keyed("routes", "09", "GET /");
+	1
+}
+let _routes = const routes();
+```
+
+The key is never written — only the line reaches the file. Deduplication
+is per `(key, line)` pair, so the same line contributed under two keys
+appears twice and the same contribution made twice appears once.
+`emit(kind, line)` is exactly `emit_keyed(kind, line, line)`, which is
+why an un-keyed kind's file comes out lexically ordered by line and why
+mixing the two spellings in one kind needs no rule of its own.
+
+The `css` kind is the one `emit_keyed` refuses: the stylesheet is
+ordered by the cascade rather than by a contribution's key, so a key
+passed for it would have no meaning. Write CSS with `emit`, or leave it
+to `std::style`.
+
 Because the kind becomes a filename, it must **be** a filename: one path
-segment, so a kind carrying `/`, `\`, or `..` is refused. It must also
+segment, so a kind carrying `/`, `\`, or `..` is refused — for either
+spelling. It must also
 not be a name the build already writes there. Refused for that reason:
 `vl` (the entry source — a lone package's outputs sit exactly where its
 entry does, so this kind would overwrite the program), `js` and `mjs`

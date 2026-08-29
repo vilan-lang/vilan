@@ -2657,9 +2657,9 @@ enum CompileGoal {
 /// JavaScript say so by not mentioning the rest.
 struct Compiled {
     javascript: String,
-    /// The `(kind, line)` pairs `asset::emit` accumulated — `write_assets`
-    /// deduplicates and orders them into `<output>.<kind>`.
-    assets: Vec<(String, String)>,
+    /// The contributions `asset::emit` / `asset::emit_keyed` accumulated —
+    /// `write_assets` deduplicates and orders them into `<output>.<kind>`.
+    assets: Vec<vilan_core::const_eval::EmittedAsset>,
     /// The files `asset::bundle` registered: (resolved source, the name it
     /// takes in the output directory). `write_bundled` copies them.
     bundled: Vec<(PathBuf, String)>,
@@ -3330,7 +3330,10 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
 /// it. The flush is the one place that knows what this round emitted, so it is
 /// where BOTH prunes belong; `write_chunks` keeps its own call for the HMR
 /// watch loop, which writes its sidecar directly rather than through here.
-fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Option<String> {
+fn write_assets(
+    output_js: &std::path::Path,
+    assets: &[vilan_core::const_eval::EmittedAsset],
+) -> Option<String> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
     let leg = output_js
         .file_stem()

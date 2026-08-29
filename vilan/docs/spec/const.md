@@ -40,7 +40,10 @@ The deliberate exception is the **compile-time file channel**,
 `std::asset`, callable **only** during const evaluation, in three
 directions. `emit(kind, content)` is the output direction for lines: it
 declares a build asset (the styling system's CSS, for example) that the
-build writes beside the output. `read(path)` is the input direction: it
+build writes beside the output; its ordered spelling
+`emit_keyed(kind, key, content)` carries the contribution's own sort
+key, and `emit(kind, content)` is exactly `emit_keyed(kind, content,
+content)`. `read(path)` is the input direction: it
 returns a project file's text so the result of parsing or transforming
 it can fold into the output. `bundle(path)` is the output direction for
 whole files: it tells the build to carry a non-code resource into the
@@ -55,7 +58,7 @@ deterministic *per build-input closure*: same sources and same project
 files, same output — `emit` same lines out, `read` same values in,
 `bundle` same files carried.
 
-A function that reaches `emit`, `read` or `bundle` is
+A function that reaches `emit`, `emit_keyed`, `read` or `bundle` is
 **compile-time-only**,
 transitively, and the compiler enforces that statically. A call from
 runtime code into compile-time-only territory is an error at the

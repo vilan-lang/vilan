@@ -846,8 +846,7 @@ fn the_typed_methods_mint_the_rules_their_raw_sites_did() {
     assert_eq!(lines[0], lines[1], "the typed chain changed the classes");
 
     // …and the shared rule is in the sheet once, not twice.
-    let assets = collected_assets(source);
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
+    let assembled = assembled_assets(source);
     let css = assembled.get("css").expect("css");
     for expected in [
         "{border:none}",
@@ -1007,7 +1006,7 @@ fn out_of_range_colour_values_fail_the_build() {
 
 #[test]
 fn identical_rules_deduplicate_across_styles() {
-    let assets = collected_assets(
+    let assembled = assembled_assets(
         r#"
         import std::style::{ style, space, Style };
         fun a(): Style {
@@ -1022,7 +1021,6 @@ fn identical_rules_deduplicate_across_styles() {
         main();
         "#,
     );
-    let assembled = vilan_core::const_eval::assemble_assets(&assets);
     let css = assembled.get("css").expect("css");
     assert_eq!(
         css.matches(".s1ufvr2{padding:var(--space-4)}").count(),
@@ -1061,8 +1059,7 @@ fn rule_for<'a>(css: &'a str, declaration: &str) -> (&'a str, usize) {
 }
 
 fn style_css(source: &str) -> String {
-    let assets = collected_assets(source);
-    vilan_core::const_eval::assemble_assets(&assets)
+    assembled_assets(source)
         .get("css")
         .expect("a css asset")
         .clone()

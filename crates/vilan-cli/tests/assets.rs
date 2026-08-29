@@ -7,7 +7,10 @@
 //! S0, `vilan run` / `run --watch` write the same sidecar each round so the
 //! dev loop serves fresh assets, and SWEEP it when the source stops emitting
 //! styles, like `build` does (G8). A kind naming a file the build writes
-//! itself never reaches the filesystem at all (G7).
+//! itself never reaches the filesystem at all (G7). Since build-hooks S3 a
+//! contribution may carry its own sort key (`asset::emit_keyed`), and the
+//! un-keyed spelling is that one with the line as its key — held here as a
+//! byte-identity differential on the written FILE.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -126,6 +129,81 @@ fn a_kind_colliding_with_the_build_namespace_never_reaches_the_filesystem() {
         "a refused build writes no bundle"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A single-file program contributing each `(key, line)` under `routes`
+/// through `spelling` — `emit` (which takes the line alone) or `emit_keyed`.
+/// The fixture for build-hooks S3's byte-identity gate, taken on the FILE
+/// rather than on the in-memory flush.
+fn routes_program(spelling: &str, contributions: &[(&str, &str)]) -> String {
+    let calls = contributions
+        .iter()
+        .map(|(key, line)| match spelling {
+            "emit" => format!("\temit(\"routes\", \"{line}\");\n"),
+            _ => format!("\temit_keyed(\"routes\", \"{key}\", \"{line}\");\n"),
+        })
+        .collect::<String>();
+    format!(
+        "import std::print;\nimport std::asset::{spelling};\n\nfun outputs(): i32 {{\n{calls}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"routes\");\n}}\nmain();\n"
+    )
+}
+
+/// Builds `source` as a lone `app.vl` and returns the bytes of its `routes`
+/// flush, with the project directory cleaned up.
+fn routes_file(tag: &str, source: &str) -> String {
+    let dir = temp_project(tag);
+    write(&dir, "app.vl", source);
+    let entry = dir.join("app.vl");
+    let output = vilan(&["build", entry.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let routes = std::fs::read_to_string(dir.join("app.routes")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    routes
+}
+
+#[test]
+fn the_two_emit_spellings_write_the_same_bytes_for_the_same_lines() {
+    // build-hooks S3's gate, end to end: `emit(kind, line)` IS
+    // `emit_keyed(kind, line, line)` (§5.3), so a line set contributed either
+    // way produces the same FILE — not merely the same in-memory flush. The
+    // corpus and the whole example tree hold the same property for every kind
+    // that already shipped; this holds it on the one program where both
+    // spellings can be written side by side.
+    let lines = [
+        "zebra",
+        "@media (min-width: 1024px){.c{}}",
+        "apple",
+        "zebra",
+    ];
+    let contributions: Vec<(&str, &str)> = lines.iter().map(|line| (*line, *line)).collect();
+    let through_emit = routes_file("emit_bytes", &routes_program("emit", &contributions));
+    let through_emit_keyed =
+        routes_file("keyed_bytes", &routes_program("emit_keyed", &contributions));
+    assert_eq!(
+        through_emit, through_emit_keyed,
+        "the two spellings must write byte-identical files"
+    );
+    // Non-vacuously: the shipped lexical order, deduplicated.
+    assert_eq!(
+        through_emit,
+        "@media (min-width: 1024px){.c{}}\napple\nzebra\n"
+    );
+}
+
+#[test]
+fn a_keyed_flush_writes_the_key_order_to_disk() {
+    // The feature the file has to show: the keys order the lines the opposite
+    // way their own bytes would, which is the case `emit` cannot express. The
+    // key itself never appears — only the line is written.
+    let routes = routes_file(
+        "keyed_order",
+        &routes_program("emit_keyed", &[("0", "zzz-first"), ("1", "aaa-second")]),
+    );
+    assert_eq!(routes, "zzz-first\naaa-second\n");
 }
 
 /// A single-file program emitting one `css` line plus one line per named

@@ -2,10 +2,32 @@
 // appends a line to the build's `kind` asset. The channel deduplicates by
 // line, orders deterministically, and writes `<output>.<kind>` beside the
 // compiled JS. Compile-time-only: callable only from within a `const`
-// expression — a runtime call path is a compile error.
+// expression — a runtime call path is a compile error. `emit_keyed` below is
+// the same channel with the contribution's own sort key.
 
 [extern("__emit_asset")]
 external fun emit(kind: str, line: str): void;
+
+// `emit`'s ORDERED spelling (proposal/build-hooks.md §5.3): the contribution
+// carries its own sort key. The kind's file holds its lines ordered by
+// (key, line) and deduplicated by that same pair, so two contributions of one
+// line under two keys are two contributions and both survive.
+//
+// The key is data you compute — a route's path, an icon's name, a zero-padded
+// rank — and the flush never re-derives it from the line. It is never written:
+// only `line` reaches the file.
+//
+// `emit(kind, line)` is exactly `emit_keyed(kind, line, line)`, which is why
+// an un-keyed kind's file is ordered lexically by line.
+//
+// The `css` kind is refused here: the style sidecar is ordered by the CSS
+// cascade rather than by a contribution's key, so a key passed for it would
+// have no meaning. Write CSS with `emit`, or with `std::style`.
+//
+// Compile-time-only, exactly like `emit`.
+
+[extern("__emit_asset_keyed")]
+external fun emit_keyed(kind: str, key: str, line: str): void;
 
 // Compile-time build inputs (proposal/docs-port.md §3.3, markdown.md §7 —
 // the read direction of the channel above): `read(path)` returns the file's
