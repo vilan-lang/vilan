@@ -9475,16 +9475,28 @@ impl<'src> Analyzer<'src> {
     /// its value's ownership with the CALLER — the position where an unbound
     /// resource is a temporary the statement must destroy.
     ///
-    /// Two positions qualify: an explicit `&` / `&mut` view, and a bare `self`
-    /// RECEIVER (`File::open(p).read_at(b, 0)` — C11's whole idiom). R3 says
-    /// bare parameters are loans generally, but this stops short of the general
-    /// rule on purpose: `Option::replace`'s intrinsic surface declares
-    /// `value: T` bare and then KEEPS the value, so recording a temporary there
-    /// destroys something the callee stored. Where a declaration understates,
-    /// the failure direction has to be a leak, not a double destruction. (The
-    /// declaration is the real defect and is reported; widening this predicate
-    /// is what should follow it being fixed.)
+    /// mR3 as the spec writes it (`memory.md` §6.8): **only `own` moves**.
+    /// A `&` / `&mut` view, a bare `self` RECEIVER (`File::open(p).read_at(b,
+    /// 0)` — C11's whole idiom) and a bare non-`self` parameter are all loans
+    /// the caller still owns after the call, so a resource temporary in any of
+    /// them is the statement's to destroy.
+    ///
+    /// This shipped NARROWED to `&`/`&mut`/`self` because `Option::replace`
+    /// declared `value: T` bare and then KEPT the value (B153) — recording a
+    /// temporary there would have destroyed something the callee stored. That
+    /// declaration now reads `own value: T`, so the general rule holds and the
+    /// predicate is back at its ruled width.
+    ///
+    /// **One callee is exempt.** A `[extern(…, retains)]` host keeps what it is
+    /// handed past the call (`memory.md` §6.8), so no argument of one is a
+    /// statement temporary: destroying it at the statement's end would free a
+    /// value the host still holds. A retained temporary leaks instead, which is
+    /// the failure direction this whole rule keeps — never a use-after-free,
+    /// never a double destruction.
     fn argument_leaves_ownership_with_caller(&self, subject_id: Id, index: usize) -> bool {
+        if self.callee_retains(subject_id) {
+            return false;
+        }
         let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return false;
         };
@@ -9504,8 +9516,7 @@ impl<'src> Analyzer<'src> {
             return false;
         };
         match parameter.convention {
-            Convention::Ref | Convention::RefMut => true,
-            Convention::Bare => parameter.name == "self",
+            Convention::Ref | Convention::RefMut | Convention::Bare => true,
             Convention::Own => false,
         }
     }
