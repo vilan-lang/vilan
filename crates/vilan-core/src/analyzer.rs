@@ -34097,8 +34097,19 @@ impl<'src> Program<'src> {
 pub(crate) struct LoadedModule {
     pub(crate) ast: &'static crate::span::Spanned<NodeList<'static>>,
     pub(crate) text: &'static str,
-    pub(crate) parse_errors: &'static [String],
+    pub(crate) parse_errors: &'static [ModuleParseError],
 }
+
+/// One lex/parse error the loader recovered from, kept the way the ENTRY file's
+/// are: the error's own span into this module's text, and what it says.
+///
+/// The span used to be discarded at load and the position folded into the
+/// message as prose (E100), which cost the diagnostic everything a span buys —
+/// a caret in the terminal, a squiggle in the editor, a position the LSP can
+/// jump to, and the diagnostic sort's file-then-position order. One bad
+/// character in an 18k-line generated module put 798 errors at line 1, out of
+/// source order.
+pub(crate) type ModuleParseError = (Span, String);
 
 /// The open-document overlay (backlog E6): the language server registers each
 /// open document's CURRENT buffer, so a dependent file's re-analysis sees
@@ -34234,9 +34245,9 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
     // recovers a (possibly partial) tree beside its diagnostics, and the
     // element/lift rewrites run before the tree freezes.
     let (tree, parse_errors) = crate::parsing::parse(text);
-    let rendered: Vec<String> = parse_errors
+    let rendered: Vec<ModuleParseError> = parse_errors
         .iter()
-        .map(|error| render_at(text, error.span.start, crate::parsing::render(error)))
+        .map(|error| (error.span, crate::parsing::render(error)))
         .collect();
     let root: Box<crate::span::Spanned<NodeList<'static>>> = match tree {
         Some(mut root) => {
@@ -34255,8 +34266,8 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
         crate::leak_tally::LeakSite::OwnedModuleAst,
         ast_bytes,
     );
-    const NO_ERRORS: &[String] = &[];
-    let (errors_handle, parse_errors): (Option<crate::leak_tally::Leaked<[String]>>, _) =
+    const NO_ERRORS: &[ModuleParseError] = &[];
+    let (errors_handle, parse_errors): (Option<crate::leak_tally::Leaked<[ModuleParseError]>>, _) =
         if rendered.is_empty() {
             (None, NO_ERRORS)
         } else {
@@ -34363,7 +34374,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     let source: &'static str = Box::leak(source.into_boxed_str());
     crate::leak_tally::record(crate::leak_tally::LeakSite::ModuleErrorText, source.len());
 
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<ModuleParseError> = Vec::new();
     fn empty_ast() -> &'static crate::span::Spanned<NodeList<'static>> {
         let leaked: &'static crate::span::Spanned<NodeList<'static>> =
             &*Box::leak(Box::new((Vec::new(), (0..0).into())));
@@ -34375,12 +34386,12 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     }
     // The handwritten frontend lexes and parses in one pass, always recovering a
     // (possibly partial) tree alongside its diagnostics (lexer and parser errors,
-    // span-ordered). Each renders to `line N, column M: reason` for this file.
+    // span-ordered). Each keeps its own span into THIS file's text.
     let (tree, parse_errors) = crate::parsing::parse(source);
     errors.extend(
         parse_errors
             .iter()
-            .map(|error| render_at(source, error.span.start, crate::parsing::render(error))),
+            .map(|error| (error.span, crate::parsing::render(error))),
     );
     let root: &'static crate::span::Spanned<NodeList<'static>> = match tree {
         Some(mut root) => {
@@ -34416,14 +34427,47 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
 }
 
 /// Pushes one diagnostic per swallowed lex/parse error in a loaded package
-/// module, naming the file (module spans are offsets into *that* file, so the
-/// rendered position rides in the message).
-fn report_module_parse_errors(diagnostics: &mut Vec<Error>, path: &Path, loaded: &LoadedModule) {
-    for rendered in loaded.parse_errors {
-        let msg = format!("parse error in `{}`: {rendered}", path.display());
-        // The same module loads through several seams (a lib re-export and a
-        // direct import, say) and the cache hands each the same errors — one
-        // diagnostic per distinct error is enough.
+/// module, carrying the error's REAL span — the shape an entry-file parse error
+/// has always had (E100). The caller attributes the module's `SourceId` right
+/// after (`attribute_new_diagnostics`), which is what gives the span a file: a
+/// [`Span`] is an offset into its own text and carries no file identity.
+///
+/// `reported` is the analysis-wide seen set. The same module loads through
+/// several seams (a lib re-export and a direct import, say) and the cache hands
+/// each the same errors — one diagnostic per distinct error is enough. It is
+/// keyed by PATH as well as position, because the messages no longer name their
+/// file: two modules can hold the same reason at the same offset, and those are
+/// two errors.
+fn report_module_parse_errors(
+    diagnostics: &mut Vec<Error>,
+    reported: &mut HashSet<(PathBuf, Span)>,
+    path: &Path,
+    loaded: &LoadedModule,
+) {
+    for (span, reason) in loaded.parse_errors {
+        if !reported.insert((path.to_path_buf(), *span)) {
+            continue;
+        }
+        diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: *span,
+            msg: reason.clone(),
+        });
+    }
+}
+
+/// The same errors for a consumer that renders MESSAGES only — `vilan check
+/// <library>`, which walks a package's modules without registering any of them
+/// as a source. With no file to hang a span on, the file and the position ride
+/// in the prose, exactly as every module parse error used to.
+fn render_module_parse_errors(diagnostics: &mut Vec<Error>, path: &Path, loaded: &LoadedModule) {
+    for (span, reason) in loaded.parse_errors {
+        let msg = format!(
+            "parse error in `{}`: {}",
+            path.display(),
+            render_at(loaded.text, span.start, reason.clone())
+        );
         if diagnostics.iter().any(|error| error.msg == msg) {
             continue;
         }
@@ -35827,7 +35871,7 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
             let Some(loaded) = load_package_module(&path) else {
                 continue;
             };
-            report_module_parse_errors(&mut diagnostics, &path, &loaded);
+            render_module_parse_errors(&mut diagnostics, &path, &loaded);
             let ast = loaded.ast;
             for (module, span) in collect_module_refs(&ast.0, "pkg") {
                 if resolve_module_in_roots(&all_roots, module).is_none() {
@@ -36710,6 +36754,11 @@ fn analyze_inner<'src>(
         .insert(std_module_id, Expr::Module(std_module_id));
     analyzer.module_id_by_name.insert("std", std_module_id);
 
+    // Every module parse error reported in this analysis, keyed by file and
+    // position: one module reaches the loader through several seams, and the
+    // cache hands each seam the same errors.
+    let mut reported_parse_errors: HashSet<(PathBuf, Span)> = HashSet::default();
+
     // Load `lib.vl` plus every module reachable through `pkg::` references,
     // transitively. Each becomes a module registered in the `pkg` namespace;
     // bodies are walked after all are registered so cross-module references
@@ -36718,7 +36767,12 @@ fn analyze_inner<'src>(
     let lib_loaded = load_package_module(&lib_path);
     if let Some(loaded) = &lib_loaded {
         let diagnostics_before = analyzer.diagnostics.len();
-        report_module_parse_errors(&mut analyzer.diagnostics, &lib_path, loaded);
+        report_module_parse_errors(
+            &mut analyzer.diagnostics,
+            &mut reported_parse_errors,
+            &lib_path,
+            loaded,
+        );
         // The lib is registered as the next source below.
         analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
     }
@@ -36937,7 +36991,12 @@ fn analyze_inner<'src>(
                 continue;
             };
             let diagnostics_before = analyzer.diagnostics.len();
-            report_module_parse_errors(&mut analyzer.diagnostics, &lib_path, &lib_loaded);
+            report_module_parse_errors(
+                &mut analyzer.diagnostics,
+                &mut reported_parse_errors,
+                &lib_path,
+                &lib_loaded,
+            );
             analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
             let lib_ast = lib_loaded.ast;
             // A dependency's surface is dependency code like any of its
@@ -37155,7 +37214,12 @@ fn analyze_inner<'src>(
                         continue;
                     };
                     let diagnostics_before = analyzer.diagnostics.len();
-                    report_module_parse_errors(&mut analyzer.diagnostics, &module_path, &loaded);
+                    report_module_parse_errors(
+                        &mut analyzer.diagnostics,
+                        &mut reported_parse_errors,
+                        &module_path,
+                        &loaded,
+                    );
                     analyzer.attribute_new_diagnostics(
                         diagnostics_before,
                         SourceId(sources.len() as u32),

@@ -29,6 +29,11 @@ written down.
 
 ---
 
+<!-- family: tooling -->
+**A parse error in an imported module now anchors where it is, instead of at line 1 in prose.** The same syntax error rendered at its true position in the ENTRY file and at 1:1 in a module: the loader rendered `line N, column M` into the message and pushed an EMPTY span, so everything a span buys was gone — the caret in the terminal, the squiggle in the editor, the position an editor can jump to, and the file-then-position order the diagnostic sort imposes. Generated code made the cost acute rather than cosmetic: one bad character out of a generator produced **798 errors, every one of them at line 1 of an 18k-line file, in an order nothing determined**. The span was never missing — `render_at` had `error.span` in hand at the moment it threw it away — so the fix is to stop discarding it: a loaded module carries `(span, reason)` pairs the way the entry has always carried the parser's own error, and the module's `SourceId` (which the loader already attributed) is what gives the span a file. Both loader paths change together — the process-global cache and the analysis-owned overlay path the language server uses — so an error reads the same however it reaches you. `vilan build` now points at `util.vl:2:11` with the source line under a caret where it used to name the file in a sentence. One consumer keeps the old shape deliberately: `vilan check <library>` walks a package's modules without registering any of them as a source and renders messages only, so with no file to hang a span on the position stays in the text. Pinned per case: the true line and the exact token spanned, several errors in one module keeping distinct spans in source order, the module error being the parser's own message and span unaltered, the library-contract path keeping its prose, and the end-to-end terminal rendering — each red on the unfixed tree, where the multi-error module reported `[1, 1]`. (backlog E100, measured by the lucide evidence run)
+
+---
+
 ## v0.39.0 — 2026-08-29
 
 <!-- family: breaking -->

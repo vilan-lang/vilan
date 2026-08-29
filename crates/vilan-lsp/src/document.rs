@@ -9327,15 +9327,24 @@ mod overlay_module_reclaim {
                 let analysis = Document::analyze_on_this_thread(ENTRY, &std_dir, &entry_path);
                 document.adopt_analysis(analysis);
             }
-            // Behavior parity with the global rich path: the importer names
-            // the module's parse error.
-            assert!(
-                document
-                    .diagnostics
-                    .iter()
-                    .any(|error| error.msg.contains("parse error in")),
-                "the broken module's parse error must reach the importer, got {:?}",
-                document.diagnostics
+            // Behavior parity with the global rich path: the importer surfaces
+            // the module's parse error, and it carries a real span into the
+            // module's own text rather than the empty one the loader used to
+            // push (E100).
+            let parse_error = document
+                .diagnostics
+                .iter()
+                .find(|error| error.msg.contains("expected a matching `}`"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the broken module's parse error must reach the importer, got {:?}",
+                        document.diagnostics
+                    )
+                });
+            assert_ne!(
+                parse_error.span.into_range(),
+                0..0,
+                "a module parse error carries its own span: {parse_error:?}"
             );
             assert_no_global_cache_growth("broken-content pin");
             assert_eq!(

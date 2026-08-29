@@ -901,6 +901,27 @@ fn contract_violations(
 }
 
 #[test]
+fn a_library_contract_check_keeps_the_position_in_prose() {
+    // E100's other half. `vilan check <library>` walks a package's modules
+    // without registering any of them as a source and renders MESSAGES only, so
+    // there is no file for a span to index into — the file and the position stay
+    // in the text, which is exactly what every module parse error used to do.
+    let violations = contract_violations(
+        &[("lib.vl", ""), ("broken.vl", "fun broken( {\n")],
+        &[],
+        &[],
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("parse error in")
+                && violation.contains("broken.vl")
+                && violation.contains("line 1, column 11")
+        }),
+        "{violations:?}"
+    );
+}
+
+#[test]
 fn contract_ok_when_each_module_stays_within_its_served_set() {
     // A base module importing a base sibling (available everywhere) and a process
     // module importing a process sibling (available across `@process`) — both within
@@ -1100,6 +1121,59 @@ fn analyze_package_attributed(
     attributed
 }
 
+/// Like [`analyze_package_attributed`], but keeping each diagnostic's SPAN as
+/// `(message, file, start..end)`. A module diagnostic's position is only
+/// meaningful together with the file it indexes into, so the two are read
+/// together (E100).
+fn analyze_package_spanned(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Vec<(String, String, std::ops::Range<usize>)> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_span_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, _errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let program = program.expect("analysis should produce a program");
+    let spanned = program
+        .diagnostics
+        .iter()
+        .zip(program.diagnostic_sources.iter())
+        .map(|(error, source)| {
+            let file = program
+                .source_path(*source)
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<none>".to_string());
+            (error.msg.clone(), file, error.span.into_range())
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    spanned
+}
+
+/// The 1-based line an offset falls on — what a reader sees, and the whole
+/// point of a span the loader kept.
+fn line_of(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())].matches('\n').count() + 1
+}
+
 // A type error INSIDE an imported module is attributed to that module's file,
 // not the entry — the root cause of the LSP's vanishing-diagnostics bug (the
 // error was mapped through the entry's line index and disappeared).
@@ -1153,8 +1227,8 @@ fn name_errors_attribute_to_their_own_files() {
     assert_eq!(entry_error.1, "main.vl", "{attributed:?}");
 }
 
-// A module that fails to PARSE attributes its (spanless) parse diagnostics to
-// its own file, so the editor can surface them there.
+// A module that fails to PARSE attributes its parse diagnostics to its own
+// file, so the editor can surface them there.
 #[test]
 fn module_parse_errors_attribute_to_the_broken_module() {
     let attributed = analyze_package_attributed(
@@ -1170,9 +1244,120 @@ fn module_parse_errors_attribute_to_the_broken_module() {
     );
     let parse_error = attributed
         .iter()
-        .find(|(msg, ..)| msg.contains("parse error in"))
+        .find(|(msg, ..)| msg.contains("expected a matching `)`"))
         .expect("the module parse error should be reported");
     assert_eq!(parse_error.1, "util.vl", "{attributed:?}");
+}
+
+// --- E100: a module-load parse error carries its own span -------------------
+//
+// The loader rendered `line N, column M` into the message and pushed an EMPTY
+// span, so the same syntax error that anchors at its true position in the ENTRY
+// file anchored at 1:1 in an imported one — with the position readable only as
+// prose. The measured cost was 798 errors from one bad generator character, all
+// at line 1 of an 18k-line generated file and out of source order. The span now
+// rides all the way from the parser, and the module's `SourceId` (already
+// attributed) is what gives it a file.
+
+#[test]
+fn a_module_parse_error_anchors_at_its_true_position() {
+    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 }\nfun broken( {\nfun c(): i32 { 3 }\n";
+    let spanned = analyze_package_spanned(
+        &[
+            (
+                "main.vl",
+                "import pkg::util::a;\nfun main() { let _ = a(); }\n",
+            ),
+            ("util.vl", helper),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    let (message, file, range) = spanned
+        .iter()
+        .find(|(message, ..)| message.contains("expected a matching `)`"))
+        .expect("the module parse error should be reported");
+    assert_eq!(file, "util.vl", "{spanned:?}");
+    assert_ne!(*range, 0..0, "an empty span is the bug: {spanned:?}");
+    assert_eq!(
+        line_of(helper, range.start),
+        3,
+        "the error is on line 3 of the module: {message} at {range:?}"
+    );
+    assert_eq!(
+        &helper[range.clone()],
+        "(",
+        "the span covers the unclosed `(`: {spanned:?}"
+    );
+}
+
+#[test]
+fn several_parse_errors_in_one_module_keep_distinct_spans() {
+    // The 798-error shape in miniature: a generated module holds many, and each
+    // needs its own place. They arrive in source order, which is what
+    // `normalize_diagnostic_order` sorts by once a span exists to sort on.
+    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 @ }\nfun c(): i32 { 3 }\n                  fun d(): i32 { 4 # }\nfun e(): i32 { 5 }\n";
+    let spanned = analyze_package_spanned(
+        &[
+            (
+                "main.vl",
+                "import pkg::util::a;\nfun main() { let _ = a(); }\n",
+            ),
+            ("util.vl", helper),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    let parse_errors: Vec<_> = spanned
+        .iter()
+        .filter(|(message, ..)| message.contains("is not a vilan token"))
+        .collect();
+    assert_eq!(parse_errors.len(), 2, "{spanned:?}");
+    let lines: Vec<usize> = parse_errors
+        .iter()
+        .map(|(_, _, range)| line_of(helper, range.start))
+        .collect();
+    assert_eq!(lines, vec![2, 4], "{spanned:?}");
+    assert!(
+        parse_errors[0].2.start < parse_errors[1].2.start,
+        "source order, not hash order: {spanned:?}"
+    );
+    assert!(
+        parse_errors.iter().all(|(_, file, _)| file == "util.vl"),
+        "{spanned:?}"
+    );
+}
+
+#[test]
+fn a_module_parse_error_is_the_parsers_own_error_unaltered() {
+    // One mechanism, however the error flows out of the loader. The entry file
+    // builds its diagnostic straight from the parser — `error.span`, and
+    // `parsing::render(error)` as the message — and a loaded module now does
+    // exactly the same, so the two are comparable against the same source of
+    // truth rather than against each other.
+    let broken = "fun util(): i32 { 1 }\nfun broken( {\n";
+    let (_tree, parse_errors) = vilan_core::parsing::parse(broken);
+    assert_eq!(parse_errors.len(), 1, "the fixture holds one parse error");
+    let expected_message = vilan_core::parsing::render(&parse_errors[0]);
+    let expected_span = parse_errors[0].span.into_range();
+
+    let spanned = analyze_package_spanned(
+        &[
+            (
+                "main.vl",
+                "import pkg::util::util;\nfun main() { let _ = util(); }\n",
+            ),
+            ("util.vl", broken),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    let module_error = spanned
+        .iter()
+        .find(|(message, ..)| *message == expected_message)
+        .unwrap_or_else(|| panic!("expected {expected_message:?} verbatim; got {spanned:?}"));
+    assert_eq!(module_error.1, "util.vl", "{spanned:?}");
+    assert_eq!(module_error.2, expected_span, "{spanned:?}");
 }
 
 // --- E82: the post-fixpoint (`finalize_build`) checks attribute like every

@@ -49,7 +49,7 @@ use crate::span::Spanned;
 pub(crate) struct OwnedModuleAllocation {
     pub(crate) text: Leaked<str>,
     pub(crate) ast: Leaked<Spanned<NodeList<'static>>>,
-    pub(crate) parse_errors: Option<Leaked<[String]>>,
+    pub(crate) parse_errors: Option<Leaked<[crate::analyzer::ModuleParseError]>>,
 }
 
 /// Every allocation one analysis's overlay-served module loads made — the
