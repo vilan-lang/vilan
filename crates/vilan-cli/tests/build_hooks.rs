@@ -841,14 +841,20 @@ fn watch_manifest(inputs: &str) -> String {
 
 /// Starts `vilan build --watch` over `dir`. `build`, not `run`: the pins are
 /// about the wake-up set, and a build round spawns no program, binds no port
-/// and leaves no `node` grandchild to reap.
+/// and leaves no `node` grandchild to reap. The loop's narration (banner,
+/// `change detected`, `Running` echoes, any error) lands in `watch.log`
+/// beside the project — NOT nulled, because the one Windows CI red this
+/// section has had was undiagnosable precisely for want of that log; the
+/// name is not `.vl` and not a declared input, so the watched set is
+/// unperturbed.
 fn spawn_watch(dir: &Path) -> Watcher {
+    let log = std::fs::File::create(dir.join("watch.log")).expect("create watch.log");
     Watcher(
         Command::new(env!("CARGO_BIN_EXE_vilan"))
             .args(["build", "--watch", dir.to_str().unwrap()])
             .env("NO_COLOR", "1")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .spawn()
             .expect("spawn vilan build --watch"),
     )
@@ -856,16 +862,47 @@ fn spawn_watch(dir: &Path) -> Watcher {
 
 /// Waits (bounded) for `condition`, returning how long it took. The bound is a
 /// LIVENESS bound, never a performance claim: how long a compile takes on the
-/// machine running the suite is not what these pins are about.
-fn wait_for(label: &str, condition: impl Fn() -> bool) -> Duration {
+/// machine running the suite is not what these pins are about. On expiry the
+/// panic carries the whole observable state — the round and hook counts and
+/// the watcher's own log — so a red on a runner nobody can shell into is a
+/// verdict rather than a mystery (the first Windows red here cost a blind
+/// diagnosis for want of exactly this).
+fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duration {
+    wait_nudged(dir, label, || {}, condition)
+}
+
+/// [`wait_for_in`], re-invoking `nudge` every ~20 s while it waits. The watch
+/// loop consumes a snapshot difference BEFORE it re-runs the action, so a
+/// round lost to a transient action failure is lost for good — a one-shot
+/// trigger then hangs the full bound on a healthy watcher (the flake-shaped
+/// Windows red, hypothesis H-A). Re-touching the trigger makes the positive
+/// pins immune to a single lost round without weakening them: if the wake-up
+/// set is wrong, no amount of re-touching wakes it. Never used by the
+/// negative pin, whose whole claim is that nothing fires.
+fn wait_nudged(
+    dir: &Path,
+    label: &str,
+    nudge: impl Fn(),
+    condition: impl Fn() -> bool,
+) -> Duration {
     let started = Instant::now();
+    let mut last_nudge = Instant::now();
     while started.elapsed() < support::WATCH_LIVENESS {
         if condition() {
             return started.elapsed();
         }
+        if last_nudge.elapsed() > Duration::from_secs(20) {
+            nudge();
+            last_nudge = Instant::now();
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("timed out waiting for {label}");
+    let log = std::fs::read_to_string(dir.join("watch.log")).unwrap_or_default();
+    panic!(
+        "timed out waiting for {label}\nrounds.txt: {} lines, ran.txt: {} lines\n--- watch.log ---\n{log}",
+        runs(dir, "rounds.txt"),
+        runs(dir, "ran.txt"),
+    );
 }
 
 #[test]
@@ -880,14 +917,19 @@ fn an_edited_hook_input_starts_a_watch_round_and_reruns_the_hook() {
     write(&dir, "input.txt", "one\n");
     let _watcher = spawn_watch(&dir);
 
-    wait_for("the first round", || runs(&dir, "rounds.txt") >= 1);
-    wait_for("the first round's hook", || runs(&dir, "ran.txt") >= 1);
+    wait_for_in(&dir, "the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
 
     write(&dir, "input.txt", "two\n");
-    wait_for("the round the edited input starts", || {
-        runs(&dir, "rounds.txt") >= 2
-    });
-    wait_for("the hook the edited input re-runs", || {
+    wait_nudged(
+        &dir,
+        "the round the edited input starts",
+        || write(&dir, "input.txt", "two\n"),
+        || runs(&dir, "rounds.txt") >= 2,
+    );
+    wait_for_in(&dir, "the hook the edited input re-runs", || {
         runs(&dir, "ran.txt") >= 2
     });
     let _ = std::fs::remove_dir_all(&dir);
@@ -906,7 +948,7 @@ fn an_undeclared_file_starts_no_watch_round() {
     write(&dir, "notes.txt", "not a declared input\n");
     let _watcher = spawn_watch(&dir);
 
-    let first_round = wait_for("the first round", || runs(&dir, "rounds.txt") >= 1);
+    let first_round = wait_for_in(&dir, "the first round", || runs(&dir, "rounds.txt") >= 1);
 
     // An undeclared, non-`.vl` file moves. Nothing may happen — and "nothing"
     // is only observable by waiting, so the window is this machine's own round
@@ -926,7 +968,7 @@ fn an_undeclared_file_starts_no_watch_round() {
     // And the session was alive the whole time, not silently dead — otherwise
     // the assertion above is vacuous and would survive any regression.
     write(&dir, "input.txt", "two\n");
-    wait_for("the round a declared input still starts", || {
+    wait_for_in(&dir, "the round a declared input still starts", || {
         runs(&dir, "rounds.txt") >= 2
     });
     let _ = std::fs::remove_dir_all(&dir);
@@ -945,14 +987,19 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
     write(&dir, "icons/check.svg", "<svg/>\n");
     let _watcher = spawn_watch(&dir);
 
-    wait_for("the first round", || runs(&dir, "rounds.txt") >= 1);
-    wait_for("the first round's hook", || runs(&dir, "ran.txt") >= 1);
+    wait_for_in(&dir, "the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
 
     write(&dir, "icons/close.svg", "<svg/>\n");
-    wait_for("the round the new icon starts", || {
-        runs(&dir, "rounds.txt") >= 2
-    });
-    wait_for("the hook the new icon re-runs", || {
+    wait_nudged(
+        &dir,
+        "the round the new icon starts",
+        || write(&dir, "icons/close.svg", "<svg/>\n"),
+        || runs(&dir, "rounds.txt") >= 2,
+    );
+    wait_for_in(&dir, "the hook the new icon re-runs", || {
         runs(&dir, "ran.txt") >= 2
     });
     let _ = std::fs::remove_dir_all(&dir);
