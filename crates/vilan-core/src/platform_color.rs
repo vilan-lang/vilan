@@ -100,8 +100,9 @@ pub fn check(program: &mut Program, platform: Platform, graph: &CallGraph) {
     // chain crosses files, so the anchor is regularly in a module (backlog E16)
     // — and ONE per mistake (E98): the walk reaches a layer by as many edges as
     // the program has, and a fence over a FAMILY re-walks per host, so the same
-    // site and the same cause arrive repeatedly. First wins, which keeps the
-    // shortest chain.
+    // site and the same cause arrive repeatedly. First wins — the walk's own
+    // deterministic depth-first order; the kept chain is the first reached,
+    // not necessarily the shortest.
     let mut seen: HashSet<(SourceId, Span, String)> = HashSet::default();
     for Violation {
         error,

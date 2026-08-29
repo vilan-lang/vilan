@@ -36,7 +36,9 @@ impl str {
 
 `contains` answers *whether*; these answer *where*. They are what
 `substring` needs and nothing else computed — without them, text is taken
-apart with `split` and put back together.
+apart with `split` and put back together. The index is zero-based and
+counts UTF-16 code units — `substring`'s own unit, so a bound one of these
+returns feeds `substring` directly, non-BMP text included.
 
 ```vilan
 import std::print;

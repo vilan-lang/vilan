@@ -957,7 +957,9 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 // ── S6: the generated root, and the formatter's exclusion (§12) ──
+
 /// The module a generator writes. `vilan fmt` expands a single-line body onto
 /// its own line, so these exact bytes are one format away from re-staling the
 /// hook that declares them — which is §12.1's loop, live in the shipped tree.
@@ -965,6 +967,7 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
 /// fixture that proved hooks can produce modules is the fixture that proves
 /// they fight the formatter.
 const GENERATED_MODULE: &str = "fun generated(): i32 { 41 }";
+
 /// A hook command writing [`GENERATED_MODULE`] to `file`, in the platform's shell.
 fn generate_module(file: &str) -> String {
     if cfg!(windows) {
@@ -973,6 +976,7 @@ fn generate_module(file: &str) -> String {
         format!("printf '{GENERATED_MODULE}\\n' > {file}")
     }
 }
+
 /// A package whose hook generates `src/icons/lib.vl`, importable as
 /// `pkg::icons` — §12.6's configuration that works on the shipped resolver,
 /// since a module's file may be `<root>/<name>/lib.vl` as well as
@@ -1006,10 +1010,12 @@ fn generated_root_project(tag: &str, generated: Option<&str>) -> PathBuf {
     std::fs::create_dir_all(dir.join("src/icons")).unwrap();
     dir
 }
+
 /// Formats `dir` through the built binary.
 fn fmt(dir: &Path) -> Output {
     vilan(&["fmt", dir.to_str().unwrap()])
 }
+
 #[test]
 fn fmt_leaves_a_file_under_the_generated_root_byte_identical() {
     // The rule itself (§12.4). The file is one the formatter demonstrably
@@ -1019,6 +1025,7 @@ fn fmt_leaves_a_file_under_the_generated_root_byte_identical() {
     build(&dir);
     let generated = dir.join("src/icons/lib.vl");
     let before = std::fs::read(&generated).unwrap();
+
     let output = fmt(&dir);
     let text = combined(&output);
     assert!(output.status.success(), "{text}");
@@ -1029,6 +1036,7 @@ fn fmt_leaves_a_file_under_the_generated_root_byte_identical() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn fmt_formats_the_same_generated_file_when_no_root_is_declared() {
     // The plant, as a pin: identical tree, `generated` absent. The formatter
@@ -1039,6 +1047,7 @@ fn fmt_formats_the_same_generated_file_when_no_root_is_declared() {
     build(&dir);
     let generated = dir.join("src/icons/lib.vl");
     let before = std::fs::read(&generated).unwrap();
+
     let output = fmt(&dir);
     let text = combined(&output);
     assert!(output.status.success(), "{text}");
@@ -1049,6 +1058,7 @@ fn fmt_formats_the_same_generated_file_when_no_root_is_declared() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn fmt_still_formats_a_file_outside_the_generated_root() {
     // The green negative that keeps the exclusion from being "fmt stopped
@@ -1059,6 +1069,7 @@ fn fmt_still_formats_a_file_outside_the_generated_root() {
     write(&dir, "src/hand_written.vl", GENERATED_MODULE);
     let generated = dir.join("src/icons/lib.vl");
     let product = std::fs::read(&generated).unwrap();
+
     let output = fmt(&dir);
     let text = combined(&output);
     assert!(output.status.success(), "{text}");
@@ -1070,6 +1081,7 @@ fn fmt_still_formats_a_file_outside_the_generated_root() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn fmt_check_does_not_report_a_generated_file_and_exits_zero() {
     // `--check` and `fmt` are one rule because the exclusion is applied at
@@ -1082,6 +1094,7 @@ fn fmt_check_does_not_report_a_generated_file_and_exits_zero() {
     let generated = dir.join("src/icons/lib.vl");
     let product = std::fs::read(&generated).unwrap();
     assert!(fmt(&dir).status.success());
+
     let output = vilan(&["fmt", "--check", dir.to_str().unwrap()]);
     let text = combined(&output);
     assert!(
@@ -1096,6 +1109,7 @@ fn fmt_check_does_not_report_a_generated_file_and_exits_zero() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn fmt_leaves_a_generated_file_alone_when_it_is_named_explicitly() {
     // §12.4's most arguable decision, pinned: the exclusion holds however the
@@ -1106,12 +1120,14 @@ fn fmt_leaves_a_generated_file_alone_when_it_is_named_explicitly() {
     build(&dir);
     let generated = dir.join("src/icons/lib.vl");
     let before = std::fs::read(&generated).unwrap();
+
     let output = vilan(&["fmt", generated.to_str().unwrap()]);
     let text = combined(&output);
     assert!(output.status.success(), "{text}");
     assert_eq!(std::fs::read(&generated).unwrap(), before, "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn fmt_says_once_how_many_generated_files_it_skipped() {
     // Silence is the failure mode this design cannot afford, so the exclusion
@@ -1120,6 +1136,7 @@ fn fmt_says_once_how_many_generated_files_it_skipped() {
     let dir = generated_root_project("fmt_note", Some("src/icons"));
     build(&dir);
     write(&dir, "src/icons/other.vl", GENERATED_MODULE);
+
     let output = fmt(&dir);
     let text = combined(&output);
     assert!(output.status.success(), "{text}");
@@ -1134,6 +1151,7 @@ fn fmt_says_once_how_many_generated_files_it_skipped() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn fmt_says_nothing_when_the_exclusion_skipped_nothing() {
     // A note about an exclusion that excluded nothing is noise, and noise is
@@ -1146,6 +1164,7 @@ fn fmt_says_nothing_when_the_exclusion_skipped_nothing() {
     assert!(!text.contains("not formatted"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn a_generated_hook_output_stays_fresh_across_a_format() {
     // THE PIN THE SLICE EXISTS FOR (§12.1, §8's S6 gate). Build, format,
@@ -1161,6 +1180,7 @@ fn a_generated_hook_output_stays_fresh_across_a_format() {
     );
     assert_eq!(runs(&dir, "ran.txt"), 1);
     let generated = std::fs::read(dir.join("src/icons/lib.vl")).unwrap();
+
     let formatted = fmt(&dir);
     assert!(formatted.status.success(), "{}", combined(&formatted));
     assert_eq!(
@@ -1168,6 +1188,7 @@ fn a_generated_hook_output_stays_fresh_across_a_format() {
         generated,
         "the format left the declared output alone"
     );
+
     let text = build(&dir);
     assert_eq!(
         runs(&dir, "ran.txt"),
@@ -1177,6 +1198,7 @@ fn a_generated_hook_output_stays_fresh_across_a_format() {
     assert!(text.contains("Fresh   icons"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn without_a_generated_root_a_format_re_stales_the_hook_forever() {
     // The loop itself, pinned as the defect it is — the same cycle on the same
@@ -1186,6 +1208,7 @@ fn without_a_generated_root_a_format_re_stales_the_hook_forever() {
     let dir = generated_root_project("loop_live", None);
     build(&dir);
     assert_eq!(runs(&dir, "ran.txt"), 1);
+
     fmt(&dir);
     let text = build(&dir);
     assert_eq!(
@@ -1200,6 +1223,7 @@ fn without_a_generated_root_a_format_re_stales_the_hook_forever() {
     assert_eq!(runs(&dir, "ran.txt"), 3, "and again, forever:\n{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn a_generated_root_outside_the_package_fails_the_build_naming_the_key() {
     // The refusal reaches the user, not just `Manifest::validate` (whose own

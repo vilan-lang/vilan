@@ -347,7 +347,9 @@ impl str {
 	/// the host method renamed: `-1` is an index the type system cannot tell
 	/// from a real one, and `substring` — which refuses a negative bound rather
 	/// than clamping it — would report the mistake one call later, at the wrong
-	/// place. An empty needle is at `0`, as everywhere else.
+	/// place. An empty needle is at `0`, as everywhere else. The index is
+	/// zero-based and counts UTF-16 code units — `substring`'s own unit, so the
+	/// bound feeds it directly.
 	fun index_of(self, needle: str): Option<i32> {
 		let at = self.raw_index_of(needle);
 		if at < 0 {

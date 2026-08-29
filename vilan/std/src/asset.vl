@@ -74,8 +74,11 @@ external fun bundle(path: str): str;
 // const-eval.md §3.1): the file at `path` is carried into the output
 // directory as `url`, and `url` is what this evaluates to. Everything else is
 // `bundle`'s and unchanged — the same registry, the same tracked build input,
-// the same manifest row, the same `run --watch` recopy — so `bundle(path)` is
-// exactly `bundle_as(path, i"/{path}")`.
+// the same manifest row, the same `run --watch` recopy — so for any path
+// free of `.` segments, `bundle(path)` is exactly `bundle_as(path,
+// i"/{path}")`. (The one divergence: `bundle` skips a `./` in the SOURCE
+// spelling when minting the name, where the target grammar refuses one,
+// because the target IS the url.)
 //
 // 029's "nothing is renamed behind your back" survives because the rename is
 // spelled here: a file lands somewhere its own path does not spell only where

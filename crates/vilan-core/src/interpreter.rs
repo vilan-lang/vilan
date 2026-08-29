@@ -54,9 +54,9 @@ const BUNDLE_FUEL: u64 = 4_096;
 
 /// What one directory entry costs `asset::read_dir` / `read_dir_all`
 /// (const-eval.md §3.1). A quarter of [`BUNDLE_FUEL`], and the ratio is the
-/// argument: an entry is a name the host already had in hand from one
-/// `readdir` — no per-entry open, no bytes read — where `bundle`'s charge
-/// prices a stat plus a whole-file read. A quarter keeps enumeration visible
+/// argument: an entry costs the walk a listing row and the stat that
+/// classifies it — no bytes read — where `bundle`'s charge prices a
+/// whole-file read on top of both. A quarter keeps enumeration visible
 /// in the budget (16M fuel buys ~15,600 entries) while leaving the dominant
 /// per-entry cost to whatever the program then DOES with the entry, which for
 /// the estate recipe is `bundle_as` at four times the price — so the fence
@@ -64,7 +64,10 @@ const BUNDLE_FUEL: u64 = 4_096;
 ///
 /// Charged per entry rather than per byte, unlike `read`: a listing's cost is
 /// the walk and not the names, and the loop body that follows runs once per
-/// entry, so a per-entry price is the one that bounds it.
+/// entry, so a per-entry price is the one that bounds it. The count is the
+/// FILES returned plus one for the listed directory itself; the directories a
+/// recursive walk descends into are not individually charged — a recorded
+/// open question on the charging basis (backlog G12).
 const DIR_ENTRY_FUEL: u64 = 1_024;
 
 /// How many bytes of a file one fuel buys `asset::digest` (const-eval.md

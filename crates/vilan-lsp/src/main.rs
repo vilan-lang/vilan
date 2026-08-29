@@ -1711,6 +1711,57 @@ fn server_capabilities() -> ServerCapabilities {
     }
 }
 
+/// Whether the formatting handler must decline `path` whole: a file under a
+/// declared `generated` root is a product, and the editor holds to that as
+/// firmly as the terminal does (`build-hooks.md` §12.4). This is the path the
+/// rule most has to reach — format-on-save fires on a file the developer
+/// merely opened to read, so the fmt↔hook loop §12.1 describes would
+/// otherwise run without anyone having typed a command. Same predicate as
+/// `vilan fmt`'s — one rule, one implementation, or the editor's answer
+/// drifts from the terminal's.
+fn formatting_declined(path: &std::path::Path) -> bool {
+    vilan_core::manifest::generated_root_covering(path).is_some()
+}
+
+#[cfg(test)]
+mod formatting_gate_tests {
+    use super::formatting_declined;
+
+    // The editor half of the generated-root exclusion (build-hooks.md §12.4):
+    // format-on-save reaches a file by its exact path and nothing else, so the
+    // handler's gate is the terminal's predicate behind this one seam. Pinned
+    // against a real manifest on disk, the way the CLI pins do for
+    // `vilan fmt` — decline the product, format the source beside it.
+    #[test]
+    fn the_generated_root_declines_the_product_and_not_its_neighbour() {
+        let dir = std::env::temp_dir().join(format!(
+            "vilan_lsp_genroot_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let generated = dir.join("src/icons");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(
+            dir.join("vilan.toml"),
+            "[package]\nname = \"gated\"\ngenerated = \"src/icons\"\n",
+        )
+        .unwrap();
+        let product = generated.join("lib.vl");
+        let source = dir.join("src/main.vl");
+        std::fs::write(&product, "fun generated(): i32 { 41 }\n").unwrap();
+        std::fs::write(&source, "fun main() {}\n").unwrap();
+        assert!(
+            formatting_declined(&product),
+            "a product under the declared root is declined whole"
+        );
+        assert!(
+            !formatting_declined(&source),
+            "an ordinary source beside the root still formats"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -2367,16 +2418,8 @@ impl LanguageServer for Backend {
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         self.fenced("formatting", Err(handler_panicked()), || {
             let uri = params.text_document.uri;
-            // A file under a declared `generated` root is a product, and the
-            // editor holds to that as firmly as the terminal does
-            // (`build-hooks.md` §12.4). This is the path the rule most has to
-            // reach: format-on-save fires on a file the developer merely opened
-            // to read, so the fmt↔hook loop §12.1 describes would otherwise run
-            // without anyone having typed a command. Same predicate as
-            // `vilan fmt`'s — one rule, one implementation, or the editor's
-            // answer drifts from the terminal's.
             if let Ok(path) = uri.to_file_path() {
-                if vilan_core::manifest::generated_root_covering(&path).is_some() {
+                if formatting_declined(&path) {
                     return Ok(None);
                 }
             }
