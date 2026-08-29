@@ -52,6 +52,31 @@ impl Default for Limits {
 /// as work rather than as bytes (the `__bundle_asset` arm says why).
 const BUNDLE_FUEL: u64 = 4_096;
 
+/// What one directory entry costs `asset::read_dir` / `read_dir_all`
+/// (const-eval.md §3.1). A quarter of [`BUNDLE_FUEL`], and the ratio is the
+/// argument: an entry is a name the host already had in hand from one
+/// `readdir` — no per-entry open, no bytes read — where `bundle`'s charge
+/// prices a stat plus a whole-file read. A quarter keeps enumeration visible
+/// in the budget (16M fuel buys ~15,600 entries) while leaving the dominant
+/// per-entry cost to whatever the program then DOES with the entry, which for
+/// the estate recipe is `bundle_as` at four times the price — so the fence
+/// that binds first is still the one on the work that copies bytes.
+///
+/// Charged per entry rather than per byte, unlike `read`: a listing's cost is
+/// the walk and not the names, and the loop body that follows runs once per
+/// entry, so a per-entry price is the one that bounds it.
+const DIR_ENTRY_FUEL: u64 = 1_024;
+
+/// How many bytes of a file one fuel buys `asset::digest` (const-eval.md
+/// §3.1) — an eighth of `read`'s per-byte rate. `read`'s rate prices two
+/// things at once: the I/O, and the arbitrary-length `str` the const program
+/// then computes over. `digest` prices only the first — its result is 64
+/// characters whatever the file weighs — so the charge bounds how many bytes
+/// a BUILD will hash rather than how large a value a program may hold. The
+/// book's largest page (40,758 bytes) costs ~5,100 fuel here against ~40,800
+/// through `read`; a 128 MB file still exhausts the explicit budget.
+const DIGEST_BYTES_PER_FUEL: u64 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// The fuel budget ran out — the macro-loop backstop.
@@ -231,7 +256,27 @@ pub trait AssetReader {
     /// bundled copy answers on. The bytes never enter the program — a font and
     /// a favicon ride this the same way a `.txt` does — so the reader reads
     /// them only to hash them as a build input.
-    fn bundle(&self, path: &str) -> Result<String, String>;
+    ///
+    /// `target` is `asset::bundle_as`'s explicitly spelled url, or `None` for
+    /// `asset::bundle`, whose target is the path itself (const-eval.md §3.1).
+    /// ONE method for both spellings on purpose: the registration, the
+    /// tracked-input record, the collision rule and the manifest row are the
+    /// same for either, and a second method would be a second implementation
+    /// of all four.
+    fn bundle(&self, path: &str, target: Option<&str>) -> Result<String, String>;
+
+    /// Lists a directory the build reads at compile time (const-eval.md §3.1):
+    /// FILES only, byte-sorted, `/`-separated, and the directory recorded as a
+    /// tracked build input. `recursive` is `read_dir_all`'s spelling — every
+    /// file beneath `path` as a path relative to it — against `read_dir`'s
+    /// immediate bare names. The reader owns the walk; the interpreter owns the
+    /// budget, and charges the entries this hands back (const-eval.md §3.1).
+    fn read_dir(&self, path: &str, recursive: bool) -> Result<Vec<String>, String>;
+
+    /// The sha-256 of a file's bytes as lowercase hex, with the file recorded
+    /// as a tracked build input. Returns the digest and the byte count it was
+    /// taken over — the interpreter charges the second (const-eval.md §3.1).
+    fn digest(&self, path: &str) -> Result<(String, u64), String>;
 }
 
 /// Everything one const evaluation produced. The result is what the caller
@@ -1610,21 +1655,104 @@ impl<'a> Interpreter<'a> {
             // charge below charges a flat per-call cost for the I/O instead:
             // ~3,900 distinct files fit the explicit budget, which bounds a
             // const function looping over paths without capping any one file.
-            "__bundle_asset" => {
+            //
+            // ONE ARM for both spellings, for the reason the emit pair shares
+            // one: `bundle(path)` IS `bundle_as(path, "/" + path)`, and this
+            // is where that identity is spelled — one fence call, one
+            // registration, one place a target can be decided. A second arm
+            // would be a second implementation of the same rule.
+            "__bundle_asset" | "__bundle_asset_as" => {
+                let spelling = if name == "__bundle_asset_as" {
+                    "asset::bundle_as"
+                } else {
+                    "asset::bundle"
+                };
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(format!(
+                        "`{spelling}` outside a `const` expression"
+                    )));
+                }
+                let path = expect_str(&take(0))?;
+                let target = match spelling {
+                    "asset::bundle_as" => Some(expect_str(&take(1))?),
+                    _ => None,
+                };
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(format!(
+                        "the project's files (`{spelling}`)"
+                    )));
+                };
+                self.charge_amount(BUNDLE_FUEL)?;
+                match reader.bundle(&path, target.as_deref()) {
+                    Ok(url) => Ok(Value::Str(url.into())),
+                    Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
+                }
+            }
+            // `asset::read_dir` / `read_dir_all` — the channel's DIRECTORY
+            // listing (kolt.local 035, const-eval.md §3.1). `read`'s sibling
+            // one level up: const-only exactly like it, behind the same
+            // `AssetReader`, with resolution, the walk, the sort and the
+            // build-input record all in the caller. One arm for the same
+            // reason the bundle pair shares one — the two spellings differ
+            // only in how deep the walk goes.
+            //
+            // Fuel is charged per ENTRY, the directory itself counting as one
+            // so an empty listing is not free, and after the walk (as `read`
+            // charges after its read).
+            "__read_asset_dir" | "__read_asset_dir_all" => {
+                let recursive = name == "__read_asset_dir_all";
+                let spelling = if recursive {
+                    "asset::read_dir_all"
+                } else {
+                    "asset::read_dir"
+                };
+                if !self.allow_assets {
+                    return Err(Failure::unsupported(format!(
+                        "`{spelling}` outside a `const` expression"
+                    )));
+                }
+                let path = expect_str(&take(0))?;
+                let Some(reader) = self.reader else {
+                    return Err(Failure::unsupported(format!(
+                        "the project's files (`{spelling}`)"
+                    )));
+                };
+                match reader.read_dir(&path, recursive) {
+                    Ok(entries) => {
+                        self.charge_amount(DIR_ENTRY_FUEL * (entries.len() as u64 + 1))?;
+                        let values = entries
+                            .into_iter()
+                            .map(|entry| Value::Str(entry.into()))
+                            .collect();
+                        Ok(Value::Array(Rc::new(RefCell::new(values))))
+                    }
+                    Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
+                }
+            }
+            // `asset::digest` — the file's sha-256 as lowercase hex
+            // (kolt.local 035, const-eval.md §3.1), which is what makes a
+            // content-hashed url mintable in the language that ships the file.
+            // Const-only and reader-backed like its siblings; the bytes are
+            // charged at an eighth of `read`'s rate, because they never enter
+            // the program and the result is 64 characters whatever the file
+            // weighs.
+            "__digest_asset" => {
                 if !self.allow_assets {
                     return Err(Failure::unsupported(
-                        "`asset::bundle` outside a `const` expression",
+                        "`asset::digest` outside a `const` expression",
                     ));
                 }
                 let path = expect_str(&take(0))?;
                 let Some(reader) = self.reader else {
                     return Err(Failure::unsupported(
-                        "the project's files (`asset::bundle`)",
+                        "the project's files (`asset::digest`)",
                     ));
                 };
-                self.charge_amount(BUNDLE_FUEL)?;
-                match reader.bundle(&path) {
-                    Ok(url) => Ok(Value::Str(url.into())),
+                match reader.digest(&path) {
+                    Ok((hex, bytes)) => {
+                        self.charge_amount(bytes.div_ceil(DIGEST_BYTES_PER_FUEL))?;
+                        Ok(Value::Str(hex.into()))
+                    }
                     Err(message) => Err(Failure::new(FailureKind::Thrown, message)),
                 }
             }

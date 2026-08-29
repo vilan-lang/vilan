@@ -7,4 +7,5 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 indexmap = "2.14.0"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 toml = "0.8"

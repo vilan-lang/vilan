@@ -2822,10 +2822,13 @@ pub struct Analyzer<'src> {
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
-    asset_emit_fn_id: Option<Id>,
-    asset_emit_keyed_fn_id: Option<Id>,
-    asset_read_fn_id: Option<Id>,
-    asset_bundle_fn_id: Option<Id>,
+    // `std::asset`'s const-only channel, in the order a diagnostic names its
+    // members. One list rather than one field per verb: the channel grows
+    // (four verbs in 2026-08, eight after kolt.local 035), and the const
+    // pass's three consumers — the R-fixpoint's seed set, the callee's own
+    // name, and the "(it reaches `…`)" parenthetical — each want the WHOLE
+    // channel, never one member of it.
+    asset_channel_fns: Vec<(Id, &'static str)>,
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
@@ -3388,10 +3391,7 @@ impl<'src> Analyzer<'src> {
             trait_body_scopes: HashSet::default(),
             trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
-            asset_emit_fn_id: None,
-            asset_emit_keyed_fn_id: None,
-            asset_read_fn_id: None,
-            asset_bundle_fn_id: None,
+            asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
             walk_depth: 0,
             walk_depth_refused: false,
@@ -33313,19 +33313,17 @@ pub struct Program<'src> {
     // the site by the argument's concrete type — a resource lowers to its `__drop`
     // helper, data is a no-op consume (destruction.md §6).
     pub drop_fn_id: Option<Id>,
-    /// `std::asset::emit` — the const-only compile-time effect (const-eval.md).
-    pub asset_emit_fn_id: Option<Id>,
-    /// `std::asset::emit_keyed` — `emit`'s ordered spelling, where the
-    /// contribution carries its own sort key (build-hooks.md §5.3):
-    /// const-only exactly like `emit`, and held separately only so a
-    /// diagnostic can name the spelling the program actually wrote.
-    pub asset_emit_keyed_fn_id: Option<Id>,
-    /// `std::asset::read` — the channel's input direction (docs-port.md §3.3):
-    /// const-only exactly like `emit`.
-    pub asset_read_fn_id: Option<Id>,
-    /// `std::asset::bundle` — the channel's output direction for whole FILES
-    /// (kolt.local 029): const-only exactly like its two siblings.
-    pub asset_bundle_fn_id: Option<Id>,
+    /// `std::asset`'s const-only channel — every verb no RUNTIME call path may
+    /// reach — paired with the `std::asset` path a diagnostic names it by, in
+    /// a fixed order so a member reaching more than one is NAMED for the same
+    /// one every run.
+    ///
+    /// Lines out in both spellings (`emit`, `emit_keyed` — const-eval.md §3,
+    /// build-hooks.md §5.3), text in (`read` — docs-port.md §3.3), whole files
+    /// out in both spellings (`bundle`, `bundle_as` — kolt.local 029/035), a
+    /// directory listing in (`read_dir`, `read_dir_all`), and a file's digest
+    /// in (`digest` — kolt.local 035, const-eval.md §3.1).
+    pub asset_channel_fns: Vec<(Id, &'static str)>,
     /// `const`-marked expression ids in walk order (const-eval.md §1).
     pub const_exprs: Vec<Id>,
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
@@ -37499,28 +37497,32 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
     }
-    // Remember `asset::emit`, `asset::emit_keyed`, `asset::read` and
-    // `asset::bundle` — the const-only compile-time channel: lines out (in
-    // both spellings), text in, and whole files out (const-eval.md §2-3,
-    // docs-port.md §3.3, build-hooks.md §5.3, kolt.local 029); the const pass
-    // enforces that no runtime call path reaches any of them.
+    // Remember `std::asset`'s const-only compile-time channel — lines out (in
+    // both spellings), text in, whole files out (in both spellings), a
+    // directory listing in, a digest in (const-eval.md §2-3 and §3.1,
+    // docs-port.md §3.3, build-hooks.md §5.3, kolt.local 029/035); the const
+    // pass enforces that no runtime call path reaches any of them. Order is
+    // the diagnostic's, so it is fixed here and read nowhere else.
     if let Some(asset_scope_id) = module_scopes.get("asset") {
-        analyzer.asset_emit_fn_id = analyzer
-            .scopes
-            .get(asset_scope_id)
-            .and_then(|scope| scope.name_to_id_map.get("emit").copied());
-        analyzer.asset_emit_keyed_fn_id = analyzer
-            .scopes
-            .get(asset_scope_id)
-            .and_then(|scope| scope.name_to_id_map.get("emit_keyed").copied());
-        analyzer.asset_read_fn_id = analyzer
-            .scopes
-            .get(asset_scope_id)
-            .and_then(|scope| scope.name_to_id_map.get("read").copied());
-        analyzer.asset_bundle_fn_id = analyzer
-            .scopes
-            .get(asset_scope_id)
-            .and_then(|scope| scope.name_to_id_map.get("bundle").copied());
+        analyzer.asset_channel_fns = [
+            ("emit", "asset::emit"),
+            ("emit_keyed", "asset::emit_keyed"),
+            ("read", "asset::read"),
+            ("bundle", "asset::bundle"),
+            ("bundle_as", "asset::bundle_as"),
+            ("read_dir", "asset::read_dir"),
+            ("read_dir_all", "asset::read_dir_all"),
+            ("digest", "asset::digest"),
+        ]
+        .into_iter()
+        .filter_map(|(member, path)| {
+            let id = analyzer
+                .scopes
+                .get(asset_scope_id)
+                .and_then(|scope| scope.name_to_id_map.get(member).copied())?;
+            Some((id, path))
+        })
+        .collect();
     }
     // Remember the std `Option`/`Result` enums and the `Try` trait: `expr!`
     // dispatches the std pair by identity and user types through `Try`
@@ -38613,10 +38615,7 @@ fn analyze_over_world<'src>(
         list_push_fn_id,
         panic_fn_id: analyzer.panic_fn_id,
         drop_fn_id: analyzer.drop_fn_id,
-        asset_emit_fn_id: analyzer.asset_emit_fn_id,
-        asset_emit_keyed_fn_id: analyzer.asset_emit_keyed_fn_id,
-        asset_read_fn_id: analyzer.asset_read_fn_id,
-        asset_bundle_fn_id: analyzer.asset_bundle_fn_id,
+        asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),
         const_results: HashMap::default(),
         const_assets: Vec::new(),

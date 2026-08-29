@@ -1,5 +1,7 @@
 //! The parse-error blackout, blanket-vs-specific dispatch (B73/B127/B130),
-//! remote sources, `std::markdown`, `std::path`, and `asset::bundle`.
+//! remote sources, `std::markdown`, `std::path`, and the const asset
+//! channel's file half — `asset::bundle`, and 035's `bundle_as` / `read_dir` /
+//! `read_dir_all` / `digest`.
 //!
 //! One subject module of the `inference` test binary; the harness it is
 //! written against lives in `support.rs`.
@@ -4423,6 +4425,581 @@ fn a_bundled_file_is_not_charged_by_its_size() {
     );
     assert_eq!(bundled.len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- kolt.local 035: the estate verbs — `read_dir`/`read_dir_all`, `bundle_as`,
+// --- `digest` (const-eval.md §3.1) ---------------------------------------------
+// The three gaps 029 left. `read_dir`/`read_dir_all` let const code ENUMERATE a
+// directory, so a static estate is a loop instead of a hand-written list of
+// `bundle` calls; `bundle_as` spells the target AT THE CALL, so a file can
+// answer on a url its path does not spell without anything being renamed behind
+// the author's back; `digest` is the sha-256 that makes a content-hashed url
+// mintable in the language that ships the file.
+
+/// A staged package root for the listing pins: a small tree with a nested
+/// directory, written in an order the sort has to undo, so a pin asserting the
+/// listing's ORDER is asserting the sort and not the host's `readdir`.
+fn estate_root(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("vilan-035-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("static/icons")).expect("create the estate");
+    // Deliberately reverse order, and the nested file first.
+    std::fs::write(root.join("static/icons/open.svg"), "open").expect("write");
+    std::fs::write(root.join("static/icons/close.svg"), "close").expect("write");
+    std::fs::write(root.join("static/robots.txt"), "ROBOTS\n").expect("write");
+    std::fs::write(root.join("static/logo.png"), "abc").expect("write");
+    root
+}
+
+/// The diagnostics an analysis against `root` produced — the failing-path twin
+/// of [`const_bundles`], which asserts a clean one.
+fn const_errors(source: &str, root: &Path) -> Vec<String> {
+    let source = source.to_string();
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (_, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            errors.into_iter().map(|error| error.msg).collect()
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[track_caller]
+fn assert_named(errors: &[String], part: &str) {
+    assert!(
+        errors.iter().any(|error| error.contains(part)),
+        "no diagnostic contains {part:?}; got: {errors:#?}"
+    );
+}
+
+/// The list a `const` folded to, as plain strings.
+#[track_caller]
+fn strings(value: &vilan_core::interpreter::ConstValue) -> Vec<String> {
+    match value {
+        vilan_core::interpreter::ConstValue::Array(elements) => elements
+            .iter()
+            .map(|element| match element {
+                vilan_core::interpreter::ConstValue::Str(text) => text.clone(),
+                other => panic!("a listing must fold to strings, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("a listing must fold to a list, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_recursive_listing_is_byte_sorted_over_files_only() {
+    // BOTH divergences from `std::fs::read_dir_all`, in one assert, because
+    // either one alone would pass vacuously on the other's failure:
+    //
+    //   - **Sorted.** A const result is compiled INTO the output, so host
+    //     iteration order would make one source tree produce two builds. This
+    //     is the determinism §9.5 rests on, not a convenience.
+    //   - **Files only.** `icons` is a directory and is NOT an entry: nothing
+    //     in the channel consumes a directory and there is no const `stat`, so
+    //     a directory entry would be one the estate recipe below could neither
+    //     act on nor filter out.
+    let root = estate_root("listing");
+    let (values, _, _) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _entries = const asset::read_dir_all("static");
+        }
+        main();
+        "#,
+        &root,
+    );
+    assert_eq!(
+        strings(&values[0]),
+        vec![
+            "icons/close.svg",
+            "icons/open.svg",
+            "logo.png",
+            "robots.txt"
+        ],
+        "byte-sorted on the WHOLE relative path, files only — `icons` itself is \
+         not an entry"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_immediate_listing_names_bare_entries_and_stops_there() {
+    // `read_dir`'s half of the shape `std::fs` sets: IMMEDIATE entries, as bare
+    // names rather than joined paths (what addresses one is `i"{dir}/{name}"`),
+    // and no descent — `icons/close.svg` is `read_dir_all`'s answer, not this
+    // one's.
+    let root = estate_root("immediate");
+    let (values, _, _) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _entries = const asset::read_dir("static");
+        }
+        main();
+        "#,
+        &root,
+    );
+    assert_eq!(
+        strings(&values[0]),
+        vec!["logo.png", "robots.txt"],
+        "immediate FILES, bare names, sorted — no descent and no directory"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn every_listed_directory_is_a_tracked_build_input() {
+    // The recorded-inputs doctrine `read` uses, per DIRECTORY WALKED — which is
+    // what makes it compose: a file appearing or disappearing anywhere in the
+    // tree moves exactly one recorded directory's key, so both directions
+    // invalidate. The keys must be the ones `directory_input_hash` computes,
+    // because that is what the CLI's per-leg skip re-hashes them with; if the
+    // two ever disagree, a listed directory disqualifies every skip forever (or,
+    // worse, compares equal when it should not).
+    let root = estate_root("tracked");
+    let (_, inputs, _) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _entries = const asset::read_dir_all("static");
+        }
+        main();
+        "#,
+        &root,
+    );
+    for directory in ["static", "static/icons"] {
+        let path = root.join(directory);
+        let recorded = inputs
+            .iter()
+            .find(|(recorded, _)| *recorded == path)
+            .unwrap_or_else(|| panic!("`{directory}` was not recorded: {inputs:?}"));
+        assert_eq!(
+            recorded.1,
+            vilan_core::const_eval::directory_input_hash(&path),
+            "the const pass and the per-leg skip must key `{directory}` the same way"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_new_file_moves_the_listed_directorys_input_key() {
+    // Appearance and disappearance both. Without this the estate recipe is a
+    // one-shot: a resource added under `--watch` would never join the build,
+    // because the leg's inputs would re-hash equal and the leg would skip.
+    let root = estate_root("membership");
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _entries = const asset::read_dir_all("static");
+        }
+        main();
+        "#;
+    let (_, before, _) = const_bundles(source, &root);
+    std::fs::write(root.join("static/icons/menu.svg"), "menu").expect("add a file");
+    let (values, after, _) = const_bundles(source, &root);
+    let key = |inputs: &[(PathBuf, Option<u64>)]| {
+        inputs
+            .iter()
+            .find(|(path, _)| *path == root.join("static/icons"))
+            .expect("the nested directory is recorded")
+            .1
+    };
+    assert_ne!(
+        key(&before),
+        key(&after),
+        "a file appearing in a listed directory must move its input key"
+    );
+    assert!(
+        strings(&values[0]).contains(&"icons/menu.svg".to_string()),
+        "and the new file must be in the listing: {:?}",
+        strings(&values[0])
+    );
+    std::fs::remove_file(root.join("static/icons/menu.svg")).expect("remove it again");
+    let (_, restored, _) = const_bundles(source, &root);
+    assert_eq!(
+        key(&before),
+        key(&restored),
+        "and removing it must put the key back — disappearance is the same event"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_listing_that_names_no_directory_is_refused() {
+    // A missing path and a path that is a FILE are both refused at the `const`
+    // expression, and the message names the call the author wrote. `read`'s
+    // posture, and `std::fs`'s.
+    let root = estate_root("nodir");
+    for (path, function) in [
+        ("nowhere", "asset::read_dir"),
+        ("static/logo.png", "asset::read_dir"),
+    ] {
+        let errors = const_errors(
+            Box::leak(
+                format!(
+                    r#"
+        import std::asset;
+        fun main() {{
+            let _entries = const asset::read_dir("{path}");
+        }}
+        main();
+        "#
+                )
+                .into_boxed_str(),
+            ),
+            &root,
+        );
+        assert_named(&errors, &format!("cannot list `{path}` with `{function}`"));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_listing_path_outside_the_package_root_is_refused() {
+    // `read`'s fence, lexically, before any filesystem look — and deliberately
+    // NOT `bundle`'s, which also refuses a backslash: a listing's argument
+    // addresses a directory to READ and never becomes derived output.
+    let absolute = if cfg!(windows) { "C:/Windows" } else { "/etc" };
+    assert_fails_with(
+        Box::leak(
+            format!(
+                r#"
+        import std::asset;
+        fun main() {{
+            let _entries = const asset::read_dir("{absolute}");
+        }}
+        main();
+        "#
+            )
+            .into_boxed_str(),
+        ),
+        &format!(
+            "`asset::read_dir` paths are relative to the package root; `{absolute}` is absolute"
+        ),
+    );
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun main() {
+            let _entries = const asset::read_dir_all("../outside");
+        }
+        main();
+        "#,
+        "`asset::read_dir_all` paths resolve inside the package root; `../outside` escapes it",
+    );
+}
+
+#[test]
+fn a_runtime_listing_is_rejected() {
+    // Const-only exactly like its siblings, and the R-fixpoint names WHICH verb
+    // the path reaches — a listing-reaching function says `asset::read_dir_all`,
+    // not `asset::emit`.
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _entries = asset::read_dir("static");
+        }
+        main();
+        "#,
+        r#"asset::read_dir("static")"#,
+        "compile-time-only",
+    );
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun estate(): List<str> {
+            asset::read_dir_all("static")
+        }
+        fun main() {
+            let _entries = estate();
+        }
+        main();
+        "#,
+        "`estate` (it reaches `asset::read_dir_all`) is compile-time-only",
+    );
+}
+
+#[test]
+fn a_bundle_as_target_is_the_url_and_the_output_name() {
+    // The whole point: the file stays where the author put it, and answers on a
+    // url its path does not spell. The registry row's NAME is the target (which
+    // is what `write_bundled` copies to and what the manifest carries), and its
+    // SOURCE is still the path.
+    let root = estate_root("target");
+    let (values, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _url = const asset::bundle_as("static/robots.txt", "/robots.txt");
+        }
+        main();
+        "#,
+        &root,
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "/robots.txt".to_string()
+        )],
+        "the call folds to the target url, which is what a `<link href>` wants"
+    );
+    assert_eq!(bundled.len(), 1);
+    assert_eq!(
+        bundled[0].1, "robots.txt",
+        "the output name is the target, not the path: {bundled:?}"
+    );
+    assert!(
+        bundled[0].0.ends_with("static/robots.txt"),
+        "and the source is still where the file actually is: {bundled:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_bundle_as_url_shape_is_refused() {
+    // The url the call returns IS the url the copy answers on, so every shape
+    // where the url spelled and the file served would part company is refused
+    // with the fix named. Each row is a distinct rule: one message for all of
+    // them would make three of these vacuous.
+    let root = estate_root("urlshape");
+    for (url, expected) in [
+        (
+            "robots.txt",
+            "urls start at the site root; `robots.txt` does not — write `/robots.txt`",
+        ),
+        ("/a\\\\b.txt", "urls are `/`-separated on every host"),
+        ("/a//b.txt", "has an empty segment"),
+        ("/a/./b.txt", "has a `.` segment"),
+        ("/a/../b.txt", "has a `..` segment"),
+        ("/", "has an empty segment"),
+    ] {
+        let errors = const_errors(
+            Box::leak(
+                format!(
+                    r#"
+        import std::asset;
+        fun main() {{
+            let _url = const asset::bundle_as("static/robots.txt", "{url}");
+        }}
+        main();
+        "#
+                )
+                .into_boxed_str(),
+            ),
+            &root,
+        );
+        assert_named(&errors, expected);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn two_sources_claiming_one_target_name_both() {
+    // The refusal the identity rule used to give for free: under `bundle` the
+    // path WAS the name, so two files could never claim one. The diagnostic
+    // carries BOTH sources, because a collision is a statement about a pair and
+    // naming one half of it sends the reader to the wrong call.
+    let root = estate_root("collision");
+    let errors = const_errors(
+        r#"
+        import std::asset;
+        fun main() {
+            let _one = const asset::bundle_as("static/robots.txt", "/pinned.txt");
+            let _two = const asset::bundle_as("static/logo.png", "/pinned.txt");
+        }
+        main();
+        "#,
+        &root,
+    );
+    assert_named(
+        &errors,
+        "`static/robots.txt` and `static/logo.png` both bundle to `/pinned.txt`",
+    );
+    assert_named(&errors, "give one of them a target of its own");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_same_source_and_target_twice_registers_once() {
+    // `bundle`'s dedup, unchanged by the target: one file at one url is one
+    // copy, one manifest row and one `serve_build` route, however many call
+    // sites named it.
+    let root = estate_root("dedup");
+    let (_, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _one = const asset::bundle_as("static/robots.txt", "/robots.txt");
+            let _two = const asset::bundle_as("./static/robots.txt", "/robots.txt");
+        }
+        main();
+        "#,
+        &root,
+    );
+    assert_eq!(
+        bundled.len(),
+        1,
+        "one (source, target) pair is one registration, `./` and all: {bundled:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_digest_is_the_sha256_of_the_files_bytes() {
+    // Against the canonical vector: sha-256("abc"). Lowercase hex, 64
+    // characters, of the BYTES — a fingerprint of a font or a `.png` must be a
+    // fingerprint of the file and not of a decoding.
+    let root = estate_root("digest");
+    let (values, _, _) = const_bundles(
+        r#"
+        import std::asset;
+        fun main() {
+            let _hex = const asset::digest("static/logo.png");
+        }
+        main();
+        "#,
+        &root,
+    );
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Str(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string()
+        )],
+        "the file holds `abc`, whose sha-256 is the standard test vector"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_digested_file_is_a_tracked_build_input() {
+    // Tracked exactly as `read`'s and `bundle`'s are, and it has to be: a
+    // fingerprinted url that did not re-mint when the file changed would serve
+    // last round's bytes under a name that promises they are immutable — the
+    // single worst failure the cache tier this exists for can have.
+    let root = estate_root("digesttrack");
+    let source = r#"
+        import std::asset;
+        fun main() {
+            let _hex = const asset::digest("static/logo.png");
+        }
+        main();
+        "#;
+    let (first, before, _) = const_bundles(source, &root);
+    std::fs::write(root.join("static/logo.png"), "abcd").expect("edit the file");
+    let (second, after, _) = const_bundles(source, &root);
+    assert_ne!(first, second, "the digest must follow the bytes");
+    let key = |inputs: &[(PathBuf, Option<u64>)]| {
+        inputs
+            .iter()
+            .find(|(path, _)| *path == root.join("static/logo.png"))
+            .expect("the digested file is recorded")
+            .1
+    };
+    assert_ne!(
+        key(&before),
+        key(&after),
+        "and its input record must move with them: {before:?} {after:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_runtime_digest_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        import std::asset;
+        fun main() {
+            let _hex = asset::digest("logo.png");
+        }
+        main();
+        "#,
+        r#"asset::digest("logo.png")"#,
+        "compile-time-only",
+    );
+    assert_fails_with(
+        r#"
+        import std::asset;
+        fun fingerprint(): str {
+            asset::digest("logo.png")
+        }
+        fun main() {
+            let _hex = fingerprint();
+        }
+        main();
+        "#,
+        "`fingerprint` (it reaches `asset::digest`) is compile-time-only",
+    );
+}
+
+#[test]
+fn the_estate_recipe_folds_to_one_url_per_file() {
+    // 035's recipe, whole: enumerate, rewrite the url as ordinary code, bundle
+    // each file at the url that rewrite produced — with the last one
+    // fingerprinted, which is 024's exhibit (kolt's fingerprints minted out of
+    // band) closed. Three verbs in one program, because what each is for is the
+    // other two.
+    let root = estate_root("recipe");
+    let (values, _, bundled) = const_bundles(
+        r#"
+        import std::asset;
+        fun estate(): List<str> {
+            mut urls: List<str> = [];
+            for file in asset::read_dir_all("static") {
+                urls.push(asset::bundle_as(i"static/{file}", i"/{file}"));
+            }
+            urls.push(asset::bundle_as(
+                "static/logo.png",
+                i"/hashed/logo.{asset::digest("static/logo.png").substring(0, 8)}.png",
+            ));
+            urls
+        }
+        fun main() {
+            let _estate = const estate();
+        }
+        main();
+        "#,
+        &root,
+    );
+    assert_eq!(
+        strings(&values[0]),
+        vec![
+            "/icons/close.svg",
+            "/icons/open.svg",
+            "/logo.png",
+            "/robots.txt",
+            // sha-256("abc") begins `ba7816bf`.
+            "/hashed/logo.ba7816bf.png",
+        ],
+        "every file lands at the url the loop minted, the prefix stripped"
+    );
+    let names: Vec<&str> = bundled.iter().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "icons/close.svg",
+            "icons/open.svg",
+            "logo.png",
+            "robots.txt",
+            "hashed/logo.ba7816bf.png",
+        ],
+        "and the build carries one copy per url: {bundled:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

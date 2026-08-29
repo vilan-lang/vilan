@@ -58,7 +58,8 @@ deterministic *per build-input closure*: same sources and same project
 files, same output — `emit` same lines out, `read` same values in,
 `bundle` same files carried.
 
-A function that reaches `emit`, `emit_keyed`, `read` or `bundle` is
+A function that reaches any verb of the channel — `emit`, `emit_keyed`,
+`read`, `bundle`, `bundle_as`, `read_dir`, `read_dir_all`, `digest` — is
 **compile-time-only**,
 transitively, and the compiler enforces that statically. A call from
 runtime code into compile-time-only territory is an error at the
@@ -85,8 +86,9 @@ Const evaluation is total by construction of the budget: each run is
 bounded by the interpreter's **fuel** (steps; an `asset::read` charges
 one per byte read, so fuel bounds input size too — an `asset::bundle`
 charges a flat cost instead, since its bytes never enter the program
-and a size charge would cap resources rather than work) and **depth**
-(nesting). Exhausting either, or panicking during evaluation, is a
+and a size charge would cap resources rather than work, a listing
+charges per entry, and an `asset::digest` charges per byte at an eighth
+of `read`'s rate) and **depth** (nesting). Exhausting either, or panicking during evaluation, is a
 compile error carrying the const expression's span; a budget failure
 says so, rather than reading as a program error. A runaway `const`
 fails the build; it cannot hang it. The fuel budget is sized so that
