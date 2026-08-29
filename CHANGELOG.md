@@ -22,6 +22,13 @@ than a band: ..."). Two entries tripped this in one cycle before it was
 written down.
 -->
 
+## Unreleased
+
+<!-- family: miscompile -->
+**An overwrite that destroys a resource ran the destructor BEFORE computing the new value — a right-hand side that panicked left the scope's `finally` to destroy the same value a second time.** R2's `holder = f()` lowers to "drop what the place holds, then write", and the drop was emitted ahead of the new value's own expression, which made the gap between them a live window: `f()` throws, the destructor has already run, and the scope-end teardown walks the corpse on the way out — the probe printed its `drop` line twice. On the JS backend that is a double `close()` of a `File`; on a native backend it is a double free, which is why this was taken now rather than left to the last-use lowering that subsumes it structurally later. **The fix is evaluation order, not lifetimes:** the new value is computed into a temporary first, then the old value is destroyed, then the write lands, so a throwing right-hand side leaves the place holding its original value — still owned, still dropped exactly once at the scope end. R2's ratified sentence survives unamended, because "drops the old value first, then moves the new one in" orders the destructor against the *write* and the drop still sits between the two; what the spec now says out loud is the half it never did, that the right-hand side's own effects are observable before the outgoing value's `drop` body runs. The temporary appears only where it can matter: a right-hand side that emits as literals and local reads can neither throw nor observe a destructor, so its drop stays exactly where it was, and every existing R2 golden is byte-identical because the corpus writes constructor literals. Both halves of R2 are covered — the owned binding and B94's write through a `&mut` view — each pinned red-first on a throwing right-hand side, alongside a pin that the success path still destroys the old value before the new one is stored. (backlog B151, reproduced on 0.38.0 by the lifetimes session's error-path probes; proposal/lifetimes.md §6; docs `spec/memory.md` §6.8)
+
+---
+
 ## v0.38.0 — 2026-08-28
 
 <!-- family: breaking -->

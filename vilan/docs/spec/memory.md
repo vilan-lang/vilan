@@ -470,6 +470,15 @@ changes no ownership and is policed by rule 4.
   so lending it is use-after-move (R1). The drop runs the same per-type glue
   in the same order the owned spelling does.
 
+  **The new value is computed before the old one is destroyed.** "Drops the
+  old value first" orders the destructor against the *write*, not against the
+  right-hand side's own evaluation: the assignment evaluates its new value,
+  then destroys what the place holds, then stores. So a right-hand side that
+  panics leaves the place holding its original value — still live, still
+  owned, and dropped exactly once at the scope end — rather than a value the
+  overwrite had already destroyed. Where the right-hand side has effects of
+  its own, they are observable before the outgoing value's `drop` body runs.
+
   The rule is read over the **place**, all the way down: writing over a
   resource-typed *component* — a field, a tuple element, a fixed-array
   element — destroys the outgoing value too, whether the aggregate is owned

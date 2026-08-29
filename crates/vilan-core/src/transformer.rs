@@ -4307,33 +4307,73 @@ impl<'src> Transformer<'src> {
                 // same storage the write is about to clobber — a resource `Local`,
                 // (B94) the synthetic `Dereference` of a writable view, whose
                 // pointee is the caller's value, and (B99) a COMPONENT projection,
-                // whose read is the drop's operand. The drop is pushed BEFORE the
-                // new value is walked, so it runs before the write clobbers the
-                // slot it reads — and, on the view path, before `__replace`
-                // truncates the payload out from under it (B89).
-                if let Some(&type_id) = self.program.overwrite_drops.get(&id) {
-                    let target = *target_id;
-                    let overwritten = match self.program.entity_map.get(&target) {
-                        Some(Expr::Local(binding)) => {
-                            Some(js::Node::Local(self.ng.name_for(*binding)))
-                        }
-                        Some(Expr::Dereference(operand)) => {
-                            let operand = *operand;
-                            self.walk_entity(operand, block)
-                        }
-                        Some(
-                            Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _) | Expr::Index(_, _),
-                        ) => self.walk_entity(target, block),
-                        _ => None,
-                    };
-                    if let Some(overwritten) = overwritten
-                        && let Some(drop) = self.resource_drop_of(type_id, overwritten)
-                    {
-                        block.push(drop);
+                // whose read is the drop's operand. The drop reads that storage
+                // before the write clobbers it — and, on the view path, before
+                // `__replace` truncates the payload out from under it (B89) — so
+                // the target place is read HERE, in source order, ahead of the
+                // new value's own effects.
+                let overwrite_drop = match self.program.overwrite_drops.get(&id) {
+                    Some(&type_id) => {
+                        let target = *target_id;
+                        let overwritten = match self.program.entity_map.get(&target) {
+                            Some(Expr::Local(binding)) => {
+                                Some(js::Node::Local(self.ng.name_for(*binding)))
+                            }
+                            Some(Expr::Dereference(operand)) => {
+                                let operand = *operand;
+                                self.walk_entity(operand, block)
+                            }
+                            Some(
+                                Expr::Field(_, _, _)
+                                | Expr::TupleIndex(_, _, _)
+                                | Expr::Index(_, _),
+                            ) => self.walk_entity(target, block),
+                            _ => None,
+                        };
+                        overwritten
+                            .and_then(|overwritten| self.resource_drop_of(type_id, overwritten))
                     }
-                }
-                let value = self.walk_entity(*value_id, block).unwrap_or(js::Node::Void);
+                    None => None,
+                };
+                // B151: the new value is computed BEFORE the old one is
+                // destroyed. Emitting the drop first left a window between the
+                // destructor and the write that a throwing right-hand side
+                // escaped through, and the scope-end `finally` then walked over
+                // the corpse — a double `close()` on the JS backend and a double
+                // free on a native one. R2's sentence survives the move: it
+                // promises the old value drops before the new one is MOVED IN,
+                // and the drop still sits between the two.
+                let mut evaluated: Vec<js::Node<'src>> = Vec::new();
+                let value = self
+                    .walk_entity(*value_id, &mut evaluated)
+                    .unwrap_or(js::Node::Void);
                 let value = self.maybe_clone(*value_id, value);
+                let value = match overwrite_drop {
+                    None => {
+                        block.append(&mut evaluated);
+                        value
+                    }
+                    // An INERT right-hand side — a tree of literals and reads of
+                    // locals, needing no prelude — can neither throw nor observe
+                    // the destructor, so the two orders are indistinguishable and
+                    // the drop stays where it was. This is what keeps every
+                    // existing R2 golden byte-identical: the corpus writes
+                    // constructor literals.
+                    Some(drop) if evaluated.is_empty() && Self::node_is_inert(&value) => {
+                        block.push(drop);
+                        value
+                    }
+                    Some(drop) => {
+                        block.append(&mut evaluated);
+                        let name = self.ng.next_name();
+                        block.push(js::Node::ConstVariable(js::Variable {
+                            name: name.clone(),
+                            value: Box::new(value),
+                        }));
+                        block.push(drop);
+                        js::Node::Local(name)
+                    }
+                };
                 // Writing a *whole value* through a view. A `Shared` write is a
                 // single-slot view (`cell.v`): rebind the slot, so every handle to
                 // the cell sees the new value (`cell.v = value`). An ordinary
@@ -7046,6 +7086,28 @@ impl<'src> Transformer<'src> {
             Box::new(js::Node::Local(helper)),
             vec![value],
         ))
+    }
+
+    /// Whether an emitted expression can neither throw nor observe a
+    /// destructor: a tree of literals and plain reads of already-declared
+    /// locals. R2's overwrite drop may stay AHEAD of such a right-hand side
+    /// (B151) — there is no window between the drop and the write for a throw
+    /// to escape through, and nothing in the expression can read the value
+    /// being destroyed — so both orders emit the same program and the shorter
+    /// one is kept. Anything else (a call, a property read, an `await`) gets
+    /// the temporary.
+    fn node_is_inert(node: &js::Node<'src>) -> bool {
+        match node {
+            js::Node::Local(_)
+            | js::Node::Number(_, _)
+            | js::Node::String(_)
+            | js::Node::Bool(_)
+            | js::Node::Null
+            | js::Node::Void => true,
+            js::Node::Array(items) => items.iter().all(Self::node_is_inert),
+            js::Node::Spread(inner) => Self::node_is_inert(inner),
+            _ => false,
+        }
     }
 
     /// Emit (once) the per-type `__drop` helper for `type_id` and return its name,

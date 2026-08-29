@@ -5597,3 +5597,137 @@ fn dropping_a_module_level_resource_is_rejected() {
         "module-level resource",
     );
 }
+
+// --- Order 19 / drop-safety: the two error-path defects the lifetimes session's
+// probes found on 0.38.0 (lifetimes.md §6 names both, and its last-use lowering
+// subsumes them structurally later; these are the narrow, now-shaped fixes).
+//
+// B151 — the mR2 overwrite double-drops when the RHS throws. The overwrite
+// lowering pushed the old value's destructor BEFORE walking the new value's
+// expression, so a panic in the RHS left the scope-end `finally` destroying an
+// already-destroyed value: a double `close()` today, a double free on a native
+// backend. The fix is evaluation ORDER, not lifetimes — the new value is
+// computed into a temporary first, then the old value drops, then the write
+// lands. memory.md §6.8's R2 sentence promises "drops the old value first, then
+// moves the new one in", which is a claim about the drop and the WRITE, and it
+// still holds: the drop stays ahead of the store.
+
+#[test]
+fn an_overwrite_whose_new_value_panics_drops_the_old_value_exactly_once() {
+    // Red-first (B151, probe E3 inverted): before the fix this printed "old"
+    // TWICE — once from the overwrite's drop, once from the scope-end `finally`
+    // walking over the corpse.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        enum Holder { Full(Guard), Empty }
+        fun boom(): Holder {
+            panic("boom");
+            Holder::Empty
+        }
+        fun main() {
+            mut holder = Holder::Full(Guard { tag = "old" });
+            holder = boom();
+            print("unreachable");
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "old\n",
+        "a throwing right-hand side must leave EXACTLY one drop of the old value"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn an_overwrite_drops_the_old_value_before_the_new_one_is_stored() {
+    // R2's ordering sentence, unchanged: the old value is destroyed before the
+    // new one moves in (so "old" precedes the scope-end "new"). A literal
+    // right-hand side cannot throw, so its emission is untouched by the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun main() {
+            mut guard = Guard { tag = "old" };
+            guard = Guard { tag = "new" };
+            print("body");
+        }
+        "#,
+        "old\nbody\nnew\n",
+    );
+}
+
+#[test]
+fn an_overwrite_evaluates_an_effectful_new_value_before_dropping_the_old_one() {
+    // The half B151 moves: the right-hand side runs FIRST, so a panic inside it
+    // never reaches a slot whose value is already destroyed. R2 is unharmed —
+    // the drop still precedes the store — but the effects of computing the new
+    // value now precede the old value's destructor, and that order is the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun make(): Guard {
+            print("made");
+            Guard { tag = "new" }
+        }
+        fun main() {
+            mut guard = Guard { tag = "old" };
+            guard = make();
+            print("body");
+        }
+        "#,
+        "made\nold\nbody\nnew\n",
+    );
+}
+
+#[test]
+fn an_overwrite_through_a_view_also_evaluates_before_it_destroys() {
+    // R2's loan half (B94) takes the same ordering: a write through a `&mut`
+    // view destroys the pointee, so a throwing right-hand side must not leave
+    // the caller's `finally` a destroyed value to walk over.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        resource struct Slot { held: Guard }
+        fun boom(): Slot {
+            panic("boom");
+            Slot { held = Guard { tag = "never" } }
+        }
+        fun refill(slot: &mut Slot) {
+            slot = boom();
+        }
+        fun main() {
+            mut slot = Slot { held = Guard { tag = "held" } };
+            refill(&mut slot);
+            print("unreachable");
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "held\n",
+        "a throwing right-hand side must leave EXACTLY one drop through the view too"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
