@@ -2236,6 +2236,12 @@ pub struct Analyzer<'src> {
     /// unconditional per-scope `try`/`finally` teardown, no runtime drop flags.
     /// Empty on resource-free programs, so their output stays byte-identical.
     dropped_bindings: HashSet<Id>,
+    /// B150: the enrolled bindings an explicit `drop(x)` destroys early. Their
+    /// teardown is emitted as a PAIR — the sink empties the slot, the scope's
+    /// `finally` destroys only a slot that is still full — so a panic before
+    /// the sink still releases the resource and the fall-through path still
+    /// destroys exactly once. Filled by `plan_resource_drops`.
+    explicit_drop_bindings: HashSet<Id>,
     /// Assignment expression ids that overwrite a live resource — the old value
     /// drops first, then the new one moves in (R2) — mapped to the type of the
     /// value being overwritten. Two shapes share the map: a still-owned resource
@@ -3211,6 +3217,7 @@ impl<'src> Analyzer<'src> {
             reported_container_structures: HashSet::default(),
             resource_value_places: HashSet::default(),
             dropped_bindings: HashSet::default(),
+            explicit_drop_bindings: HashSet::default(),
             overwrite_drops: HashMap::default(),
             drop_methods: HashMap::default(),
             drop_glue: HashMap::default(),
@@ -7647,9 +7654,11 @@ impl<'src> Analyzer<'src> {
             .collect();
         let place_overwrites =
             self.collect_place_overwrites(&bindings, &self.resource_value_places);
+        let explicitly_dropped = self.explicitly_dropped_bindings(&owned_bindings);
         let resources = ResourceOwnership {
             owned_bindings,
             place_overwrites,
+            explicitly_dropped,
         };
         // The resource types reached by a `drop(db)` sink call, per enclosing scan
         // root (destruction.md §8 platform coloring): a sink call is invisible to
@@ -7663,6 +7672,7 @@ impl<'src> Analyzer<'src> {
         {
             return;
         }
+        self.explicit_drop_bindings = resources.explicitly_dropped.clone();
         let mut dropped: HashSet<Id> = HashSet::default();
         let mut overwrites: HashMap<Id, TypeId> = HashMap::default();
         // Per scan-root, the resource types it drops (for the §8 coloring edges).
@@ -7716,9 +7726,10 @@ impl<'src> Analyzer<'src> {
             );
             // An own resource parameter still owned at the fall-through end was
             // never moved out, so it drops here (`plan_scope` removes only the
-            // scope's own declared locals, never parameters).
+            // scope's own declared locals, never parameters) — and so does one
+            // an explicit `drop(x)` moved out, which stays enrolled (B150).
             for parameter in own_params {
-                if owned.contains(parameter) {
+                if owned.contains(parameter) || resources.explicitly_dropped.contains(parameter) {
                     root_dropped.insert(*parameter);
                 }
             }
@@ -7939,8 +7950,14 @@ impl<'src> Analyzer<'src> {
         // Scope end: a resource local declared here and still owning its value
         // drops here. Either way it leaves scope, so it no longer counts as owned
         // for any enclosing scope.
+        //
+        // B150: a binding an explicit `drop(x)` moved out enrolls too. The sink
+        // is not the last word on whether the value is still alive at the scope
+        // end — a panic between the acquisition and the `drop(x)` never reaches
+        // it — so the teardown `finally` stays, and the transformer makes the
+        // pair idempotent (the sink empties the slot, the `finally` tests it).
         for variable_id in &declared_here {
-            if owned.remove(variable_id) {
+            if owned.remove(variable_id) || resources.explicitly_dropped.contains(variable_id) {
                 dropped.insert(*variable_id);
             }
         }
@@ -8406,6 +8423,37 @@ impl<'src> Analyzer<'src> {
             .keys()
             .filter_map(|call_id| self.drop_sink_argument_of(*call_id))
             .filter_map(|argument_id| self.drop_sink_argument_type_id(argument_id))
+            .collect()
+    }
+
+    /// B150: the bindings an explicit `drop(x)` destroys early — the sink calls
+    /// whose argument is a bare place rather than a value. Each stays enrolled
+    /// in `dropped_bindings`, so its scope keeps the teardown `finally` a panic
+    /// before the sink has to flow through; the transformer pairs the two so
+    /// the fall-through path still destroys exactly once.
+    ///
+    /// No control flow is consulted, and none is needed: R7 rejects a
+    /// conditional move outright, so an accepted `drop(x)` runs on every path
+    /// through its scope. Recognition goes through `drop_sink_argument_of`, the
+    /// one place the sink is identified, so this cannot drift from the glue
+    /// seeding or the §8 coloring edges. A `drop(f(x))` names no binding and is
+    /// absent here: the value it destroys was never enrolled to begin with.
+    fn explicitly_dropped_bindings(&self, owned_bindings: &HashSet<Id>) -> HashSet<Id> {
+        if self.drop_fn_id.is_none() {
+            return HashSet::default();
+        }
+        self.function_calls
+            .keys()
+            .filter_map(|call_id| self.drop_sink_argument_of(*call_id))
+            .filter_map(
+                |argument_id| match self.expr_id_to_expr_map.get(&argument_id) {
+                    // A parameter in expression position is an `Expr::Local` of the
+                    // parameter's id, so both spellings arrive through this arm.
+                    Some(Expr::Local(binding) | Expr::Parameter(binding)) => Some(*binding),
+                    _ => None,
+                },
+            )
+            .filter(|binding| owned_bindings.contains(binding))
             .collect()
     }
 
@@ -10426,6 +10474,15 @@ impl<'src> Analyzer<'src> {
                 .collect(),
             place_overwrites: self
                 .collect_place_overwrites(resource_bindings, resource_value_places),
+            // Empty here, deliberately: B150's enrollment answers "does this
+            // scope still owe a teardown on the panicking path", which is a
+            // codegen question, and this scan asks the R11 one — "would this
+            // erased body owe a destruction it cannot emit". A `drop(x)` sink
+            // IS the destruction site, so it must keep exempting the binding,
+            // exactly as it did before. (A `drop(x)` on a still-abstract `T` is
+            // separately rejected under a resource instantiation, so no
+            // delta-resource binding reaches the guarded pair anyway.)
+            explicitly_dropped: HashSet::default(),
         };
         self.plan_scope(
             &[],
@@ -32951,6 +33008,12 @@ struct ResourceOwnership {
     /// [`Analyzer::collect_place_overwrites`] for why neither asks a liveness
     /// question.
     place_overwrites: HashMap<Id, TypeId>,
+    /// B150: the bindings an explicit `drop(x)` destroys early. They stay
+    /// ENROLLED in the scope-end teardown even though the sink moved them out,
+    /// because a panic between the acquisition and the `drop(x)` must still
+    /// release the resource; the emitted pair is made idempotent instead (the
+    /// sink empties the slot, the `finally` destroys only a full one).
+    explicitly_dropped: HashSet<Id>,
 }
 
 /// What `compute_capture_clone_sites` settles about a program's pattern
@@ -33388,6 +33451,13 @@ pub struct Program<'src> {
     /// scope in `try`/`finally`, dropping them in reverse declaration order.
     /// Filled by `plan_resource_drops`; empty on resource-free programs.
     pub dropped_bindings: HashSet<Id>,
+    /// B150: the enrolled bindings an explicit `drop(x)` destroys early. The
+    /// transformer emits their teardown as a pair — the sink empties the slot,
+    /// the scope-end `finally` destroys only a slot that is still full — so a
+    /// panic before the `drop(x)` still releases the resource while the
+    /// fall-through path destroys exactly once. Empty unless a program calls
+    /// the sink on a binding.
+    pub explicit_drop_bindings: HashSet<Id>,
     /// Destruction (R2): assignment expression ids that overwrite a live
     /// resource — the old value drops before the new one moves in — mapped to
     /// the type of the value being overwritten. Covers both the owned binding
@@ -38413,6 +38483,7 @@ fn analyze_over_world<'src>(
         materialized_captures: capture_plan.materialized,
         resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
+        explicit_drop_bindings: std::mem::take(&mut analyzer.explicit_drop_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
         drop_glue: std::mem::take(&mut analyzer.drop_glue),
         drop_sink_value_types: std::mem::take(&mut analyzer.drop_sink_value_types),

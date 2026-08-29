@@ -5597,3 +5597,416 @@ fn dropping_a_module_level_resource_is_rejected() {
         "module-level resource",
     );
 }
+
+// --- Order 19 / drop-safety: the two error-path defects the lifetimes session's
+// probes found on 0.38.0 (lifetimes.md §6 names both, and its last-use lowering
+// subsumes them structurally later; these are the narrow, now-shaped fixes).
+//
+// B151 — the mR2 overwrite double-drops when the RHS throws. The overwrite
+// lowering pushed the old value's destructor BEFORE walking the new value's
+// expression, so a panic in the RHS left the scope-end `finally` destroying an
+// already-destroyed value: a double `close()` today, a double free on a native
+// backend. The fix is evaluation ORDER, not lifetimes — the new value is
+// computed into a temporary first, then the old value drops, then the write
+// lands. memory.md §6.8's R2 sentence promises "drops the old value first, then
+// moves the new one in", which is a claim about the drop and the WRITE, and it
+// still holds: the drop stays ahead of the store.
+
+#[test]
+fn an_overwrite_whose_new_value_panics_drops_the_old_value_exactly_once() {
+    // Red-first (B151, probe E3 inverted): before the fix this printed "old"
+    // TWICE — once from the overwrite's drop, once from the scope-end `finally`
+    // walking over the corpse.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        enum Holder { Full(Guard), Empty }
+        fun boom(): Holder {
+            panic("boom");
+            Holder::Empty
+        }
+        fun main() {
+            mut holder = Holder::Full(Guard { tag = "old" });
+            holder = boom();
+            print("unreachable");
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "old\n",
+        "a throwing right-hand side must leave EXACTLY one drop of the old value"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn an_overwrite_drops_the_old_value_before_the_new_one_is_stored() {
+    // R2's ordering sentence, unchanged: the old value is destroyed before the
+    // new one moves in (so "old" precedes the scope-end "new"). A literal
+    // right-hand side cannot throw, so its emission is untouched by the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun main() {
+            mut guard = Guard { tag = "old" };
+            guard = Guard { tag = "new" };
+            print("body");
+        }
+        "#,
+        "old\nbody\nnew\n",
+    );
+}
+
+#[test]
+fn an_overwrite_evaluates_an_effectful_new_value_before_dropping_the_old_one() {
+    // The half B151 moves: the right-hand side runs FIRST, so a panic inside it
+    // never reaches a slot whose value is already destroyed. R2 is unharmed —
+    // the drop still precedes the store — but the effects of computing the new
+    // value now precede the old value's destructor, and that order is the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun make(): Guard {
+            print("made");
+            Guard { tag = "new" }
+        }
+        fun main() {
+            mut guard = Guard { tag = "old" };
+            guard = make();
+            print("body");
+        }
+        "#,
+        "made\nold\nbody\nnew\n",
+    );
+}
+
+#[test]
+fn an_overwrite_through_a_view_also_evaluates_before_it_destroys() {
+    // R2's loan half (B94) takes the same ordering: a write through a `&mut`
+    // view destroys the pointee, so a throwing right-hand side must not leave
+    // the caller's `finally` a destroyed value to walk over.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        resource struct Guard { tag: str }
+        impl Guard with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        resource struct Slot { held: Guard }
+        fun boom(): Slot {
+            panic("boom");
+            Slot { held = Guard { tag = "never" } }
+        }
+        fun refill(slot: &mut Slot) {
+            slot = boom();
+        }
+        fun main() {
+            mut slot = Slot { held = Guard { tag = "held" } };
+            refill(&mut slot);
+            print("unreachable");
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "held\n",
+        "a throwing right-hand side must leave EXACTLY one drop through the view too"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+// B150 — `drop(x)` is not exception-safe. The explicit drop moved the binding
+// into the sink, so `plan_resource_drops` unenrolled it and the scope's
+// teardown `finally` disappeared: a panic between the acquisition and the
+// `drop(x)` leaked the resource permanently, where a scope-end drop would have
+// released it. The fix keeps the binding enrolled and makes the pair
+// idempotent — the sink empties the slot (`= null`, the moved-out state
+// `Option.take` leaves behind), and the `finally` destroys only a slot that is
+// still full. The test is the emitted machinery's, not the source language's:
+// mR7's ban on runtime drop flags is about CONDITIONAL moves, and R7 already
+// rejects a conditional `drop(x)` outright.
+
+#[test]
+fn a_panic_before_an_explicit_drop_still_releases_the_resource() {
+    // Red-first (B150, probe E2 inverted): before the fix stdout stopped at
+    // "acquired" — the `finally` was gone and "released" never printed.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun boom() { panic("boom"); }
+        fun leaky() {
+            let r = Res { tag = "released" };
+            print("acquired");
+            boom();
+            drop(r);
+            print("after");
+        }
+        fun main() { leaky(); }
+        "#,
+    );
+    assert_eq!(
+        stdout, "acquired\nreleased\n",
+        "a panic before the explicit drop must still run the scope's teardown"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn an_explicit_drop_on_the_normal_path_destroys_exactly_once() {
+    // The other half of the pair: with the `finally` back, the fall-through
+    // path must NOT drop twice. The early teardown still happens EARLY — the
+    // print after it observes a released resource.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun early() {
+            let r = Res { tag = "released" };
+            print("acquired");
+            drop(r);
+            print("after");
+        }
+        fun main() { early(); }
+        "#,
+        "acquired\nreleased\nafter\n",
+    );
+}
+
+#[test]
+fn an_explicit_drop_empties_the_slot_its_finally_tests() {
+    // The emitted machinery, pinned on the bytes: the sink writes the slot
+    // empty and the scope-end teardown reads that emptiness. Both halves must
+    // be present — either alone is a leak or a double drop.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun early() {
+            let r = Res { tag = "released" };
+            drop(r);
+            print("after");
+        }
+        fun main() { early(); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("= null"),
+        "the explicit drop must empty the slot:\n{js}"
+    );
+    assert!(
+        js.contains("!== null") && js.contains("finally"),
+        "the scope-end teardown must test the slot before destroying it:\n{js}"
+    );
+}
+
+#[test]
+fn a_resource_with_no_explicit_drop_keeps_its_unguarded_teardown() {
+    // The delta is scoped to the bindings an explicit `drop(x)` reaches: a
+    // scope that never calls the sink emits the same bare `finally` it always
+    // did, with no emptiness test and no rebindable slot.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun scoped() {
+            let r = Res { tag = "released" };
+            print("body");
+        }
+        fun main() { scoped(); }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("finally"),
+        "the teardown must still be there:\n{js}"
+    );
+    assert!(
+        !js.contains("!== null"),
+        "an unguarded teardown must not grow an emptiness test:\n{js}"
+    );
+}
+
+#[test]
+fn a_panic_before_dropping_an_own_parameter_still_releases_it() {
+    // The same pair on an `own` resource PARAMETER, whose teardown wraps the
+    // whole body (destruction.md §6) rather than riding a `let`.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun boom() { panic("boom"); }
+        fun sink(own r: Res) {
+            print("entered");
+            boom();
+            drop(r);
+        }
+        fun main() { sink(Res { tag = "released" }); }
+        "#,
+    );
+    assert_eq!(
+        stdout, "entered\nreleased\n",
+        "an own parameter dropped explicitly must still drop when a panic beats the sink"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn an_own_parameter_dropped_explicitly_destroys_exactly_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun sink(own r: Res) {
+            print("entered");
+            drop(r);
+            print("after");
+        }
+        fun main() { sink(Res { tag = "released" }); }
+        "#,
+        "entered\nreleased\nafter\n",
+    );
+}
+
+#[test]
+fn a_panic_before_dropping_a_match_capture_still_releases_it() {
+    // The `match opt.take() { Some(let c) => drop(c), ... }` idiom memory.md
+    // §6.8 sanctions for conditional teardown: its capture owns the payload, so
+    // it owes the same exception safety a `let` does.
+    let (stdout, _stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::panic;
+        import std::drop::Drop;
+        import std::drop::drop;
+        import std::option::Option;
+        import std::option::Some;
+        import std::option::None;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun boom() { panic("boom"); }
+        fun teardown() {
+            mut full: Option<Res> = Some(Res { tag = "released" });
+            match full.take() {
+                Some(let c) => {
+                    print("captured");
+                    boom();
+                    drop(c);
+                },
+                None => {},
+            }
+        }
+        fun main() { teardown(); }
+        "#,
+    );
+    assert_eq!(
+        stdout, "captured\nreleased\n",
+        "a captured payload must drop even when a panic beats its explicit drop"
+    );
+    assert_ne!(code, 0, "the panic must still take the process down");
+}
+
+#[test]
+fn a_match_capture_dropped_explicitly_destroys_exactly_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        import std::option::Option;
+        import std::option::Some;
+        import std::option::None;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun teardown() {
+            mut full: Option<Res> = Some(Res { tag = "released" });
+            match full.take() {
+                Some(let c) => drop(c),
+                None => {},
+            }
+            print("after");
+        }
+        fun main() { teardown(); }
+        "#,
+        "released\nafter\n",
+    );
+}
+
+#[test]
+fn a_binding_reassigned_after_its_explicit_drop_destroys_each_value_once() {
+    // The ordering-sensitive corner where the two halves meet: the sink empties
+    // the slot, the assignment refills it, and the guarded `finally` destroys
+    // the SECOND value only. No overwrite drop fires — the slot was empty.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::drop::drop;
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) { print(self.tag); }
+        }
+        fun reuse() {
+            mut r = Res { tag = "one" };
+            drop(r);
+            r = Res { tag = "two" };
+            print("body");
+        }
+        fun main() { reuse(); }
+        "#,
+        "one\nbody\ntwo\n",
+    );
+}

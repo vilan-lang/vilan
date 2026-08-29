@@ -3584,25 +3584,50 @@ impl<'src> Transformer<'src> {
                         }
                         if Some(target_id) == self.drop_fn_id {
                             let arg_node = args.into_iter().next().unwrap_or(js::Node::Void);
-                            let argument_type =
-                                function_call
-                                    .argument_ids
-                                    .first()
-                                    .copied()
-                                    .map(|argument_id| {
-                                        self.drop_argument_type_id(argument_id)
-                                            .map(|type_id| self.resolve_type_id(type_id))
-                                    });
+                            let argument_id = function_call.argument_ids.first().copied();
+                            let argument_type = argument_id.map(|argument_id| {
+                                self.drop_argument_type_id(argument_id)
+                                    .map(|type_id| self.resolve_type_id(type_id))
+                            });
                             match argument_type {
                                 // A resource: its `__drop` helper. Data (no glue
                                 // for the type): the no-op consume, which still
                                 // evaluates the argument for its effects.
                                 Some(Some(type_id)) => match self.ensure_drop_helper(type_id) {
                                     Some(helper) => {
-                                        return Some(js::Node::Call(
+                                        let drop = js::Node::Call(
                                             Box::new(js::Node::Local(helper)),
-                                            vec![arg_node],
-                                        ));
+                                            vec![arg_node.clone()],
+                                        );
+                                        // B150: the sink no longer takes the
+                                        // binding's teardown away with it — the
+                                        // scope's `finally` stays, so a panic
+                                        // before this line still releases the
+                                        // resource. What keeps the fall-through
+                                        // path destroying exactly once is the
+                                        // other half of the pair: the slot is
+                                        // left EMPTY, which is the moved-out
+                                        // state `Option.take` writes for the
+                                        // same reason, and the `finally` tests
+                                        // it. `arg_node` is the very node the
+                                        // teardown reads (a local, or a leg's
+                                        // payload accessor), so the two cannot
+                                        // name different storage.
+                                        let empties_slot = argument_id
+                                            .and_then(|argument_id| {
+                                                self.place_binding_of(argument_id)
+                                            })
+                                            .is_some_and(|binding| {
+                                                self.slot_is_emptied_early(binding)
+                                            });
+                                        if empties_slot {
+                                            block.push(drop);
+                                            return Some(js::Node::Assignment(
+                                                Box::new(arg_node),
+                                                Box::new(js::Node::Null),
+                                            ));
+                                        }
+                                        return Some(drop);
                                     }
                                     None => return Some(arg_node),
                                 },
@@ -4293,7 +4318,11 @@ impl<'src> Transformer<'src> {
                     name,
                     value: Box::new(value),
                 };
-                if mutable {
+                // B150: a slot an explicit `drop(x)` empties is rebound once,
+                // so it is declared `let` even for an immutable vilan binding.
+                // The affine rules make that invisible to the program — the
+                // binding is dead after the move, so nothing may read it again.
+                if mutable || self.slot_is_emptied_early(*id) {
                     js::Node::LetVariable(js_variable)
                 } else {
                     js::Node::ConstVariable(js_variable)
@@ -4313,33 +4342,73 @@ impl<'src> Transformer<'src> {
                 // same storage the write is about to clobber — a resource `Local`,
                 // (B94) the synthetic `Dereference` of a writable view, whose
                 // pointee is the caller's value, and (B99) a COMPONENT projection,
-                // whose read is the drop's operand. The drop is pushed BEFORE the
-                // new value is walked, so it runs before the write clobbers the
-                // slot it reads — and, on the view path, before `__replace`
-                // truncates the payload out from under it (B89).
-                if let Some(&type_id) = self.program.overwrite_drops.get(&id) {
-                    let target = *target_id;
-                    let overwritten = match self.program.entity_map.get(&target) {
-                        Some(Expr::Local(binding)) => {
-                            Some(js::Node::Local(self.ng.name_for(*binding)))
-                        }
-                        Some(Expr::Dereference(operand)) => {
-                            let operand = *operand;
-                            self.walk_entity(operand, block)
-                        }
-                        Some(
-                            Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _) | Expr::Index(_, _),
-                        ) => self.walk_entity(target, block),
-                        _ => None,
-                    };
-                    if let Some(overwritten) = overwritten
-                        && let Some(drop) = self.resource_drop_of(type_id, overwritten)
-                    {
-                        block.push(drop);
+                // whose read is the drop's operand. The drop reads that storage
+                // before the write clobbers it — and, on the view path, before
+                // `__replace` truncates the payload out from under it (B89) — so
+                // the target place is read HERE, in source order, ahead of the
+                // new value's own effects.
+                let overwrite_drop = match self.program.overwrite_drops.get(&id) {
+                    Some(&type_id) => {
+                        let target = *target_id;
+                        let overwritten = match self.program.entity_map.get(&target) {
+                            Some(Expr::Local(binding)) => {
+                                Some(js::Node::Local(self.ng.name_for(*binding)))
+                            }
+                            Some(Expr::Dereference(operand)) => {
+                                let operand = *operand;
+                                self.walk_entity(operand, block)
+                            }
+                            Some(
+                                Expr::Field(_, _, _)
+                                | Expr::TupleIndex(_, _, _)
+                                | Expr::Index(_, _),
+                            ) => self.walk_entity(target, block),
+                            _ => None,
+                        };
+                        overwritten
+                            .and_then(|overwritten| self.resource_drop_of(type_id, overwritten))
                     }
-                }
-                let value = self.walk_entity(*value_id, block).unwrap_or(js::Node::Void);
+                    None => None,
+                };
+                // B151: the new value is computed BEFORE the old one is
+                // destroyed. Emitting the drop first left a window between the
+                // destructor and the write that a throwing right-hand side
+                // escaped through, and the scope-end `finally` then walked over
+                // the corpse — a double `close()` on the JS backend and a double
+                // free on a native one. R2's sentence survives the move: it
+                // promises the old value drops before the new one is MOVED IN,
+                // and the drop still sits between the two.
+                let mut evaluated: Vec<js::Node<'src>> = Vec::new();
+                let value = self
+                    .walk_entity(*value_id, &mut evaluated)
+                    .unwrap_or(js::Node::Void);
                 let value = self.maybe_clone(*value_id, value);
+                let value = match overwrite_drop {
+                    None => {
+                        block.append(&mut evaluated);
+                        value
+                    }
+                    // An INERT right-hand side — a tree of literals and reads of
+                    // locals, needing no prelude — can neither throw nor observe
+                    // the destructor, so the two orders are indistinguishable and
+                    // the drop stays where it was. This is what keeps every
+                    // existing R2 golden byte-identical: the corpus writes
+                    // constructor literals.
+                    Some(drop) if evaluated.is_empty() && Self::node_is_inert(&value) => {
+                        block.push(drop);
+                        value
+                    }
+                    Some(drop) => {
+                        block.append(&mut evaluated);
+                        let name = self.ng.next_name();
+                        block.push(js::Node::ConstVariable(js::Variable {
+                            name: name.clone(),
+                            value: Box::new(value),
+                        }));
+                        block.push(drop);
+                        js::Node::Local(name)
+                    }
+                };
                 // Writing a *whole value* through a view. A `Shared` write is a
                 // single-slot view (`cell.v`): rebind the slot, so every handle to
                 // the cell sees the new value (`cell.v = value`). An ordinary
@@ -5559,7 +5628,8 @@ impl<'src> Transformer<'src> {
                 .variables
                 .get(&capture_id)
                 .is_some_and(|variable| variable.mutable);
-            out.push(if mutable {
+            // B150: a capture an explicit `drop(c)` empties is rebound once.
+            out.push(if mutable || self.slot_is_emptied_early(capture_id) {
                 js::Node::LetVariable(variable)
             } else {
                 js::Node::ConstVariable(variable)
@@ -6115,7 +6185,8 @@ impl<'src> Transformer<'src> {
                     name,
                     value: Box::new(subject),
                 };
-                bindings.push(if mutable {
+                // B150: a capture an explicit `drop(c)` empties is rebound once.
+                bindings.push(if mutable || self.slot_is_emptied_early(*capture_id) {
                     js::Node::LetVariable(variable)
                 } else {
                     js::Node::ConstVariable(variable)
@@ -6271,7 +6342,7 @@ impl<'src> Transformer<'src> {
         let mut finally: Vec<js::Node<'src>> = Vec::new();
         for (parameter_id, type_id) in param_drops.iter().rev() {
             let value = js::Node::Local(self.ng.name_for(*parameter_id));
-            if let Some(drop) = self.resource_drop_of(*type_id, value) {
+            if let Some(drop) = self.slot_drop_node(*parameter_id, *type_id, value) {
                 finally.push(drop);
             }
         }
@@ -6887,7 +6958,7 @@ impl<'src> Transformer<'src> {
             };
             let accessor = self.is_bindings.get(&capture_id).cloned();
             let value = accessor.unwrap_or_else(|| js::Node::Local(self.ng.name_for(capture_id)));
-            if let Some(drop) = self.resource_drop_of(type_id, value) {
+            if let Some(drop) = self.slot_drop_node(capture_id, type_id, value) {
                 drops.push(drop);
             }
         }
@@ -6944,7 +7015,7 @@ impl<'src> Transformer<'src> {
                     ScopeTeardown::Binding(variable_id) => {
                         let type_id = self.program.variables.get(&variable_id).unwrap().type_id;
                         let value = js::Node::Local(self.ng.name_for(variable_id));
-                        self.resource_drop_of(type_id, value)
+                        self.slot_drop_node(variable_id, type_id, value)
                             .map(|node| vec![node])
                             .unwrap_or_default()
                     }
@@ -7080,6 +7151,80 @@ impl<'src> Transformer<'src> {
             Box::new(js::Node::Local(helper)),
             vec![value],
         ))
+    }
+
+    /// Whether an emitted expression can neither throw nor observe a
+    /// destructor: a tree of literals and plain reads of already-declared
+    /// locals. R2's overwrite drop may stay AHEAD of such a right-hand side
+    /// (B151) — there is no window between the drop and the write for a throw
+    /// to escape through, and nothing in the expression can read the value
+    /// being destroyed — so both orders emit the same program and the shorter
+    /// one is kept. Anything else (a call, a property read, an `await`) gets
+    /// the temporary.
+    fn node_is_inert(node: &js::Node<'src>) -> bool {
+        match node {
+            js::Node::Local(_)
+            | js::Node::Number(_, _)
+            | js::Node::String(_)
+            | js::Node::Bool(_)
+            | js::Node::Null
+            | js::Node::Void => true,
+            js::Node::Array(items) => items.iter().all(Self::node_is_inert),
+            js::Node::Spread(inner) => Self::node_is_inert(inner),
+            _ => false,
+        }
+    }
+
+    /// The binding an expression NAMES, when it is a bare place: a local, a
+    /// pattern capture, or a parameter (which reaches expression position as an
+    /// `Expr::Local` of the parameter's id). `None` for a value expression,
+    /// which owns no slot anyone else can read.
+    fn place_binding_of(&self, expr_id: Id) -> Option<Id> {
+        match self.program.entity_map.get(&expr_id) {
+            Some(Expr::Local(binding) | Expr::Parameter(binding)) => Some(*binding),
+            _ => None,
+        }
+    }
+
+    /// Whether `binding`'s teardown is the GUARDED half of B150's pair: an
+    /// explicit `drop(x)` reaches it, so the value may already be gone by the
+    /// time the scope's `finally` runs. Every other binding keeps the bare,
+    /// unconditional drop it always had, which is what keeps a program that
+    /// never calls the sink byte-identical.
+    fn slot_is_emptied_early(&self, binding: Id) -> bool {
+        self.program.explicit_drop_bindings.contains(&binding)
+            && self.program.dropped_bindings.contains(&binding)
+    }
+
+    /// The scope-end teardown statement for `binding`, reading `slot`.
+    ///
+    /// For an ordinary owner that is the bare destructor call. For a binding an
+    /// explicit `drop(x)` may already have destroyed (B150) it is the same call
+    /// under the emptiness test the sink's `slot = null` answers — the emitted
+    /// discriminant test the enum drop glue already uses, applied to a whole
+    /// slot rather than a payload. This is emission machinery, not a semantic
+    /// drop flag: mR7 bans runtime flags for CONDITIONAL moves, and R7 rejects
+    /// a conditional `drop(x)` outright, so the pair guards an UNCONDITIONAL
+    /// early teardown against a path that never reached it.
+    fn slot_drop_node(
+        &mut self,
+        binding: Id,
+        type_id: TypeId,
+        slot: js::Node<'src>,
+    ) -> Option<js::Node<'src>> {
+        let drop = self.resource_drop_of(type_id, slot.clone())?;
+        if !self.slot_is_emptied_early(binding) {
+            return Some(drop);
+        }
+        Some(js::Node::If(js::IfBranch::If(
+            Box::new(js::Node::Binary(
+                BinaryOp::NotEq,
+                Box::new(slot),
+                Box::new(js::Node::Null),
+            )),
+            vec![drop],
+            None,
+        )))
     }
 
     /// Emit (once) the per-type `__drop` helper for `type_id` and return its name,

@@ -48,8 +48,15 @@ function conditional_teardown() {
 		const $j = __option_take(full);
 		let $k = null;
 		if ($j[0] === 0) {
-			const c = $j[1];
-			$k = $h(c);
+			let c = $j[1];
+			try {
+				$h(c);
+				$k = c = null;
+			} finally {
+				if (c !== null) {
+					$h(c);
+				}
+			}
 		} else {
 			$k = undefined;
 		}
@@ -60,8 +67,15 @@ function conditional_teardown() {
 			const $l = __option_take(empty);
 			let $m = null;
 			if ($l[0] === 0) {
-				const c2 = $l[1];
-				$m = $h(c2);
+				let c2 = $l[1];
+				try {
+					$h(c2);
+					$m = c2 = null;
+				} finally {
+					if (c2 !== null) {
+						$h(c2);
+					}
+				}
 			} else {
 				$m = console.log("cond none-arm");
 			}
@@ -94,9 +108,16 @@ function match_move() {
 	} else {
 		$o = [ "default" ];
 	}
-	const extracted = $o;
-	console.log("match extracted " + extracted[0]);
-	$h(extracted);
+	let extracted = $o;
+	try {
+		console.log("match extracted " + extracted[0]);
+		$h(extracted);
+		extracted = null;
+	} finally {
+		if (extracted !== null) {
+			$h(extracted);
+		}
+	}
 }
 function match_leg_drop() {
 	const held = [ 0, [ "leg" ] ];
@@ -200,26 +221,40 @@ conditional_teardown();
 console.log("--");
 sink([ "sunk" ]);
 console.log("sink returned");
-const back = passthrough([ "through" ]);
-console.log("passthrough returned");
-$h(back);
-console.log("--");
-$h(passthrough([ "unbound" ]));
-console.log("unbound dropped");
-console.log("--");
-match_move();
-console.log("--");
-match_leg_drop();
-console.log("--");
-match_leg_pair();
-console.log("--");
-match_leg_guard("kept");
-console.log("--");
-match_leg_guard("other");
-console.log("--");
-destructure_drop();
-console.log("--");
-const db = [ "immediate" ];
-console.log("before drop");
-$h(db);
-console.log("after drop");
+let back = passthrough([ "through" ]);
+try {
+	console.log("passthrough returned");
+	$h(back);
+	back = null;
+	console.log("--");
+	$h(passthrough([ "unbound" ]));
+	console.log("unbound dropped");
+	console.log("--");
+	match_move();
+	console.log("--");
+	match_leg_drop();
+	console.log("--");
+	match_leg_pair();
+	console.log("--");
+	match_leg_guard("kept");
+	console.log("--");
+	match_leg_guard("other");
+	console.log("--");
+	destructure_drop();
+	console.log("--");
+	let db = [ "immediate" ];
+	try {
+		console.log("before drop");
+		$h(db);
+		db = null;
+		console.log("after drop");
+	} finally {
+		if (db !== null) {
+			$h(db);
+		}
+	}
+} finally {
+	if (back !== null) {
+		$h(back);
+	}
+}
