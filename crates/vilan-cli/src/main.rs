@@ -1585,6 +1585,22 @@ impl DeclaredHook {
             outputs,
         })
     }
+
+    /// The declared outputs that are not on disk, in declaration order — the
+    /// ONE reason [`DeclaredHook::fingerprint`] returns `None` that is the
+    /// user's mistake rather than the filesystem's, separated out so the run
+    /// can say it out loud.
+    ///
+    /// Only a path that is genuinely absent counts (`Some(None)`): one that
+    /// could not be *read* is a permission error or a broken link, which is
+    /// not "the hook did not write it".
+    fn missing_outputs(&self, dir: &Path) -> Vec<&str> {
+        self.outputs
+            .iter()
+            .filter(|declared| file_digest(&dir.join(declared)) == Some(None))
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// What a hook's stamp entry records, and what freshness compares (§3.1): the
@@ -1780,6 +1796,23 @@ impl BuildHooks {
                     write_hook_stamp(&stamp_path, &next);
                     return Err(error);
                 }
+            }
+            // A hook that succeeded and left a declared output missing is the
+            // one way this design can go quiet: nothing is stamped, so it
+            // re-runs forever, and the build fails later at whatever was
+            // supposed to consume the file — an import error with no path back
+            // to its cause. The manifest said what this hook produces; when it
+            // does not, say so here, where the reason is still known. A note,
+            // not an error: the hook itself succeeded, and the build's own
+            // outcome is the compile's to decide.
+            for missing in hook.missing_outputs(&self.dir) {
+                eprintln!(
+                    "{} `[[build.hook]]` `{}` did not write its declared `outputs` entry \
+                     `{missing}`: nothing is recorded for a hook whose output is missing, so \
+                     it re-runs on every build — write the file, or drop it from `outputs`",
+                    paint::warning_prefix(),
+                    hook.name
+                );
             }
             // Fingerprinted AFTER the run: the outputs recorded are the ones
             // the run actually produced. A hook that did not produce a

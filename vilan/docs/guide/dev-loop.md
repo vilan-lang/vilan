@@ -199,6 +199,11 @@ The rest of the rules:
   hook after its first run.
 - **A missing input is recorded as missing**, so creating it later re-runs the
   hook. A missing or hand-edited output re-runs it too.
+- **A hook that succeeds without writing a declared output is told so**, by
+  name and by path. Nothing is recorded for a hook whose output isn't there, so
+  it would otherwise re-run on every build in silence while the failure
+  surfaced somewhere else — at the import of the module it was supposed to
+  write. Write the file, or drop it from `outputs`.
 - **A hook that declares neither `inputs` nor `outputs` runs every time**,
   exactly like a `run = [...]` entry. That is the default, and `run` keeps
   working unchanged.
