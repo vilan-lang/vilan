@@ -284,7 +284,7 @@ impl interpreter::AssetReader for ProjectReader {
 /// is bit-for-bit the one it used to build.
 pub struct Evaluated {
     pub results: HashMap<Id, ConstValue>,
-    pub assets: Vec<(String, String)>,
+    pub assets: Vec<EmittedAsset>,
     /// Each failure with the file its span indexes into (backlog E16): the pass
     /// walks the whole program, so a `const` in a module reports in that module.
     pub errors: Vec<(Error, SourceId)>,
@@ -457,17 +457,48 @@ fn inference_candidates(program: &Program) -> Vec<Id> {
     candidates
 }
 
-/// Deduplicates and deterministically orders the collected `(kind, line)`
-/// pairs into per-kind file contents (newline-terminated). Every kind's
-/// bytes are a function of the SET of contributions — write order never
-/// leaks (build-hooks.md §5.1) — under a kind-specific rule (const-eval.md
-/// §3):
+/// One contribution to a build asset: the kind that names its file, the line
+/// itself, and the SORT KEY the contributor computed for it.
 ///
-/// - **Every kind but `css` sorts lexically by line.** That is the one
-///   content-derived order that assumes nothing about what the lines mean,
-///   and it is exactly what the proposed keyed surface gives an un-keyed
-///   `emit` (`emit_keyed(kind, line, line)` sorts by `(line, line)` —
-///   build-hooks.md §5.3), so these bytes hold if that surface lands.
+/// The key is why this is a struct rather than a `(kind, line)` pair
+/// (build-hooks.md §5.3, Q3 ruled 2026-08-28: *the contribution carries its
+/// key*). A route's sort key is its path, an icon's is its name, a ranked
+/// entry's is a zero-padded index — and the contributor is the only code that
+/// can compute any of them. The flush therefore never re-derives a key from
+/// the line, which would mean parsing the line back: the invented second
+/// source of truth this tree refuses on principle.
+///
+/// **`asset::emit(kind, line)` is exactly `emit_keyed(kind, line, line)`.**
+/// The un-keyed spelling records the line as its own key, at the one place
+/// either spelling records anything ([`crate::interpreter`]'s `__emit_asset`
+/// arm), which is what makes every existing kind's bytes identical by
+/// construction rather than by inspection: ordering by `(line, line)` and
+/// deduplicating by `(line, line)` are ordering and deduplicating by the
+/// line.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EmittedAsset {
+    /// The asset kind — the file this line flushes to (`<output>.<kind>`).
+    pub kind: String,
+    /// The contribution's sort key within its kind. Equal to `line` for a
+    /// contribution made through the un-keyed `asset::emit`.
+    pub key: String,
+    /// The line written to the file. The key is never written.
+    pub line: String,
+}
+
+/// Deduplicates and deterministically orders the collected contributions into
+/// per-kind file contents (newline-terminated). Every kind's bytes are a
+/// function of the SET of contributions — write order never leaks
+/// (build-hooks.md §5.1) — under a kind-specific rule (const-eval.md §3):
+///
+/// - **Every kind but `css` orders by `(key, line)`**, and deduplicates by
+///   that same pair (build-hooks.md §5.3: the output is a function of the set
+///   of `(key, line)` pairs). Two contributions of one line under two keys
+///   are two contributions and both survive; the line is the tiebreak inside
+///   a key, so a key shared by several lines still orders them by content and
+///   never by call order. An un-keyed `emit` records the line as its own key,
+///   so this reduces to the lexical-by-line order and the dedup-by-line that
+///   shipped before the key existed — G5's rule, unchanged and unmoved.
 ///
 /// - **`css` alone adds the cascade override**: `@media (min-width: …)`
 ///   lines sort by ascending min-width, after everything else, not by digit
@@ -485,15 +516,29 @@ fn inference_candidates(program: &Program) -> Vec<Id> {
 ///   happened to parse as a media rule sorted last whatever its first byte,
 ///   because `None` precedes `Some` in the key (G5) — which is why it is
 ///   fenced to the one kind whose semantics justify it.
-pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> {
-    let mut by_kind: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for (kind, line) in assets {
-        by_kind.entry(kind).or_default().insert(line);
+///
+///   The cascade comparator reads the LINE and ignores the contribution's
+///   key, which is precisely why `emit_keyed` refuses `css`
+///   ([`crate::interpreter`]'s emit fence): the sheet's order belongs to the
+///   cascade, and a key silently dropped here would be a wrong answer rather
+///   than a refusal. So every `css` contribution reaching this function came
+///   through the un-keyed spelling and carries its line as its key, and the
+///   dedup below is the dedup-by-line it has always been.
+pub fn assemble_assets(assets: &[EmittedAsset]) -> BTreeMap<String, String> {
+    let mut by_kind: BTreeMap<&str, BTreeSet<(&str, &str)>> = BTreeMap::new();
+    for asset in assets {
+        by_kind
+            .entry(&asset.kind)
+            .or_default()
+            .insert((&asset.key, &asset.line));
     }
     by_kind
         .into_iter()
-        .map(|(kind, lines)| {
-            let mut lines = lines.into_iter().collect::<Vec<_>>();
+        .map(|(kind, contributions)| {
+            let mut lines = contributions
+                .into_iter()
+                .map(|(_key, line)| line)
+                .collect::<Vec<_>>();
             if kind == "css" {
                 // Media lines as a group sort after everything else ('@' is
                 // the highest first byte the styling system emits) — the key
@@ -900,7 +945,7 @@ struct State<'p, 'src> {
     /// [`SpanRegions`] and [`State::in_const_subtree`].
     const_regions: SpanRegions,
     results: HashMap<Id, ConstValue>,
-    assets: Vec<(String, String)>,
+    assets: Vec<EmittedAsset>,
     failed: HashSet<Id>,
     in_progress: HashSet<Id>,
     errors: Vec<(Error, SourceId)>,
@@ -1105,8 +1150,9 @@ impl<'p, 'src> State<'p, 'src> {
     }
 
     /// The const-only capability check (const-eval.md §2): no RUNTIME call
-    /// path may reach the compile-time channel — `asset::emit`, `asset::read`
-    /// or `asset::bundle`. R = the functions/closures that reach one through call
+    /// path may reach the compile-time channel — `asset::emit`,
+    /// `asset::emit_keyed`, `asset::read` or `asset::bundle`. R = the
+    /// functions/closures that reach one through call
     /// sites OUTSIDE `const` subtrees; roots (`main`, top-level initializers)
     /// never join R — a root's call into R is the offending boundary,
     /// reported at that call site.
@@ -1131,11 +1177,16 @@ impl<'p, 'src> State<'p, 'src> {
     /// carries a live `__emit_asset`/`__read_asset` call with no runtime
     /// binding.
     fn check_const_only(&mut self, graph: &CallGraph) {
-        // The const-only set: the channel's three directions, in a fixed order
-        // so an R-member reaching more than one is NAMED for the same one every
-        // run.
+        // The const-only set: the channel's three directions — lines out (in
+        // both its spellings, build-hooks.md §5.3), text in, whole files out —
+        // in a fixed order so an R-member reaching more than one is NAMED for
+        // the same one every run. `emit_keyed` belongs here for the reason
+        // `emit` does and no other: a runtime path reaching it would compile
+        // clean and carry a live `__emit_asset_keyed` call with no runtime
+        // binding (B143's shape).
         let const_only: Vec<Id> = [
             self.program.asset_emit_fn_id,
+            self.program.asset_emit_keyed_fn_id,
             self.program.asset_read_fn_id,
             self.program.asset_bundle_fn_id,
         ]
@@ -1462,12 +1513,15 @@ impl<'p, 'src> State<'p, 'src> {
     }
 
     /// How a const-only callee names itself in a diagnostic: the builtin
-    /// itself (`asset::emit` / `asset::read` / `asset::bundle`), or the
-    /// R-member that reaches one — named for the builtin `reaches` recorded
-    /// for it.
+    /// itself (`asset::emit` / `asset::emit_keyed` / `asset::read` /
+    /// `asset::bundle`), or the R-member that reaches one — named for the
+    /// builtin `reaches` recorded for it.
     fn const_only_name(&self, callee: Id, reaches: &HashMap<Id, Id>) -> String {
         if Some(callee) == self.program.asset_emit_fn_id {
             return "`asset::emit`".to_string();
+        }
+        if Some(callee) == self.program.asset_emit_keyed_fn_id {
+            return "`asset::emit_keyed`".to_string();
         }
         if Some(callee) == self.program.asset_read_fn_id {
             return "`asset::read`".to_string();
@@ -1489,6 +1543,9 @@ impl<'p, 'src> State<'p, 'src> {
     /// seeded or propagated with one).
     fn builtin_name(&self, member: Id, reaches: &HashMap<Id, Id>) -> &'static str {
         match reaches.get(&member) {
+            Some(&builtin) if Some(builtin) == self.program.asset_emit_keyed_fn_id => {
+                "asset::emit_keyed"
+            }
             Some(&builtin) if Some(builtin) == self.program.asset_read_fn_id => "asset::read",
             Some(&builtin) if Some(builtin) == self.program.asset_bundle_fn_id => "asset::bundle",
             _ => "asset::emit",

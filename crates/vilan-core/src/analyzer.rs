@@ -2774,6 +2774,7 @@ pub struct Analyzer<'src> {
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
     asset_emit_fn_id: Option<Id>,
+    asset_emit_keyed_fn_id: Option<Id>,
     asset_read_fn_id: Option<Id>,
     asset_bundle_fn_id: Option<Id>,
     // `const`-marked expression ids, in walk order (innermost-first for
@@ -3334,6 +3335,7 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
             asset_emit_fn_id: None,
+            asset_emit_keyed_fn_id: None,
             asset_read_fn_id: None,
             asset_bundle_fn_id: None,
             const_exprs: Vec::new(),
@@ -33092,6 +33094,11 @@ pub struct Program<'src> {
     pub drop_fn_id: Option<Id>,
     /// `std::asset::emit` — the const-only compile-time effect (const-eval.md).
     pub asset_emit_fn_id: Option<Id>,
+    /// `std::asset::emit_keyed` — `emit`'s ordered spelling, where the
+    /// contribution carries its own sort key (build-hooks.md §5.3):
+    /// const-only exactly like `emit`, and held separately only so a
+    /// diagnostic can name the spelling the program actually wrote.
+    pub asset_emit_keyed_fn_id: Option<Id>,
     /// `std::asset::read` — the channel's input direction (docs-port.md §3.3):
     /// const-only exactly like `emit`.
     pub asset_read_fn_id: Option<Id>,
@@ -33103,9 +33110,10 @@ pub struct Program<'src> {
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
     /// the transformer serializes these in place of the expressions.
     pub const_results: HashMap<Id, crate::interpreter::ConstValue>,
-    /// `(kind, line)` pairs `asset::emit` accumulated during const evaluation;
-    /// the build deduplicates, orders, and writes them beside the output.
-    pub const_assets: Vec<(String, String)>,
+    /// The contributions `asset::emit` / `asset::emit_keyed` accumulated
+    /// during const evaluation; the build deduplicates, orders, and writes
+    /// them beside the output.
+    pub const_assets: Vec<crate::const_eval::EmittedAsset>,
     /// Every file `asset::read` touched during const evaluation, resolved, with
     /// the content hash it read (`None` for a file that could not be read —
     /// still a dependency: its APPEARANCE must invalidate as surely as a
@@ -37246,15 +37254,20 @@ fn analyze_inner<'src>(
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
     }
-    // Remember `asset::emit`, `asset::read` and `asset::bundle` — the
-    // const-only compile-time channel: lines out, text in, and whole files out
-    // (const-eval.md §2-3, docs-port.md §3.3, kolt.local 029); the const pass
+    // Remember `asset::emit`, `asset::emit_keyed`, `asset::read` and
+    // `asset::bundle` — the const-only compile-time channel: lines out (in
+    // both spellings), text in, and whole files out (const-eval.md §2-3,
+    // docs-port.md §3.3, build-hooks.md §5.3, kolt.local 029); the const pass
     // enforces that no runtime call path reaches any of them.
     if let Some(asset_scope_id) = module_scopes.get("asset") {
         analyzer.asset_emit_fn_id = analyzer
             .scopes
             .get(asset_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("emit").copied());
+        analyzer.asset_emit_keyed_fn_id = analyzer
+            .scopes
+            .get(asset_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("emit_keyed").copied());
         analyzer.asset_read_fn_id = analyzer
             .scopes
             .get(asset_scope_id)
@@ -38347,6 +38360,7 @@ fn analyze_over_world<'src>(
         panic_fn_id: analyzer.panic_fn_id,
         drop_fn_id: analyzer.drop_fn_id,
         asset_emit_fn_id: analyzer.asset_emit_fn_id,
+        asset_emit_keyed_fn_id: analyzer.asset_emit_keyed_fn_id,
         asset_read_fn_id: analyzer.asset_read_fn_id,
         asset_bundle_fn_id: analyzer.asset_bundle_fn_id,
         const_exprs: analyzer.const_exprs.clone(),

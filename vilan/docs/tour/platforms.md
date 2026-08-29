@@ -145,7 +145,9 @@ were emitted. Your server serves those two files and an HTML shell; the
 shape.
 
 > **Going deeper.** Build assets come from `std::asset::emit(kind,
-> content)`, callable only during `const` evaluation; its input sibling
+> content)` — or `emit_keyed(kind, key, content)`, where the
+> contribution carries its own sort key — callable only during `const`
+> evaluation; the input sibling
 > `std::asset::read(path)` pulls a project file in at compile time the
 > same way. The styling
 > system's `const style()` chains call it to write CSS rules. Libraries

@@ -629,13 +629,23 @@ draft's next push already does.
 **"`asset::emit` outside a `const` expression"**
 Styles (and other build assets) are constructed at compile time. Build
 the `Style` in a `const` (`let card = const style()…`); select and merge
-already-built styles at runtime. The channel's input direction,
-`asset::read`, is compile-time-only the same way.
+already-built styles at runtime. The channel's other directions —
+`asset::emit_keyed` and `asset::read` — are compile-time-only the same
+way.
 → [Styling](../guide/styling.md), [Macros & const](../tour/macros-and-const.md)
+
+**"`asset::emit_keyed` cannot order the `css` kind: the style sidecar is
+ordered by the CSS cascade, not by a contribution's key"**
+The stylesheet's order is decided by the cascade — base rules before
+`@media` blocks, media blocks by ascending min-width — so a sort key
+handed to it would have nowhere to apply. Write the rule with
+`asset::emit("css", …)`, or let [`std::style`](../std/style.md) own the
+sheet. `emit_keyed` is for a kind of the program's own.
 
 **"… is compile-time-only; evaluate this call inside a `const` expression"**
 The same rule, caught statically: some function on this call path reaches
-`asset::emit` or `asset::read`, and the call itself sits in runtime code.
+`asset::emit`, `asset::emit_keyed` or `asset::read`, and the call itself
+sits in runtime code.
 The span is the outermost runtime crossing — the call that leaves ordinary
 code and enters compile-time territory — so wrap *that* call in a `const`.
 A crossing through trait dispatch counts too: a generic call is charged at
