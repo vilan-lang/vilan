@@ -94,7 +94,7 @@ function add(self, b) {
 		}
 		$h;
 	}
-	return [ __clone(rules) ];
+	return [ rules ];
 }
 function $a(self) {
 	let result = [  ];

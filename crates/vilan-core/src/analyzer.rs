@@ -16,6 +16,8 @@ use crate::target::{Platform, PlatformPattern};
 use crate::type_::{SubstitutionContext, Type, TypeId};
 use crate::util::{join_with, plural};
 
+mod liveness;
+
 /// Distinguishes the recursive type operations that resolve generics through a
 /// substitution context, so each [`TypeCycleGuard`] tracks its own active path (the
 /// operations can nest, and one's in-flight generic must not bail the other's).
@@ -2721,6 +2723,10 @@ pub struct Analyzer<'src> {
     prepped_uses: Vec<(Vec<(&'src str, Span)>, &'src str, Id, Span, Span, SourceId)>,
     prepped_type_static_accessors: Vec<(TypeId, TypeId, &'src str, Span)>,
     reference_count: HashMap<Id, u32>,
+    /// The last-use liveness dataflow (`liveness.rs`, `lifetimes.md` §6/S2) —
+    /// filled once the tree is final (after the view-assignment rewrite) and
+    /// read by rule 2's elision. Empty until then, which elides nothing.
+    last_use: liveness::LastUse,
     resolved_types: HashMap<Id, TypeId>,
     // B70 (`variadic-generics.md` §T.8): the type of every ELEMENT of a tuple
     // construction, keyed by the element's expr id — the type the tuple rule
@@ -3326,6 +3332,7 @@ impl<'src> Analyzer<'src> {
             prepped_type_static_accessors: Vec::new(),
             prepped_uses: Vec::new(),
             reference_count: HashMap::default(),
+            last_use: liveness::LastUse::default(),
             resolved_types: HashMap::default(),
             tuple_element_types: HashMap::default(),
             scope_id: 0,
@@ -17183,7 +17190,6 @@ impl<'src> Analyzer<'src> {
     /// literal's element/field/payload, and an `own` argument (which is how
     /// `List::push` declares that it keeps what it is given).
     fn compute_clone_sites(&mut self, shared_captures: &HashSet<Id>) -> HashMap<Id, CopyDecision> {
-        let repeatable = self.collect_repeatable_interiors();
         // Phase 1 — the candidate positions, collected before any classifying
         // so the (`&mut`, memoizing) resource query can run over them.
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
@@ -17197,7 +17203,7 @@ impl<'src> Analyzer<'src> {
                 // draws.
                 && !analyzer.assignment_target_is_view(value_id)
                 && !analyzer.resource_value_places.contains(&value_id)
-                && !analyzer.is_elidable_copy(value_id, &repeatable, shared_captures)
+                && !analyzer.is_elidable_copy(value_id, shared_captures)
             {
                 if let Some(type_id) = type_id {
                     candidates.push((value_id, type_id));
@@ -17594,17 +17600,16 @@ impl<'src> Analyzer<'src> {
             classified.push((capture_id, subject_id, copy));
         }
         // Phase 3 — the MOVE elision, rule 2's dead-source form: a subject
-        // that is a local read exactly once (a `?`-lift temp holding a fresh
-        // call result, say) donates its elements — the captures take
-        // ownership of a corpse, no copy needed. `is_elidable_copy` already
-        // refuses parameters (they alias the caller's value, which outlives
-        // the call — the `unwrap` leak), loop/closure repeats, and — with
-        // phase 2's set in hand — a SHARED capture, which owns nothing to
-        // donate.
-        let repeatable = self.collect_repeatable_interiors();
+        // whose read here is its LAST (a `?`-lift temp holding a fresh call
+        // result, say) donates its elements — the captures take ownership of a
+        // corpse, no copy needed. `is_elidable_copy` already refuses parameters
+        // (they alias the caller's value, which outlives the call — the
+        // `unwrap` leak), a subject still live across a back edge or read from
+        // a closure, and — with phase 2's set in hand — a SHARED capture, which
+        // owns nothing to donate.
         let mut sites = HashMap::default();
         for (capture_id, subject_id, copy) in classified {
-            if !self.is_elidable_copy(subject_id, &repeatable, &shared) {
+            if !self.is_elidable_copy(subject_id, &shared) {
                 sites.insert(capture_id, copy);
             }
         }
@@ -17747,205 +17752,41 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Rule 2 (elision): whether a copy of an aggregate place can be downgraded
-    /// to a move because the aliasing can never be observed. Sound, not complete
-    /// — we only elide when the source is a local read *exactly once* (so there
-    /// is no later read, and no closure capture, which would be a second read)
-    /// and that read is not inside a loop or closure, where it could repeat and
-    /// the alias would persist into the next iteration. A parameter is never
-    /// elided: it aliases the caller's value, which outlives the call.
+    /// to a move because the aliasing can never be observed. Sound, not
+    /// complete. The source must be a plain local binding — a field/element
+    /// source (`mut b = a.field`) is conservatively always copied — and this
+    /// read must be the binding's **last use on every path**, the question
+    /// `analyzer/liveness.rs` answers (`lifetimes.md` §6, slice S2).
     ///
-    /// Nor is a SHARED pattern capture (B53): the share elision left it
+    /// That dataflow replaces `reference_count == 1`, a syntactic whole-program
+    /// use count, and its `collect_repeatable_interiors` guard, a lexical set of
+    /// every id inside a loop or closure. Both are gone: the liveness rule
+    /// subsumes them and is strictly better at each of the three jobs they did.
+    /// A later read now refuses the elision *because it is a later read*, not
+    /// because the count says two; a closure capture refuses it because the
+    /// capture reads the binding from another region (§4 — a closure captures
+    /// BINDINGS); and the loop rule asks "live across the back edge" **relative
+    /// to the declaration**, so a binding the loop body itself declares — fresh
+    /// on every iteration — elides at its last use where the lexical set
+    /// refused it. §3 fact 3 priced the difference: 25.4% of entities failed the
+    /// old test, half of them with exactly two uses.
+    ///
+    /// A parameter is still never elided: it aliases the caller's value, which
+    /// outlives the call, so it is not in `variables` and the dataflow is not
+    /// asked. Nor is a SHARED pattern capture (B53): the share elision left it
     /// aliasing its subject's element, so it has no storage of its own to
     /// donate — `let (xs, n) = pair; mut ys = xs; ys.push(9)` would grow
     /// `pair.0` through two elisions that are each sound alone. Refusing here
     /// makes the second binding copy, which restores the invariant every other
     /// elision rests on: only an OWNER moves.
-    fn is_elidable_copy(
-        &self,
-        value_id: Id,
-        repeatable: &HashSet<Id>,
-        shared_captures: &HashSet<Id>,
-    ) -> bool {
-        if repeatable.contains(&value_id) {
-            return false;
-        }
+    fn is_elidable_copy(&self, value_id: Id, shared_captures: &HashSet<Id>) -> bool {
         let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&value_id) else {
-            // Only a simple binding alias is elided; a field/element source
-            // (`mut b = a.field`) is conservatively always copied.
             return false;
         };
         if shared_captures.contains(binding_id) {
             return false;
         }
-        self.variables.contains_key(binding_id)
-            && self.reference_count.get(binding_id).copied() == Some(1)
-    }
-
-    /// Entity ids inside a loop or closure body — code that may run a different
-    /// number of times than its enclosing scope, so a copy there cannot be
-    /// elided (the alias would survive into the next repetition). Every function,
-    /// module, and closure body is walked; closures are also roots (at depth 1)
-    /// so a copy inside any closure is treated as repeatable.
-    fn collect_repeatable_interiors(&self) -> HashSet<Id> {
-        let mut interior = HashSet::default();
-        let mut visited = HashSet::default();
-        for function in self.functions.values() {
-            if function.has_body {
-                for statement in &function.body.0 {
-                    self.mark_repeatable(*statement, 0, &mut interior, &mut visited);
-                }
-                self.mark_repeatable(function.body.1, 0, &mut interior, &mut visited);
-            }
-        }
-        for module in self.modules.values() {
-            for statement in &module.body.0 {
-                self.mark_repeatable(*statement, 0, &mut interior, &mut visited);
-            }
-        }
-        for closure in self.closures.values() {
-            self.mark_repeatable(closure.return_, 1, &mut interior, &mut visited);
-        }
-        interior
-    }
-
-    /// Walks the expression tree from `id`, recording every id reached at
-    /// `depth > 0` (inside a loop or closure) in `interior`. Mirrors the call
-    /// graph's traversal; `visited` guards against shared sub-expressions.
-    fn mark_repeatable(
-        &self,
-        id: Id,
-        depth: u32,
-        interior: &mut HashSet<Id>,
-        visited: &mut HashSet<Id>,
-    ) {
-        if !visited.insert(id) {
-            return;
-        }
-        if depth > 0 {
-            interior.insert(id);
-        }
-        let Some(expr) = self.expr_id_to_expr_map.get(&id) else {
-            return;
-        };
-        match expr {
-            Expr::Variable(variable_id) => {
-                if let Some(initial) = self
-                    .variables
-                    .get(variable_id)
-                    .and_then(|variable| variable.initial)
-                {
-                    self.mark_repeatable(initial, depth, interior, visited);
-                }
-            }
-            Expr::Closure(closure_id) | Expr::Async(closure_id) => {
-                if let Some(closure) = self.closures.get(closure_id) {
-                    self.mark_repeatable(closure.return_, depth + 1, interior, visited);
-                }
-            }
-            Expr::Field(subject_id, _, _) | Expr::TupleIndex(subject_id, _, _) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited)
-            }
-            Expr::Index(subject_id, index_id) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited);
-                self.mark_repeatable(*index_id, depth, interior, visited);
-            }
-            Expr::FunctionReturn(Some(value_id)) => {
-                self.mark_repeatable(*value_id, depth, interior, visited)
-            }
-            Expr::Binary(_, lhs, rhs) => {
-                self.mark_repeatable(*lhs, depth, interior, visited);
-                self.mark_repeatable(*rhs, depth, interior, visited);
-            }
-            Expr::Unary(_, operand) | Expr::Reference(operand, _) | Expr::Dereference(operand) => {
-                self.mark_repeatable(*operand, depth, interior, visited)
-            }
-            Expr::Assignment(target_id, value_id) => {
-                self.mark_repeatable(*target_id, depth, interior, visited);
-                self.mark_repeatable(*value_id, depth, interior, visited);
-            }
-            Expr::Call(call_id) => {
-                if let Some(function_call) = self.function_calls.get(call_id) {
-                    self.mark_repeatable(function_call.subject_id, depth, interior, visited);
-                    for argument_id in &function_call.argument_ids {
-                        self.mark_repeatable(*argument_id, depth, interior, visited);
-                    }
-                }
-            }
-            Expr::Await(inner) => self.mark_repeatable(*inner, depth, interior, visited),
-            Expr::Block((statements, tail)) => {
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth, interior, visited);
-            }
-            Expr::For(condition, (statements, tail)) => {
-                if let Some(condition) = condition {
-                    self.mark_repeatable(*condition, depth + 1, interior, visited);
-                }
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth + 1, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth + 1, interior, visited);
-            }
-            Expr::ForEach(iterable, _item, (statements, tail)) => {
-                self.mark_repeatable(*iterable, depth, interior, visited);
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth + 1, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth + 1, interior, visited);
-            }
-            Expr::If(branch) => self.mark_repeatable_if(branch, depth, interior, visited),
-            Expr::Is(subject_id, _pattern) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited)
-            }
-            Expr::Match(subject_id, legs) => {
-                self.mark_repeatable(*subject_id, depth, interior, visited);
-                for leg in legs {
-                    if let Some(guard) = leg.guard {
-                        self.mark_repeatable(guard, depth, interior, visited);
-                    }
-                    self.mark_repeatable(leg.body, depth, interior, visited);
-                }
-            }
-            Expr::List(ids) | Expr::Tuple(ids) => {
-                for id in ids {
-                    self.mark_repeatable(*id, depth, interior, visited);
-                }
-            }
-            Expr::StructInitializer(_, fields) => {
-                for value_id in fields.values() {
-                    self.mark_repeatable(*value_id, depth, interior, visited);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn mark_repeatable_if(
-        &self,
-        branch: &ExprIfBranch,
-        depth: u32,
-        interior: &mut HashSet<Id>,
-        visited: &mut HashSet<Id>,
-    ) {
-        match branch {
-            ExprIfBranch::If(condition, (statements, tail), else_branch) => {
-                self.mark_repeatable(*condition, depth, interior, visited);
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth, interior, visited);
-                if let Some(else_branch) = else_branch {
-                    self.mark_repeatable_if(else_branch, depth, interior, visited);
-                }
-            }
-            ExprIfBranch::Else((statements, tail)) => {
-                for statement in statements {
-                    self.mark_repeatable(*statement, depth, interior, visited);
-                }
-                self.mark_repeatable(*tail, depth, interior, visited);
-            }
-        }
+        self.variables.contains_key(binding_id) && self.last_use.is_last_use(value_id, *binding_id)
     }
 
     /// Resolves a value-name USE at a byte offset, honoring positional
@@ -38183,6 +38024,11 @@ fn analyze_over_world<'src>(
     // Transparent references (R5): rewrite bare assignments to a view into the
     // write-through deref form before codegen reads the targets.
     analyzer.rewrite_view_assignment_targets();
+    // The last-use dataflow (`analyzer/liveness.rs`, lifetimes.md §6/S2), run
+    // once the tree is FINAL — the rewrite above moves reads, and a liveness
+    // answer about a tree that no longer exists is worse than none. Every
+    // elision below reads it.
+    analyzer.last_use = liveness::LastUse::compute(&analyzer);
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.

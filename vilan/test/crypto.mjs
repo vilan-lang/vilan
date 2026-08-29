@@ -139,7 +139,7 @@ function decode_url(text) {
 		set(out, write, chunk2 >> 10 & 255);
 		set(out, write + 1, chunk2 >> 2 & 255);
 	}
-	return [ 0, __clone(out) ];
+	return [ 0, out ];
 }
 function set(self, index, value2) {
 	self.fill(value2, index, index + 1);

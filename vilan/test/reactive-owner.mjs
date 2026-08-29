@@ -173,7 +173,7 @@ function $D(owner2, body) {
 function $F(body) {
 	const scope2 = new2();
 	const result = body(scope2);
-	return [ result, __clone(scope2) ];
+	return [ result, scope2 ];
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
