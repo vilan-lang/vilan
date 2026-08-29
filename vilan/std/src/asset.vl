@@ -69,3 +69,116 @@ external fun read(path: str): str;
 
 [extern("__bundle_asset")]
 external fun bundle(path: str): str;
+
+// `bundle` with the target spelled AT THE CALL (kolt.local 035,
+// const-eval.md §3.1): the file at `path` is carried into the output
+// directory as `url`, and `url` is what this evaluates to. Everything else is
+// `bundle`'s and unchanged — the same registry, the same tracked build input,
+// the same manifest row, the same `run --watch` recopy — so `bundle(path)` is
+// exactly `bundle_as(path, i"/{path}")`.
+//
+// 029's "nothing is renamed behind your back" survives because the rename is
+// spelled here: a file lands somewhere its own path does not spell only where
+// a program said so. What this frees is the path-pinned name — `/favicon.ico`
+// can live under `static/` — and the fingerprinted url, which needs `digest`
+// below.
+//
+// The url starts with `/`, is `/`-separated on every host (a backslash is
+// refused rather than translated), and every segment must be a NAME: no empty
+// segment, no `..`, no `.`. The value returned IS the url the copy answers on,
+// so a target that is not already that url would be a lie the caller cannot
+// see. The target is fenced against the names a leg's build owns
+// (`<leg>.js`, `<leg>.css`, `<leg>.chunks.json`, the route chunks) exactly as
+// `bundle`'s is, by reaching the same check.
+//
+// One refusal `bundle` did not need: "the path is the name" made two files
+// claiming one name impossible, and this breaks that, so two registrations of
+// one target from two different sources are a compile error naming both. The
+// same (source, target) pair reached twice deduplicates, as `bundle`'s does.
+//
+// Compile-time-only, exactly like `bundle`.
+
+[extern("__bundle_asset_as")]
+external fun bundle_as(path: str, url: str): str;
+
+// The channel's DIRECTORY listing (kolt.local 035, const-eval.md §3.1) —
+// `read`'s sibling one level up, and what lets a static estate be a loop
+// instead of a hand-written list of `bundle` calls:
+//
+//     fun static_estate() {
+//         for file in asset::read_dir_all("static") {
+//             asset::bundle_as(i"static/{file}", i"/{file}");
+//         }
+//     }
+//     let _estate = const static_estate();
+//
+// `read_dir(path)` returns a directory's IMMEDIATE entries as bare names (not
+// path-joined — what addresses one is `i"{path}/{name}"`); `read_dir_all`
+// below returns every entry BENEATH it as a path relative to it. The path is
+// relative and resolves against the package root under `read`'s fence
+// (absolute is refused, escaping the root is refused); `""` and `"."` name
+// the package root itself, which is a legal directory to enumerate. A
+// missing, unreadable, or not-a-directory path is a compile error at the
+// `const` expression.
+//
+// Two things differ from `std::fs::read_dir`, both because this result is
+// compiled INTO the build:
+//
+//   - **Entries are byte-sorted, always.** `std::fs` is honest that the
+//     host's order is the host's; here host order would make one source tree
+//     produce two builds, so the sort is part of the contract.
+//   - **Only FILES are listed.** Nothing in this channel consumes a directory
+//     — `read`, `bundle`, `bundle_as` and `digest` all take a file — and
+//     there is no const `stat`, so a directory entry would be one the program
+//     could neither act on nor filter out.
+//
+// A symlink is classified by what it points AT, so a link to a file is a file
+// and is bundleable; the walk never follows one into a directory, so it
+// cannot loop. Nothing is filtered by name: a dotfile is an entry.
+//
+// The directory is a tracked build input, exactly as a read file is: a file
+// appearing or disappearing invalidates the compile that listed it, both
+// directions, so `run --watch` sees a new asset arrive. Fuel is charged per
+// entry (the directory itself counting as one), which prices the walk rather
+// than the names.
+//
+// Compile-time-only, exactly like `read`.
+
+[extern("__read_asset_dir")]
+external fun read_dir(path: str): List<str>;
+
+// `read_dir`'s recursive spelling: every FILE beneath `path`, however deep, as
+// a path RELATIVE to `path` (`"icons/close.svg"`), `/`-separated on every host
+// and byte-sorted on the whole relative path — so a tree's listing is stable
+// whatever order the host walks in. Every rule above holds here, and the
+// tracked-input record is per DIRECTORY walked, so a change anywhere in the
+// tree invalidates.
+//
+// Compile-time-only, exactly like `read_dir`.
+
+[extern("__read_asset_dir_all")]
+external fun read_dir_all(path: str): List<str>;
+
+// The file's sha-256, lowercase hex, 64 characters (kolt.local 035,
+// const-eval.md §3.1). Of the BYTES: a fingerprint of a font or a `.png` must
+// be a fingerprint of the file and not of a decoding, which is also why this
+// exists rather than `crypto` over `read`'s text.
+//
+// What it is for is the content-hashed url — the immutable-cache tier's whole
+// basis — now spellable in the language that ships the file:
+//
+//     let logo = const asset::bundle_as(
+//         "static/logo.png",
+//         i"/static/logo.{asset::digest("static/logo.png").substring(0, 8)}.png",
+//     );
+//
+// The file is a tracked build input exactly as `read`'s is, so a changed file
+// re-mints the url. Fuel is charged per byte at an eighth of `read`'s rate:
+// the bytes never enter the program and the result is 64 characters whatever
+// the file weighs, so the charge bounds how much a build hashes rather than
+// how large a value it holds.
+//
+// Compile-time-only, exactly like `read`.
+
+[extern("__digest_asset")]
+external fun digest(path: str): str;

@@ -840,6 +840,15 @@ fn hmr_round(
     state.manifest = Some(manifest);
     let force_full = hmr::round_forces_full(state.legs.is_empty(), state.failed, manifest_changed);
     let current_hash = |path: &Path| -> Option<u64> {
+        // A recorded input that is a DIRECTORY re-hashes as its listing
+        // (`asset::read_dir` / `read_dir_all`, const-eval.md §3.1). Without
+        // this arm the read below fails on it and the leg could never skip;
+        // with it, an unchanged directory compares equal and a file appearing
+        // or vanishing anywhere in a listed tree fails the compare, which is
+        // exactly the invalidation the tracked-directory doctrine promises.
+        if path.is_dir() {
+            return vilan_core::const_eval::directory_input_hash(path);
+        }
         // Read the same way the compiler reads (BOM dropped,
         // windows-support.md §2), or the hash recorded from the text it
         // consumed could never match.
@@ -985,6 +994,10 @@ fn hmr_round(
             extension: leg.script_extension,
         })
         .collect();
+    // Shared across the round's legs, for the reason `reserved` is: `dist/` is
+    // one directory, so two legs bundling two different files to one name is a
+    // collision this round must refuse rather than resolve by copy order.
+    let mut bundled_names: BTreeMap<String, PathBuf> = BTreeMap::new();
     for leg in &next {
         let bundle_path = dist.join(format!("{}.{}", leg.name, leg.script_extension));
         let contents = if leg.is_browser {
@@ -1031,7 +1044,8 @@ fn hmr_round(
         // see them (`dev-refresh.md` §5, item 1). The trigger itself is the
         // build-input record `record_const_inputs` hands the watcher; without
         // it no round fires and `dist/` keeps the first round's copy forever.
-        let assets = write_bundled(&dist, &leg.bundled, &reserved).unwrap_or_default();
+        let assets =
+            write_bundled(&dist, &leg.bundled, &reserved, &mut bundled_names).unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
         let _ = write_chunks(
             &bundle_path,
@@ -1262,6 +1276,7 @@ fn build_and_spawn_run(
                 output_path.parent().unwrap_or(Path::new(".")),
                 &compiled.bundled,
                 &[],
+                &mut BTreeMap::new(),
             )
             .ok()?;
             let script = watch_script_path();
@@ -2748,6 +2763,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         &directory,
         &compiled.bundled,
         &[LegNamespace::of(&leg, platform)],
+        &mut BTreeMap::new(),
     ) {
         Ok(assets) => assets,
         Err(code) => return code,
@@ -2827,6 +2843,7 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
         output_path.parent().unwrap_or(Path::new(".")),
         &compiled.bundled,
         &[],
+        &mut BTreeMap::new(),
     )
     .is_err()
     {
@@ -2909,6 +2926,10 @@ fn build_workspace_artifacts(
         .filter(|(_, platform)| !platform.is_none())
         .map(|(unit, platform)| LegNamespace::of(&unit.name, *platform))
         .collect();
+    // Shared across legs for the same reason: two legs bundling two different
+    // files to one output name is one `dist/` asked to serve two files on one
+    // url, which `asset::bundle_as` made expressible (const-eval.md §3.1).
+    let mut bundled_names: BTreeMap<String, PathBuf> = BTreeMap::new();
     for (unit, platform) in members {
         if platform.is_none() {
             continue;
@@ -2921,7 +2942,7 @@ fn build_workspace_artifacts(
         let compiled = compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
         let output = artifact_path(&dist, &unit.name, *platform);
         let styles = write_assets(&output, &compiled.assets);
-        let assets = write_bundled(&dist, &compiled.bundled, &reserved)?;
+        let assets = write_bundled(&dist, &compiled.bundled, &reserved, &mut bundled_names)?;
         // Unconditional: this is also where a previous build's chunks are swept
         // when this one wrote none, and where a browser leg's build manifest is
         // written whether it split or not (`fullstack-dx.md` §10.3).
@@ -3544,7 +3565,14 @@ fn prune_and_record_asset_kinds(
 ///   resource parked on one of those names does not merely collide — it
 ///   disappears.
 /// - **A name two legs both bundle** is fine and expected — it is the same
-///   package-relative file, so the copy is idempotent.
+///   package-relative file, so the copy is idempotent. A name two legs bundle
+///   from DIFFERENT files is not, and is refused: `asset::bundle_as` lets a
+///   target be spelled at the call (const-eval.md §3.1), so the identity rule
+///   that used to make this impossible — the path IS the name — no longer
+///   does, and one `dist/` cannot serve two files on one url. The const pass
+///   catches the collision within a compile; this catches it ACROSS legs,
+///   which are separate compiles into one directory, and `written` is what
+///   carries the earlier leg's answer here.
 ///
 /// A failed copy fails the build. Unlike a stray chunk, a missing asset is not
 /// a tidiness problem: the manifest is about to name it, and `load_build`
@@ -3553,17 +3581,36 @@ fn write_bundled(
     output_directory: &std::path::Path,
     bundled: &[(PathBuf, String)],
     reserved: &[LegNamespace],
+    written_names: &mut BTreeMap<String, PathBuf>,
 ) -> Result<Vec<String>, ExitCode> {
     let mut written = Vec::new();
     for (source, name) in bundled {
+        match written_names.get(name) {
+            Some(earlier) if earlier != source => {
+                eprintln!(
+                    "{} `{}` and `{}` both bundle to `{name}` — one build directory \
+                     cannot serve two files on one url; give one of them a target of \
+                     its own with `asset::bundle_as`",
+                    paint::error_prefix(),
+                    earlier.display(),
+                    source.display()
+                );
+                return Err(ExitCode::FAILURE);
+            }
+            _ => {
+                written_names.insert(name.clone(), source.clone());
+            }
+        }
         if let Some((leg, role)) = reserved
             .iter()
             .find_map(|namespace| namespace.claims(name).map(|role| (&namespace.leg, role)))
         {
             eprintln!(
-                "{} `asset::bundle(\"{name}\")` would land on `{name}`, which is the \
-                 `{leg}` leg's {role} — rename the resource, or move it into a subdirectory",
-                paint::error_prefix()
+                "{} `{name}` is the `{leg}` leg's {role}, so `{}` cannot be bundled \
+                 there — move the resource into a subdirectory, or give it a target \
+                 of its own with `asset::bundle_as`",
+                paint::error_prefix(),
+                source.display()
             );
             return Err(ExitCode::FAILURE);
         }

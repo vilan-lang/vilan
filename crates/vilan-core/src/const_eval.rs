@@ -21,6 +21,7 @@ use crate::options::BuildOptions;
 use crate::span::Span;
 use crate::transformer;
 use crate::type_::{Type, TypeId};
+use sha2::{Digest, Sha256};
 
 /// The budgets the EXPLICIT form evaluates under (const-eval.md §9.3). A miss
 /// here is a diagnostic (§4's "did not finish within the compile-time budget"),
@@ -137,10 +138,25 @@ fn phase_add(
 struct ProjectReader {
     root: PathBuf,
     inputs: RefCell<Vec<(PathBuf, Option<u64>)>>,
-    /// Every file `asset::bundle` registered, as (resolved source, the name it
-    /// takes in the output directory). Insertion-ordered and deduplicated by
-    /// name, so bundling one file from two call sites registers it once.
-    bundled: RefCell<Vec<(PathBuf, String)>>,
+    /// Every file `asset::bundle` / `asset::bundle_as` registered.
+    /// Insertion-ordered and deduplicated by name, so bundling one file from
+    /// two call sites registers it once.
+    bundled: RefCell<Vec<BundleRow>>,
+}
+
+/// One registered bundle: the file the build copies, the name its copy takes,
+/// and the spelling the program asked for.
+///
+/// `requested` exists for one reason — the collision diagnostic
+/// (const-eval.md §3.1). Under `bundle` alone the path WAS the name, so two
+/// files could not claim one name and there was nothing to report; `bundle_as`
+/// breaks that identity, and a collision is a statement about a PAIR, so the
+/// message needs the spelling of both sources rather than the resolved path of
+/// one.
+struct BundleRow {
+    source: PathBuf,
+    name: String,
+    requested: String,
 }
 
 /// The package-relative name a bundled file takes in the output directory —
@@ -160,16 +176,19 @@ struct ProjectReader {
 /// rule would make every one of them host-dependent. `\` is refused rather
 /// than translated, so a path that means two things on two hosts means nothing
 /// on either.
-fn bundled_name(path: &str) -> Result<String, String> {
+/// `function` is the spelling the program wrote (`asset::bundle` or
+/// `asset::bundle_as`), so a refusal names the call the author made rather
+/// than a canonical one they did not.
+fn bundled_name(path: &str, function: &str) -> Result<String, String> {
     if path.contains('\\') {
         return Err(format!(
-            "`asset::bundle` paths are `/`-separated on every host; `{path}` contains a backslash"
+            "`{function}` paths are `/`-separated on every host; `{path}` contains a backslash"
         ));
     }
     let requested = Path::new(path);
     if requested.is_absolute() {
         return Err(format!(
-            "`asset::bundle` paths are relative to the package root; `{path}` is absolute"
+            "`{function}` paths are relative to the package root; `{path}` is absolute"
         ));
     }
     let mut parts: Vec<&str> = Vec::new();
@@ -180,46 +199,136 @@ fn bundled_name(path: &str) -> Result<String, String> {
                 Some(part) => parts.push(part),
                 None => {
                     return Err(format!(
-                        "`asset::bundle` paths must be valid text; `{path}` is not"
+                        "`{function}` paths must be valid text; `{path}` is not"
                     ));
                 }
             },
             _ => {
                 return Err(format!(
-                    "`asset::bundle` paths resolve inside the package root; `{path}` escapes it"
+                    "`{function}` paths resolve inside the package root; `{path}` escapes it"
                 ));
             }
         }
     }
     if parts.is_empty() {
         return Err(format!(
-            "`asset::bundle` needs a file inside the package root; `{path}` names none"
+            "`{function}` needs a file inside the package root; `{path}` names none"
         ));
     }
     Ok(parts.join("/"))
 }
 
+/// The output name `asset::bundle_as`'s explicitly spelled url takes
+/// (const-eval.md §3.1) — the url with its leading `/` removed — or the reason
+/// it is not a url at all.
+///
+/// The value `bundle_as` returns IS the url the copy answers on, so a target
+/// that is not already that url would be a lie the caller cannot see: the
+/// refusals below are exactly the shapes where the url spelled and the file
+/// served would part company. `..` because a target may not climb out of the
+/// output directory; `.` and the empty segment because `/a/./b` is a different
+/// url to a browser while being the same file on disk; the backslash for the
+/// reason `bundled_name` refuses one (kolt.local 017: the target becomes an
+/// output name, a manifest row and a golden, and a separator-aware rule would
+/// make all three host-dependent).
+fn bundled_target(url: &str) -> Result<String, String> {
+    if url.contains('\\') {
+        return Err(format!(
+            "`asset::bundle_as` urls are `/`-separated on every host; \
+             `{url}` contains a backslash — spell it with `/`"
+        ));
+    }
+    let Some(rest) = url.strip_prefix('/') else {
+        return Err(format!(
+            "`asset::bundle_as` urls start at the site root; `{url}` does not — \
+             write `/{url}`"
+        ));
+    };
+    for segment in rest.split('/') {
+        let reason = match segment {
+            "" => "an empty segment",
+            "." => "a `.` segment",
+            ".." => "a `..` segment",
+            _ => continue,
+        };
+        return Err(format!(
+            "`asset::bundle_as` urls name a file under the site root, one \
+             segment at a time; `{url}` has {reason} — the url returned is the \
+             one the copy answers on, so it must already be that url"
+        ));
+    }
+    Ok(rest.to_string())
+}
+
+/// The lexical containment fence the channel's INPUT paths pass before any
+/// filesystem look, so the refusal itself is deterministic (const-eval.md
+/// §9.5): relative, and inside the package root. Shared by `asset::read`,
+/// `asset::read_dir`, `asset::read_dir_all` and `asset::digest` — one fence,
+/// named for whichever of them the program wrote.
+///
+/// Deliberately NOT [`bundled_name`]'s fence, which also refuses a backslash:
+/// these arguments address a file to READ and never become derived output, and
+/// `a\b` is a legal filename on Linux, so refusing it there would refuse a real
+/// file to fix a problem that host does not have.
+fn contained_input(path: &str, function: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(path);
+    if requested.is_absolute() {
+        return Err(format!(
+            "`{function}` paths are relative to the package root; `{path}` is absolute"
+        ));
+    }
+    if requested
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "`{function}` paths resolve inside the package root; `{path}` escapes it"
+        ));
+    }
+    Ok(requested.to_path_buf())
+}
+
+/// One directory's immediate entries, byte-sorted by name — the single reading
+/// of "what this directory holds" that the const channel has.
+///
+/// One function so the WALK and the re-hash cannot disagree: the const pass
+/// keys a listed directory on this, and the CLI's per-leg skip re-keys it on
+/// this, so an unchanged directory compares equal instead of disqualifying the
+/// leg by failing to read as a file.
+fn sorted_entries(directory: &Path) -> std::io::Result<Vec<(std::ffi::OsString, PathBuf)>> {
+    let mut entries: Vec<(std::ffi::OsString, PathBuf)> = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| (entry.file_name(), entry.path())))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort();
+    Ok(entries)
+}
+
+/// The content key a LISTED directory is tracked by (const-eval.md §3.1): its
+/// immediate membership, byte-sorted and newline-joined. A file appearing or
+/// disappearing moves it; a file's CONTENTS changing does not, because the
+/// listing verbs read names and never bytes — a file whose contents matter to
+/// the build is tracked in its own right by the `read`/`bundle`/`digest` that
+/// touched it.
+///
+/// `None` when the path cannot be listed (it is gone, it is a file, it is
+/// unreadable), which is exactly the answer that disqualifies a reuse.
+pub fn directory_input_hash(directory: &Path) -> Option<u64> {
+    let entries = sorted_entries(directory).ok()?;
+    let names: Vec<String> = entries
+        .iter()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    Some(crate::content_hash(&names.join("\n")))
+}
+
 impl interpreter::AssetReader for ProjectReader {
     fn read(&self, path: &str) -> Result<String, String> {
-        let requested = Path::new(path);
         // Relative, inside the root, by construction: the channel reads THE
         // PROJECT, deterministically per build-input closure — a path that is
         // absolute or climbs out of the root reaches state the build cannot
         // track (const-eval.md §9.5's determinism stance). Refused lexically,
         // before any filesystem look, so the refusal itself is deterministic.
-        if requested.is_absolute() {
-            return Err(format!(
-                "`asset::read` paths are relative to the package root; `{path}` is absolute"
-            ));
-        }
-        if requested
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-        {
-            return Err(format!(
-                "`asset::read` paths resolve inside the package root; `{path}` escapes it"
-            ));
-        }
+        let requested = contained_input(path, "asset::read")?;
         let resolved = self.root.join(requested);
         match crate::util::read_source(&resolved) {
             Ok(text) => {
@@ -250,9 +359,24 @@ impl interpreter::AssetReader for ProjectReader {
     /// `Program` would buy nothing. A miss is an ERROR and not a recorded
     /// absence: `read`'s miss can be a legitimate answer to ask about, but a
     /// build cannot carry a file that is not there.
-    fn bundle(&self, path: &str) -> Result<String, String> {
-        let name = bundled_name(path)?;
-        let resolved = self.root.join(&name);
+    ///
+    /// `target` is `asset::bundle_as`'s explicit url; `None` is `bundle`,
+    /// whose target is the source path itself. That is the whole difference
+    /// between the two spellings, which is why they share this one method —
+    /// the registration, the input record, the collision rule and the manifest
+    /// row it feeds are identical for either (const-eval.md §3.1).
+    fn bundle(&self, path: &str, target: Option<&str>) -> Result<String, String> {
+        let function = if target.is_some() {
+            "asset::bundle_as"
+        } else {
+            "asset::bundle"
+        };
+        let source_name = bundled_name(path, function)?;
+        let name = match target {
+            Some(url) => bundled_target(url)?,
+            None => source_name.clone(),
+        };
+        let resolved = self.root.join(&source_name);
         // Recorded before the read succeeds, exactly as `read` records its
         // misses: a file that was not there is still a dependency, and its
         // APPEARANCE must invalidate the compile that failed on it.
@@ -260,7 +384,7 @@ impl interpreter::AssetReader for ProjectReader {
             Ok(bytes) => {
                 self.inputs
                     .borrow_mut()
-                    .push((resolved, Some(crate::content_hash_bytes(&bytes))));
+                    .push((resolved.clone(), Some(crate::content_hash_bytes(&bytes))));
             }
             Err(error) => {
                 self.inputs.borrow_mut().push((resolved.clone(), None));
@@ -270,11 +394,155 @@ impl interpreter::AssetReader for ProjectReader {
                 ));
             }
         }
+        // The collision the identity rule used to make impossible: under
+        // `bundle` the path WAS the name, so two files could never claim one.
+        // `bundle_as` breaks that, so the guarantee is enforced here instead of
+        // inherited — and the message carries BOTH sources, because a collision
+        // is a statement about a pair. The same (source, target) pair reached
+        // twice still deduplicates, as `bundle`'s two call sites always did.
         let mut bundled = self.bundled.borrow_mut();
-        if !bundled.iter().any(|(_, existing)| *existing == name) {
-            bundled.push((self.root.join(&name), name.clone()));
+        if let Some(existing) = bundled.iter().find(|row| row.name == name) {
+            if existing.source != resolved {
+                return Err(format!(
+                    "`{}` and `{path}` both bundle to `/{name}` — two files cannot \
+                     answer on one url; give one of them a target of its own with \
+                     `asset::bundle_as`",
+                    existing.requested
+                ));
+            }
+            return Ok(format!("/{name}"));
         }
+        bundled.push(BundleRow {
+            source: resolved,
+            name: name.clone(),
+            requested: path.to_string(),
+        });
         Ok(format!("/{name}"))
+    }
+
+    /// The channel's directory listing (const-eval.md §3.1): FILES only,
+    /// byte-sorted, `/`-separated on every host, with every directory walked
+    /// recorded as a tracked build input.
+    ///
+    /// Sorted because a const result is compiled INTO the output, so host
+    /// iteration order would make one source tree produce two builds. Files
+    /// only because nothing in this channel consumes a directory — `read`,
+    /// `bundle`, `bundle_as` and `digest` all take a file — and there is no
+    /// const `stat`, so a directory entry would be one the program could
+    /// neither act on nor filter out.
+    fn read_dir(&self, path: &str, recursive: bool) -> Result<Vec<String>, String> {
+        let function = if recursive {
+            "asset::read_dir_all"
+        } else {
+            "asset::read_dir"
+        };
+        let requested = contained_input(path, function)?;
+        let resolved = self.root.join(requested);
+        let mut entries = Vec::new();
+        self.walk(&resolved, "", recursive, function, path, &mut entries)?;
+        // The whole relative path, so a tree's listing is stable whatever order
+        // the host walked in — not merely each directory's own entries.
+        entries.sort();
+        Ok(entries)
+    }
+
+    /// The file's sha-256 as lowercase hex, with the file tracked exactly as
+    /// `read`'s and `bundle`'s are. The BYTES, not the decoded text: a
+    /// fingerprint of a font or a `.png` must be a fingerprint of the file and
+    /// not of a decoding.
+    fn digest(&self, path: &str) -> Result<(String, u64), String> {
+        let requested = contained_input(path, "asset::digest")?;
+        let resolved = self.root.join(requested);
+        match std::fs::read(&resolved) {
+            Ok(bytes) => {
+                self.inputs
+                    .borrow_mut()
+                    .push((resolved, Some(crate::content_hash_bytes(&bytes))));
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                let hex: String = hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                Ok((hex, bytes.len() as u64))
+            }
+            Err(error) => {
+                self.inputs.borrow_mut().push((resolved.clone(), None));
+                Err(format!(
+                    "cannot digest `{path}` (resolved against the package root to `{}`): {error}",
+                    resolved.display()
+                ))
+            }
+        }
+    }
+}
+
+impl ProjectReader {
+    /// One level of [`interpreter::AssetReader::read_dir`]'s walk: record
+    /// `directory` as a tracked input, push its FILES (prefixed with `prefix`,
+    /// the path relative to the listing's root), and — under `read_dir_all` —
+    /// descend.
+    ///
+    /// The record is per directory walked, and that is what makes the doctrine
+    /// compose: a file appearing or disappearing anywhere in the tree moves
+    /// exactly one recorded directory's key, so both directions invalidate.
+    ///
+    /// Kind is decided by FOLLOWING a symlink (`metadata`), so a link to a file
+    /// is a file and is bundleable. Descent is decided by NOT following
+    /// (`symlink_metadata`), so a link to a directory is never entered and a
+    /// const walk cannot be made to loop. An entry that is neither — a socket,
+    /// a broken link — is neither listed nor descended.
+    fn walk(
+        &self,
+        directory: &Path,
+        prefix: &str,
+        recursive: bool,
+        function: &str,
+        spelled: &str,
+        out: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let entries = match sorted_entries(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.inputs
+                    .borrow_mut()
+                    .push((directory.to_path_buf(), None));
+                return Err(format!(
+                    "cannot list `{spelled}` with `{function}` (resolved against the \
+                     package root to `{}`): {error}",
+                    directory.display()
+                ));
+            }
+        };
+        let names: Vec<String> = entries
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        self.inputs.borrow_mut().push((
+            directory.to_path_buf(),
+            Some(crate::content_hash(&names.join("\n"))),
+        ));
+        for ((name, path), lossy) in entries.iter().zip(&names) {
+            let Some(name) = name.to_str() else {
+                return Err(format!(
+                    "`{function}` entries must be valid text; `{}` holds `{lossy}`, \
+                     which is not",
+                    directory.display()
+                ));
+            };
+            let entry = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.metadata().is_ok_and(|meta| meta.is_file()) {
+                out.push(entry);
+            } else if recursive && path.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+                self.walk(path, &entry, recursive, function, spelled, out)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -345,8 +613,15 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
         input_files: inputs,
         // Insertion order, NOT sorted: a build log that names the files in the
         // order the program asked for them reads as the program does, and the
-        // registry is already deduplicated by name.
-        bundled: reader.bundled.into_inner(),
+        // registry is already deduplicated by name. The requested spelling
+        // stays behind: it exists for the collision diagnostic, and the copy
+        // downstream wants the resolved source and the output name.
+        bundled: reader
+            .bundled
+            .into_inner()
+            .into_iter()
+            .map(|row| (row.source, row.name))
+            .collect(),
     }
 }
 
@@ -1150,8 +1425,8 @@ impl<'p, 'src> State<'p, 'src> {
     }
 
     /// The const-only capability check (const-eval.md §2): no RUNTIME call
-    /// path may reach the compile-time channel — `asset::emit`,
-    /// `asset::emit_keyed`, `asset::read` or `asset::bundle`. R = the
+    /// path may reach any verb of the compile-time channel
+    /// (`Program::asset_channel_fns`). R = the
     /// functions/closures that reach one through call
     /// sites OUTSIDE `const` subtrees; roots (`main`, top-level initializers)
     /// never join R — a root's call into R is the offending boundary,
@@ -1177,22 +1452,18 @@ impl<'p, 'src> State<'p, 'src> {
     /// carries a live `__emit_asset`/`__read_asset` call with no runtime
     /// binding.
     fn check_const_only(&mut self, graph: &CallGraph) {
-        // The const-only set: the channel's three directions — lines out (in
-        // both its spellings, build-hooks.md §5.3), text in, whole files out —
-        // in a fixed order so an R-member reaching more than one is NAMED for
-        // the same one every run. `emit_keyed` belongs here for the reason
-        // `emit` does and no other: a runtime path reaching it would compile
-        // clean and carry a live `__emit_asset_keyed` call with no runtime
-        // binding (B143's shape).
-        let const_only: Vec<Id> = [
-            self.program.asset_emit_fn_id,
-            self.program.asset_emit_keyed_fn_id,
-            self.program.asset_read_fn_id,
-            self.program.asset_bundle_fn_id,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        // The const-only set: every verb of the channel, in the fixed order the
+        // analyzer recorded, so an R-member reaching more than one is NAMED
+        // for the same one every run. Each spelling belongs here for the
+        // reason `emit` does and no other: a runtime path reaching it would
+        // compile clean and carry a live host call with no runtime binding
+        // (B143's shape).
+        let const_only: Vec<Id> = self
+            .program
+            .asset_channel_fns
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
         if const_only.is_empty() {
             return;
         }
@@ -1512,22 +1783,17 @@ impl<'p, 'src> State<'p, 'src> {
         }
     }
 
-    /// How a const-only callee names itself in a diagnostic: the builtin
-    /// itself (`asset::emit` / `asset::emit_keyed` / `asset::read` /
-    /// `asset::bundle`), or the R-member that reaches one — named for the
-    /// builtin `reaches` recorded for it.
+    /// How a const-only callee names itself in a diagnostic: the channel verb
+    /// itself, by its `std::asset` path, or the R-member that reaches one —
+    /// named for the verb `reaches` recorded for it.
     fn const_only_name(&self, callee: Id, reaches: &HashMap<Id, Id>) -> String {
-        if Some(callee) == self.program.asset_emit_fn_id {
-            return "`asset::emit`".to_string();
-        }
-        if Some(callee) == self.program.asset_emit_keyed_fn_id {
-            return "`asset::emit_keyed`".to_string();
-        }
-        if Some(callee) == self.program.asset_read_fn_id {
-            return "`asset::read`".to_string();
-        }
-        if Some(callee) == self.program.asset_bundle_fn_id {
-            return "`asset::bundle`".to_string();
+        if let Some((_, path)) = self
+            .program
+            .asset_channel_fns
+            .iter()
+            .find(|(id, _)| *id == callee)
+        {
+            return format!("`{path}`");
         }
         let via = self.builtin_name(callee, reaches);
         self.program
@@ -1542,14 +1808,16 @@ impl<'p, 'src> State<'p, 'src> {
     /// for a member with no record (unreachable in practice: every R-member is
     /// seeded or propagated with one).
     fn builtin_name(&self, member: Id, reaches: &HashMap<Id, Id>) -> &'static str {
-        match reaches.get(&member) {
-            Some(&builtin) if Some(builtin) == self.program.asset_emit_keyed_fn_id => {
-                "asset::emit_keyed"
-            }
-            Some(&builtin) if Some(builtin) == self.program.asset_read_fn_id => "asset::read",
-            Some(&builtin) if Some(builtin) == self.program.asset_bundle_fn_id => "asset::bundle",
-            _ => "asset::emit",
-        }
+        reaches
+            .get(&member)
+            .and_then(|builtin| {
+                self.program
+                    .asset_channel_fns
+                    .iter()
+                    .find(|(id, _)| id == builtin)
+            })
+            .map(|(_, path)| *path)
+            .unwrap_or("asset::emit")
     }
 
     /// An interpreter failure as a diagnostic. The primary span stays the

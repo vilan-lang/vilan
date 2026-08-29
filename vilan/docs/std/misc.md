@@ -183,9 +183,13 @@ fun emit(kind: str, line: str)               // compile-time only: append to a b
 fun emit_keyed(kind: str, key: str, line: str)  // …with the contribution's own sort key
 fun read(path: str): str                     // compile-time only: read a project file
 fun bundle(path: str): str                   // compile-time only: carry a file into the build
+fun bundle_as(path: str, url: str): str      // …at a url the path does not spell
+fun read_dir(path: str): List<str>           // compile-time only: a directory's files
+fun read_dir_all(path: str): List<str>       // …and every file beneath it
+fun digest(path: str): str                   // compile-time only: a file's sha-256
 ```
 
-All four callable only from `const` evaluation — a runtime call path
+All eight callable only from `const` evaluation — a runtime call path
 to any of them is a compile error. `emit` is how `std::style` writes the CSS
 file (`emit("css", rule)`). Reach for it directly only for a shape std
 has no spelling for: a whole declaration block under a selector you
@@ -290,3 +294,65 @@ build manifest lists what it bundled, so
 [`serve_build`](web.md#stdhttp) serves every one of them with no route
 of your own — reachability stays the compiler's, and a resource no
 `const` names is never copied and does not ship.
+
+### Bundling a whole estate
+
+`bundle_as(path, url)` is `bundle` with the target spelled at the call.
+Everything else is identical — same copy, same tracked input, same
+manifest row, same `--watch` recopy — and the value it returns is the
+url:
+
+```vilan,fragment
+// The file stays at `static/robots.txt`; the crawler still finds it.
+let robots = const asset::bundle_as("static/robots.txt", "/robots.txt");
+```
+
+Nothing is renamed behind your back, because the rename is spelled
+here. The url starts with `/`, is `/`-separated on every host, and every
+segment must be a name: an empty segment, a `.` or a `..` is a compile
+error naming the fix. The target passes the same build-owned-name fence
+`bundle`'s does, and one new rule `bundle` never needed: two files
+bundling to one url is a compile error naming both, since one url
+cannot answer with two files. The same file at the same url twice is
+one copy, as it always was.
+
+`read_dir(path)` and `read_dir_all(path)` list a directory at compile
+time — immediate files by bare name, and every file beneath by a path
+relative to `path`. Both are **byte-sorted** (a const result is compiled
+into the build, so host order would make one source tree produce two
+builds) and list **files only** (nothing in this channel consumes a
+directory, and there is no compile-time `stat` to filter one out). The
+directory is a tracked build input, so a file appearing or disappearing
+invalidates the compile that listed it, and `--watch` picks up an asset
+you just dropped in.
+
+Together they make a static estate three lines of ordinary code, with
+any rewrite policy you like written as ordinary code too:
+
+```vilan,fragment
+fun static_estate(): List<str> {
+	mut urls: List<str> = [];
+	for file in asset::read_dir_all("static") {
+		urls.push(asset::bundle_as(i"static/{file}", i"/{file}"));
+	}
+	urls
+}
+let ESTATE = const static_estate();
+```
+
+`digest(path)` completes it: the file's sha-256 as lowercase hex, 64
+characters, taken over the **bytes**. That is what a content-hashed url
+needs — the basis of the immutable cache tier, where a url that changes
+whenever the bytes do can be served with a year-long `max-age`:
+
+```vilan,fragment
+let logo = const asset::bundle_as(
+	"static/logo.png",
+	i"/static/logo.{asset::digest("static/logo.png").substring(0, 8)}.png",
+);
+```
+
+The digested file is a tracked build input like a read one, so an edit
+re-mints the url. Listings charge fuel per entry; `digest` charges per
+byte at an eighth of `read`'s rate, since its bytes never enter the
+program and its result is 64 characters whatever the file weighs.

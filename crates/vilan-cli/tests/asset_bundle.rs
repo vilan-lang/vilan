@@ -27,7 +27,11 @@
 //!     `write_chunks` would otherwise DELETE a resource parked on one.
 //!   - **A source that is already its destination is not copied** — `fs::copy`
 //!     over itself truncates, so carrying the file would destroy it.
-//!   - **The call is compile-time-only**, like its two `std::asset` siblings.
+//!   - **The call is compile-time-only**, like its `std::asset` siblings.
+//!
+//! The last block pins kolt.local 035's three additions on the same machinery:
+//! `bundle_as`'s target spelled at the call, `read_dir_all`'s sorted and
+//! tracked listing, and `digest`'s fingerprint.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -423,6 +427,420 @@ fn a_watch_round_recopies_a_changed_resource() {
         })
         .expect("round 2");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- kolt.local 035: the estate verbs, end to end ------------------------------
+//
+// `bundle` alone said "the path is the url", so a path-pinned name forced the
+// file to the package root and a static estate was a hand-written list of
+// calls. These pin what closing that costs and what it must keep: the target is
+// spelled at the call, the listing is deterministic and tracked, and the
+// fingerprint is mintable in the language that ships the file.
+//
+// The green negative for the whole slice is the corpus gate — `asset_bundle.vl`
+// and every other golden are byte-identical, so a project using plain `bundle`
+// emits exactly what it emitted before.
+
+/// The estate a `read_dir_all` project ships: two files and a nested one, so a
+/// listing pin measures the recursion and the sort rather than one name.
+fn stage_estate(dir: &Path) {
+    write(
+        dir,
+        "vilan.toml",
+        "[package]\nname = \"estate\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    // Written in an order the sort has to undo.
+    write(dir, "src/static/robots.txt", "User-agent: *\n");
+    write(dir, "src/static/icons/open.svg", ICON);
+    write(dir, "src/static/icons/close.svg", ICON);
+    write(dir, "src/static/logo.svg", ICON);
+    write(
+        dir,
+        "src/server.vl",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+    );
+}
+
+/// The client of that project: 035's recipe verbatim — enumerate, strip the
+/// prefix, bundle each file at the url the strip produced.
+const ESTATE_CLIENT: &str = "import std::asset;\n\
+     import std::ui::{ mount_root, view };\n\
+     \n\
+     fun estate(): List<str> {\n\
+     \tmut urls: List<str> = [];\n\
+     \tfor file in asset::read_dir_all(\"static\") {\n\
+     \t\turls.push(asset::bundle_as(i\"static/{file}\", i\"/{file}\"));\n\
+     \t}\n\
+     \turls\n\
+     }\n\
+     \n\
+     let ESTATE = const estate();\n\
+     \n\
+     fun main() {\n\
+     \tlet _root = mount_root(\"app\", || view(\"img\").attr(\"src\", ESTATE[0]));\n\
+     }\n";
+
+/// **The gate for `bundle_as`.** A two-leg project whose client bundles its
+/// estate at urls the paths do not spell: the copies land on the TARGETS, the
+/// manifest names the targets, and the running server — reading only that
+/// manifest — answers on them, with the source tree gone.
+#[test]
+fn a_targeted_resource_is_served_at_the_url_it_was_given() {
+    let port = free_port();
+    let dir = temp_project("estate-serve");
+    stage_estate(&dir);
+    write(&dir, "src/client.vl", ESTATE_CLIENT);
+    write(
+        &dir,
+        "src/server.vl",
+        &format!(
+            "import std::build::require_build;\n\
+             import std::http::{{ Request, Response, Server }};\n\
+             import std::io::print;\n\
+             \n\
+             async fun main() {{\n\
+             \tlet build = require_build(\"client\");\n\
+             \tServer::builder()\n\
+             \t\t.port({port})\n\
+             \t\t.serve_build(build)\n\
+             \t\t.on_request(|request| Response::builder().body(\"app\").build())\n\
+             \t\t.on_start(|server| print(\"listening\"))\n\
+             \t\t.build()\n\
+             \t\t.start();\n\
+             }}\n"
+        ),
+    );
+    build_ok(&dir);
+
+    let manifest =
+        std::fs::read_to_string(dir.join("dist/client.chunks.json")).expect("the manifest");
+    assert!(
+        manifest.contains("\"icons/close.svg\"") && manifest.contains("\"robots.txt\""),
+        "the manifest names the TARGETS, prefix stripped — that row is what \
+         `serve_build` turns into a route:\n{manifest}"
+    );
+    assert!(
+        !manifest.contains("static/"),
+        "and no target keeps the source prefix:\n{manifest}"
+    );
+    assert!(
+        dir.join("dist/icons/close.svg").is_file(),
+        "the copy lands on the target, subdirectory and all"
+    );
+
+    // Nothing but `dist/` from here, exactly as the `bundle` gate proves.
+    std::fs::remove_dir_all(dir.join("src")).expect("delete the source tree");
+    let mut server = serve(&dir);
+    assert!(wait_for_port(port), "the server never came up");
+    let (head, body) = http_get(port, "/icons/close.svg");
+    // The SOURCE path is not a route: the target replaced it rather than
+    // aliasing it, so this falls through to the app's own handler.
+    let (_, fallthrough) = http_get(port, "/static/icons/close.svg");
+    stop(&mut server);
+    assert!(
+        head.contains("200"),
+        "the targeted url must answer:\n{head}"
+    );
+    assert_eq!(body, ICON, "and with the resource's own bytes");
+    assert_eq!(
+        fallthrough, "app",
+        "the source path must not be a route of its own — the build serves \
+         the target it was given, and nothing else"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A recursive listing is byte-sorted, whatever order the host walks in — the
+/// determinism a const result compiled INTO the build has to have. The emitted
+/// array is the observable: two builds of one tree must fold to one list.
+#[test]
+fn a_recursive_listing_folds_in_sorted_order() {
+    let dir = temp_project("estate-order");
+    stage_estate(&dir);
+    write(&dir, "src/client.vl", ESTATE_CLIENT);
+    build_ok(&dir);
+    let javascript = std::fs::read_to_string(dir.join("dist/client.js")).expect("the bundle");
+    let expected = "[ \"/icons/close.svg\", \"/icons/open.svg\", \"/logo.svg\", \"/robots.txt\" ]";
+    assert!(
+        javascript.contains(expected),
+        "the listing must fold byte-sorted, files only (`icons` is not an \
+         entry), and with no runtime call left; expected {expected}:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("__read_asset_dir"),
+        "no runtime listing survives:\n{javascript}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The listed DIRECTORY is a tracked build input: a file dropped into it joins
+/// the next build with no source edit at all. Without the record the estate
+/// recipe would be a one-shot — the leg's inputs would re-hash equal and the
+/// new resource would never ship.
+#[test]
+fn a_file_added_to_a_listed_directory_joins_the_next_build() {
+    let dir = temp_project("estate-membership");
+    stage_estate(&dir);
+    write(&dir, "src/client.vl", ESTATE_CLIENT);
+    build_ok(&dir);
+    assert!(
+        !dir.join("dist/late.svg").exists(),
+        "the fixture must start without the late arrival"
+    );
+    // The ONLY change: a new file in the listed tree. No `.vl` is touched.
+    write(&dir, "src/static/late.svg", ICON);
+    build_ok(&dir);
+    assert!(
+        dir.join("dist/late.svg").is_file(),
+        "a file appearing in a listed directory must reach the build"
+    );
+    let javascript = std::fs::read_to_string(dir.join("dist/client.js")).expect("the bundle");
+    assert!(
+        javascript.contains("\"/late.svg\""),
+        "and the folded listing must name it:\n{javascript}"
+    );
+    // And the other direction: removing it takes it back out of the listing.
+    std::fs::remove_file(dir.join("src/static/late.svg")).expect("remove the file");
+    build_ok(&dir);
+    let javascript = std::fs::read_to_string(dir.join("dist/client.js")).expect("the bundle");
+    assert!(
+        !javascript.contains("\"/late.svg\""),
+        "disappearance is the same event:\n{javascript}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `digest` against the canonical vector, through a whole build: the url the
+/// program computed carries sha-256("abc")'s first eight hex digits, the copy
+/// lands on it, and editing the file re-mints it. A fingerprinted url that did
+/// not move with the bytes would serve stale content under a name promising it
+/// is immutable — the worst failure the cache tier this exists for can have.
+#[test]
+fn a_fingerprinted_url_is_the_files_digest_and_moves_with_it() {
+    let dir = temp_project("estate-digest");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"fingerprint\"\n\n[entry.app]\n",
+    );
+    write(&dir, "src/logo.svg", "abc");
+    write(
+        &dir,
+        "src/app.vl",
+        "import std::asset;\n\
+         import std::io::print;\n\
+         \n\
+         let LOGO = const asset::bundle_as(\n\
+         \t\"logo.svg\",\n\
+         \ti\"/logo.{asset::digest(\"logo.svg\").substring(0, 8)}.svg\",\n\
+         );\n\
+         \n\
+         fun main() {\n\
+         \tprint(LOGO);\n\
+         }\n",
+    );
+    build_ok(&dir);
+    let javascript = std::fs::read_to_string(dir.join("dist/app.mjs")).expect("the bundle");
+    assert!(
+        javascript.contains("\"/logo.ba7816bf.svg\""),
+        "sha-256(\"abc\") begins `ba7816bf` — the url is the file's own \
+         digest:\n{javascript}"
+    );
+    assert!(
+        dir.join("dist/logo.ba7816bf.svg").is_file(),
+        "and the copy lands on the minted url"
+    );
+    write(&dir, "src/logo.svg", "abcd");
+    build_ok(&dir);
+    let javascript = std::fs::read_to_string(dir.join("dist/app.mjs")).expect("the bundle");
+    assert!(
+        !javascript.contains("ba7816bf"),
+        "an edited file must re-mint its url — the digested file is a tracked \
+         build input:\n{javascript}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The url's shape, refused at the `const` expression with the fix named. Each
+/// row is a distinct rule: one message for all of them would make the rest of
+/// these vacuous.
+#[test]
+fn a_target_that_is_not_a_url_is_refused() {
+    for (url, expected) in [
+        ("robots.txt", "urls start at the site root"),
+        ("/a\\\\b.txt", "urls are `/`-separated on every host"),
+        ("/a//b.txt", "has an empty segment"),
+        ("/a/./b.txt", "has a `.` segment"),
+        ("/a/../b.txt", "has a `..` segment"),
+        ("/", "has an empty segment"),
+    ] {
+        let dir = temp_project("estate-urlshape");
+        write(&dir, "vilan.toml", "[package]\nname = \"shapes\"\n");
+        write(&dir, "src/note.txt", "a resource\n");
+        write(
+            &dir,
+            "src/main.vl",
+            &format!(
+                "import std::asset;\n\
+                 import std::io::print;\n\
+                 \n\
+                 let TAKEN = const asset::bundle_as(\"note.txt\", \"{url}\");\n\
+                 \n\
+                 fun main() {{\n\
+                 \tprint(TAKEN);\n\
+                 }}\n"
+            ),
+        );
+        let output = build(&dir);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "`{url}` must fail the build:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(expected),
+            "the refusal for `{url}` must say {expected:?}; got:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The refusal the identity rule used to give for free. Two sources, one
+/// target: refused at const evaluation, naming BOTH, because a collision is a
+/// statement about a pair.
+#[test]
+fn two_files_bundling_to_one_url_are_refused_naming_both() {
+    let dir = temp_project("estate-collision");
+    write(&dir, "vilan.toml", "[package]\nname = \"collide\"\n");
+    write(&dir, "src/first.txt", "one\n");
+    write(&dir, "src/second.txt", "two\n");
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::asset;\n\
+         import std::io::print;\n\
+         \n\
+         let ONE = const asset::bundle_as(\"first.txt\", \"/pinned.txt\");\n\
+         let TWO = const asset::bundle_as(\"second.txt\", \"/pinned.txt\");\n\
+         \n\
+         fun main() {\n\
+         \tprint(ONE);\n\
+         \tprint(TWO);\n\
+         }\n",
+    );
+    let output = build(&dir);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success(),
+        "the collision must fail the build:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`first.txt` and `second.txt` both bundle to `/pinned.txt`"),
+        "the refusal must name both sources; got:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same collision ACROSS legs, which the const pass cannot see: a workspace's
+/// legs are separate compiles into one `dist/`, so the copy is where two legs
+/// claiming one name meet. Without this the second copy would silently win, and
+/// `dist/` would serve one leg's file under the other leg's url.
+#[test]
+fn two_legs_bundling_to_one_url_are_refused_at_the_copy() {
+    let dir = temp_project("estate-crossleg");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"collide\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/first.txt", "one\n");
+    write(&dir, "src/second.txt", "two\n");
+    write(
+        &dir,
+        "src/client.vl",
+        "import std::asset;\n\
+         import std::ui::{ mount_root, view };\n\
+         \n\
+         let ONE = const asset::bundle_as(\"first.txt\", \"/pinned.txt\");\n\
+         \n\
+         fun main() {\n\
+         \tlet _root = mount_root(\"app\", || view(\"a\").attr(\"href\", ONE));\n\
+         }\n",
+    );
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::asset;\n\
+         import std::io::print;\n\
+         \n\
+         let TWO = const asset::bundle_as(\"second.txt\", \"/pinned.txt\");\n\
+         \n\
+         fun main() {\n\
+         \tprint(TWO);\n\
+         }\n",
+    );
+    let output = build(&dir);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success(),
+        "one `dist/` cannot serve two files on one url:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("both bundle to `pinned.txt`"),
+        "the refusal must name the collision; got:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The build-owned-name fence applies to the TARGET, and by reaching the same
+/// check `bundle` reaches — one list, never two. A resource parked on
+/// `client.css` does not merely collide: `sweep_stale_sidecar` deletes that name
+/// when a leg emits no styles, so it would vanish on the next build.
+#[test]
+fn a_target_a_legs_build_owns_is_refused() {
+    for (url, expected) in [
+        ("/client.js", "`client` leg's compiled bundle"),
+        ("/client.css", "`client` leg's style sidecar"),
+        ("/server.mjs", "`server` leg's compiled bundle"),
+    ] {
+        let dir = temp_project("estate-owned");
+        write(
+            &dir,
+            "vilan.toml",
+            "[package]\nname = \"owned\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+        );
+        write(&dir, "src/note.txt", "a resource in the way\n");
+        write(
+            &dir,
+            "src/client.vl",
+            &format!(
+                "import std::asset;\n\
+                 import std::ui::{{ mount_root, view }};\n\
+                 \n\
+                 let TAKEN = const asset::bundle_as(\"note.txt\", \"{url}\");\n\
+                 \n\
+                 fun main() {{\n\
+                 \tlet _root = mount_root(\"app\", || view(\"a\").attr(\"href\", TAKEN));\n\
+                 }}\n"
+            ),
+        );
+        write(
+            &dir,
+            "src/server.vl",
+            "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+        );
+        let output = build(&dir);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "targeting `{url}` must fail the build:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(expected),
+            "the refusal must name whose artifact `{url}` is; got:\n{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Polls for `path` to hold `expected`, up to a bounded deadline. Returns the

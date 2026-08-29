@@ -649,7 +649,7 @@ struct LegBuild {
 	styles: Option<str>,    // `client.css`, or None if the leg compiled no styles
 	chunks: List<str>,      // route chunks, empty unless the leg splits
 	classic_script: bool,   // true exactly when it splits
-	assets: List<str>,      // resources `const asset::bundle` carried in
+	assets: List<str>,      // resources the const asset channel carried in
 }
 
 fun build_of(leg: str): Result<LegBuild, BuildError>   // async
@@ -671,7 +671,10 @@ serve, so it stops with the error's message instead of starting.
 non-code resource the leg named with
 [`const asset::bundle`](misc.md#stdasset), by its package-relative path, so
 `static/icon.svg` is served at `/static/icon.svg` from
-`dist/static/icon.svg`. A build written before bundling existed carries no
+`dist/static/icon.svg`. A row placed by `bundle_as` carries the TARGET
+instead — the url spelled at the call, minus its leading `/` — and is served
+and read exactly the same way, which is why a fingerprinted or path-pinned
+name needs nothing here. A build written before bundling existed carries no
 `assets` field and reads as a build with none, which is what it was.
 
 ## std::document

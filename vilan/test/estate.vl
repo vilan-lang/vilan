@@ -1,0 +1,36 @@
+// The estate recipe (kolt.local 035, const-eval.md §3.1): the const channel's
+// three newest verbs in the shape they exist for. `read_dir_all` enumerates the
+// estate, `bundle_as` places each file at a url its path does not spell (the
+// `estate-static/` prefix stripped), and `digest` mints the content-hashed url
+// the immutable-cache tier runs on — with the filtering and the fingerprinting
+// both written as ORDINARY CODE, which is the whole argument for putting this
+// in the language rather than in a manifest key.
+//
+// Every call folds at compile time, so the emitted JS holds plain strings and
+// no runtime call survives.
+import std::asset;
+import std::print;
+
+fun estate(): List<str> {
+	mut urls: List<str> = [];
+	for file in asset::read_dir_all("estate-static") {
+		// The fingerprinted one is placed below, under a url this loop cannot
+		// mint — policy, spelled as an `if`.
+		if file != "logo.svg" {
+			urls.push(asset::bundle_as(i"estate-static/{file}", i"/{file}"));
+		}
+	}
+	let stamp = asset::digest("estate-static/logo.svg").substring(0, 8);
+	urls.push(asset::bundle_as("estate-static/logo.svg", i"/logo.{stamp}.svg"));
+	urls
+}
+
+let ESTATE = const estate();
+
+fun main() {
+	for url in ESTATE {
+		print(url);
+	}
+}
+
+main();

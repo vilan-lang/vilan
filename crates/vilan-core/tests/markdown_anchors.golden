@@ -308,6 +308,7 @@ std/misc.md h2 stdcontext
 std/misc.md h2 stdcrypto
 std/misc.md h2 stdjwt
 std/misc.md h2 stdasset
+std/misc.md h3 bundling-a-whole-estate
 std/net.md h1 networking-reference
 std/net.md h2 stdfetch
 std/net.md h2 stdws

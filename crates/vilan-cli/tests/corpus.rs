@@ -18,6 +18,22 @@ use std::process::Command;
 /// the runtime rather than leaving it to be sniffed (`top-level-await.md` §8.1).
 const GOLDEN_EXTENSION: &str = "mjs";
 
+/// Copies `from` into `to`, whole. The corpus's own resource trees are small
+/// and shallow; a symlink is followed like any other entry, because
+/// `std::fs::copy` follows one and the corpus has none.
+fn stage_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create a staged directory");
+    for entry in std::fs::read_dir(from).expect("read a corpus subdirectory") {
+        let path = entry.expect("a corpus subdirectory entry").path();
+        let name = path.file_name().expect("an entry has a name");
+        if path.is_dir() {
+            stage_tree(&path, &to.join(name));
+        } else {
+            std::fs::copy(&path, to.join(name)).expect("stage a corpus resource");
+        }
+    }
+}
+
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test")
 }
@@ -184,6 +200,16 @@ fn every_corpus_golden_is_byte_identical() {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        // A corpus program may ENUMERATE a directory (`asset::read_dir_all`,
+        // kolt.local 035), so a subdirectory travels whole. Without this it
+        // would not travel at all — it has no extension, so the filter below
+        // dropped it — and the listing would come back empty in the work dir,
+        // diverging the golden on a difference that is the staging's rather
+        // than the compiler's.
+        if path.is_dir() {
+            stage_tree(&path, &work.join(name));
+            continue;
+        }
         let Some(extension) = path.extension() else {
             continue;
         };
