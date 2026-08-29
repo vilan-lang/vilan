@@ -143,5 +143,5 @@ const leaf2 = $s(graph, [ 3, [  ] ]);
 let root_edges = [  ];
 root_edges.push(leaf1);
 root_edges.push(leaf2);
-const root = $s(graph, [ 1, __clone(root_edges) ]);
+const root = $s(graph, [ 1, root_edges ]);
 console.log(sum_from(graph, root));

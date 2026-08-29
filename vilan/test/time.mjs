@@ -688,7 +688,7 @@ function begin_variant4(self, name, arity) {
 			const payload = subject[name];
 			let $G = null;
 			if (arity === 1) {
-				self[0].v.push(__clone(payload));
+				self[0].v.push(payload);
 			} else {
 				const elements = payload;
 				let index = elements.length - 1;

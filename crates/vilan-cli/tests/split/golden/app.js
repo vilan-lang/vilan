@@ -719,8 +719,8 @@ function $aM(self, source, render, $aN, $aO) {
 			});
 			element.appendChild(built2[0]);
 			last_value.v = [ 0, __clone(value) ];
-			live_view.v = [ 0, __clone(built2) ];
-			live_owner.v = [ 0, __clone(owner) ];
+			live_view.v = [ 0, built2 ];
+			live_owner.v = [ 0, owner ];
 		}
 		return;
 	}, $aN, $aO);
@@ -866,7 +866,7 @@ function $aJ(self, source, render, $aK, $aL) {
 function $bG(body) {
 	const scope = new3();
 	const result = body(scope);
-	return [ result, __clone(scope) ];
+	return [ result, scope ];
 }
 function $bH(policy, body) {
 	const fresh = new2();

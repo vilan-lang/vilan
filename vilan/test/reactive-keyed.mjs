@@ -6,12 +6,6 @@ function __at_put(list, index, value) {
 	if (index >= 0 && index < list.length) return list[index] = value;
 	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
 }
-function __clone(value) {
-	if (Array.isArray(value)) return value.map(__clone);
-	if (value instanceof Set) return new Set([ ...value ].map(__clone));
-	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
-	return value;
-}
 function show(plan) {
 	let out = "";
 	for (const step of plan[0]) {
@@ -69,7 +63,7 @@ function $a(old_keys, old_items, items, key_of) {
 		}
 		index2 = index2 + 1;
 	}
-	return [ __clone(steps), __clone(removed) ];
+	return [ steps, removed ];
 }
 show($a([ 1, 2, 3 ], [ 10, 20, 30 ], [ 30, 10, 20 ], (item) => {
 	return Math.trunc(item / 10);

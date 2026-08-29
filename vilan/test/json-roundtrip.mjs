@@ -91,7 +91,7 @@ function $d(value) {
 		}
 		result.push($g[1]);
 	}
-	return [ 0, __clone(result) ];
+	return [ 0, result ];
 }
 function $a(text) {
 	const $b = __try_parse_json(text);
@@ -176,7 +176,7 @@ function $D(value) {
 		}
 		result.push($F[1]);
 	}
-	return [ 0, __clone(result) ];
+	return [ 0, result ];
 }
 function $H(value) {
 	let $I = null;
@@ -228,7 +228,7 @@ function $T(value) {
 		}
 		result.push($V[1]);
 	}
-	return [ 0, __clone(result) ];
+	return [ 0, result ];
 }
 function $Q(text) {
 	const $R = __try_parse_json(text);
