@@ -53,12 +53,26 @@ Fences add no runtime behavior; they are checked declarations.
 The manifest declares what a directory builds. Sections:
 
 - **`[package]`**: an application or plain package: `name`,
-  `description`, `root` (source root; default `src/`), `entry` (the
-  entry file, when there is exactly one), `target` (a platform;
-  default `node`), and `dependencies` (name → `{ path = "…" }` for a
-  local directory, or `{ git = "…", tag | rev = "…" }` for a `[library]`
-  repository pinned to exactly one of a tag or a commit; registry
-  dependencies are future work).
+  `description`, `root` (source root; default `src/`), `generated`
+  (below), `entry` (the entry file, when there is exactly one),
+  `target` (a platform; default `node`), and `dependencies` (name →
+  `{ path = "…" }` for a local directory, or
+  `{ git = "…", tag | rev = "…" }` for a `[library]` repository pinned
+  to exactly one of a tag or a commit; registry dependencies are future
+  work).
+- **Generated sources**: `[package] generated` (and `[library]
+  generated`) names the directory holding the package's **generated**
+  sources, relative to the manifest. It must be a relative path inside
+  the package, must not name the package directory, and must not be the
+  source `root`; each is a manifest error naming the key. The directory
+  need not exist. Its effect is on the **formatter**: `vilan fmt` — and
+  any editor formatting that goes through the same toolchain — leaves
+  every source file under it byte-identical, however that file is
+  reached, and reports once per run that it did. A file the formatter
+  rewrote would re-digest as changed and so re-stale the
+  `[[build.hook]]` that declared it as an output, which would regenerate
+  it unformatted; nothing else in the toolchain reads the key, and
+  module resolution is unaffected by it.
 - **`[entry.<name>]`**: one build entry per table: `path` (default
   `<root>/<name>.vl`), `target` (default `node`), and `split` (default
   `false`; §11.5). A package with
@@ -66,8 +80,8 @@ The manifest declares what a directory builds. Sections:
   what lets one source tree serve several. `[package] default-entry`
   names the entry `vilan run` executes when several are runnable.
 - **`[library]`**: a dependency-only package: `name`, `description`,
-  `root`, `dependencies`, and **`[library.layer.<name>]`** overlays
-  (`root`, `platform = ["…"]`) for per-platform sources.
+  `root`, `generated`, `dependencies`, and **`[library.layer.<name>]`**
+  overlays (`root`, `platform = ["…"]`) for per-platform sources.
 - **`[project]`**: a workspace: `packages = ["member", …]` (paths);
   building the project builds every member against its own manifest.
   `default-entry` names the member `vilan run` executes when several

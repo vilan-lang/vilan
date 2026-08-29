@@ -25,6 +25,10 @@
           "description": "The package source root, relative to this manifest. `entry` and every `pkg::` module resolve against it. Default: `src`.",
           "default": "src"
         },
+        "generated": {
+          "type": "string",
+          "description": "Where this package's generated sources live, relative to this manifest. `vilan fmt` leaves everything under it byte-identical — formatting a build hook's generated module would re-stale the hook forever. Must be inside the package, and not the source root. Absent by default."
+        },
         "entry": {
           "type": "string",
           "description": "The `build`/`run` entry file, resolved against `root`. Default: `main.vl`. Replaced by `[entry.<name>]` sections.",
@@ -70,6 +74,10 @@
           "type": "string",
           "description": "The base (shared) source root, relative to this manifest. Default: `src`.",
           "default": "src"
+        },
+        "generated": {
+          "type": "string",
+          "description": "Where this library's generated sources live, relative to this manifest. `vilan fmt` leaves everything under it byte-identical — formatting a build hook's generated module would re-stale the hook forever. Must be inside the library, and not the source root. Absent by default."
         },
         "dependencies": {
           "$ref": "#/definitions/dependencies"

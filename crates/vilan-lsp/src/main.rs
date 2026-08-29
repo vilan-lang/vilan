@@ -2367,6 +2367,19 @@ impl LanguageServer for Backend {
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         self.fenced("formatting", Err(handler_panicked()), || {
             let uri = params.text_document.uri;
+            // A file under a declared `generated` root is a product, and the
+            // editor holds to that as firmly as the terminal does
+            // (`build-hooks.md` §12.4). This is the path the rule most has to
+            // reach: format-on-save fires on a file the developer merely opened
+            // to read, so the fmt↔hook loop §12.1 describes would otherwise run
+            // without anyone having typed a command. Same predicate as
+            // `vilan fmt`'s — one rule, one implementation, or the editor's
+            // answer drifts from the terminal's.
+            if let Ok(path) = uri.to_file_path() {
+                if vilan_core::manifest::generated_root_covering(&path).is_some() {
+                    return Ok(None);
+                }
+            }
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };

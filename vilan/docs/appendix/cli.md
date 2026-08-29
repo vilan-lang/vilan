@@ -202,6 +202,22 @@ is the current directory. Formatting is conservative and a fixed point:
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.
 
+**Generated sources are skipped.** A package that declares
+`[package] generated = "…"` is saying that directory holds *products* — files
+a build hook writes, not files anyone authored — and `vilan fmt` leaves every
+one of them byte-identical, in `--check` too. It prints one dim `note:` line
+per run saying how many it skipped and which root they were under; the exit
+code doesn't move, because skipping a product is the right answer rather than
+a degraded one.
+
+The exclusion holds however the file is reached, naming it on the command line
+included, and your editor's format-on-save honors it through the same rule.
+That is the point of it: formatting a generated module rewrites bytes the hook
+that wrote them digests, so the hook goes stale, regenerates the file
+unformatted, and the two undo each other on every round — quietly, since
+neither tool is doing anything wrong. If a file should be formatted, it isn't
+a product: move it out of the root, or drop the key.
+
 ## `vilan test [path]`
 
 Runs `*_test.vl` files: the given file, a directory of tests, or every

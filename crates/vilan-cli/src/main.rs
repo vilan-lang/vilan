@@ -1521,6 +1521,10 @@ fn entry_case_mismatch(entry: &Path, pkg_root: &Path) -> Option<(String, String)
 /// reports files that would change; otherwise it rewrites them in place. The
 /// formatter leaves a file untouched when it's already formatted or contains a
 /// construct it can't yet print (it never produces non-round-tripping output).
+///
+/// A file under a package's declared `generated` root is not formatted at all —
+/// see [`exclude_generated`], which is applied to the collected set so `--check`
+/// and the rewrite are one rule rather than two that have to be kept in step.
 fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
     let roots: Vec<PathBuf> = if paths.is_empty() {
         vec![PathBuf::from(".")]
@@ -1531,6 +1535,7 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
     for root in &roots {
         collect_vl_files(root, &mut files);
     }
+    exclude_generated(&mut files);
     let mut changed = 0;
     let mut failed = false;
     for file in &files {
@@ -1577,6 +1582,85 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Drops every file that lives under a declared `generated` root, and says so
+/// once per root (`build-hooks.md` §12.4).
+///
+/// A package's products are not authored: not reviewed as diffs, not formatted
+/// as source. Formatting one is worse than pointless — a `[[build.hook]]`
+/// declares its generated module in `outputs`, freshness digests that file by
+/// content, so the reformat re-stales the hook, the generator rewrites the file
+/// unformatted, and the two undo each other on every round, forever (§12.1).
+///
+/// It happens **here**, after collection and in `fmt` alone, rather than inside
+/// [`collect_vl_files`] — which `scan_vl` shares with the watcher, and the
+/// watcher must keep seeing these files. A generated `.vl` that changed is a
+/// source input that changed; a round that ignored it would compile stale bytes.
+/// Formatting and rebuilding want opposite answers about the same file, and only
+/// one of them is this rule's.
+///
+/// The exclusion is unconditional: naming the file on the command line does not
+/// lift it. That is what lets the language server honor the same rule for
+/// format-on-save, which reaches a file by its exact path and nothing else.
+fn exclude_generated(files: &mut Vec<PathBuf>) {
+    // Every file in one directory has the same ancestors, so the covering root
+    // is a property of the directory — one manifest walk per directory rather
+    // than one per file, which matters at the thousand-generated-modules scale
+    // the key exists for.
+    let mut covering: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+    let mut skipped: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    files.retain(|file| {
+        let directory = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let root = covering
+            .entry(directory)
+            .or_insert_with_key(|directory| {
+                vilan_core::manifest::generated_root_covering(directory)
+            })
+            .clone();
+        match root {
+            Some(root) => {
+                *skipped.entry(root).or_default() += 1;
+                false
+            }
+            None => true,
+        }
+    });
+    // One dim line per root that actually skipped something — the honesty budget
+    // `Fresh <name>` and the un-opted-in dependency note already spend, for the
+    // same reason: a tool that quietly stops doing what it was asked is the
+    // failure mode this design cannot afford. Never per file (a thousand
+    // generated icons is a thousand lines nobody reads), never when the
+    // exclusion excluded nothing, and never a warning — skipping a product is
+    // the correct outcome, so the exit code does not move.
+    for (root, count) in &skipped {
+        let plural = if *count == 1 { "" } else { "s" };
+        eprintln!(
+            "{}",
+            paint::err(
+                paint::Style::DIM,
+                &format!(
+                    "note: {count} generated file{plural} not formatted (`{}`, the \
+                     package's `generated` root)",
+                    display_relative(root).display()
+                )
+            )
+        );
+    }
+}
+
+/// `path` relative to the working directory when it is under it, else `path` —
+/// so a note about a root the user is standing in reads as they spelled it,
+/// rather than as an absolute path resolution happened to produce.
+fn display_relative(path: &Path) -> PathBuf {
+    env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            path.strip_prefix(vilan_core::util::canonical_path(cwd))
+                .ok()
+        })
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Collects every `.vl` file under `path` (recursing into directories), in a
