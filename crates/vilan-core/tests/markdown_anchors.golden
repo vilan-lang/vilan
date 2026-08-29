@@ -222,6 +222,8 @@ spec/memory.md h3 the-resource-class
 spec/memory.md h3 the-affine-rules
 spec/memory.md h3 destruction--the-drop-trait
 spec/memory.md h3 drop-timing-and-order
+spec/memory.md h3 temporaries
+spec/memory.md h3 externs-and-retention
 spec/memory.md h3 optiontake-and-optionreplace
 spec/memory.md h3 early-teardown--drop
 spec/memory.md h3 ownednursery
@@ -458,7 +460,7 @@ tour/projects.md h2 workspaces
 tour/resources.md h1 resources
 tour/resources.md h2 moving-not-copying
 tour/resources.md h2 loaning-instead-of-moving
-tour/resources.md h2 teardown-happens-on-every-exit
+tour/resources.md h2 teardown-happens-at-the-last-use--and-on-every-exit
 tour/resources.md h2 tearing-down-early-dropx
 tour/resources.md h2 conditional-teardown-optiontake
 tour/resources.md h2 a-real-resource-database

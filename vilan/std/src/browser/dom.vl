@@ -60,12 +60,12 @@ impl Element {
 	external fun set_style_property(self, name: str, value: str): void;
 
 	/// Appends `child` as the element's last child.
-	[extern(method, "appendChild", retains)]
+	[extern(method, "appendChild")]
 	external fun append(self, child: Element): void;
 
 	/// Appends a text node as the element's last child — the `Text` overload of
 	/// `append` (the same `appendChild` binding; the DOM takes any node).
-	[extern(method, "appendChild", retains)]
+	[extern(method, "appendChild")]
 	external fun append_text(self, child: Text): void;
 
 	/// Removes the element from the document (`element.remove()`).
