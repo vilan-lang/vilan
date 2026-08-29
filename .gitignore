@@ -15,3 +15,7 @@ vilan/examples/**/*.chunks.json
 # The benchmark bundle (`vilan run vilan/benchmarks` writes it beside the source).
 vilan/benchmarks/src/main.mjs
 vilan/docs/book/
+
+# The union-suite log every integration writes beside the tree (three
+# tracked-by-accident incidents in one day; the hygiene gate caught two).
+suite.log
