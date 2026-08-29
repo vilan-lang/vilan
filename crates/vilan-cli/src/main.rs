@@ -483,52 +483,124 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
 /// How often the watcher polls for changes.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
-/// The build inputs `const asset::read` pulled in, recorded per compile —
-/// misses included, because a file that was not there is still a dependency
-/// whose APPEARANCE must trigger a round exactly as a change to it would.
-/// The watcher's snapshot polls these alongside its `.vl` scan; process-global
-/// because the recording compile runs several opaque call frames below the
-/// watch loop's action closure. Accumulative across rounds: a path a later
-/// round no longer reads stays watched, which costs at most one round whose
-/// legs then verify by content and skip.
+/// The build inputs a round declared or read beyond its `.vl` sources — the
+/// **recorded-inputs** set the watcher polls alongside [`scan_vl`]. Two
+/// producers feed it, and they are the whole list:
+///
+/// * `const asset::read`, recorded per compile by [`record_const_inputs`] —
+///   misses included, because a file that was not there is still a dependency
+///   whose APPEARANCE must trigger a round exactly as a change to it would.
+/// * a manifest's `[[build.hook]]` `inputs`, recorded per hook run by
+///   [`BuildHooks::record_watched_inputs`] — the declaration the freshness
+///   stamp already reads, now read by the watcher too (G10).
+///
+/// Process-global because the recording compile runs several opaque call
+/// frames below the watch loop's action closure. Accumulative across rounds: a
+/// path a later round no longer reads stays watched, which costs at most one
+/// round whose legs then verify by content and skip.
+///
+/// Declared **outputs** are deliberately absent. Only inputs are watched, so a
+/// hook writing what it said it writes can never wake the loop that ran it —
+/// the `.vl` scan's own invariant (`watch-mode.md`: a build can never trigger
+/// its own rebuild) carried into this set.
+///
+/// What that invariant does not cover — here, and equally for `asset::read`
+/// since the day those were recorded — is an input some OTHER unconditional
+/// step rewrites every round. The poll compares modification times, exactly as
+/// it does for `.vl` sources (saving a source with identical bytes is a round
+/// today too), so a rewrite settles nothing by being byte-identical. The hook
+/// does settle: its stamp is content-based and finds nothing moved, so it is
+/// skipped. The ROUNDS stop when the step doing the rewriting stops.
 ///
 /// Both locks below RECOVER from poisoning (backlog E97, the tree's one
 /// posture). This changes nothing about the CLI's *panic* stance — a compiler
 /// panic in a one-shot `vilan build` is still loud and fatal (AGENTS.md's fence
 /// note) — but `--watch` is a long-lived loop, and a watch set that could stop
-/// being readable would leave the loop silently blind to every `asset::read`
-/// input. An unwind can only ever leave this set holding a subset of one
-/// round's paths, which the next round re-records.
-static CONST_INPUT_PATHS: std::sync::Mutex<BTreeSet<PathBuf>> =
+/// being readable would leave the loop silently blind to every recorded input.
+/// An unwind can only ever leave this set holding a subset of one round's
+/// paths, which the next round re-records.
+static RECORDED_INPUT_PATHS: std::sync::Mutex<BTreeSet<PathBuf>> =
     std::sync::Mutex::new(BTreeSet::new());
+
+/// Adds `paths` to the watcher's recorded-input set — the one door into
+/// [`RECORDED_INPUT_PATHS`], so every producer records the same way.
+fn record_watched_inputs(paths: impl IntoIterator<Item = PathBuf>) {
+    let mut paths = paths.into_iter().peekable();
+    if paths.peek().is_none() {
+        return;
+    }
+    RECORDED_INPUT_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(paths);
+}
 
 /// Records a compile's `asset::read` inputs for the watcher.
 fn record_const_inputs(inputs: &[(PathBuf, Option<u64>)]) {
-    if inputs.is_empty() {
-        return;
-    }
-    let mut paths = CONST_INPUT_PATHS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    paths.extend(inputs.iter().map(|(path, _)| path.clone()));
+    record_watched_inputs(inputs.iter().map(|(path, _)| path.clone()));
 }
 
-/// [`scan_vl`] plus the recorded `asset::read` inputs: the full watched set.
-/// A recorded path that does not exist stays out of the map — its later
-/// appearance inserts an entry, which is exactly the snapshot difference that
-/// fires a round.
+/// [`scan_vl`] plus the recorded build inputs: the full watched set. A recorded
+/// path that does not exist stays out of the map — its later appearance inserts
+/// an entry, which is exactly the snapshot difference that fires a round.
 fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
     let mut files = scan_vl(roots);
-    for path in CONST_INPUT_PATHS
+    for path in RECORDED_INPUT_PATHS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
     {
-        if let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) {
-            files.insert(path.clone(), modified);
-        }
+        insert_watched_input(path, &mut files);
     }
     files
+}
+
+/// Adds one recorded input to the snapshot: its modification time, or — when it
+/// is a **directory** — one entry per file in its tree.
+///
+/// A directory means its tree because that is what the declaration already
+/// means to the freshness stamp ([`file_digest`] digests a directory as its
+/// whole tree, which is why `inputs = ["src/static"]` reads the way it looks):
+/// one reading of the manifest, both consumers. Watching only the directory
+/// itself would not do — a directory's own mtime moves when an entry is added
+/// or removed but NOT when a file inside it is edited, which is exactly the
+/// edit the hook that declared it cares about.
+///
+/// The top-level path is resolved through a symlink (`fs::metadata`), matching
+/// both the stamp — which reads a declared link's *target* bytes — and the
+/// `asset::read` inputs this set has always carried. Inside a tree, a symlink
+/// is never followed: the stamp digests the link's own target path there, and
+/// following one could walk out of the tree or into a cycle.
+fn insert_watched_input(path: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        collect_input_tree(path, files);
+    } else if let Ok(modified) = metadata.modified() {
+        files.insert(path.to_path_buf(), modified);
+    }
+}
+
+/// Every file under a declared directory input → its modification time. An
+/// entry that cannot be read is skipped rather than failing the snapshot: the
+/// watcher's job is to keep polling, and a path it cannot stat is one whose
+/// later readability is itself a difference.
+fn collect_input_tree(root: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_input_tree(&path, files);
+        } else if let Ok(modified) = metadata.modified() {
+            files.insert(path, modified);
+        }
+    }
 }
 
 /// Runs `action` once and returns its exit code (no `--watch`, `roots` is `None`),
@@ -621,11 +693,22 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
         .map(|root| root.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    // The line names BOTH halves of the set. It used to say `.vl` alone, which
+    // was already an understatement (recorded `asset::read` inputs have been
+    // polled beside the scan for as long as they have been recorded) and became
+    // a misleading one once hook `inputs` joined them: G10 was diagnosed off
+    // this banner — "it says `.vl`, so the watcher is doing what it says and the
+    // stamp must be wrong" — when the truth was the reverse. Nothing here can
+    // enumerate the recorded set (the first round is what discovers it), so the
+    // line states the rule instead of the contents.
     eprintln!(
         "{}",
         paint::err(
             paint::Style::CYAN,
-            &format!("[watch] watching {watched} for `.vl` changes (Ctrl-C to stop)")
+            &format!(
+                "[watch] watching {watched} for `.vl` changes and declared build \
+                 inputs (Ctrl-C to stop)"
+            )
         )
     );
     // The baseline snapshot is taken BEFORE the first action, never after: the
@@ -1756,6 +1839,11 @@ impl BuildHooks {
     /// run, and must never be described as a security property: if a hook is
     /// dangerous, running it once is the whole of the damage.
     fn run(&self, rerun: bool) -> Result<(), String> {
+        // Before anything runs, and unconditionally — a hook that is skipped as
+        // fresh, or that fails, still declared what it reads, and under
+        // `--watch` the edit to one of those files is precisely the event that
+        // must start the next round.
+        self.record_watched_inputs();
         for command in &self.commands {
             self.spawn(command, "`[build] run`")?;
         }
@@ -1831,6 +1919,30 @@ impl BuildHooks {
         }
         write_hook_stamp(&stamp_path, &next);
         Ok(())
+    }
+
+    /// Hands every declared `[[build.hook]]` input to the watcher's
+    /// recorded-input set (G10).
+    ///
+    /// The freshness stamp and the `--watch` wake-up set are two consumers of
+    /// ONE declaration, and before this they disagreed: a manifest could name a
+    /// file in `inputs`, have the stamp re-run the hook the moment its bytes
+    /// moved, and never get a round in which that could happen — the loop
+    /// polled `.vl` sources only, so editing a declared input produced nothing
+    /// at all until some unrelated `.vl` save woke the session. The paths are
+    /// resolved against [`BuildHooks::dir`], the same base
+    /// [`DeclaredHook::fingerprint`] resolves them against, so an input outside
+    /// the watch root (`inputs = ["../shared/icons"]`) is watched exactly as it
+    /// is stamped.
+    ///
+    /// `outputs` are not recorded, on purpose — see [`RECORDED_INPUT_PATHS`].
+    fn record_watched_inputs(&self) {
+        record_watched_inputs(
+            self.declared
+                .iter()
+                .flat_map(|hook| hook.inputs.iter())
+                .map(|declared| self.dir.join(declared)),
+        );
     }
 
     /// Runs one command through the platform shell, echoing it first. `label`
@@ -5124,7 +5236,73 @@ mod tests {
         );
         assert_ne!(next, snapshot);
         let _ = fs::remove_dir_all(&dir);
+    }
 
+    #[test]
+    fn watch_snapshot_expands_a_recorded_directory_input_to_its_tree() {
+        // G10: a declared directory input means its TREE, because that is what
+        // the freshness stamp already reads it as. Watching the directory entry
+        // alone would miss an edit to a file inside it — the directory's own
+        // mtime does not move for that.
+        let dir = env::temp_dir().join(format!("vilan-watch-tree-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("icons/svg")).unwrap();
+        let nested = dir.join("icons/svg/check.svg");
+        fs::write(&nested, "<svg/>\n").unwrap();
+        record_watched_inputs([dir.join("icons")]);
+        let roots = vec![dir.clone()];
+
+        let snapshot = watch_snapshot(&roots);
+        assert!(
+            snapshot.contains_key(&nested),
+            "a file nested under a declared directory is watched: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key(&dir.join("icons")),
+            "the directory itself is not an entry — its tree is"
+        );
+
+        // Adding a file under the tree is a snapshot difference: the round
+        // trigger the lucide case needed.
+        fs::write(dir.join("icons/svg/x.svg"), "<svg/>\n").unwrap();
+        assert_ne!(watch_snapshot(&roots), snapshot);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hooks_declared_inputs_are_recorded_and_its_outputs_are_not() {
+        // The wake-up set is the declaration, resolved against the manifest's
+        // own directory — and it stops at `inputs`: recording an output would
+        // let a hook wake the loop that ran it.
+        let dir = env::temp_dir().join(format!("vilan-watch-hook-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("icons.lock");
+        let output = dir.join("generated.vl.txt");
+        fs::write(&input, "lock\n").unwrap();
+        fs::write(&output, "generated\n").unwrap();
+        let hooks = BuildHooks {
+            dir: dir.clone(),
+            commands: Vec::new(),
+            declared: vec![DeclaredHook {
+                name: "icons".to_string(),
+                commands: vec!["true".to_string()],
+                inputs: vec!["icons.lock".to_string()],
+                outputs: vec!["generated.vl.txt".to_string()],
+            }],
+        };
+        hooks.record_watched_inputs();
+
+        let snapshot = watch_snapshot(std::slice::from_ref(&dir));
+        assert!(
+            snapshot.contains_key(&input),
+            "a declared input joins the watched set: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key(&output),
+            "a declared output must never be watched — that is the build \
+             triggering itself"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -199,6 +199,13 @@ The rest of the rules:
   hook after its first run.
 - **A missing input is recorded as missing**, so creating it later re-runs the
   hook. A missing or hand-edited output re-runs it too.
+- **Under `--watch`, a declared input starts a round.** Saving a file the hook
+  names in `inputs` — or adding to, or editing anything inside, a directory it
+  names — wakes the loop exactly the way saving a `.vl` source does, and the
+  round then re-runs the hook. One declaration, read the same way by the
+  freshness check and by the watcher. `outputs` are deliberately *not* watched:
+  a hook writing what it said it writes must never trigger the build that ran
+  it.
 - **A hook that succeeds without writing a declared output is told so**, by
   name and by path. Nothing is recorded for a hook whose output isn't there, so
   it would otherwise re-run on every build in silence while the failure

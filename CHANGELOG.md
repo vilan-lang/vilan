@@ -22,6 +22,13 @@ than a band: ..."). Two entries tripped this in one cycle before it was
 written down.
 -->
 
+## Unreleased
+
+<!-- family: tooling -->
+**A `[[build.hook]]`'s declared `inputs` now wake `--watch`, not just the freshness stamp.** The declaration had two consumers and only one of them was reading it: the stamp re-ran a hook the moment a declared input's bytes moved, while the watch loop polled `.vl` sources and nothing else — so editing a file the manifest names in `inputs` produced **zero rounds**, and the hook re-ran only when some unrelated `.vl` save happened to wake the session (measured on 0.39.0 with a lucide icon pipeline: three edits to declared inputs, no round each time, the banner cheerfully reporting `watching . for .vl changes`). The wake-up set now extends to every declared input, resolved against the manifest's own directory the way the stamp resolves them — so an input outside the watch root is watched exactly as it is stamped — and a declared **directory** means its tree, which is already what the stamp reads it as: adding a file under `inputs = ["icons"]`, or editing one inside it, starts a round. One reading of the manifest, both consumers. This is the recorded-inputs doctrine `markdown.md` §11 settled for `const asset::read`, and it is literally the same mechanism: hook inputs join the set the compile's read inputs already join, rather than a parallel one. Declared `outputs` are deliberately left out — watching what a hook writes would let a build trigger the round that ran it, which is the invariant only `.vl` tracking has protected so far, and the negative is pinned. The session banner now says what it watches, too: it read `watching . for .vl changes` while already polling recorded `asset::read` inputs beside the scan, and that understatement is how the defect came to be diagnosed backwards (the banner looked truthful, so the stamp looked guilty). Pinned by three bounded `--watch` sessions (an edited file input rounds; an added file under a declared directory rounds; an undeclared file does not, on a session proven still alive), the first two proven red first: both waited out the full liveness bound against the unfixed tree. (backlog G10; `build-hooks.md` §9's owed watch-round pin; docs `guide/dev-loop.md`)
+
+---
+
 ## v0.39.0 — 2026-08-29
 
 <!-- family: breaking -->
