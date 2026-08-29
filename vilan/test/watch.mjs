@@ -163,16 +163,16 @@ function $g($h) {
 		console.log(describe(await (next(flat, [ 1 ]))));
 		$g(flat);
 		flat = null;
-		const deep = await (watch_all("watch-corpus"));
-		try {
-			console.log(describe(await (next(deep, [ 1 ]))));
-		} finally {
-			$g(deep);
-		}
 	} finally {
 		if (flat !== null) {
 			$g(flat);
 		}
+	}
+	const deep = await (watch_all("watch-corpus"));
+	try {
+		console.log(describe(await (next(deep, [ 1 ]))));
+	} finally {
+		$g(deep);
 	}
 })().catch(($i) => {
 	console.error(String($i));

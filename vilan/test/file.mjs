@@ -47,17 +47,17 @@ async function $c(path, body) {
 		$a(file);
 		file = null;
 		console.log(await (read_at(await (open2("file-corpus.txt")), buffer, 0)));
-		console.log((await (stat(await (open2("file-corpus.txt")))))[0]);
-		const size = await ($c("file-corpus.txt", async (f) => {
-			return (await (stat(f)))[0];
-		}));
-		console.log(size);
-		await (unlink("file-corpus.txt"));
 	} finally {
 		if (file !== null) {
 			$a(file);
 		}
 	}
+	console.log((await (stat(await (open2("file-corpus.txt")))))[0]);
+	const size = await ($c("file-corpus.txt", async (f) => {
+		return (await (stat(f)))[0];
+	}));
+	console.log(size);
+	await (unlink("file-corpus.txt"));
 })().catch(($d) => {
 	console.error(String($d));
 	process.exit(1);

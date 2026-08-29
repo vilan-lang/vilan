@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
-    Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
+    BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch, ExprPattern, Function,
+    GenericDispatch, Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::Error;
@@ -2082,7 +2082,12 @@ impl<'src> Transformer<'src> {
                 Some(Expr::Void) | None
             );
             if tail_is_void || !self.program.platform.has_process_exit() {
-                self.walk_scope_body(&main_fn.body.0, 0, main_fn.body.1, TailDisposition::Discard)
+                self.walk_scope_body(
+                    &main_fn.body.0,
+                    0,
+                    main_fn.body.0.len(),
+                    Some((main_fn.body.1, TailDisposition::Discard)),
+                )
             } else {
                 let exit_temp = self.ng.next_name();
                 let mut body = vec![js::Node::LetVariable(js::Variable {
@@ -2092,8 +2097,8 @@ impl<'src> Transformer<'src> {
                 let wrapped = self.walk_scope_body(
                     &main_fn.body.0,
                     0,
-                    main_fn.body.1,
-                    TailDisposition::AssignTo(exit_temp.clone()),
+                    main_fn.body.0.len(),
+                    Some((main_fn.body.1, TailDisposition::AssignTo(exit_temp.clone()))),
                 );
                 body.extend(wrapped);
                 body.push(js::Node::Call(
@@ -4515,8 +4520,12 @@ impl<'src> Transformer<'src> {
                         Some(Expr::Void) | None
                     );
                     if tail_is_void {
-                        let wrapped =
-                            self.walk_scope_body(&body.0, 0, body.1, TailDisposition::Discard);
+                        let wrapped = self.walk_scope_body(
+                            &body.0,
+                            0,
+                            body.0.len(),
+                            Some((body.1, TailDisposition::Discard)),
+                        );
                         block.extend(wrapped);
                         return Some(js::Node::Void);
                     }
@@ -4528,8 +4537,8 @@ impl<'src> Transformer<'src> {
                     let wrapped = self.walk_scope_body(
                         &body.0,
                         0,
-                        body.1,
-                        TailDisposition::AssignTo(temp.clone()),
+                        body.0.len(),
+                        Some((body.1, TailDisposition::AssignTo(temp.clone()))),
                     );
                     block.extend(wrapped);
                     return Some(js::Node::Local(temp));
@@ -6275,34 +6284,12 @@ impl<'src> Transformer<'src> {
         // `try`/`finally` teardown (destruction.md §7); one owning none emits
         // exactly as before (byte-identical corpus gate).
         let mut body = self.parameter_entry_preludes(&function.parameters);
-        body.extend(if self.scope_needs_drops(&function.body.0) {
-            self.walk_scope_body(
-                &function.body.0,
-                0,
-                function.body.1,
-                TailDisposition::Return,
-            )
-        } else {
-            let mut body = self.walk_list(&function.body.0);
-            if let Some(return_expr) = self.walk_entity(function.body.1, &mut body) {
-                match return_expr {
-                    js::Node::Void => {}
-                    // A tail that already left the function — `fun a(): i32 {
-                    // ret 1 }` — is the statement, not a value to return
-                    // (B152: wrapping it emitted `return return 1;`).
-                    node if node.is_divergent() => body.push(node),
-                    _ => {
-                        body.push(js::Node::Return(Box::new(return_expr)));
-                    }
-                }
-            }
-            body
-        });
-        // An `own` resource parameter not moved out drops at the body's scope end
-        // (destruction.md §6). Its `finally` wraps the WHOLE body — outside any
-        // local teardown — so parameters drop last (declared before the locals =>
-        // reverse order after them), and `ret` / a thrown panic leave through it.
-        // A function with no such parameter emits exactly as above.
+        body.extend(self.walk_function_body(function));
+        // An `own` resource parameter not moved out drops at its LAST USE — or,
+        // when the dataflow refuses to say, at the body's scope end
+        // (destruction.md §6). `walk_function_body` above has already emitted
+        // the split form when the last use is short of the end; this wraps the
+        // whole body otherwise, keeping parameters last in the reverse order.
         let body = self.wrap_own_param_drops(function, body);
         js::Node::Function(js::Function {
             name,
@@ -6316,17 +6303,90 @@ impl<'src> Transformer<'src> {
         })
     }
 
-    /// Wrap a function body in a `try`/`finally` that drops its owned resource
-    /// parameters (destruction.md §6) in reverse declaration order, or return the
-    /// body unchanged when it has none — which every resource-free program does,
-    /// keeping its output byte-identical. The parameter type ids match the glue
-    /// `build_drop_glue` seeded from the same `parameters` table.
-    fn wrap_own_param_drops(
-        &mut self,
-        function: &Function<'src>,
-        body: Vec<js::Node<'src>>,
-    ) -> Vec<js::Node<'src>> {
-        let param_drops: Vec<(Id, TypeId)> = function
+    /// The function body's statements and tail, restructured for teardown.
+    ///
+    /// Three shapes, narrowest first, so a program that owns nothing keeps the
+    /// bytes it had:
+    ///
+    /// 1. no resource declarations and no early-dropping `own` parameter — the
+    ///    plain statement list;
+    /// 2. resource declarations only — [`Self::walk_scope_body`] over the whole
+    ///    body, which places each local's drop at its own last use;
+    /// 3. an `own` resource parameter whose last use is short of the body's end
+    ///    — the body SPLIT at that statement, the prefix wrapped in the
+    ///    parameters' `try`/`finally` and the suffix (with the tail) emitted
+    ///    after it. This is the parameter twin of a local's early drop, and it
+    ///    is done here rather than in [`Self::wrap_own_param_drops`] because by
+    ///    the time that runs the statement boundaries are gone.
+    fn walk_function_body(&mut self, function: &Function<'src>) -> Vec<js::Node<'src>> {
+        let statements = &function.body.0;
+        let tail = function.body.1;
+        if let Some(split) = self.own_param_split(function) {
+            let prefix = self.walk_scope_body(statements, 0, split, None);
+            let finally = self.own_param_drop_nodes(function);
+            let mut out = vec![js::Node::Try(prefix, finally)];
+            out.extend(self.walk_scope_body(
+                statements,
+                split,
+                statements.len(),
+                Some((tail, TailDisposition::Return)),
+            ));
+            return out;
+        }
+        if self.scope_needs_drops(statements) {
+            return self.walk_scope_body(
+                statements,
+                0,
+                statements.len(),
+                Some((tail, TailDisposition::Return)),
+            );
+        }
+        let mut body = self.walk_list(statements);
+        if let Some(return_expr) = self.walk_entity(tail, &mut body) {
+            match return_expr {
+                js::Node::Void => {}
+                // A tail that already left the function — `fun a(): i32 { ret 1
+                // }` — is the statement, not a value to return (B152: wrapping
+                // it emitted `return return 1;`).
+                node if node.is_divergent() => body.push(node),
+                _ => {
+                    body.push(js::Node::Return(Box::new(return_expr)));
+                }
+            }
+        }
+        body
+    }
+
+    /// The statement index (exclusive) at which this function's owned resource
+    /// parameters stop being live, when that is short of the body's end —
+    /// `None` when they run to the end (the shipped whole-body wrap), when the
+    /// dataflow refuses to answer for any of them, or when the function owns no
+    /// droppable parameter at all.
+    ///
+    /// A parameter is declared before every statement, so its region starts at
+    /// index 0 and the group discharges together at the LAST of their last uses
+    /// — which keeps the reverse-declaration order `own_param_drop_nodes`
+    /// emits for a simultaneous discharge.
+    fn own_param_split(&self, function: &Function<'src>) -> Option<usize> {
+        let parameters = self.own_param_drops(function);
+        if parameters.is_empty() {
+            return None;
+        }
+        let statements = &function.body.0;
+        let teardown = ScopeTeardown::Captures(parameters.iter().map(|(id, _)| *id).collect());
+        // The parameters' region starts at the body's entry rather than after a
+        // declaration statement, and — like any region — must cover every
+        // teardown declared inside it.
+        let end = statements.len();
+        let own = self.own_teardown_extent(&teardown, statements, 0, end);
+        let extent = self.widen_over_declarations(own, statements, 0, end);
+        (extent < end).then_some(extent)
+    }
+
+    /// This function's `own` resource parameters that actually destroy
+    /// something, in declaration order.
+    fn own_param_drops(&self, function: &Function<'src>) -> Vec<(Id, TypeId)> {
+        function
             .parameters
             .iter()
             .filter(|parameter_id| self.program.dropped_bindings.contains(parameter_id))
@@ -6335,7 +6395,41 @@ impl<'src> Transformer<'src> {
                 self.type_drops_nontrivially(type_id)
                     .then_some((*parameter_id, type_id))
             })
-            .collect();
+            .collect()
+    }
+
+    /// The `finally` nodes destroying this function's owned resource parameters,
+    /// in reverse declaration order.
+    fn own_param_drop_nodes(&mut self, function: &Function<'src>) -> Vec<js::Node<'src>> {
+        let mut finally: Vec<js::Node<'src>> = Vec::new();
+        for (parameter_id, type_id) in self.own_param_drops(function).iter().rev() {
+            let value = js::Node::Local(self.ng.name_for(*parameter_id));
+            if let Some(drop) = self.slot_drop_node(*parameter_id, *type_id, value) {
+                finally.push(drop);
+            }
+        }
+        finally
+    }
+
+    /// Wrap a function body in a `try`/`finally` that drops its owned resource
+    /// parameters (destruction.md §6) in reverse declaration order, or return the
+    /// body unchanged when it has none — which every resource-free program does,
+    /// keeping its output byte-identical. The parameter type ids match the glue
+    /// `build_drop_glue` seeded from the same `parameters` table.
+    ///
+    /// A function whose parameters drop EARLY has already been split by
+    /// [`Self::walk_function_body`]; this returns its body untouched, because
+    /// `own_param_split` answering `Some` is exactly the case that already
+    /// emitted the `finally`.
+    fn wrap_own_param_drops(
+        &mut self,
+        function: &Function<'src>,
+        body: Vec<js::Node<'src>>,
+    ) -> Vec<js::Node<'src>> {
+        if self.own_param_split(function).is_some() {
+            return body;
+        }
+        let param_drops: Vec<(Id, TypeId)> = self.own_param_drops(function);
         if param_drops.is_empty() {
             return body;
         }
@@ -6983,22 +7077,34 @@ impl<'src> Transformer<'src> {
     }
 
     /// Emit a scope body (statements + tail) with per-resource `try`/`finally`
-    /// teardown (destruction.md §7). Each owned resource declaration is emitted,
-    /// then everything after it is wrapped in a `try` whose `finally` drops it —
-    /// declarations stay OUTSIDE their own `try` (a panic mid-acquisition never
-    /// drops an unacquired value), and the nested tries drop in reverse
-    /// declaration order. `ret` / `break` / `continue` / a thrown panic all leave
-    /// through the finallys natively.
+    /// teardown (destruction.md §7, as amended by `lifetimes.md` §6). Each owned
+    /// resource declaration is emitted, then the statements it stays live across
+    /// are wrapped in a `try` whose `finally` drops it — declarations stay
+    /// OUTSIDE their own `try` (a panic mid-acquisition never drops an
+    /// unacquired value), and nested tries discharge in reverse declaration
+    /// order. `ret` / `break` / `continue` / a thrown panic all leave through
+    /// the finallys natively.
+    ///
+    /// **S3: the region ends at the LAST USE, not at the scope's end.**
+    /// [`Self::teardown_extent`] answers where, as an exclusive statement index;
+    /// the scope then continues *after* the `try` instead of being nested inside
+    /// it. An extent of `end` reproduces the shipped scope-end shape exactly,
+    /// which is what an opaque binding falls back to.
+    ///
+    /// `start`/`end` bound the statement range this call owns, and `tail` is
+    /// `Some` only when the range reaches the scope's own end — a range cut
+    /// short by an earlier drop point has no tail to emit.
     fn walk_scope_body(
         &mut self,
         statements: &[Id],
         start: usize,
-        tail: Id,
-        disposition: TailDisposition,
+        end: usize,
+        tail: Option<(Id, TailDisposition)>,
     ) -> Vec<js::Node<'src>> {
         let mut out: Vec<js::Node<'src>> = Vec::new();
+        let mut tail = tail;
         let mut index = start;
-        while index < statements.len() {
+        while index < end {
             let statement = statements[index];
             let teardown = self.statement_teardown(statement);
             if !matches!(teardown, ScopeTeardown::None) {
@@ -7008,9 +7114,21 @@ impl<'src> Transformer<'src> {
                         out.push(node);
                     }
                 }
-                // Wrap the rest of the scope in a `try` whose `finally` drops it.
-                let inner = self.walk_scope_body(statements, index + 1, tail, disposition.clone());
-                let finally = match teardown {
+                let extent = self.teardown_extent(&teardown, statements, index, end);
+                let inner_tail = if extent == end { tail.take() } else { None };
+                // A binding nothing reads again drops right here, and an empty
+                // `try` would be the only thing between the acquisition and the
+                // drop: there is no window for a throw to escape through, so
+                // the bare call is the same program, shorter.
+                let region_is_empty = extent == index + 1 && inner_tail.is_none();
+                // The region is walked BEFORE the teardown is built, in both
+                // shapes: `capture_drop_nodes` reads the `is_bindings` alias
+                // table the walk fills in, and every minted name is drawn from
+                // the same generator, so building the drop first would rename
+                // every helper after it.
+                let inner = (!region_is_empty)
+                    .then(|| self.walk_scope_body(statements, index + 1, extent, inner_tail));
+                let teardown_nodes = match teardown {
                     ScopeTeardown::None => Vec::new(),
                     ScopeTeardown::Binding(variable_id) => {
                         let type_id = self.program.variables.get(&variable_id).unwrap().type_id;
@@ -7021,8 +7139,12 @@ impl<'src> Transformer<'src> {
                     }
                     ScopeTeardown::Captures(captures) => self.capture_drop_nodes(captures),
                 };
-                out.push(js::Node::Try(inner, finally));
-                return out;
+                match inner {
+                    Some(inner) => out.push(js::Node::Try(inner, teardown_nodes)),
+                    None => out.extend(teardown_nodes),
+                }
+                index = extent;
+                continue;
             }
             if let Some(node) = self.walk_entity(statement, &mut out) {
                 if !matches!(node, js::Node::Void) {
@@ -7031,8 +7153,133 @@ impl<'src> Transformer<'src> {
             }
             index += 1;
         }
-        self.emit_scope_tail(tail, disposition, &mut out);
+        if let Some((tail, disposition)) = tail {
+            self.emit_scope_tail(tail, disposition, &mut out);
+        }
         out
+    }
+
+    /// Where a declaration's teardown region ends — an EXCLUSIVE index into
+    /// `statements`, never past `end` and never before `declaration + 1`.
+    ///
+    /// The analyzer answers per BINDING ([`DropExtent`], `lifetimes.md` §6) with
+    /// the chain of statements enclosing the last read, outermost first; this
+    /// picks the chain element that is a direct statement of the range being
+    /// emitted. Three refusals all fall back to `end`, which is the scope-end
+    /// law that shipped: no answer at all (an opaque binding — a capture, a
+    /// cross-region read, an unfollowable loan), an explicit `ScopeEnd`, and a
+    /// chain naming no statement of this range (the read is in the scope's tail
+    /// or somewhere this walk does not emit).
+    ///
+    /// A last read *inside* a branch or a loop resolves to that branch or loop
+    /// STATEMENT, so the drop lands at the join and every path through it —
+    /// taken, not-taken, `ret`, `jump` — releases through the one `finally`.
+    /// That is §6.3's drop specialization with no runtime flag anywhere.
+    ///
+    /// A `ScopeTeardown::Captures` group shares one region, so the group's
+    /// extent is the LAST of its members' — simultaneous discharge, in the
+    /// reverse declaration order `capture_drop_nodes` already emits.
+    ///
+    /// **Regions nest.** The region lowers to a JS block, so every `const` a
+    /// statement inside it declares dies at its brace: the region is widened
+    /// until it covers the last read of every name declared within it (a
+    /// fixpoint — widening admits more declarations, which may widen again).
+    /// Without that the emitted program reads a name out of scope, which is how
+    /// this was found (`owner.enter(…)`'s result, read after the owner's drop
+    /// point). The widening question is deliberately SYNTACTIC — see
+    /// `liveness::LastUse::syntactic_extent`: block scope is about where a name
+    /// may be written down, not about when a value may be destroyed.
+    fn teardown_extent(
+        &self,
+        teardown: &ScopeTeardown,
+        statements: &[Id],
+        declaration: usize,
+        end: usize,
+    ) -> usize {
+        let own = self.own_teardown_extent(teardown, statements, declaration + 1, end);
+        self.widen_over_declarations(own, statements, declaration + 1, end)
+    }
+
+    /// Grow `extent` until every name declared in `statements[start..extent]`
+    /// has its last read inside it. Monotone and bounded by `end`.
+    fn widen_over_declarations(
+        &self,
+        mut extent: usize,
+        statements: &[Id],
+        start: usize,
+        end: usize,
+    ) -> usize {
+        loop {
+            let mut widened = extent;
+            for index in start..extent {
+                let Some(declared) = self
+                    .program
+                    .declared_binding_extents
+                    .get(&statements[index])
+                else {
+                    continue;
+                };
+                for binding_extent in declared {
+                    // Measured from the declaring statement itself, not after
+                    // it: a `for` item or an `is` capture has its last read
+                    // INSIDE the statement that declares it, and resolving from
+                    // the next one would find no chain element and refuse.
+                    widened =
+                        widened.max(Self::resolve_extent(binding_extent, statements, index, end));
+                }
+            }
+            if widened == extent {
+                return extent;
+            }
+            extent = widened;
+        }
+    }
+
+    /// One [`DropExtent`] resolved against a statement range: the exclusive
+    /// index its last read sits at, `start` when nothing reads it, and `end`
+    /// for every refusal (an explicit scope end, or a chain naming no statement
+    /// of this range — the read is in the scope's tail).
+    fn resolve_extent(extent: &DropExtent, statements: &[Id], start: usize, end: usize) -> usize {
+        let start = start.min(end);
+        match extent {
+            DropExtent::ScopeEnd => end,
+            DropExtent::Declaration => start,
+            DropExtent::Statement(chain) => {
+                let region = &statements[start..end];
+                match chain
+                    .iter()
+                    .find_map(|holder| region.iter().position(|s| s == holder))
+                {
+                    Some(offset) => start + offset + 1,
+                    None => end,
+                }
+            }
+        }
+    }
+
+    /// One teardown's own extent, before nesting is taken into account: the
+    /// exclusive statement index its last use sits at, `start` when nothing
+    /// reads it, and `end` for every refusal.
+    fn own_teardown_extent(
+        &self,
+        teardown: &ScopeTeardown,
+        statements: &[Id],
+        start: usize,
+        end: usize,
+    ) -> usize {
+        let bindings: &[Id] = match teardown {
+            ScopeTeardown::None => return end,
+            ScopeTeardown::Binding(binding) => std::slice::from_ref(binding),
+            ScopeTeardown::Captures(captures) => captures.as_slice(),
+        };
+        let mut extent = start.min(end);
+        for binding in bindings {
+            let Some(binding_extent) = self.program.drop_extents.get(binding) else {
+                return end;
+            };
+            extent = extent.max(Self::resolve_extent(binding_extent, statements, start, end));
+        }
+        extent.min(end)
     }
 
     /// Emit a loop body's nodes (statements + discarded tail), with per-resource
@@ -7041,7 +7288,12 @@ impl<'src> Transformer<'src> {
     /// finally; a resource-free body emits exactly as before.
     fn walk_loop_body_nodes(&mut self, statements: &[Id], tail: Id) -> Vec<js::Node<'src>> {
         if self.scope_needs_drops(statements) {
-            self.walk_scope_body(statements, 0, tail, TailDisposition::Discard)
+            self.walk_scope_body(
+                statements,
+                0,
+                statements.len(),
+                Some((tail, TailDisposition::Discard)),
+            )
         } else {
             let mut body = self.walk_list(statements);
             match self.program.entity_map.get(&tail) {
@@ -7078,11 +7330,16 @@ impl<'src> Transformer<'src> {
                 self.walk_scope_body(
                     statements,
                     0,
-                    tail,
-                    TailDisposition::ResultOrDivergence(name),
+                    statements.len(),
+                    Some((tail, TailDisposition::ResultOrDivergence(name))),
                 )
             } else {
-                self.walk_scope_body(statements, 0, tail, TailDisposition::Discard)
+                self.walk_scope_body(
+                    statements,
+                    0,
+                    statements.len(),
+                    Some((tail, TailDisposition::Discard)),
+                )
             }
         } else {
             let mut body = self.walk_list(statements);

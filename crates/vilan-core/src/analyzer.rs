@@ -18,6 +18,8 @@ use crate::util::{join_with, plural};
 
 mod liveness;
 
+pub use liveness::DropExtent;
+
 /// Distinguishes the recursive type operations that resolve generics through a
 /// substitution context, so each [`TypeCycleGuard`] tracks its own active path (the
 /// operations can nest, and one's in-flight generic must not bail the other's).
@@ -2238,6 +2240,18 @@ pub struct Analyzer<'src> {
     /// unconditional per-scope `try`/`finally` teardown, no runtime drop flags.
     /// Empty on resource-free programs, so their output stays byte-identical.
     dropped_bindings: HashSet<Id>,
+    /// S3 (`lifetimes.md` §6): for each enrolled binding, where its teardown
+    /// region ENDS — its last use rather than its scope's end. Filled by
+    /// `plan_last_use_drop_extents` once the last-use dataflow has run over the
+    /// final tree; a binding the dataflow refuses to answer for is absent and
+    /// keeps the scope-end teardown that shipped.
+    drop_extents: HashMap<Id, liveness::DropExtent>,
+    /// S3: per declaring STATEMENT, the syntactic extents of the names it
+    /// brings into existence. A teardown region lowers to a JS block, so it may
+    /// not close while a `const` declared inside it is still read afterwards —
+    /// this is what the transformer widens a region against. Filled beside
+    /// `drop_extents`; empty on a program that drops nothing.
+    declared_binding_extents: HashMap<Id, Vec<liveness::DropExtent>>,
     /// B150: the enrolled bindings an explicit `drop(x)` destroys early. Their
     /// teardown is emitted as a PAIR — the sink empties the slot, the scope's
     /// `finally` destroys only a slot that is still full — so a panic before
@@ -3224,6 +3238,8 @@ impl<'src> Analyzer<'src> {
             reported_container_structures: HashSet::default(),
             resource_value_places: HashSet::default(),
             dropped_bindings: HashSet::default(),
+            drop_extents: HashMap::default(),
+            declared_binding_extents: HashMap::default(),
             explicit_drop_bindings: HashSet::default(),
             overwrite_drops: HashMap::default(),
             drop_methods: HashMap::default(),
@@ -7778,6 +7794,38 @@ impl<'src> Analyzer<'src> {
         self.dropped_bindings = dropped;
         self.overwrite_drops = overwrites;
         self.drop_owned_types_by_root = owned_by_root;
+    }
+
+    /// S3 (`lifetimes.md` §6): ask the last-use dataflow where each enrolled
+    /// binding's teardown region ends. Runs after `liveness::LastUse::compute`,
+    /// which needs the FINAL tree, so it cannot be folded into
+    /// `plan_resource_drops` (which runs much earlier, and whose answer — WHICH
+    /// bindings drop — this does not touch: only WHERE moves).
+    ///
+    /// **Module-level bindings never drop** (`memory.md` §6.8, unchanged), so
+    /// they are not in `dropped_bindings` and nothing here reaches them.
+    ///
+    /// **An explicit `drop(x)` needs no exception.** Moving into the sink is a
+    /// USE, and R7 rejects a conditional one, so the sink's statement *is* the
+    /// binding's last use and B150's guarded `finally` simply closes there
+    /// instead of at the scope end. The net still covers the whole window
+    /// between acquisition and the sink — which is the only thing it was ever
+    /// for — and P6's identity holds as stated: the point the pass infers is
+    /// the point the human wrote.
+    fn plan_last_use_drop_extents(&mut self) {
+        if self.dropped_bindings.is_empty() {
+            return;
+        }
+        let bindings: Vec<Id> = self.dropped_bindings.iter().copied().collect();
+        for binding in bindings {
+            let extent = self.last_use.drop_extent(binding);
+            if !matches!(extent, liveness::DropExtent::ScopeEnd) {
+                self.drop_extents.insert(binding, extent);
+            }
+        }
+        if !self.drop_extents.is_empty() {
+            self.declared_binding_extents = self.last_use.declared_binding_extents();
+        }
     }
 
     /// R2's two **static** halves — the writes whose outgoing value has no owner
@@ -33331,6 +33379,17 @@ pub struct Program<'src> {
     /// scope in `try`/`finally`, dropping them in reverse declaration order.
     /// Filled by `plan_resource_drops`; empty on resource-free programs.
     pub dropped_bindings: HashSet<Id>,
+    /// S3 (`lifetimes.md` §6): where each enrolled binding's teardown region
+    /// ENDS. The transformer closes the `finally` after the statement named
+    /// here rather than at the scope's end; a binding the last-use dataflow
+    /// refuses to answer for is absent from the map and keeps the scope-end
+    /// teardown. Empty on resource-free programs.
+    pub drop_extents: HashMap<Id, DropExtent>,
+    /// S3: per declaring statement, the syntactic extents of the names it
+    /// declares — what a teardown region must cover before it may close, since
+    /// the region lowers to a JS block and its `const`s die at the brace.
+    /// Empty unless some binding drops before its scope's end.
+    pub declared_binding_extents: HashMap<Id, Vec<DropExtent>>,
     /// B150: the enrolled bindings an explicit `drop(x)` destroys early. The
     /// transformer emits their teardown as a pair — the sink empties the slot,
     /// the scope-end `finally` destroys only a slot that is still full — so a
@@ -38029,6 +38088,10 @@ fn analyze_over_world<'src>(
     // answer about a tree that no longer exists is worse than none. Every
     // elision below reads it.
     analyzer.last_use = liveness::LastUse::compute(&analyzer);
+    // S3 (`lifetimes.md` §6): the same answers, asked for DISPOSAL — where each
+    // enrolled binding's teardown `finally` closes. Must follow the dataflow;
+    // `plan_resource_drops` (which bindings drop) ran long before it.
+    analyzer.plan_last_use_drop_extents();
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
@@ -38374,6 +38437,8 @@ fn analyze_over_world<'src>(
         materialized_captures: capture_plan.materialized,
         resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
+        drop_extents: std::mem::take(&mut analyzer.drop_extents),
+        declared_binding_extents: std::mem::take(&mut analyzer.declared_binding_extents),
         explicit_drop_bindings: std::mem::take(&mut analyzer.explicit_drop_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
         drop_glue: std::mem::take(&mut analyzer.drop_glue),

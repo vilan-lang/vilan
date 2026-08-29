@@ -2082,7 +2082,7 @@ fn b62_a_capture_moved_onward_is_destroyed_once_at_its_destination() {
             }
             "#,
         ),
-        "got moved\nafter\ndrop moved\n",
+        "got moved\ndrop moved\nafter\n",
     );
 }
 
@@ -2132,7 +2132,7 @@ fn b62_a_capture_stored_in_a_struct_is_destroyed_with_the_struct() {
             }
             "#,
         ),
-        "held stored\nafter\ndrop stored\n",
+        "held stored\ndrop stored\nafter\n",
     );
 }
 
@@ -2156,7 +2156,7 @@ fn b62_a_capture_returned_out_of_the_function_is_destroyed_by_the_caller() {
             }
             "#,
         ),
-        "got returned\nafter\ndrop returned\n",
+        "got returned\ndrop returned\nafter\n",
     );
 }
 
@@ -2275,7 +2275,7 @@ fn b62_an_is_capture_does_not_enroll_and_is_destroyed_once_by_its_subject() {
             }
             "#,
         ),
-        "is tested\nafter\ndrop tested\n",
+        "is tested\ndrop tested\nafter\n",
     );
 }
 
@@ -2313,12 +2313,12 @@ fn b62_a_destructure_capture_is_destroyed_at_its_scope_end() {
             fun main() {
                 let pair = (Res { tag = "destructured" }, 3);
                 let (r, n) = pair;
-                print(i"pair {r.tag} {n}");
                 print("after");
+                print(i"pair {r.tag} {n}");
             }
             "#,
         ),
-        "pair destructured 3\nafter\ndrop destructured\n",
+        "after\npair destructured 3\ndrop destructured\n",
     );
 }
 
@@ -2942,7 +2942,7 @@ fn b66_a_generic_capture_moved_on_is_clean() {
             }
             "#,
         ),
-        "after\ndrop moved\n",
+        "drop moved\nafter\n",
     );
 }
 
@@ -3066,7 +3066,7 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
             print("end");
         }
         "#,
-        "drop first\nend\ndrop second\n",
+        "drop first\ndrop second\nend\n",
     );
 }
 
@@ -3275,7 +3275,7 @@ fn b101_a_concrete_body_with_the_same_write_still_drops() {
         }
         "#,
         ),
-        "before\ndropped first\nafter\ndropped second\n",
+        "before\ndropped first\ndropped second\nafter\n",
     );
 }
 
@@ -3302,7 +3302,7 @@ fn b101_a_concrete_resource_written_inside_a_generic_body_is_not_r11s() {
         }
         "#,
         ),
-        "dropped old\ndropped passed\nend\ndropped fresh\n",
+        "dropped old\ndropped passed\ndropped fresh\nend\n",
     );
 }
 
@@ -4762,7 +4762,7 @@ fn a_resource_binding_runs_its_destructor() {
         }
         main();
         "#,
-        "ok\nclosing\n",
+        "closing\nok\n",
     );
 }
 
@@ -4807,7 +4807,7 @@ fn a_resource_field_runs_its_destructor() {
         }
         main();
         "#,
-        "ok\nclosing\n",
+        "closing\nok\n",
     );
 }
 
