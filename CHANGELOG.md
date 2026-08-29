@@ -29,6 +29,11 @@ written down.
 
 ---
 
+<!-- family: miscompile -->
+**`drop(x)` took its scope's teardown away with it, so a panic between the acquisition and the explicit drop leaked the resource permanently.** The sink moves the binding, drop planning unenrolled it, and the scope's `try`/`finally` disappeared: `let file = File::open(p); …; drop(file)` emitted a bare destructor call with nothing around it, so any panic before that line left the handle open for the life of the process — where the very same program *without* the `drop(file)` would have closed it. The language's own sentence is that every exit runs drops, panic unwinding included, "because a resource-owning scope lowers to a `try`/`finally`", and the one spelling that asks for an early teardown was the one that had none. **The binding stays enrolled now, and the pair is made idempotent instead:** the explicit drop empties the slot — `file = null`, the moved-out state `Option.take` writes for exactly the same reason — and the scope's `finally` destroys only a slot that is still full. The panicking path therefore releases the resource, the fall-through path still destroys exactly once, and the early teardown is still early: a statement after `drop(file)` observes a released handle, as it always did. What the emitted test is, and is not, is the ratified distinction: mR7 bans runtime drop flags for CONDITIONAL moves, R7 rejects a conditional `drop(x)` outright, and what this guards is an unconditional early teardown against a path that never reached it — emission machinery, invisible to the source semantics. The delta is scoped to the bindings the sink actually names: a scope that never calls `drop` emits the same bare `finally` to the byte, and `drop(f(x))`, which names no binding and was never enrolled, is untouched. Three corpus goldens move deliberately — `file.vl`, `watch.vl` and `resource_take.vl`, the three programs that drop a binding early — each growing the teardown it was missing. (backlog B150, reproduced on 0.38.0 by the lifetimes session's error-path probes; proposal/lifetimes.md §6, whose last-use lowering subsumes this structurally later; docs `spec/memory.md` §6.8)
+
+---
+
 ## v0.38.0 — 2026-08-28
 
 <!-- family: breaking -->

@@ -733,6 +733,12 @@ emitted once, erased), so R11 rejects it **under a resource instantiation**
 ("whose erased body has no concrete destructor; destroy at a concrete type, or move the value out to the caller"); a data
 instantiation keeps the legitimate no-op consume.
 
+`drop(x)` moves the teardown earlier; it does not remove the scope's safety
+net. The owner's scope end still covers the window between the acquisition
+and the `drop(x)`, so a panic that never reaches the explicit call releases
+the resource on the way out exactly as an implicit scope-end drop would — and
+the two never both fire, so a fall-through path destroys exactly once.
+
 ### `OwnedNursery`
 
 `OwnedNursery` (`std::task`) is the resource-owner for object-lifetime
