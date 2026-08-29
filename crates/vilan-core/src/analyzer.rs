@@ -2307,15 +2307,17 @@ pub struct Analyzer<'src> {
     /// resource members (with substituted types), so the transformer can emit a
     /// per-type drop helper. Built by `build_drop_glue`, moved onto the `Program`.
     drop_glue: HashMap<TypeId, DropGlue>,
-    /// Per scan-root (function / closure node), the resource TYPES its body drops.
+    /// Per scan-root (function / closure node), the resource TYPES its body drops,
+    /// each with the expression that CONSTRUCTED the value (see [`DropSites`]).
     /// Filled by `plan_resource_drops`, consumed by `build_drop_glue` to synthesize
     /// the drop reachability edges (destruction.md §8 platform coloring).
-    drop_owned_types_by_root: HashMap<Id, HashSet<TypeId>>,
+    drop_owned_types_by_root: HashMap<Id, DropSites>,
     /// Synthetic reachability edges (destruction.md §8): a scan root → the drop
     /// impl functions its owned resources reach (transitively through their
-    /// members). `CallGraph::successors` appends them so platform coloring flows a
+    /// members), each with the construction site the teardown answers to.
+    /// `CallGraph::successors` appends them so platform coloring flows a
     /// `@process`-needing drop to its owning scopes. Built by `build_drop_glue`.
-    drop_call_edges: HashMap<Id, Vec<Id>>,
+    drop_call_edges: HashMap<Id, Vec<DropEdge>>,
     /// The `drop` methods awaiting the synchronous-teardown check
     /// (`check_async_drops`, destruction.md §5): `(the drop function id, the
     /// `with Drop` span, the rendered subject name)`. Moved onto the `Program`
@@ -7726,7 +7728,7 @@ impl<'src> Analyzer<'src> {
         self.explicit_drop_bindings = resources.explicitly_dropped.clone();
         let mut plan = DropPlan::default();
         // Per scan-root, the resource types it drops (for the §8 coloring edges).
-        let mut owned_by_root: HashMap<Id, HashSet<TypeId>> = HashMap::default();
+        let mut owned_by_root: HashMap<Id, DropSites> = HashMap::default();
         // Per scan-root, the temporary POSITIONS it owns — typed after the scan
         // (which runs as `&self`), then merged into the same coloring map.
         let mut temporaries_by_root: Vec<(Id, HashSet<Id>)> = Vec::new();
@@ -7830,9 +7832,13 @@ impl<'src> Analyzer<'src> {
         // platform reachability. The refused conditional temporaries are already
         // out of `resource_temporaries` by the time this reads it.
         for (root_id, positions) in temporaries_by_root {
-            let types: HashSet<TypeId> = positions
+            // A temporary IS its construction, so the position is the site.
+            let types: DropSites = positions
                 .iter()
-                .filter_map(|expr_id| self.resource_temporaries.get(expr_id).copied())
+                .filter_map(|expr_id| {
+                    let type_id = self.resource_temporaries.get(expr_id).copied()?;
+                    Some((type_id, Some(*expr_id)))
+                })
                 .collect();
             if !types.is_empty() {
                 owned_by_root.entry(root_id).or_default().extend(types);
@@ -8052,24 +8058,50 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Record the resource TYPES a scan root drops — a dropped local's type and an
-    /// overwrite target's type — for the §8 drop reachability edges. Skips a root
-    /// that drops nothing.
+    /// overwrite target's type — for the §8 drop reachability edges, each with the
+    /// construction site the teardown answers to. Skips a root that drops nothing.
     fn record_root_drop_types(
         &self,
         root: Id,
         dropped: &HashSet<Id>,
         overwrites: &HashMap<Id, TypeId>,
-        out: &mut HashMap<Id, HashSet<TypeId>>,
+        out: &mut HashMap<Id, DropSites>,
     ) {
-        let mut types: HashSet<TypeId> = HashSet::default();
+        let mut sites: DropSites = Vec::new();
         for binding in dropped {
             if let Some(type_id) = self.dropped_binding_type_id(*binding) {
-                types.insert(type_id);
+                sites.push((type_id, Some(self.binding_construction_site(*binding))));
             }
         }
-        types.extend(overwrites.values().copied());
-        if !types.is_empty() {
-            out.entry(root).or_default().extend(types);
+        // An overwrite destroys the value already in the place; the assignment
+        // that overwrites it is the site.
+        for (assignment_id, type_id) in overwrites {
+            sites.push((*type_id, Some(*assignment_id)));
+        }
+        if !sites.is_empty() {
+            out.entry(root).or_default().extend(sites);
+        }
+    }
+
+    /// The expression that constructed what a binding holds — its initializer,
+    /// else the binding itself (an `own` parameter is constructed by the
+    /// caller, so the parameter is the nearest site this body has).
+    fn binding_construction_site(&self, binding: Id) -> Id {
+        self.variables
+            .get(&binding)
+            .and_then(|variable| variable.initial)
+            .unwrap_or(binding)
+    }
+
+    /// The construction site an expression in teardown position stands for: a
+    /// bare place resolves through its binding to the initializer, anything else
+    /// (a temporary, a `drop(f(x))` value) is its own construction.
+    fn teardown_construction_site(&self, expr_id: Id) -> Id {
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding)) => {
+                self.binding_construction_site(*binding)
+            }
+            _ => expr_id,
         }
     }
 
@@ -8682,8 +8714,8 @@ impl<'src> Analyzer<'src> {
     /// a closure's from a walk of its return expression. Non-resource / generic
     /// argument types are harmless here — `build_drop_glue` only builds an edge for
     /// a type that has drop glue. Empty when `std::drop` is not loaded.
-    fn drop_sink_types_by_root(&self) -> HashMap<Id, HashSet<TypeId>> {
-        let mut by_root: HashMap<Id, HashSet<TypeId>> = HashMap::default();
+    fn drop_sink_types_by_root(&self) -> HashMap<Id, DropSites> {
+        let mut by_root: HashMap<Id, DropSites> = HashMap::default();
         if self.drop_fn_id.is_none() {
             return by_root;
         }
@@ -8719,13 +8751,17 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The argument types of the `drop` sink calls among `calls` (the §8 coloring
-    /// helper). Reads each argument's type the same way the transformer's rewrite
-    /// will, so the seeded type matches the glue key.
-    fn drop_sink_types_of_calls(&self, calls: &[Id]) -> HashSet<TypeId> {
+    /// helper), each with its construction site. Reads each argument's type the
+    /// same way the transformer's rewrite will, so the seeded type matches the
+    /// glue key.
+    fn drop_sink_types_of_calls(&self, calls: &[Id]) -> DropSites {
         calls
             .iter()
             .filter_map(|call_id| self.drop_sink_argument_of(*call_id))
-            .filter_map(|argument_id| self.drop_sink_argument_type_id(argument_id))
+            .filter_map(|argument_id| {
+                let type_id = self.drop_sink_argument_type_id(argument_id)?;
+                Some((type_id, Some(self.teardown_construction_site(argument_id))))
+            })
             .collect()
     }
 
@@ -8849,33 +8885,47 @@ impl<'src> Analyzer<'src> {
         // `@process`-needing drop colors the owning scope. `CallGraph::successors`
         // appends these. Empty on a resource-free program.
         let owned_by_root = std::mem::take(&mut self.drop_owned_types_by_root);
-        let mut edges: HashMap<Id, Vec<Id>> = HashMap::default();
-        for (root, types) in owned_by_root {
-            let mut methods: Vec<Id> = Vec::new();
+        let mut edges: HashMap<Id, Vec<DropEdge>> = HashMap::default();
+        for (root, mut seeds) in owned_by_root {
+            // The seeds arrive in the order several unordered scans pushed them
+            // and one type can be owned at several sites; canonical order, with
+            // the earliest site winning per type, makes both the walk and the
+            // site it reports independent of that.
+            seeds.sort_unstable_by_key(|(type_id, site)| {
+                (type_id.0, site.map_or(u32::MAX, |site| site.0))
+            });
+            seeds.dedup_by_key(|(type_id, _)| *type_id);
+            let mut methods: Vec<DropEdge> = Vec::new();
             let mut seen: HashSet<TypeId> = HashSet::default();
-            let mut worklist: Vec<TypeId> = types.into_iter().collect();
-            while let Some(type_id) = worklist.pop() {
+            // A member's teardown runs because the OWNER was constructed, so
+            // members inherit the owner's site.
+            let mut worklist: DropSites = seeds;
+            while let Some((type_id, site)) = worklist.pop() {
                 if !seen.insert(type_id) {
                     continue;
                 }
                 if let Some(glue) = self.drop_glue.get(&type_id) {
                     if let Some(method) = glue.drop_method
-                        && !methods.contains(&method)
+                        && !methods.iter().any(|(existing, _)| *existing == method)
                     {
-                        methods.push(method);
+                        methods.push((method, site));
                     }
-                    worklist.extend(glue.members.member_type_ids());
+                    worklist.extend(
+                        glue.members
+                            .member_type_ids()
+                            .into_iter()
+                            .map(|member| (member, site)),
+                    );
                 }
             }
-            // The seed types and the glue's members are both HashSet-ordered,
-            // so this list arrived in hash order — and it is an EDGE LIST that
-            // `platform_color` walks in order under a `visited` once-guard,
-            // which quotes the TRAIL that reached a boundary. Two drop impls
-            // meeting below the same off-platform callee would therefore have
-            // named different chains in the same diagnostic. Order is carried
-            // by nothing here (every successor is walked), so canonical id
-            // order is free.
-            methods.sort_unstable_by_key(|method| method.0);
+            // The glue's members are HashSet-ordered, so this list arrived in
+            // hash order — and it is an EDGE LIST that `platform_color` walks in
+            // order under a `visited` once-guard, which quotes the TRAIL that
+            // reached a boundary. Two drop impls meeting below the same
+            // off-platform callee would therefore have named different chains in
+            // the same diagnostic. Order is carried by nothing here (every
+            // successor is walked), so canonical id order is free.
+            methods.sort_unstable_by_key(|(method, _)| method.0);
             if !methods.is_empty() {
                 edges.insert(root, methods);
             }
@@ -33205,6 +33255,22 @@ pub struct CapturePlan {
     pub materialized: HashSet<Id>,
 }
 
+/// One synthetic destruction edge (destruction.md §8): the `drop` impl a scan
+/// root reaches, and the expression that CONSTRUCTED the resource whose
+/// teardown reaches it — the `File::open(path)` behind a `let file = …`, the
+/// struct literal behind a user resource, the temporary's own expression.
+///
+/// The site is what a diagnostic drawn on this edge anchors at. The teardown
+/// itself is written by the compiler and has no spelling in the source, so
+/// without it a platform-coloring violation on a `drop` impl falls back to the
+/// impl's own definition — inside the library, where the user has nothing to
+/// change — and reads as a second, unrelated mistake beside the construction's
+/// (E98).
+pub type DropEdge = (Id, Option<Id>);
+
+/// A scan root's droppable resource types, each with its construction site.
+type DropSites = Vec<(TypeId, Option<Id>)>;
+
 /// How a resource type's members are reached at runtime for destruction.
 #[derive(Debug, Clone)]
 pub enum DropMembers {
@@ -33670,7 +33736,7 @@ pub struct Program<'src> {
     /// node → the `drop` impl functions its owned resources reach. Appended by
     /// `CallGraph::successors` so platform coloring flows a `@process`-needing drop
     /// to its owning scopes. Empty on a resource-free program.
-    pub drop_call_edges: HashMap<Id, Vec<Id>>,
+    pub drop_call_edges: HashMap<Id, Vec<DropEdge>>,
     // Slice 4: scalar locals boxed into a `[value]` cell because a view is taken
     // of them; their reads/writes lower through `[0]`.
     pub boxed_locals: HashSet<Id>,
@@ -34040,8 +34106,19 @@ impl<'src> Program<'src> {
 pub(crate) struct LoadedModule {
     pub(crate) ast: &'static crate::span::Spanned<NodeList<'static>>,
     pub(crate) text: &'static str,
-    pub(crate) parse_errors: &'static [String],
+    pub(crate) parse_errors: &'static [ModuleParseError],
 }
+
+/// One lex/parse error the loader recovered from, kept the way the ENTRY file's
+/// are: the error's own span into this module's text, and what it says.
+///
+/// The span used to be discarded at load and the position folded into the
+/// message as prose (E100), which cost the diagnostic everything a span buys —
+/// a caret in the terminal, a squiggle in the editor, a position the LSP can
+/// jump to, and the diagnostic sort's file-then-position order. One bad
+/// character in an 18k-line generated module put 798 errors at line 1, out of
+/// source order.
+pub(crate) type ModuleParseError = (Span, String);
 
 /// The open-document overlay (backlog E6): the language server registers each
 /// open document's CURRENT buffer, so a dependent file's re-analysis sees
@@ -34177,9 +34254,9 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
     // recovers a (possibly partial) tree beside its diagnostics, and the
     // element/lift rewrites run before the tree freezes.
     let (tree, parse_errors) = crate::parsing::parse(text);
-    let rendered: Vec<String> = parse_errors
+    let rendered: Vec<ModuleParseError> = parse_errors
         .iter()
-        .map(|error| render_at(text, error.span.start, crate::parsing::render(error)))
+        .map(|error| (error.span, crate::parsing::render(error)))
         .collect();
     let root: Box<crate::span::Spanned<NodeList<'static>>> = match tree {
         Some(mut root) => {
@@ -34198,8 +34275,8 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
         crate::leak_tally::LeakSite::OwnedModuleAst,
         ast_bytes,
     );
-    const NO_ERRORS: &[String] = &[];
-    let (errors_handle, parse_errors): (Option<crate::leak_tally::Leaked<[String]>>, _) =
+    const NO_ERRORS: &[ModuleParseError] = &[];
+    let (errors_handle, parse_errors): (Option<crate::leak_tally::Leaked<[ModuleParseError]>>, _) =
         if rendered.is_empty() {
             (None, NO_ERRORS)
         } else {
@@ -34306,7 +34383,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     let source: &'static str = Box::leak(source.into_boxed_str());
     crate::leak_tally::record(crate::leak_tally::LeakSite::ModuleErrorText, source.len());
 
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<ModuleParseError> = Vec::new();
     fn empty_ast() -> &'static crate::span::Spanned<NodeList<'static>> {
         let leaked: &'static crate::span::Spanned<NodeList<'static>> =
             &*Box::leak(Box::new((Vec::new(), (0..0).into())));
@@ -34318,12 +34395,12 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     }
     // The handwritten frontend lexes and parses in one pass, always recovering a
     // (possibly partial) tree alongside its diagnostics (lexer and parser errors,
-    // span-ordered). Each renders to `line N, column M: reason` for this file.
+    // span-ordered). Each keeps its own span into THIS file's text.
     let (tree, parse_errors) = crate::parsing::parse(source);
     errors.extend(
         parse_errors
             .iter()
-            .map(|error| render_at(source, error.span.start, crate::parsing::render(error))),
+            .map(|error| (error.span, crate::parsing::render(error))),
     );
     let root: &'static crate::span::Spanned<NodeList<'static>> = match tree {
         Some(mut root) => {
@@ -34359,14 +34436,47 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
 }
 
 /// Pushes one diagnostic per swallowed lex/parse error in a loaded package
-/// module, naming the file (module spans are offsets into *that* file, so the
-/// rendered position rides in the message).
-fn report_module_parse_errors(diagnostics: &mut Vec<Error>, path: &Path, loaded: &LoadedModule) {
-    for rendered in loaded.parse_errors {
-        let msg = format!("parse error in `{}`: {rendered}", path.display());
-        // The same module loads through several seams (a lib re-export and a
-        // direct import, say) and the cache hands each the same errors — one
-        // diagnostic per distinct error is enough.
+/// module, carrying the error's REAL span — the shape an entry-file parse error
+/// has always had (E100). The caller attributes the module's `SourceId` right
+/// after (`attribute_new_diagnostics`), which is what gives the span a file: a
+/// [`Span`] is an offset into its own text and carries no file identity.
+///
+/// `reported` is the analysis-wide seen set. The same module loads through
+/// several seams (a lib re-export and a direct import, say) and the cache hands
+/// each the same errors — one diagnostic per distinct error is enough. It is
+/// keyed by PATH as well as position, because the messages no longer name their
+/// file: two modules can hold the same reason at the same offset, and those are
+/// two errors.
+fn report_module_parse_errors(
+    diagnostics: &mut Vec<Error>,
+    reported: &mut HashSet<(PathBuf, Span)>,
+    path: &Path,
+    loaded: &LoadedModule,
+) {
+    for (span, reason) in loaded.parse_errors {
+        if !reported.insert((path.to_path_buf(), *span)) {
+            continue;
+        }
+        diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: *span,
+            msg: reason.clone(),
+        });
+    }
+}
+
+/// The same errors for a consumer that renders MESSAGES only — `vilan check
+/// <library>`, which walks a package's modules without registering any of them
+/// as a source. With no file to hang a span on, the file and the position ride
+/// in the prose, exactly as every module parse error used to.
+fn render_module_parse_errors(diagnostics: &mut Vec<Error>, path: &Path, loaded: &LoadedModule) {
+    for (span, reason) in loaded.parse_errors {
+        let msg = format!(
+            "parse error in `{}`: {}",
+            path.display(),
+            render_at(loaded.text, span.start, reason.clone())
+        );
         if diagnostics.iter().any(|error| error.msg == msg) {
             continue;
         }
@@ -35770,7 +35880,7 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
             let Some(loaded) = load_package_module(&path) else {
                 continue;
             };
-            report_module_parse_errors(&mut diagnostics, &path, &loaded);
+            render_module_parse_errors(&mut diagnostics, &path, &loaded);
             let ast = loaded.ast;
             for (module, span) in collect_module_refs(&ast.0, "pkg") {
                 if resolve_module_in_roots(&all_roots, module).is_none() {
@@ -36653,6 +36763,11 @@ fn analyze_inner<'src>(
         .insert(std_module_id, Expr::Module(std_module_id));
     analyzer.module_id_by_name.insert("std", std_module_id);
 
+    // Every module parse error reported in this analysis, keyed by file and
+    // position: one module reaches the loader through several seams, and the
+    // cache hands each seam the same errors.
+    let mut reported_parse_errors: HashSet<(PathBuf, Span)> = HashSet::default();
+
     // Load `lib.vl` plus every module reachable through `pkg::` references,
     // transitively. Each becomes a module registered in the `pkg` namespace;
     // bodies are walked after all are registered so cross-module references
@@ -36661,7 +36776,12 @@ fn analyze_inner<'src>(
     let lib_loaded = load_package_module(&lib_path);
     if let Some(loaded) = &lib_loaded {
         let diagnostics_before = analyzer.diagnostics.len();
-        report_module_parse_errors(&mut analyzer.diagnostics, &lib_path, loaded);
+        report_module_parse_errors(
+            &mut analyzer.diagnostics,
+            &mut reported_parse_errors,
+            &lib_path,
+            loaded,
+        );
         // The lib is registered as the next source below.
         analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
     }
@@ -36880,7 +37000,12 @@ fn analyze_inner<'src>(
                 continue;
             };
             let diagnostics_before = analyzer.diagnostics.len();
-            report_module_parse_errors(&mut analyzer.diagnostics, &lib_path, &lib_loaded);
+            report_module_parse_errors(
+                &mut analyzer.diagnostics,
+                &mut reported_parse_errors,
+                &lib_path,
+                &lib_loaded,
+            );
             analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
             let lib_ast = lib_loaded.ast;
             // A dependency's surface is dependency code like any of its
@@ -37098,7 +37223,12 @@ fn analyze_inner<'src>(
                         continue;
                     };
                     let diagnostics_before = analyzer.diagnostics.len();
-                    report_module_parse_errors(&mut analyzer.diagnostics, &module_path, &loaded);
+                    report_module_parse_errors(
+                        &mut analyzer.diagnostics,
+                        &mut reported_parse_errors,
+                        &module_path,
+                        &loaded,
+                    );
                     analyzer.attribute_new_diagnostics(
                         diagnostics_before,
                         SourceId(sources.len() as u32),

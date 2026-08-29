@@ -715,8 +715,16 @@ fn a_parse_error_inside_a_package_module_fails_the_build_loudly() {
     );
     let output = combined(&build);
     assert!(
-        output.contains("parse error in") && output.contains("util.vl"),
-        "the diagnostic should name the broken module: {output}"
+        output.contains("unclosed `(`: expected a matching `)`"),
+        "the diagnostic should say what is wrong: {output}"
+    );
+    // E100: the position is a SPAN now, not prose, so the terminal renders the
+    // module's own file at the real line and column with a caret under it —
+    // this used to read `parse error in \u{60}…/util.vl\u{60}: line 2, column 11`
+    // hung off an empty span at line 1.
+    assert!(
+        output.contains("util.vl:2:11"),
+        "the diagnostic should locate the broken module: {output}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

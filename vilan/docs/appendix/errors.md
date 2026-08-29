@@ -749,6 +749,33 @@ condition's operand, which reports **"`Point` is a type, not a value"**.
 Parenthesize the literal: `if p == (Point { x = 1 }) { … }`.
 → [spec §3.8](../spec/grammar.md)
 
+**"`pub` is not a vilan keyword …"**
+`pub` (and `public`) is an ordinary identifier here, so `pub fun helper()`
+reads as the expression statement `pub` followed by an item — which used
+to report a missing `;` three columns in, a true statement about a
+program nobody wrote. Vilan has no visibility marker to reach for: a
+module's items are importable as written, so the fix is to delete the
+word. `export` is a different thing — it *re-exports* something this
+module imported (`export import pkg::io::panic;`), so importers of this
+module see the name as if it were declared here.
+→ [spec §4.3](../spec/names.md)
+
+**"a mutable binding is spelled `mut x = …` …"**
+`let mut x = 1` is the Rust spelling. `let` and `mut` are vilan's two
+binding *forms*, not a keyword and a modifier on it: `let` binds
+immutably, `mut` binds mutably, and writing both is neither. The old
+message ("found 'let' expected a statement") named the one token that was
+right.
+→ [Values and types](../tour/values-and-types.md), [spec §3.3](../spec/grammar.md)
+
+**"a `{` inside an `i"…"` string opens an interpolation hole …"**
+A trailing note on whatever the parser found inside the hole. `{` is the
+hole opener, so a *literal* brace has to be escaped: write `\{` and `\}`.
+Without it, `i"body { color: red }"` reports a failure about an
+expression the author never wrote — and code that generates braces (a CSS
+rule, a JS body, a JSON object) hits this on nearly every line.
+→ [Values and types](../tour/values-and-types.md)
+
 **"a string cannot span lines unless it is triple-quoted …"**
 A `"…"` or `i"…"` ran into a line break before its closing quote. Either
 the quote is missing (the common case; the error is reported on the

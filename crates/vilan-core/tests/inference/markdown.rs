@@ -3472,6 +3472,134 @@ fn stripping_a_whole_match_is_some_empty_not_none() {
     );
 }
 
+// --- E101: `index_of` / `last_index_of` — locating, not just testing --------
+//
+// `contains` tested and `substring` cut, and nothing in between computed a
+// bound: text was taken apart with `split` and put back together. These two
+// close the gap under `substring`'s own doctrine — absence is `None`, never the
+// host's `-1`, which is an index nothing in the type system distinguishes from
+// a real one and which `substring` would refuse one call later.
+
+#[test]
+fn index_of_locates_the_first_occurrence_or_reports_absence() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            match "a=1;b=2".index_of("=") {
+                Some(let at) => print(at),
+                None => print("absent"),
+            }
+            match "a=1;b=2".index_of("b=") {
+                Some(let at) => print(at),
+                None => print("absent"),
+            }
+            match "a=1;b=2".index_of("zz") {
+                Some(let at) => print(at),
+                None => print("absent"),
+            }
+        }
+        main();
+        "#,
+        "1
+4
+absent
+",
+    );
+}
+
+#[test]
+fn last_index_of_locates_the_final_occurrence() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            match "a.b.c".last_index_of(".") {
+                Some(let at) => print(at),
+                None => print("absent"),
+            }
+            match "a.b.c".last_index_of("/") {
+                Some(let at) => print(at),
+                None => print("absent"),
+            }
+        }
+        main();
+        "#,
+        "3
+absent
+",
+    );
+}
+
+#[test]
+fn an_absent_needle_is_none_not_minus_one() {
+    // The whole reason these are not the host methods renamed. `-1` reads as an
+    // index everywhere it is passed, and the failure would surface one call
+    // later, inside `substring`, about a number this call produced.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print("abc".index_of("z").unwrap_or(-99));
+            print("abc".last_index_of("z").unwrap_or(-99));
+        }
+        main();
+        "#,
+        "-99
+-99
+",
+    );
+}
+
+#[test]
+fn an_empty_needle_sits_at_each_end() {
+    // The boundary the host defines and this does not paper over: the empty
+    // string is at `0` from the front and at `len()` from the back.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print("abc".index_of("").unwrap_or(-1));
+            print("abc".last_index_of("").unwrap_or(-1));
+            print("".index_of("").unwrap_or(-1));
+        }
+        main();
+        "#,
+        "0
+3
+0
+",
+    );
+}
+
+#[test]
+fn index_of_composes_with_substring_to_cut_at_a_separator() {
+    // The idiom the pair exists for — the bound `substring` always needed and
+    // nothing computed, which is why the evidence run parsed by `split`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ None, Some, self };
+        fun main() {
+            let line = "key: value";
+            match line.index_of(": ") {
+                Some(let at) => {
+                    print(line.substring(0, at));
+                    print(line.substring(at + 2, line.len()));
+                }
+                None => print("no separator"),
+            }
+        }
+        main();
+        "#,
+        "key
+value
+",
+    );
+}
+
 // --- B139: the recorded return answer is the FUNCTION's, never a caller's ----
 //
 // `infer_function_returns` serves `inferred_return_types` to skip re-deriving a

@@ -403,11 +403,12 @@ impl CallGraph {
         // Synthetic destruction edges (destruction.md §8): a node whose scope
         // drops a resource reaches that resource's `drop` impl(s). The teardown is
         // inserted by the transformer, so reachability can't see it otherwise;
-        // this makes a `@process`-needing drop color its owning scopes. No call
-        // site (a scope exit), so the origin is `None`, like a created closure.
+        // this makes a `@process`-needing drop color its owning scopes. The site
+        // is the CONSTRUCTION the teardown answers to — the scope exit has no
+        // spelling of its own (E98).
         if let Some(drop_methods) = program.drop_call_edges.get(&node) {
-            for &drop_method in drop_methods {
-                successors.push((drop_method, None));
+            for &(drop_method, site) in drop_methods {
+                successors.push((drop_method, site));
             }
         }
         successors

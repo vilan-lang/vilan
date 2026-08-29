@@ -170,6 +170,34 @@ const CSS_ITEM_EXPECTED: &str =
 const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
      declaration on the same property already wins — remove it";
 
+/// The rule a program written with a Rust/Swift visibility marker breaks.
+/// Curated (diagnostics-standard.md B6 — the prohibition explains itself and
+/// names the sanctioned spelling): `pub` is an ordinary identifier here, so
+/// `pub fun helper()` reads as the expression statement `pub` followed by an
+/// item, and the located failure is a missing `;` three columns in — true, and
+/// useless. Vilan has no visibility marker to reach for: a module's items are
+/// importable as written (E101).
+const PUB_IS_NOT_A_KEYWORD: &str = "`pub` is not a vilan keyword: a module's items are importable as they stand — \
+     `import pkg::util::helper;` reaches `fun helper` with nothing marking it — so the \
+     fix is to delete the word. (`export` exists, but it RE-exports something this \
+     module imported: `export import pkg::io::panic;`.)";
+
+/// The rule `let mut x = …` breaks. Curated (diagnostics-standard.md B6): `let`
+/// and `mut` are the two BINDING FORMS, not a keyword and a modifier on it, so
+/// the pair is a Rust spelling with no reading here — and the failure it
+/// produces ("found 'let' expected a statement") names the one token that was
+/// right (E101).
+const LET_MUT_IS_ONE_WORD: &str = "a mutable binding is spelled `mut x = …`: `let` and `mut` are the two binding forms, \
+     not a keyword and a modifier — `let` binds immutably, `mut` binds mutably, and \
+     writing both is neither";
+
+/// The did-you-mean note for a failure INSIDE an interpolation hole. A `{` in an
+/// `i"…"` opens a hole, so a literal brace has to be escaped — and code that
+/// GENERATES braces (a CSS rule, a JS body, a JSON object) hits this constantly,
+/// with a message about an expression it never wrote (E101).
+const BRACE_IN_AN_ISTRING: &str = "a `{` inside an `i\"…\"` string opens an interpolation hole, so this is being read as \
+     an expression — write `\\{` (and `\\}`) for a literal brace";
+
 /// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
 /// `resource` modifiers that lead one. An item is never part of an expression, so
 /// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
@@ -985,6 +1013,36 @@ impl<'a, 'src> Parser<'a, 'src> {
             });
             return;
         }
+        // `pub fun …` outranks the missing-terminator reading of it the way the
+        // `css` keyword does: the `;` the gap anchor asks for is a true statement
+        // about a program nobody wrote, and the word before it is the whole
+        // mistake. Recognized structurally — the identifier `pub`, immediately
+        // before a token that starts a fresh statement or item — never by
+        // matching the message.
+        if let Some(marker) = self.visibility_marker_before(position) {
+            self.errors.push(ParseError {
+                span: self.token_span(marker),
+                reason: ParseErrorReason::Rule(PUB_IS_NOT_A_KEYWORD),
+                context,
+                hint: None,
+            });
+            return;
+        }
+        // `let mut x = …`: two binding forms written as one. The located failure
+        // is on the `let`, which is the token the reader is least likely to
+        // suspect, so the rule replaces the message rather than trailing it.
+        if matches!(self.tokens.get(position), Some((Token::Let, _)))
+            && matches!(self.tokens.get(position + 1), Some((Token::Mut, _)))
+        {
+            let span = (self.token_span(position).start..self.token_span(position + 1).end).into();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(LET_MUT_IS_ONE_WORD),
+                context,
+                hint: None,
+            });
+            return;
+        }
         // A missing statement terminator is not a "found X expected Y" — the token
         // at `position` is a perfectly good next statement, and the mistake is in
         // the whitespace before it (`editing-dx.md` §4.4). It reports at the gap,
@@ -1001,13 +1059,61 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         let span = self.token_span(position);
         let found = self.found_at(position);
-        let hint = self.soup_hint(position);
+        let hint = self
+            .soup_hint(position)
+            .or_else(|| self.istring_brace_hint(position));
         self.errors.push(ParseError {
             span,
             reason: ParseErrorReason::Expected { found, expected },
             context,
             hint,
         });
+    }
+
+    /// The index of a `pub`-style visibility marker standing immediately before
+    /// `position`, when `position` starts a fresh statement or item — the shape
+    /// `pub fun helper()` takes once `pub` lexes as the ordinary identifier it
+    /// is. `public` is included: it is the same reflex, one synonym over.
+    fn visibility_marker_before(&self, position: usize) -> Option<usize> {
+        let previous = position.checked_sub(1)?;
+        let marker = matches!(
+            self.tokens.get(previous),
+            Some((Token::Ident("pub" | "public"), _))
+        );
+        let starts_fresh = self
+            .tokens
+            .get(position)
+            .is_some_and(|(token, _)| starts_statement_or_item(token));
+        (marker && starts_fresh).then_some(previous)
+    }
+
+    /// Whether the failure at `position` lies inside an interpolation HOLE, in
+    /// which case a `{` the author meant literally is the likeliest cause.
+    ///
+    /// Recognized structurally, from the token stream the lexer's desugaring
+    /// leaves behind: a hole becomes a parenthesized group whose parens carry the
+    /// `{…}` span, so the nearest enclosing opener whose source text begins with
+    /// `{` IS a hole. The i-string's own wrapper parens carry the whole literal's
+    /// span (which begins `i"`), and a real `(` begins with itself, so neither is
+    /// mistaken for one.
+    fn istring_brace_hint(&self, position: usize) -> Option<&'static str> {
+        let mut depth = 0usize;
+        for index in (0..position.min(self.tokens.len())).rev() {
+            match self.tokens.get(index) {
+                Some((Token::Ctrl(')'), _)) => depth += 1,
+                Some((Token::Ctrl('('), span)) => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        return self.source[span.start..]
+                            .starts_with('{')
+                            .then_some(BRACE_IN_AN_ISTRING);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// The anchor for a missing statement terminator: the LAST CHARACTER of the

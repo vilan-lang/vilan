@@ -280,6 +280,252 @@ fn the_router_is_browser_only() {
     );
 }
 
+// --- E98: one coloring mistake draws one diagnostic --------------------------
+//
+// The admission walk reaches a layer by every edge the program has — the call
+// the user wrote, the synthetic teardown the transformer will insert, and (for
+// a fence over a FAMILY) one walk per host in it — so one mistake used to be
+// reported two or three times. Two fixes hold the line: a teardown's edge
+// carries the CONSTRUCTION as its site, so its diagnostic anchors in the user's
+// code rather than inside the library's own `drop`, and violations dedupe on
+// `(anchor, layer, what the chain hangs from)`. The negatives below are the
+// other half of the claim: genuinely distinct mistakes still each report.
+
+#[test]
+fn a_library_resource_in_a_browser_build_draws_one_diagnostic() {
+    // Constructing a `@process` resource in a browser build is ONE mistake. It
+    // used to draw two: the construction's, plus the scope-end teardown's —
+    // that one anchored inside `std`'s own `File::drop`, where the user has
+    // nothing to change.
+    assert_fails_browser_once_with(
+        r#"
+        import std::fs::File;
+
+        fun main() {
+            let file = File::open("data.txt");
+        }
+        "#,
+        "requires the `process` layer of `std`",
+    );
+}
+
+#[test]
+fn the_doubling_was_the_resource_class_not_one_type() {
+    // `Database` shows it identically — the teardown edge, not `File`.
+    assert_fails_browser_once_with(
+        r#"
+        import std::db::Database;
+
+        fun main() {
+            let db = Database::open("app.db");
+        }
+        "#,
+        "requires the `process` layer of `std`",
+    );
+}
+
+#[test]
+fn an_early_drop_sink_does_not_add_a_second_diagnostic() {
+    // The `drop(x)` sink seeds its own §8 edge, from the SINK rather than the
+    // scope exit — and it resolves through the binding to the same
+    // construction, so the count is still one.
+    assert_fails_browser_once_with(
+        r#"
+        import std::fs::File;
+        import std::drop::drop;
+
+        fun main() {
+            let file = File::open("data.txt");
+            drop(file);
+        }
+        "#,
+        "requires the `process` layer of `std`",
+    );
+}
+
+#[test]
+fn a_family_fence_draws_one_diagnostic_not_one_per_host() {
+    // `@process` enumerates node, deno and bun, and the fence is checked
+    // against each — three walks, one broken promise. The diagnostic names the
+    // first host that rejects it; the fence itself is quoted, so the family is
+    // not lost.
+    let source = r#"
+        import std::router::navigate;
+
+        [platform("@process")]
+        fun go() {
+            navigate("/home");
+        }
+
+        fun main() {}
+        "#;
+    let errors = compile(source).expect_err("the fence is broken");
+    let coloring: Vec<_> = errors
+        .iter()
+        .filter(|error| error.contains("requires the `browser` layer of `std`"))
+        .collect();
+    assert_eq!(
+        coloring.len(),
+        1,
+        "expected one fence diagnostic: {errors:#?}"
+    );
+    assert!(
+        coloring[0].contains(r#"fenced `[platform("@process")]`"#),
+        "the fence must still be quoted: {:?}",
+        coloring[0]
+    );
+}
+
+#[test]
+fn two_fences_broken_the_same_way_each_report() {
+    // The negative for the fence half: the origin is part of the cause, so two
+    // distinct promises are two distinct mistakes even reaching the same callee.
+    let source = r#"
+        import std::router::navigate;
+
+        [platform("@process")]
+        fun go_home() {
+            navigate("/home");
+        }
+
+        [platform("@process")]
+        fun go_away() {
+            navigate("/away");
+        }
+
+        fun main() {}
+        "#;
+    let errors = compile(source).expect_err("both fences are broken");
+    let coloring = errors
+        .iter()
+        .filter(|error| error.contains("requires the `browser` layer of `std`"))
+        .count();
+    assert_eq!(coloring, 2, "expected one per fence: {errors:#?}");
+}
+
+#[test]
+fn two_distinct_off_platform_calls_each_report() {
+    // The negative for the entry half: same layer, same function, two sites —
+    // two things the user must change, so two diagnostics.
+    let source = r#"
+        import std::fs::{ stat, write_file };
+
+        fun main() {
+            let _probe = stat("cache");
+            write_file("out.txt", "data");
+        }
+        "#;
+    let errors = compile_browser(source).expect_err("both calls are off platform");
+    let coloring = errors
+        .iter()
+        .filter(|error| error.contains("requires the `process` layer of `std`"))
+        .count();
+    assert_eq!(coloring, 2, "expected one per call site: {errors:#?}");
+}
+
+#[test]
+fn a_drop_only_mistake_still_reports_beside_an_unrelated_one() {
+    // The negative for the teardown half: a user resource whose ONLY off-platform
+    // surface is its `Drop` is a mistake the construction says nothing about, so
+    // it must keep its own diagnostic beside an unrelated off-platform call.
+    let source = r#"
+        import std::fs::{ stat, write_file };
+        import std::drop::Drop;
+
+        resource struct Logger { path: str }
+        impl Logger with Drop {
+            fun drop(&mut self) { write_file(self.path, "closing"); }
+        }
+
+        fun main() {
+            let logger = Logger { path = "log.txt" };
+            let _probe = stat("cache");
+        }
+        "#;
+    let errors = compile_browser(source).expect_err("both are off platform");
+    let coloring = errors
+        .iter()
+        .filter(|error| error.contains("requires the `process` layer of `std`"))
+        .count();
+    assert_eq!(
+        coloring, 2,
+        "the teardown and the call are two mistakes: {errors:#?}"
+    );
+}
+
+#[test]
+fn nothing_is_left_anchored_inside_the_library() {
+    // The whole diagnostic list, not just the coloring share: the teardown's
+    // second error used to land at `std`'s own `File::drop` — a file the user
+    // cannot edit, at a position that meant nothing to them. Exactly one
+    // diagnostic remains, and it spans the construction they wrote.
+    let source = r#"
+        import std::fs::File;
+
+        fun main() {
+            let file = File::open("data.txt");
+        }
+        "#;
+    let diagnostics = failure_diagnostics_on(source, Platform::Browser);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one mistake, one diagnostic: {diagnostics:#?}"
+    );
+    let construction = source
+        .find(r#"File::open("data.txt")"#)
+        .expect("the construction is in the source");
+    assert_eq!(
+        diagnostics[0].1,
+        construction..construction + r#"File::open("data.txt")"#.len(),
+        "the diagnostic must span the construction: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_user_written_drop_anchors_at_its_own_off_platform_call() {
+    // The complement: when the `drop` impl is the user's own, the deepest
+    // user-code site on the chain is inside that body, and that is where the
+    // fix goes — the teardown's construction site is a FALLBACK for a library
+    // destructor, not a replacement for a real call site.
+    assert_fails_browser_spanning(
+        r#"
+        import std::fs::write_file;
+        import std::drop::Drop;
+
+        resource struct Logger { path: str }
+        impl Logger with Drop {
+            fun drop(&mut self) { write_file(self.path, "closing"); }
+        }
+
+        fun main() {
+            let logger = Logger { path = "log.txt" };
+        }
+        "#,
+        r#"write_file(self.path, "closing")"#,
+        "`write_file` requires the `process` layer of `std`",
+    );
+}
+
+#[test]
+fn an_optional_library_resource_draws_one_diagnostic() {
+    // `Option<File>` is the sanctioned container (`filesystem.md`), and its
+    // teardown reaches `File::drop` through the drop GLUE's members rather than
+    // directly — a member inherits the owner's construction site, so the count
+    // is still one.
+    assert_fails_browser_once_with(
+        r#"
+        import std::fs::File;
+        import std::option::Option;
+
+        fun main() {
+            let held = Option::Some(File::open("data.txt"));
+        }
+        "#,
+        "requires the `process` layer of `std`",
+    );
+}
+
 // --- platform coloring: per-function requirement lines (hover's data) --------
 //
 // `platform_color::requirements` renders what the admission walk knows into an

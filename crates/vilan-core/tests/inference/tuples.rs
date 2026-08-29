@@ -1660,6 +1660,160 @@ fn the_not_equals_soup_hints_the_postfix_bang_spacing() {
     );
 }
 
+// --- E101: three diagnostics that named no cause ---------------------------
+//
+// Each reported something true about the token stream and nothing about the
+// mistake — `pub fun` as a missing `;` three columns in, `let mut x` as a `let`
+// that is not a statement, a literal brace in an i-string as a failure inside
+// an expression the author never wrote. Each now names its cause and the
+// sanctioned spelling (diagnostics-standard.md B6), recognized structurally.
+
+#[test]
+fn a_pub_marker_names_itself_instead_of_a_missing_semicolon() {
+    assert_fails_spanning(
+        r#"
+pub fun helper(): i32 { 1 }
+
+fun main() {
+    let _ = helper();
+}
+        "#,
+        "pub",
+        "`pub` is not a vilan keyword",
+    );
+}
+
+#[test]
+fn a_pub_marker_no_longer_asks_for_a_semicolon() {
+    // The half that matters: the misleading message is GONE, not merely joined
+    // by a better one.
+    assert_fails_without(
+        r#"
+pub struct Point { x: i32 }
+
+fun main() {}
+        "#,
+        "expected `;` to end this statement",
+    );
+}
+
+#[test]
+fn the_pub_steer_names_the_export_form_it_is_not() {
+    assert_fails_with(
+        r#"
+public fun helper(): i32 { 1 }
+
+fun main() {}
+        "#,
+        "`export` exists, but it RE-exports",
+    );
+}
+
+#[test]
+fn a_bare_pub_identifier_is_still_an_ordinary_name() {
+    // The negative: `pub` is an identifier, and the steer fires only where one
+    // stands immediately before a fresh statement or item.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pub = 1;
+            print(pub);
+        }
+        "#,
+        "1
+",
+    );
+}
+
+#[test]
+fn let_mut_names_the_two_binding_forms() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() {
+            let mut x = 1;
+            x = 2;
+            print(x);
+        }
+        "#,
+        "let mut",
+        "a mutable binding is spelled `mut x = …`",
+    );
+}
+
+#[test]
+fn let_mut_no_longer_reports_the_let_as_a_non_statement() {
+    assert_fails_without(
+        r#"
+        fun main() {
+            let mut x = 1;
+        }
+        "#,
+        "found 'let' expected",
+    );
+}
+
+#[test]
+fn a_literal_brace_in_an_istring_names_the_escape() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            print(i"body { color: red }");
+        }
+        "#,
+        r"opens an interpolation hole",
+    );
+}
+
+#[test]
+fn an_empty_brace_pair_in_an_istring_names_the_escape_too() {
+    // The shape the evidence run hit: `{}` reads as an EMPTY hole, so the
+    // located failure is "found ')' expected an expression" — about a hole
+    // nobody wrote.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            print(i"a{}b");
+        }
+        "#,
+        r"write `\{` (and `\}`) for a literal brace",
+    );
+}
+
+#[test]
+fn an_escaped_brace_in_an_istring_still_prints_the_brace() {
+    // The negative for the note: the sanctioned spelling it names works, and a
+    // real hole beside it still interpolates.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let n = 42;
+            print(i"n = {n} and \{literal\}");
+        }
+        "#,
+        "n = 42 and {literal}
+",
+    );
+}
+
+#[test]
+fn a_broken_expression_outside_a_hole_gets_no_brace_note() {
+    // The other negative: the note is scoped to a failure INSIDE a hole, so an
+    // ordinary parenthesized expression that breaks is unchanged.
+    assert_fails_without(
+        r#"
+        fun main() {
+            let bad = (1 + );
+        }
+        "#,
+        "opens an interpolation hole",
+    );
+}
+
 /// An unclosed generic argument list steers to `,` or `>` without the
 /// optional-continuation noise (`context clause`, `generic arguments`) chumsky
 /// would offer, and names the type position it failed in.
