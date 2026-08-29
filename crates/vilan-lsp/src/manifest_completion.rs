@@ -191,6 +191,14 @@ pub const TABLES: &[Table] = &[
                 values: ValueSet::Open,
             },
             Key {
+                name: "generated",
+                documentation: "Where this package's generated sources live, relative to \
+                                this manifest. `vilan fmt` leaves everything under it \
+                                byte-identical, so a build hook's generated module stops \
+                                re-staling. Inside the package, and not `root`.",
+                values: ValueSet::Open,
+            },
+            Key {
                 name: "entry",
                 documentation: "The `build`/`run` entry file, resolved against `root`. \
                                 Default `main.vl`. Replaced by `[entry.<name>]` sections.",
@@ -243,6 +251,14 @@ pub const TABLES: &[Table] = &[
                 name: "root",
                 documentation: "The base (shared) source root, relative to this manifest. \
                                 Default `src`.",
+                values: ValueSet::Open,
+            },
+            Key {
+                name: "generated",
+                documentation: "Where this library's generated sources live, relative to \
+                                this manifest. `vilan fmt` leaves everything under it \
+                                byte-identical, so a build hook's generated module stops \
+                                re-staling. Inside the library, and not `root`.",
                 values: ValueSet::Open,
             },
             Key {

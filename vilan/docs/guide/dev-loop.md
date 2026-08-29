@@ -216,6 +216,49 @@ The rest of the rules:
 Freshness is about cost, never about safety: a skipped hook is code you
 already trusted to run, and skipping it buys time, not containment.
 
+### When the hook generates Vilan
+
+A hook that writes a `.vl` module has one more thing to say, and leaving it
+unsaid costs you the freshness you just bought. Run `vilan fmt` over a tree
+holding a generated module and you get a loop: the formatter rewrites the
+module, the rewrite is a change to a declared output, the hook goes stale, the
+next build regenerates the file — unformatted, because a generator emits what
+its templates produce — and the next format rewrites it again. Neither tool is
+wrong, nothing reports anything, and with format-on-save it happens to files
+you only opened to read.
+
+Say where the products live, and the formatter leaves them alone:
+
+```toml
+[package]
+name      = "app"
+generated = "src/icons"
+
+[[build.hook]]
+name    = "icons"
+run     = "node scripts/generate-icons.mjs"
+inputs  = ["scripts/generate-icons.mjs", "icons.lock"]
+outputs = ["src/icons/lib.vl"]
+```
+
+- **Everything under the root is left byte-identical** by `vilan fmt`, by
+  `vilan fmt --check`, and by your editor's format-on-save — however the file
+  is reached, including by name. `fmt` says so once per run, with a count.
+- **It's a directory inside the package**, and not the source `root` itself:
+  pointing it there would leave every hand-written module unformatted, so it's
+  a manifest error. It doesn't have to exist yet — before the first build, it
+  usually doesn't.
+- **Nothing else reads the key.** The generated module resolves exactly as it
+  did: `src/icons/lib.vl` is `pkg::icons`, the same as any other module whose
+  file is a directory's `lib.vl`.
+- **Whether you commit the directory is your call.** Most projects add it to
+  `.gitignore`; some deliberately commit generated sources so a reader doesn't
+  need the generator's toolchain. Nothing enforces either, and the formatter's
+  rule holds the same way regardless — it reads the manifest, never
+  `.gitignore`.
+- **The escape is the manifest, not a flag.** If a file should be formatted,
+  it isn't a product: move it out, or drop the key. Both land in review.
+
 A dependency's hooks are a different question, and the answer is still no. If
 a package you depend on declares one, the build says so — one dim `note:` line
 naming it, once per build — and does not run it. Granting one is a line in

@@ -54,6 +54,7 @@ guide/dev-loop.md h2 what-each-edit-does
 guide/dev-loop.md h2 what-carries-across-a-swap-and-what-resets
 guide/dev-loop.md h2 escape-hatches
 guide/dev-loop.md h2 running-something-alongside-the-build
+guide/dev-loop.md h3 when-the-hook-generates-vilan
 guide/dev-loop.md h2 freshness-for-a-hand-rolled-server
 guide/dev-loop.md h2 picking-which-server-to-run
 guide/dev-loop.md h2 the-css-link-idiom

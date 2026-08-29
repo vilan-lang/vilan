@@ -42,9 +42,12 @@ line (or a list of them) for your shell, run before each build and each
 privileges and Vilan doesn't prompt — the manifest is yours, and this is
 the trust `cargo build` and `npm run` already take. A step too expensive
 to repeat gets a `[[build.hook]]` instead: a name, and the `inputs` and
-`outputs` that decide whether it needs to run at all. And
-`default-entry` names the entry `vilan run` should drive when a package
-has several. Both are covered in [the dev loop](../guide/dev-loop.md).
+`outputs` that decide whether it needs to run at all. A hook that writes
+Vilan modules also wants `generated`, naming the directory it writes
+them into, so `vilan fmt` leaves them alone instead of rewriting bytes
+the hook is watching. And `default-entry` names the entry `vilan run`
+should drive when a package has several. All are covered in
+[the dev loop](../guide/dev-loop.md).
 
 ## Workspaces
 

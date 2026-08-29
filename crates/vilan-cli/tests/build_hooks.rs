@@ -795,3 +795,285 @@ fn check_says_nothing_about_dependency_hooks() {
     assert!(!text.contains("declares build hooks"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── S6: the generated root, and the formatter's exclusion (§12) ──
+
+/// The module a generator writes. `vilan fmt` expands a single-line body onto
+/// its own line, so these exact bytes are one format away from re-staling the
+/// hook that declares them — which is §12.1's loop, live in the shipped tree.
+/// It is the same spelling the P6 pin above generates, deliberately: the
+/// fixture that proved hooks can produce modules is the fixture that proves
+/// they fight the formatter.
+const GENERATED_MODULE: &str = "fun generated(): i32 { 41 }";
+
+/// A hook command writing [`GENERATED_MODULE`] to `file`, in the platform's shell.
+fn generate_module(file: &str) -> String {
+    if cfg!(windows) {
+        format!("echo {GENERATED_MODULE}> {file}")
+    } else {
+        format!("printf '{GENERATED_MODULE}\\n' > {file}")
+    }
+}
+
+/// A package whose hook generates `src/icons/lib.vl`, importable as
+/// `pkg::icons` — §12.6's configuration that works on the shipped resolver,
+/// since a module's file may be `<root>/<name>/lib.vl` as well as
+/// `<root>/<name>.vl`. `generated` is the manifest line under test; `None` is
+/// the PLANT the exclusion pins are proven against, and it is also exactly what
+/// this tree did before the key existed.
+fn generated_root_project(tag: &str, generated: Option<&str>) -> PathBuf {
+    let dir = temp_project(tag);
+    let declaration = generated
+        .map(|root| format!("generated = \"{root}\"\n"))
+        .unwrap_or_default();
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n{declaration}\n[[build.hook]]\nname = \"icons\"\n\
+             run = [{}, {}]\ninputs = \"icons.lock\"\noutputs = \"src/icons/lib.vl\"\n",
+            toml_string(&append("ran.txt")),
+            toml_string(&generate_module("src/icons/lib.vl"))
+        ),
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::print;\nimport pkg::icons::generated;\n\
+         fun main() { print(generated() + 1) }\nmain();\n",
+    );
+    write(&dir, "icons.lock", "v1\n");
+    // The generator redirects into this directory, so it has to exist first —
+    // a shell `>` creates the file, never its parent.
+    std::fs::create_dir_all(dir.join("src/icons")).unwrap();
+    dir
+}
+
+/// Formats `dir` through the built binary.
+fn fmt(dir: &Path) -> Output {
+    vilan(&["fmt", dir.to_str().unwrap()])
+}
+
+#[test]
+fn fmt_leaves_a_file_under_the_generated_root_byte_identical() {
+    // The rule itself (§12.4). The file is one the formatter demonstrably
+    // WOULD rewrite — the negative below is what proves that, on the same
+    // bytes in the same tree.
+    let dir = generated_root_project("fmt_skips", Some("src/icons"));
+    build(&dir);
+    let generated = dir.join("src/icons/lib.vl");
+    let before = std::fs::read(&generated).unwrap();
+
+    let output = fmt(&dir);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read(&generated).unwrap(),
+        before,
+        "a declared product is not formatted:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_formats_the_same_generated_file_when_no_root_is_declared() {
+    // The plant, as a pin: identical tree, `generated` absent. The formatter
+    // rewrites the file, which is both today's behavior and the first half of
+    // §12.1's loop — so the pin above is not vacuous, and this one records the
+    // defect the key exists to close.
+    let dir = generated_root_project("fmt_plant", None);
+    build(&dir);
+    let generated = dir.join("src/icons/lib.vl");
+    let before = std::fs::read(&generated).unwrap();
+
+    let output = fmt(&dir);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_ne!(
+        std::fs::read(&generated).unwrap(),
+        before,
+        "without the declaration the formatter rewrites the product:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_still_formats_a_file_outside_the_generated_root() {
+    // The green negative that keeps the exclusion from being "fmt stopped
+    // working". One package, one declared root, two files — the one inside is
+    // untouched and the one beside it is formatted, in a single run.
+    let dir = generated_root_project("fmt_outside", Some("src/icons"));
+    build(&dir);
+    write(&dir, "src/hand_written.vl", GENERATED_MODULE);
+    let generated = dir.join("src/icons/lib.vl");
+    let product = std::fs::read(&generated).unwrap();
+
+    let output = fmt(&dir);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(std::fs::read(&generated).unwrap(), product, "{text}");
+    assert_ne!(
+        std::fs::read_to_string(dir.join("src/hand_written.vl")).unwrap(),
+        GENERATED_MODULE,
+        "a hand-written module beside the root still formats:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_check_does_not_report_a_generated_file_and_exits_zero() {
+    // `--check` and `fmt` are one rule because the exclusion is applied at
+    // COLLECTION: a `--check` reporting a file `fmt` will never touch would be
+    // a CI failure with no fix. Pinned as the fixed point — format the tree,
+    // then check it — because that is the shape CI actually runs, and the
+    // product is still unformatted when the check passes.
+    let dir = generated_root_project("fmt_check", Some("src/icons"));
+    build(&dir);
+    let generated = dir.join("src/icons/lib.vl");
+    let product = std::fs::read(&generated).unwrap();
+    assert!(fmt(&dir).status.success());
+
+    let output = vilan(&["fmt", "--check", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a formatted tree whose only unformatted file is a product is clean:\n{text}"
+    );
+    assert!(!text.contains("would reformat"), "{text}");
+    assert_eq!(
+        std::fs::read(&generated).unwrap(),
+        product,
+        "and the product is still exactly as the generator wrote it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_leaves_a_generated_file_alone_when_it_is_named_explicitly() {
+    // §12.4's most arguable decision, pinned: the exclusion holds however the
+    // file is reached. An explicit-path exception would be one the language
+    // server could never honor — format-on-save reaches a file by its exact
+    // path and nothing else.
+    let dir = generated_root_project("fmt_explicit", Some("src/icons"));
+    build(&dir);
+    let generated = dir.join("src/icons/lib.vl");
+    let before = std::fs::read(&generated).unwrap();
+
+    let output = vilan(&["fmt", generated.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(std::fs::read(&generated).unwrap(), before, "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_says_once_how_many_generated_files_it_skipped() {
+    // Silence is the failure mode this design cannot afford, so the exclusion
+    // is announced — once per root, with a count, naming the root. Two files
+    // under one root produce ONE line.
+    let dir = generated_root_project("fmt_note", Some("src/icons"));
+    build(&dir);
+    write(&dir, "src/icons/other.vl", GENERATED_MODULE);
+
+    let output = fmt(&dir);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("generated files not formatted").count(),
+        1,
+        "one line per root, never one per file:\n{text}"
+    );
+    assert!(
+        text.contains("2 generated files not formatted") && text.contains("icons"),
+        "the note carries the count and names the root:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_says_nothing_when_the_exclusion_skipped_nothing() {
+    // A note about an exclusion that excluded nothing is noise, and noise is
+    // how the honest lines get ignored. A declared root with no `.vl` under it
+    // is the clean checkout, and it says nothing.
+    let dir = generated_root_project("fmt_quiet", Some("src/icons"));
+    let output = fmt(&dir);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains("not formatted"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_generated_hook_output_stays_fresh_across_a_format() {
+    // THE PIN THE SLICE EXISTS FOR (§12.1, §8's S6 gate). Build, format,
+    // build: the hook is `Fresh`, its declared output never moved, and the
+    // module it wrote still compiles. Without the declaration this cycle
+    // re-runs the generator forever — which the plant below is.
+    let dir = generated_root_project("loop_dead", Some("src/icons"));
+    let output = vilan(&["run", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && text.contains("42"),
+        "the generated module compiles:\n{text}"
+    );
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    let generated = std::fs::read(dir.join("src/icons/lib.vl")).unwrap();
+
+    let formatted = fmt(&dir);
+    assert!(formatted.status.success(), "{}", combined(&formatted));
+    assert_eq!(
+        std::fs::read(dir.join("src/icons/lib.vl")).unwrap(),
+        generated,
+        "the format left the declared output alone"
+    );
+
+    let text = build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        1,
+        "a format does not re-stale the generator:\n{text}"
+    );
+    assert!(text.contains("Fresh   icons"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn without_a_generated_root_a_format_re_stales_the_hook_forever() {
+    // The loop itself, pinned as the defect it is — the same cycle on the same
+    // tree with `generated` absent. This is the plant for the pin above, kept
+    // as a test because it is the behavior the key changes, and because a
+    // future change that quietly fixed it elsewhere should be noticed.
+    let dir = generated_root_project("loop_live", None);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+
+    fmt(&dir);
+    let text = build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "the reformat re-stales the declared output:\n{text}"
+    );
+    // And it never settles: the generator rewrote the file unformatted, so the
+    // next format moves it again.
+    fmt(&dir);
+    let text = build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 3, "and again, forever:\n{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_generated_root_outside_the_package_fails_the_build_naming_the_key() {
+    // The refusal reaches the user, not just `Manifest::validate` (whose own
+    // pins cover the four cases, §12.3). Lexical: `../shared` never exists in
+    // this tree, and the refusal does not depend on whether it could.
+    let dir = generated_root_project("root_escapes", Some("../shared"));
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`[package] generated`") && text.contains("free of `..`"),
+        "the refusal names the key and the rule:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

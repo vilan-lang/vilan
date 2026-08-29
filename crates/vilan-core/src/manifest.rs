@@ -11,7 +11,7 @@
 //! `proposal/project-model-p1.md`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -71,6 +71,17 @@ pub struct Package {
     pub description: Option<String>,
     /// The package's source root, relative to the manifest. Default `src`.
     pub root: Option<PathBuf>,
+    /// Where this package's **generated** sources live, relative to the manifest
+    /// (`build-hooks.md` §12). Absent by default, which is exactly today's
+    /// behavior. Its one shipped consumer is the formatter: `vilan fmt` leaves
+    /// everything under it byte-identical, which is what keeps a `[[build.hook]]`
+    /// that generates a `.vl` module from re-staling on every format (§12.1).
+    ///
+    /// Declared here, beside `root`, because it is a fact about the package's
+    /// source *layout* — the same kind of fact `root` is — and not about which
+    /// hooks happen to exist. §12.2 weighs the alternative (hanging it on the
+    /// hook that generates) and records why it loses.
+    pub generated: Option<PathBuf>,
     /// The `build`/`run` entry, resolved against `root`. Default `main.vl`.
     pub entry: Option<PathBuf>,
     /// The default build platform (`node` / `deno` / `bun` / `browser` / `none`).
@@ -101,6 +112,13 @@ pub struct Library {
     pub description: Option<String>,
     /// The base (shared) source root, relative to the manifest. Default `src`.
     pub root: Option<PathBuf>,
+    /// Where this library's generated sources live — `[package] generated`'s
+    /// twin, with the same meaning and the same rules (`build-hooks.md` §12).
+    /// A library declares a `root` for the same reason a package does, and it
+    /// meets the same fmt↔hook loop in its own checkout, so the key belongs on
+    /// both sections and on neither `[project]` (which declares members, not
+    /// sources).
+    pub generated: Option<PathBuf>,
     /// Overlay layers, keyed by layer name (`process`, `browser`, …).
     #[serde(default)]
     pub layer: BTreeMap<String, LayerDecl>,
@@ -569,6 +587,104 @@ impl Package {
     }
 }
 
+/// What is wrong with a declared `generated` root, or `None` when it is
+/// well-formed (`build-hooks.md` §12.3). `section` is the manifest spelling to
+/// name in the message (`[package]` / `[library]`).
+///
+/// Three refusals, all **lexical** — decided from the two declared strings, with
+/// no filesystem look. That is deliberate twice over: the refusal is then
+/// deterministic (`asset::read`'s `ProjectReader` refuses escapes the same way
+/// and says why), and a generated root that does not exist yet stays legal,
+/// which is the normal state of a clean checkout. Nothing here checks that the
+/// directory is there.
+///
+/// A fourth rule needs no code: the key is a `PathBuf`, so `generated = ["a",
+/// "b"]` fails to deserialize and never reaches validation. One package, one
+/// home for its products.
+fn generated_root_problem(section: &str, generated: &Path, root: &Path) -> Option<String> {
+    // Inside the package, refused before any filesystem look. A path that
+    // leaves the package names files this manifest has no standing to speak
+    // for — and, since the one consumer is "do not format this", an escaping
+    // root would silently turn the formatter off over someone else's tree.
+    let escapes = generated.is_absolute()
+        || generated
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir));
+    if escapes {
+        return Some(format!(
+            "`{section} generated` must be a relative path inside the package, \
+             free of `..` (got `{}`)",
+            generated.display()
+        ));
+    }
+    let segments = |path: &Path| -> Vec<std::ffi::OsString> {
+        path.components()
+            .filter(|component| matches!(component, Component::Normal(_)))
+            .map(|component| component.as_os_str().to_os_string())
+            .collect()
+    };
+    let declared = segments(generated);
+    if declared.is_empty() {
+        return Some(format!(
+            "`{section} generated` names the package directory itself (`{}`), which \
+             holds the manifest and every hand-written module; name a directory \
+             inside the package",
+            generated.display()
+        ));
+    }
+    if declared == segments(root) {
+        return Some(format!(
+            "`{section} generated` and `{section} root` are both `{}`: `generated` \
+             declares a SECOND root for the package's products, so pointing it at \
+             the source root would leave every hand-written module unformatted; \
+             change one of them",
+            generated.display()
+        ));
+    }
+    None
+}
+
+/// The declared generated root of `directory`'s `vilan.toml`, resolved against
+/// `directory` — the on-disk half of [`Manifest::generated_root`].
+///
+/// Every failure answers `None`: no manifest, a manifest that does not parse, a
+/// manifest declaring no generated root. That is the safe direction and the only
+/// one available to a formatter — a tree it cannot read is a tree it formats,
+/// never a tree it silently skips.
+pub fn generated_root_in(directory: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(directory.join("vilan.toml")).ok()?;
+    let (manifest, _warnings) = Manifest::parse(&text).ok()?;
+    Some(directory.join(manifest.generated_root()?))
+}
+
+/// The declared generated root covering `path` (a file or a directory), or
+/// `None` — the ONE predicate behind `build-hooks.md` §12.4's exclusion.
+///
+/// It lives here, over a path, rather than in either front end, because the two
+/// front ends reach a file differently and must still answer identically: the
+/// CLI walks directories, while the language server is handed one buffer by its
+/// exact path. A rule expressed as a directory-walk filter could not have been
+/// honored by format-on-save, which is §12.1's worst case.
+///
+/// The search climbs from `path` to the filesystem root and takes the nearest
+/// manifest whose generated root **contains** `path`. Climbing past a manifest
+/// that declares none is the point: a file inside a declared generated root is a
+/// product whichever manifest above it said so.
+pub fn generated_root_covering(path: &Path) -> Option<PathBuf> {
+    let path = crate::util::canonical_path(path);
+    let mut current = Some(path.as_path());
+    while let Some(directory) = current {
+        if let Some(root) = generated_root_in(directory) {
+            let root = crate::util::canonical_path(&root);
+            if path.starts_with(&root) {
+                return Some(root);
+            }
+        }
+        current = directory.parent();
+    }
+    None
+}
+
 impl Manifest {
     /// Parses `vilan.toml` text into the typed schema. Returns the manifest plus
     /// non-fatal warnings (e.g. unknown top-level keys, which a forward-compatible
@@ -593,6 +709,30 @@ impl Manifest {
             .map(|key| format!("unknown `vilan.toml` key `{key}` (ignored)"))
             .collect();
         Ok((manifest, warnings))
+    }
+
+    /// The declared generated root (`build-hooks.md` §12), relative to this
+    /// manifest's own directory — `[package] generated` or its `[library]`
+    /// twin, whichever section this manifest declares.
+    ///
+    /// A declaration [`validate`](Self::validate) would refuse answers `None`.
+    /// The one consumer is an exclusion, so a malformed key must fail towards
+    /// *formatting too much* rather than towards silently formatting nothing:
+    /// the build still reports the manifest error, and until it is fixed the
+    /// formatter behaves exactly as it did before the key existed.
+    pub fn generated_root(&self) -> Option<&Path> {
+        let (section, generated, root) = match (&self.package, &self.library) {
+            (Some(package), _) => ("[package]", package.generated.as_deref()?, package.root()),
+            (_, Some(library)) => (
+                "[library]",
+                library.generated.as_deref()?,
+                library.base_root(),
+            ),
+            _ => return None,
+        };
+        generated_root_problem(section, generated, root)
+            .is_none()
+            .then_some(generated)
     }
 
     /// Validates the schema, returning a (possibly empty) list of error messages.
@@ -715,6 +855,13 @@ impl Manifest {
                 errors.push(format!("invalid `[package] target`: {error}"));
             }
         }
+        if let Some(generated) = &package.generated {
+            errors.extend(generated_root_problem(
+                "[package]",
+                generated,
+                package.root(),
+            ));
+        }
         if package.splits() && self.entries.is_empty() {
             let declared = package.target.as_deref().unwrap_or("node");
             if !matches!(Platform::parse(declared), Ok(Platform::Browser)) {
@@ -824,6 +971,13 @@ impl Manifest {
                 "`[library] name` must be a valid identifier (got `{name}`)"
             )),
             Some(_) => {}
+        }
+        if let Some(generated) = &library.generated {
+            errors.extend(generated_root_problem(
+                "[library]",
+                generated,
+                library.base_root(),
+            ));
         }
         for (name, layer) in &library.layer {
             if layer.platform.is_empty() {
@@ -3455,6 +3609,191 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("free of `..`"))
         );
+    }
+
+    // ── `[package] generated`: the generated root (`build-hooks.md` §12) ──
+
+    /// A `[package]` declaring `generated = <value>`, with its validation errors.
+    fn generated_package(value: &str) -> (Manifest, Vec<String>) {
+        let manifest = parse(&format!(
+            "[package]\nname = \"app\"\ngenerated = \"{value}\"\n"
+        ));
+        let errors = manifest.validate();
+        (manifest, errors)
+    }
+
+    #[test]
+    fn a_generated_root_parses_and_resolves_against_the_manifest() {
+        let (manifest, errors) = generated_package("src/icons");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(manifest.generated_root(), Some(Path::new("src/icons")));
+    }
+
+    #[test]
+    fn a_generated_root_parses_on_a_library_too() {
+        // The key belongs on every section that declares a `root`, because the
+        // fmt↔hook loop does not care which kind of package it is in.
+        let manifest = parse("[library]\nname = \"icons\"\ngenerated = \"gen\"\n");
+        assert!(manifest.validate().is_empty());
+        assert_eq!(manifest.generated_root(), Some(Path::new("gen")));
+    }
+
+    #[test]
+    fn no_generated_root_is_the_default() {
+        // The absent key is today's behavior to the byte: nothing is excluded.
+        let manifest = parse("[package]\nname = \"app\"\n");
+        assert_eq!(manifest.generated_root(), None);
+        assert!(manifest.validate().is_empty());
+    }
+
+    #[test]
+    fn a_generated_root_that_escapes_the_package_is_refused() {
+        let (_, errors) = generated_package("../shared/gen");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`[package] generated`") && e.contains("free of `..`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_generated_root_is_refused() {
+        // Outside the package by construction, and it would make the manifest
+        // machine-specific.
+        let (_, errors) = generated_package("/var/tmp/gen");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`[package] generated`") && e.contains("relative")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_generated_root_naming_the_package_directory_is_refused() {
+        // `.` would swallow the manifest and every hand-written module.
+        let (_, errors) = generated_package(".");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`[package] generated`")
+                    && e.contains("package directory itself")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_generated_root_equal_to_the_source_root_is_refused_naming_both_keys() {
+        // The key declares a SECOND root; pointing it at the first would leave
+        // every hand-written module unformatted. Both spellings are refused —
+        // the default `src` and an explicit one — because the rule is about the
+        // resolved value, not about which key was written.
+        let (_, errors) = generated_package("src");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`[package] generated`") && e.contains("`[package] root`")),
+            "{errors:?}"
+        );
+        let explicit = parse("[package]\nname = \"app\"\nroot = \"lib\"\ngenerated = \"./lib\"\n");
+        assert!(
+            explicit
+                .validate()
+                .iter()
+                .any(|e| e.contains("`[package] root`")),
+            "{:?}",
+            explicit.validate()
+        );
+    }
+
+    #[test]
+    fn a_generated_root_that_does_not_exist_yet_is_accepted() {
+        // A generated root before its first build is the NORMAL case — that is
+        // the whole shape of "generated" — so validation never looks at the
+        // disk, and this pin holds wherever the suite runs.
+        let (manifest, errors) = generated_package("no/such/directory/anywhere");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(manifest.generated_root().is_some());
+    }
+
+    #[test]
+    fn the_covering_predicate_answers_for_a_path_at_any_depth() {
+        // The ONE predicate `vilan fmt` and the language server's formatting
+        // handler both call (§12.4). It is pinned here, over paths, rather than
+        // in either front end, because "same rule, one implementation" is the
+        // property — the CLI walks directories and the editor is handed one
+        // buffer by its exact path, and both have to answer identically.
+        let root = std::env::temp_dir().join(format!("vilan-covering-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("gen/deep/deeper")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        for relative in ["gen/a.vl", "gen/deep/deeper/b.vl", "src/c.vl"] {
+            std::fs::write(root.join(relative), "").unwrap();
+        }
+        let covering = |relative: &str| generated_root_covering(&root.join(relative));
+        let expected = Some(crate::util::canonical_path(root.join("gen")));
+
+        assert_eq!(covering("gen/a.vl"), expected, "a file in the root itself");
+        assert_eq!(
+            covering("gen/deep/deeper/b.vl"),
+            expected,
+            "and one nested arbitrarily deep inside it — the search climbs to \
+             the manifest, so depth is not a limit"
+        );
+        assert_eq!(covering("gen"), expected, "the root covers itself");
+        assert_eq!(
+            covering("src/c.vl"),
+            None,
+            "a file outside the root is not a product"
+        );
+        assert_eq!(
+            covering("gen_other/x.vl"),
+            None,
+            "and neither is a sibling directory whose name merely starts the \
+             same way — the test is on path COMPONENTS, not on the string"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nothing_is_covered_without_a_manifest_declaring_it() {
+        // A tree the predicate cannot read is a tree the formatter formats. Both
+        // failure modes answer `None`: no manifest at all, and a manifest that
+        // declares no generated root.
+        let root = std::env::temp_dir().join(format!("vilan-uncovered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bare/src")).unwrap();
+        std::fs::create_dir_all(root.join("plain/src")).unwrap();
+        std::fs::write(root.join("plain/vilan.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(root.join("bare/src/a.vl"), "").unwrap();
+        std::fs::write(root.join("plain/src/a.vl"), "").unwrap();
+
+        assert_eq!(generated_root_covering(&root.join("bare/src/a.vl")), None);
+        assert_eq!(generated_root_covering(&root.join("plain/src/a.vl")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refused_generated_root_excludes_nothing() {
+        // The safe direction. A malformed key must fail towards formatting too
+        // much, never towards silently formatting nothing: the build still
+        // reports the error, and until it is fixed the formatter behaves as it
+        // did before the key existed.
+        for value in ["../gen", ".", "src"] {
+            let (manifest, errors) = generated_package(value);
+            assert!(!errors.is_empty(), "`{value}` should be refused");
+            assert_eq!(
+                manifest.generated_root(),
+                None,
+                "`{value}` is refused, so it excludes nothing"
+            );
+        }
     }
 
     #[test]
