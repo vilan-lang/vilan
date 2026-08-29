@@ -365,6 +365,41 @@ fun get_owner(): Owner {
 	owner_scope.get()
 }
 
+/// Hand `subscription` to the ambient owner when there is one, and give it
+/// back either way — the OWNER-OPTIONAL half of `Source::effect`
+/// (`proposal/lifetimes.md` §5, A28).
+///
+/// `effect` reads the owner strictly (`get_owner`), which makes "no ambient
+/// owner" a COMPILE error; that is right for a subscription the caller never
+/// sees, and wrong for the derivation combinators (`map`, `combine`,
+/// `flatten`), which are documented as callable at module level — `current_path()
+/// .map(parse)` at the top of `main`, `RemoteSource::status` above every
+/// boundary. So they read it SAFELY: inside a boundary the derivation dies with
+/// the boundary (the leak A28 measured — 25 mount/dispose rounds left 25 dead
+/// subscribers on the module path signal — is gone), and outside every boundary
+/// the derivation lives as long as its source, exactly as it does today.
+///
+/// The ownerless case is therefore leak-as-today, not a refusal. Refusing it
+/// would be the stronger law ("a derivation must have an owner", the shape
+/// `RemoteSource::map` already enforces), and it is a BREAKING change to a
+/// documented idiom, so it is the owner's call and not this function's.
+fun register_with_owner(subscription: Subscription): Subscription {
+	match owner_scope.get_safe() {
+		Some(let owner) => owner.take(subscription),
+		None => subscription,
+	}
+}
+
+/// `Owner::defer` against the ambient owner when there is one — the
+/// `register_with_owner` shape for teardown that is not a single
+/// `Disposable` (`flatten`'s rolling inner subscription).
+fun defer_to_owner(cleanup: || void) {
+	match owner_scope.get_safe() {
+		Some(let owner) => owner.defer(cleanup),
+		None => {},
+	}
+}
+
 /// Establish `owner` as the ambient owner for the dynamic extent of `body` —
 /// the plain-function wrapper, made possible by the `context` clause
 /// (proposal/ambient-owner.md §5): `body` is an INJECTED closure, deferring
@@ -421,16 +456,33 @@ impl Signal<type T> with Source<T> {
 
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription {
-		let id = fresh_id();
-		self.subscribers.write().push(Subscriber {
-			id,
-			notify = || {
-				observer(self.get());
-			},
-		});
+		let subscription = observe(self, observer);
 		observer(self.get());
-		Subscription { subscribers = self.subscribers, id, release = Shared::new(None) }
+		subscription
 	}
+}
+
+/// Attach `observer` to `signal`'s subscriber list and hand back the handle
+/// that detaches it — `sub` WITHOUT the immediate first call. `sub` is this
+/// plus that call; a derivation (`map`) seeds its own first value and must not
+/// pay for a second `transform`.
+///
+/// The notify closure captures the VALUE CELL, never the signal
+/// (`proposal/lifetimes.md` §5, V1). Capturing `self` closed a back edge —
+/// signal → subscribers cell → list → subscriber → closure → scope → signal —
+/// so every subscription in the program minted its own 6-node cycle. The cell
+/// is what the closure actually needs, and nothing points from it back to the
+/// signal.
+fun observe<T>(signal: Signal<T>, observer: |T| void): Subscription {
+	let id = fresh_id();
+	let cell = signal.value;
+	signal.subscribers.write().push(Subscriber {
+		id,
+		notify = || {
+			observer(cell.read());
+		},
+	});
+	Subscription { subscribers = signal.subscribers, id, release = Shared::new(None) }
 }
 
 impl Signal<type T> {
@@ -490,14 +542,19 @@ impl Signal<type T> {
 		self.notify();
 	}
 
+	/// A derived signal: `transform` of this one's value, recomputed on every
+	/// change. DETACHABLE (A28): the subscription into this signal is handed to
+	/// the ambient owner, so a derivation made inside a boundary — a mounted
+	/// view, a `bind_each` row — dies when that boundary is disposed instead of
+	/// notifying a dead derived signal for the rest of the session. Made
+	/// outside every boundary (module level, the top of `main`) it lives as long
+	/// as its source, which is what a module-level `current_path().map(parse)`
+	/// wants.
 	fun map<U>(self, transform: sync |T| U): Signal<U> {
 		let derived = Signal::new(transform(self.get()));
-		self.subscribers.write().push(Subscriber {
-			id = fresh_id(),
-			notify = || {
-				derived.set(transform(self.get()));
-			},
-		});
+		let _owned = register_with_owner(observe(self, |value| {
+			derived.set(transform(value));
+		}));
 		derived
 	}
 }
@@ -506,34 +563,46 @@ impl Signal<type T> {
 /// recomputed whenever any input changes. Variadic over the inputs' (distinct)
 /// types via a mapped-tuple parameter — `combine((a, b, c))` of `Signal<A>`,
 /// `Signal<B>`, `Signal<C>` yields `Signal<(A, B, C)>`.
+///
+/// Detachable like `map` (A28): each per-input subscription is handed to the
+/// ambient owner, so the whole product dies with the boundary that built it.
 fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {
 	let snapshot = || (source in sources => source.get());
 	let derived = Signal::new(snapshot());
-	// Subscribe each input (the comprehension's `.map` runs `sub` per element);
-	// the resulting subscriptions are intentionally dropped.
-	let subscriptions = (source in sources => source.sub(|_| {
+	// Subscribe each input (the comprehension's `.map` runs `sub` per element).
+	// The handles are the AMBIENT OWNER's from here on — the tuple itself is
+	// what is dropped, not the subscriptions.
+	let _owned = (source in sources => register_with_owner(source.sub(|_| {
 		derived.set(snapshot());
-	}));
+	})));
 	derived
 }
 
 // The monadic join (backlog A4): follow whichever inner signal the outer
 // currently holds — a DYNAMIC dependency. When the outer switches, the result
 // detaches from the replaced inner and follows the new one from its current
-// value; when the current inner changes, the result updates. Like `map` and
-// `combine`, the subscription into the OUTER is deliberately unowned (it lives
-// as long as the outer does); the rolling INNER subscription is disposed on
-// every switch, so a replaced inner stops driving the result.
+// value; when the current inner changes, the result updates. The rolling INNER
+// subscription is disposed on every switch, so a replaced inner stops driving
+// the result — and BOTH halves are the ambient owner's (A28): the outer
+// subscription is registered, and the inner one that happens to be live at
+// disposal is deferred, so nothing survives the boundary.
 impl Signal<Signal<type U>> {
 	fun flatten(self): Signal<U> {
 		let derived = Signal::new(self.get().get());
 		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
 		// `sub` runs its observer immediately, so the first inner wires here too.
-		let outer_subscription = self.sub(|inner| {
+		let _outer = register_with_owner(self.sub(|inner| {
 			inner_subscription.read()?.dispose();
 			inner_subscription.write() = Some(inner.sub(|value| {
 				derived.set(value);
 			}));
+		}));
+		// The outer handle detaches this signal from the outer; whichever inner
+		// is current at that moment needs releasing too, and it is not a handle
+		// anyone else holds.
+		defer_to_owner(|| {
+			inner_subscription.read()?.dispose();
+			inner_subscription.write() = None;
 		});
 		derived
 	}

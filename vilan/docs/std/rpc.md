@@ -149,6 +149,12 @@ pending-call registry, inbound dispatch, `on_reconnect` hooks) and the
 the SSE/split fallback). App code doesn't construct these; the generated
 `connect` does.
 
+Disposing a reactive session (`ReactiveServer`/`ReactiveClient`) also clears
+its end's inbound handler — `DuplexEnd::clear_on_frame`, the teardown half of
+`on_frame`. Without it the wire kept the closure that captured the session, so
+a closed connection stayed reachable from its transport; the server half runs
+per disconnect, through `drop_session`.
+
 ```vilan,fragment
 fun connect_socket(url: str): Result<SocketDuplex, str>   // dial + announcement (backoff)
 impl SocketDuplex {

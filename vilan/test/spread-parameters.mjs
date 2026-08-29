@@ -129,14 +129,19 @@ function $k(self, value, $l) {
 	self[0].v = value;
 	$m(self, $l);
 }
-function $u(self, observer) {
+function $v(signal, observer) {
 	const id = fresh_id();
-	self[1].v.push([ id, () => {
-		observer($i(self));
+	const cell = signal[0];
+	signal[1].v.push([ id, () => {
+		observer(cell.v);
 		return;
 	} ]);
+	return [ signal[1], id, __shared_new([ 1 ]) ];
+}
+function $u(self, observer) {
+	const subscription = $v(self, observer);
 	observer($i(self));
-	return [ self[1], id, __shared_new([ 1 ]) ];
+	return subscription;
 }
 function $g(sources, $h) {
 	const snapshot = () => {
@@ -153,34 +158,34 @@ function $g(sources, $h) {
 	});
 	return derived;
 }
-function $v(self) {
+function $w(self) {
 	return self[0].v;
 }
-function $x(self, $n) {
-	const $y = $n;
-	let $z = null;
-	if ($y[0] === 0) {
-		const turn = $y[1];
-		$z = enqueue(turn, self[1].v);
+function $y(self, $n) {
+	const $z = $n;
+	let $A = null;
+	if ($z[0] === 0) {
+		const turn = $z[1];
+		$A = enqueue(turn, self[1].v);
 	} else {
-		const $A = $r(draining_turns.v);
-		let $B = null;
-		if ($A[0] === 0) {
-			const draining = $A[1];
-			$B = enqueue(draining, self[1].v);
+		const $B = $r(draining_turns.v);
+		let $C = null;
+		if ($B[0] === 0) {
+			const draining = $B[1];
+			$C = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$B = undefined;
+			$C = undefined;
 		}
-		$z = $B;
+		$A = $C;
 	}
-	return $z;
+	return $A;
 }
-function $w(self, value, $l) {
+function $x(self, value, $l) {
 	self[0].v = value;
-	$x(self, $l);
+	$y(self, $l);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -195,7 +200,7 @@ console.log($d([ ...inner, 12 ]));
 const count = $e(20);
 const name = $f("hi");
 const both = $g([ __clone(count), name ], [ 1 ]);
-console.log($v(both)[0]);
-$w(count, 21, [ 1 ]);
-console.log($v(both)[0]);
-console.log($v(both)[1]);
+console.log($w(both)[0]);
+$x(count, 21, [ 1 ]);
+console.log($w(both)[0]);
+console.log($w(both)[1]);

@@ -80,8 +80,15 @@ fun main() {
 	});                                                        // 3
 }
 ```
-- `map`'s result is a live derived signal; its internal subscription is
-  unowned (lives as long as the source).
+- `map`'s result is a live derived signal, and its internal subscription is
+  **detachable**: made inside a boundary — a mounted view, a `bind_each` row —
+  it is registered with the ambient owner and dies when that boundary is
+  disposed. `combine` and `flatten` register theirs the same way (`flatten`
+  also releases whichever inner subscription is live at disposal).
+- Made **outside** every boundary — module level, the top of `main` — a
+  derivation has no owner to register with and lives as long as its source.
+  That is what a module-level `current_path().map(parse)` wants, and it is why
+  the derivations read the ambient owner optionally where `effect` demands one.
 - `effect` requires an ambient owner; calling it outside every owner is a
   compile error (context coverage). It fires once immediately.
 - `sub` fires once immediately with the current value, like `effect`, and

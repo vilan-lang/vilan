@@ -136,6 +136,23 @@ impl DuplexEnd with DuplexTransport {
 	}
 }
 
+impl DuplexEnd {
+	/// Forget the inbound handler — `on_frame`'s missing teardown half
+	/// (`proposal/lifetimes.md` §5, V5 / backlog A29).
+	///
+	/// `ReactiveClient::new`/`ReactiveServer::new` install a handler that
+	/// captures the client/server it belongs to, and nothing ever cleared it:
+	/// `dispose` emptied `sources`/`live` but left the transport holding the
+	/// closure, so a closed session's whole component stayed reachable from the
+	/// wire — a leak per disconnect under any counted backend, and a live
+	/// retention under the JS collector for as long as the transport lives.
+	/// After this the end is inert: frames sent at it are dropped, exactly as
+	/// they are before `on_frame` is ever called.
+	fun clear_on_frame(self) {
+		self.me.write() = None;
+	}
+}
+
 /// Create two connected duplex ends: whatever one sends arrives at the other's handler.
 fun duplex_pair(): (DuplexEnd, DuplexEnd) {
 	let slot_a: Shared<Option<|Frame| void>> = Shared::new(None);
@@ -1173,10 +1190,17 @@ impl ReactiveServer {
 }
 
 impl ReactiveServer with Disposable {
-	/// Tear the session down: stop every live forward. Starters keep no
-	/// subscription of their own, so clearing the tables releases everything
-	/// this session held on the app's signals — after this, changes no longer
-	/// reach (or reference) this wire.
+	/// Tear the session down: stop every live forward, then let the transport
+	/// forget us. Starters keep no subscription of their own, so clearing the
+	/// tables releases everything this session held on the app's signals — and
+	/// clearing the inbound handler (A29) releases what the WIRE held on this
+	/// session, which the tables never could: `new` installed a closure
+	/// capturing the whole server, so without this a closed connection's server
+	/// stayed reachable from its transport forever. After this, changes no
+	/// longer reach this wire and the wire no longer reaches this session.
+	///
+	/// `drop_session` is covered by the same line: it disposes the session it
+	/// drops.
 	fun dispose(self) {
 		for entry in self.live.read() {
 			let (channel, subscription) = entry;
@@ -1184,6 +1208,7 @@ impl ReactiveServer with Disposable {
 		}
 		self.live.write() = [];
 		self.sources.write() = [];
+		(self.transport).clear_on_frame();
 	}
 }
 
@@ -1267,6 +1292,26 @@ impl ReactiveClient {
 				},
 			}
 		}
+	}
+}
+
+impl ReactiveClient with Disposable {
+	/// Tear the client half down — `ReactiveServer::dispose`'s mirror (A29).
+	/// `new` installs an inbound handler capturing the whole client, so without
+	/// this the transport holds the client, its routes and every mirror cache
+	/// for as long as the transport lives; the measured cycle is client →
+	/// transport → handler → client, and one line cuts it. Clearing `routes`
+	/// releases the mirrors themselves.
+	///
+	/// Nothing in std calls this today: a browser app's `ReactiveClient` is one
+	/// per connection and lives as long as the tab, which is why A29 measured
+	/// the SERVER half (one session per connection, churned per disconnect) as
+	/// the leak that costs. It exists so the two halves are symmetric, and so a
+	/// host that DOES retire a client — a test, an HMR teardown, a reconnect
+	/// that builds a fresh one — has the seam to call.
+	fun dispose(self) {
+		(self.transport).clear_on_frame();
+		self.routes.write() = [];
 	}
 }
 

@@ -47,11 +47,22 @@ impl Event {
 	fun shift_key(self): bool
 	fun alt_key(self): bool
 	fun key(self): str           // "Enter", "Escape", "a", …
+	fun target_value(self): str  // event.target.value — the input's text
 }
 ```
 
 Raw `element.on` handlers do **not** establish a turn: that's `View.on`'s
 job. Prefer the `View` layer; drop to `dom` for what it doesn't cover.
+
+`target_value` is how a listener reads what the user typed **without holding
+the element**. An element that reaches its own listener and back is a cycle
+straddling the language/host boundary, where no disposal can see both halves,
+so `bind_value`/`bind_draft` are built on this — and a hand-written input
+handler should be too:
+
+```vilan,fragment
+view("input").on_event("input", |event| query.set(event.target_value()))
+```
 
 ## std::ui
 
