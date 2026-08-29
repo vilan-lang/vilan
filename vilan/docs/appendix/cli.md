@@ -76,6 +76,8 @@ A *dependency* that declares hooks gets a `note:` line and no execution.
   Analysis only; the emitted JavaScript is unchanged, so this is how to
   measure a leg before opting it in
   ([the dev loop](../guide/dev-loop.md#shipping-routes-separately)).
+- `--explain`: after the build, print where every output came from — see
+  below.
 - `--backend js`: the only backend today; the flag exists so a future
   one has somewhere to live.
 
@@ -87,6 +89,85 @@ cost the first load more than it deferred. The leg's chunk files belong to
 its last build: a build that writes none removes any a previous one left,
 and rewrites the manifest to say the leg emitted none. `vilan run` ignores
 `split` — the dev loop swaps whole bundles — and emits the leg as one file.
+
+### `vilan build --explain`
+
+*Where did this file come from?* The compile-time asset channel scatters
+its contributions across files on purpose — that scatter **is**
+import-driven composition — so a stylesheet in `dist/` is the sum of
+however many `emit` calls the program reached, and finding them was a
+grep. `--explain` asks the build instead. It builds first, exactly as
+`vilan build` does, and then prints what it wrote:
+
+```text
+output  dist/client.css
+  role         emitted kind `css`
+  emitted      src/client.vl:14
+  emitted      src/theme.vl:9
+
+output  dist/brand/logo.svg
+  role         bundled copy
+  source       src/static/logo.svg
+  named        src/client.vl:17 (asset::bundle_as)
+
+output  dist/client.js
+  role         compiled bundle
+  leg          client
+
+output  src/icons.vl
+  role         hook output
+  hook         icons (Fresh)
+
+input   src/static/logo.svg
+  read         src/client.vl:17 (asset::bundle_as)
+  invalidates  dist/brand/logo.svg
+  invalidates  dist/client.js
+```
+
+**One block per file the build wrote**, headed `output` and its path,
+then a fixed `role` and whatever the build knows about it:
+
+| `role` | What follows |
+|---|---|
+| `emitted kind <k>` | one `emitted` line per `const` site that contributed to it |
+| `bundled copy` | the `source` file, and a `named` line per `const` site that named it, with the spelling (`asset::bundle` / `asset::bundle_as`) |
+| `compiled bundle` | the `leg` whose JavaScript it is |
+| `build manifest` | the `leg` it describes |
+| `route chunk` | the `leg` and the route `arm` |
+| `hook output` | the `hook` that declares it, and this build's verdict — `(ran)` or `(Fresh)` |
+
+**Then one block per tracked input**, headed `input`: a `read` line per
+`const` site that touched it (with the call — `asset::read`,
+`asset::read_dir`, `asset::read_dir_all`, `asset::digest`, or a bundle's
+source read), a `declared` line per `[[build.hook]]` that names it in
+`inputs`, and an `invalidates` line per output a change to it would move.
+"Invalidates" is read off the same records, not guessed: a const input
+moves its leg's **compiled bundle** (the channel's inputs are sources to
+the compile, which is why editing one starts a `--watch` round) plus the
+flushes and copies of the sites that read it; a hook input moves that
+hook's declared outputs. The build manifest is deliberately absent — every
+build of a browser leg rewrites it, so naming it under every input would be
+true and would say nothing.
+
+Three things worth knowing:
+
+- **It builds.** Explaining a tree without building it would describe
+  whatever the last build happened to leave, which is the one answer that
+  is never useful. Under `--watch`, every round prints its own report.
+- **A site is a `const` expression**, not the `emit` call inside it. That
+  is the granularity the compiler keeps: the const evaluator runs a
+  lowered tree whose frames carry function names and no spans, so the
+  `const` site is what a const-eval *error* points at too, and the two
+  locations are counted from one set of bytes.
+- **`--stdout` is refused with it.** `--stdout` prints a bundle, not a
+  build: it writes no output directory at all, so there would be nothing
+  to explain, and the report would corrupt the one stream the flag exists
+  to produce.
+
+The shape is line-oriented on purpose — a fixed key per line, paths spelled
+exactly as the build's own `Compiled` / `Emitted` / `Bundled` lines spell
+them — so `grep '^output'` lists a `dist/`, `grep invalidates` answers
+"what does this file feed", and two builds diff cleanly.
 
 ## `vilan check [file]`
 

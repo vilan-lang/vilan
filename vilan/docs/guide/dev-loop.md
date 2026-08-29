@@ -223,6 +223,15 @@ The rest of the rules:
 Freshness is about cost, never about safety: a skipped hook is code you
 already trusted to run, and skipping it buys time, not containment.
 
+When you want the whole picture rather than one `Fresh` line — which hook
+wrote which file, which `const` site emitted which stylesheet, and what a
+change to a given input would move — run
+[`vilan build --explain`](../appendix/cli.md#vilan-build---explain). It
+builds and then prints one block per output, naming each declared hook
+output with this build's verdict for it (`(ran)` or `(Fresh)`), and one
+block per tracked input — hook `inputs` included — with what it
+invalidates.
+
 ### When the hook generates Vilan
 
 A hook that writes a `.vl` module has one more thing to say, and leaving it

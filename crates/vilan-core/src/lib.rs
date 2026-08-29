@@ -749,6 +749,7 @@ pub fn post_analysis_passes(
     program.const_assets = evaluated.assets;
     program.const_input_files = evaluated.input_files;
     program.const_bundled_files = evaluated.bundled;
+    program.const_facts = evaluated.facts;
     for (error, source) in evaluated.errors {
         program.push_diagnostic(error, source);
     }

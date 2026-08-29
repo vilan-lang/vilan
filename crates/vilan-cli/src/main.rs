@@ -9,6 +9,7 @@ use std::{
 use ariadne::{Color, Label, Report, ReportKind, sources};
 use clap::{Parser as _, Subcommand};
 mod bindgen;
+mod explain;
 mod hmr;
 mod init;
 mod job;
@@ -85,6 +86,14 @@ enum Command {
         /// for a hook that reads something it did not declare.
         #[arg(long)]
         rerun_hooks: bool,
+        /// After the build, print what wrote every file in the output
+        /// directory — the emitting `const` sites of each accumulated kind,
+        /// the source and the naming site of each bundled copy, the hook
+        /// behind each declared output — and, per tracked input, what a
+        /// change to it would move. Builds first: explaining a stale tree
+        /// would lie.
+        #[arg(long)]
+        explain: bool,
     },
     /// Type-check, reporting diagnostics without writing output. With no path,
     /// checks the project entry from the nearest `vilan.toml`.
@@ -241,10 +250,22 @@ fn run_cli() -> ExitCode {
             debug,
             watch,
             rerun_hooks,
+            explain,
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error(&message),
+            // `--stdout` prints a bundle, not a build: it writes no output
+            // directory at all, and its one stream is the JavaScript. There
+            // would be nothing to explain, and the report would corrupt what
+            // the stream is for. Refused rather than quietly dropped.
+            Ok(_backend) if explain && stdout => report_error(
+                "`--explain` reports what a build wrote, and `--stdout` writes nothing — \
+                 it prints a bundle, not a build. Drop one of the two.",
+            ),
             Ok(_backend) => {
                 PRINT_CHUNKS.store(print_chunks, std::sync::atomic::Ordering::Relaxed);
+                if explain {
+                    explain::ask();
+                }
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
                     build_once(file.clone(), stdout, platform.clone(), debug, rerun_hooks)
@@ -309,6 +330,10 @@ fn build_once(
     debug: bool,
     rerun_hooks: bool,
 ) -> ExitCode {
+    // Before the hooks, which are the first thing that records: every round of
+    // `--watch` explains itself, and a round must not inherit the previous
+    // one's outputs.
+    explain::begin();
     with_project(file, |project| {
         if let Err(code) = run_build_hooks(&project, rerun_hooks) {
             return code;
@@ -1127,8 +1152,14 @@ fn hmr_round(
         // see them (`dev-refresh.md` §5, item 1). The trigger itself is the
         // build-input record `record_const_inputs` hands the watcher; without
         // it no round fires and `dist/` keeps the first round's copy forever.
-        let assets =
-            write_bundled(&dist, &leg.bundled, &reserved, &mut bundled_names).unwrap_or_default();
+        let assets = write_bundled(
+            &dist,
+            &leg.bundled,
+            &leg.name,
+            &reserved,
+            &mut bundled_names,
+        )
+        .unwrap_or_default();
         let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
         let _ = write_chunks(
             &bundle_path,
@@ -1358,6 +1389,7 @@ fn build_and_spawn_run(
             write_bundled(
                 output_path.parent().unwrap_or(Path::new(".")),
                 &compiled.bundled,
+                "",
                 &[],
                 &mut BTreeMap::new(),
             )
@@ -1970,6 +2002,19 @@ impl BuildHooks {
                 && hook.is_skippable()
                 && before.is_some()
                 && recorded.remove(&hook.name) == before;
+            // Recorded whichever way it goes, and in the words the terminal
+            // uses: `--explain` names a hook's declared outputs and this
+            // build's verdict for each, which is the difference between "this
+            // file is current" and "this file is what the last run left".
+            explain::hook(
+                &hook.name,
+                if fresh { "Fresh" } else { "ran" },
+                hook.inputs.iter().map(|path| self.dir.join(path)).collect(),
+                hook.outputs
+                    .iter()
+                    .map(|path| self.dir.join(path))
+                    .collect(),
+            );
             if fresh {
                 eprintln!(
                     "{}",
@@ -2877,6 +2922,12 @@ struct Compiled {
     /// Each source this leg was compiled from, with the content hash it was
     /// compiled at — what the watch loop re-hashes to decide a per-leg skip.
     sources: Vec<(PathBuf, u64)>,
+    /// The const channel's provenance, resolved to `file:line` — what
+    /// `vilan build --explain` prints (G11). EMPTY unless the flag asked for
+    /// it: resolving a line means re-reading the source it is counted in, and
+    /// a build nobody asked to explain must not pay for a report it will not
+    /// print.
+    explain: Vec<explain::Fact>,
 }
 
 fn compile_unit(
@@ -2952,12 +3003,15 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         print!("{}", compiled.javascript);
         return ExitCode::SUCCESS;
     }
+    // Before the writers, which record the files this leg's facts explain.
+    explain::leg_facts(&leg, compiled.explain);
     let output_path = unit.entry.with_extension(platform.script_extension());
     let styles = write_assets(&output_path, &compiled.assets);
     let directory = output_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let assets = match write_bundled(
         &directory,
         &compiled.bundled,
+        &leg,
         &[LegNamespace::of(&leg, platform)],
         &mut BTreeMap::new(),
     ) {
@@ -2982,6 +3036,11 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
                 paint::out(paint::Style::BOLD, &output_path.display().to_string())
             );
             warn_superseded_sibling(&output_path);
+            explain::bundle(output_path.clone(), &leg);
+            // The build is complete, so the report is complete. A build that
+            // failed has not written the tree it would be explaining, and its
+            // diagnostics are the account it owes.
+            explain::print();
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -3038,6 +3097,9 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
     if write_bundled(
         output_path.parent().unwrap_or(Path::new(".")),
         &compiled.bundled,
+        // `run` never explains — `--explain` is a `vilan build` flag — so the
+        // leg name here is recorded by nothing.
+        "",
         &[],
         &mut BTreeMap::new(),
     )
@@ -3055,7 +3117,12 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
 /// server's `dist/client.js` exists). `--platform`/`--stdout` don't apply.
 fn build_workspace(root: &Path, members: &[(Unit, Platform)], debug: bool) -> ExitCode {
     match build_workspace_artifacts(root, members, debug, Emission::AsDeclared) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            // Every leg is written, so the report is complete — see
+            // `build_single` for why only a successful build prints one.
+            explain::print();
+            ExitCode::SUCCESS
+        }
         Err(code) => code,
     }
 }
@@ -3135,10 +3202,19 @@ fn build_workspace_artifacts(
         }
         let mut chunks = Vec::new();
         let sink = (emission == Emission::AsDeclared).then(|| (unit.name.as_str(), &mut chunks));
-        let compiled = compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
+        let mut compiled =
+            compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
+        // Before the writers, which record the files this leg's facts explain.
+        explain::leg_facts(&unit.name, std::mem::take(&mut compiled.explain));
         let output = artifact_path(&dist, &unit.name, *platform);
         let styles = write_assets(&output, &compiled.assets);
-        let assets = write_bundled(&dist, &compiled.bundled, &reserved, &mut bundled_names)?;
+        let assets = write_bundled(
+            &dist,
+            &compiled.bundled,
+            &unit.name,
+            &reserved,
+            &mut bundled_names,
+        )?;
         // Unconditional: this is also where a previous build's chunks are swept
         // when this one wrote none, and where a browser leg's build manifest is
         // written whether it split or not (`fullstack-dx.md` §10.3).
@@ -3164,6 +3240,7 @@ fn build_workspace_artifacts(
             paint::out(paint::Style::BOLD, &output.display().to_string())
         );
         warn_superseded_sibling(&output);
+        explain::bundle(output, &unit.name);
     }
     Ok(())
 }
@@ -3580,6 +3657,9 @@ fn write_assets(
             paint::out(paint::Style::GREEN, "Emitted"),
             paint::out(paint::Style::BOLD, &path.display().to_string())
         );
+        // The write and the record are one call apart, on purpose: the report
+        // can never name a file this build did not flush (G11).
+        explain::emitted(path.clone(), &leg, &kind);
         if is_styles {
             styles = path
                 .file_name()
@@ -3776,6 +3856,10 @@ fn prune_and_record_asset_kinds(
 fn write_bundled(
     output_directory: &std::path::Path,
     bundled: &[(PathBuf, String)],
+    // Whose copies these are — the leg name `--explain` groups them under, so
+    // a report can tell `client`'s copy of a shared file from `server`'s. Only
+    // the report reads it; the copy itself is a leg-agnostic file operation.
+    leg: &str,
     reserved: &[LegNamespace],
     written_names: &mut BTreeMap<String, PathBuf>,
 ) -> Result<Vec<String>, ExitCode> {
@@ -3797,12 +3881,12 @@ fn write_bundled(
                 written_names.insert(name.clone(), source.clone());
             }
         }
-        if let Some((leg, role)) = reserved
+        if let Some((claimant, role)) = reserved
             .iter()
             .find_map(|namespace| namespace.claims(name).map(|role| (&namespace.leg, role)))
         {
             eprintln!(
-                "{} `{name}` is the `{leg}` leg's {role}, so `{}` cannot be bundled \
+                "{} `{name}` is the `{claimant}` leg's {role}, so `{}` cannot be bundled \
                  there — move the resource into a subdirectory, or give it a target \
                  of its own with `asset::bundle_as`",
                 paint::error_prefix(),
@@ -3813,6 +3897,10 @@ fn write_bundled(
         let destination = output_directory.join(name);
         // Same file, so the copy is already done — and doing it would undo it.
         if same_file(source, &destination) {
+            // Recorded anyway: it is a resource this build carries, and a
+            // report that named only the copies that moved bytes would leave a
+            // reader hunting for the one file it skipped.
+            explain::bundled(destination, leg, source.clone(), name);
             written.push(name.clone());
             continue;
         }
@@ -3840,6 +3928,7 @@ fn write_bundled(
             paint::out(paint::Style::GREEN, "Bundled"),
             paint::out(paint::Style::BOLD, &destination.display().to_string())
         );
+        explain::bundled(destination, leg, source.clone(), name);
         written.push(name.clone());
     }
     Ok(written)
@@ -3985,6 +4074,14 @@ fn write_chunks(
             paint::out(paint::Style::BOLD, &path.display().to_string()),
             chunk.arm
         );
+        explain::chunk(
+            path,
+            &output_js
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            &chunk.arm,
+        );
     }
     if !is_browser {
         return Ok(());
@@ -4044,6 +4141,11 @@ fn write_chunks(
         );
         return Err(ExitCode::FAILURE);
     }
+    // Explained ALWAYS, and announced only when it describes chunks — the two
+    // are different questions. The build log is a running commentary and says
+    // nothing routine; `--explain` is an inventory of `dist/`, and a file it
+    // left out would be the one the reader came to look up.
+    explain::manifest(manifest_path.clone(), &leg);
     // Announced only when it describes chunks: a non-splitting leg's manifest is
     // as routine as its `.css` sidecar and says nothing a reader of a build log
     // needs. (Byte-identical `vilan build` output for every project that has one
@@ -4531,9 +4633,11 @@ fn compile_to_js(
                 // (by re-hashing, never by mtime) to skip a leg whose sources
                 // didn't change (backlog E12, half b).
                 Ok(javascript) => {
+                    let explained = resolve_const_facts(&mut diagnostic_files, &program);
                     output =
                         Some(Compiled {
                             javascript,
+                            explain: explained,
                             assets: program.const_assets.clone(),
                             bundled: program.const_bundled_files.clone(),
                             sources: program
@@ -4775,6 +4879,70 @@ fn load_diagnostic_file(
         None => ("<generated>".to_string(), String::new()),
     };
     files.insert(source, entry);
+}
+
+/// This compile's const-channel provenance with every site resolved to
+/// `file:line` — the `--explain` half of a `Compiled` (G11).
+///
+/// It reads the record the const pass kept (`Program::const_facts`) and adds
+/// nothing to it: a `ConstFact` carries a `SourceId` and a `Span` because
+/// turning those into a line needs the source TEXT, which the pass does not
+/// hold. This function does, through the very map the diagnostics render
+/// against — so the location `--explain` prints for a `const` site and the
+/// location a const-eval *error* prints for the same site are counted from one
+/// set of bytes, and cannot drift.
+///
+/// Empty when nobody asked: the resolution re-reads every source a fact names,
+/// which is a cost a plain `vilan build` should not carry.
+fn resolve_const_facts(
+    files: &mut HashMap<SourceId, (String, String)>,
+    program: &Program,
+) -> Vec<explain::Fact> {
+    if !explain::asked() {
+        return Vec::new();
+    }
+    program
+        .const_facts
+        .iter()
+        .map(|fact| {
+            load_diagnostic_file(files, program, fact.source);
+            let (name, text) = diagnostic_file(files, fact.source);
+            explain::Fact {
+                site: format!("{name}:{}", line_of(text, fact.span.start)),
+                what: match &fact.what {
+                    vilan_core::const_eval::ConstFactKind::Emitted { kind } => {
+                        explain::FactKind::Emitted { kind: kind.clone() }
+                    }
+                    vilan_core::const_eval::ConstFactKind::Bundled { name, function, .. } => {
+                        explain::FactKind::Bundled {
+                            name: name.clone(),
+                            function: (*function).to_string(),
+                        }
+                    }
+                    vilan_core::const_eval::ConstFactKind::Read { path, function } => {
+                        explain::FactKind::Read {
+                            path: path.clone(),
+                            function: (*function).to_string(),
+                        }
+                    }
+                },
+            }
+        })
+        .collect()
+}
+
+/// The 1-based line `offset` falls on in `text`. Counted over BYTES rather
+/// than through a `str` slice, so an offset past the end or inside a codepoint
+/// — a span that does not index this text, the shape [`snippet`] degrades for
+/// its own reasons — lands on a line instead of panicking (backlog E16's rule:
+/// a span that does not fit is a bug, and the honest degrade is never an
+/// abort).
+fn line_of(text: &str, offset: usize) -> usize {
+    let bounded = offset.min(text.len());
+    1 + text.as_bytes()[..bounded]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
 }
 
 /// The (label, text) a diagnostic renders against. Every source a diagnostic
