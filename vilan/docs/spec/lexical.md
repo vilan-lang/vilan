@@ -34,10 +34,11 @@ Identifiers are ASCII. The following words are **reserved**; they lex as
 keyword tokens and are never `IDENT`:
 
 ```text
-async  await  borrows  const     else    enum   export  external
-for    fun    if       impl      import  in     is      jump
-let    macro  match    mod       mut     null   own     resource
-ret    struct trait    type      use     with   true    false
+async     await  borrows  const  css   else    enum  export
+external  for    fun      if     impl  import  in    is
+jump      let    macro    match  mod   mut     null  own
+resource  ret    struct   trait  type  use     with  true
+false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
@@ -199,11 +200,29 @@ span-adjacent pairs, `on:` joins by adjacency, and a hyphenated element
 or attribute name (`aria-label`, `my-widget`) is a span-adjacent
 name-`-`-name run — `data - id` is three tokens of arithmetic, not a
 name. The lexer itself is untouched by the element form: every token it
-produces already existed.
+produces already existed. The `css` block (grammar spec, *atom*) is the
+same: a property name is that identical span-adjacent run, and a
+dimension such as `1px` or `1.5rem` was already one number token (§2.3),
+so CSS's own value shape needed nothing new.
+
+**`#` and `@` are in neither class, and lex as nothing at all.** They
+belong to no run and open no literal, so either one is a lex error
+wherever it is written — including inside a `css` block, which cannot
+change that, because lexing finishes before any parser exists (§2.5).
+The two consequences are stated rather than worked around, and each
+diagnostic names its spelling: a colour is a hole,
+`color: {Color::hex("#333")};`, which routes the value through the
+`Color` type that carries its own `:root` line; and a block has no
+at-rules, so a media query is a breakpoint condition rule
+(`.md { … }`) and a declaration block under a selector of your own is
+`std::style::declare`. `#id` selectors are unwritable for the same
+reason; `[id="x"]` is the spelling.
 
 ## 2.5 Trivia and token separation
 
 Whitespace (any Unicode whitespace) and comments may appear between any
 two tokens and are required only where two tokens would otherwise lex as
 one (`fun main` needs the space; `a + b` does not). Lexing is greedy and
-context-free: no token depends on parse state.
+context-free: no token depends on parse state — which is why a construct
+whose body reads as another language, such as the `css` block, still
+lexes as ordinary vilan tokens and admits not one byte more.

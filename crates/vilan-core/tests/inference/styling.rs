@@ -5385,3 +5385,49 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
         "#,
     );
 }
+
+#[test]
+fn a_block_without_style_in_scope_fails_at_the_css_keyword() {
+    // The one generated accessor S2 gave a REAL span, and this is what the
+    // span was kept for (§7.3): the block lowers to `style()`, so a missing
+    // `import std::style::style` fails on the generated accessor — and the
+    // squiggle lands on the word that asked for a `Style`, not on a
+    // zero-width anchor somewhere inside the block.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _s = const css { display: flex; };
+        }
+        "#,
+        "css",
+        "cannot find 'style' in this scope",
+    );
+    // S4's tailored note. The generic report is honest but disjointed — `css`
+    // underlined, `style` in the message, nothing drawing the line — so the
+    // note says which is which, on the element-syntax precedent.
+    assert_fails_noting(
+        r#"
+        fun main() {
+            let _s = const css { display: flex; };
+        }
+        "#,
+        "cannot find 'style' in this scope",
+        "css",
+        "a `css { … }` block lowers to a std::style::style chain",
+    );
+}
+
+#[test]
+fn a_hand_written_style_accessor_gets_no_css_note() {
+    // The note's gate is the SPAN reading `css`, so it cannot fire on an
+    // ordinary unresolved `style` — which would be a note about a construct
+    // the author never wrote.
+    assert_fails_without(
+        r#"
+        fun main() {
+            let _s = const style().raw("display", "flex");
+        }
+        "#,
+        "a `css { … }` block lowers to",
+    );
+}

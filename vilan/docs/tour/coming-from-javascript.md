@@ -70,6 +70,17 @@ for the explicit keywords when you *don't* want to wait. The
 | JSX: `<div className="x">`      | `<div class("x")>` — text children are quoted   |
 | JSX: `onClick={handler}`        | `on:click(handler)`                             |
 | JSX: `<TodoRow todo={t} />`     | a function call in a hole: `{todo_row(t)}`      |
+| CSS: `display: flex;`           | the same, inside `css { … }`                    |
+| CSS: `color: #333;`             | `color: {Color::hex("#333")};` — a hole         |
+| CSS: `:hover { … }`             | `.hover { … }` — a condition rule               |
+| CSS: `@media (min-width: …)`    | `.md { … }`, and `.sm` `.lg` `.xl`              |
+| CSS: `!important`               | nothing — a later declaration wins              |
+| CSS: `gap: 1rem;` (hard-coded)  | `gap: {space(4)};` (a scale token)              |
+
+The CSS rows are a real block, not a template string: `css { … }` is
+core syntax that lowers to a `std::style` chain, so the property names
+are tokens the compiler sees and `vilan fmt` orders them for you. The
+[styling guide](../guide/styling.md#the-css-block) has the whole shape.
 
 ## Things that look the same and mostly are
 
@@ -87,6 +98,9 @@ library is small and imported explicitly, so files start with a few
 - **Don't wrap things in `try`/`catch`.** Errors are values. Look at the
   `Result` and decide.
 - **Don't sprinkle `await`.** It's already there.
+- **Don't type `#` or `@`.** Neither is a vilan character anywhere, a
+  `css` block included. A colour goes through `Color`, a media query
+  through `.md { … }`.
 
 ## Where to go next
 

@@ -3,7 +3,7 @@
  "information_for_contributors": [
   "The word-list halves of this grammar (the keyword, primitive-type, attribute-marker and operator lists) are GENERATED from the compiler's exported tables by crates/vilan-cli/tests/grammar_sync.rs, which byte-gates them on every suite run. Do not hand-edit a generated `match`/`begin` value; change the compiler table (or grammar_sync.rs's role tables) and regenerate:",
   "VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated",
-  "The structural rules (strings, number shapes, elements, captures, the contextual `context`/`sync` anchors) are hand-written."
+  "The structural rules (strings, number shapes, elements, `css` blocks, captures, the contextual `context`/`sync` anchors) are hand-written."
  ],
  "name": "Vilan",
  "scopeName": "source.vilan",
@@ -22,6 +22,9 @@
   },
   {
    "include": "#elements"
+  },
+  {
+   "include": "#css"
   },
   {
    "include": "#function-definition"
@@ -399,6 +402,116 @@
      "comment": "A hyphenated attribute name in a head (`aria-label(`, `data-id(`).",
      "match": "\\b([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)+)(?=\\()",
      "name": "entity.other.attribute-name.vilan"
+    }
+   ]
+  },
+  "css": {
+   "patterns": [
+    {
+     "comment": "The `css { … }` block (css-block S4). Scoped as begin/end so that a property name is coloured as one only INSIDE a block — the entry is the grammar's own two-token gate, the keyword glued to `{`. Everything inside is `#css-items`; the block's own `}` is whatever `}` those patterns did not consume, which is why the hole and nested-rule rules below both take their braces with them.",
+     "begin": "\\b(css)\\s*(\\{)",
+     "beginCaptures": {
+      "1": {
+       "name": "keyword.other.vilan"
+      },
+      "2": {
+       "name": "punctuation.section.block.begin.vilan"
+      }
+     },
+     "end": "\\}",
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.section.block.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "include": "#css-items"
+      }
+     ]
+    }
+   ]
+  },
+  "css-items": {
+   "patterns": [
+    {
+     "include": "#comments"
+    },
+    {
+     "comment": "A condition rule `.hover { … }` / `.within(\"data-theme\", \"dark\") { … }`. The dot is the grammar's whole disambiguator, so a dotted head is a combinator and never a property. The head's arguments are taken in the `begin` rather than left to a nested rule, so the body's `{` is consumed here and the rule's own `}` closes it; a head whose arguments wrap across lines simply does not match, which is the regex level's honest limit.",
+     "begin": "(\\.)([a-z][a-zA-Z0-9_]*)(\\([^)]*\\))?\\s*(\\{)",
+     "beginCaptures": {
+      "1": {
+       "name": "punctuation.definition.keyword.vilan"
+      },
+      "2": {
+       "name": "entity.name.function.vilan"
+      },
+      "3": {
+       "patterns": [
+        {
+         "include": "$self"
+        }
+       ]
+      },
+      "4": {
+       "name": "punctuation.section.block.begin.vilan"
+      }
+     },
+     "end": "\\}",
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.section.block.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "include": "#css-items"
+      }
+     ]
+    },
+    {
+     "comment": "A property name and its `:` — the span-adjacent name-`-`-name run the grammar reads, custom properties (`--brand-ink`) and vendor prefixes (`-webkit-…`) included.",
+     "match": "(-{0,2}[a-zA-Z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(:)",
+     "captures": {
+      "1": {
+       "name": "support.type.property-name.vilan"
+      },
+      "2": {
+       "name": "punctuation.separator.key-value.vilan"
+      }
+     }
+    },
+    {
+     "comment": "A `{expression}` hole. Nested rules are matched first and take their own braces, so a bare `{` inside a block is always a hole; its contents are ordinary vilan.",
+     "begin": "\\{",
+     "beginCaptures": {
+      "0": {
+       "name": "punctuation.section.embedded.begin.vilan"
+      }
+     },
+     "end": "\\}",
+     "endCaptures": {
+      "0": {
+       "name": "punctuation.section.embedded.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "include": "$self"
+      }
+     ]
+    },
+    {
+     "include": "#strings"
+    },
+    {
+     "include": "#numbers"
+    },
+    {
+     "comment": "The declaration terminator, which the grammar requires after every declaration including the last.",
+     "match": ";",
+     "name": "punctuation.terminator.vilan"
     }
    ]
   }

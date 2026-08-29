@@ -455,6 +455,59 @@ fn a_family_is_connected_by_entanglement() {
     }
 }
 
+/// The derivation a `css` block's canonical order rests on
+/// (proposal/css-block.md §8, S3).
+///
+/// `vilan fmt` ranks a block's declarations by the CSS PROPERTY they write,
+/// looked up in these same rows' `properties` column — deliberately NOT a fourth
+/// hand-maintained table. That lookup is only well defined if a property never
+/// belongs to two families: `padding` and `padding_x` both write
+/// `padding-left`, and they had better agree that it is family `padding`, or the
+/// block would rank a declaration somewhere the chain does not and one style
+/// would have two canonical spellings.
+///
+/// Gate 3 above already forces two rows writing a common property into one
+/// family, so this is that consequence stated where the derivation can read it —
+/// and it is the test that goes red if gate 3's `entangled` predicate is ever
+/// narrowed.
+#[test]
+fn no_css_property_is_claimed_by_two_families() {
+    let mut families: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for row in STYLE_PROPERTY_METHODS {
+        for property in row.properties {
+            families.entry(property).or_default().insert(row.family);
+        }
+    }
+    let ambiguous: Vec<String> = families
+        .iter()
+        .filter(|(_, claimed)| claimed.len() > 1)
+        .map(|(property, claimed)| {
+            format!(
+                "`{property}` is claimed by {:?} — a `css` block cannot rank a declaration \
+                 writing it",
+                claimed
+            )
+        })
+        .collect();
+    assert!(ambiguous.is_empty(), "{}", ambiguous.join("\n"));
+    // Non-vacuity: the shared-property cases the rule exists for are really in
+    // the table (a table that stopped naming slots would pass trivially).
+    assert!(
+        families
+            .values()
+            .filter(|claimed| claimed.len() == 1)
+            .count()
+            > 40,
+        "the property column has thinned out — this gate is passing on an empty map"
+    );
+    assert_eq!(
+        families.get("padding-left").map(BTreeSet::len),
+        Some(1),
+        "`padding-left` is written by both `padding_x` and `padding_left`; it must resolve to \
+         one family"
+    );
+}
+
 // --- 4. Condition axes -------------------------------------------------------
 
 #[test]

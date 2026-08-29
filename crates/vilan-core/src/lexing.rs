@@ -876,7 +876,7 @@ enum IStringEnd {
 }
 
 /// The rule a `#` breaks. It is in no charset, so it cannot lex — and lexing is
-/// context-free by spec (`lexical.md` §7) and by construction, so a `css` block
+/// context-free by spec (`lexical.md` §2.5) and by construction, so a `css` block
 /// cannot make it lex there either (proposal/css-block.md §4.1). The byte's one
 /// realistic use is a hex colour, and the refusal is the right one: the vilan
 /// spelling routes the value through `Color`, which carries its own `:root`
