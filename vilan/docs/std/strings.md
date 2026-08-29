@@ -23,12 +23,46 @@ impl str {
 	fun split(self, separator: str): List<str>
 	fun substring(self, start: i32, end: i32): str   // end-exclusive; see below
 	fun code_at(self, index: i32): u32               // UTF-16 code unit
-	fun strip_prefix(self, prefix: str): Option<str> // declared in std::option
+	fun index_of(self, needle: str): Option<i32>     // declared in std::option
+	fun last_index_of(self, needle: str): Option<i32> // likewise
+	fun strip_prefix(self, prefix: str): Option<str> // likewise
 	fun strip_suffix(self, suffix: str): Option<str> // likewise
 	fun parse_i32(self): Option<i32>                 // likewise
 	fun parse_f64(self): Option<f64>                 // likewise
 }
 ```
+
+### Locating: `index_of` and `last_index_of`
+
+`contains` answers *whether*; these answer *where*. They are what
+`substring` needs and nothing else computed — without them, text is taken
+apart with `split` and put back together.
+
+```vilan
+import std::print;
+import std::option::{ Some, None };
+
+fun main() {
+	let line = "key: value";
+	match line.index_of(": ") {
+		Some(let at) => {
+			print(line.substring(0, at));                 // "key"
+			print(line.substring(at + 2, line.len()));    // "value"
+		}
+		None => print("no separator"),
+	}
+	print("a.b.c".last_index_of(".").unwrap_or(-1));      // 3 — the final one
+}
+```
+
+**Absence is `None`, never `-1`.** That is the whole reason these are not
+the host's `indexOf` renamed: `-1` is an index nothing in the type system
+tells apart from a real one, and it would be reported one call later, by
+`substring`, about a number this call produced. The `Option` makes "not
+found" a case you have to answer.
+
+The empty needle sits at each end, as it does in the host: `s.index_of("")`
+is `Some(0)` and `s.last_index_of("")` is `Some(s.len())`.
 
 ### Slicing: `substring` refuses, it does not correct
 

@@ -321,6 +321,49 @@ impl str {
 			None
 		}
 	}
+
+	/// The host's `indexOf` / `lastIndexOf`, which report absence as `-1`.
+	/// Internal and opaque, exactly like `fs`'s `raw_read`: `-1` is a sentinel
+	/// index — arithmetic on it is silently wrong, and `substring` would refuse
+	/// it one call later — so nothing outside this module sees the raw form.
+	[extern(method, "indexOf")]
+	external fun raw_index_of(self, needle: str): i32;
+
+	[extern(method, "lastIndexOf")]
+	external fun raw_last_index_of(self, needle: str): i32;
+
+	/// The index of the FIRST occurrence of `needle`, or `None` when the text
+	/// does not contain it — `contains` tests, this one locates. It is the
+	/// missing half of the `substring` pair: `substring` needs bounds and until
+	/// now nothing computed them, so text was taken apart with `split` and
+	/// reassembled.
+	///
+	/// Absence is `None`, never `-1`. That is the whole reason this is not just
+	/// the host method renamed: `-1` is an index the type system cannot tell
+	/// from a real one, and `substring` — which refuses a negative bound rather
+	/// than clamping it — would report the mistake one call later, at the wrong
+	/// place. An empty needle is at `0`, as everywhere else.
+	fun index_of(self, needle: str): Option<i32> {
+		let at = self.raw_index_of(needle);
+		if at < 0 {
+			None
+		} else {
+			Some(at)
+		}
+	}
+
+	/// The index of the LAST occurrence of `needle`, or `None` when the text
+	/// does not contain it — `index_of` read from the other end, for cutting at
+	/// the final separator (a file extension, the last path segment). An empty
+	/// needle is at `len()`, which is where the host puts it.
+	fun last_index_of(self, needle: str): Option<i32> {
+		let at = self.raw_last_index_of(needle);
+		if at < 0 {
+			None
+		} else {
+			Some(at)
+		}
+	}
 }
 
 // `List`'s `Option`-returning methods live here (not `list.vl`) so the
