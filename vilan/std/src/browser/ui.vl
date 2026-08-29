@@ -244,16 +244,18 @@ impl View {
 
 	/// Two-way bind an `<input>`'s value to a signal: the input shows the
 	/// signal, and typing writes it back.
+	///
+	/// The listener reaches NO element (`proposal/lifetimes.md` §5, V3), which
+	/// takes both halves of `write_back_value`'s note: the typed text comes off
+	/// the EVENT, and the listener is created in a scope that never held an
+	/// element. What survives an unmount is then element → listener → signal,
+	/// with nothing pointing back.
 	fun bind_value(self, signal: Signal<str>): View {
 		let element = self.element;
 		signal.effect(|value| {
 			element.set_value(value);
 		});
-		// The write-back is a boundary dispatch too: each input event's
-		// write settles in its own turn.
-		element.on("input", || turn(FlushPolicy::AtSuspension, || {
-			signal.set(element.value());
-		}));
+		write_back_value(self.element, signal);
 		self
 	}
 
@@ -271,9 +273,7 @@ impl View {
 				element.set_value(value);
 			}
 		});
-		element.on("input", || turn(FlushPolicy::AtSuspension, || {
-			draft.push(element.value());
-		}));
+		write_back_draft(self.element, draft);
 		self
 	}
 
@@ -518,6 +518,39 @@ impl View {
 		});
 		self
 	}
+}
+
+// === The input write-back listeners (proposal/lifetimes.md §5, V3) ==========
+//
+// These exist as FUNCTIONS OF THEIR OWN, and that is the whole fix. A closure
+// captures its enclosing SCOPE, not the names it happens to mention (§4's
+// capture rule), and one JS scope is allocated per invocation — so a listener
+// written inline in `bind_value` would reach the `element` its sibling effect
+// closure needs, however carefully the listener's own body avoids naming it.
+// Element → listener → element is the one cycle that straddles the
+// language/host boundary, where no vilan-side disposal can see both halves, so
+// it has to be absent by CONSTRUCTION.
+//
+// Born here, a listener's scope chain holds the signal (or the draft) and
+// nothing else: the element is a plain parameter no closure reads, and the
+// typed text comes off the event (`Event::target_value`). After an unmount the
+// element still reaches the signal — a dead end, since the effect that pointed
+// back was disposed with the boundary.
+
+/// The write-back half of `bind_value`. Each input event's write is a boundary
+/// dispatch, so it settles in its own turn.
+fun write_back_value(element: Element, signal: Signal<str>) {
+	element.on_event("input", |event| turn(FlushPolicy::AtSuspension, || {
+		signal.set(event.target_value());
+	}));
+}
+
+/// The write-back half of `bind_draft`: USER input pushes (locally first, then
+/// the draft's commit).
+fun write_back_draft(element: Element, draft: Draft<str>) {
+	element.on_event("input", |event| turn(FlushPolicy::AtSuspension, || {
+		draft.push(event.target_value());
+	}));
 }
 
 /// True while a route chunk is in flight (proposal/bundle-splitting.md §2) —

@@ -141,4 +141,16 @@ impl Event {
 	/// The key for a keyboard event (`event.key`): `"Enter"`, `"Escape"`, `"a"`, ….
 	[extern(get, "key")]
 	external fun key(self): str;
+
+	/// The value of the element the event was dispatched to
+	/// (`event.target.value`) — what an `<input>` holds right now, read from
+	/// the EVENT instead of from a captured element.
+	///
+	/// That is the whole point (`proposal/lifetimes.md` §5, V3): a listener that
+	/// reaches for its own element closes an element ↔ listener cycle that
+	/// straddles the language/host boundary, where no vilan-side scheme can see
+	/// both halves. `bind_value`/`bind_draft` read the value through here and
+	/// capture no element at all.
+	[extern(get, "target.value")]
+	external fun target_value(self): str;
 }

@@ -460,6 +460,8 @@ call it directly to build your own list-rendering primitive.
   and let the owner handle it.
 - Disposal stops *future* deliveries. A watcher already queued in the
   currently-settling turn may fire one final time.
-- Derived signals (`map`/`combine`) live as long as their sources, by
-  design. They don't need owners, and they don't leak into disposed
-  subtrees.
+- Derived signals (`map`/`combine`/`flatten`) take the ambient owner when
+  there is one, so a derivation built inside a view dies with the view.
+  Built where no owner is ambient — module level, the top of `main` — it
+  lives as long as its source, which is what a module-level
+  `current_path().map(parse)` is for. Either way you never hold a handle.
