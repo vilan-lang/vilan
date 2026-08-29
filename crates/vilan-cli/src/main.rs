@@ -70,7 +70,11 @@ enum Command {
         /// The emitter backend: `js` (the only backend today).
         #[arg(long)]
         backend: Option<String>,
-        /// Also emit `.parse.out` / `.analyze.out` / `.callgraph.out` debug dumps.
+        /// Also emit debug dumps beside the source, one per pipeline stage:
+        /// `.parse-raw.out` (the tree the parser produced), `.parse.out` (the
+        /// same tree after the `css` / element / lift desugars — what analysis
+        /// receives), `.analyze.out` (the analyzed program) and
+        /// `.callgraph.out` (the call graph the post-analysis passes shared).
         #[arg(short, long)]
         debug: bool,
         /// Rebuild whenever a watched `.vl` source file changes (Ctrl-C to stop).
@@ -95,7 +99,11 @@ enum Command {
         /// The emitter backend: `js` (the only backend today).
         #[arg(long)]
         backend: Option<String>,
-        /// Also emit `.parse.out` / `.analyze.out` / `.callgraph.out` debug dumps.
+        /// Also emit debug dumps beside the source, one per pipeline stage:
+        /// `.parse-raw.out` (the tree the parser produced), `.parse.out` (the
+        /// same tree after the `css` / element / lift desugars — what analysis
+        /// receives), `.analyze.out` (the analyzed program) and
+        /// `.callgraph.out` (the call graph the post-analysis passes shared).
         #[arg(short, long)]
         debug: bool,
         /// Re-check whenever a watched `.vl` source file changes (Ctrl-C to stop).
@@ -4019,6 +4027,22 @@ fn compile_to_js(
 
     if let Some(root) = root {
         if emit_debug {
+            // Two dumps, and they BRACKET the desugars hooked at every parse
+            // entry — `css`, `elements`, `lift` (backlog E99). `parse-raw.out`
+            // is the tree the frontend produced; `parse.out` is the tree
+            // analysis receives, which is the rewritten one and always was, so
+            // a node in one and not the other is something a desugar added or
+            // removed — the split needed to tell a parser bug from a desugar's.
+            //
+            // The raw tree comes from a fresh parse of the entry's own text
+            // rather than from the branch above, so a clean-parse cache HIT
+            // dumps one too: the cache is content-keyed, so this parse
+            // reproduces exactly the tree the cached entry was built from. It
+            // is one extra parse, paid only under `-d`.
+            let (raw_root, _) = vilan_core::parsing::parse(source_ref);
+            if let Some(raw_root) = raw_root {
+                write_debug(file, "parse-raw.out", &format!("{raw_root:#?}"));
+            }
             write_debug(file, "parse.out", &format!("{root:#?}"));
         }
 

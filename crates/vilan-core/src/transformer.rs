@@ -2439,7 +2439,7 @@ impl<'src> Transformer<'src> {
         body: &mut Vec<js::Node<'src>>,
     ) {
         match value {
-            js::Node::Return(_) | js::Node::Break | js::Node::Continue => body.push(value),
+            value if value.is_divergent() => body.push(value),
             value => body.push(js::Node::Assignment(
                 Box::new(js::Node::Local(result_name.to_string())),
                 Box::new(value),
@@ -3704,7 +3704,13 @@ impl<'src> Transformer<'src> {
                 }
                 let value = self.walk_entity(closure.return_, &mut body);
                 if let Some(value) = value {
-                    body.push(js::Node::Return(Box::new(value)));
+                    // Same seam as a function body's tail (B152): a divergent
+                    // tail is the statement, never a value to `return`.
+                    if value.is_divergent() {
+                        body.push(value);
+                    } else {
+                        body.push(js::Node::Return(Box::new(value)));
+                    }
                 }
                 js::Node::Closure(js::Closure {
                     parameters,
@@ -4468,7 +4474,18 @@ impl<'src> Transformer<'src> {
                         }
                     }
                 }
-                return self.walk_entity(body.1, block);
+                // B152: a block whose tail LEAVES (`{ ret 1 }`, `{ jump break }`)
+                // has no value — emit the statement here, where it is legal, and
+                // report no value. Handing the `return` back would put it in
+                // whatever value position the block sits in (`const y = return
+                // 1;`, `return return 1;`), which does not parse. Everything
+                // after it in that position is unreachable anyway.
+                let tail = self.walk_entity(body.1, block)?;
+                if tail.is_divergent() {
+                    block.push(tail);
+                    return None;
+                }
+                return Some(tail);
             }
             Expr::For(condition, body) => {
                 // Every loop compiles to a `while`; an absent condition is an
@@ -6199,6 +6216,10 @@ impl<'src> Transformer<'src> {
             if let Some(return_expr) = self.walk_entity(function.body.1, &mut body) {
                 match return_expr {
                     js::Node::Void => {}
+                    // A tail that already left the function — `fun a(): i32 {
+                    // ret 1 }` — is the statement, not a value to return
+                    // (B152: wrapping it emitted `return return 1;`).
+                    node if node.is_divergent() => body.push(node),
                     _ => {
                         body.push(js::Node::Return(Box::new(return_expr)));
                     }
@@ -6995,11 +7016,17 @@ impl<'src> Transformer<'src> {
         } else {
             let mut body = self.walk_list(statements);
             if has_value {
-                let value = self.walk_entity(tail, &mut body).unwrap_or(js::Node::Null);
+                let value = self.walk_entity(tail, &mut body);
+                // The result temp is named whether or not the tail yields one, so
+                // the sibling arms and every later temp keep their names.
                 let name = result_name
                     .get_or_insert_with(|| self.ng.next_name())
                     .clone();
-                self.push_result_or_divergence(&name, value, &mut body);
+                // A tail that emitted itself and reported no value (a block that
+                // LEAVES — B152) has nothing to assign; the arm already diverged.
+                if let Some(value) = value {
+                    self.push_result_or_divergence(&name, value, &mut body);
+                }
             }
             body
         }
@@ -7018,6 +7045,13 @@ impl<'src> Transformer<'src> {
             return;
         };
         if matches!(node, js::Node::Void) {
+            return;
+        }
+        // A tail that already leaves the scope (`ret` / `jump`) is emitted as the
+        // statement it is under EVERY disposition — returning or assigning one
+        // is B152's unparseable `return return 1;` / `t = return 1;`.
+        if node.is_divergent() {
+            out.push(node);
             return;
         }
         match disposition {
@@ -8723,6 +8757,27 @@ pub mod js {
         // panic mid-acquisition never drops an unacquired value.
         Try(Vec<Self>, Vec<Self>),
         Void,
+    }
+
+    impl Node<'_> {
+        /// Whether this node is a JS *statement* that leaves its enclosing block
+        /// rather than an expression with a value — `return` / `break` /
+        /// `continue`. vilan's `ret` and `jump` are expressions (of the never
+        /// type) that may sit in a tail position, so a walk can hand one of these
+        /// back where a value was expected; every seam that would wrap or assign
+        /// a tail must emit a divergent node AS-IS instead. Wrapping one produced
+        /// B152's `return return 1;` — a bundle that does not parse.
+        ///
+        /// The set is every variant the emitter renders as a bare statement:
+        /// `Throw` is in it for the same reason, though no walk hands one back
+        /// today (the only `Throw` is built directly into a generated closure
+        /// body) — a future one must not be wrapped either.
+        pub fn is_divergent(&self) -> bool {
+            matches!(
+                self,
+                Self::Return(_) | Self::Break | Self::Continue | Self::Throw(_)
+            )
+        }
     }
 
     #[derive(Clone, Debug)]

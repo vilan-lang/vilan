@@ -61,8 +61,14 @@ A *dependency* that declares hooks gets a `note:` line and no execution.
   overrides the package's `target` (`--target` is an accepted alias).
   `none` checks against no platform's layers, the strictest reading.
 - `--watch`: rebuild whenever a watched source changes (Ctrl-C stops).
-- `-d, --debug`: also emit `.parse.out` / `.analyze.out` /
-  `.callgraph.out` dumps, for poking at the compiler's view of your code.
+- `-d, --debug`: also emit a dump per pipeline stage beside the source, for
+  poking at the compiler's view of your code. `.parse-raw.out` is the tree
+  the parser produced; `.parse.out` is that tree after the desugars hooked
+  at every parse entry (the `css` block, element syntax, `?` lifting) — the
+  one analysis actually receives, so the pair brackets the desugars and a
+  node in one and not the other is something they added or removed.
+  `.analyze.out` is the analyzed program and `.callgraph.out` the call
+  graph its post-analysis passes shared.
 - `--print-chunks`: report the route-chunk plan — what a `split = true`
   browser leg would load lazily per route, with function counts and a byte
   estimate, plus a `verdict:` line measuring what splitting would actually

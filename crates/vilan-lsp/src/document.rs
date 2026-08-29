@@ -10331,10 +10331,30 @@ mod leak_measurement {
     /// both windows, while anything that *accumulates* contributes more to the
     /// second. RSS is printed beside it and asserted on nowhere, for the reason
     /// `leak_tally`'s module doc gives.
+    ///
+    /// M12: it REFUSES when it measured nothing. Both corpora live in sibling
+    /// checkouts behind environment variables nothing in this tree sets, and the
+    /// old body `continue`d past each with a skip line — so the default outcome
+    /// of running the soak was a PASS in milliseconds with zero assertions
+    /// against its own "thousands of analyses" charter, and "I ran the soak" and
+    /// "the soak ran" were the same green. Nothing was left unchecked by that
+    /// (the synthetic fixtures above hold the same invariant on every run), so
+    /// the fix is not to weaken the gate but to stop the soak claiming a verdict
+    /// it does not have: invoking it — and it is `#[ignore]`d, so invoking it is
+    /// always deliberate — with no corpus present is a mistake in the invocation
+    /// and says so, naming the variables to set.
     #[test]
     #[ignore = "the leak soak: thousands of analyses per corpus, run deliberately (proposal/leak-soak.md §5)"]
     fn leak_soak_corpus_plateaus() {
-        for &(corpus, variable, relative) in SOAK_CORPORA {
+        soak_corpora(SOAK_CORPORA);
+    }
+
+    /// The soak's body, over whatever corpus table it is given, so the
+    /// no-corpus refusal below is reachable from a test that costs microseconds
+    /// instead of hours.
+    fn soak_corpora(corpora: &[(&str, &str, &str)]) {
+        let mut measured_corpora = 0usize;
+        for &(corpus, variable, relative) in corpora {
             let Some(root) = std::env::var_os(variable).map(PathBuf::from) else {
                 println!("LEAK-SKIP {corpus}: {variable} is not set");
                 continue;
@@ -10346,6 +10366,7 @@ mod leak_measurement {
             };
             let lines = base.lines().count();
             let source_bytes = moving_edit(&base, 0).len();
+            measured_corpora += 1;
 
             for driver in [Driver::Inline, Driver::PerAnalysisThread] {
                 let window = match driver {
@@ -10425,6 +10446,96 @@ mod leak_measurement {
                 );
             }
         }
+
+        if let Some(refusal) = soak_refusal(corpora, measured_corpora) {
+            panic!("{refusal}");
+        }
+    }
+
+    /// The soak's verdict on its own inputs (M12): `Some(message)` when it
+    /// measured NOTHING, `None` when at least one corpus ran. A partial run is
+    /// deliberately allowed — one corpus present is still thousands of analyses
+    /// of a real file, and the plateau claim is per corpus — so this is the only
+    /// case where the soak has no finding at all to report.
+    ///
+    /// The message names every variable, and where each one points, because the
+    /// failure is in the INVOCATION and the reader is the person who just typed
+    /// it: what they need is the export they forgot, not a diagnosis.
+    fn soak_refusal(corpora: &[(&str, &str, &str)], measured_corpora: usize) -> Option<String> {
+        if measured_corpora > 0 {
+            return None;
+        }
+        let addresses = corpora
+            .iter()
+            .map(|(corpus, variable, relative)| {
+                format!("{variable}=<checkout> for `{corpus}` ({relative})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "the leak soak measured NO corpus, so it asserted nothing — it did not pass, it did \
+             not run. Every corpus lives in a sibling checkout addressed by an environment \
+             variable, and none was set or readable: set {addresses}. (The synthetic fixtures in \
+             this module hold the same plateau invariant on every suite run; this test exists to \
+             hold it over thousands of analyses of a real file, which needs the real file.)"
+        ))
+    }
+
+    /// M12's pin on the verdict: a soak that measured nothing refuses, and the
+    /// refusal names every variable the invoker was missing — the whole point,
+    /// since a message that only said "no corpus" would leave them where the
+    /// silent skip lines already left them. One corpus measured is enough, so
+    /// this never turns a partial soak red.
+    #[test]
+    fn a_soak_that_measured_no_corpus_refuses_and_names_its_variables() {
+        let refusal =
+            soak_refusal(SOAK_CORPORA, 0).expect("measuring no corpus at all must refuse");
+        for &(_, variable, _) in SOAK_CORPORA {
+            assert!(
+                refusal.contains(variable),
+                "the refusal must name {variable}, the export the invoker is missing: {refusal}"
+            );
+        }
+        assert!(
+            soak_refusal(SOAK_CORPORA, 1).is_none(),
+            "one corpus measured is a real soak — a partial run must not be refused"
+        );
+        assert!(
+            soak_refusal(SOAK_CORPORA, SOAK_CORPORA.len()).is_none(),
+            "every corpus measured must not be refused"
+        );
+    }
+
+    /// …and the pin that the soak BODY takes that verdict, which the pure one
+    /// above cannot say. Driven through a corpus addressed by a variable nothing
+    /// sets, so the body skips it exactly as it skipped the real two and reaches
+    /// the refusal without measuring anything: microseconds, where the soak
+    /// proper is hours. Without this, `soak_refusal` could be perfect and never
+    /// called — which is the shape of the defect M12 filed.
+    #[test]
+    fn the_soak_body_refuses_when_every_corpus_is_absent() {
+        const ABSENT: &[(&str, &str, &str)] = &[(
+            "absent_for_the_pin",
+            "VILAN_PERF_ABSENT_CORPUS_FOR_THE_M12_PIN",
+            "src/main.vl",
+        )];
+        assert!(
+            std::env::var_os(ABSENT[0].1).is_none(),
+            "{} must be unset for this pin to mean anything",
+            ABSENT[0].1
+        );
+        let outcome = std::panic::catch_unwind(|| soak_corpora(ABSENT));
+        let payload = outcome
+            .expect_err("a soak over an absent corpus measured nothing and must refuse, not pass");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            message.contains(ABSENT[0].1) && message.contains("measured NO corpus"),
+            "the body's refusal must be the one `soak_refusal` composed: {message}"
+        );
     }
 
     /// The gate's pin on the soak harness: a handful of analyses through BOTH
