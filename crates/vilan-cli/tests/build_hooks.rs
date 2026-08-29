@@ -14,6 +14,10 @@
 //!   get to run them — and now says so, once per build, naming itself. The
 //!   opt-in (`build-hooks = true`) parses and is refused too: the point of the
 //!   slice is that the syntax is fixed before anything can cross it.
+//! * **The watch rounds §9 owed** (G10). The declaration is read by two
+//!   consumers — the freshness stamp and `--watch`'s wake-up set — and they
+//!   have to be the same reading. These pins drive a real `--watch` session and
+//!   observe rounds, which no `build`-at-a-time pin above can.
 //!
 //! Each test writes a throwaway project tree and drives the built `vilan`
 //! binary. The fixtures are per-platform where they have to be: a hook runs
@@ -21,8 +25,11 @@
 //! never assumed.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+mod support;
 
 /// A fresh temp directory for one test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
@@ -793,5 +800,160 @@ fn check_says_nothing_about_dependency_hooks() {
     let text = combined(&output);
     assert!(output.status.success(), "{text}");
     assert!(!text.contains("declares build hooks"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Watch rounds: the declaration is the wake-up set too (§9's owed pin, G10) ──
+//
+// The defect these close: `inputs` reached the freshness stamp and nothing
+// else, so under `vilan build . --watch` an edit to a declared input produced
+// ZERO rounds — the loop polled `.vl` sources only — and the hook re-ran only
+// when some unrelated `.vl` save happened to wake the session. The stamp was
+// right the whole time; the wake-up set was the half that had not been told.
+//
+// Two observables, because a round and a hook run are different events: the
+// `[build] run` command counts ROUNDS (it declares nothing, so it runs on every
+// one), and the declared hook counts its own runs (a round whose inputs are
+// untouched finds it fresh and skips it).
+
+/// A spawned `--watch` session, killed and reaped when it leaves scope — on the
+/// panic path too, so a failing pin never leaves a polling compiler behind. It
+/// kills only the child this harness spawned, by handle.
+struct Watcher(Child);
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        support::kill_watcher(&mut self.0);
+    }
+}
+
+/// A manifest whose `[build] run` counts rounds and whose one declared hook
+/// (`inputs` given as the TOML value to write) counts its own runs.
+fn watch_manifest(inputs: &str) -> String {
+    format!(
+        "[package]\nname = \"app\"\n\n[build]\nrun = [{}]\n\n[[build.hook]]\nname = \"gen\"\n\
+         run = [{}, {}]\ninputs = {inputs}\noutputs = \"generated.txt\"\n",
+        toml_string(&append("rounds.txt")),
+        toml_string(&append("ran.txt")),
+        toml_string(&write_line("generated.txt", "generated"))
+    )
+}
+
+/// Starts `vilan build --watch` over `dir`. `build`, not `run`: the pins are
+/// about the wake-up set, and a build round spawns no program, binds no port
+/// and leaves no `node` grandchild to reap.
+fn spawn_watch(dir: &Path) -> Watcher {
+    Watcher(
+        Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["build", "--watch", dir.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vilan build --watch"),
+    )
+}
+
+/// Waits (bounded) for `condition`, returning how long it took. The bound is a
+/// LIVENESS bound, never a performance claim: how long a compile takes on the
+/// machine running the suite is not what these pins are about.
+fn wait_for(label: &str, condition: impl Fn() -> bool) -> Duration {
+    let started = Instant::now();
+    while started.elapsed() < support::WATCH_LIVENESS {
+        if condition() {
+            return started.elapsed();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out waiting for {label}");
+}
+
+#[test]
+fn an_edited_hook_input_starts_a_watch_round_and_reruns_the_hook() {
+    // G10's headline case, as it was measured: edit a file the manifest names
+    // in `inputs` and the session must round. Before the fix this waited out
+    // its whole bound — the edit reached the stamp's predicate, but no round
+    // ever asked the predicate anything.
+    let dir = temp_project("watch_input");
+    write(&dir, "vilan.toml", &watch_manifest("\"input.txt\""));
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+    let _watcher = spawn_watch(&dir);
+
+    wait_for("the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for("the first round's hook", || runs(&dir, "ran.txt") >= 1);
+
+    write(&dir, "input.txt", "two\n");
+    wait_for("the round the edited input starts", || {
+        runs(&dir, "rounds.txt") >= 2
+    });
+    wait_for("the hook the edited input re-runs", || {
+        runs(&dir, "ran.txt") >= 2
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_undeclared_file_starts_no_watch_round() {
+    // The other half, and the one that keeps the fix honest: the wake-up set is
+    // the DECLARED inputs, not the world. A watcher that woke on every file
+    // would pass the pin above and re-open the invariant only `.vl` tracking
+    // has protected so far — a build that can trigger its own rebuild.
+    let dir = temp_project("watch_undeclared");
+    write(&dir, "vilan.toml", &watch_manifest("\"input.txt\""));
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+    write(&dir, "notes.txt", "not a declared input\n");
+    let _watcher = spawn_watch(&dir);
+
+    let first_round = wait_for("the first round", || runs(&dir, "rounds.txt") >= 1);
+
+    // An undeclared, non-`.vl` file moves. Nothing may happen — and "nothing"
+    // is only observable by waiting, so the window is this machine's own round
+    // scaled up (E32's rule), not a guessed number.
+    write(&dir, "notes.txt", "still not a declared input\n");
+    let quiet = Instant::now();
+    let window = support::round_budget(first_round);
+    while quiet.elapsed() < window {
+        assert_eq!(
+            runs(&dir, "rounds.txt"),
+            1,
+            "an undeclared file must not start a round"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // And the session was alive the whole time, not silently dead — otherwise
+    // the assertion above is vacuous and would survive any regression.
+    write(&dir, "input.txt", "two\n");
+    wait_for("the round a declared input still starts", || {
+        runs(&dir, "rounds.txt") >= 2
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
+    // A declared DIRECTORY means its tree — the reading the stamp already has
+    // (`inputs = ["icons"]` digests every file under it), now the watcher's
+    // reading too. Watching the directory entry alone would be a different,
+    // weaker set: its own mtime moves for an added entry but not for an edit
+    // inside it.
+    let dir = temp_project("watch_directory");
+    write(&dir, "vilan.toml", &watch_manifest("[\"icons\"]"));
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "icons/check.svg", "<svg/>\n");
+    let _watcher = spawn_watch(&dir);
+
+    wait_for("the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for("the first round's hook", || runs(&dir, "ran.txt") >= 1);
+
+    write(&dir, "icons/close.svg", "<svg/>\n");
+    wait_for("the round the new icon starts", || {
+        runs(&dir, "rounds.txt") >= 2
+    });
+    wait_for("the hook the new icon re-runs", || {
+        runs(&dir, "ran.txt") >= 2
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }
