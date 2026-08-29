@@ -22,6 +22,13 @@ than a band: ..."). Two entries tripped this in one cycle before it was
 written down.
 -->
 
+## Unreleased
+
+<!-- family: tooling -->
+**`fun a(): i32 { ret 1 }` emitted `return return 1;` — a bundle that does not parse.** `ret` is an expression of the never type, so it may sit in a tail position; JS `return` is a statement. Every seam that consumed a walked tail wrapped or assigned it blindly, so a tail that had already LEFT was wrapped a second time — the function body's tail (`return return 1;`, and `return return;` for the bare void form), a value-position block bound by a `let` (`const y = return 1;`), and, through the restructured resource path, the `try`/`finally` tail under both the return and the assign dispositions. Filed as a miscompile and classified tooling on the §7.2 test: the artifact never runs, because `node` refuses the file — the failure is loud at the bundle's first parse, not a program quietly computing the wrong answer. The fix names the category the emitter always had and never said: a `Node` is **divergent** when the emitter renders it as a bare statement (`return` / `break` / `continue` / `throw`), and a divergent node is emitted AS-IS at every seam instead of being wrapped, assigned, or returned — which is what the if/match arm seam had been doing alone, in an inline `matches!` that is now the shared predicate. The leak itself is closed one level down: a block whose tail leaves reports NO value and emits the statement into the enclosing block, so `{ ret 1 }` composes to any depth and in any value position rather than handing a `return` to whatever expression slot the block sits in. `ret` in an if-tail and in a match arm were already correct — they went through the arm seam's divergence check — and are pinned so they stay that way. Every corpus golden is byte-identical: the broken shapes could not have been in one, since they do not parse. (backlog B152)
+
+---
+
 ## v0.38.0 — 2026-08-28
 
 <!-- family: breaking -->
