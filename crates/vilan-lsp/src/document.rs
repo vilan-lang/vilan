@@ -7528,6 +7528,121 @@ pub(crate) mod tests {
         );
     }
 
+    // E105: the shape none of the 23 S5 pins covered — the block whose `}` has
+    // not been typed yet. There is no `Node::Css` to read (the atom declines a
+    // region with no end), so the parse-only question returned `None` and
+    // completion fell through to ordinary expression ground, offering `fun`,
+    // `for … in { }` and every name in scope inside what the author is plainly
+    // writing as CSS. The live lexis answers it instead.
+    #[test]
+    fn an_unterminated_css_block_is_still_css_position() {
+        // Nothing closes: no `}` for the block and none for `main` either.
+        let labels = completions_at_marker(
+            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisp~\n"),
+            '~',
+        );
+        assert!(
+            labels.contains(&"display".to_string())
+                && labels.contains(&"flex-direction".to_string()),
+            "the property vocabulary in an unterminated block: {labels:?}"
+        );
+        for wrong in ["fun", "for … in { }", "struct", "card", "space", "print"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` is ordinary scope, not CSS: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unterminated_css_block_keeps_its_four_positions() {
+        // The dotted head, the value, and the custom property answer the same
+        // as they do in a closed block — the fallback hands the position walk a
+        // body start and changes nothing else about the four answers.
+        let dotted = completions_at_marker(
+            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\t.~\n"),
+            '~',
+        );
+        assert!(
+            dotted.contains(&"hover".to_string()) && !dotted.contains(&"display".to_string()),
+            "the combinators: {dotted:?}"
+        );
+        let value = completions_at_marker(
+            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay: ~\n"),
+            '~',
+        );
+        assert!(value.is_empty(), "value position is empty: {value:?}");
+        let custom = completions_at_marker(
+            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\t--~\n"),
+            '~',
+        );
+        assert!(custom.is_empty(), "no custom properties: {custom:?}");
+    }
+
+    #[test]
+    fn an_unterminated_nested_rule_is_still_css_position() {
+        // A nested rule's body is a body here too: the `.` that commits the
+        // item to a condition is what makes the `{` after it a body rather than
+        // a hole, which is the grammar's own marker.
+        let labels = completions_at_marker(
+            &format!(
+                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\t.md {{\n\t\t\tpad~\n"
+            ),
+            '~',
+        );
+        assert!(
+            labels.contains(&"padding".to_string()) && labels.contains(&"padding-left".to_string()),
+            "the property vocabulary inside an unterminated rule: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_hole_is_not_css_position() {
+        // The negative that keeps the fallback honest: a `{…}` hole is an
+        // ordinary expression, and an unclosed one does not become CSS just
+        // because a `css` block encloses it.
+        let labels = completions_at_marker(
+            &format!(
+                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet ink = Color::gray(900);\n\tlet card = css {{\n\t\tcolor: {{i~\n"
+            ),
+            '~',
+        );
+        assert!(
+            !labels.contains(&"display".to_string())
+                && !labels.contains(&"flex-direction".to_string()),
+            "a hole is not the property vocabulary: {labels:?}"
+        );
+        // Ordinary expression ground, which is what the hole always was. (The
+        // names the enclosing `let` would bind are not among them, because with
+        // the statement unterminated there is no analyzed binding to offer —
+        // that is the mid-edit analysis, not this classification.)
+        assert!(
+            labels.contains(&"Color".to_string()) && labels.contains(&"fun".to_string()),
+            "the expression vocabulary: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_closed_css_block_does_not_leak_past_its_brace() {
+        // The other negative: the fallback must not reach a block the author
+        // finished. After the closing `}` the cursor is ordinary ground again,
+        // even with the enclosing function still unterminated.
+        let labels = completions_at_marker(
+            &format!(
+                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay: flex;\n\t}};\n\tlet other = ca~\n"
+            ),
+            '~',
+        );
+        assert!(
+            labels.contains(&"card".to_string()),
+            "the binding in scope: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"display".to_string()),
+            "not the property vocabulary: {labels:?}"
+        );
+    }
+
     // The negative: a `.` outside any block is untouched.
     #[test]
     fn a_dot_outside_a_css_block_still_completes_normally() {
