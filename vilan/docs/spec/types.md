@@ -47,6 +47,14 @@ variant is a constructor (with payload types) and a static member of the
 enum. An `external struct` declares a host type: no fields, its surface
 defined entirely by externs in impls.
 
+An extern's `[extern(…)]` attribute takes one further trailing flag,
+`retains`, declaring that the host keeps an argument past the call rather
+than reading it only until the call returns; it composes with every
+binding form. It is the one part of an extern's contract the signature
+cannot express, and omitting it where it applies is a use-after-free the
+compiler cannot warn about — §6.8's
+[Externs and retention](memory.md#externs-and-retention) defines it.
+
 ### Enum representation
 
 An enum has one of two runtime representations, and **which one is a

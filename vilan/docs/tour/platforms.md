@@ -133,6 +133,16 @@ The four binding forms:
 | `[extern(method, "name")]` | a method on a host object |
 | `[extern(get, "prop")]` / `[extern(set, "prop")]` | a property read / write |
 
+Any of the four takes a trailing `retains` —
+`[extern(method, "addEventListener", retains)]` — and you need it whenever
+the host *keeps* what you hand it instead of reading it only until the
+call returns: an event listener, a queued callback, a stashed value.
+Without the flag the compiler assumes the host is done at the call and may
+destroy the argument's binding at its last use, which the host then reads
+after the fact. The [memory
+chapter](../spec/memory.md#externs-and-retention) states what the flag
+promises.
+
 Keep externs in platform-specific packages (they are host-specific by
 nature). When a binding proves itself, consider promoting it into std
 rather than copying it between apps.
