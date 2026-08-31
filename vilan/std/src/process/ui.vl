@@ -7,11 +7,18 @@
 // subscriptions, no owner survives the request.
 //
 // READ-ONCE BINDINGS: `bind_text`/`bind_attr`/`bind_class`/`bind_value` embed
-// the signal's value AT RENDER TIME — no subscription is created (the value
+// the source's value AT RENDER TIME — no subscription is created (the value
 // served is the value the data had). `bind_each` renders the current list;
 // `when`/`swap` render the taken branch. Event and draft binders ACCEPT AND
 // DISCARD: a server-rendered `<button>` is just a button — its handler is
 // client business.
+//
+// The read-only binders take a `Source<T>` bound rather than a concrete
+// `Signal<T>` (A33), in LOCKSTEP with the browser twin — the same component
+// source compiles through both layers, so a widening on one side that the other
+// lacks would make a custom-source component client-only. `bind_value` and
+// `bind_draft` stay concrete on both sides for the same reason: their browser
+// halves write back.
 //
 // OMITTED (proposal/ssr.md §2, §6a): `mount`/`mount_root` do not exist here — a
 // component that mounts is a client entry, not a renderable view; the natural
@@ -23,7 +30,7 @@
 
 import pkg::compare::PartialEq;
 import pkg::option::Option::{ None, self };
-import pkg::reactive::{ Draft, Owner, Signal, owner_scope, run_with_owner, turn_scope };
+import pkg::reactive::{ Draft, Owner, Signal, Source, owner_scope, run_with_owner, turn_scope };
 import pkg::shared::Shared;
 import pkg::style::Style;
 
@@ -116,7 +123,7 @@ impl View {
 	/// A CSS custom property, read once and folded into the `style` attribute —
 	/// the server end of `width(Length::var("--w"))`. (No subscription: the
 	/// value at render time is the value served.)
-	fun style_var(self, name: str, source: Signal<str>): View {
+	fun style_var<S: Source<str>>(self, name: str, source: S): View {
 		mut current = "";
 		for attribute in self.attributes.read() {
 			if attribute.name == "style" {
@@ -178,33 +185,34 @@ impl View {
 
 	/// Reactive text content, READ ONCE: embeds `source`'s current value as
 	/// text. No subscription — nothing to notify at serve time.
-	fun bind_text(self, source: Signal<str>): View {
+	fun bind_text<S: Source<str>>(self, source: S): View {
 		self.text.write() = source.get();
 		self.children.write() = [];
 		self
 	}
 
 	/// Reactive CSS class, read once.
-	fun bind_class(self, source: Signal<str>): View {
+	fun bind_class<S: Source<str>>(self, source: S): View {
 		set_attribute(self.attributes, "class", source.get());
 		self
 	}
 
 	/// Reactive `Style`, read once: the style the signal holds at render time
 	/// is the one served.
-	fun bind_styled(self, source: Signal<Style>): View {
+	fun bind_styled<S: Source<Style>>(self, source: S): View {
 		set_attribute(self.attributes, "class", source.get().class_list());
 		self
 	}
 
 	/// Reactive attribute, read once.
-	fun bind_attr(self, name: str, source: Signal<str>): View {
+	fun bind_attr<S: Source<str>>(self, name: str, source: S): View {
 		set_attribute(self.attributes, name, source.get());
 		self
 	}
 
 	/// A two-way input bind, server side: the input renders with its current
 	/// value. The write-back listener is client business — accepted and dropped.
+	/// Concrete `Signal`, matching the browser twin's write-back half (A33).
 	fun bind_value(self, signal: Signal<str>): View {
 		set_attribute(self.attributes, "value", signal.get());
 		self
@@ -225,9 +233,9 @@ impl View {
 	/// not establish any boundary. Nothing a row registers survives, so the owner
 	/// is discarded. (`List<T>` is annotated so `get`'s element type resolves —
 	/// the two-parameter-generic inference trap.)
-	fun bind_each<T: PartialEq, K: PartialEq>(
+	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
 		self,
-		source: Signal<List<T>>,
+		source: S,
 		key: sync |T| K,
 		build: (sync |T| View) context owner_scope,
 	): View {
@@ -242,7 +250,7 @@ impl View {
 	/// Conditional content: renders the body when `condition` is currently true,
 	/// nothing when false. Read once — no toggling survives the request. The body
 	/// runs under a throwaway owner, like `bind_each`'s rows.
-	fun when(self, condition: Signal<bool>, body: (sync || View) context owner_scope): View {
+	fun when<S: Source<bool>>(self, condition: S, body: (sync || View) context owner_scope): View {
 		if condition.get() {
 			let owner = Owner::new();
 			self.children.write().push(Child::Element(run_with_owner(owner, body)));
@@ -252,6 +260,8 @@ impl View {
 
 	/// The dynamic-subtree swap, server side: renders the branch for `source`'s
 	/// CURRENT value. Read once — there is no later change to follow.
+	/// Concrete `Signal`, in lockstep with the browser twin's `swap` — which is
+	/// blocked by the bare-parameter `Source<T>` bound gap, not by a write (A33).
 	fun swap<T: PartialEq>(
 		self,
 		source: Signal<T>,
@@ -265,7 +275,7 @@ impl View {
 
 	/// Show or hide on a condition, read once: a hidden element renders with the
 	/// `hidden` attribute (mirrors the DOM's `element.hidden`).
-	fun show(self, condition: Signal<bool>): View {
+	fun show<S: Source<bool>>(self, condition: S): View {
 		if !condition.get() {
 			set_attribute(self.attributes, "hidden", "");
 		}
@@ -276,6 +286,11 @@ impl View {
 /// Something that can fill a child position (proposal/element-syntax.md §5) —
 /// the type-directed half of `child`: the value's type carries the
 /// static-vs-tracked distinction; on this twin every arm reads once.
+///
+/// The tracked arm stays `Signal<str>` rather than `Source<str>` — DEFERRED
+/// with the browser twin's (A33): widening a trait ARM means a blanket impl
+/// (`impl S: Source<str> with Slot`), which is B158's machinery, not a bound on
+/// an ordinary generic parameter.
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
 trait Slot {
 	fun place(self, parent: View);
@@ -311,7 +326,9 @@ impl List<View> with Slot {
 	}
 }
 
-/// Something that can fill an attribute value (proposal/element-syntax.md §5).
+/// Something that can fill an attribute value (proposal/element-syntax.md §5) —
+/// what `<div name(value)>` desugars through (`.attr`, never `.bind_attr`).
+/// Widening the tracked arm past `Signal<str>` is deferred to B158 (see `Slot`).
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
 trait AttrValue {
 	fun apply(self, parent: View, name: str);

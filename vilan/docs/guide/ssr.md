@@ -139,7 +139,7 @@ server nodes, addresses them, or reconciles against them.
 
 The server render creates, serializes, and discards: no effects attach, no
 subscriptions survive the request. So the bindings **read once**: `bind_text`,
-`bind_attr`, `bind_each`, `when`, and `swap` embed the signal's value *at render
+`bind_attr`, `bind_each`, `when`, and `swap` embed the source's value *at render
 time*. That is the value served, and it is the value the client re-derives.
 
 The rule this implies: **build pure, bind reactive.** A component that computes

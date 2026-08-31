@@ -4140,3 +4140,86 @@ import std::print;
         "count = 0\ncount = 7\nlabel = sum 7\nadd -> 7\ndrift: {\"Contract\":\"the server reports a different service surface\"}\n",
     );
 }
+
+// --- A33: a trait bound over a BARE parameter, resolved in a generic body ----
+//
+// A33 widened `std::ui`'s read-only bindings from `Signal<T>` to a `Source<T>`
+// bound, and `View::swap` — read-only like every other, no write anywhere in
+// it — is the one site that could NOT come along. The gap the widening walked
+// into is narrow and exact:
+//
+//   * `S: Source<List<T>>` — the bound's argument CONSTRUCTED over the caller's
+//     own `T` — resolves fine inside a generic body. That is `bind_each`, and
+//     it shipped.
+//   * `S: Source<T>` — the bound's argument the BARE parameter — does not. The
+//     callee's `T` is inferred through the bound to the *impl's* own unbound
+//     parameter instead of to the caller's, so the callee's `T: PartialEq` is
+//     then checked against something that carries no bound and refused.
+//
+// `swap_split` calls `self.swap(gated, render)` from exactly such a body
+// (`gated: Signal<T>`, `T` its own parameter), so widening `swap` makes std
+// itself uncompilable — with an explicit `self.swap<T, Signal<T>>(..)` too, the
+// bound check being downstream of the argument. The value FLOWS correctly: drop
+// `T`'s bound entirely and the same program compiles and runs, which places
+// this in the bound CHECK rather than in inference.
+//
+// When this passes, `View::swap`, `View::swap_split` and `ui::chunk_preload`
+// widen together, keeping their generic-parameter ORDER — the split gate rebinds
+// their type arguments by position (`transformer.rs::rebind_by_position`).
+
+/// The gap, minimized out of `swap_split`. Un-ignore with the fix.
+#[test]
+#[ignore = "A33: a `Source<T>` bound whose argument is a BARE generic parameter \
+            resolves the callee's `T` to the impl's own unbound parameter inside \
+            a generic body, so the callee's `T: PartialEq` is refused. Blocks \
+            widening `std::ui::View::swap` (and `swap_split`/`chunk_preload`), \
+            the one read-only binding A33 had to hold."]
+fn a_bare_parameter_source_bound_resolves_inside_a_generic_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::reactive::{ Signal, Source };
+
+        fun consume<T: PartialEq, S: Source<T>>(source: S): T {
+            source.get()
+        }
+
+        fun wrapper<T: PartialEq>(value: T): T {
+            let cell: Signal<T> = Signal::new(value);
+            consume(cell)
+        }
+
+        fun main() { print(wrapper(1)); }
+        main();
+        "#,
+        "1\n",
+    );
+}
+
+/// The half that DOES work, kept beside it so the pair localizes the gap to the
+/// bare parameter rather than to `Source` bounds in general — this is
+/// `bind_each`'s shape and it must not regress while the pin above is red.
+#[test]
+fn a_constructed_source_bound_resolves_inside_a_generic_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::reactive::{ Signal, Source };
+
+        fun consume<T: PartialEq, S: Source<List<T>>>(source: S): i32 {
+            source.get().len()
+        }
+
+        fun wrapper<T: PartialEq>(value: List<T>): i32 {
+            let cell: Signal<List<T>> = Signal::new(value);
+            consume(cell)
+        }
+
+        fun main() { print(wrapper([1, 2, 3])); }
+        main();
+        "#,
+        "3\n",
+    );
+}

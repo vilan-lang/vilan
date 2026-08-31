@@ -211,6 +211,10 @@ fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T {
 /// extent ends (its first suspension); the reconcile settles as its own
 /// continuation segment. Inside a held turn (a `turn` with an awaiting
 /// body) the whole lifecycle holds — the transaction wins.
+///
+/// Concrete `Signal` because it WRITES (A33's sweep: the write-back class, with
+/// `Optimistic::over`, `ui`'s `bind_value` and `bind_draft`). `Source` declares
+/// `get`/`sub` and no `set`, so the whole point of this function is outside it.
 fun optimistic<T, E>(signal: Signal<T>, value: T, commit: async || Result<T, E>): Result<T, E> {
 	let previous = signal.get();
 	signal.set(value);
@@ -473,6 +477,12 @@ impl Signal<type T> with Source<T> {
 /// so every subscription in the program minted its own 6-node cycle. The cell
 /// is what the closure actually needs, and nothing points from it back to the
 /// signal.
+///
+/// Concrete `Signal` and NOT widenable to `Source` (A33): this reads the
+/// STRUCTURE — the value cell and the subscriber list — not the trait's
+/// `get`/`sub`, and the whole reason it exists is to attach without the
+/// immediate first call that `sub` makes. There is no `Source` spelling for
+/// that, so `map`, which is built on it, stays a `Signal` method too.
 fun observe<T>(signal: Signal<T>, observer: |T| void): Subscription {
 	let id = fresh_id();
 	let cell = signal.value;
@@ -566,6 +576,14 @@ impl Signal<type T> {
 ///
 /// Detachable like `map` (A28): each per-input subscription is handed to the
 /// ambient owner, so the whole product dies with the boundary that built it.
+///
+/// READ-ONLY (it only `get`s and `sub`s) and still concrete — HELD by the
+/// spelling, not by the semantics (A33). Widening the elements would need each
+/// one to be *some* `Source<U>`, a per-element EXISTENTIAL, and the mapped-tuple
+/// form has no place to bind it: `(U in T: Source<U>)` is refused because vilan
+/// has no trait objects, and a `<S: Source<U>>` parameter names ONE type where
+/// the tuple needs a different one per element. `combine` widens when the
+/// mapped-tuple grammar can bind a bound per element, not before.
 fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {
 	let snapshot = || (source in sources => source.get());
 	let derived = Signal::new(snapshot());
@@ -956,6 +974,9 @@ impl Optimistic<type T> {
 	/// Wrap `signal` in an optimistic-write cell, seeded with its current
 	/// value as the confirmed truth — the value the cell is handed is, by
 	/// definition, the last thing anyone confirmed.
+	///
+	/// Concrete `Signal`: the cell's whole job is to write this (A33's
+	/// write-back class).
 	fun over(signal: Signal<T>): Optimistic<T> {
 		Optimistic {
 			value = signal,

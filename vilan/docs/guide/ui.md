@@ -37,11 +37,17 @@ view so you can keep going:
 - **Structure**: `.child(content)`, `.children(views)`.
 - **Events**: `.on(event, handler)`, or `.on_event(event, |e| …)` when
   you need the DOM event itself (`prevent_default`, `key()`, modifiers).
-- **Reactive bindings**: `.bind_text(signal)`, `.bind_class(signal)`,
-  `.bind_attr(name, signal)`, `.style_var(name, signal)`.
+- **Reactive bindings**: `.bind_text(source)`, `.bind_class(source)`,
+  `.bind_attr(name, source)`, `.style_var(name, source)`.
 
-Every `bind_*` sets the property now and re-sets it whenever the signal
+Every `bind_*` sets the property now and re-sets it whenever the source
 changes. There is no render loop to trigger.
+
+A read-only binding asks for a
+[`Source<T>`](../std/reactive.md#source), not the concrete `Signal<T>` — a
+signal is one, and so is anything else you implement `get`/`sub` on. Only
+the bindings that write back (`bind_value`, `bind_draft`) need a real
+signal.
 
 ## Text children and mixed content
 
@@ -76,6 +82,10 @@ re-sets whenever it changes — `attr("href", signal)` and
 `bind_attr("href", signal)` are the same binding, chosen by type or by
 name. (`text` is unchanged: it still replaces everything the element
 contains, text nodes included, like the DOM's `textContent`.)
+
+`attr` and `child` dispatch through traits rather than a bound, so their
+reactive arms are `Signal<str>` specifically — a custom `Source` goes
+through the named binding (`bind_attr`, `bind_text`) for now.
 
 ## Element syntax
 
@@ -249,9 +259,10 @@ fun main() {
 
 ## Lists: `bind_each`
 
-`bind_each(source, key, render)` renders one row per element of a
-`Signal<List<T>>`. Rows are **keyed**, like React's `key` prop, and the
-key does real work here:
+`bind_each(source, key, render)` renders one row per element of any
+`Source<List<T>>` — a signal, a derived one, a mirror, a type of your own.
+Rows are **keyed**, like React's `key` prop, and the key does real work
+here:
 
 - A row whose key survives a change is reused. Its element moves to
   the new position with its state and subscriptions intact.
@@ -283,9 +294,9 @@ fun main() {
 ```
 
 ```vilan,fragment
-fun bind_each<T: PartialEq, K: PartialEq>(
+fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
 	self,
-	source: Signal<List<T>>,
+	source: S,
 	key: sync |T| K,
 	render: (sync |T| View) context owner_scope,
 ): View
@@ -303,8 +314,8 @@ not visible:
 | `.swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
 
 ```vilan,fragment
-.show(open)                             // Signal<bool>
-.when(present, || task_editor(…))       // Signal<bool> + (sync || View)
+.show(open)                             // any Source<bool>
+.when(present, || task_editor(…))       // any Source<bool> + (sync || View)
 .swap(route, |current| match current {  // Signal<T> + (sync |T| View)
 	Route::Home => home_page(),
 	Route::NotFound => not_found(),
@@ -373,7 +384,7 @@ fun main() {
 Two rules make one component serve both legs:
 
 - **Bindings read once.** `bind_text`, `bind_attr`, `bind_each`, `when`, and
-  `swap` embed the signal's value *at render time*: no subscription is created,
+  `swap` embed the source's value *at render time*: no subscription is created,
   and nothing survives the request (create, serialize, discard). Build pure, bind
   reactive: a component that leans on effect side-channels at build time renders
   stale. Text and attribute values are escaped, so a hostile string is inert.

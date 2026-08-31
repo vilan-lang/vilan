@@ -269,6 +269,7 @@ std/browser.md h1 browser-modules-reference
 std/browser.md h2 stddom
 std/browser.md h2 stdui
 std/browser.md h3 view-methods
+std/browser.md h3 a-binding-takes-a-source-not-a-signal
 std/browser.md h2 stdrouter
 std/browser.md h2 stdstorage
 std/cells.md h1 cells-reference
@@ -349,6 +350,7 @@ std/process.md h2 stdwatch
 std/reactive.md h1 stdreactive-reference
 std/reactive.md h2 at-a-glance
 std/reactive.md h2 signal
+std/reactive.md h2 source
 std/reactive.md h2 combine
 std/reactive.md h2 subscription-disposable
 std/reactive.md h2 owner
