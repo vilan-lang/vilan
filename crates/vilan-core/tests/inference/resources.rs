@@ -4131,8 +4131,9 @@ fn option_replace_returns_the_old_resource_for_the_caller_to_own() {
 // stores, but `r10_refuses_an_inferred_shared_of_a_resource` above shows no
 // resource can reach it; `Context::run(self, value: T, body)` binds its value
 // for the dynamic extent of `body` and hands it back, so a loan is the honest
-// reading there. The third, `NativeMap::insert`, is genuinely broken and is
-// pinned `#[ignore]`d below.
+// reading there. The third, `NativeMap::insert`, was genuinely broken (B154)
+// and is closed below — not by moving its declaration to `own`, but by putting
+// the internal head in R10's rejecting list, so no resource ever reaches it.
 
 #[test]
 fn option_replace_moves_the_new_value_in_rather_than_loaning_it() {
@@ -4181,24 +4182,22 @@ fn option_replace_rejects_a_read_of_the_value_it_was_handed() {
 }
 
 #[test]
-#[ignore = "B154 OPEN: R10's rejecting heads omit the internal `NativeMap`"]
 fn r10_refuses_a_native_map_of_a_resource() {
-    // The one sibling the sweep found still broken, filed rather than fixed
-    // here. `NativeMap::insert` stores a bare `value: V` exactly as `replace`
-    // did, and the measured consequence is worse: the caller destroys the value
-    // at the insert statement while the table goes on holding it (`drop r` then
-    // `after`, host-side use-after-free).
+    // B154, closed by the ruled fix. `NativeMap::insert` stores a bare
+    // `value: V` exactly as `replace` did, and the measured consequence was
+    // worse: the caller destroyed the value at the insert statement while the
+    // table went on holding it (`drop r` then `after`, host-side
+    // use-after-free).
     //
-    // The declaration fix (`own value: V`) is NOT the right one: `Map`/`Set`
+    // The declaration fix (`own value: V`) was NOT the right one: `Map`/`Set`
     // are built on `NativeMap` and pass a value they already own, so `own`
     // buys a redundant `__clone` on every insert in the language and moves 12
     // corpus goldens — a language-wide cost to close a hazard reachable only by
     // importing `std::native_map` directly, which the module documents as not
     // public surface. The zero-cost fix is R10: `List`/`Map`/`Set`/`Shared`/
-    // `Context`/`Promise`/`Task` all refuse a resource argument and the
-    // internal head simply is not in the list. It is a wider change than it
-    // looks (`Map<K, Res>` would then report through two heads, which the
-    // `assert_fails_once_with` pins read), so it is a ruling of its own.
+    // `Context`/`Promise`/`Task` all refuse a resource argument, and the
+    // internal head simply was not in the list. It is now, so no resource ever
+    // reaches `insert` and the bare declaration is honest again.
     assert_fails_with(
         r#"
         import std::print;
@@ -4212,6 +4211,168 @@ fn r10_refuses_a_native_map_of_a_resource() {
         }
         "#,
         "`NativeMap` cannot hold the resource `Res`",
+    );
+}
+
+#[test]
+fn r10_refuses_the_measured_native_map_use_after_free() {
+    // B154's actual program, the one that measured the defect: the insert
+    // stores the resource in the table AND the widened temporary predicate
+    // destroys it at that statement, so the table held a freed value (it
+    // printed `drop r` then `after` and ran on). R10 now refuses the type
+    // before the insert is ever reached.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::native_map::NativeMap;
+        import std::hash::Hashable;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            mut table: NativeMap<Res> = NativeMap::new();
+            let r = Res { tag = "r" };
+            table.insert("k".hash(), r);
+            print("after");
+        }
+        "#,
+        "`NativeMap` cannot hold the resource `Res`",
+    );
+}
+
+#[test]
+fn r10_admits_a_native_map_of_a_non_resource() {
+    // The green negative the head extension has to keep: `NativeMap` is only
+    // refused AT a resource. The raw layer is still the thing `Map`/`Set` are
+    // built on, and every one of their inserts goes through this.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::native_map::NativeMap;
+        import std::hash::Hashable;
+        fun main() {
+            mut table: NativeMap<str> = NativeMap::new();
+            table.insert("k".hash(), "v");
+            print(i"{table.len()}");
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn native_map_insert_loans_its_hash_key() {
+    // `insert(&mut self, key: Hash, value: V)` declares the KEY bare, and that
+    // stays honest under B154's fix where `value` needed the head: a `Hash` is
+    // a non-generic external struct nothing can declare `resource`, so no
+    // destructor ever hangs on the key position and a loan changes nothing.
+    // The key is read after the insert to prove the caller still owns it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::native_map::NativeMap;
+        import std::hash::{ Hash, Hashable };
+        fun main() {
+            mut table: NativeMap<str> = NativeMap::new();
+            let key: Hash = "k".hash();
+            table.insert(key, "v");
+            print(i"{table.contains_key(key)}");
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// --- B154's two-head shape: one mistake, one diagnostic ----------------------
+//
+// `Map<K, V>` stores a `NativeMap<(K, V)>` and `Set<T>` a `NativeMap<T>`, so
+// with the internal head in R10's rejecting list a `Map<str, Res>` offends at
+// BOTH heads. The public one is the mistake — it is the type the user wrote and
+// the only one they can fix — and the inner one is that refusal a layer in.
+// Kept to one report by the general rule, not by naming the type: R11's
+// in-body container check stands down when the callee's own instantiated
+// SIGNATURE is refused and the caller has already been told (E98's shape).
+
+#[test]
+fn r10_map_of_a_resource_reports_once() {
+    assert_fails_once_with(
+        r#"
+        import std::map::Map;
+        resource struct Db { handle: i32 }
+        fun sink(table: Map<str, Db>) {}
+        fun main() {}
+        "#,
+        "cannot hold the resource",
+    );
+}
+
+#[test]
+fn r10_set_of_a_resource_reports_once() {
+    assert_fails_once_with(
+        r#"
+        import std::set::Set;
+        resource struct Db { handle: i32 }
+        fun sink(items: Set<Db>) {}
+        fun main() {}
+        "#,
+        "cannot hold the resource",
+    );
+}
+
+#[test]
+fn r10_map_construction_never_reports_the_native_map_inside_it() {
+    // The constructing form, where `Map::new()`'s body binds the offending
+    // `NativeMap<(str, Res)>` under the substitution. The user's diagnostic is
+    // about `Map`; the storage inside it is not a second thing to fix.
+    assert_fails_without(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            mut table: Map<str, Res> = Map::new();
+            print("built");
+        }
+        "#,
+        "`NativeMap` cannot hold",
+    );
+}
+
+#[test]
+fn r10_set_construction_never_reports_the_native_map_inside_it() {
+    assert_fails_without(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            mut items: Set<Res> = Set::new();
+            print("built");
+        }
+        "#,
+        "`NativeMap` cannot hold",
+    );
+}
+
+#[test]
+fn r11_still_reports_a_container_the_caller_cannot_see() {
+    // The other half of the claim: standing down on a refused signature must
+    // not blind R11's in-body check, whose whole subject is the container a
+    // generic body builds out of its own `T` and never hands back. `stash`'s
+    // signature holds no container at all, so it still reports.
+    assert_fails_with(
+        r#"
+        resource struct Guard { handle: i32 }
+        fun stash<type T>(own value: T) { let items = [value]; }
+        fun main() {
+            stash(Guard { handle = 1 });
+        }
+        "#,
+        "`List` cannot hold the resource `Guard`",
     );
 }
 
