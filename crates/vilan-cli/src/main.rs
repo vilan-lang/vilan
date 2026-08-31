@@ -581,15 +581,27 @@ fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
 }
 
 /// Adds one recorded input to the snapshot: its modification time, or — when it
-/// is a **directory** — one entry per file in its tree.
+/// is a **directory** — an entry for the directory itself plus one per file in
+/// its tree.
 ///
 /// A directory means its tree because that is what the declaration already
 /// means to the freshness stamp ([`file_digest`] digests a directory as its
 /// whole tree, which is why `inputs = ["src/static"]` reads the way it looks):
-/// one reading of the manifest, both consumers. Watching only the directory
-/// itself would not do — a directory's own mtime moves when an entry is added
-/// or removed but NOT when a file inside it is edited, which is exactly the
-/// edit the hook that declared it cares about.
+/// one reading of the manifest, both consumers. The tree alone would not do
+/// either, which is N30: a directory contributed only its FILES, so a
+/// recorded-missing directory that APPEARS EMPTY added no entry at all and
+/// started no round — while the compile that failed on it (`asset::read_dir`
+/// records the miss) would now succeed against the empty listing. The first
+/// file created inside it fired; the appearance itself did not.
+///
+/// So a directory contributes both, and each half answers what the other
+/// cannot: the directory's own entry is what makes its EXISTENCE observable,
+/// and its files' entries are what make an edit INSIDE it observable — a
+/// directory's own mtime does not move for that. The directory's value is its
+/// own mtime rather than a rendering of its membership, because mtime is the
+/// instrument every other entry in this map already uses and a directory's
+/// mtime moves precisely when a direct entry is added or removed; membership
+/// changes deeper down are carried by the file entries themselves.
 ///
 /// The top-level path is resolved through a symlink (`fs::metadata`), matching
 /// both the stamp — which reads a declared link's *target* bytes — and the
@@ -600,17 +612,20 @@ fn insert_watched_input(path: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) 
     let Ok(metadata) = fs::metadata(path) else {
         return;
     };
+    if let Ok(modified) = metadata.modified() {
+        files.insert(path.to_path_buf(), modified);
+    }
     if metadata.is_dir() {
         collect_input_tree(path, files);
-    } else if let Ok(modified) = metadata.modified() {
-        files.insert(path.to_path_buf(), modified);
     }
 }
 
-/// Every file under a declared directory input → its modification time. An
-/// entry that cannot be read is skipped rather than failing the snapshot: the
-/// watcher's job is to keep polling, and a path it cannot stat is one whose
-/// later readability is itself a difference.
+/// Every path under a declared directory input → its modification time: each
+/// file, and each nested DIRECTORY in its own right, for the same reason the
+/// root gets an entry — a subdirectory appearing empty is a change to the tree
+/// that no file entry can express. An entry that cannot be read is skipped
+/// rather than failing the snapshot: the watcher's job is to keep polling, and
+/// a path it cannot stat is one whose later readability is itself a difference.
 fn collect_input_tree(root: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -620,10 +635,11 @@ fn collect_input_tree(root: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
+        if let Ok(modified) = metadata.modified() {
+            files.insert(path.clone(), modified);
+        }
         if metadata.is_dir() {
             collect_input_tree(&path, files);
-        } else if let Ok(modified) = metadata.modified() {
-            files.insert(path, modified);
         }
     }
 }
@@ -5540,9 +5556,10 @@ mod tests {
     #[test]
     fn watch_snapshot_expands_a_recorded_directory_input_to_its_tree() {
         // G10: a declared directory input means its TREE, because that is what
-        // the freshness stamp already reads it as. Watching the directory entry
-        // alone would miss an edit to a file inside it — the directory's own
-        // mtime does not move for that.
+        // the freshness stamp already reads it as. The tree alone would miss an
+        // edit to a file inside it — the directory's own mtime does not move
+        // for that — and the directory alone would miss its own appearance
+        // (N30), so the snapshot carries both.
         let dir = env::temp_dir().join(format!("vilan-watch-tree-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("icons/svg")).unwrap();
@@ -5557,14 +5574,48 @@ mod tests {
             "a file nested under a declared directory is watched: {snapshot:?}"
         );
         assert!(
-            !snapshot.contains_key(&dir.join("icons")),
-            "the directory itself is not an entry — its tree is"
+            snapshot.contains_key(&dir.join("icons")),
+            "the declared directory is an entry in its own right: {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains_key(&dir.join("icons/svg")),
+            "and so is a directory nested inside it: {snapshot:?}"
         );
 
         // Adding a file under the tree is a snapshot difference: the round
         // trigger the lucide case needed.
         fs::write(dir.join("icons/svg/x.svg"), "<svg/>\n").unwrap();
         assert_ne!(watch_snapshot(&roots), snapshot);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_snapshot_sees_a_recorded_directory_that_appears_empty() {
+        // N30: `asset::read_dir` on a missing directory records the miss, and
+        // creating that directory — even with nothing in it — is the change
+        // that makes the failed compile succeed. Expanding the directory to its
+        // FILES alone said nothing about an empty one, so the appearance added
+        // no entry and started no round; the first file created inside it did.
+        let dir = env::temp_dir().join(format!("vilan-watch-empty-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let icons = dir.join("icons");
+        record_const_inputs(&[(icons.clone(), None)]);
+        let roots = vec![dir.clone()];
+
+        let missing = watch_snapshot(&roots);
+        assert!(
+            !missing.contains_key(&icons),
+            "a recorded-missing directory stays out until it appears"
+        );
+
+        fs::create_dir(&icons).unwrap();
+        let appeared = watch_snapshot(&roots);
+        assert!(
+            appeared.contains_key(&icons),
+            "an EMPTY directory appearing is a snapshot change: {appeared:?}"
+        );
+        assert_ne!(appeared, missing);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1005,6 +1005,47 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_declared_directory_input_appearing_empty_starts_a_watch_round() {
+    // N30. A declared directory that does not exist yet is the ordinary state
+    // of a generated tree, and CREATING it is the change the build is waiting
+    // for — `asset::read_dir` failed on it and recorded the miss, and the same
+    // call against an empty directory succeeds. But the watched set expanded a
+    // directory to its FILES and inserted nothing for the directory itself, so
+    // an empty one contributed no entry: the appearance was invisible and the
+    // session sat still until somebody happened to put a file in it.
+    //
+    // Measured before the fix on this fixture: round 1, then `mkdir icons` and
+    // nothing at all, then the first file inside it firing round 2 — the narrow
+    // shape the item describes, with the empty step the only silent one.
+    let dir = temp_project("watch_empty_directory");
+    write(&dir, "vilan.toml", &watch_manifest("[\"icons\"]"));
+    write(&dir, "src/main.vl", MAIN);
+    // No `icons/` — the directory is declared and missing, which builds fine.
+    let _watcher = spawn_watch(&dir);
+
+    wait_for_in(&dir, "the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
+
+    std::fs::create_dir(dir.join("icons")).expect("create the empty declared directory");
+    wait_nudged(
+        &dir,
+        "the round the appearing EMPTY directory starts",
+        // The re-touch a lost round needs, in the one form available to a
+        // directory with nothing in it: remove and re-create. Either half is a
+        // snapshot difference on its own, so a poll landing between them is
+        // fine, and a missing declared input builds cleanly.
+        || {
+            let _ = std::fs::remove_dir(dir.join("icons"));
+            let _ = std::fs::create_dir(dir.join("icons"));
+        },
+        || runs(&dir, "rounds.txt") >= 2,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── S6: the generated root, and the formatter's exclusion (§12) ──
 
 /// The module a generator writes. `vilan fmt` expands a single-line body onto
