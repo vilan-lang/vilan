@@ -604,10 +604,13 @@ fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
 /// changes deeper down are carried by the file entries themselves.
 ///
 /// The top-level path is resolved through a symlink (`fs::metadata`), matching
-/// both the stamp — which reads a declared link's *target* bytes — and the
-/// `asset::read` inputs this set has always carried. Inside a tree, a symlink
-/// is never followed: the stamp digests the link's own target path there, and
-/// following one could walk out of the tree or into a cycle.
+/// both the `asset::read` inputs this set has always carried and the stamp,
+/// which resolves its own declared path the same way. That last half was only
+/// half true until G15 — the stamp stat'd the link itself, so a declared link
+/// to a DIRECTORY was watched here and unreadable there — and the comment
+/// claiming the match is what let it stand. Inside a tree, a symlink is never
+/// followed: the stamp digests the link's own target path there, and following
+/// one could walk out of the tree or into a cycle.
 fn insert_watched_input(path: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
     let Ok(metadata) = fs::metadata(path) else {
         return;
@@ -1986,8 +1989,10 @@ impl DeclaredHook {
     /// can say it out loud.
     ///
     /// Only a path that is genuinely absent counts (`Some(None)`): one that
-    /// could not be *read* is a permission error or a broken link, which is
-    /// not "the hook did not write it".
+    /// could not be *read* is a permission error, which is not "the hook did
+    /// not write it". A link with no target IS absent — [`file_digest`]
+    /// resolves through the link — and an output the build cannot follow to a
+    /// file is exactly what this note is for.
     fn missing_outputs(&self, dir: &Path) -> Vec<&str> {
         self.outputs
             .iter()
@@ -2024,15 +2029,34 @@ fn digest_of(bytes: &[u8]) -> String {
 
 /// A declared path's content digest: `Some(None)` for a path that is not there,
 /// `Some(Some(hex))` for one that is, and `None` when it could not be read at
-/// all (a permission error, a broken link) — which is not a fingerprint and
-/// must not be recorded as one.
+/// all (a permission error) — which is not a fingerprint and must not be
+/// recorded as one.
 ///
 /// A **directory** digests as its whole tree: the sorted relative paths and
 /// their contents, so declaring `inputs = ["src/static"]` means what a reader
 /// expects it to mean. That is the shape the copy case (§2.1) needs, and it is
 /// why this design refuses glob patterns rather than growing a matcher.
+///
+/// The declared path is resolved THROUGH a symlink (`fs::metadata`), which is
+/// exactly how [`insert_watched_input`] resolves the same declaration — one
+/// reading of the manifest, both consumers. It stat'd the link itself until
+/// G15, which was invisible for a link to a FILE (`fs::read` follows one) and a
+/// silent forever-loop for a link to a DIRECTORY: not `is_dir()`, so `fs::read`
+/// got `EISDIR`, so the digest was `None`, so the hook was stale on every build
+/// with nothing said — while the watcher was watching the tree behind the link
+/// all along. Inside a tree a link is never followed ([`collect_tree`]): that is
+/// the loop-and-escape fence, and it is a different question from what the
+/// declaration names.
+///
+/// A link with no target resolves to nothing and so reads as MISSING rather
+/// than unreadable — the same answer the watcher gives it (no entry, and its
+/// later appearance is a difference). Both alternatives to that are worse: an
+/// unreadable input is never fresh, so the hook re-runs forever, and an
+/// unreadable output is not "the hook did not write it" either, so it is never
+/// reported. Missing is recorded, is explained, and invalidates when the target
+/// appears.
 fn file_digest(path: &Path) -> Option<Option<String>> {
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
         Err(_) => return None,
