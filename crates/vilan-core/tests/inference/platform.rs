@@ -4398,6 +4398,367 @@ fn same_type_native_comparisons_still_compile_and_run() {
     );
 }
 
+// --- B148: `+` skipped operand checking on the native path (FIXED) -----------
+//
+// B24 closed the hole for the COMPARISONS and left `+` open, so a native left
+// operand still typed nothing on its right: `"here " + point` compiled, took
+// its type from the left (`str`), and emitted `"here " + point` — which the
+// host renders as the struct's runtime tuple, `here 1,2`. Two desugarings
+// build the same expression, so the garbage turned up far from any `+` a
+// reader wrote: an i-string is `("" + part + part + …)`, and a css block's
+// mixed value is built to that shape (`a_mixed_css_value_refuses_a_struct_hole`
+// in `styling.rs` holds that end).
+//
+// `+` on a native left operand now admits exactly `str + x` where `x` renders
+// (the numeric primitives, `bool`, `str` — the set an i-string hole rests on)
+// and `T + T` for a numeric primitive `T`. The other native operators still
+// skip the check; theirs is a breaking numeric-strictness change with its own
+// migration, not this fix.
+
+#[test]
+fn a_struct_concatenated_into_a_string_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let p = Point { x = 1, y = 2 };
+            let _text = "here " + p;
+        }
+        "#,
+        r#""here " + p"#,
+        "`+` on `str` concatenates, and `Point` has no string form",
+    );
+}
+
+#[test]
+fn an_i_string_hole_holding_a_struct_is_rejected() {
+    // The control the whole class hangs from: an i-string is not a second
+    // mechanism, it lexes to this very concatenation — so it was the same bug
+    // and it takes the same fix. The span is the left-associated prefix that
+    // reaches the hole (`("" + "here " + p)`), which is where the `+` is.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let p = Point { x = 1, y = 2 };
+            let _text = i"here {p} there";
+        }
+        "#,
+        r#"i"here {p}"#,
+        "`+` on `str` concatenates, and `Point` has no string form",
+    );
+}
+
+#[test]
+fn an_enum_concatenated_into_a_string_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        enum Colour { Red, Green }
+
+        fun main() {
+            let c = Colour::Red;
+            let _text = "colour " + c;
+        }
+        "#,
+        r#""colour " + c"#,
+        "`+` on `str` concatenates, and `Colour` has no string form",
+    );
+}
+
+#[test]
+fn a_list_concatenated_into_a_string_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let items = [ 1, 2, 3 ];
+            let _text = "items " + items;
+        }
+        "#,
+        r#""items " + items"#,
+        "`+` on `str` concatenates, and `List<i32>` has no string form",
+    );
+}
+
+#[test]
+fn an_option_concatenated_into_a_string_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        import std::option::Some;
+
+        fun main() {
+            let held = Some(5);
+            let _text = "held " + held;
+        }
+        "#,
+        r#""held " + held"#,
+        "`+` on `str` concatenates, and `Option<i32>` has no string form",
+    );
+}
+
+#[test]
+fn a_tuple_concatenated_into_a_string_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let pair = (1, 2);
+            let _text = "pair " + pair;
+        }
+        "#,
+        r#""pair " + pair"#,
+        "`+` on `str` concatenates, and `(i32, i32)` has no string form",
+    );
+}
+
+#[test]
+fn a_backed_enum_concatenated_into_a_string_is_rejected() {
+    // A backing is a LOWERING, not a rendering: `Size::Small` lowers to "sm"
+    // and would have concatenated as one, which reads as a display form the
+    // program chose when nothing chose it. `.to_string()` is still the answer.
+    assert_fails_spanning(
+        r#"
+        enum Size {
+            Small = "sm",
+            Large = "lg",
+        }
+
+        fun main() {
+            let s = Size::Small;
+            let _text = "size " + s;
+        }
+        "#,
+        r#""size " + s"#,
+        "`+` on `str` concatenates, and `Size` has no string form",
+    );
+}
+
+#[test]
+fn the_to_string_steer_the_refusal_names_compiles_and_renders() {
+    // The refusal's whole worth is that the fix it names works, at both
+    // spellings of the concatenation.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun main() {
+            let p = Point { x = 1, y = 2 };
+            print("here " + p.to_string());
+            print(i"here {p.to_string()} there");
+        }
+        "#,
+        "here (1, 2)\nhere (1, 2) there\n",
+    );
+}
+
+#[test]
+fn a_string_concatenation_still_admits_the_renderable_primitives() {
+    // The set an i-string hole rests on, and so the set `str + x` must keep:
+    // std's own `impl i32 with Display` is `i"{self}"`, which is `"" + self`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::display::Display;
+
+        fun main() {
+            let count = 3;
+            let ratio = 1.5;
+            let flag = true;
+            let name = "vilan";
+            print("n=" + count + " r=" + ratio + " f=" + flag + " s=" + name);
+            print(i"n={count} r={ratio} f={flag} s={name}");
+            print(count.to_string() + "!");
+        }
+        "#,
+        "n=3 r=1.5 f=true s=vilan\nn=3 r=1.5 f=true s=vilan\n3!\n",
+    );
+}
+
+#[test]
+fn the_numeric_additions_still_compile_and_run() {
+    // `T + T`, and an unsuffixed literal still adapts to its peer.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            let counted: u32 = 5;
+            let stamp: i53 = 1;
+            print(1 + 2);
+            print(1.5 + 2.5);
+            print(counted + 4);
+            print(stamp + 1000);
+            print(7n + 1n);
+            print("a" + "b");
+        }
+        "#,
+        "3\n4\n9\n1001\n8n\nab\n",
+    );
+}
+
+#[test]
+fn an_integer_added_to_a_string_is_rejected() {
+    // The mirror shape. It used to emit "1a" while typing as `i32`, and the
+    // numeric steer would misread the author: only a `str` LEFT operand
+    // concatenates, because the expression takes its type from the left.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let n = 1;
+            let _text = n + "a";
+        }
+        "#,
+        r#"n + "a""#,
+        "only a `str` LEFT operand concatenates",
+    );
+}
+
+#[test]
+fn a_mixed_width_addition_is_rejected() {
+    // What `<` has refused since B24, now refused by `+` too (§5.8).
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let ratio: f64 = 1.5;
+            let count: i32 = 3;
+            let _sum = ratio + count;
+        }
+        "#,
+        "ratio + count",
+        "`+` adds two values of the same type, but the operands are `f64` and `i32`",
+    );
+}
+
+#[test]
+fn adding_bools_is_rejected() {
+    // `bool` is native for `==`/`<` and has no `Add`: the host would have
+    // added the lowering, making `true + true` a `bool` holding 2.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _sum = true + true;
+        }
+        "#,
+        "true + true",
+        "`bool` is neither: it has no `Add`",
+    );
+}
+
+#[test]
+fn adding_backed_enum_variants_is_rejected() {
+    assert_fails_spanning(
+        r#"
+        enum Level {
+            Low = 1,
+            High = 2,
+        }
+
+        fun main() {
+            let _sum = Level::Low + Level::High;
+        }
+        "#,
+        "Level::Low + Level::High",
+        "`Level` is neither: it has no `Add`",
+    );
+}
+
+#[test]
+fn a_user_add_impl_still_dispatches_with_its_own_right_operand() {
+    // The non-native path is untouched: the impl's `B` types the right
+    // operand, and it need not be `Self`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::operators::Add;
+
+        struct Metres { value: i32 }
+
+        impl Metres with Add<i32> {
+            fun add(self, b: i32): Metres {
+                Metres { value = self.value + b }
+            }
+        }
+
+        fun main() {
+            let far = Metres { value = 5 } + 4;
+            print(far.value);
+        }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_is_checked_like_the_addition_it_desugars_to() {
+    // `text += p` is `text = text + p`, and the desugar SYNTHESIZES its own
+    // binary from a second registration site — so the rule has to reach it
+    // there too, or the one spelling most likely to be written in a loop
+    // would have kept emitting the tuple.
+    assert_fails_with(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let p = Point { x = 1, y = 2 };
+            mut text = "here ";
+            text += p;
+        }
+        "#,
+        "`+` on `str` concatenates, and `Point` has no string form",
+    );
+}
+
+#[test]
+fn a_closure_or_function_reference_concatenated_into_a_string_is_rejected() {
+    // Not only the nominal types: the rule is "has a string form", so the
+    // structural ones are refused by the same predicate rather than by a list.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let f = |n: i32| n + 1;
+            let _text = "f=" + f;
+        }
+        "#,
+        "`+` on `str` concatenates, and `|i32| i32` has no string form",
+    );
+}
+
+#[test]
+#[ignore = "B148 residual: an unbounded generic right operand still escapes the check"]
+fn an_unbounded_generic_concatenated_into_a_string_is_rejected() {
+    // KNOWN BUG. The rule only rejects a GROUNDED right operand, the same
+    // leniency B24 gave the comparisons, so a bare `T` passes and every
+    // instantiation of `show` prints the runtime shape — `show(Point { … })`
+    // still emits `"v=" + value` and prints `v=1,2`.
+    //
+    // The declaration is checked once for all instantiations (§5.7's note on
+    // generic parameters), so the honest fix is a refusal HERE with a
+    // `T: Display` steer, not a per-monomorphization check — but which of
+    // those the language wants is a design call, and the operand rule this
+    // pin belongs to does not settle it.
+    assert_fails_with(
+        r#"
+        fun show<T>(value: T): str {
+            "v=" + value
+        }
+
+        fun main() {
+            let _text = show(5);
+        }
+        "#,
+        "has no string form",
+    );
+}
+
 // --- §J.3: module-level initializers cannot await ----------------------------
 //
 // Initializers run at module load — no enclosing function to become async,

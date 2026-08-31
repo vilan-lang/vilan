@@ -487,6 +487,34 @@ right operand (default `Self`); the result type is the impl's (for the
 arithmetic traits, `Self`). Compound assignment `x op= e` is exactly
 `x = x op e` with `x`'s place evaluated once.
 
+The primitives do not dispatch — native machine operators *are* their
+semantics — so their admitted operand pairs are stated rather than read
+off an impl. For `+` those pairs are exactly two:
+
+- `str + x`, **concatenation**, where `x` is a `str`, a numeric
+  primitive, or a `bool` — the types whose value is already their
+  rendering. This is the rule an interpolated string is checked
+  against, since `i"a{x}b"` *is* a `+` chain (§2.3).
+- `T + T` for a numeric primitive `T`, ordinary addition, with no
+  implicit conversions (§5.8).
+
+Anything else is an error. A struct, an enum, a `List`, an `Option` or a
+tuple has no string form, so it does not concatenate: render it first
+with `to_string()`, implementing `Display` if it has none. The order
+matters, because the expression takes its type from the left operand:
+`"n=" + count` concatenates, `count + "n="` does not. And `bool` and
+backed enums, native though they are for `==` and `<`, have no `Add` at
+all — a backing value is a lowering detail, not a number to compute
+with.
+
+```vilan,fragment
+"n=" + count                 // str + i32 — concatenation
+"p=" + point                 // error: `Point` has no string form
+"p=" + point.to_string()     // the fix the error names
+count + "n="                 // error: only a `str` LEFT operand concatenates
+1.5 + count                  // error: f64 and i32; no implicit conversions
+```
+
 `is` (§3.7 level 10) tests a value against a match pattern and yields
 `bool`; bindings inside an `is` pattern are scoped to nothing (use
 `match` to bind).

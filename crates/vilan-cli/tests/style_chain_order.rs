@@ -605,10 +605,17 @@ const CSS_ORDER_SENSITIVE: &str = concat!(
     // `size` writes width and height; `width` writes one of them. In a block
     // there is no `size` property, so the pair is `width`/`height` themselves.
     "\tlet c = const css { gap: {space(2)}; width: 32px; height: 16px; };\n",
-    // `border-color` is one of `border`'s longhands.
+    // `border-color` is one of `border`'s longhands. The shorthand's value is
+    // written HOLE-FREE (B148): a value that mixes text with a hole lowers to a
+    // `str` concatenation, and `1px solid {Color::gray(500)}` was concatenating
+    // the token's two-field struct — emitting
+    // `1px solid var(--gray-500),:root{--gray-500:#6b7280}`, invalid CSS that
+    // this fixture could not see because it compares two builds of itself. What
+    // is under test is the ORDER of the two properties; the values do not enter
+    // it, and `border-color`'s one-hole token still carries a real one.
     "\tlet e = const css { display: flex; border-color: {Color::gray(300)}; ",
-    "border: 1px solid {Color::gray(500)}; };\n",
-    "\tlet f = const css { display: flex; border: 1px solid {Color::gray(500)}; ",
+    "border: 1px solid black; };\n",
+    "\tlet f = const css { display: flex; border: 1px solid black; ",
     "border-color: {Color::gray(300)}; };\n",
     // A property the table does not write is a BARRIER: `padding-top` must not
     // cross it to reach `display`, or the vendor rule stops landing where it was

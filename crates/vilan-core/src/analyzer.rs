@@ -3223,6 +3223,14 @@ fn contains_try_assert(node: &Node) -> bool {
     found
 }
 
+/// The scalar primitives whose operators lower to native JS instead of
+/// dispatching through the operator traits — [`crate::type_::SCALAR_PRIMITIVE_NAMES`]
+/// minus `null`, which has no operators. `bool` belongs to the same class but
+/// is a numeric *enum*, so it is handled beside this list, never in it.
+const NATIVE_OPERATOR_PRIMITIVES: &[&str] = &[
+    "i32", "u32", "f64", "BigInt", "str", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
+];
+
 fn is_overloadable_operator(op: BinaryOp) -> bool {
     operator_trait_method(op).is_some()
 }
@@ -13216,13 +13224,19 @@ impl<'src> Analyzer<'src> {
             .filter(|enum_| enum_.backing == Some(Backing::Str))
     }
 
+    /// Whether `type_` is one of [`NATIVE_OPERATOR_PRIMITIVES`].
+    fn is_native_operator_primitive(&self, type_: &Type) -> bool {
+        let Type::Struct(id, _) = type_ else {
+            return false;
+        };
+        NATIVE_OPERATOR_PRIMITIVES
+            .iter()
+            .any(|name| self.primitive_struct_ids.get(*name).copied() == Some(*id))
+    }
+
     fn is_native_operator_type(&self, type_: &Type) -> bool {
         match type_ {
-            Type::Struct(id, _) => [
-                "i32", "u32", "f64", "BigInt", "str", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
-            ]
-            .iter()
-            .any(|name| self.primitive_struct_ids.get(*name).copied() == Some(*id)),
+            Type::Struct(_, _) => self.is_native_operator_primitive(type_),
             Type::Enum(id, _) => {
                 self.bool_enum_id == Some(*id)
                     || self
@@ -13230,6 +13244,38 @@ impl<'src> Analyzer<'src> {
                         .get(id)
                         .is_some_and(|enum_| enum_.backing.is_some())
             }
+            _ => false,
+        }
+    }
+
+    /// Whether `type_` is `str` — the one native type whose `+` concatenates
+    /// rather than adds, and so the one with an operand rule of its own.
+    fn is_str_type(&self, type_: &Type) -> bool {
+        matches!(type_, Type::Struct(id, _) if self.primitive_struct_ids.get("str") == Some(id))
+    }
+
+    /// Whether a value of `type_` has a string form the host produces on its
+    /// own — the predicate the right operand of a `str` concatenation is held
+    /// to (B148), and so the predicate every i-string hole is held to, since
+    /// `lexing::emit_interpolated` desugars `i"a{x}b"` to `("" + "a" + x + "b")`.
+    ///
+    /// True for the native primitives and `bool`: those lower to a JS number,
+    /// string, bigint, or boolean, whose stringification *is* their rendering
+    /// — which is what makes `impl i32 with Display { i"{self}" }` correct.
+    /// False for everything else. A struct lowers to a tuple, an enum to a
+    /// tagged array, a `List` to an array; the host renders any of them as its
+    /// comma-joined elements (`Point { x = 1, y = 2 }` as `1,2`), which is
+    /// never the rendering the author meant. A *backed* enum is native for
+    /// arithmetic but not renderable: its backing is a lowering detail, not a
+    /// display form, and printing `"sm"` for `Size::Small` reads as a value the
+    /// program chose when nothing chose it.
+    fn renders_into_a_string(&self, type_: &Type) -> bool {
+        match type_ {
+            // `any` is the escape hatch and `never` is unreachable; neither is
+            // a claim about a runtime shape, so neither is this rule's to make.
+            Type::Any | Type::Never => true,
+            Type::Struct(_, _) => self.is_native_operator_primitive(type_),
+            Type::Enum(id, _) => self.bool_enum_id == Some(*id),
             _ => false,
         }
     }
@@ -32387,12 +32433,137 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                 }
+                // --- `+`'s admitted set on the native path (B148) ---
+                //
+                // Every operator that reaches here models a trait whose right
+                // operand is the trait's `B`, defaulted to `Self` (spec §5.7).
+                // A non-native left operand falls through to the dispatch
+                // below, where the impl's own `B` decides. A NATIVE one never
+                // dispatches — native JS *is* its operator semantics — and it
+                // used to skip this check along with the dispatch, so nothing
+                // typed the right operand of a native `+` at all.
+                //
+                // `"here " + point` type-checked on that hole. A binary takes
+                // its type from the LEFT operand, so the expression was `str`,
+                // and it emitted `"here " + point` — which the host renders as
+                // the struct's runtime tuple: `here 1,2`. Two desugarings reach
+                // the same expression, which is why the shape turns up far from
+                // any `+` a reader wrote: an i-string is
+                // `("" + part + part + …)` (`lexing::emit_interpolated`), and a
+                // css block's mixed value is built to that same shape
+                // (`css::build_value`), so `padding: calc({space(4)} + 2px);`
+                // put a tuple mid-declaration.
+                //
+                // So `+` on a native left operand admits exactly:
+                //
+                //   * `str + x` where `x` renders (`renders_into_a_string`) —
+                //     concatenation, and deliberately NOT `B = Self`, because
+                //     an i-string hole IS this expression;
+                //   * `T + T` for a numeric primitive `T` — `B = Self`.
+                //
+                // and nothing else: `bool` and a backed enum are native for
+                // `==`/`<` but have no `Add`, and reach `+` only through host
+                // coercion (`true + true` is `2`).
+                //
+                // SCOPE. This is `+`'s rule, not the arithmetic family's. The
+                // other native operators share the hole — `f64 * i32` and
+                // `str - str` still go unchecked — but not the bug: they emit
+                // arithmetic on numbers, where `+` emits a rendering. Closing
+                // theirs refuses code that computes correct answers today, so
+                // it is a breaking numeric-strictness change with a migration
+                // of its own (`as_f64()`), not this miscompile fix.
+                let native_left = grounded(&lhs_type) && self.is_native_operator_type(&lhs_type);
+                if native_left && matches!(op, BinaryOp::Add) {
+                    let concatenating = self.is_str_type(&lhs_type);
+                    if !concatenating && !self.is_native_operator_primitive(&lhs_type) {
+                        // Reached only by `bool` and a backed enum: the two
+                        // types that are native for `==`/`<` without being
+                        // numbers. Each gets the reason that is actually its
+                        // own.
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let msg = if matches!(&lhs_type, Type::Enum(id, _) if self.bool_enum_id == Some(*id))
+                        {
+                            "`+` adds numbers and concatenates `str`, and `bool` is neither: it \
+                             has no `Add`, and the host would add the lowering instead — \
+                             `true + true` is `2`, typed here as a `bool`"
+                                .to_string()
+                        } else {
+                            format!(
+                                "`+` adds numbers and concatenates `str`, and `{lhs_label}` is \
+                                 neither: it has no `Add`. A backing value is a lowering detail, \
+                                 not a number to compute with, and the sum of two backings is \
+                                 rarely a variant — match on the variant, or hold the number you \
+                                 mean"
+                            )
+                        };
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg,
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
+                    let rhs_type = self.infer_type(rhs_id, &lhs_type, &HashMap::default());
+                    let admitted = if concatenating {
+                        self.renders_into_a_string(&rhs_type)
+                    } else {
+                        self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
+                    };
+                    if grounded(&rhs_type) && !admitted {
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+                        let msg = if concatenating {
+                            // Not "or interpolate it": an i-string hole lexes to
+                            // this very concatenation and is refused here too,
+                            // so steering to one would steer into the same
+                            // garbage. `.to_string()` is the whole fix.
+                            format!(
+                                "`+` on `str` concatenates, and `{rhs_label}` has no string form: \
+                                 concatenating it renders the value's runtime shape — a struct is \
+                                 a tuple, an enum a tagged array — not the value. Call \
+                                 `.to_string()` on it, implementing `Display` for its type if it \
+                                 has none; an i-string hole is this same concatenation, so it \
+                                 needs the same call"
+                            )
+                        } else if self.is_str_type(&rhs_type) {
+                            // The mirror shape, where the numeric steer ("suffix
+                            // the literal") would misread the author: they meant
+                            // a concatenation, and only a `str` LEFT operand
+                            // performs one.
+                            format!(
+                                "`+` on `{lhs_label}` adds, and `str` is not a number: only a \
+                                 `str` LEFT operand concatenates, because the expression takes \
+                                 its type from the left. Put the string first (`\"…\" + value`), \
+                                 or convert this operand with `.to_string()`"
+                            )
+                        } else {
+                            format!(
+                                "`+` adds two values of the same type, but the operands are \
+                                 `{lhs_label}` and `{rhs_label}`: there are no implicit \
+                                 conversions; suffix the literal or convert with `as_*`"
+                            )
+                        };
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg,
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
+                }
                 // Same-type operands on the native path (`B = Self`). The
                 // non-native equality path falls through to the trait
                 // dispatch below, exactly as before.
                 if (is_ordering_operator(op) || matches!(op, BinaryOp::Eq | BinaryOp::NotEq))
-                    && grounded(&lhs_type)
-                    && self.is_native_operator_type(&lhs_type)
+                    && native_left
                 {
                     let rhs_type = self.infer_type(rhs_id, &lhs_type, &HashMap::default());
                     if grounded(&rhs_type)

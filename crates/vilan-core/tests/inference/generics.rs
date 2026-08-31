@@ -3242,18 +3242,27 @@ fn emitted_js_preserves_grouping_across_precedence() {
 }
 
 #[test]
-fn emitted_js_parenthesizes_right_nested_string_concat() {
-    // `+` is left-associative but not insensitive to grouping once strings mix
-    // in: `1 + (2 + "x")` is "12x", while flat `1 + 2 + "x"` would be "3x".
+fn emitted_js_parenthesizes_right_nested_addition() {
+    // `+` is left-associative but not insensitive to grouping: float addition
+    // does not reassociate, so `0.1 + (0.2 + 0.3)` is 0.6 where the flat
+    // `0.1 + 0.2 + 0.3` is 0.6000000000000001. The printer must keep the
+    // parentheses on a right-nested operand of equal precedence.
+    //
+    // This case was written as `1 + (2 + "x")` until B148: an `i32 + str`,
+    // which the native path's operand rule now refuses. It was itself an
+    // instance of the bug — the expression took its type from the LEFT operand
+    // and so type-checked as `i32` while the host produced the string "12x".
+    // The printer property is unchanged; only the operands had to become ones
+    // the language admits.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         fun main() {
-            let suffix = "x";
-            print(1 + (2 + suffix));
+            let start = 0.1;
+            print(start + (0.2 + 0.3));
         }
         "#,
-        "12x\n",
+        "0.6\n",
     );
 }
 
