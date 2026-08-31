@@ -10980,17 +10980,17 @@ impl<'src> Analyzer<'src> {
         let mut memo = HashMap::default();
         // The offense the caller CANNOT see is this check's whole subject. When
         // the callee's own signature is refused at this substitution and the
-        // caller has already been told so, every container inside the body is
-        // that one mistake seen a layer deeper (B154).
-        if self.instantiated_signature_already_reported(
+        // caller has already been told so, a container inside the body built
+        // out of THOSE type parameters is that one mistake seen a layer deeper
+        // (B154). Collected as a parameter set rather than asked as one
+        // yes/no, because the answer differs per offending type (E104).
+        let reported_signature_parameters = self.instantiated_signature_reported_parameters(
             instance.callee,
             &context,
             &containers,
             &no_generic_resources,
             &mut memo,
-        ) {
-            return;
-        }
+        );
         let mut examined: HashSet<TypeId> = HashSet::default();
         for (_, type_id, body_span) in sites {
             if !examined.insert(type_id) {
@@ -11018,6 +11018,14 @@ impl<'src> Analyzer<'src> {
             {
                 continue;
             }
+            // B154's stand-down, asked of THIS offending type: it is the
+            // signature's refusal a layer deeper only when every type parameter
+            // it is built from is one the reported signature already carried.
+            // A container the substitution caused through some OTHER parameter
+            // is an independent offense nobody has been told about.
+            if self.traces_only_to(type_id, &reported_signature_parameters) {
+                continue;
+            }
             let key = self.container_structure_key(found.container_type);
             if !self.reported_container_structures.insert(key) {
                 continue;
@@ -11032,9 +11040,11 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Whether the callee's own SIGNATURE — its parameters and its declared
-    /// return type, instantiated at this call — is itself refused by R10, and
-    /// the caller has already been told about it.
+    /// The callee's own generic parameters that a REFUSED-AND-REPORTED
+    /// signature type already accounts for at this call: for each parameter and
+    /// declared return type that R10 refuses once instantiated here AND whose
+    /// container the caller has already been told about, the generic parameters
+    /// its unsubstituted spelling is written in terms of.
     ///
     /// This is what keeps ONE mistake to one diagnostic across the two checks.
     /// `check_instantiation_container_resources` exists for the container a
@@ -11053,16 +11063,27 @@ impl<'src> Analyzer<'src> {
     /// a consequence of is already rejected. "Already reported" is asked of
     /// `reported_container_structures` rather than assumed, so a signature
     /// offense nobody was told about never silences the body's account of it.
-    fn instantiated_signature_already_reported(
+    ///
+    /// E104 is the other half of that sentence. The stand-down used to be one
+    /// early return over the whole instantiation, so the FIRST refused
+    /// signature type silenced every body container at it — including one
+    /// derived from a different type parameter, which is not a consequence of
+    /// anything the caller saw. `fun two<A, B>(a: Map<str, A>, own b: B) { let
+    /// items = [b]; }` at `A := Guard, B := Other` lost its `List<Other>`
+    /// entirely. Returning the covered PARAMETERS instead lets the question be
+    /// asked per offending type (`traces_only_to`): `Map<str, A>` covers `A`,
+    /// the body's `List<B>` is written in `B`, and `B` is nobody's consequence.
+    fn instantiated_signature_reported_parameters(
         &mut self,
         callee: Id,
         context: &SubstitutionContext,
         containers: &[(Id, &'static str)],
         resource_constraints: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
-    ) -> bool {
+    ) -> HashSet<TypeId> {
+        let mut covered: HashSet<TypeId> = HashSet::default();
         let Some(function) = self.functions.get(&callee) else {
-            return false;
+            return covered;
         };
         let mut signature_types: Vec<TypeId> = function
             .parameters
@@ -11080,14 +11101,38 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            if self
+            if !self
                 .reported_container_structures
                 .contains(&self.container_structure_key(found.container_type))
             {
-                return true;
+                continue;
             }
+            covered.extend(self.generic_parameters_of(type_id));
         }
-        false
+        covered
+    }
+
+    /// Whether every generic parameter `type_id` is written in terms of is in
+    /// `covered` — and that there is at least one, so a type that mentions no
+    /// parameter at all is never vacuously covered.
+    ///
+    /// The "traces to" of E104's stand-down: the body's `NativeMap<(K, V)>` is
+    /// the signature's refused `Map<K, V>` a layer deeper, while its `List<B>`
+    /// under a signature that only refused `Map<str, A>` is its own offense.
+    fn traces_only_to(&self, type_id: TypeId, covered: &HashSet<TypeId>) -> bool {
+        let parameters = self.generic_parameters_of(type_id);
+        !parameters.is_empty()
+            && parameters
+                .iter()
+                .all(|constraint_id| covered.contains(constraint_id))
+    }
+
+    /// The generic constraint ids `type_id`'s unsubstituted spelling is written
+    /// in terms of, in first-seen order.
+    fn generic_parameters_of(&self, type_id: TypeId) -> Vec<TypeId> {
+        let mut parameters = Vec::new();
+        self.collect_generics(&type_id.get_type(self), 0, &mut parameters);
+        parameters
     }
 
     /// the instantiation site, like the other R11 diagnostics.

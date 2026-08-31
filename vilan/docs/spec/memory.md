@@ -601,7 +601,10 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   reached. Because a `Map<K, Database>` offends at *both* heads — its own and
   the `NativeMap` inside it — and one mistake is one diagnostic, the refusal
   is reported at the head you wrote, and never a second time at the storage
-  behind it.
+  behind it. That collapse is scoped to the one mistake: it silences only the
+  containers built out of the very type parameters the reported refusal
+  already carried. A container the body builds out of a *different* parameter
+  is an independent offense nobody has been told about, and is still reported.
 
   It is read per instantiation whatever the type's **provenance**: an
   inferred container is a container. Deleting the annotation changes
