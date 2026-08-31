@@ -595,6 +595,14 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   `Shared<Database>` is. Holding the resource in a struct field of your own
   is the sanctioned alternative, and stays legal.
 
+  The set is closed over the standard library's own internals, not just the
+  surface it publishes: the raw `NativeMap` that `Map` and `Set` are built on
+  rejects a resource the same way, so the rule holds however the raw layer is
+  reached. Because a `Map<K, Database>` offends at *both* heads — its own and
+  the `NativeMap` inside it — and one mistake is one diagnostic, the refusal
+  is reported at the head you wrote, and never a second time at the storage
+  behind it.
+
   It is read per instantiation whatever the type's **provenance**: an
   inferred container is a container. Deleting the annotation changes
   nothing, and neither does never writing one —

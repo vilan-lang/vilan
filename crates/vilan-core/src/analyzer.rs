@@ -6734,9 +6734,22 @@ impl<'src> Analyzer<'src> {
     /// name: the native containers and the external generics. `Option` is the
     /// sanctioned resource container (a vilan enum, checkable under R11), so it
     /// is deliberately absent.
+    ///
+    /// `NativeMap` — the raw `std::native_map` layer the public `Map`/`Set` are
+    /// built on — belongs in the set for the same reason its wrappers do, and
+    /// omitting it was B154: its `insert(&mut self, key: Hash, value: V)`
+    /// declares `value` bare, so the widened temporary predicate destroys a
+    /// resource argument at the insert statement while the table goes on
+    /// holding it (a host-side use-after-free). Declaring `own value: V`
+    /// instead would close it by buying a redundant deep copy on EVERY
+    /// `Map`/`Set` insert in the language, to fence a module no public path
+    /// reaches; the head is the zero-cost fix. Because `Map`/`Set` hold their
+    /// own `NativeMap` member, this head is also reachable BENEATH a
+    /// `Map<K, Res>` — see `check_container_resource_arguments`, where the
+    /// member descent is what keeps that one mistake to one diagnostic.
     fn resource_rejecting_containers(&self) -> Vec<(Id, &'static str)> {
         let mut containers: Vec<(Id, &'static str)> = Vec::new();
-        for name in ["List", "Map", "Set", "Shared", "Context"] {
+        for name in ["List", "Map", "Set", "NativeMap", "Shared", "Context"] {
             if let Some(id) = self.primitive_struct_ids.get(name).copied() {
                 containers.push((id, name));
             }
@@ -10965,6 +10978,19 @@ impl<'src> Analyzer<'src> {
             .unwrap_or("this generic");
         let no_generic_resources = HashSet::default();
         let mut memo = HashMap::default();
+        // The offense the caller CANNOT see is this check's whole subject. When
+        // the callee's own signature is refused at this substitution and the
+        // caller has already been told so, every container inside the body is
+        // that one mistake seen a layer deeper (B154).
+        if self.instantiated_signature_already_reported(
+            instance.callee,
+            &context,
+            &containers,
+            &no_generic_resources,
+            &mut memo,
+        ) {
+            return;
+        }
         let mut examined: HashSet<TypeId> = HashSet::default();
         for (_, type_id, body_span) in sites {
             if !examined.insert(type_id) {
@@ -11004,6 +11030,64 @@ impl<'src> Analyzer<'src> {
                 Some((callee_name, body_span, instance.callee)),
             );
         }
+    }
+
+    /// Whether the callee's own SIGNATURE — its parameters and its declared
+    /// return type, instantiated at this call — is itself refused by R10, and
+    /// the caller has already been told about it.
+    ///
+    /// This is what keeps ONE mistake to one diagnostic across the two checks.
+    /// `check_instantiation_container_resources` exists for the container a
+    /// generic body builds out of its own `T` and never hands back (`fun
+    /// stash<T>(own value: T) { let items = [value]; }`): no type the caller
+    /// holds is a `List<Guard>`, so the whole-program sweep cannot reach it and
+    /// the instantiation is the only place to say so. When the signature IS
+    /// refused, the opposite is true — the caller holds the offending type
+    /// itself, was told at the type it wrote, and the body's container is that
+    /// same refusal one layer in. `Map<K, V>`'s storage is a `NativeMap<(K,
+    /// V)>` and `Set<T>`'s is a `NativeMap<T>`, so with the internal head in
+    /// R10's list (B154) `Map<str, Database>` reported at `Map` and again at
+    /// the `NativeMap` inside `Map::new`'s body — one mistake, two heads.
+    ///
+    /// E98's shape, generalized: a consequence is dropped when the thing it is
+    /// a consequence of is already rejected. "Already reported" is asked of
+    /// `reported_container_structures` rather than assumed, so a signature
+    /// offense nobody was told about never silences the body's account of it.
+    fn instantiated_signature_already_reported(
+        &mut self,
+        callee: Id,
+        context: &SubstitutionContext,
+        containers: &[(Id, &'static str)],
+        resource_constraints: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> bool {
+        let Some(function) = self.functions.get(&callee) else {
+            return false;
+        };
+        let mut signature_types: Vec<TypeId> = function
+            .parameters
+            .iter()
+            .filter_map(|parameter_id| self.parameters.get(parameter_id))
+            .map(|parameter| parameter.type_id)
+            .collect();
+        signature_types.extend(function.return_type_id);
+        for type_id in signature_types {
+            let instantiated = self
+                .substitute_type(&type_id.get_type(self), context)
+                .get_type_id(self);
+            let Some(found) =
+                self.container_resource_at(instantiated, containers, resource_constraints, memo)
+            else {
+                continue;
+            };
+            if self
+                .reported_container_structures
+                .contains(&self.container_structure_key(found.container_type))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// the instantiation site, like the other R11 diagnostics.
