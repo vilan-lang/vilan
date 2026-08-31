@@ -3867,17 +3867,19 @@ fn a_variant_pattern_steers_to_its_std_import() {
 
 #[test]
 fn the_value_position_some_still_steers() {
-    // The green control on the sibling path: a bare value-position name
+    // The green control on the sibling path: a bare VALUE-position name
     // steered before E103 and must go on steering after it — the fix joins a
     // second door to the steer, it does not move the first one. (`Some` left
-    // this pin when the prelude made it ambient; `Ordering` keeps the claim.)
+    // this pin when the prelude made it ambient; `format` keeps the claim ON
+    // THE VALUE DOOR — audit run 6 caught the first retarget landing on the
+    // type door, which the sibling type pins already cover.)
     assert_fails_with(
         r#"
         fun main() {
-            let order = Ordering::Less;
+            let v = format("x");
         }
         "#,
-        "cannot find type 'Ordering'; import it first (`import std::compare::Ordering;`)",
+        "cannot find 'format' in this scope; import it first",
     );
 }
 

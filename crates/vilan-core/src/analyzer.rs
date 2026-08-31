@@ -3008,7 +3008,7 @@ pub enum ImportableKind {
 /// the module is publishing the name on purpose, and std's `lib.vl` — which
 /// declares nothing at all — is entirely made of them.
 /// The curated steer for a name std's package root used to re-export
-/// (`prelude.md` §10.2). Thirteen aliases lived in `std/src/lib.vl` for one
+/// (`prelude.md` §10.2). Sixteen aliases lived in `std/src/lib.vl` for one
 /// reason — to let a caller write `std::print` instead of `std::io::print` —
 /// and the prelude serves that better, so they were deleted.
 ///
@@ -28911,6 +28911,21 @@ impl<'src> Analyzer<'src> {
         // get the ordinary import steer, not "switch to the web set".
         for shared in ["print", "Option", "Some", "None", "Result", "Ok", "Err"] {
             names.remove(shared);
+        }
+        // A MODULE-carried entry (`style`, `ui`) leaves the steer set too:
+        // under the web set the bare name becomes a module, so a VALUE-position
+        // miss on it is not fixed by switching preludes — the steer's "both
+        // work" promise fails exactly there (audit run 6, F2: the css desugar
+        // needs the bare function `std::style::style`, and the css note beside
+        // it names the import that actually compiles). Removed dynamically by
+        // the std module list, never a Rust-side name copy.
+        let module_names: Vec<String> = self
+            .std_module_files
+            .iter()
+            .map(|(module_name, _)| module_name.clone())
+            .collect();
+        for module_name in module_names {
+            names.remove(module_name.as_str());
         }
         self.web_prelude_index = Some(names);
     }

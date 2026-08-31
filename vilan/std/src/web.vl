@@ -27,7 +27,7 @@ export import pkg::ui::{ view, View };
 //
 // `style` is the move that dissolves the `Display` collision: the CSS enum is
 // `style::Display` and the `to_string` trait keeps bare `Display` to itself, so
-// neither has to rename. It carries sixteen enums for one name. A file that
+// neither has to rename. It carries eleven enums for one name. A file that
 // wants the builder bare still writes `import std::style::style;` — an explicit
 // import beats an ambient module, so all 60 existing `style()` call sites are
 // untouched.

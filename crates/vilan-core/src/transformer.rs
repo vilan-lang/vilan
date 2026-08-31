@@ -8340,9 +8340,11 @@ impl<'src> Transformer<'src> {
     /// `List<Generic(T)>`) so the caller can bind the impl's generics from the
     /// concrete type's arguments.
     fn resolve_member_on_type(&self, type_id: TypeId, member: &str) -> Option<(Id, TypeId)> {
-        // Nominal subjects only: a re-dispatch with no trait to steer by is the
-        // fallback path, and widening it to every impl subject shape would
-        // change which body existing programs reach without a bound asking.
+        // Nominal RECEIVERS only (the check below is on the receiver's type;
+        // impl subjects of every shape, blankets included, are admitted past
+        // it by select_member): a re-dispatch with no trait to steer by is
+        // the fallback path, and widening the receiver set would change which
+        // body existing programs reach without a bound asking.
         if !matches!(
             self.program.type_id_to_type_map.get(&type_id),
             Some(Type::Struct(..) | Type::Enum(..))

@@ -8498,7 +8498,7 @@ pub(crate) mod tests {
             "`import std::lib` is not a thing: {labels:?}"
         );
         // std's `lib.vl` surface publishes NOTHING since the alias sweep
-        // (prelude.md §10.2) — its thirteen re-exports were short-name aliases
+        // (prelude.md §10.2) — its sixteen re-exports were short-name aliases
         // and each name is spelled at its real home now. The two prelude
         // modules are ordinary modules and list as such.
         assert!(

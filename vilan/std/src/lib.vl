@@ -2,7 +2,7 @@
 // so anything re-exported here would be reachable by the SHORT name `std::x`.
 //
 // Nothing is. Every entry that used to sit here — `print`, `panic`, `assert`,
-// `Default`, `str` and the ten numerics — existed for one reason: to let a
+// `Default`, `str` and the eleven numerics — existed for one reason: to let a
 // caller write `std::print` instead of `std::io::print`. That is import
 // brevity, and the prelude serves it properly now (`prelude.md` §10.2), so the
 // aliases are gone and each name is spelled at its real home.

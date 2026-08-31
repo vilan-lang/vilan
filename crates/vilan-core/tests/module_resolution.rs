@@ -3258,6 +3258,31 @@ fn a_package_already_on_the_web_set_never_gets_the_web_steer() {
 }
 
 #[test]
+fn a_module_carried_web_name_gets_no_web_steer() {
+    // The web set carries `style` and `ui` as MODULES, so switching preludes
+    // does not make the bare name a value — the "both work" promise fails
+    // exactly there (audit run 6, F2). A value-position miss on `style` must
+    // fall through to the ordinary machinery (the css note beside the css
+    // desugar names the import that actually compiles: `std::style::style`).
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", "fun main() { let s = style(); }\n")],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("cannot find 'style' in this scope")),
+        "the ordinary miss still reports: {errors:?}",
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("web set")),
+        "no web-set steer for a module-carried name: {errors:?}",
+    );
+}
+
+#[test]
 fn the_base_seven_never_steer_toward_the_web_set() {
     // Both sets carry them, so a `prelude = false` package missing `print`
     // must be told to import it, not to switch sets.
