@@ -876,13 +876,62 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 
 /// Past a raw-text element's body (`<script>`, `<style>`): its content is not
 /// markup, so the scanner resumes at its closing tag.
+///
+/// The search compares in place rather than folding a copy of the document
+/// (M14). It used to be `index_of(markup.to_lowercase_ascii(), "</" + name,
+/// from)`, which folded the WHOLE markup once per raw-text element — a page
+/// with five `<script>`s folded itself five times — and since F14 that fold is
+/// a per-code-unit vilan loop rather than one host call, minting a
+/// one-character string and a concatenation per unit. `index_of` then minted
+/// its own needle-length substring per position on top. Neither allocation
+/// buys anything a comparison cannot do directly, and the answer is the same
+/// one: `name` is already ASCII-folded by its caller, and folding `A`..`Z` in
+/// place preserves both length and index, so a case-insensitive compare
+/// against the unfolded markup finds exactly the position the folded copy did.
 fun skip_raw_text(markup: str, from: i32, name: str): i32 {
-	// Lowercased for the search only — `to_lowercase_ascii` maps `A`..`Z` in
-	// place and touches nothing else, so the index it reports is an index
-	// into `markup` too. That claim was FALSE while the name lowered to the
-	// host's full fold, which is length-changing (`İ` becomes two units);
-	// F14's honest ASCII pair is what makes it true.
-	past(index_of(markup.to_lowercase_ascii(), "</" + name, from), 0, markup.len())
+	let length = markup.len();
+	let closing = "</" + name;
+	let closing_length = closing.len();
+	mut index = if from < 0 {
+		0
+	} else {
+		from
+	};
+	for index + closing_length <= length {
+		if matches_ascii_insensitive(markup, index, closing) {
+			ret index;
+		}
+		index = index + 1;
+	}
+	length
+}
+
+/// Whether `markup` carries `needle` at `at`, reading `A`–`Z` and `a`–`z` as
+/// equal and every other code unit exactly.
+///
+/// `at + needle.len() <= markup.len()` is the caller's contract, and it is what
+/// puts every `code_at` below in range.
+fun matches_ascii_insensitive(markup: str, at: i32, needle: str): bool {
+	let needle_length = needle.len();
+	mut offset = 0;
+	for offset < needle_length {
+		if lowered_unit(markup.code_at(at + offset)) != lowered_unit(needle.code_at(offset)) {
+			ret false;
+		}
+		offset = offset + 1;
+	}
+	true
+}
+
+/// One code unit with `A` (65) through `Z` (90) shifted to `a`–`z` and every
+/// other unit untouched — `to_lowercase_ascii`'s rule, per unit, minting no
+/// string.
+fun lowered_unit(unit: u32): u32 {
+	if unit >= 65 && unit <= 90 {
+		unit + 32
+	} else {
+		unit
+	}
 }
 
 /// The first index at or after `from` that is not whitespace.

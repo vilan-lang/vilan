@@ -1373,3 +1373,108 @@ fn a_closing_tag_only_an_unused_hatch_would_need_is_not_required() {
         "the body() markup should compose despite the missing </head> no hatch aims at:\n{report}"
     );
 }
+
+// --- M14: the raw-text skip prices itself -----------------------------------
+//
+// `skip_raw_text` used to fold the WHOLE document with `to_lowercase_ascii`
+// once per `<script>`/`<style>` element, and since F14 that fold is a
+// per-code-unit vilan loop rather than one host call. It now compares in place,
+// which changes nothing a caller can observe — so the pins below are the
+// scanner's OBSERVABLE behaviour through `check_shell`, held over exactly the
+// shapes the fold was there to serve. Measured on an 18,190-unit page carrying
+// five `<script>` elements (counts, not milliseconds, and the driver's own
+// search excluded): 182,015 strings minted and 90,950 code units read before,
+// 5 and 290 after. The five mints are the one `"</" + name` per element; the
+// old figure is dominated by the fold, which is why it scales with the DOCUMENT
+// where the new one scales with the element's body.
+const RAW_TEXT: &str = r#"import std::build::LegBuild;
+import std::document::check_shell;
+import std::io::print;
+import std::option::Option::{ None, Some, self };
+import std::result::Result::{ Err, Ok, self };
+
+fun build(): LegBuild {
+	LegBuild {
+		leg = "client",
+		dist = "dist",
+		bundle = "client.js",
+		styles = None,
+		chunks = [],
+		classic_script = false,
+		assets = [],
+	}
+}
+
+fun report(label: str, shell: str) {
+	match check_shell(shell, build(), "app") {
+		Ok(let _ok) => print(i"{label}: OK"),
+		Err(let faults) => {
+			for fault in faults {
+				print(i"{label}: FAULT {fault.message()}");
+			}
+		},
+	}
+}
+
+fun main() {
+	// The baseline: an ordinary page, nothing raw before the mount.
+	report("plain", "<!doctype html><html><head></head><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>");
+	// An UPPERCASE element and its uppercase close, then the mount AFTER it. A
+	// case-sensitive search would run the skip to the end of the document and
+	// the mount would go unseen.
+	report("upper", "<!doctype html><html><head></head><body><SCRIPT>let a = 1;</SCRIPT><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>");
+	// The close in mixed case, which is the half a fold of the NAME alone
+	// would not have covered.
+	report("mixed", "<!doctype html><html><head></head><body><script>let a = 1;</ScRiPt><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>");
+	// The skip really skips: markup inside a script body is text, so the mount
+	// spelled in a JavaScript string is NOT a mount element.
+	report("inbody", "<!doctype html><html><head></head><body><script>let s = '<div id=\"app\"></div>';</script><script type=\"module\" src=\"/client.js\"></script></body></html>");
+	// Non-ASCII in the body, including the length-changing `İ` that made the
+	// pre-F14 full fold report an index into a string the caller did not have.
+	report("unicode", "<!doctype html><html><head></head><body><script>let x = \"İǱßé\";</script><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>");
+	// A raw-text element with no closing tag at all: the skip runs to the end
+	// of the document, which is what the `<` bound must allow rather than read
+	// past.
+	report("unterminated", "<!doctype html><html><head></head><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script><script>never closed");
+	// The other half of the unterminated case, and the one that discriminates
+	// the fallback: an element with no close SWALLOWS the rest of the
+	// document, so a mount spelled after it is still raw text and the check
+	// must refuse. A skip that gave up and resumed where it started would
+	// find it and pass.
+	report("swallowed", "<!doctype html><html><head></head><body><script type=\"module\" src=\"/client.js\"></script><script>let s = '<div id=\"app\"></div>';");
+	// A `<style>` too — the other raw-text name, so the skip is not pinned on
+	// `script` alone.
+	report("style", "<!doctype html><html><head><STYLE>a { content: \"</div>\" }</STYLE></head><body><div id=\"app\"></div><script type=\"module\" src=\"/client.js\"></script></body></html>");
+}
+"#;
+
+#[test]
+fn the_raw_text_skip_reads_the_closing_tag_without_regard_to_case() {
+    let report = run_probe("rawtext", RAW_TEXT);
+    // Every shape whose mount sits after a raw-text element passes: the skip
+    // ends at the closing tag whatever case it is written in, and the scanner
+    // resumes on real markup.
+    for label in [
+        "plain",
+        "upper",
+        "mixed",
+        "unicode",
+        "unterminated",
+        "style",
+    ] {
+        assert!(
+            report.contains(&format!("{label}: OK")),
+            "`{label}` should scan clean:\n{report}"
+        );
+    }
+    // And the negative that proves the skip is a skip: a mount element spelled
+    // inside a script body is text, not an element.
+    for label in ["inbody", "swallowed"] {
+        assert!(
+            report.contains(&format!(
+                "{label}: FAULT no element in this document carries id=\"app\""
+            )),
+            "markup inside a raw-text body must not be scanned as markup (`{label}`):\n{report}"
+        );
+    }
+}
