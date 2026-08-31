@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Parameter, SourceId};
+use vilan_core::formatter::{STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
 use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
-use vilan_core::lexing::tokenize;
-use vilan_core::node::Convention;
+use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, HASH_IS_NOT_A_TOKEN, tokenize};
+use vilan_core::node::{Convention, CssDeclaration, CssItem, CssValuePiece, Node};
+use vilan_core::parsing::IMPORTANT_HAS_NO_PLACE;
 use vilan_core::{
     Error, LeakedEntryAst, Manifest, OwnedModules, Platform as BuildPlatform, Program, Span,
     Workspace as BuildWorkspace, analyze_source_owning_overlay_modules,
@@ -720,6 +722,53 @@ fn collect_markup_spans(
     }
     node.0
         .for_each_child(&mut |child| collect_markup_spans(child, out));
+}
+
+/// The `css`-block spans of a raw parse (css-block S5): property names,
+/// condition-head names, and the one desugar-scaffolding span that is NOT
+/// zero-width.
+///
+/// S2 cut every one of these deliberately, for this slice: the AST carries the
+/// property-name span, and each generated accessor takes a zero-width anchor so
+/// that no analyzed token ever lands on CSS-side syntax. The single exception is
+/// the outer `style()`, which keeps the `css` keyword's own span so a missing
+/// `import std::style::style` underlines the word that asked for a `Style` — and
+/// that one accessor is what `scaffolding` suppresses here, exactly as the
+/// element desugar's `<tag` accessor is suppressed.
+#[derive(Default)]
+struct CssSpans {
+    scaffolding: Vec<Span>,
+    properties: Vec<Span>,
+    conditions: Vec<Span>,
+}
+
+/// The `css` keyword's own length. A `Node::Css` span starts exactly at the
+/// keyword (`css.rs`'s `KEYWORD`), so this is the outer `style()` accessor's
+/// span — the one token to suppress.
+const CSS_KEYWORD_LENGTH: usize = "css".len();
+
+fn collect_css_spans(node: &vilan_core::Spanned<vilan_core::node::Node<'_>>, out: &mut CssSpans) {
+    if let Node::Css(body) = &node.0 {
+        out.scaffolding
+            .push((node.1.start..node.1.start + CSS_KEYWORD_LENGTH).into());
+        collect_css_body_spans(body, out);
+    }
+    // Holes and condition-head arguments are ordinary expression positions, so
+    // a block written inside one is reached the same way any other child is.
+    node.0
+        .for_each_child(&mut |child| collect_css_spans(child, out));
+}
+
+fn collect_css_body_spans(body: &vilan_core::node::CssBody<'_>, out: &mut CssSpans) {
+    for item in &body.items {
+        match item {
+            CssItem::Declaration(declaration) => out.properties.push(declaration.property),
+            CssItem::Nested(nested) => {
+                out.conditions.push(nested.name.1);
+                collect_css_body_spans(&nested.body, out);
+            }
+        }
+    }
 }
 
 /// The innermost element whose open or close TAG NAME contains `offset`,
@@ -1877,20 +1926,27 @@ impl Document {
         // suppressed here and the tag painted from the markup itself. (A
         // per-request parse is the `keyword_hover` pattern: cheap, and
         // independent of analysis succeeding.)
+        //
+        // A `css` block (css-block S5) rides the very same parse for the very
+        // same reason: `Node::Css` is retired before analysis too, so property
+        // names and condition heads exist only in the raw tree.
         {
             let mut markup = MarkupSpans::default();
+            let mut css = CssSpans::default();
             let (tree, _errors) = vilan_core::parsing::parse(self.analyzed_text());
             if let Some(root) = &tree {
                 for item in &root.0 {
                     collect_markup_spans(item, &mut markup);
+                    collect_css_spans(item, &mut css);
                 }
             }
-            if !markup.scaffolding.is_empty() {
-                let scaffolding: std::collections::HashSet<(usize, usize)> = markup
-                    .scaffolding
-                    .iter()
-                    .map(|span| (span.start, span.end))
-                    .collect();
+            let scaffolding: std::collections::HashSet<(usize, usize)> = markup
+                .scaffolding
+                .iter()
+                .chain(css.scaffolding.iter())
+                .map(|span| (span.start, span.end))
+                .collect();
+            if !scaffolding.is_empty() {
                 tokens.retain(|(span, _, _)| !scaffolding.contains(&(span.start, span.end)));
             }
             for span in markup.tags {
@@ -1898,6 +1954,16 @@ impl Document {
             }
             for span in markup.attributes {
                 tokens.push((span, TokenKind::Property, 0));
+            }
+            // A property name is CSS, not a method reference; a condition head
+            // IS the `Style` method it lowers to, and paints as one — the
+            // precise form of TextMate's two approximations
+            // (`support.type.property-name`, `entity.name.function`).
+            for span in css.properties {
+                tokens.push((span, TokenKind::Property, 0));
+            }
+            for span in css.conditions {
+                tokens.push((span, TokenKind::Method, 0));
             }
         }
 
@@ -2609,9 +2675,96 @@ impl Document {
                     span: semicolon_span,
                     replacement: String::new(),
                 });
+            } else if diagnostic.msg.starts_with(HASH_IS_NOT_A_TOKEN)
+                && let Some(span) = hex_colour_span(&self.text, diagnostic.span.start)
+            {
+                // css-block S5, §7.2 fix 1. The lexer is context-free, so the
+                // diagnostic is ONE character wide (`#`) — the colour it
+                // belongs to is read off the text here, and the fix is the
+                // hole spelling the diagnostic already names, so the two
+                // cannot disagree (E58c's rule, applied to a curated rule
+                // instead of a note).
+                let hole = format!("{{Color::hex(\"{}\")}}", &self.text[span.into_range()]);
+                fixes.push(QuickFix {
+                    title: format!("Wrap as `{hole}`"),
+                    span,
+                    replacement: hole,
+                });
+            } else if diagnostic.msg.starts_with(AT_IS_NOT_A_TOKEN)
+                && let Some(fix) = media_rule_fix(&self.text, diagnostic.span.start)
+            {
+                // §7.2 fix 2, the `#`'s twin: the one at-rule with a
+                // combinator spelling is a min-width media query.
+                fixes.push(fix);
+            } else if diagnostic.msg.starts_with(IMPORTANT_HAS_NO_PLACE) {
+                // §7.2 fix 3. The parser excises `!important` from the value
+                // and reports at exactly its span, so the fix is that span
+                // plus the whitespace holding it to the value — removing the
+                // marker alone would leave `flex ;`.
+                let start = self.text[..diagnostic.span.start]
+                    .trim_end_matches([' ', '\t'])
+                    .len();
+                fixes.push(QuickFix {
+                    title: "Remove `!important`".to_string(),
+                    span: Span::from(start..diagnostic.span.end),
+                    replacement: String::new(),
+                });
             }
         }
         fixes
+    }
+
+    /// The `css`-spelling conversion offered over `range` (LIVE space, and the
+    /// caller gates staleness first exactly as it does for [`Self::quickfixes`])
+    /// — css-block.md §7.2's one refactor, and the estate's migration path.
+    ///
+    /// Read from a RAW parse, like every other css query: neither spelling's
+    /// distinguishing node survives desugaring, and the block is the one that
+    /// does not survive at all. The block direction is tried first, because a
+    /// cursor in a block is never in a chain but a cursor in a chain LINK's
+    /// argument may be in a block.
+    pub fn css_spelling_conversion(&self, range: Span) -> Option<CssConversion> {
+        let source = self.text.as_str();
+        let (tree, _errors) = vilan_core::parsing::parse(source);
+        let root = tree?;
+        let commented = |span: Span| {
+            vilan_core::formatter::extract_comments(source)
+                .iter()
+                .any(|(comment, _)| spans_overlap(span, *comment))
+        };
+        let mut block = None;
+        for item in &root.0 {
+            innermost_css_node(item, range.start, &mut block);
+        }
+        if let Some(node) = block {
+            let Node::Css(body) = &node.0 else {
+                unreachable!("innermost_css_node only records a `Node::Css`");
+            };
+            // A comment's attachment is not recoverable across the reshape —
+            // the S3 printer refuses to reorder a commented block for exactly
+            // this reason, and inventing a placement here would be worse.
+            if commented(node.1) {
+                return None;
+            }
+            return Some(CssConversion {
+                to_chain: true,
+                span: node.1,
+                replacement: render_style_chain(body, source, &line_indent(source, node.1.start))?,
+            });
+        }
+        let mut chain = None;
+        for item in &root.0 {
+            outermost_style_chain(item, range.start, &mut chain);
+        }
+        let node = chain?;
+        if commented(node.1) {
+            return None;
+        }
+        Some(CssConversion {
+            to_chain: false,
+            span: node.1,
+            replacement: render_css_block(node, source, &line_indent(source, node.1.start))?,
+        })
     }
 
     /// Every unambiguous missing-import fix in the file, folded into ONE edit
@@ -2791,6 +2944,353 @@ fn closest_name_suggestion(note_message: &str) -> Option<&str> {
     note_message
         .strip_prefix("did you mean `")?
         .strip_suffix("`?")
+}
+
+/// One direction of the `css`-block ⇄ `style()`-chain conversion (css-block.md
+/// §7.2's refactor). The two spellings are interconvertible because the lowering
+/// is TOTAL and one-to-one (§5.2): a declaration is a `.raw` link, a nested rule
+/// is a combinator link carrying the inner chain as its final argument, and
+/// there is no third row.
+///
+/// Both directions DECLINE rather than guess, which is the whole of what makes a
+/// refactor safe to offer from a menu. The three refusals, each about meaning
+/// rather than shape:
+///
+/// - a **comment** anywhere inside the construct;
+/// - a value whose text carries a **backslash** — a chain's string literal has
+///   its escapes processed at emission and a block's token run does not, so the
+///   two spellings would stop meaning the same thing (a `"` is fine: escaping it
+///   into the literal round-trips exactly);
+/// - a chain link that is neither `.raw(<name>, …)` nor a condition combinator.
+///   `.padding(space(4))` lowers to `with_length("padding", …)`, which is NOT
+///   the node `padding: {space(4)};` lowers to — so the inverse is partial by
+///   construction, and says so by not being offered.
+pub struct CssConversion {
+    /// `true` for block → chain, `false` for chain → block. The server picks
+    /// the action's title from it, as a literal, so `book_sync.rs` can hold the
+    /// book's editor page to both.
+    pub to_chain: bool,
+    pub span: Span,
+    pub replacement: String,
+}
+
+/// The innermost `Node::Css` containing `offset`. Nested rules are not nodes, so
+/// this narrows only across blocks written inside one another's holes.
+fn innermost_css_node<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+    offset: usize,
+    out: &mut Option<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>,
+) {
+    if matches!(node.0, Node::Css(_)) && node.1.start <= offset && offset <= node.1.end {
+        *out = Some(node);
+    }
+    node.0
+        .for_each_child(&mut |child| innermost_css_node(child, offset, out));
+}
+
+/// The OUTERMOST `style()`-seeded chain containing `offset` — the whole chain,
+/// never a link's own inner one, which is why the walk stops at its first hit.
+fn outermost_style_chain<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+    offset: usize,
+    out: &mut Option<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>,
+) {
+    if out.is_some() {
+        return;
+    }
+    if node.1.start <= offset
+        && offset <= node.1.end
+        && style_chain_links(node).is_some_and(|links| !links.is_empty())
+    {
+        *out = Some(node);
+        return;
+    }
+    node.0
+        .for_each_child(&mut |child| outermost_style_chain(child, offset, out));
+}
+
+/// The links of a `style()`-seeded chain, in written order, or `None` when
+/// `node` is some other expression. The seed is a bare `style()` call — a
+/// receiver of any other shape is not a chain this refactor can read.
+fn style_chain_links<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+) -> Option<Vec<&'a vilan_core::Spanned<vilan_core::node::Node<'src>>>> {
+    match &node.0 {
+        Node::MemberAccessor(subject, member) => {
+            let mut links = style_chain_links(subject)?;
+            links.push(member);
+            Some(links)
+        }
+        Node::Call(callee, None, arguments)
+            if matches!(callee.0, Node::Accessor("style")) && arguments.0.is_empty() =>
+        {
+            Some(Vec::new())
+        }
+        _ => None,
+    }
+}
+
+/// The leading whitespace of the line `offset` sits on — the indentation the
+/// converted construct is written at.
+fn line_indent(source: &str, offset: usize) -> String {
+    let line_start = source[..offset].rfind('\n').map(|at| at + 1).unwrap_or(0);
+    source[line_start..offset]
+        .chars()
+        .take_while(|character| *character == ' ' || *character == '\t')
+        .collect()
+}
+
+/// A `css` body as the `style()` chain it lowers to. One link per line at
+/// `indent` + 1, except that a body of a single declaration renders inline —
+/// the shape S3 gives the outer body itself, and the shape the corpus's own
+/// chain twin is written in.
+fn render_style_chain(
+    body: &vilan_core::node::CssBody<'_>,
+    source: &str,
+    indent: &str,
+) -> Option<String> {
+    let inline = body.items.len() <= 1
+        && !body
+            .items
+            .iter()
+            .any(|item| matches!(item, CssItem::Nested(_)));
+    let mut out = String::from("style()");
+    for item in &body.items {
+        let link = render_chain_link(item, source)?;
+        if !inline {
+            out.push('\n');
+            out.push_str(indent);
+            out.push('\t');
+        }
+        out.push_str(&link);
+    }
+    Some(out)
+}
+
+/// A body rendered on ONE line — a nested rule's inner chain, which is a chain
+/// link's ARGUMENT and never breaks.
+fn render_inline_chain(body: &vilan_core::node::CssBody<'_>, source: &str) -> Option<String> {
+    let mut out = String::from("style()");
+    for item in &body.items {
+        out.push_str(&render_chain_link(item, source)?);
+    }
+    Some(out)
+}
+
+fn render_chain_link(item: &CssItem<'_>, source: &str) -> Option<String> {
+    match item {
+        CssItem::Declaration(declaration) => {
+            let property = &source[declaration.property.into_range()];
+            let value = render_chain_value(declaration, source)?;
+            Some(format!(".raw(\"{property}\", {value})"))
+        }
+        CssItem::Nested(nested) => {
+            let mut arguments: Vec<String> = nested
+                .arguments
+                .iter()
+                .map(|argument| source[argument.1.into_range()].to_string())
+                .collect();
+            // Inner-last, as the desugar appends it (§5.3).
+            arguments.push(render_inline_chain(&nested.body, source)?);
+            Some(format!(".{}({})", nested.name.0, arguments.join(", ")))
+        }
+    }
+}
+
+/// A declaration's value as the `raw` argument it lowers to — the three rows of
+/// §5.2's table, in the same order the desugar reads them.
+fn render_chain_value(declaration: &CssDeclaration<'_>, source: &str) -> Option<String> {
+    match declaration.value.as_slice() {
+        // Exactly one hole passes its expression through untouched, so the
+        // argument IS that expression.
+        [CssValuePiece::Hole(_, braces)] => Some(
+            source[braces.start + 1..braces.end.saturating_sub(1)]
+                .trim()
+                .to_string(),
+        ),
+        [CssValuePiece::Text(text)] => {
+            Some(format!("\"{}\"", escape_value(&source[text.into_range()])?))
+        }
+        // Mixed: the i-string the desugar's concatenation already is — the two
+        // build the same tree (§5.2), and the value's own text is an i-string
+        // body verbatim, holes included.
+        pieces => {
+            let mut literal = String::new();
+            for piece in pieces {
+                match piece {
+                    CssValuePiece::Hole(_, braces) => {
+                        literal.push_str(&source[braces.into_range()])
+                    }
+                    CssValuePiece::Text(text) => {
+                        literal.push_str(&escape_value(&source[text.into_range()])?)
+                    }
+                }
+            }
+            Some(format!("i\"{literal}\""))
+        }
+    }
+}
+
+/// `text` as a vilan string-literal BODY, or `None` when the two spellings would
+/// stop meaning the same thing — see [`CssConversion`]'s backslash refusal.
+fn escape_value(text: &str) -> Option<String> {
+    (!text.contains('\\')).then(|| text.replace('"', "\\\""))
+}
+
+/// A `style()` chain as the `css` block it is the lowering of.
+fn render_css_block(
+    chain: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    source: &str,
+    indent: &str,
+) -> Option<String> {
+    let items = render_css_items(&style_chain_links(chain)?, source, indent)?;
+    Some(format!("css {{\n{items}{indent}}}"))
+}
+
+fn render_css_items(
+    links: &[&vilan_core::Spanned<vilan_core::node::Node<'_>>],
+    source: &str,
+    indent: &str,
+) -> Option<String> {
+    let inner = format!("{indent}\t");
+    let mut out = String::new();
+    for link in links {
+        let Node::Call(callee, None, arguments) = &link.0 else {
+            return None;
+        };
+        let Node::Accessor(name) = callee.0 else {
+            return None;
+        };
+        if name == "raw" {
+            let [property, value] = arguments.0.as_slice() else {
+                return None;
+            };
+            let Node::String(property) = property.0 else {
+                return None;
+            };
+            if !is_css_property(property) {
+                return None;
+            }
+            let value = render_block_value(value, source);
+            out.push_str(&format!("{inner}{property}: {value};\n"));
+        } else if STYLE_CONDITION_METHODS
+            .iter()
+            .any(|(condition, _)| *condition == name)
+        {
+            let (nested, head) = arguments.0.split_last()?;
+            let body = render_css_items(&style_chain_links(nested)?, source, &inner)?;
+            let head = if head.is_empty() {
+                String::new()
+            } else {
+                let written: Vec<String> = head
+                    .iter()
+                    .map(|argument| source[argument.1.into_range()].to_string())
+                    .collect();
+                format!("({})", written.join(", "))
+            };
+            out.push_str(&format!("{inner}.{name}{head} {{\n{body}{inner}}}\n"));
+        } else {
+            // Not a row of the lowering table: no block spelling exists, and
+            // one is not this refactor's to invent.
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// A `raw` argument as a declaration's value. A plain token run is written as
+/// itself; everything else goes back through a HOLE, which is exact — a value
+/// that is exactly one hole passes its expression through untouched.
+fn render_block_value(
+    value: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    source: &str,
+) -> String {
+    if let Node::String(literal) = value.0
+        && !literal.is_empty()
+        && literal.trim() == literal
+        && !literal.contains(['\\', '"', ';', '{', '}'])
+    {
+        return literal.to_string();
+    }
+    format!("{{{}}}", &source[value.1.into_range()])
+}
+
+/// Whether `name` is spellable as a `css` property: the span-adjacent
+/// `name`-`-`-`name` run the grammar reads (`parse_css_property`), custom
+/// properties and vendor prefixes included. A `raw` call naming anything else
+/// has no block spelling.
+fn is_css_property(name: &str) -> bool {
+    let body = name.trim_start_matches('-');
+    if name.len() - body.len() > 2 || body.is_empty() {
+        return false;
+    }
+    body.split('-').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && !segment.as_bytes()[0].is_ascii_digit()
+    })
+}
+
+/// The whole `#rrggbb` run the `#` diagnostic at `hash` points at — when it IS
+/// one. CSS has exactly four hex-colour lengths (3, 4, 6 and 8 digits), and the
+/// run has to END there: `#zzz` and `#333xyz` are not colours, and a fix that
+/// rewrote them would be inventing a value the author never wrote. Those keep
+/// the rule's explanation and get no edit at all (css-block.md §7.2 fix 1).
+fn hex_colour_span(text: &str, hash: usize) -> Option<Span> {
+    let rest = text.get(hash..)?.strip_prefix('#')?;
+    let digits = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+    let ends = rest
+        .as_bytes()
+        .get(digits)
+        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
+    (matches!(digits, 3 | 4 | 6 | 8) && ends).then(|| Span::from(hash..hash + 1 + digits))
+}
+
+/// css-block.md §7.2 fix 2: `@media (min-width: 768px) {` → `.md {`.
+///
+/// The diagnostic is the lexer's and one character wide, so the at-rule's head
+/// is read off the text: `@media`, a parenthesized query, and the `{` that opens
+/// the rule. The combinator comes from the query's own min-width —
+/// [`STYLE_BREAKPOINT_WIDTHS`] where one names it, and the general `.media("…")`
+/// the four delegate to where none does, which is exact for any width.
+///
+/// `None` for every other at-rule. `@supports`, `@font-face` and `@keyframes`
+/// have no combinator spelling (§10), so there is nothing to offer and the
+/// diagnostic's own sentence is the whole answer.
+fn media_rule_fix(text: &str, at: usize) -> Option<QuickFix> {
+    let rest = text.get(at..)?.strip_prefix("@media")?;
+    let query_start = rest.len() - rest.trim_start().len();
+    let query = rest[query_start..].strip_prefix('(')?;
+    let query_end = query.find(')')?;
+    let (property, width) = query[..query_end].split_once(':')?;
+    if property.trim() != "min-width" {
+        return None;
+    }
+    let width = width.trim();
+    let after_query = query_start + 1 + query_end + 1;
+    let brace = rest[after_query..].len() - rest[after_query..].trim_start().len();
+    if !rest[after_query + brace..].starts_with('{') {
+        return None;
+    }
+    let head = match STYLE_BREAKPOINT_WIDTHS
+        .iter()
+        .find(|(_, breakpoint)| *breakpoint == width)
+    {
+        Some((name, _)) => format!(".{name}"),
+        None => format!(".media(\"{width}\")"),
+    };
+    // The spelling is built once and quoted into the title, rather than doubling
+    // braces inside the `format!` template: `book_sync.rs` reads that template
+    // literally to hold the book's editor page in sync, and `{{` is not a hole
+    // to it.
+    let spelling = format!("{head} {{ … }}");
+    Some(QuickFix {
+        title: format!("Use `{spelling}`"),
+        span: Span::from(at..at + "@media".len() + after_query + brace + 1),
+        replacement: format!("{head} {{"),
+    })
 }
 
 /// S2's parse-error message (`parsing.rs::render`, `ParseErrorReason::
@@ -3295,6 +3795,285 @@ pub(crate) mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- css-block S5: the quickfixes of §7.2 --------------------------------
+
+    /// The fixes `quickfixes` offers over a whole `css`-block fixture, as
+    /// `(title, replaced text, replacement)` — the shape every §7.2 pin reads.
+    fn css_block_fixes(body: &str) -> Vec<(String, String, String)> {
+        let source = format!(
+            "import std::style::{{ Color, Style, style }};\n\nfun card(): Style {{\n{body}}}\n"
+        );
+        let (directory, document) = analyze_workspace(&[("main.vl", &source)]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("a css fixture still analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| {
+                (
+                    fix.title,
+                    text[fix.span.into_range()].to_string(),
+                    fix.replacement,
+                )
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        fixes
+    }
+
+    // §7.2 fix 1. `#` cannot lex — lexing is context-free and finishes before
+    // the parser exists (§4.1) — so the diagnostic is ONE CHARACTER wide and
+    // the fix reads the colour off the text itself. It rewrites the whole run,
+    // into the hole spelling the diagnostic already names.
+    #[test]
+    fn quickfix_wraps_a_hex_colour_as_a_colour_hole() {
+        let fixes = css_block_fixes("\tcss {\n\t\tcolor: #336699;\n\t}\n");
+        assert!(
+            fixes.contains(&(
+                "Wrap as `{Color::hex(\"#336699\")}`".to_string(),
+                "#336699".to_string(),
+                "{Color::hex(\"#336699\")}".to_string(),
+            )),
+            "{fixes:?}"
+        );
+        // The three-digit form too, and the four hex lengths are the whole
+        // gate: a `#` that is not a colour keeps the explanation and gets no
+        // edit, because there is nothing to wrap.
+        let short = css_block_fixes("\tcss {\n\t\tcolor: #333;\n\t}\n");
+        assert!(
+            short
+                .iter()
+                .any(|(title, _, _)| title == "Wrap as `{Color::hex(\"#333\")}`"),
+            "{short:?}"
+        );
+        for stray in ["#zzz", "#33669", "#333ing"] {
+            let not_a_colour = css_block_fixes(&format!("\tcss {{\n\t\tcolor: {stray};\n\t}}\n"));
+            assert!(
+                !not_a_colour
+                    .iter()
+                    .any(|(title, _, _)| title.starts_with("Wrap as")),
+                "`{stray}` is not a colour, so it gets the rule and no edit: {not_a_colour:?}"
+            );
+        }
+    }
+
+    // §7.2 fix 2. `@` is the `#`'s twin, refused for the same context-free
+    // reason, and the fix is the breakpoint combinator the block spells media
+    // queries with. Which combinator comes from the query's OWN min-width,
+    // matched against `STYLE_BREAKPOINT_WIDTHS` — held to `style.vl`'s method
+    // bodies by `style_table_sync.rs`, so the map cannot drift from std.
+    #[test]
+    fn quickfix_rewrites_an_at_media_rule_as_its_breakpoint() {
+        let fixes = css_block_fixes(
+            "\tcss {\n\t\t@media (min-width: 768px) {\n\t\t\tdisplay: flex;\n\t\t}\n\t}\n",
+        );
+        assert!(
+            fixes.contains(&(
+                "Use `.md { … }`".to_string(),
+                "@media (min-width: 768px) {".to_string(),
+                ".md {".to_string(),
+            )),
+            "{fixes:?}"
+        );
+        // A width no breakpoint names still has an exact spelling — the
+        // general combinator the four delegate to — rather than no fix.
+        let arbitrary = css_block_fixes(
+            "\tcss {\n\t\t@media (min-width: 900px) {\n\t\t\tdisplay: flex;\n\t\t}\n\t}\n",
+        );
+        assert!(
+            arbitrary.contains(&(
+                "Use `.media(\"900px\") { … }`".to_string(),
+                "@media (min-width: 900px) {".to_string(),
+                ".media(\"900px\") {".to_string(),
+            )),
+            "{arbitrary:?}"
+        );
+        // An at-rule that is not a min-width media query has no combinator
+        // spelling at all (§10), so it gets the rule and no edit.
+        let keyframes =
+            css_block_fixes("\tcss {\n\t\t@keyframes spin {\n\t\t\tdisplay: flex;\n\t\t}\n\t}\n");
+        assert!(
+            !keyframes
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Use `.")),
+            "{keyframes:?}"
+        );
+    }
+
+    // §7.2 fix 3. The parser excises `!important` from the value and reports
+    // at exactly its span; the fix removes it — and takes the space in front
+    // of it, so `flex !important;` becomes `flex;` rather than `flex ;`.
+    #[test]
+    fn quickfix_removes_an_important_marker() {
+        let fixes = css_block_fixes("\tcss {\n\t\tdisplay: flex !important;\n\t}\n");
+        assert!(
+            fixes.contains(&(
+                "Remove `!important`".to_string(),
+                " !important".to_string(),
+                String::new(),
+            )),
+            "{fixes:?}"
+        );
+    }
+
+    // §7.2 fix 5, "the existing quickfix, unchanged" — asserted rather than
+    // assumed. A declaration's missing `;` reports as the ordinary
+    // missing-terminator diagnostic (`parse_css_declaration` raises
+    // `TERMINATOR_EXPECTED`, which is gap-anchored like any other), so E61's
+    // insertion fires inside a block with no css-side code at all.
+    #[test]
+    fn quickfix_inserts_a_missing_semicolon_in_a_css_block() {
+        let fixes = css_block_fixes("\tcss {\n\t\tdisplay: flex\n\t}\n");
+        assert!(
+            fixes.contains(&("Insert `;`".to_string(), String::new(), ";".to_string())),
+            "{fixes:?}"
+        );
+    }
+
+    // --- css-block S5: the convert-between-spellings refactor (§7.2) --------
+
+    /// The conversion offered at the `~` cursor in a `css`-block fixture, as
+    /// `(to_chain, replaced text, replacement)`.
+    fn css_conversion(body: &str) -> Option<(bool, String, String)> {
+        let source = format!(
+            "import std::style::{{ Color, Length, Style, space, style }};\n\nfun card(): Style {{\n{body}}}\n"
+        );
+        let offset = source.find('~').expect("fixture needs a `~` cursor");
+        let text = source.replace('~', "");
+        let (directory, document) = analyze_workspace(&[("main.vl", &text)]);
+        let conversion = document
+            .css_spelling_conversion(Span {
+                start: offset,
+                end: offset,
+            })
+            .map(|conversion| {
+                (
+                    conversion.to_chain,
+                    text[conversion.span.into_range()].to_string(),
+                    conversion.replacement,
+                )
+            });
+        let _ = std::fs::remove_dir_all(&directory);
+        conversion
+    }
+
+    // The refactor's forward direction. The lowering is total and one-to-one
+    // (§5.2), so the chain it prints is the chain the block already lowers to:
+    // a declaration is a `.raw` link, a nested rule is a combinator link with
+    // the inner chain as its final argument, and there is no third row.
+    #[test]
+    fn refactor_converts_a_css_block_to_a_style_chain() {
+        let conversion = css_conversion(
+            "\tcss {\n\t\tdis~play: flex;\n\t\tgap: {space(4)};\n\t\ttransition-duration: {150}ms;\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}\n",
+        )
+        .expect("a block converts");
+        assert!(conversion.0, "block -> chain");
+        assert!(conversion.1.starts_with("css {"), "{conversion:?}");
+        assert_eq!(
+            conversion.2,
+            "style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.raw(\"gap\", space(4))\n\t\t.raw(\"transition-duration\", i\"{150}ms\")\n\t\t.md(style().raw(\"padding\", space(6)))",
+            "{conversion:?}"
+        );
+    }
+
+    // A one-declaration block converts on ONE line, the shape S3 gives the
+    // outer body itself: `const css { padding: {space(6)}; }` is written
+    // inline, and its chain is too.
+    #[test]
+    fn refactor_converts_a_single_declaration_block_inline() {
+        let conversion =
+            css_conversion("\tconst css { pad~ding: {space(6)}; }\n").expect("a block converts");
+        assert_eq!(conversion.2, "style().raw(\"padding\", space(6))");
+    }
+
+    // The inverse. Only the two rows of the lowering table have a block
+    // spelling, and a value that is not a plain token run goes back through a
+    // HOLE — which is exact, since a value that is exactly one hole passes its
+    // expression through untouched.
+    #[test]
+    fn refactor_converts_a_style_chain_to_a_css_block() {
+        let conversion = css_conversion(
+            "\tsty~le()\n\t\t.raw(\"display\", \"flex\")\n\t\t.raw(\"gap\", space(4))\n\t\t.md(style().raw(\"padding\", space(6)))\n",
+        )
+        .expect("a chain converts");
+        assert!(!conversion.0, "chain -> block");
+        assert!(conversion.1.starts_with("style()"), "{conversion:?}");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // The inverse is PARTIAL, and says so by not being offered. A typed
+    // property method is `with_length("padding", …)`, which is not the node
+    // `padding: {space(4)};` lowers to — so a chain carrying one has no block
+    // spelling this refactor is entitled to invent.
+    #[test]
+    fn refactor_declines_a_chain_with_a_typed_property_link() {
+        assert_eq!(
+            css_conversion("\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"display\", \"flex\")\n"),
+            None
+        );
+        // `class_list` ends the chain in something that is not a `Style` at
+        // all — likewise not convertible.
+        assert_eq!(
+            css_conversion("\tsty~le()\n\t\t.raw(\"display\", \"flex\")\n\t\t.class_list()\n"),
+            None
+        );
+    }
+
+    // The two directions are INVERSES, which is the claim a migration path has
+    // to make: converting a block and converting the result straight back gives
+    // the block again, byte for byte, nesting included.
+    #[test]
+    fn the_two_conversions_round_trip() {
+        let block = "css {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}";
+        let to_chain = css_conversion(&format!("\t{}\n", block.replacen("display", "dis~play", 1)))
+            .expect("a block converts");
+        assert!(to_chain.0, "block -> chain");
+        let back = css_conversion(&format!(
+            "\t{}\n",
+            to_chain.2.replacen("style", "sty~le", 1)
+        ))
+        .expect("the chain converts back");
+        assert!(!back.0, "chain -> block");
+        assert_eq!(back.2, block, "the round trip is the identity");
+    }
+
+    // Two refusals, both about meaning rather than shape. A comment's
+    // attachment is not recoverable across the reshape (the S3 printer refuses
+    // to reorder a commented block for the same reason), and a value carrying a
+    // BACKSLASH means different things in the two spellings — a chain's string
+    // literal has its escapes processed at emission and a block's token run
+    // does not.
+    #[test]
+    fn refactor_declines_where_the_two_spellings_would_differ() {
+        assert_eq!(
+            css_conversion("\tcss {\n\t\t// keep me\n\t\tdis~play: flex;\n\t}\n"),
+            None
+        );
+        assert_eq!(
+            css_conversion("\tcss {\n\t\tcon~tent: \"\\201C\";\n\t}\n"),
+            None
+        );
+        // A quoted value is fine, though: escaping a `\"` into the chain's
+        // string literal round-trips exactly.
+        let quoted = css_conversion("\tcss {\n\t\tbackground-im~age: url(\"tile.png\");\n\t}\n")
+            .expect("a quoted value converts");
+        assert_eq!(
+            quoted.2,
+            "style().raw(\"background-image\", \"url(\\\"tile.png\\\")\")"
+        );
     }
 
     // E54c: an unimported name in an ALREADY-LOADED module (loaded because a
@@ -4727,6 +5506,78 @@ pub(crate) mod tests {
         // The `<div` scaffolding Function token is suppressed.
         assert_eq!(kind_of("<div", 0), None, "{tokens:?}");
         // The invariant the sweep guarantees, re-checked over markup.
+        let mut last_end = 0usize;
+        for (span, _, _) in &tokens {
+            let range = span.into_range();
+            assert!(
+                range.start >= last_end && range.end > range.start,
+                "{tokens:?}"
+            );
+            last_end = range.end;
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_paint_a_css_block() {
+        // css-block S5: a property name paints as Property and a condition
+        // head as Method, both from the RAW parse — the desugar retires
+        // `Node::Css` before analysis and every accessor it generates is
+        // zero-width (S2, cut for this slice), so the analyzed program carries
+        // no token for either. The one accessor that keeps a REAL span — the
+        // outer `style()`, at the `css` keyword, so the missing-import note can
+        // underline the word that asked for a `Style` — is suppressed here,
+        // exactly as `<div`'s Function token is.
+        let text = "import std::style::{ Color, Style, space, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay: flex;\n\t\tflex-direction: column;\n\t\tgap: {space(4)};\n\t\t--brand-ink: {Color::gray(900)};\n\t\t.md {\n\t\t\tcolor: {Color::gray(50)};\n\t\t}\n\t}\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        let kind_of = |snippet: &str, occurrence: usize| -> Option<TokenKind> {
+            let mut start = 0;
+            let mut position = None;
+            for _ in 0..=occurrence {
+                position = text[start..].find(snippet).map(|at| start + at);
+                start = position? + 1;
+            }
+            let at = position?;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + snippet.len()
+                })
+                .map(|(_, kind, _)| *kind)
+        };
+        assert_eq!(
+            kind_of("display", 0),
+            Some(TokenKind::Property),
+            "{tokens:?}"
+        );
+        // A hyphenated property is several tokens the parser joins by span
+        // adjacency — the whole run paints as one Property.
+        assert_eq!(
+            kind_of("flex-direction", 0),
+            Some(TokenKind::Property),
+            "{tokens:?}"
+        );
+        assert_eq!(kind_of("gap", 0), Some(TokenKind::Property), "{tokens:?}");
+        // A custom property is the same span-adjacency run, leading `--`
+        // included.
+        assert_eq!(
+            kind_of("--brand-ink", 0),
+            Some(TokenKind::Property),
+            "{tokens:?}"
+        );
+        // A NESTED declaration too — the walk descends the whole body.
+        assert_eq!(kind_of("color", 0), Some(TokenKind::Property), "{tokens:?}");
+        // A condition head is the name without its dot, painted as the method
+        // it lowers to (TextMate's `entity.name.function` approximation, made
+        // precise).
+        assert_eq!(kind_of("md", 0), Some(TokenKind::Method), "{tokens:?}");
+        // The `style()` scaffolding token at the keyword is suppressed, so
+        // TextMate's `keyword.other.vilan` keeps the word.
+        assert_eq!(kind_of("css", 0), None, "{tokens:?}");
+        // A hole is ordinary vilan and keeps its ordinary tokens.
+        assert_eq!(kind_of("space", 1), Some(TokenKind::Function), "{tokens:?}");
+        // The invariant the sweep guarantees, re-checked over a block.
         let mut last_end = 0usize;
         for (span, _, _) in &tokens {
             let range = span.into_range();
@@ -6497,6 +7348,212 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"caption".to_string()),
             "the binding in scope: {labels:?}"
+        );
+    }
+
+    // --- css-block S5: the four positions of a `css` body (§7.1) ------------
+
+    /// The prelude the `css`-block pins share.
+    const CSS_BLOCK_PRELUDE: &str =
+        "import std::style::{ Color, Length, Style, space, style };\nimport std::print;\n";
+
+    fn css_block_completions(body: &str) -> Vec<String> {
+        completions_at_marker(
+            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n{body}}}\n"),
+            '~',
+        )
+    }
+
+    // §7.1 row 1: property position offers CSS PROPERTY NAMES, and they are not
+    // invented — every one is a slot some `Style` method writes, read from
+    // `STYLE_PROPERTY_METHODS`'s `properties` column, which
+    // `style_table_sync.rs` already holds to the method bodies. What the
+    // position stops offering is the enclosing scope, exactly as an element
+    // head does: a value here is source text, not an expression.
+    #[test]
+    fn css_property_position_offers_the_property_names() {
+        let labels = css_block_completions("\tlet card = css {\n\t\tdisp~\n\t};\n");
+        for property in [
+            "display",
+            "flex-direction",
+            "background-color",
+            "padding-left",
+            "border-radius",
+        ] {
+            assert!(
+                labels.contains(&property.to_string()),
+                "`{property}` is a slot a `Style` method writes: {labels:?}"
+            );
+        }
+        // The METHOD spelling is not a property name — the block writes CSS.
+        assert!(
+            !labels.contains(&"flex_direction".to_string()),
+            "the method spelling has no place in a block: {labels:?}"
+        );
+        // Several methods write `padding-left` (`padding_x` and `padding_left`
+        // both do), and a property is offered once.
+        let mut unique = labels.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+        // Nothing merely in scope, and no construct snippets.
+        for wrong in ["card", "str", "space", "fun", "for … in { }", "print"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` may not appear in a css body: {labels:?}"
+            );
+        }
+    }
+
+    // §7.1 row 3: the dotted head offers the condition combinators, from
+    // `STYLE_CONDITION_METHODS` — the dot is the grammar's whole
+    // disambiguator, so a dotted item is a combinator and never a property.
+    #[test]
+    fn css_dotted_head_offers_the_condition_combinators() {
+        let labels = css_block_completions("\tlet card = css {\n\t\t.~\n\t};\n");
+        for condition in ["md", "hover", "within", "children", "attribute", "pseudo"] {
+            assert!(
+                labels.contains(&condition.to_string()),
+                "`{condition}` is a condition combinator: {labels:?}"
+            );
+        }
+        assert!(
+            !labels.iter().any(|label| label.starts_with('.')),
+            "the dot is already typed: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"display".to_string()),
+            "a dotted item is never a property: {labels:?}"
+        );
+        // Mid-word offers the same list; the editor filters by the prefix.
+        let mid_word = css_block_completions("\tlet card = css {\n\t\t.ho~\n\t};\n");
+        assert!(
+            mid_word.contains(&"hover".to_string()),
+            "mid-word: {mid_word:?}"
+        );
+    }
+
+    // §7.1 row 4: a hole is an ordinary expression, and completes as one —
+    // "unchanged", which is what makes typed values reachable at all.
+    #[test]
+    fn css_hole_is_ordinary_expression_ground() {
+        let labels = css_block_completions(
+            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\tcolor: {i~};\n\t};\n",
+        );
+        assert!(
+            labels.contains(&"ink".to_string()) && labels.contains(&"space".to_string()),
+            "the names in scope: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"display".to_string()),
+            "not the property vocabulary: {labels:?}"
+        );
+    }
+
+    // Value position offers NOTHING in v1 (§7.1's closing paragraph, Q4):
+    // `flex` after `display:` needs a property->enum map that does not exist,
+    // and inventing one is the second source of truth E67 refused. Offering
+    // the scope instead would be worse than offering nothing — a binding name
+    // in value position is emitted as literal text.
+    #[test]
+    fn css_value_position_offers_nothing() {
+        let labels = css_block_completions("\tlet card = css {\n\t\tdisplay: ~\n\t};\n");
+        assert!(
+            labels.is_empty(),
+            "value position is empty in v1: {labels:?}"
+        );
+        // Mid-value, after a hole: the hole's own `}` must not be read as a
+        // nested rule's, or the rest of the value reads as property position.
+        let after_hole =
+            css_block_completions("\tlet card = css {\n\t\tpadding: {space(4)} ~;\n\t};\n");
+        assert!(
+            after_hole.is_empty(),
+            "still the value after a hole closes: {after_hole:?}"
+        );
+    }
+
+    // §7.1 row 2: a custom property completes from the declarations of this
+    // build — which is nothing in v1 (Q4). It must not fall back to the
+    // standard property list, which no `--`-prefixed name can ever match.
+    #[test]
+    fn css_custom_property_position_offers_nothing() {
+        let labels = css_block_completions("\tlet card = css {\n\t\t--~\n\t};\n");
+        assert!(labels.is_empty(), "no custom properties in v1: {labels:?}");
+        // A hyphenated STANDARD property is not the custom-property row, and
+        // still offers the vocabulary the prefix filters.
+        let hyphenated = css_block_completions("\tlet card = css {\n\t\tflex-~\n\t};\n");
+        assert!(
+            hyphenated.contains(&"flex-direction".to_string()),
+            "a hyphenated standard property: {hyphenated:?}"
+        );
+    }
+
+    // A nested rule's body is a body: the innermost one containing the cursor
+    // decides, so `.md { pad| }` is property position inside the RULE.
+    #[test]
+    fn css_completion_fires_inside_a_nested_rule() {
+        let labels = css_block_completions(
+            "\tlet card = css {\n\t\tdisplay: flex;\n\t\t.md {\n\t\t\tpad~\n\t\t}\n\t};\n",
+        );
+        assert!(
+            labels.contains(&"padding".to_string()) && labels.contains(&"padding-left".to_string()),
+            "the property vocabulary inside a rule: {labels:?}"
+        );
+        // And after a completed nested rule the OUTER body is property
+        // position again — the rule's `}` closes its item.
+        let after = css_block_completions(
+            "\tlet card = css {\n\t\t.md {\n\t\t\tpadding: 1px;\n\t\t}\n\t\tdisp~\n\t};\n",
+        );
+        assert!(
+            after.contains(&"display".to_string()),
+            "back in the outer body: {after:?}"
+        );
+    }
+
+    // The boundary, element syntax's own: a condition head's ARGUMENT is
+    // ordinary expression ground — brackets deep, so the css vocabulary does
+    // not apply and the names in scope do.
+    #[test]
+    fn a_css_condition_argument_is_not_a_css_position() {
+        let labels = css_block_completions(
+            "\tlet theme = \"dark\";\n\tlet card = css {\n\t\t.within(\"data-theme\", the~) {\n\t\t\tdisplay: flex;\n\t\t}\n\t};\n",
+        );
+        assert!(
+            labels.contains(&"theme".to_string()),
+            "the binding in scope: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"hover".to_string()),
+            "not the combinator vocabulary: {labels:?}"
+        );
+    }
+
+    // The negative: a `.` outside any block is untouched.
+    #[test]
+    fn a_dot_outside_a_css_block_still_completes_normally() {
+        let labels = css_block_completions("\tlet card = style();\n\tcard.~\n");
+        assert!(
+            labels.contains(&"raw".to_string()) && labels.contains(&"flex_direction".to_string()),
+            "the Style's members, in their METHOD spelling: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"flex-direction".to_string()),
+            "not the property vocabulary: {labels:?}"
+        );
+    }
+
+    // A block in an element's head is still a block: the css pass runs BEFORE
+    // the element pass and descends into markup, and the head's own vocabulary
+    // does not reach inside a `.styled(…)` argument.
+    #[test]
+    fn css_completion_fires_inside_an_element_head_argument() {
+        let source = format!(
+            "{CSS_BLOCK_PRELUDE}import std::ui::view;\n\nfun main() {{\n\t<div .styled(css {{ disp~ }})></div>;\n}}\n"
+        );
+        let labels = completions_at_marker(&source, '~');
+        assert!(
+            labels.contains(&"display".to_string()),
+            "the property vocabulary inside the head's argument: {labels:?}"
         );
     }
 

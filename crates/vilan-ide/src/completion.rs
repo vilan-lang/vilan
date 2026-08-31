@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use vilan_core::analyzer::{Expr, Implementation, SourceId};
+use vilan_core::formatter::{STYLE_CONDITION_METHODS, STYLE_PROPERTY_METHODS};
 use vilan_core::id::Id;
 use vilan_core::lexing::tokenize;
 use vilan_core::token::Token;
@@ -595,6 +596,254 @@ fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
     (name > 0).then_some(start + 1 + name)
 }
 
+/// The candidates for one of §7.1's four positions in a `css` body.
+///
+/// The part that matters is where the vocabulary comes from. E67 refused to
+/// invent an HTML attribute list, on the ground that it "would be a second
+/// source of truth with nothing to gate it" — and that refusal is what this has
+/// to clear. It clears it on a real disanalogy: the CSS property vocabulary is
+/// NOT invented here. Every name below is a slot some `Style` method already
+/// writes, read from [`STYLE_PROPERTY_METHODS`]'s own `properties` column, which
+/// `crates/vilan-core/tests/style_table_sync.rs` holds to the method bodies
+/// through six gates — so the list cannot drift from std without a red test.
+/// The combinators come from [`STYLE_CONDITION_METHODS`] the same way.
+///
+/// Table order is canonical order (S3's sorter reads the same rows), so the
+/// list arrives in the sequence `vilan fmt` would put the declarations in.
+fn css_block_completions(position: CssPosition) -> Vec<Completion> {
+    match position {
+        CssPosition::Property => {
+            let mut seen: HashSet<&str> = HashSet::new();
+            STYLE_PROPERTY_METHODS
+                .iter()
+                .flat_map(|method| method.properties.iter())
+                .filter(|property| seen.insert(property))
+                .map(|property| Completion::bare(property.to_string(), CompletionKind::Field))
+                .collect()
+        }
+        CssPosition::Condition => STYLE_CONDITION_METHODS
+            .iter()
+            .map(|(condition, _)| Completion::bare(condition.to_string(), CompletionKind::Method))
+            .collect(),
+        // Both v1 blanks (Q4), and blank rather than absent: falling through to
+        // the enclosing scope is what an element head refuses for the same
+        // reason — nothing in scope is a CSS value or a custom property.
+        CssPosition::CustomProperty | CssPosition::Value => Vec::new(),
+    }
+}
+
+/// The root of a raw parse, shared by the two sub-language worlds
+/// [`Analysis::cursor_context`] classifies (an element head, a `css` body).
+type RawRoot<'src> = vilan_core::Spanned<vilan_core::node::NodeList<'src>>;
+
+/// Whether `offset` (LIVE space — see [`Analysis::completion`]) sits in an
+/// element's OPENING TAG, where the desugar takes an attribute, an
+/// `on:event(…)`, or a `.method(…)` chain link (element-syntax.md §2–4).
+///
+/// "In the head" is *after the tag name, before the head's `>`, and at the
+/// head's own bracket depth*. The depth clause is what keeps this honest:
+/// a head item's ARGUMENT is ordinary expression ground — the cursor in
+/// `<form on:submit(|event| { print(client.add(x).| ) })>` is inside a
+/// closure, three brackets deep, and belongs to E66's answer, not to this
+/// one. It is also what makes the recovered shape safe to use, since a
+/// flattened `<…>` error node spans the arguments too.
+///
+/// The token walk reads the LIVE buffer, like the rest of completion's
+/// dispatch: the character being typed is live by nature. `tokens` is that
+/// buffer's lexis, tokenized once by [`Analysis::cursor_context`] and shared
+/// with the member test; `root` is that buffer's raw parse, shared with the
+/// `css` body test.
+fn in_element_head(
+    root: Option<&RawRoot<'_>>,
+    text: &str,
+    tokens: &[(Token<'_>, Span)],
+    offset: usize,
+) -> bool {
+    let mut best: Option<(usize, usize)> = None;
+    if let Some(root) = root {
+        for item in &root.0 {
+            innermost_open_tag_end(item, offset, text, &mut best);
+        }
+    }
+    let Some((_, tag_end)) = best else {
+        return false;
+    };
+    let mut depth = 0usize;
+    for (token, span) in tokens {
+        let range = span.into_range();
+        if range.start < tag_end {
+            continue;
+        }
+        if range.start >= offset {
+            break;
+        }
+        match token {
+            Token::Ctrl('(' | '[' | '{') => depth += 1,
+            Token::Ctrl(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            // The head is already closed: the cursor is among the children.
+            Token::Ctrl('>') if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// Which of §7.1's four positions `offset` (LIVE space) sits in, or `None` when
+/// the cursor is not in a `css` body at all.
+///
+/// Two questions, in the element head's own order. [`innermost_css_body_start`]
+/// answers *which body* from the raw parse; the token walk below answers *where
+/// in it*, at the body's OWN brace depth — a hole (`{…}`) and a condition head's
+/// arguments are ordinary expression ground, and both are bracket-deep, so the
+/// depth clause declines them exactly as the head's does.
+///
+/// Within one item the two markers are the grammar's own: the leading `.` is the
+/// whole declaration/combinator disambiguator (§3), and the `:` separates the
+/// property from its value. A `;` starts the next item — and so does a nested
+/// rule's closing `}`, which is why that one arm is guarded on `dotted`: a
+/// HOLE's `}` closes no item, and reading it as one would put the rest of the
+/// value in property position.
+fn css_position(
+    root: Option<&RawRoot<'_>>,
+    text: &str,
+    tokens: &[(Token<'_>, Span)],
+    offset: usize,
+) -> Option<CssPosition> {
+    let mut best: Option<(usize, usize)> = None;
+    for item in &root?.0 {
+        innermost_css_body_start(item, offset, &mut best);
+    }
+    let (_, body_start) = best?;
+    let mut depth = 0usize;
+    let mut dotted = false;
+    let mut after_colon = false;
+    for (token, span) in tokens {
+        let range = span.into_range();
+        if range.start < body_start {
+            continue;
+        }
+        if range.start >= offset {
+            break;
+        }
+        match token {
+            Token::Ctrl('(' | '[' | '{') => depth += 1,
+            // The body's own `}`: the cursor is past the block entirely.
+            Token::Ctrl('}') if depth == 0 => return None,
+            // A nested rule's `}` ends its item; a hole's does not.
+            Token::Ctrl('}') if depth == 1 && dotted => {
+                depth = 0;
+                dotted = false;
+                after_colon = false;
+            }
+            Token::Ctrl(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            Token::Ctrl(';') if depth == 0 => {
+                dotted = false;
+                after_colon = false;
+            }
+            // The declaration's separator is an OPERATOR token, not a control
+            // one (`parse_css_declaration` reads it with `peek_is_op`).
+            Token::Op(":") if depth == 0 => after_colon = true,
+            Token::Ctrl('.') if depth == 0 && !after_colon => dotted = true,
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    if after_colon {
+        return Some(CssPosition::Value);
+    }
+    if dotted {
+        return Some(CssPosition::Condition);
+    }
+    // A property name is a span-adjacent `name`-`-`-`name` run, so the name
+    // being typed reaches back over hyphens as well as identifier bytes — which
+    // is what tells `--brand-|` (the custom-property row) from `flex-|` (an
+    // ordinary hyphenated property, whose prefix the editor filters on).
+    let bytes = text.as_bytes();
+    let mut name_start = offset.min(bytes.len());
+    while name_start > body_start
+        && (is_identifier_byte(bytes[name_start - 1]) || bytes[name_start - 1] == b'-')
+    {
+        name_start -= 1;
+    }
+    Some(if text[name_start..].starts_with("--") {
+        CssPosition::CustomProperty
+    } else {
+        CssPosition::Property
+    })
+}
+
+/// The body start (one past the `{`) of the innermost `css` block body
+/// containing `offset` — the css twin of [`innermost_open_tag_end`], and E67's
+/// pattern verbatim: read from a RAW parse, because the css desugar retires
+/// `Node::Css` before analysis exactly as the element desugar retires
+/// `Node::Element`.
+///
+/// A nested rule's body is a body too, so the walk descends `CssBody`'s items
+/// as well as the ordinary expression children `for_each_child` reaches — a
+/// cursor inside `.md { … }` belongs to the RULE's body, not the outer one.
+/// The narrowest body containing the offset wins, which is what "innermost"
+/// means when they nest.
+///
+/// The body parser COMMITS (`parsing.rs::parse_css_body`), so a half-typed item
+/// leaves the block's own `Node::Css` in the tree with the items around the
+/// mistake intact — which is why this needs no `Node::Error` arm of the kind
+/// the element head's recovery does. A block that never closes at all declines
+/// its atom and leaves no node, and completion simply does not fire there.
+fn innermost_css_body_start(
+    node: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    offset: usize,
+    best: &mut Option<(usize, usize)>,
+) {
+    use vilan_core::node::Node;
+    if let Node::Css(body) = &node.0 {
+        css_body_start(body, offset, best);
+    }
+    node.0
+        .for_each_child(&mut |child| innermost_css_body_start(child, offset, best));
+}
+
+fn css_body_start(
+    body: &vilan_core::node::CssBody<'_>,
+    offset: usize,
+    best: &mut Option<(usize, usize)>,
+) {
+    use vilan_core::node::CssItem;
+    let range = body.braces.into_range();
+    // Strictly inside the braces: the cursor ON the `{` is not in the body yet.
+    if range.start < offset
+        && offset < range.end
+        && best.is_none_or(|(width, _)| range.end - range.start <= width)
+    {
+        *best = Some((range.end - range.start, range.start + 1));
+    }
+    for item in &body.items {
+        if let CssItem::Nested(nested) = item {
+            css_body_start(&nested.body, offset, best);
+        }
+    }
+}
+
+/// Where in a `css` block's body the cursor is (css-block.md §7.1) — the four
+/// positions, and the four answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CssPosition {
+    /// An item's head, undotted: a CSS property name is being written.
+    Property,
+    /// The same head on a CUSTOM property (`--|`). Its vocabulary is the custom
+    /// properties declared in this build, which is nothing in v1 (Q4) — and it
+    /// is deliberately not the standard list, which no `--` name can match.
+    CustomProperty,
+    /// An item's head after the `.` that commits it to a condition combinator.
+    Condition,
+    /// After the `:` — the declaration's value. Empty in v1 (Q4): offering
+    /// `flex` after `display:` needs a property->enum map that does not exist,
+    /// and the enclosing scope is not an answer either (a value is source text,
+    /// so a binding's NAME is what would land on the sheet).
+    Value,
+}
+
 /// What the cursor is IN — the classification [`Analysis::completion`]
 /// dispatches on, and the general answer to kolt.local 001.
 ///
@@ -618,6 +867,10 @@ enum CursorContext {
     /// Inside an element's opening tag (E67). `chain` is the `.` that commits
     /// the head item to the chain form rather than to an attribute.
     ElementHead { chain: bool },
+    /// Inside a `css` block's own body (css-block.md §7.1) — a second
+    /// sub-language world, and the same shape as the first: the block is
+    /// desugared before analysis, so nothing in scope belongs here.
+    CssBlock(CssPosition),
     /// Inside an import path (E57) — names come from the package tree.
     ImportPath,
     /// A member position: after a `.`, whatever trivia surrounds it and whatever
@@ -750,6 +1003,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
             // below.
             CursorContext::MacroName => return self.macro_name_completions(),
             CursorContext::ElementHead { chain } => return self.element_head_completions(chain),
+            CursorContext::CssBlock(position) => return css_block_completions(position),
             _ => {}
         }
         // An import path takes names from the package tree, and it also shapes
@@ -851,15 +1105,28 @@ impl<'a, 'src> Analysis<'a, 'src> {
         if start >= 1 && bytes[start - 1] == b'(' && text[..start - 1].ends_with("[derive") {
             return CursorContext::MacroName;
         }
+        // ONE raw parse serves both sub-language worlds below. Element syntax
+        // and the `css` block are each desugared before analysis, so neither
+        // survives into `program` and each is only ever seen through a raw
+        // parse — and both are in the same tree, so it is parsed once.
+        let raw = vilan_core::parsing::parse(text).0;
         // An element's opening tag is its own world (E67): between `<div` and
         // `>` the desugar takes an attribute, an `on:event(…)` or a `.method(…)`
         // chain link — and nothing that is merely in scope. The check runs from
         // `start` (the head item being typed), and the `.` just before it is the
         // same disambiguator the grammar uses.
-        if self.in_element_head(tokens, start) {
+        if in_element_head(raw.as_ref(), text, tokens, start) {
             return CursorContext::ElementHead {
                 chain: start >= 1 && bytes[start - 1] == b'.',
             };
+        }
+        // A `css` block's body is the second such world (css-block.md §7.1),
+        // and it is checked after the head for the reason the two can nest: a
+        // block written in an element's head (`<div .styled(css { … })>`) sits
+        // inside a head ARGUMENT, which the head's own depth clause already
+        // declines.
+        if let Some(position) = css_position(raw.as_ref(), text, tokens, start) {
+            return CursorContext::CssBlock(position);
         }
         // An import path is its own world too (E57): a name there is being
         // reached FOR THE FIRST TIME, so none of the in-scope machinery applies
@@ -878,59 +1145,6 @@ impl<'a, 'src> Analysis<'a, 'src> {
             };
         }
         CursorContext::Expression
-    }
-
-    /// Whether `offset` (LIVE space — see [`Self::completion`]) sits in an
-    /// element's OPENING TAG, where the desugar takes an attribute, an
-    /// `on:event(…)`, or a `.method(…)` chain link (element-syntax.md §2–4).
-    ///
-    /// "In the head" is *after the tag name, before the head's `>`, and at the
-    /// head's own bracket depth*. The depth clause is what keeps this honest:
-    /// a head item's ARGUMENT is ordinary expression ground — the cursor in
-    /// `<form on:submit(|event| { print(client.add(x).| ) })>` is inside a
-    /// closure, three brackets deep, and belongs to E66's answer, not to this
-    /// one. It is also what makes the recovered shape safe to use, since a
-    /// flattened `<…>` error node spans the arguments too.
-    ///
-    /// The token walk reads the LIVE buffer, like the rest of completion's
-    /// dispatch: the character being typed is live by nature. `tokens` is that
-    /// buffer's lexis, tokenized once by [`Self::cursor_context`] and shared
-    /// with the member test.
-    fn in_element_head(&self, tokens: &[(Token<'_>, Span)], offset: usize) -> bool {
-        let text = self.live.text();
-        let Some(tag_end) = self.open_tag_end(text, offset) else {
-            return false;
-        };
-        let mut depth = 0usize;
-        for (token, span) in tokens {
-            let range = span.into_range();
-            if range.start < tag_end {
-                continue;
-            }
-            if range.start >= offset {
-                break;
-            }
-            match token {
-                Token::Ctrl('(' | '[' | '{') => depth += 1,
-                Token::Ctrl(')' | ']' | '}') => depth = depth.saturating_sub(1),
-                // The head is already closed: the cursor is among the children.
-                Token::Ctrl('>') if depth == 0 => return false,
-                _ => {}
-            }
-        }
-        depth == 0
-    }
-
-    /// The head start of the innermost element containing `offset` — a raw
-    /// parse of the live text, since no element survives into `program`.
-    fn open_tag_end(&self, text: &str, offset: usize) -> Option<usize> {
-        let (tree, _errors) = vilan_core::parsing::parse(text);
-        let root = tree?;
-        let mut best: Option<(usize, usize)> = None;
-        for item in &root.0 {
-            innermost_open_tag_end(item, offset, text, &mut best);
-        }
-        best.map(|(_, tag_end)| tag_end)
     }
 
     /// The candidates for an element's head (E67). `chain` says the cursor

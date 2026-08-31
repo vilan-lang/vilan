@@ -701,6 +701,25 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("pseudo",    ConditionAxis::Pseudo),
 ];
 
+/// The breakpoint combinators' own min-widths, as `style.vl` spells them: `md`
+/// is `self.media("768px", inner)`. Every row delegates to `media`, so this is
+/// a NAME for a width rather than a fifth axis.
+///
+/// The formatter has no use for it; the language server does. `@media
+/// (min-width: 768px)` in a `css` block is refused at the lexer with `.md { … }`
+/// named as the fix (css-block.md §7.2 fix 2), and the quickfix that performs
+/// that rewrite has to know which combinator a width belongs to. It lives here,
+/// beside [`STYLE_CONDITION_METHODS`], so that
+/// `crates/vilan-core/tests/style_table_sync.rs` can hold it to the method
+/// bodies rather than let a second copy of std's breakpoints drift.
+#[doc(hidden)]
+pub const STYLE_BREAKPOINT_WIDTHS: &[(&str, &str)] = &[
+    ("sm", "640px"),
+    ("md", "768px"),
+    ("lg", "1024px"),
+    ("xl", "1280px"),
+];
+
 /// The `Style` methods that are barriers even though they ARE part of std: the
 /// slot they write is an argument, not the name, so the formatter cannot know
 /// it without evaluating the call. Listed rather than omitted so the

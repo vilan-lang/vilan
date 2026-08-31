@@ -81,6 +81,14 @@ Where the cursor is decides what is offered.
   supertraits provide.
 - **Inside a string or a comment** nothing is offered. A caption is text, not
   code, and a `.` in one is not a member access.
+- **Inside a `css` block** the vocabulary is CSS, and nothing in scope is
+  offered at all. An undotted item completes **property names** — every slot
+  a `Style` method writes, so the list is std's own surface rather than an
+  invented one — and a dotted item completes the **condition combinators**
+  (`md`, `hover`, `within`, …). A value offers nothing: it is source text,
+  not an expression, so a name in scope would be the wrong answer. A `{…}`
+  hole is an ordinary expression and completes as one, which is how a typed
+  value gets in.
 - **After `::`** offers an enum's variants and statics, a struct's statics,
   or a module's members — and only when the name on the left is actually
   **in scope**. It used to match that name against every type the compiler
@@ -111,7 +119,7 @@ sees it.
 
 ## Quick fixes
 
-Four, each attached to the diagnostic that earns it:
+Seven, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -119,6 +127,9 @@ Four, each attached to the diagnostic that earns it:
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
 | ``Insert `;` `` | ``expected `;` to end this statement``, at the gap the diagnostic points at |
 | ``Remove `;` `` | ``the `;` discards this body's last value`` — it finds the right `;` from the diagnostic's own bookkeeping, and declines rather than guess when a comment sits in the gap |
+| ``Wrap as `{Color::hex("#333")}` `` | a `#` in a `css` block. The character cannot lex at all, so the diagnostic is one column wide; the fix reads the whole colour off the line and routes it through `Color`, which carries its own `:root` line. Offered only when the run really is a colour (3, 4, 6 or 8 hex digits) |
+| ``Use `.md { … }` `` | ``@media (min-width: …)`` in a `css` block. The breakpoint is chosen by the query's own min-width, and an arbitrary one becomes `.media("900px")` rather than no fix. The other at-rules have no combinator spelling, so they get the explanation alone |
+| ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |
 
 and two source actions:
 
@@ -138,6 +149,25 @@ is kept.
 save. It is the extension's own hook rather than a line in your
 `editor.codeActionsOnSave`, and organizing is a fixed point, so turning
 both on is harmless.
+
+## Refactors
+
+A refactor is offered on the construct your cursor is in, rather than on a
+diagnostic or on the file:
+
+| Action | Does |
+|---|---|
+| **Convert to a `style()` chain** | rewrites the `css { … }` block the cursor is in as the builder chain it lowers to — a declaration becomes a `.raw` link, a nested rule becomes a combinator link carrying the inner chain |
+| **Convert to a `css` block** | the inverse, on a `style()` chain. Only the two rows of that lowering have a block spelling, so a chain carrying a typed property method (`.padding(space(4))`, which writes its slot through `with_length`) is not offered the conversion at all |
+
+Both directions decline rather than guess. A **comment** inside the
+construct stops the conversion, because its attachment is not recoverable
+across the reshape — the same refusal `vilan fmt` makes when it declines to
+reorder a commented block. So does a value carrying a **backslash**: a
+chain's string literal has its escapes processed at emission and a block's
+token run does not, so the two spellings would stop meaning the same thing.
+A quoted value is fine — escaping a `"` into the literal round-trips
+exactly — and the two directions are inverses on everything they accept.
 
 ## What it does while you type
 
