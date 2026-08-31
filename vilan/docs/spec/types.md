@@ -611,8 +611,11 @@ Normative rejection cases (each is a compile error):
   enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the
   bound …`).
-- A `match` whose VALUE legs' types don't unify. Diverging legs
-  (`ret`, `panic`, `jump`) are `Never` and don't participate (§5.1).
+- A `match` whose VALUE legs' types don't unify, and — by the same rule
+  — a value `if` (one with a final `else`, §5.1) whose arms' don't. An
+  `else if` chain is one construct: every arm unifies with the rest, not
+  just with its neighbour. Diverging legs and arms (`ret`, `panic`,
+  `jump`) are `Never` and don't participate (§5.1).
 - An `i53`/`i32` operand mix (no implicit widening; suffix the
   literal).
 
