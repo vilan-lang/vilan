@@ -7,9 +7,80 @@ impl str {
 
 	external fun trim(self): str;
 
+	/// The host's **full Unicode** uppercase mapping, locale-independent.
+	///
+	/// One-to-many mappings included, so the result can be LONGER than the
+	/// receiver: `"Straße".to_uppercase()` is `"STRASSE"` — ß expands to two
+	/// characters — and non-ASCII letters map, `"ǳ".to_uppercase()` being
+	/// `"Ǳ"`. Indices therefore do not survive the call. For a
+	/// length-preserving fold over the 26 ASCII letters alone, reach for
+	/// `to_uppercase_ascii`.
 	external fun to_uppercase(self): str;
 
-	external fun to_lowercase_ascii(self): str;
+	/// The host's **full Unicode** lowercase mapping, locale-independent.
+	///
+	/// The mirror of `to_uppercase`: non-ASCII letters map (`"Ǳ"` lowers to
+	/// `"ǳ"`, `"É"` to `"é"`) and one-to-many mappings apply, so the result
+	/// can be LONGER than the receiver — `"İ"` lowers to `"i̇"`, two code
+	/// units — and indices do not survive the call. For a length-preserving
+	/// fold over the 26 ASCII letters alone, reach for `to_lowercase_ascii`.
+	external fun to_lowercase(self): str;
+
+	/// `A`–`Z` shifted to `a`–`z`, and **nothing else touched**.
+	///
+	/// Exactly the 26 ASCII letters: `ß`, `Ǳ`, `İ`, `É` and every other code
+	/// unit passes through unchanged, so the result always has the same
+	/// length as the receiver and an index into one is an index into the
+	/// other. That is what makes it the tool for protocol text — file
+	/// extensions, mime rows, HTTP header names, HTML tag names, hex — where
+	/// "case-insensitive" is defined over ASCII and a Unicode fold would
+	/// rewrite data instead: U+212A KELVIN SIGN lowers to a plain `k` under
+	/// `to_lowercase`, so a full fold makes a character that is not an ASCII
+	/// letter read as one. For human text, `to_lowercase` is the one you want.
+	fun to_lowercase_ascii(self): str {
+		let lowercase = "abcdefghijklmnopqrstuvwxyz";
+		let length = self.len();
+		mut out = "";
+		mut index = 0;
+		for index < length {
+			let unit = self.code_at(index);
+			// `A` (65) through `Z` (90) — the only units this maps.
+			if unit >= 65 && unit <= 90 {
+				let letter = (unit - 65).as_i32();
+				out = out + lowercase.substring(letter, letter + 1);
+			} else {
+				out = out + self.substring(index, index + 1);
+			}
+			index = index + 1;
+		}
+		out
+	}
+
+	/// `a`–`z` shifted to `A`–`Z`, and **nothing else touched**.
+	///
+	/// The mirror of `to_lowercase_ascii`: exactly the 26 ASCII letters, every
+	/// other code unit unchanged, the length preserved. `"Straße"` comes back
+	/// `"STRAßE"` — where `to_uppercase` would expand the ß to `SS` and change
+	/// the length. The right tool wherever an identifier is ASCII by
+	/// specification; for human text, `to_uppercase`.
+	fun to_uppercase_ascii(self): str {
+		let uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+		let length = self.len();
+		mut out = "";
+		mut index = 0;
+		for index < length {
+			let unit = self.code_at(index);
+			// `a` (97) through `z` (122) — the only units this maps.
+			if unit >= 97 && unit <= 122 {
+				let letter = (unit - 97).as_i32();
+				out = out + uppercase.substring(letter, letter + 1);
+			} else {
+				out = out + self.substring(index, index + 1);
+			}
+			index = index + 1;
+		}
+		out
+	}
 
 	external fun contains(self, needle: str): bool;
 

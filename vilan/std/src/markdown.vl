@@ -611,6 +611,8 @@ fun heading_id(content: List<Inline>): str {
 			out = out + text.substring(i, i + 1);
 			i += 1;
 		} else if c >= 65 && c <= 90 {
+			// The unit is `A`..`Z` by the guard above, so the ASCII fold is
+			// exactly the operation — and the only one that cannot surprise.
 			out = out + text.substring(i, i + 1).to_lowercase_ascii();
 			i += 1;
 		} else if is_slug_whitespace(c) {
@@ -620,9 +622,9 @@ fun heading_id(content: List<Inline>): str {
 			i += 1;
 		} else {
 			// A kept non-ASCII unit: lowercased with the host's Unicode
-			// fold (`to_lowercase_ascii` lowers to the host `toLowerCase`),
-			// mdBook's own case rule.
-			out = out + text.substring(i, i + 1).to_lowercase_ascii();
+			// fold (`to_lowercase`), mdBook's own case rule — the ONE site
+			// in std that wants the full mapping rather than the ASCII one.
+			out = out + text.substring(i, i + 1).to_lowercase();
 			i += 1;
 		}
 	}

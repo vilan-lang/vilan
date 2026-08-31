@@ -335,7 +335,9 @@ fun content_type_of(file: str): Option<str> {
 	// resource could live in a subdirectory (kolt.local 029). The leading `.`
 	// is dropped here because the table's rows are spelled without it, and it
 	// is lowercased because `FAVICON.PNG` is one file to the build that wrote
-	// it, so it is one row to the table that types it.
+	// it, so it is one row to the table that types it. The fold is the ASCII
+	// one: every row below is ASCII, so a full Unicode fold could only ever
+	// invent a match (the Kelvin sign lowering into a plain `k`).
 	let extension = path::extname(file);
 	match extension.strip_prefix(".").unwrap_or("").to_lowercase_ascii() {
 		// GENERATED(mime-table): from crates/vilan-core/tests/mime-table.tsv, itself derived from

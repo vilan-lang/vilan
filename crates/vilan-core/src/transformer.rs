@@ -6020,7 +6020,7 @@ impl<'src> Transformer<'src> {
                 js::Node::Call(Box::new(js::Node::Local("__scan".to_string())), Vec::new())
             }
             Intrinsic::StrTrim => native_method(&mut args, "trim"),
-            Intrinsic::StrToLowercaseAscii => native_method(&mut args, "toLowerCase"),
+            Intrinsic::StrToLowercase => native_method(&mut args, "toLowerCase"),
             Intrinsic::StrToUppercase => native_method(&mut args, "toUpperCase"),
             Intrinsic::StrContains => native_method(&mut args, "includes"),
             Intrinsic::StrStartsWith => native_method(&mut args, "startsWith"),

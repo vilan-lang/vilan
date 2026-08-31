@@ -367,6 +367,7 @@ std/rpc.md h2 server-plumbing-stdrpc_server-process-layer
 std/rpc.md h2 envelope--codec-layer
 std/strings.md h1 strings-reference
 std/strings.md h2 str
+std/strings.md h3 case-the-full-pair-and-the-ascii-pair
 std/strings.md h3 locating-index_of-and-last_index_of
 std/strings.md h3 slicing-substring-refuses-it-does-not-correct
 std/strings.md h3 cutting-a-known-affix
