@@ -214,3 +214,41 @@ fn disposing_a_reactive_client_clears_its_transports_inbound_handler() {
         "status = idle\ntrue\nfalse\n",
     );
 }
+
+// A30 wires `dispose` to the terminal `Closed`, so std now calls it on a client
+// an app may already have disposed — which makes idempotence load-bearing
+// rather than incidental. Both halves are read: the handler slot (already
+// `None` on the second pass) and the ROUTES, which is the half a second pass
+// could plausibly disturb and the half `close_for_good` is really there for.
+#[test]
+fn disposing_a_reactive_client_twice_is_harmless() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::json_codec;
+        import std::reactive::{ Disposable, Signal };
+        import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+
+        fun main() {
+            let status = Signal::new("idle");
+            let (client_end, server_end) = duplex_pair();
+            let server = ReactiveServer::new(server_end, json_codec());
+            let channel = server.expose(status);
+            let client = ReactiveClient::new(client_end, json_codec());
+            let mirror: RemoteSource<str> = client.source(channel);
+            let watching = mirror.sub(|value| print(i"status = {value}"));
+            print(client.routes.read().len());
+            client.dispose();
+            print(client.routes.read().len());
+            print(client_end.me.read().is_some());
+            client.dispose();
+            print(client.routes.read().len());
+            print(client_end.me.read().is_some());
+            watching.dispose();
+        }
+
+        main();
+        "#,
+        "status = idle\n1\n0\nfalse\n0\nfalse\n",
+    );
+}

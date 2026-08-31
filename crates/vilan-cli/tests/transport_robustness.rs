@@ -14,7 +14,8 @@
 //! Connected, a call made while down fails fast, the mirror RE-SYNCS to the
 //! restarted server's value through the re-attach hook, calls work again
 //! afterwards — and, when the mirrors CANNOT be rebound, the socket reaches the
-//! terminal `Closed` instead of claiming to be live over dead channel ids.
+//! terminal `Closed` instead of claiming to be live over dead channel ids, and
+//! the client that held those mirrors disposes itself (A30) instead of wedging.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -275,6 +276,15 @@ async fun main() {
 				// on the reconnected transport must succeed again.
 				if value == 2 && !resynced.read() {
 					resynced.write() = true;
+					// A30's negative: this socket redialled and its mirrors
+					// resynced, so the client must NOT have disposed itself —
+					// the inbound handler that just delivered this very value
+					// is still installed.
+					if client.status.transport.me.read().is_some() {
+						print("disposed:false");
+					} else {
+						print("disposed:true");
+					}
 					match client.set_status(5) {
 						Ok(let confirmed) => {
 							print(i"call:ok:{confirmed}");
@@ -307,11 +317,19 @@ async fun main() {
 /// call to make but a claim to disprove — that the socket says `Connected`
 /// while the mirrors are bound to a dead connection's channels — so the client
 /// only reports, and the assertions are about what does and does not appear.
+///
+/// It also reports A30's auto-disposal, which is POLLED rather than reported
+/// from the state observer: the observer runs inside `state.set(Closed)`, one
+/// line before the client disposes itself, so it could only ever see the
+/// before. The slot it reads is `ReactiveClient.transport.me` — the mirror
+/// holds that same `DuplexEnd`, which is what makes the disposal visible from
+/// the generated client at all.
 #[cfg(unix)]
 const WATCH_CLIENT: &str = r#"import std::print;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
 import std::time::sleep;
+import std::rpc::ConnectionState;
 import common::{ StatusBoard, StatusClient };
 
 async fun main() {
@@ -324,6 +342,24 @@ async fun main() {
 				print(i"mirror:{value}");
 			});
 			print("ready");
+			// Poll for the terminal state, then report the disposal that
+			// follows it. Bounded (30 s) so a run that never closes ends
+			// quietly rather than spinning; the harness's own 20 s waits
+			// fail the test first.
+			mut ticks = 0;
+			for ticks < 300 {
+				sleep(100);
+				if client.transport.connection_state().get() == ConnectionState::Closed {
+					ticks = 300;
+					if client.status.transport.me.read().is_some() {
+						print("disposed:false");
+					} else {
+						print("disposed:true");
+					}
+				} else {
+					ticks = ticks + 1;
+				}
+			}
 			// Held open through the outage; the harness kills the process.
 			sleep(600000);
 		},
@@ -461,6 +497,13 @@ fn a_dropped_connection_reconnects_and_resyncs() {
     revived.await_line("listening 2", wait);
     client.await_line("state:Connected", wait);
     client.await_line("mirror:2", wait);
+    // A30's load-bearing negative: an ordinary redial disposes NOTHING. The
+    // two terminal siblings below are the only paths that may.
+    let disposal = client.await_line("disposed:", wait);
+    assert_eq!(
+        disposal, "disposed:false",
+        "a resynced connection must keep its client wired to the transport"
+    );
     client.await_line("call:ok:5", wait);
 
     fixture.clean();
@@ -508,6 +551,14 @@ fn a_refused_reattach_closes_the_socket_instead_of_wedging_the_mirrors() {
         !settled.iter().any(|line| line.contains("mirror:2")),
         "nothing was rebound, so no mirror can have resynced: {settled:?}"
     );
+    // A30: the terminal state is followed by the client disposing itself —
+    // routes emptied, transport handler cleared. Nothing on this socket can
+    // ever update those mirrors again, so nothing should still hold them.
+    let disposal = client.await_line("disposed:", wait);
+    assert_eq!(
+        disposal, "disposed:true",
+        "a refused re-attach must leave no wedged client holding the graph"
+    );
 
     fixture.clean();
 }
@@ -542,6 +593,12 @@ fn a_server_that_redeploys_a_different_surface_closes_the_socket() {
     assert!(
         !settled.iter().any(|line| line.contains("mirror:2")),
         "a drifted surface must not feed the mirrors: {settled:?}"
+    );
+    // A30, the drift half of the same wiring.
+    let disposal = client.await_line("disposed:", wait);
+    assert_eq!(
+        disposal, "disposed:true",
+        "a drifted surface must leave no wedged client holding the graph"
     );
 
     fixture.clean();
