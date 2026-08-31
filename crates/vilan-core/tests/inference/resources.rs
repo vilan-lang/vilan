@@ -7507,3 +7507,27 @@ fn a_retaining_extern_composes_with_every_binding_form() {
         "#,
     );
 }
+
+#[test]
+fn the_retention_flag_is_per_declaration_not_per_host() {
+    // The shape `std::dom`'s listen surface is declared in (`proposal/router.md`
+    // §5.2): two bindings on ONE host object, one retaining and one not, because
+    // `addEventListener` stores the closure and `removeEventListener` does not.
+    // The flag is a property of the declaration, so a host that retains through
+    // one method does not retain through its neighbor — over-marking the removal
+    // twin is the error the §S4 audit caught on `appendChild`.
+    assert_compiles(
+        r#"
+        external struct Host;
+        external struct Event;
+        impl Host {
+            [extern(method, "addEventListener", retains)]
+            external fun on_event(self, event: str, handler: |Event| void): void;
+
+            [extern(method, "removeEventListener")]
+            external fun off_event(self, event: str, handler: |Event| void): void;
+        }
+        fun main() {}
+        "#,
+    );
+}

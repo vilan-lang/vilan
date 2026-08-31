@@ -54,6 +54,9 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __dom_window() {
+	return window;
+}
 function __hmr_active() {
 	return typeof globalThis.__VILAN_HMR__ !== "undefined";
 }
@@ -199,7 +202,7 @@ function ensure_wired($e) {
 	if (!(wired.v)) {
 		wired.v = true;
 		$f(path_signal, __router_path(), $e);
-		window.addEventListener("popstate", () => {
+		__dom_window().addEventListener("popstate", () => {
 			return $q([ 1 ], ($p) => {
 				$f(path_signal, __router_path(), [ 0, $p ]);
 				return;
