@@ -3285,7 +3285,14 @@ fn the_removed_std_print_alias_names_the_prelude_and_the_real_path() {
     // removal nor either way forward; this arm names both.
     let errors = analyze_under_prelude(
         base_prelude(),
-        &[("main.vl", "fun main() { print(\"x\"); }\n")],
+        // The import line below is THE SUBJECT of this pin — the removed
+        // alias must be spelled to draw its curated removal message. A
+        // fixture sweep deleting `import std::print;` lines must skip this
+        // one (it did not, once, at the Order 22 integration).
+        &[(
+            "main.vl",
+            "import std::print;\nfun main() { print(\"x\"); }\n",
+        )],
         "main.vl",
         Platform::default(),
     );

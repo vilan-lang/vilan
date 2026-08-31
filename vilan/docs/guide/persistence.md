@@ -400,7 +400,6 @@ answers an **empty** chunk at end of file:
 
 ```vilan,norun
 import std::fs::{ File, Reader };
-import std::print;
 
 fun main() {
 	let reader = Reader::of(File::open("big.bin"));

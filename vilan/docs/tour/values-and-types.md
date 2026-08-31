@@ -92,7 +92,6 @@ and is refused rather than printed as its runtime shape, which is what
 `"p=" + point` would have done (`p=1,2`). Render it yourself:
 
 ```vilan
-import std::print;
 import std::display::Display;
 
 struct Point { x: i32, y: i32 }

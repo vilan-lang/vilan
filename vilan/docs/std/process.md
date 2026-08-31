@@ -605,7 +605,6 @@ empty.
 ```vilan,norun
 import std::drop::drop;
 import std::fs::{ File, Reader };
-import std::print;
 
 fun main() {
 	let reader = Reader::of(File::open("big.bin"));

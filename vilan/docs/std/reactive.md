@@ -110,7 +110,6 @@ any type of yours — a storage-backed cell, a mirror over a transport, a wrappe
 that logs. Implement `get` and `sub` and `effect` comes free.
 
 ```vilan
-import std::print;
 import std::reactive::{ Owner, Signal, Source, Subscription };
 
 /// A signal with a place to hang persistence, and no `set` on the trait.
