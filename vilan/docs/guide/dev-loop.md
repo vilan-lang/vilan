@@ -233,8 +233,18 @@ The rest of the rules:
   looks like it means). A pattern such as `src/**/*.css` is a manifest error,
   not a match — it would hash as a file that is never there and freeze the
   hook after its first run.
+- **A directory's tree is its members**, so a subdirectory counts even while it
+  is empty: creating or removing `src/static/icons` re-runs the hook the same
+  way adding a file does, and so does replacing a directory with a file of the
+  same name. That is also what `--watch` wakes on, so the round you get and the
+  hook that runs in it always agree.
 - **A missing input is recorded as missing**, so creating it later re-runs the
-  hook. A missing or hand-edited output re-runs it too.
+  hook. A missing or hand-edited output re-runs it too. A declared path that is
+  a *symlink* is followed — `inputs = ["static"]` may name a link to the real
+  directory, and it hashes as that directory's tree — and a link with no target
+  counts as missing, the same as an absent path. Links found *inside* a declared
+  tree are a different question and are not followed: one hashes as its target
+  path, so the walk can neither leave the tree nor run into a cycle.
 - **Under `--watch`, a declared input starts a round.** Saving a file the hook
   names in `inputs` — or adding to, or editing anything inside, a directory it
   names — wakes the loop exactly the way saving a `.vl` source does, and the

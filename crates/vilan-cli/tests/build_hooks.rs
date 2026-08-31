@@ -367,6 +367,278 @@ fn a_declared_directory_digests_its_whole_tree() {
 }
 
 #[test]
+fn an_empty_directory_added_to_a_declared_tree_reruns_the_hook() {
+    // G16. A directory is a MEMBER of the tree, not just a place files are
+    // found in: `mkdir static/empty` is a change to what `inputs = ["static"]`
+    // names, and so is removing it again. The walk pushed files and links only,
+    // so both moved nothing — while the watcher, which inserts an entry per
+    // nested directory, woke a round for exactly this change and handed it to a
+    // predicate that said `Fresh`.
+    let dir = temp_project("directory_input_empty_child");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"copy\"\nrun = {}\n\
+             inputs = \"static\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "static/a.txt", "a\n");
+
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "an untouched tree is fresh");
+
+    std::fs::create_dir(dir.join("static/empty")).expect("create the empty subdirectory");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "an empty directory added to the tree re-runs the hook"
+    );
+
+    std::fs::remove_dir(dir.join("static/empty")).expect("remove it again");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        3,
+        "and removing it is a change in its own right"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_directory_replaced_by_an_empty_file_reruns_the_hook() {
+    // Why the row states its KIND instead of carrying a digest of nothing. Give
+    // a directory the digest of the empty byte string and it produces exactly
+    // the row an EMPTY FILE at the same key produces, so swapping one for the
+    // other is invisible to the predicate — and that swap is not exotic, it is
+    // what a generator does when a directory of parts becomes a single file.
+    // Each row says what it is, so a path that changes kind is a change.
+    //
+    // Proven by planting the digest-of-nothing row: this goes red on it, and
+    // the pin above stays green, which is what makes the two rows distinct
+    // rather than merely present.
+    let dir = temp_project("directory_input_kind_swap");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"copy\"\nrun = {}\n\
+             inputs = \"static\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    std::fs::create_dir_all(dir.join("static/sub")).expect("an empty subdirectory");
+
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "an untouched tree is fresh");
+
+    std::fs::remove_dir(dir.join("static/sub")).unwrap();
+    write(&dir, "static/sub", "");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "an empty file where an empty directory was is a change"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── G15: a declared path that IS a symlink ──
+//
+// The declaration has two consumers and they have to resolve a path the same
+// way. On a LINK they did not: the stamp stat'd with `symlink_metadata`, so a
+// link to a directory was not `is_dir()`, fell through to `fs::read` (EISDIR),
+// digested as unreadable, and the hook was stale on every build forever and
+// silently — while the watcher's `insert_watched_input` followed the same link
+// with `fs::metadata` and watched the tree behind it. A link to a FILE hid the
+// split, because `fs::read` follows one.
+//
+// Creating a symlink needs a privilege Windows does not grant by default, so
+// these are `cfg(unix)` like every other symlink pin in the tree; nothing they
+// pin is platform-specific.
+
+#[cfg(unix)]
+#[test]
+fn a_declared_directory_input_reached_through_a_symlink_stays_fresh() {
+    // G15's own repro, as measured: three builds over `inputs =
+    // "linked_static"` ran the hook three times, where the same tree declared
+    // by its real name ran it once. The last two assertions are the ones that
+    // were red.
+    let dir = temp_project("directory_input_link");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"copy\"\nrun = {}\n\
+             inputs = \"linked_static\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "static/a.txt", "a\n");
+    std::os::unix::fs::symlink("static", dir.join("linked_static"))
+        .expect("link the declared name at the real directory");
+
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        1,
+        "a declared link to a directory digests as that directory's tree"
+    );
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        1,
+        "and stays fresh, build after build"
+    );
+
+    // And it is fresh rather than frozen: the tree behind the link is still
+    // the content, so a change through it re-runs the hook.
+    write(&dir, "static/a.txt", "changed\n");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "an edit behind the link is an edit to the declared input"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_inside_a_declared_tree_is_digested_unfollowed() {
+    // The fence the fix above must not breach. The TOP-LEVEL declared path is
+    // resolved through a link; a link found INSIDE the tree is not, and digests
+    // as its own target path — otherwise the walk could leave the declared tree
+    // or run into a cycle.
+    //
+    // Both halves are sharp because the fixture makes following and not
+    // following disagree: `a.txt` and `b.txt` hold identical bytes, so
+    // re-pointing the link is invisible to a walk that follows it and is a
+    // change to one that reads the link itself.
+    let dir = temp_project("tree_link");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"copy\"\nrun = {}\n\
+             inputs = \"static\"\n",
+            toml_string(&append("ran.txt"))
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "static/a.txt", "same\n");
+    write(&dir, "static/b.txt", "same\n");
+    write(&dir, "outside.txt", "one\n");
+    std::os::unix::fs::symlink("a.txt", dir.join("static/link")).expect("link inside the tree");
+    std::os::unix::fs::symlink("../outside.txt", dir.join("static/escape"))
+        .expect("link out of the tree");
+
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "an untouched tree is fresh");
+
+    std::fs::remove_file(dir.join("static/link")).unwrap();
+    std::os::unix::fs::symlink("b.txt", dir.join("static/link")).expect("re-point the link");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "the link's target PATH is its content: re-pointing it at a \
+         byte-identical file is still a change"
+    );
+
+    write(&dir, "outside.txt", "two\n");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "and the tree does not extend through a link that leaves it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declared_input_that_is_a_broken_link_reads_as_missing() {
+    // A link to nothing is the same forever-loop one level down, and the same
+    // resolution closes it: the declared path resolves through the link, so a
+    // link with no target is a path that is not there — recorded as missing,
+    // fresh on the next build, and invalidated when the target appears. It used
+    // to be "unreadable", which is never fresh and never explained.
+    let dir = declared_hook_project("input_broken_link");
+    std::fs::remove_file(dir.join("input.txt")).unwrap();
+    std::os::unix::fs::symlink("target.txt", dir.join("input.txt")).expect("link at nothing");
+
+    build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1);
+    let second = build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        1,
+        "a link to nothing is a missing input, not an unreadable one:\n{second}"
+    );
+
+    write(&dir, "target.txt", "one\n");
+    build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "and the target appearing is the input appearing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declared_output_that_is_a_broken_link_is_reported_as_not_written() {
+    // The other side of the same reading, and the reason it is the right one:
+    // an output that is a link to nothing is an output the build cannot use, so
+    // it is the "did not write it" note rather than silence. Read as
+    // "unreadable" it was neither recorded nor reported — the hook re-ran on
+    // every build with nothing said, which is the exact failure the note exists
+    // to prevent.
+    let dir = temp_project("output_broken_link");
+    write(
+        &dir,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\n\n[[build.hook]]\nname = \"gen\"\nrun = [{}, {}]\n\
+             inputs = \"input.txt\"\noutputs = \"generated.txt\"\n",
+            toml_string(&append("ran.txt")),
+            toml_string("ln -sf nowhere.txt generated.txt")
+        ),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+
+    let first = build(&dir);
+    assert_eq!(runs(&dir, "ran.txt"), 1, "the hook ran:\n{first}");
+    assert!(
+        first.contains("`gen`") && first.contains("generated.txt"),
+        "an output that links to nothing is named as not written:\n{first}"
+    );
+    let second = build(&dir);
+    assert_eq!(
+        runs(&dir, "ran.txt"),
+        2,
+        "and nothing is stamped for it, so the hook re-runs:\n{second}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn rerun_hooks_runs_a_fresh_hook_anyway() {
     // §3.2's escape, for the hook that reads something it did not declare.
     let dir = declared_hook_project("rerun_flag");
@@ -1052,6 +1324,49 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
         || runs(&dir, "rounds.txt") >= 2,
     );
     wait_for_in(&dir, "the hook the new icon re-runs", || {
+        runs(&dir, "ran.txt") >= 2
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_empty_directory_added_under_a_declared_input_rounds_and_reruns_the_hook() {
+    // G16, and the reason it is one item and not two: the two consumers have to
+    // AGREE about `mkdir icons/empty`, and either answer would have been an
+    // answer as long as both gave it. They gave different ones. The watcher
+    // inserts an entry per nested directory, so the round fired; the stamp
+    // pushed files and links only, so the round it fired judged the hook Fresh
+    // and did nothing at all. A round that reliably does nothing is not a safe
+    // failure — it is the freshness gate answering a reading of the manifest
+    // that the thing which woke it does not share.
+    //
+    // Measured before the fix on this fixture: `rounds.txt` reached 2 within a
+    // second and `ran.txt` sat at 1 for the whole liveness bound.
+    let dir = temp_project("watch_empty_nested_directory");
+    write(&dir, "vilan.toml", &watch_manifest("[\"icons\"]"));
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "icons/check.svg", "<svg/>\n");
+    let _watcher = spawn_watch(&dir);
+
+    wait_for_in(&dir, "the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
+
+    std::fs::create_dir(dir.join("icons/empty")).expect("create the empty subdirectory");
+    wait_nudged(
+        &dir,
+        "the round the empty subdirectory starts",
+        // The re-touch N30's pin uses, for the same reason: remove and
+        // re-create is the only edit an empty directory has, and either half is
+        // a difference on its own.
+        || {
+            let _ = std::fs::remove_dir(dir.join("icons/empty"));
+            let _ = std::fs::create_dir(dir.join("icons/empty"));
+        },
+        || runs(&dir, "rounds.txt") >= 2,
+    );
+    wait_for_in(&dir, "the hook the empty subdirectory re-runs", || {
         runs(&dir, "ran.txt") >= 2
     });
     let _ = std::fs::remove_dir_all(&dir);

@@ -604,10 +604,13 @@ fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
 /// changes deeper down are carried by the file entries themselves.
 ///
 /// The top-level path is resolved through a symlink (`fs::metadata`), matching
-/// both the stamp — which reads a declared link's *target* bytes — and the
-/// `asset::read` inputs this set has always carried. Inside a tree, a symlink
-/// is never followed: the stamp digests the link's own target path there, and
-/// following one could walk out of the tree or into a cycle.
+/// both the `asset::read` inputs this set has always carried and the stamp,
+/// which resolves its own declared path the same way. That last half was only
+/// half true until G15 — the stamp stat'd the link itself, so a declared link
+/// to a DIRECTORY was watched here and unreadable there — and the comment
+/// claiming the match is what let it stand. Inside a tree, a symlink is never
+/// followed: the stamp digests the link's own target path there, and following
+/// one could walk out of the tree or into a cycle.
 fn insert_watched_input(path: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
     let Ok(metadata) = fs::metadata(path) else {
         return;
@@ -623,9 +626,12 @@ fn insert_watched_input(path: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) 
 /// Every path under a declared directory input → its modification time: each
 /// file, and each nested DIRECTORY in its own right, for the same reason the
 /// root gets an entry — a subdirectory appearing empty is a change to the tree
-/// that no file entry can express. An entry that cannot be read is skipped
-/// rather than failing the snapshot: the watcher's job is to keep polling, and
-/// a path it cannot stat is one whose later readability is itself a difference.
+/// that no file entry can express. The stamp reads it that way too: a directory
+/// is a row of its own in [`collect_tree`]. It was not until G16, and the
+/// disagreement was visible exactly here — this entry woke a round that the
+/// stamp then answered `Fresh`. An entry that cannot be read is skipped rather
+/// than failing the snapshot: the watcher's job is to keep polling, and a path
+/// it cannot stat is one whose later readability is itself a difference.
 fn collect_input_tree(root: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -1986,8 +1992,10 @@ impl DeclaredHook {
     /// can say it out loud.
     ///
     /// Only a path that is genuinely absent counts (`Some(None)`): one that
-    /// could not be *read* is a permission error or a broken link, which is
-    /// not "the hook did not write it".
+    /// could not be *read* is a permission error, which is not "the hook did
+    /// not write it". A link with no target IS absent — [`file_digest`]
+    /// resolves through the link — and an output the build cannot follow to a
+    /// file is exactly what this note is for.
     fn missing_outputs(&self, dir: &Path) -> Vec<&str> {
         self.outputs
             .iter()
@@ -2024,15 +2032,35 @@ fn digest_of(bytes: &[u8]) -> String {
 
 /// A declared path's content digest: `Some(None)` for a path that is not there,
 /// `Some(Some(hex))` for one that is, and `None` when it could not be read at
-/// all (a permission error, a broken link) — which is not a fingerprint and
-/// must not be recorded as one.
+/// all (a permission error) — which is not a fingerprint and must not be
+/// recorded as one.
 ///
-/// A **directory** digests as its whole tree: the sorted relative paths and
-/// their contents, so declaring `inputs = ["src/static"]` means what a reader
-/// expects it to mean. That is the shape the copy case (§2.1) needs, and it is
-/// why this design refuses glob patterns rather than growing a matcher.
+/// A **directory** digests as its whole tree: the sorted relative paths of
+/// every member with what each one is ([`collect_tree`]), so declaring
+/// `inputs = ["src/static"]` means what a reader expects it to mean. That is
+/// the shape the copy case (§2.1) needs, and it is why this design refuses glob
+/// patterns rather than growing a matcher.
+///
+/// The declared path is resolved THROUGH a symlink (`fs::metadata`), which is
+/// exactly how [`insert_watched_input`] resolves the same declaration — one
+/// reading of the manifest, both consumers. It stat'd the link itself until
+/// G15, which was invisible for a link to a FILE (`fs::read` follows one) and a
+/// silent forever-loop for a link to a DIRECTORY: not `is_dir()`, so `fs::read`
+/// got `EISDIR`, so the digest was `None`, so the hook was stale on every build
+/// with nothing said — while the watcher was watching the tree behind the link
+/// all along. Inside a tree a link is never followed ([`collect_tree`]): that is
+/// the loop-and-escape fence, and it is a different question from what the
+/// declaration names.
+///
+/// A link with no target resolves to nothing and so reads as MISSING rather
+/// than unreadable — the same answer the watcher gives it (no entry, and its
+/// later appearance is a difference). Both alternatives to that are worse: an
+/// unreadable input is never fresh, so the hook re-runs forever, and an
+/// unreadable output is not "the hook did not write it" either, so it is never
+/// reported. Missing is recorded, is explained, and invalidates when the target
+/// appears.
 fn file_digest(path: &Path) -> Option<Option<String>> {
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
         Err(_) => return None,
@@ -2042,10 +2070,10 @@ fn file_digest(path: &Path) -> Option<Option<String>> {
         collect_tree(path, Path::new(""), &mut entries)?;
         entries.sort();
         let mut joined = String::new();
-        for (relative, digest) in entries {
+        for (relative, row) in entries {
             joined.push_str(&relative);
             joined.push('\0');
-            joined.push_str(&digest);
+            joined.push_str(&row);
             joined.push('\n');
         }
         return Some(Some(digest_of(joined.as_bytes())));
@@ -2053,11 +2081,38 @@ fn file_digest(path: &Path) -> Option<Option<String>> {
     Some(Some(digest_of(&fs::read(path).ok()?)))
 }
 
-/// Every file under `root`, as `(slash-joined relative path, digest)`. The
-/// separator is normalized to `/` so a stamp written on one platform describes
-/// the same tree on another. A symlink is digested as its *target path*, never
-/// followed: following one could walk out of the tree or into a cycle, and the
-/// link itself is the declared content.
+/// Every path under `root`, as `(slash-joined relative path, kind and digest)`.
+/// The separator is normalized to `/` so a stamp written on one platform
+/// describes the same tree on another. Three kinds of row, because the tree has
+/// three kinds of member and the declaration means all of them:
+///
+/// * a **file** is `file <digest of its bytes>`;
+/// * a **symlink** is `link <digest of its target path>`, never followed —
+///   following one could walk out of the tree or into a cycle, and the link
+///   itself is the declared content (the TOP-LEVEL declared path is a different
+///   question and is resolved, see [`file_digest`]);
+/// * a **directory** is `dir`, and its members are rows of their own.
+///
+/// A directory's row carries no digest because a directory has no content of
+/// its own — its membership is exactly the rows of its members — so the row's
+/// whole information is that the key EXISTS, which is what makes an empty one
+/// visible. That row is G16: the walk pushed files and links only, so `mkdir`
+/// under a declared input moved nothing here, while the watcher's
+/// [`collect_input_tree`] inserts an entry per nested directory and started a
+/// round for it — which this predicate then answered `Fresh`. One reading of
+/// the manifest, both consumers, and it is the watcher's reading that is right:
+/// N30 settled for the declared ROOT that a directory appearing is a change
+/// nothing about its (absent) files can express, and a nested directory is the
+/// same rule one level down. The failure the alignment removes was the safe
+/// direction — a spurious round, never a missed one — but a round that
+/// reliably does nothing is the gate reporting on a tree it reads differently
+/// from the thing that woke it.
+///
+/// The KIND is in the row rather than implied by the digest, so a path that
+/// changes kind is a change even where the two would otherwise hash alike: a
+/// directory row of "the digest of no bytes" is indistinguishable from an empty
+/// file's, and a generator replacing a directory of parts with a single file is
+/// not an exotic edit.
 fn collect_tree(root: &Path, prefix: &Path, out: &mut Vec<(String, String)>) -> Option<()> {
     let mut children: Vec<PathBuf> = fs::read_dir(root)
         .ok()?
@@ -2071,11 +2126,14 @@ fn collect_tree(root: &Path, prefix: &Path, out: &mut Vec<(String, String)>) -> 
         let key = relative.to_string_lossy().replace('\\', "/");
         if metadata.is_symlink() {
             let target = fs::read_link(&child).ok()?;
-            out.push((key, digest_of(target.to_string_lossy().as_bytes())));
+            let digest = digest_of(target.to_string_lossy().as_bytes());
+            out.push((key, format!("link {digest}")));
         } else if metadata.is_dir() {
+            out.push((key, "dir".to_string()));
             collect_tree(&child, &relative, out)?;
         } else {
-            out.push((key, digest_of(&fs::read(&child).ok()?)));
+            let digest = digest_of(&fs::read(&child).ok()?);
+            out.push((key, format!("file {digest}")));
         }
     }
     Some(())
