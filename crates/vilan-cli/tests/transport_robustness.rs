@@ -4,18 +4,22 @@
 //! call hangs), KILLED (the socket closes), and RESTARTED. What the restarted
 //! server IS is the variable this file turns: the same service (the happy
 //! re-sync path), a service that will not open a session (the re-attach fails),
-//! or a DIFFERENT service (the contract drifted under us). All three are real
-//! servers built from one source — there is no fault-injection seam in std, and
-//! none is needed, because every failure the reconnect path can meet is
-//! reachable from `Service`'s own public surface.
+//! or a DIFFERENT service (the contract drifted under us) — or NOTHING, the
+//! server that never comes back and spends the whole retry budget. The three
+//! servers are real, built from one source — there is no fault-injection seam
+//! in std, and none is needed, because every failure the reconnect path can
+//! meet is reachable from `Service`'s own public surface, the fourth case by
+//! declining to start one at all.
 //!
-//! Asserted across the three: the pending call rejects with a typed transport
+//! Asserted across the legs: the pending call rejects with a typed transport
 //! error (never dangles), the state signal walks Connected → Reconnecting →
 //! Connected, a call made while down fails fast, the mirror RE-SYNCS to the
 //! restarted server's value through the re-attach hook, calls work again
 //! afterwards — and, when the mirrors CANNOT be rebound, the socket reaches the
 //! terminal `Closed` instead of claiming to be live over dead channel ids, and
-//! the client that held those mirrors disposes itself (A30) instead of wedging.
+//! the client that held those mirrors disposes itself instead of wedging: on
+//! the two refusals (A30) and on the spent retry budget (A31), which is one
+//! law read off the state rather than three arms each remembering it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -368,6 +372,23 @@ async fun main() {
 }
 "#;
 
+/// `WATCH_CLIENT` with a longer terminal-state poll, and nothing else changed.
+/// The re-attach refusals close for good within a beat of the server coming
+/// back, so 30 s of polling is generous for them; the retry budget IS the
+/// event in the exhaustion leg — ten attempts, 250 ms doubling to a 4 s cap,
+/// about 24 s of sleeps — which leaves that const's bound close enough to the
+/// thing it is waiting for to be a timing pin rather than a behaviour one. Same
+/// program otherwise, and the two A30 legs keep the 30 s form byte for byte.
+#[cfg(unix)]
+fn patient_watch_client() -> String {
+    assert_eq!(
+        WATCH_CLIENT.matches("300").count(),
+        2,
+        "the poll bound is the only `300` in WATCH_CLIENT; keep this helper in step with it"
+    );
+    WATCH_CLIENT.replace("300", "900")
+}
+
 /// One built project — `common` (the shared `[service]`), `server` (the
 /// mode-taking server above) and `client` (whichever program the test drives)
 /// — on one ephemeral port, ready to spawn processes from. The port is
@@ -599,6 +620,54 @@ fn a_server_that_redeploys_a_different_surface_closes_the_socket() {
     assert_eq!(
         disposal, "disposed:true",
         "a drifted surface must leave no wedged client holding the graph"
+    );
+
+    fixture.clean();
+}
+
+/// A31, the THIRD terminal arm and the one A30 left unwired: the retry budget
+/// runs out. The server dies and STAYS dead, so `handle_drop` spends all ten
+/// attempts against a port nothing answers on and gives up — the same terminal
+/// `Closed` the two refusals above reach, arrived at from the transport rather
+/// than from the contract.
+///
+/// The defect this pins: that arm was `duplex.state.set(Closed)` on its own,
+/// with no `ReactiveClient` anywhere in scope to dispose — so the ONE outage
+/// every app actually meets (a server that does not come back) was the one path
+/// that reported the connection over while leaving the client holding every
+/// mirror, and the release A30 built ran on the two rarer paths only. The state
+/// says the same thing on all three; what it costs is now the same too.
+#[cfg(unix)]
+#[test]
+fn a_spent_retry_budget_closes_for_good_and_disposes_the_client() {
+    let fixture = ReconnectFixture::build("retry_exhaustion", &patient_watch_client());
+    // The budget itself is ~24 s of backoff sleeps, so this wait covers the
+    // whole of it rather than the usual beat-or-two.
+    let wait = Duration::from_secs(60);
+
+    let server = fixture.server("1", "none");
+    server.await_line("listening 1", wait);
+    let client = fixture.client();
+    client.await_line("state:Connected", wait);
+    client.await_line("mirror:1", wait);
+
+    // The one difference from every other leg in this file: nothing takes the
+    // dead server's place. The port stays unbound for the whole budget.
+    server.signal("-KILL");
+    drop(server);
+    client.await_line("state:Reconnecting", wait);
+
+    let settled = client.collect_until("state:Closed", wait);
+    assert!(
+        !settled.iter().any(|line| line.contains("state:Connected")),
+        "nothing came back, so no attempt can have reconnected: {settled:?}"
+    );
+    // A31's uniform law: the terminal state disposes on this arm exactly as it
+    // does on the two refusals — routes emptied, transport handler cleared.
+    let disposal = client.await_line("disposed:", wait);
+    assert_eq!(
+        disposal, "disposed:true",
+        "a spent retry budget must leave no wedged client holding the graph"
     );
 
     fixture.clean();
