@@ -5577,6 +5577,205 @@ fn fs_exists_is_gone_and_the_import_says_so() {
     );
 }
 
+// --- kolt.local 031 S5: `Reader` and the writing scoped forms
+// (filesystem.md §3.4's build note, §5.3). Unlike `File`, `Db` and `Watcher`,
+// `Reader` is an ORDINARY vilan struct that happens to hold a `File`, so its
+// resource-ness comes from destruction.md §3's containment inference — it
+// writes `resource` for intent, and the modifier buys nothing the inference
+// would not have. That is what these pin: every R-rule lands on it with
+// nothing declared. Runtime behavior is pinned in
+// `crates/vilan-cli/tests/fs.rs`; these pin the semantics and the emission.
+
+#[test]
+fn a_reader_binding_moves_and_a_later_use_is_use_after_move() {
+    // R1 through containment: the `File` inside makes the whole `Reader` a
+    // resource, so a stale cursor is a compile error too.
+    assert_use_after_move_noting(
+        r#"
+        import std::fs::{ File, Reader };
+        fun main() {
+            let reader = Reader::of(File::open("data.txt"));
+            let heir = reader;
+            reader.next(8);
+        }
+        "#,
+        "reader",
+        1,
+    );
+}
+
+#[test]
+fn a_list_of_readers_is_rejected() {
+    // R10 through containment — the same fence `List<File>` meets, reached
+    // without the `Reader` declaration saying anything about it.
+    assert_fails_with(
+        r#"
+        import std::fs::Reader;
+        fun main() {
+            let readers: List<Reader> = [];
+        }
+        "#,
+        "cannot hold the resource",
+    );
+}
+
+#[test]
+fn a_closure_cannot_capture_a_reader() {
+    // R9 through containment. This is also why there is no `with_reader`
+    // scoped form built the way `with_file` is: a body could not hold one.
+    assert_fails_with(
+        r#"
+        import std::fs::{ File, Reader };
+        fun run_it(body: || void) { body(); }
+        fun main() {
+            let reader = Reader::of(File::open("data.txt"));
+            run_it(|| { reader.next(8); });
+        }
+        "#,
+        "cannot capture the resource",
+    );
+}
+
+#[test]
+fn a_readers_file_is_loanable_but_cannot_be_moved_out_of_it() {
+    // R5, and the pair that makes §3.4's interleaving claim precise: reading
+    // through `reader.file` is a LOAN and compiles (positional reads and the
+    // cursor coexist on one open file), while moving the `File` out of a live
+    // `Reader` is refused — the door is one-way.
+    assert_compiles(
+        r#"
+        import std::print;
+        import std::bytes::Bytes;
+        import std::fs::{ File, Reader };
+        fun main() {
+            let reader = Reader::of(File::open("data.txt"));
+            let buffer = Bytes::alloc(8);
+            print(reader.file.read_at(buffer, 0));
+            print(reader.next(8).len());
+        }
+        "#,
+    );
+    assert_fails_with(
+        r#"
+        import std::fs::{ File, Reader };
+        fun main() {
+            let reader = Reader::of(File::open("data.txt"));
+            let stolen = reader.file;
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn a_cursor_method_that_awaits_cannot_take_a_mut_view() {
+    // Why `Reader`'s position is a `Shared<i53>` and not a plain field behind
+    // `&mut self`: it is FORCED, not chosen (filesystem.md §3.4(i)). `next`
+    // awaits the read, and an async function cannot take a `&mut` parameter —
+    // the view would be held across the suspension. Pinned in the `Reader`'s
+    // own shape rather than only in the abstract, because the paper's sketch
+    // reached for `Shared` without saying why and a later reader would
+    // otherwise read it as taste.
+    assert_fails_with(
+        r#"
+        import std::bytes::Bytes;
+        import std::fs::File;
+        resource struct Cursor {
+            file: File,
+            position: i53,
+        }
+        impl Cursor {
+            fun next(&mut self, size: i32): Bytes {
+                let buffer = Bytes::alloc(size);
+                let count = self.file.read_at(buffer, self.position);
+                self.position = self.position + count.as_i53();
+                buffer.slice(0, count)
+            }
+        }
+        fun main() {}
+        "#,
+        "an async function cannot take '&mut' parameters",
+    );
+}
+
+#[test]
+fn every_writing_scoped_form_awaits_its_close() {
+    // §5.3: the four writing forms carry `with_file`'s awaited close, which
+    // is the half that matters on a writing handle — the OS may report a
+    // write's failure at `close(2)` rather than at the write. One
+    // implementation serves all five (`scoped_file`), so this pins that each
+    // form actually routes through it. Plant-proven: dropping the
+    // `close_awaited(file)` line from `scoped_file` reddens every arm.
+    for form in [
+        "with_file_create",
+        "with_file_create_new",
+        "with_file_append",
+        "with_file_modify",
+    ] {
+        let js = compile(&format!(
+            r#"
+            import std::print;
+            import std::fs::{form};
+            fun main() {{
+                let size = {form}("data.txt", |file| file.stat().size);
+                print(size);
+            }}
+            "#
+        ))
+        .expect("compiles");
+        assert!(
+            js.contains("await (__fs_close_awaited(file))"),
+            "{form} must AWAIT its close (filesystem.md §5.3):\n{js}"
+        );
+    }
+}
+
+#[test]
+fn the_awaited_close_does_not_swallow_its_failure_the_way_the_destructors_does() {
+    // The two close seams side by side, which is what makes "a failure to
+    // close is a failure of the call" true rather than decorative: the
+    // destructor's helper catches and reports to stderr (Q1's (a) — the
+    // error is deliberately unobservable there), while the awaited one has no
+    // catch at all, so a rejected close propagates out of the scoped call.
+    // Plant-proven at the seam itself: teaching `__fs_close_awaited` a
+    // `.catch(() => {})` in `transformer.rs` reddens the second assertion.
+    let js = compile(
+        r#"
+        import std::bytes::encode_utf8;
+        import std::fs::with_file_create;
+        fun main() {
+            with_file_create("data.txt", |file| { file.write_at(encode_utf8("x"), 0i53); });
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        js.contains("file.close().catch("),
+        "the destructor's close must swallow and report its failure:\n{js}"
+    );
+    assert!(
+        js.contains("async function __fs_close_awaited(file) {\n\tawait file.close();\n}"),
+        "the awaited close must NOT catch — its failure is the call's:\n{js}"
+    );
+}
+
+#[test]
+fn a_reader_on_a_browser_build_is_refused_by_coloring() {
+    // The coloring argument carries through containment unchanged: `Reader`
+    // the type is colorless, but the only way to obtain one is to have
+    // obtained a `File` first, and every `File` constructor is seeded
+    // `@process` by definition site.
+    assert_fails_browser_with(
+        r#"
+        import std::fs::{ File, Reader };
+        fun main() {
+            let reader = Reader::of(File::open("data.txt"));
+        }
+        "#,
+        "`open` requires the `process` layer of `std` and cannot run on `browser`",
+    );
+}
+
 // --- kolt.local 020: `Watcher` — the watch tier, and std's third resource.
 // Designed to MATCH `File` by ruling (the owner, 2026-08-28: 020 owns the whole
 // watch surface, shape and mechanism both, and its resource follows

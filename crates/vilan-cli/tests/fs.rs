@@ -1647,6 +1647,387 @@ main();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- S5: the incremental reader and the writing scoped forms -------------
+// (kolt.local 031 S5, filesystem.md §3.4's build note and §5.3)
+//
+// Against real files, because a cursor's whole claim is that what comes out
+// of the chunks equals what is on disk.
+
+#[test]
+fn a_reader_reads_a_file_through_in_chunks_that_do_not_divide_it() {
+    // The chunk loop, over a size that divides neither the file nor any
+    // prefix of it (7 into 30), so every boundary falls mid-content: the
+    // concatenation must equal the file byte for byte, and the cursor must
+    // land exactly on the length. Plant-proven by advancing the cursor one
+    // byte too far (`+ count + 1`), which reddens this and its two siblings
+    // below with dropped bytes and a cursor past the end. The plant is an
+    // OVERSHOOT rather than the obvious understep because an understepping
+    // cursor never reaches the empty read and hangs the loop instead of
+    // failing it — worth recording, since a hung probe is what a broken
+    // cursor actually looks like.
+    let dir = temp_project("reader_chunks");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/thirty.txt", "0123456789abcdefghijABCDEFGHIJ");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::decode_utf8;
+import std::fs::{ File, Reader };
+import std::drop::drop;
+
+fun main() {
+	let reader = Reader::of(File::open("data/thirty.txt"));
+	mut whole = "";
+	mut chunks = 0;
+	for {
+		let chunk = reader.next(7);
+		if chunk.len() == 0 {
+			jump break;
+		}
+		whole += decode_utf8(chunk);
+		chunks += 1;
+	}
+	print(whole);
+	print(chunks);
+	print(reader.position());
+	drop(reader);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "0123456789abcdefghijABCDEFGHIJ\n5\n30\n",
+        "the chunks must reassemble the file exactly — four full 7-byte reads, \
+         a short 2-byte one, then the empty read that ends the loop"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_reader_handles_a_file_shorter_than_one_chunk_and_an_empty_one() {
+    // The two degenerate lengths, which are where an off-by-one in the slice
+    // or in the EOF test would show: a file smaller than the request answers
+    // once and then empty (the short read is NOT the end signal — the empty
+    // one after it is), and an empty file answers empty on the very first
+    // call with the cursor still at zero.
+    let dir = temp_project("reader_small");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/tiny.txt", "abc");
+    write(&dir, "data/empty.txt", "");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::decode_utf8;
+import std::fs::{ File, Reader };
+import std::drop::drop;
+
+fun main() {
+	let small = Reader::of(File::open("data/tiny.txt"));
+	let first = small.next(64);
+	print(first.len());
+	print(decode_utf8(first));
+	print(small.next(64).len());
+	print(small.position());
+	drop(small);
+
+	let empty = Reader::of(File::open("data/empty.txt"));
+	print(empty.next(64).len());
+	print(empty.position());
+	drop(empty);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "3\nabc\n0\n3\n0\n0\n",
+        "a short chunk is the content, not the end; the empty one after it is \
+         the end; and an empty file is empty on the first call"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_positional_read_through_a_readers_file_leaves_the_cursor_alone() {
+    // §3.4's whole point, demonstrated rather than argued: the cursor is a
+    // wrapper over a positional primitive, so reading through the reader's
+    // own `file` loan does not move it — cursored and positional reads
+    // interleave soundly on one open file, which is exactly what the host's
+    // hidden position would have destroyed. `seek` then proves the cursor is
+    // writable as well as readable. Plant-proven by the same overshooting
+    // cursor its sibling above describes: every reading of `position()` here
+    // goes wrong under it.
+    let dir = temp_project("reader_interleave");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/thirty.txt", "0123456789abcdefghijABCDEFGHIJ");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::{ Bytes, decode_utf8 };
+import std::fs::{ File, Reader };
+import std::drop::drop;
+
+fun main() {
+	let reader = Reader::of(File::open("data/thirty.txt"));
+	print(decode_utf8(reader.next(4)));
+	print(reader.position());
+
+	let buffer = Bytes::alloc(6);
+	print(reader.file.read_at(buffer, 20));
+	print(decode_utf8(buffer.slice(0, 6)));
+	print(reader.position());
+
+	print(decode_utf8(reader.next(4)));
+	reader.seek(10i53);
+	print(decode_utf8(reader.next(4)));
+	reader.seek(999i53);
+	print(reader.next(4).len());
+	drop(reader);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "0123\n4\n6\nABCDEF\n4\n4567\nabcd\n0\n",
+        "a positional read through the reader's file must not move the cursor \
+         (still 4 after reading at 20), the cursor must resume where it was, \
+         a seek must move it, and a seek past the end must read empty"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_writing_scoped_forms_each_open_in_their_own_mode() {
+    // §5.3's family, one mode at a time and each proved by what it does to a
+    // file that already exists — which is what §3.3 says a constructor's name
+    // is for. `create` truncates, `append` lands at the end whatever position
+    // it names, `modify` edits in place without truncating. (`create_new`,
+    // whose whole content is a refusal, is the sibling below.) Plant-proven:
+    // opening `with_file_append` over `File::create` instead of
+    // `File::append_to` reddens the second and third readings at once.
+    let dir = temp_project("with_file_writing");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/existing.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::encode_utf8;
+import std::fs::{ read_file_to_str, with_file, with_file_append, with_file_create, with_file_modify };
+
+fun main() {
+	// create: truncates what was there, so ten bytes become four.
+	with_file_create("data/existing.txt", |file| {
+		file.write_at(encode_utf8("abcd"), 0i53);
+	});
+	print(read_file_to_str("data/existing.txt"));
+
+	// append: position ignored, every write lands at the end.
+	with_file_append("data/existing.txt", |file| {
+		file.write_at(encode_utf8("EF"), 0i53);
+	});
+	print(read_file_to_str("data/existing.txt"));
+
+	// modify: in place, no truncation — one byte overwritten at offset 1.
+	with_file_modify("data/existing.txt", |file| {
+		file.write_at(encode_utf8("Z"), 1i53);
+	});
+	print(read_file_to_str("data/existing.txt"));
+
+	// the body's value comes back out of a writing form too.
+	print(with_file_create("data/fresh.txt", |file| file.write_at(encode_utf8("hello"), 0i53)));
+	print(with_file("data/fresh.txt", |file| file.stat().size));
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "abcd\nabcdEF\naZcdEF\n5\n5\n",
+        "create truncates, append ignores the position, modify edits in place, \
+         and a writing form returns its body's value"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn with_file_create_new_refuses_an_occupied_path_and_leaves_it_alone() {
+    // The exclusive claim in its scoped form: the failure is the OPEN, so the
+    // body never runs and the incumbent's bytes are untouched.
+    let dir = temp_project("with_file_create_new");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/claimed.txt", "mine");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::encode_utf8;
+import std::fs::with_file_create_new;
+
+fun main() {
+	with_file_create_new("data/claimed.txt", |file| {
+		print("the body must not run");
+		file.write_at(encode_utf8("theirs"), 0i53);
+	});
+}
+main();
+"#,
+    );
+    let stderr = run_err(&dir, "probe.vl");
+    assert!(
+        stderr.contains("EEXIST"),
+        "an occupied path must fail the exclusive scoped create; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/claimed.txt")).unwrap(),
+        "mine",
+        "the refused claim must not have touched the incumbent's bytes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_throwing_body_fails_the_scoped_call_and_the_write_before_it_still_landed() {
+    // The safety net under §5.3(d)'s emitted shape — `try { body; await
+    // close; return } finally { drop }`: a body that throws propagates out of
+    // the call (nothing after it runs), and the handle is still closed by the
+    // scope-end drop, so what the body wrote before throwing is on disk and
+    // readable afterwards. The `finally` is compiler-generated (the drop
+    // planner's, not this module's), so there is nothing in `fs.vl` to plant
+    // here; what this pin adds over the emission pins is that the throw
+    // travels through the generic scoped form at all rather than being
+    // swallowed by it.
+    let dir = temp_project("with_file_throwing_body");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::encode_utf8;
+import std::fs::{ File, with_file_create };
+
+fun main() {
+	with_file_create("data/half.txt", |file| {
+		file.write_at(encode_utf8("written"), 0i53);
+		File::open("nothing/here.txt").stat().size
+	});
+	print("must not be reached");
+}
+main();
+"#,
+    );
+    let stderr = run_err(&dir, "probe.vl");
+    assert!(
+        stderr.contains("ENOENT"),
+        "a throwing body must fail the scoped call; stderr was:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("must not be reached"),
+        "nothing after the failed call may run; stderr was:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/half.txt")).unwrap(),
+        "written",
+        "what the body wrote before throwing must still be on disk — the \
+         handle was closed by the scope-end drop behind the awaited path"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_writing_scoped_form_returns_with_its_descriptor_already_closed() {
+    // The writing forms release their handle at RUNTIME, and a `Reader`
+    // releases the `File` it owns through containment teardown —
+    // `drop(reader)` reaching through the plain struct into the field. The
+    // drop only INITIATES that close (Q1's (a)), so the reader's count is
+    // read through a settling poll while the scoped forms' are read
+    // immediately.
+    //
+    // What this does NOT prove is the ORDERING, and the distinction is worth
+    // stating because the counts look like they do: measured with
+    // `close_awaited` removed from `scoped_file`, these readings are still
+    // zero — `fd_count` itself awaits, which is all the slack a
+    // fire-and-forget close needs. The await IS the ordering, so the ordering
+    // is pinned on the emitted bytes instead
+    // (`every_writing_scoped_form_awaits_its_close` in the `inference` suite,
+    // which that same plant reddens). This pin holds the weaker, still-real
+    // line: the descriptors come back and the bytes land.
+    //
+    // The warm-up before the baseline is load-bearing for the reasons
+    // `a_dropped_file_closes_the_underlying_descriptor` documents: the first
+    // descriptor-based fs op can lazily create process-lifetime
+    // infrastructure (io_uring), and the first print on a piped stdout
+    // materializes that stream's own handle.
+    let dir = temp_project("with_file_writing_fds");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "data/ten.txt", "0123456789");
+    write(
+        &dir,
+        "probe.vl",
+        r#"import std::print;
+import std::bytes::encode_utf8;
+import std::fs::{ File, Reader, read_dir, with_file_append, with_file_create };
+import std::drop::drop;
+import std::range::Range;
+import std::time::sleep;
+
+fun fd_count(): i32 {
+	read_dir("/proc/self/fd").len()
+}
+
+fun settled_count(baseline: i32): i32 {
+	for _attempt in Range::new(0, 200) {
+		if fd_count() == baseline {
+			ret baseline;
+		}
+		sleep(10);
+	}
+	fd_count()
+}
+
+fun main() {
+	let warm = File::open("data/ten.txt");
+	drop(warm);
+	print("warm");
+	sleep(300);
+
+	let baseline = fd_count();
+	with_file_create("data/written.txt", |file| { file.write_at(encode_utf8("payload"), 0i53); });
+	print(fd_count() - baseline);
+	with_file_append("data/written.txt", |file| { file.write_at(encode_utf8("!"), 0i53); });
+	print(fd_count() - baseline);
+
+	let reader = Reader::of(File::open("data/ten.txt"));
+	print(fd_count() - baseline);
+	print(reader.next(4).len());
+	drop(reader);
+	print(settled_count(baseline) - baseline);
+}
+main();
+"#,
+    );
+    let stdout = run_ok(&dir, "probe.vl");
+    assert_eq!(
+        stdout, "warm\n0\n0\n1\n4\n0\n",
+        "a writing scoped form's descriptor is already released when it \
+         returns, a Reader holds exactly one while it is alive, and dropping \
+         the Reader releases it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/written.txt")).unwrap(),
+        "payload!",
+        "both writing forms must have landed their bytes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- the watch tier (kolt.local 020) -------------------------------------
 //
 // Against real file activity, because that is the only thing that proves a

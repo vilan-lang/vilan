@@ -1,7 +1,7 @@
-import std::bytes::{ Bytes, decode_utf8 };
+import std::bytes::{ Bytes, decode_utf8, encode_utf8 };
 import std::drop::drop;
 import std::fs;
-import std::fs::{ File, with_file };
+import std::fs::{ File, Reader, with_file, with_file_create };
 import std::print;
 
 // The handle tier (kolt.local 031 S3, proposal/filesystem.md §3.2): positional
@@ -9,6 +9,9 @@ import std::print;
 // was gated on (B141 — fixed in Order 13, pinned here as the tier's intended
 // idiom), and the two close paths: with_file's AWAITED close, and the
 // scope-end Drop that fires the fire-and-forget close inside a finally.
+// Plus S5 (§3.4): the `Reader` chunk loop, whose emitted shape is the
+// containment teardown reaching through a plain struct into the `File` it
+// owns, and a WRITING scoped form, whose close is the same awaited one.
 // Excluded from the macro interpreter gate — the filesystem is a host
 // capability, and every call here awaits.
 
@@ -32,6 +35,25 @@ fun main() {
 	// and the close is awaited before with_file returns.
 	let size = with_file("file-corpus.txt", |f| f.stat().size);
 	print(size);
+
+	// S5: the writing scoped form — the same awaited close over a `create`.
+	with_file_create("file-corpus.txt", |f| {
+		f.write_at(encode_utf8("0123456789"), 0i53);
+	});
+
+	// S5: the chunk loop, over `read_at` and a cursor this program owns.
+	let reader = Reader::of(File::open("file-corpus.txt"));
+	mut whole = "";
+	for {
+		let chunk = reader.next(4);
+		if chunk.len() == 0 {
+			jump break;
+		}
+		whole += decode_utf8(chunk);
+	}
+	print(whole);
+	print(reader.position());
+	drop(reader);
 
 	fs::remove("file-corpus.txt");
 }
