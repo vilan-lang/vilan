@@ -184,15 +184,25 @@ impl LastUse {
     /// into existence — what a teardown region must cover before it may close,
     /// because those names live in the emitted block the region becomes.
     ///
-    /// Keyed on the outermost enclosing statement, so a name declared in a
-    /// nested block keys the statement that block belongs to; its own last read
-    /// is inside that same statement, so it never widens anything by itself.
+    /// Keyed on the INNERMOST enclosing statement — the direct statement of the
+    /// block the binding is declared in, which is the coordinate the consumer
+    /// holds. The transformer widens one emitted region at a time and asks the
+    /// question per statement of THAT region, at whatever depth it sits: "does
+    /// this statement put a name into the block I am about to wrap?" Only a
+    /// statement's own declarations do — a name declared inside a nested
+    /// construct is scoped to it and cannot be read outside it — so the direct
+    /// statement is the only key that ever answers, and it answers at every
+    /// depth. Keying the outermost statement instead answered only for a
+    /// one-element chain, which is why the widening was live at a body's top
+    /// level and dead inside every `if` arm, `match` leg, loop body and nested
+    /// block (B159: the trapped `const` was a released `ReferenceError`).
+    ///
     /// A binding declared in a scope's tail, or at a function's entry (a
     /// parameter), keys nothing — neither can be read past a statement region.
     pub(super) fn declared_binding_extents(&self) -> HashMap<Id, Vec<DropExtent>> {
         let mut declared: HashMap<Id, Vec<DropExtent>> = HashMap::default();
         for (binding_id, chain) in &self.declaration_statements {
-            let Some(statement) = chain.first().copied() else {
+            let Some(statement) = chain.last().copied() else {
                 continue;
             };
             declared

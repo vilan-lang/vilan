@@ -727,6 +727,15 @@ more than one region, a loan it cannot follow to its end — the resource
 keeps the **scope-end** teardown, which is the previous law. The fallback
 is never a guess.
 
+One rule pushes a drop *later* than the last use. The region between an
+acquisition and its teardown is a block, so it cannot close while a name
+declared inside it is still read afterwards — the drop waits for that read
+instead of putting the name out of scope. In `let r = …; let size =
+r.size(); print("between"); print(size)`, `r`'s last read is `r.size()` but
+its teardown runs after `print(size)`, because `size` lives in the region
+`r` opened. This holds at **every depth**: inside an `if` arm, a `match`
+leg, a loop body or a nested block, exactly as at a body's top level.
+
 - **A loan takes no teardown.** Only an owner destroys. A view *binding* of a
   resource (`let v = &mut holder`) names storage another binding still owns,
   so its scope end drops nothing — its referent is destroyed once, where the
