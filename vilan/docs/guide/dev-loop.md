@@ -66,6 +66,40 @@ overlay answers *which* call left the read uncovered, as the terminal's
 labels and the editor's related information do. The terminal stays
 authoritative; the overlay is the copy, and the next successful save clears it.
 
+## When a round fails
+
+A round is one pass of the loop: the build hooks below, then the compile, then
+whatever the command does with the result. A round can fail — a compile error, a
+hook that exits non-zero — and when it does the terminal says so and the session
+keeps watching.
+
+Under `vilan build --watch`, `vilan check --watch` and `vilan test --watch`, the
+change that started a failed round is **kept, and the round is retried once** on
+the next poll. That matters for the failure that is nobody's fault: a hook
+command hiccups on a loaded machine, a generator races something outside your
+tree, a file is locked for the half-second the round needed it. Without the
+retry that save would be gone — not "failed" gone, *silently* gone, because the
+loop had already spent the change and would sit quiet until you touched some
+other file. The retry costs one extra run and closes that hole.
+
+It happens once, and then the loop waits for the next change:
+
+- A **compile error** retried once fails the same way a second time and the
+  session goes quiet — which is correct, because the fix for a broken tree is
+  your next edit, not another attempt at the same bytes. You pay one extra
+  compile per broken save.
+- Nothing spins. A retry is an ordinary round on the ordinary poll interval, and
+  a failing tree gets at most two runs per change however fast you save.
+- The loop narrates it: a retried round says it is retrying, and the run that
+  gives up says it is waiting for the next change.
+
+`vilan run --watch` is the exception, deliberately. Its rounds handle their own
+failures — the terminal, the in-page error overlay, the app left running on its
+last good build — and hand the loop no verdict to act on, so a failed round
+there waits for the next change as it always has. Which is the same answer the
+retry reaches anyway for the failure you actually hit while iterating: fix the
+file, and the save that fixes it is the round that clears the overlay.
+
 ## What carries across a swap, and what resets
 
 A swap re-evaluates the whole client bundle. Two things survive it:
@@ -166,7 +200,9 @@ The rules are short:
   run — so an unfamiliar `vilan.toml` is worth reading before you build it, the
   way you would read a `Makefile`.
 - A hook that exits non-zero fails the build, naming the command. Nothing
-  after it runs.
+  after it runs. Under `--watch` that round is retried once before the loop
+  goes back to waiting ([When a round fails](#when-a-round-fails)), so a hook
+  that failed on a hiccup gets a second chance at the save that started it.
 - Vilan prints each command before spawning it, and the output goes straight to
   your terminal. (Under `vilan build --stdout`, which writes the emitted JS to
   stdout, a chatty hook shares that stream; redirect it in the command if you
