@@ -17,7 +17,6 @@ The UI layer, the rpc mirrors, and the router are all built on these, so
 this chapter pays for itself quickly.
 
 ```vilan
-import std::print;
 import std::reactive::{ Signal, Owner, run_with_owner };
 
 fun main() {
@@ -49,7 +48,6 @@ itself. For a collection, `update` is the one you want: the closure gets a
 **writable view of the stored value**, so you mutate it directly.
 
 ```vilan
-import std::print;
 import std::reactive::Signal;
 
 fun main() {
@@ -74,7 +72,6 @@ any other write. `update` works for any `T` a closure can mutate: `Map`,
 better when you're computing a new value rather than editing one:
 
 ```vilan
-import std::print;
 import std::reactive::Signal;
 
 fun main() {
@@ -95,7 +92,6 @@ Build state as a graph and let it recompute itself:
 - `signal.map(transform)` gives a signal of the transformed value:
 
   ```vilan
-  import std::print;
   import std::reactive::Signal;
   fun main() {
   	let count = Signal::new(2);
@@ -111,7 +107,6 @@ Build state as a graph and let it recompute itself:
   signal is current, and detaches from a replaced one.
 
 ```vilan
-import std::print;
 import std::reactive::{ Signal, combine };
 
 fun main() {
@@ -166,7 +161,6 @@ For tests, or when you're building your own machinery:
   with `owner.defer(…)`.
 
 ```vilan
-import std::print;
 import std::reactive::{ Signal, Owner, run_with_owner };
 
 fun main() {
@@ -302,7 +296,6 @@ you type ──▶ local (Signal) ──▶ the input shows it INSTANTLY
 ```
 
 ```vilan
-import std::print;
 import std::reactive::{ draft, Draft, DraftState };
 import std::option::Option::{ self, Some, None };
 import std::shared::Shared;
@@ -339,7 +332,6 @@ state still land the instant you press a key, so the input is as immediate
 as ever. Only the commit waits for you to stop:
 
 ```vilan
-import std::print;
 import std::reactive::{ draft, Draft, DraftState };
 import std::option::Option::{ self, Some, None };
 import std::shared::Shared;
@@ -403,7 +395,6 @@ write is in flight, and a banner that should say why it failed.
 changes — and adds a `state` signal to bind:
 
 ```vilan
-import std::print;
 import std::reactive::{ Signal, Optimistic, WriteState };
 import std::result::Result::{ self, Ok, Err };
 

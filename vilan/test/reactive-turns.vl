@@ -2,7 +2,7 @@
 // queue, so two extents can never drain each other's notifications — the
 // two-requests scenario, distilled — and a turn follows its own extent's
 // continuations across `await` (capture-at-creation).
-import std::print;
+import std::io::print;
 import std::reactive::{ Signal, Subscription, Turn, FlushPolicy, turn_scope, turn, batch, flush };
 
 async fun tick() {

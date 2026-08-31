@@ -1429,7 +1429,7 @@ fun main(): i32 {
     // `$VILAN_STD` without a word.
     #[test]
     fn a_rename_refuses_to_edit_the_standard_library() {
-        let source = "import std::print;\n\nfun main() {\n\tprint(\"hello\");\n}\n";
+        let source = "import std::io::print;\n\nfun main() {\n\tprint(\"hello\");\n}\n";
         let (dir, document) = analyze_workspace(&[("main.vl", source)]);
         assert!(
             document.diagnostics.is_empty(),

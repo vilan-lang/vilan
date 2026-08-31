@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::reactive::Signal;
 import std::ui::{ View, render, view };
 

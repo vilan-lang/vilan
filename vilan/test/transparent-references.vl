@@ -3,7 +3,7 @@
 // parameter, a `borrows`-returning call, a re-borrow, and a captured
 // `Option<&mut T>` view — for both plain `=` and compound `+=` / `/=`. Reading a
 // view as a value keeps its explicit `*`.
-import std::print;
+import std::io::print;
 import std::option::Option::{ self, Some, None };
 
 fun add_ten(x: &mut i32) {

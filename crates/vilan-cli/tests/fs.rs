@@ -89,7 +89,7 @@ fn run_ok_within(dir: &Path, relative: &str, limit: Duration) -> String {
 
 /// The `describe`/`show` preamble every watch probe shares: pull one change
 /// and print it as `<kind> <path>`, which is the whole observable surface.
-const WATCH_PREAMBLE: &str = r#"import std::print;
+const WATCH_PREAMBLE: &str = r#"import std::io::print;
 import std::drop::drop;
 import std::fs;
 import std::fs::{ Change, ChangeKind, Watcher, remove, write_file };
@@ -124,7 +124,7 @@ fn read_bytes_reads_the_real_bytes_a_buffer_hands_back() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::read_bytes;
 
 fun main() {
@@ -153,7 +153,7 @@ fn read_dir_lists_entry_names_flat() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::read_dir;
 
 fun main() {
@@ -181,7 +181,7 @@ fn read_dir_all_lists_every_entry_recursively_as_relative_paths() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::read_dir_all;
 
 fun main() {
@@ -223,7 +223,7 @@ fn a_backslash_in_a_name_survives_read_dir_all() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::read_dir_all;
 
 fun main() {
@@ -249,7 +249,7 @@ fn stat_reports_size_mtime_and_kind_for_a_file_and_a_directory() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::stat;
 import std::option::Option::{ self, Some, None };
 
@@ -282,7 +282,7 @@ fn stat_on_a_missing_path_is_none_not_a_throw() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::stat;
 import std::option::Option::{ self, Some, None };
 
@@ -312,7 +312,7 @@ fn read_bytes_still_throws_host_side_on_a_missing_path() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::read_bytes;
 
 fun main() {
@@ -348,7 +348,7 @@ fn read_file_to_str_is_unaffected_by_the_read_file_bytes_rename() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::read_file_to_str;
 
 fun main() {
@@ -372,7 +372,7 @@ fn write_atomic_creates_a_file_that_did_not_exist() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::{ read_file_to_str, write_atomic };
 
 fun main() {
@@ -398,7 +398,7 @@ fn write_atomic_replaces_an_existing_file_and_leaves_no_temporary_behind() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::{ read_file_to_str, write_atomic };
 
 fun main() {
@@ -473,7 +473,7 @@ fn rename_moves_a_file_and_replaces_an_existing_destination() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::{ read_file_to_str, rename, stat };
 
 fun main() {
@@ -540,7 +540,7 @@ fn write_bytes_round_trips_a_binary_payload_byte_identically() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::{ read_bytes, write_bytes };
 
 fun main() {
@@ -578,7 +578,7 @@ fn write_bytes_atomic_replaces_a_binary_file_whole_and_strands_no_temporary() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::{ read_bytes, write_bytes_atomic };
 
 fun main() {
@@ -745,7 +745,7 @@ fn update_revises_a_file_in_place_and_leaves_no_temporary() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::{ read_file_to_str, update };
 
 fun main() {
@@ -933,7 +933,7 @@ fn remove_dir_all_removes_a_whole_tree_and_a_missing_path_is_a_no_op() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::remove_dir_all;
 
 fun main() {
@@ -1019,7 +1019,7 @@ fn scan_dir_reports_each_entry_kind_from_one_host_call() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::scan_dir;
 
 fun main() {
@@ -1060,7 +1060,7 @@ fn scan_dir_does_not_follow_symlinks_and_reports_other_kinds_as_none_of_the_thre
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::scan_dir;
 
 fun main() {
@@ -1104,7 +1104,7 @@ fn read_at_reads_positionally_with_short_reads_and_zero_at_eof() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::{ Bytes, decode_utf8 };
 import std::fs::File;
 import std::drop::drop;
@@ -1143,7 +1143,7 @@ fn a_postfix_read_and_stat_off_the_awaited_constructor_read_the_value() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::Bytes;
 import std::fs::File;
 
@@ -1203,7 +1203,7 @@ fn modify_edits_in_place_without_truncating() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::{ Bytes, encode_utf8 };
 import std::fs::File;
 import std::drop::drop;
@@ -1351,7 +1351,7 @@ fn truncate_and_stat_report_through_the_handle() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::File;
 import std::drop::drop;
 
@@ -1391,7 +1391,7 @@ fn sync_and_data_sync_complete_without_error() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::encode_utf8;
 import std::fs::File;
 import std::drop::drop;
@@ -1429,7 +1429,7 @@ fn an_open_handle_survives_removal_of_its_path() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::{ Bytes, decode_utf8 };
 import std::fs::{ File, remove, stat };
 import std::drop::drop;
@@ -1470,7 +1470,7 @@ fn with_file_returns_the_bodys_value_from_an_open_file() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::{ Bytes, decode_utf8 };
 import std::fs::with_file;
 
@@ -1516,7 +1516,7 @@ fn a_dropped_file_closes_the_underlying_descriptor() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::fs::{ File, read_dir, with_file };
 import std::drop::drop;
 import std::range::Range;
@@ -1601,7 +1601,7 @@ fn a_temporary_handle_releases_its_descriptor_at_its_statements_end() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::Bytes;
 import std::fs::{ File, read_dir };
 import std::drop::drop;

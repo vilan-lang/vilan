@@ -70,7 +70,7 @@ fn must_use_consumed_result_no_warning() {
     // result — no warning.
     let messages = warnings(
         r#"
-        import std::print;
+        import std::io::print;
         [must_use]
         fun make(): i32 { 42 }
         fun consume(x: i32) { print(x); }
@@ -299,7 +299,7 @@ fn enum_constructor_propagates_expected_type_to_payload() {
     // `Option<User>`, so it round-trips. (Was a generic-binding-flow bug.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -334,7 +334,7 @@ fn generic_field_method_dispatch_runs() {
     // instead of the empty abstract trait method.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Handler { fun handle(self, x: i32): i32; }
         struct Doubler { factor: i32 }
         impl Doubler with Handler { fun handle(self, x: i32): i32 { x * self.factor } }
@@ -359,7 +359,7 @@ fn generic_field_from_a_variable_dispatches() {
     // resolves, and the dispatch reaches the concrete `Doubler::handle`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Handler { fun handle(self, x: i32): i32; }
         struct Doubler { factor: i32 }
         impl Doubler with Handler { fun handle(self, x: i32): i32 { x * self.factor } }
@@ -386,7 +386,7 @@ fn from_json_indirect_element_type_runs() {
     // and lowered to the abstract `from_json_value` → `Some(undefined)`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -413,7 +413,7 @@ fn deep_dependency_chain_resolves_across_passes() {
     // safety net), so the whole nest resolves to `i32` and prints `7`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         fun id<T>(x: T): T { x }
         fun main() {
@@ -435,7 +435,7 @@ fn from_json_return_type_flows_through_match_arm() {
     // propagation the leg was inferred bottom-up → abstract decoder → `Some(undefined)`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -471,7 +471,7 @@ fn multi_parameter_generic_function_instantiations() {
     // distinct, non-colliding instances — a key bug would cross-wire them.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun first<A, B>(a: A, b: B): A { a }
         fun second<A, B>(a: A, b: B): B { b }
         fun main() {
@@ -493,7 +493,7 @@ fn multi_parameter_generic_method_monomorphizes() {
     // through the receiver's arguments. Both reach the one `emit_instance` path.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Pair<A, B> { left: A, right: B }
         impl Pair<type A, type B> {
             fun show_left(self): A { self.left }
@@ -516,7 +516,7 @@ fn operator_monomorphizes_on_generic_aggregate() {
     // `binary_op_dispatch` + `method_call_substitution` into the one emitter.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         [derive(PartialEq)] struct Point { x: i32, y: i32 }
         fun main() {
@@ -544,7 +544,7 @@ fn b135_operator_at_all_native_binding_monomorphizes_an_explicit_eq_body() {
     assert_compiles_and_runs(
         r#"
         import std::compare::PartialEq;
-        import std::print;
+        import std::io::print;
         struct Pair<T> { a: T, b: T }
         impl Pair<type T: PartialEq> with PartialEq {
             fun eq(self, b: Pair<T>): bool {
@@ -572,7 +572,7 @@ fn b135_operator_reaches_the_requirement_through_a_generic_helper() {
     assert_compiles_and_runs(
         r#"
         import std::compare::PartialEq;
-        import std::print;
+        import std::io::print;
         struct Pair<T> { a: T, b: T }
         fun both_equal<E: PartialEq>(p: E, q: E, r: E, s: E): bool {
             p.eq(q) && r.eq(s)
@@ -603,7 +603,7 @@ fn b135_operator_reaches_the_requirement_through_a_closure() {
     assert_compiles_and_runs(
         r#"
         import std::compare::PartialEq;
-        import std::print;
+        import std::io::print;
         struct Pair<T> { a: T, b: T }
         impl Pair<type T: PartialEq> with PartialEq {
             fun eq(self, b: Pair<T>): bool {
@@ -631,7 +631,7 @@ fn single_level_container_from_json_roundtrip_runs() {
     // element type at runtime (the nested case is still open — see the ignored test).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
         fun main() {
@@ -657,7 +657,7 @@ fn nested_container_from_json_roundtrip_runs() {
     // exercises the recursion through two intermediate container instances.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
         fun main() {
@@ -685,7 +685,7 @@ fn mixed_nested_container_from_json_roundtrips() {
     // generics bound from the concrete type.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -727,7 +727,7 @@ fn generic_bounded_value_method_dispatch() {
     // not the abstract trait method (which would print `undefined`). Roadmap 1.2.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun describe<T: Display>(x: T): str { x.to_string() }
         fun main() {
@@ -746,7 +746,7 @@ fn generic_bounded_value_operator_dispatch() {
     // a `str`. Roadmap 1.2 / generic-equality.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
         fun same<T: PartialEq>(a: T, b: T): bool { a == b }
         fun main() {
@@ -767,7 +767,7 @@ fn method_routes_own_generic_to_nested_call() {
     // nested call through the field access + the inherited substitution.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::{ Display, format };
         struct Wrap<T: Display> { v: T }
         impl Wrap<type T: Display> {
@@ -790,7 +790,7 @@ fn auto_deref_through_view_returning_call() {
     // the access miss the deref).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         impl Inner { fun get(self): i32 { self.n } }
         struct Outer { inner: Inner }
@@ -813,7 +813,7 @@ fn mut_view_argument_mutates_through_call_chain() {
     // place-write is exercised end to end.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(x: &mut i32) { x += 1; }
         fun via(y: &mut i32) { bump(y); }
         fun main() {
@@ -835,7 +835,7 @@ fn mut_view_as_method_argument_mutates() {
     // `self` receiver. C5 / R8.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Counter { n: i32 }
         impl Counter { fun add_into(self, target: &mut i32) { target += self.n; } }
         fun main() {
@@ -857,7 +857,7 @@ fn mixed_value_view_and_own_arguments() {
     // mutable copy the caller never sees). Each must keep its own semantics.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun combine(base: i32, acc: &mut i32, own scratch: i32): i32 {
             acc += base;
             scratch += 100;
@@ -895,7 +895,7 @@ fn generic_mut_view_parameter_writes_through() {
     // unchanged). For an aggregate pointee it stays the in-place copy.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun replace<T>(slot: &mut T, value: T) { slot = value; }
         fun main() {
             mut a = 1;
@@ -920,7 +920,7 @@ fn generic_mut_view_reads_and_swaps() {
     // monomorphization for a scalar `T`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun peek<T: Display>(slot: &mut T): str { (*slot).to_string() }
         fun swap<T>(a: &mut T, b: &mut T) { let t = *a; a = *b; b = t; }
@@ -948,7 +948,7 @@ fn generic_mut_view_of_a_generic_local() {
     // fix the scalar case crashed: `slot[0][slot[1]]` on an unboxed value.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun inner<T>(slot: &mut T, value: T) { slot = value; }
         fun outer<T>(x: T, value: T): T { mut local = x; inner(&mut local, value); local }
         struct P { x: i32 }
@@ -969,7 +969,7 @@ fn generic_mut_view_aggregate_pointee_copies_in_place() {
     // change the aggregate path.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct P { x: i32 }
         fun replace<T>(slot: &mut T, value: T) { slot = value; }
         fun main() {
@@ -1010,7 +1010,7 @@ fn trait_default_self_dispatch_still_runs() {
     // catch these.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Stepper {
             fun step(self): i32;
             fun twice(self): i32 { self.step() + self.step() }
@@ -1041,7 +1041,7 @@ fn inferred_list_closure_param_field_access() {
     // list.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct P { x: i32 }
         fun main() {
             mut xs = List::new();
@@ -1064,7 +1064,7 @@ fn inferred_list_never_pushed_still_resolves() {
     // `Unknown`/`any`) rather than deferring forever.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let xs = List::new();
             print(xs.len());
@@ -1087,7 +1087,7 @@ fn inline_match_on_method_result_field_access() {
     // `let` first (an extra pass) — now works inline too, for `get` and `pop`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct P { x: i32 }
         fun main() {
@@ -1116,7 +1116,7 @@ fn impl_binder_inherits_struct_bound() {
     // if `impl Wrapper<type T: Greeter>` had been written.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Greeter { fun greet(self): str; }
         struct Hello { name: str }
         impl Hello with Greeter { fun greet(self): str { "hi " + self.name } }
@@ -1139,7 +1139,7 @@ fn impl_binder_inherits_multiple_bounds() {
     // reuses, so methods from either trait resolve on the field.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Named { fun name(self): str; }
         trait Aged { fun age(self): i32; }
         struct Person { n: str, a: i32 }
@@ -1166,7 +1166,7 @@ fn impl_binder_inherits_per_position_with_multiple_params() {
     // is matched to the binder by position, not conflated.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Named { fun name(self): str; }
         trait Aged { fun age(self): i32; }
         struct Tag { n: str }
@@ -1195,7 +1195,7 @@ fn impl_binder_mixes_explicit_and_inherited_bounds() {
     // for the other did not break the mixed form.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Named { fun name(self): str; }
         trait Aged { fun age(self): i32; }
         struct Tag { n: str }
@@ -1222,7 +1222,7 @@ fn impl_binder_inherits_enum_bound() {
     // Inheritance works for an enum subject too, not just structs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Greeter { fun greet(self): str; }
         struct Hello { name: str }
         impl Hello with Greeter { fun greet(self): str { "hi " + self.name } }
@@ -1250,7 +1250,7 @@ fn impl_binder_without_a_declared_bound_stays_unconstrained() {
     // the `T`-typed field must still be rejected — the fix must not invent bounds.
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
         trait Greeter { fun greet(self): str; }
         struct Plain<T> { inner: T }
         impl Plain<type T> {
@@ -1271,7 +1271,7 @@ fn impl_binder_inherits_bound_from_a_later_declared_struct() {
     // every declaration exists — declaration order no longer matters.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Greeter { fun greet(self): str; }
         struct Hello { name: str }
         impl Hello with Greeter { fun greet(self): str { "hi " + self.name } }
@@ -1293,7 +1293,7 @@ fn impl_binder_inherits_multiple_bounds_from_a_later_declared_struct() {
     // declared after the impl, methods from both traits resolving.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Greeter { fun greet(self): str; }
         trait Counter { fun count(self): i32; }
         struct Hello { name: str }
@@ -1323,7 +1323,7 @@ fn impl_binder_inherits_bound_from_a_later_declared_enum() {
     // Enum subjects inherit through the same deferred path as structs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Greeter { fun greet(self): str; }
         struct Hello { name: str }
         impl Hello with Greeter { fun greet(self): str { "hi " + self.name } }
@@ -1352,7 +1352,7 @@ fn a_boundless_trait_argument_binder_inherits_the_traits_bound() {
     // to the with-clause.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         trait Sink { fun put(self, value: i32); }
         struct Collector { total: Shared<i32> }
@@ -1387,7 +1387,7 @@ fn subject_and_trait_argument_binders_compose_on_one_impl() {
     // T, the argument binds S, one call resolves both.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         trait Sink { fun put(self, value: i32); }
         struct Collector { total: Shared<i32> }
@@ -1432,7 +1432,7 @@ fn async_trait_method_through_generic_bound_auto_awaits() {
     // `main`) are async and the program runs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         [extern("Promise.resolve")]
         async external fun resolved(value: str): str;
         trait Fetcher { fun fetch(self): str; }
@@ -1459,7 +1459,7 @@ fn async_impl_through_generic_bound_propagates_transitively() {
     // dispatch must pick that up after propagation, not just from a direct `await`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         [extern("Promise.resolve")]
         async external fun resolved(value: str): str;
         fun load(tag: str): str { await resolved(tag) }
@@ -1488,7 +1488,7 @@ fn mixed_async_and_sync_impls_through_generic_bound_both_run() {
     // a JS no-op, and both instantiations run correctly.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         [extern("Promise.resolve")]
         async external fun resolved(value: str): str;
         trait Fetcher { fun fetch(self): str; }
@@ -1514,7 +1514,7 @@ fn async_trait_default_body_through_generic_bound_auto_awaits() {
     // member — so candidate resolution must consider the trait's own declarations.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         [extern("Promise.resolve")]
         async external fun resolved(value: str): str;
         trait Greeter {
@@ -1541,7 +1541,7 @@ fn sync_method_through_generic_bound_is_not_made_async() {
     // same name in an unrelated trait) would fail here, not just slip past `runs`.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         trait Greeter { fun greet(self): str; }
         struct Hello { name: str }
         impl Hello with Greeter { fun greet(self): str { "hi " + self.name } }
@@ -1576,7 +1576,7 @@ fn sync_method_through_generic_bound_is_not_made_async() {
 
 /// The shared preamble: async helpers whose calls are implicitly awaited.
 const AWAIT_POSTFIX_PRELUDE: &str = r#"
-        import std::print;
+        import std::io::print;
         [extern("Promise.resolve")]
         async external fun resolved(value: i32): i32;
         struct Row { id: i32, name: str }
@@ -1719,7 +1719,7 @@ fn generic_element_serialized_in_a_closure_through_a_bounded_method() {
     // arm, and the derive-from-bound step in `resolve_call_subject`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::Json;
         trait Feed<T> { fun each(self, observer: |T| void); }
         struct Nums {}
@@ -1741,7 +1741,7 @@ fn generic_source_element_serialized_in_a_sub_closure() {
     // inside the `sub` closure, where `T` appears only in the `S: Source<T>` bound.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::Json;
         import std::reactive::{ Source, Signal, Subscription };
         fun forward<T: Json, S: Source<T>>(source: S, out: |str| void): Subscription {
@@ -1764,7 +1764,7 @@ fn generic_element_type_derived_from_a_parameterized_bound() {
     // bound. Pins that the fix threads a concrete *aggregate* type, not just `i32`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::Json;
         trait Feed<T> { fun each(self, observer: |T| void); }
         [derive(Json)]
@@ -1794,7 +1794,7 @@ fn generic_bound_derivation_through_a_method_call() {
     // path), so the inferred case works too.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::Json;
         import std::reactive::{ Source, Signal, Subscription };
         struct Sink {}
@@ -1828,7 +1828,7 @@ fn owner_take_disposes_a_mapped_and_a_root_subscription() {
     // so a leaked subscription keeps firing: pre-fix this printed a trailing `a=10`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner };
         fun main() {
             let owner = Owner::new();
@@ -1853,7 +1853,7 @@ fn lone_set_notifies_synchronously() {
     // before the next statement, exactly as before batching existed.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal };
         fun main() {
             let a = Signal::new(0);
@@ -1874,7 +1874,7 @@ fn batch_commits_value_immediately_but_defers_notification() {
     // then settles. Pins the "defer notification, not the value" divergence.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
         fun main() {
             let s = Signal::new(0);
@@ -1897,7 +1897,7 @@ fn batch_coalesces_a_multi_input_observer() {
     // fires once (11 -> 22), with no intermediate (a-new, b-old) reading.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
         fun main() {
             let a = Signal::new(1);
@@ -1923,7 +1923,7 @@ fn without_a_batch_a_multi_input_observer_glitches() {
     // batching is what removes it (the opt-in boundary).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal };
         fun main() {
             let a = Signal::new(1);
@@ -1947,7 +1947,7 @@ fn batch_cascade_settles_in_one_flush() {
     // value (20 -> 60), never an intermediate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
         fun main() {
             let a = Signal::new(1);
@@ -1967,7 +1967,7 @@ fn nested_batches_flush_at_the_outer_boundary() {
     // boundary and coalesce to the final value. `mid` prints before any observer fires.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
         fun main() {
             let a = Signal::new(0);
@@ -1993,7 +1993,7 @@ fn dispose_in_a_batch_scrubs_the_pending_notify() {
     // Pins the "disposed is silent" resolution (no `tick 1` from the batch, no `tick 2` after).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
         fun main() {
             let counter = Signal::new(0);
@@ -2020,7 +2020,7 @@ fn update_mutates_a_list_in_place_and_a_later_get_sees_it() {
     // A18's headline case: a push through the view, no copy-transform-return.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         fun main() {
             let todos = Signal::new([1, 2]);
@@ -2038,7 +2038,7 @@ fn update_generalizes_over_every_collection() {
     // struct) exactly as it serves `List` — no per-container twin.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::set::Set;
         import std::reactive::Signal;
@@ -2068,7 +2068,7 @@ fn update_over_a_scalar_signal_writes_through_the_view() {
     // than a stray number (which crashed at runtime before the fix).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         fun main() {
             let count = Signal::new(1);
@@ -2086,7 +2086,7 @@ fn update_notifies_exactly_once_per_call() {
     // each, after the closure returns — never per mutation inside it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner };
         fun main() {
             let owner = Owner::new();
@@ -2106,7 +2106,7 @@ fn update_notifies_even_when_the_closure_writes_nothing() {
     // compares either. A no-op `mutate` still publishes.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner };
         fun main() {
             let owner = Owner::new();
@@ -2126,7 +2126,7 @@ fn update_coalesces_under_batch() {
     // at the boundary, carrying the final value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, batch };
         fun main() {
             let owner = Owner::new();
@@ -2150,7 +2150,7 @@ fn a_reentrant_get_inside_update_sees_the_in_progress_value() {
     // scalar view writes the same `(cell, "v")` slot `get` reads).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         fun main() {
             let xs = Signal::new([1, 2]);
@@ -2192,7 +2192,7 @@ fn set_with_still_copies_and_transforms() {
     // and its `mut` copy is still a copy (the source list is untouched).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         fun main() {
             mut seed = [1, 2];
@@ -2220,7 +2220,7 @@ fn a_closure_parameter_takes_the_mut_view_convention() {
     // `|&mut x|` is the prefix spelling; the callee mutates the CALLER's value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun apply(target: &mut List<i32>, mutate: sync |&mut List<i32>| void) {
             mutate(target);
         }
@@ -2239,7 +2239,7 @@ fn a_closure_parameter_takes_the_view_convention_from_its_type() {
     // The type-position spelling, inferred the same way a `fun` parameter's is.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun apply(target: &mut List<i32>, mutate: sync |&mut List<i32>| void) {
             mutate(target);
         }
@@ -2293,7 +2293,7 @@ fn a_scalar_shared_write_passes_as_a_mut_view() {
     // callee the VALUE, and `slot[0][slot[1]]` on a number crashed at runtime.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         fun replace<T>(slot: &mut T, value: T) { slot = value; }
         fun main() {
@@ -2315,7 +2315,7 @@ fn a_shared_write_assignment_is_unchanged_for_both_pointees() {
     // above cannot regress `cell.write() = x` for a scalar or an aggregate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         fun main() {
             let flag: Shared<bool> = Shared::new(false);
@@ -2354,7 +2354,7 @@ fn a_sync_void_parameter_still_takes_a_synchronous_closure() {
     // callback. A void `sync` parameter is the ordinary case.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun run_now(body: sync || void) { body(); }
         fun main() {
             run_now(|| { print(1); });
@@ -2414,7 +2414,7 @@ fn generic_call_over_a_bounded_transport_decodes() {
     // that this whole generic-through-generic path monomorphizes (the example isn't auto-run).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
         import std::promise::Promise;
@@ -2455,7 +2455,7 @@ fn wire_derives_the_json_round_trip() {
     // including nested Wire structs, `List<Wire>`, and Wire enums.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
         [derive(Wire)]
         struct Point { x: i32, y: i32 }
@@ -2622,7 +2622,7 @@ fn trait_only_method_is_hidden_from_the_concrete_type() {
     // surface — the direct call is an error even though the impl provides it.
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
         trait Marker { [trait_only] fun tag(self): str; }
         struct Pt { x: i32 }
         impl Pt with Marker { fun tag(self): str { "pt" } }
@@ -2636,7 +2636,7 @@ fn trait_only_method_resolves_through_a_bound() {
     // ...but through a trait bound it resolves and monomorphizes normally.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Marker { [trait_only] fun tag(self): str; }
         struct Pt { x: i32 }
         impl Pt with Marker { fun tag(self): str { "pt" } }
@@ -2666,7 +2666,7 @@ fn trait_only_static_resolves_through_a_bound() {
     // ...while `T::make()` through the bound stays the sanctioned path.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Factory { [trait_only] fun make(): i32; }
         struct Pt {}
         impl Pt with Factory { fun make(): i32 { 7 } }
@@ -2683,7 +2683,7 @@ fn trait_only_default_method_is_bound_reachable_but_hidden() {
     // bound path, but it is not promoted onto the concrete surface.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Marker { [trait_only] fun tag(self): str { "default" } }
         struct Pt { x: i32 }
         impl Pt with Marker {}
@@ -2694,7 +2694,7 @@ fn trait_only_default_method_is_bound_reachable_but_hidden() {
     );
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
         trait Marker { [trait_only] fun tag(self): str { "default" } }
         struct Pt { x: i32 }
         impl Pt with Marker {}
@@ -2710,7 +2710,7 @@ fn trait_only_does_not_shadow_an_inherent_method() {
     // shadows it (nor is shadowed by it at the bound).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Marker { [trait_only] fun tag(self): str { "trait-default" } }
         struct Pt { x: i32 }
         impl Pt { fun tag(self): str { "own" } }
@@ -2730,7 +2730,7 @@ fn bound_dispatch_prefers_the_trait_method_on_a_name_collision() {
     // — override, else default — so an inherent name collision can't shadow it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Marker { fun tag(self): str { "trait-default" } }
         struct Pt { x: i32 }
         impl Pt { fun tag(self): str { "own" } }
@@ -2753,7 +2753,7 @@ fn service_generates_dispatcher_client_and_mirror() {
     // wire turn as the mutating call's reply — hence `status = bumped` before `bump -> 5`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::reactive::Signal;
         import std::result::Result::{ self, Ok, Err };
@@ -2813,7 +2813,7 @@ fn service_client_name_defaults_to_struct_client() {
     // Bare `[service]` names the generated client `<Struct>Client`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, json_codec };
@@ -2854,7 +2854,7 @@ fn service_contract_verify_matches_and_catches_drift() {
     // garbage.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, json_codec };
@@ -2902,7 +2902,7 @@ fn an_async_rpc_method_replies_after_its_await() {
     // `LocalTransport.call`) awaits through a re-marked `let` (J2 v1).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, json_codec };
@@ -2943,7 +2943,7 @@ fn sync_and_async_rpc_methods_coexist_on_one_service() {
     // resolves), the async one settles before its reply encodes.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, json_codec };
@@ -2992,7 +2992,7 @@ fn an_async_rpc_methods_writes_settle_as_one_wave_with_its_reply() {
     // update before the reply.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::reactive::Signal;
         import std::result::Result::{ self, Ok, Err };
@@ -3046,7 +3046,7 @@ fn a_no_arg_rpc_methods_writes_coalesce_in_the_wire_turn() {
     // sync no-arg method arrive at the mirror as ONE update, the final value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, FromJson };
@@ -3095,7 +3095,7 @@ fn a_hand_written_async_route_dispatches_through_respond() {
     // directly — the reply envelope encodes the settled outcome.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::json_codec;
         import std::wire::Frame;
         import std::rpc::{ Dispatcher, reply, encode_request, RpcOutcome };
@@ -3143,7 +3143,7 @@ fn a_discarded_async_block_still_runs() {
     // loop }` silently vanished from codegen (found via SplitDuplex's pump).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let _ = async {
                 print("ran");
@@ -3163,7 +3163,7 @@ fn a_parenthesized_type_is_grouping_not_a_tuple() {
     // called through the parenthesized annotation.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun run_with(callback: |(|| void)| void) {
             callback(|| print("called"));
         }
@@ -3185,7 +3185,7 @@ fn calling_an_unannotated_closure_parameter_defers() {
     // paths already had (Bug C′'s family).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun run_with(callback: |(|| void)| void) {
             callback(|| print("called"));
         }
@@ -3204,7 +3204,7 @@ fn doc_hidden_method_stays_callable() {
     // `[doc(hidden)]` is tooling-only: completion omits it, resolution doesn't.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Pt { x: i32 }
         impl Pt {
             [doc(hidden)]
@@ -3224,7 +3224,7 @@ fn emitted_js_preserves_grouping_across_precedence() {
     // now parenthesized by JS precedence.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print((1 + 2) * 3);
             let a = 1;
@@ -3247,7 +3247,7 @@ fn emitted_js_parenthesizes_right_nested_string_concat() {
     // in: `1 + (2 + "x")` is "12x", while flat `1 + 2 + "x"` would be "3x".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let suffix = "x";
             print(1 + (2 + suffix));
@@ -3263,7 +3263,7 @@ fn hex_literals_type_and_evaluate_like_decimal() {
     // apply, and the literal reaches JS verbatim (proposal/bits-and-bytes.md §1).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(0xFF);
             print(0x10 + 1);
@@ -3280,7 +3280,7 @@ fn hex_literals_type_and_evaluate_like_decimal() {
 fn bitwise_operators_on_i32_use_signed_js_semantics() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(12 & 10);
             print(12 | 3);
@@ -3300,7 +3300,7 @@ fn bitwise_operators_on_u32_stay_unsigned() {
     // (proposal/bits-and-bytes.md §2).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let high: u32 = 0x80000000;
             print(high | 0);
@@ -3321,7 +3321,7 @@ fn bitwise_operators_on_bigint_do_not_wrap() {
     // `>>> 0` normalization must NOT — `1n << 64n` exceeds 64 bits intact.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(0xFFn & 0x0Fn);
             print(1n << 64n);
@@ -3338,7 +3338,7 @@ fn bitwise_precedence_is_rust_order_not_c_order() {
     // Emission must survive JS's DIFFERENT (C-style) order via parentheses.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(1 << 2 == 4);
             print(1 | 2 ^ 2 & 3);
@@ -3357,7 +3357,7 @@ fn shifts_coexist_with_nested_generics() {
     // `List<List<i32>>` (type position) and comparisons are untouched.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let nested: List<List<i32>> = [[1, 2], [3]];
             let shifted = nested.len() << 2;
@@ -3389,7 +3389,7 @@ fn bitand_dispatches_to_the_operator_trait() {
     // mirroring `+`/`Add`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::operators::BitAnd;
         struct Flags { bits: i32 }
         impl Flags with BitAnd {
@@ -3430,7 +3430,7 @@ fn bytes_buffers_round_trip() {
     // round-trip. The codec substrate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::bytes::{ Bytes, encode_utf8, decode_utf8 };
         fun main() {
             let buffer = Bytes::alloc(4);
@@ -3462,7 +3462,7 @@ fn generic_trait_method_dispatches_through_a_bound() {
     // as ordered values, zipped onto the target's own generics.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         trait Sink { fun put(self, value: i32); }
         struct Collector { total: Shared<i32> }
@@ -3505,7 +3505,7 @@ fn impl_binder_in_trait_argument_position() {
     // closed.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         trait Sink { fun put(self, value: i32); }
         struct Collector { total: Shared<i32> }
@@ -3545,7 +3545,7 @@ fn hand_written_wire_impls_round_trip_through_json() {
     // backlog I3's validating decode.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
         import std::wire::{ Wire, Serialize, Deserialize };
@@ -3699,7 +3699,7 @@ fn qualified_generic_static_resolves_inner_trait_statics() {
     // gave those declarations their real spelling.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Build {
             fun build(seed: i32): Self;
         }
@@ -3732,7 +3732,7 @@ fn derived_wire_visitor_matches_to_json_and_round_trips() {
     // GENERATED rebuilds.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, encode_json, decode_json };
@@ -3799,7 +3799,7 @@ fn derived_struct_with_two_differently_typed_options() {
     // Option<str>". Per-call subject bindings keep the two instantiations apart.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         [derive(Json)]
         struct OnlyOptions {
@@ -3832,7 +3832,7 @@ fn both_codecs_round_trip_derived_wire_values() {
     // and a truncated binary frame fails sticky instead of crashing.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
         import std::wire::{ Wire, Frame, Codec, encode, decode };
@@ -3921,7 +3921,7 @@ fn generated_decode_gate_rejects_a_garbled_request() {
     // the server's counter must still be 0 afterwards.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::result::Result::{ self, Ok, Err };
         import std::json::Json;
@@ -3966,7 +3966,7 @@ fn ws_parser_handles_the_rfc_vectors() {
     // close ending the stream (later frames ignored).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::bytes::{ Bytes, encode_utf8 };
         import std::ws::{ WsParser, WsEvent, text_frame, encode_frame, close_frame };
 
@@ -4042,7 +4042,7 @@ fn client_connect_enforces_the_contract_and_wires_mirrors() {
     // probe-then-substitute port keeps a TOCTOU window the OS can close for us.
     assert_compiles_and_runs(
         &r#"
-import std::print;
+import std::io::print;
         import std::process::exit;
         import std::time::sleep;
         import std::option::Option::{ self, Some, None };

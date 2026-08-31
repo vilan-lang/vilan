@@ -1,4 +1,4 @@
-import std::assert;
+import std::io::assert;
 import pkg::square::{ square, sum_of_squares };
 
 fun main() {

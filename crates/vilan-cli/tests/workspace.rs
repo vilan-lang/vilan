@@ -68,7 +68,7 @@ fn write_fullstack_workspace(dir: &Path) {
     write(
         dir,
         "server/src/main.vl",
-        "import std::print;\nimport common::greeting;\nfun main() { print(greeting()) }\n",
+        "import std::io::print;\nimport common::greeting;\nfun main() { print(greeting()) }\n",
     );
     write(
         dir,
@@ -263,12 +263,12 @@ fn write_multi_entry_package(dir: &Path) {
     write(
         dir,
         "src/server.vl",
-        "import std::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"loaded\") } else { print(\"fresh\") }\n}\n",
+        "import std::io::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"loaded\") } else { print(\"fresh\") }\n}\n",
     );
     write(
         dir,
         "src/client.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"ui\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"ui\");\n}\n",
     );
 }
 
@@ -432,7 +432,7 @@ fn a_lone_package_writes_its_bundle_mjs() {
     write(
         &dir,
         "src/main.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"solo\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"solo\");\n}\n",
     );
     let output = vilan(&["build", dir.to_str().unwrap()]);
     assert!(
@@ -468,7 +468,7 @@ fn the_emitted_node_bundle_is_classified_as_esm() {
     write(
         &dir,
         "src/main.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"bare\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"bare\");\n}\n",
     );
     let output = vilan(&["build", dir.to_str().unwrap()]);
     assert!(
@@ -548,7 +548,7 @@ fn check_colors_each_entry_against_its_own_target() {
     write(
         &dir,
         "src/client.vl",
-        "import std::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"?\") }\n}\n",
+        "import std::io::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"?\") }\n}\n",
     );
     let violating = vilan(&["check", dir.to_str().unwrap()]);
     assert!(
@@ -609,7 +609,7 @@ fn the_retired_server_client_form_fails_with_the_migration_hint() {
     write(
         &dir,
         "server.vl",
-        "import std::print;\nfun main() { print(1) }\n",
+        "import std::io::print;\nfun main() { print(1) }\n",
     );
     write(&dir, "client.vl", "fun main() { }\n");
     let output = vilan(&["build", dir.to_str().unwrap()]);
@@ -786,7 +786,7 @@ fn a_post_build_violation_in_a_module_renders_in_that_module() {
     write(
         dir.as_path(),
         "src/store.vl",
-        "import std::print;\nimport std::drop::Drop;\n\
+        "import std::io::print;\nimport std::drop::Drop;\n\
          resource struct Guard { label: str }\n\
          impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\n\
          fun keep() {\n\tmut arr: List<Guard> = [];\n}\n",
@@ -842,7 +842,7 @@ fn body_scoped_imports_load_dependencies_and_siblings() {
     write(
         &dir,
         "server/src/main.vl",
-        "import std::print;\n\nfun main() {\n    import common::greeting;\n    import pkg::helper;\n    print(greeting());\n    print(helper::tagline());\n}\n",
+        "import std::io::print;\n\nfun main() {\n    import common::greeting;\n    import pkg::helper;\n    print(greeting());\n    print(helper::tagline());\n}\n",
     );
     write(
         &dir,
@@ -920,7 +920,7 @@ fn the_walkthrough_example_builds() {
 
 /// A node entry whose stdout says which leg ran.
 fn marker_source(marker: &str) -> String {
-    format!("import std::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\n")
+    format!("import std::io::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\n")
 }
 
 #[test]
@@ -1029,7 +1029,7 @@ fn a_build_hook_runs_before_the_build_that_consumes_it() {
     write(
         &dir,
         "src/main.vl",
-        "import std::print;\nimport pkg::generated::generated;\n\
+        "import std::io::print;\nimport pkg::generated::generated;\n\
          fun main() { print(generated() + 1) }\n",
     );
     // The generated module does not exist yet — only the hook creates it.
@@ -1126,7 +1126,7 @@ fn no_hooks_is_no_change_and_check_never_runs_them() {
 /// The `*_test.vl` body for a one-assertion test.
 fn test_source(imports: &str, condition: &str, label: &str) -> String {
     format!(
-        "import std::assert;\n{imports}\n\nfun main() {{\n\tassert({condition}, \"{label}\");\n}}\n"
+        "import std::io::assert;\n{imports}\n\nfun main() {{\n\tassert({condition}, \"{label}\");\n}}\n"
     )
 }
 
@@ -1238,7 +1238,7 @@ fn a_librarys_own_test_resolves_its_siblings_and_dependencies() {
 #[test]
 fn a_test_with_no_manifest_keeps_its_old_context() {
     // The control: a lone `*_test.vl` under no package still compiles and runs,
-    // rooted at its own directory — the behavior every existing `std::assert`
+    // rooted at its own directory — the behavior every existing `std::io::assert`
     // test relies on.
     let dir = temp_project("test_bare");
     write(
@@ -1385,7 +1385,7 @@ fn ordered_entry(imports: &[&str]) -> String {
 /// The imports of [`ordered_entry`], in one spelling.
 fn ordered_imports() -> Vec<&'static str> {
     vec![
-        "import std::print;",
+        "import std::io::print;",
         "import std::math::PI;",
         "import alpha::A_ROOT;",
         "import alpha::amod::A_MOD;",

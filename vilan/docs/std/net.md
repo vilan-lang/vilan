@@ -26,7 +26,6 @@ impl Response {
 ```
 
 ```vilan,norun
-import std::print;
 import std::fetch;
 
 fun main() {

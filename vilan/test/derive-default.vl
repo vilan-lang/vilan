@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `[derive(Default)]` synthesizes `default()`, building the struct from each
 // field type's own `default()`. Combines with other derives.

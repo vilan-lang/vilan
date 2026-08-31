@@ -84,7 +84,7 @@ fn walker_source(root: &Path, pages: &[String]) -> String {
     let root = root.display();
     format!(
         r#"
-import std::print;
+import std::io::print;
 import std::fs::read_file_to_str;
 import std::markdown::{{ parse, Block, Doc, Inline, ParseError }};
 import std::result::Result::{{ Err, Ok }};

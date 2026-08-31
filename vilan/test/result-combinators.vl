@@ -1,4 +1,4 @@
-import std::{ print, option::Option::{ self, Some, None }, result::Result::{ self, Ok, Err } };
+import std::{ io::print, option::Option::{ self, Some, None }, result::Result::{ self, Ok, Err } };
 
 fun main() {
 	let ok: Result<i32, str> = Ok(10);

@@ -1,7 +1,7 @@
 // Rule 1: assignment of an aggregate is a semantic copy. Binding one aggregate
 // to another and mutating the copy must NOT affect the source — under the old
 // JS-reference semantics both would change.
-import std::print;
+import std::io::print;
 
 struct Point { x: i32, y: i32 }
 

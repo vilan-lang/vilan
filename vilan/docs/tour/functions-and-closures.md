@@ -8,8 +8,6 @@
 value, and `ret` returns early:
 
 ```vilan
-import std::print;
-
 fun clamp(value: i32, low: i32, high: i32): i32 {
 	if value < low {
 		ret low;
@@ -35,8 +33,6 @@ have to agree. A body that only ever leaves by `ret` is typed by those
 `ret`s:
 
 ```vilan
-import std::print;
-
 fun sign(x: i32) {
 	if x < 0 {
 		ret -1;
@@ -72,8 +68,6 @@ caller's value, take `&mut` instead). It works on `self` and closure
 parameters too:
 
 ```vilan
-import std::print;
-
 fun bump(mut x: i32): i32 {
 	x = x + 1;
 	x
@@ -96,8 +90,6 @@ however many arguments arrived, and its bound decides how many are
 allowed:
 
 ```vilan
-import std::print;
-
 // `(..)` admits any arity, including none at all.
 fun how_many<T: (..)>(...items: T): i32 {
 	1
@@ -130,8 +122,6 @@ how a pack is forwarded to another spread function, and it is not the
 same as passing the tuple itself, which would arrive as a pack of one:
 
 ```vilan
-import std::print;
-
 fun how_many<T: (..)>(...items: T): i32 {
 	1
 }
@@ -160,8 +150,6 @@ A closure is an inline function value. Where JavaScript writes
 inferred from where the closure is used. Annotate them when they aren't:
 
 ```vilan
-import std::print;
-
 fun apply(seed: i32, transform: |i32| i32): i32 {
 	transform(seed)
 }
@@ -189,8 +177,6 @@ creator share the binding, so a write on either side shows up on the
 other, and even reassigning the whole binding is visible inside:
 
 ```vilan
-import std::print;
-
 fun main() {
 	mut label = "before";
 	let show = || label;
@@ -220,7 +206,6 @@ When a function already does what your closure would do, pass the
 function itself:
 
 ```vilan
-import std::print;
 import std::reactive::Signal;
 
 fun exclaim(text: str): str {
@@ -238,8 +223,6 @@ You can also just name one and call it later. A binding holding a
 function is a function:
 
 ```vilan
-import std::print;
-
 fun exclaim(text: str): str {
 	text + "!"
 }

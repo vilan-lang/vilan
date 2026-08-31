@@ -45,7 +45,7 @@ directory is spelled `foo`.
 is idempotent and cycle-tolerant) and binds the imported items in the
 importing module's scope:
 
-- `import std::print;` binds the item `print`.
+- `import std::io::print;` binds the item `print`.
 - `import std::reactive::{ Signal, combine };` binds each set member.
 - `import std::option::Option::{ self, Some, None };` is a path into a
   TYPE: `self` binds the type itself; variant names bind the variants for
@@ -68,8 +68,6 @@ outward from the use site to the innermost binding. A `let`/`mut` binding
 declaration onward, including imports and items:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let print_count = 2;
 	mut label = "a";
@@ -156,8 +154,6 @@ too, by the coherence rule of §5.4: rule 2 above says "the method a trait
 provides", and a trait provides one.
 
 ```vilan
-import std::print;
-
 struct Bag { x: i32 }
 trait Iter { fun pick(self): str; }
 
@@ -232,7 +228,7 @@ not a workspace root's, and not per platform layer. Two packages that
 disagree about what `Signal` means both keep compiling in one build.
 
 A shadowed prelude name has no qualified spelling at the use site:
-`std::print(x)` written inline is refused (§4.6). Recover by importing
+`std::io::print(x)` written inline is refused (§4.6). Recover by importing
 the module and qualifying through it — `import std::io;` then
 `io::print(…)`.
 

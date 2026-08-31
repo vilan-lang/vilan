@@ -20,7 +20,7 @@ use crate::support::*;
 fn resource_struct_parses_and_is_inert() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Session {
             id: i32,
             name: str,
@@ -40,7 +40,7 @@ fn resource_struct_with_generics_parses() {
     // independent of the generic parameters.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Wrapper<T> {
             value: T,
         }
@@ -57,7 +57,7 @@ fn resource_struct_with_generics_parses() {
 fn resource_enum_parses_and_is_inert() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource enum Color {
             Red,
             Green,
@@ -95,7 +95,7 @@ fn resource_struct_carries_a_derive_through_expansion() {
     // modifier (the item is boxed, not rebuilt).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         [derive(PartialEq, Debug)]
         resource struct Session {
             id: i32,
@@ -450,7 +450,7 @@ fn r10_leaves_a_generic_aggregate_over_a_resource_alone() {
 fn b103_program(body: &str) -> String {
     format!(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
@@ -1213,7 +1213,7 @@ fn b60_a_consuming_call_kills_the_source_binding() {
     // The B60 headline: `o.is_some()` after `o.unwrap()` used to compile clean.
     assert_use_after_move_noting(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Res { n: i32 }
         fun main() {
@@ -1234,7 +1234,7 @@ fn b60_a_consuming_call_in_one_branch_is_a_conditional_move() {
     // because end-of-scope ownership must be static (no runtime drop flags).
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Res { n: i32 }
         fun main() {
@@ -1253,7 +1253,7 @@ fn b60_a_consuming_call_in_a_loop_is_rejected() {
     // R8's precedent: the move would repeat on the next iteration.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Res { n: i32 }
         fun main() {
@@ -1276,7 +1276,7 @@ fn b60_a_consuming_call_on_a_field_is_a_partial_move() {
     // sanctioned way out of a live aggregate.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Res { n: i32 }
         struct Holder { slot: Option<Res> }
@@ -1297,7 +1297,7 @@ fn b60_reinitialization_after_a_consuming_call_compiles() {
     // so each resource is destroyed exactly once, in reverse declaration order.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str }
@@ -1324,7 +1324,7 @@ fn b60_a_data_option_is_unaffected_by_the_consuming_call() {
     // the source stays readable and correct. B60 must not touch the data world.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let slot: Option<i32> = Some(5);
@@ -1373,7 +1373,7 @@ fn b63_is_some_and_at_a_resource_instantiation() {
     // alternative is the silent leak this pin used to assert.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str, n: i32 }
@@ -1396,7 +1396,7 @@ fn b63_is_some_and_at_data_is_untouched_by_the_b66_rejection() {
     // caller — which is all of them, in std, the corpus and the examples.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let slot: Option<i32> = Some(7);
@@ -1415,7 +1415,7 @@ fn b63_ok_or_at_a_resource_instantiation() {
     // exactly once — one `drop b`, after `end`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -1439,7 +1439,7 @@ fn b63_unzip_at_a_resource_instantiation() {
     // resource once.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str, n: i32 }
@@ -1463,7 +1463,7 @@ fn b63_inspect_at_a_resource_instantiation() {
     // parameter's move — one value, one drop.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str, n: i32 }
@@ -1486,7 +1486,7 @@ fn b63_or_else_at_a_resource_instantiation() {
     // to destroy. One resource is built and destroyed once.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str, n: i32 }
@@ -1512,7 +1512,7 @@ fn b63_eq_at_a_resource_instantiation() {
     // per-comparison tuple is gone (`equality.js`, `generic-equality.js`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str, n: i32 }
@@ -1538,7 +1538,7 @@ fn b63_or_at_a_resource_rejects_the_discarded_alternative() {
     // `affine-moves.md` §6). The error now names `b`, not `self`.
     assert_only_failure_noting_into_std(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Db { handle: i32 }
         fun main() {
@@ -1560,7 +1560,7 @@ fn b63_xor_at_a_resource_rejects_the_two_some_discard() {
     // distraction about `self`.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Db { handle: i32 }
         fun main() {
@@ -1581,7 +1581,7 @@ fn b63_unwrap_or_at_a_resource_rejects_the_discarded_fallback() {
     // that works.
     assert_only_failure_noting_into_std(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Db { handle: i32 }
         fun main() {
@@ -1600,7 +1600,7 @@ fn b63_unwrap_or_else_is_the_resource_clean_fallback() {
     // cannot rot: producing the fallback instead of handing it in is clean.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str, n: i32 }
@@ -1622,7 +1622,7 @@ fn b63_the_rewritten_combinators_are_unchanged_at_data() {
     // byte-identical to the v0.25.0 output.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let some: Option<i32> = Some(3);
@@ -1661,7 +1661,7 @@ fn b63_a_data_option_survives_the_own_self_combinators() {
     // data, so the source binding stays readable and correct after each call.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let slot: Option<i32> = Some(5);
@@ -2301,7 +2301,7 @@ fn owned_nursery_enter_runs_its_body_then_drops_clean() {
     // value, and the owner's `Drop` (cancel) runs at scope end without error.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::OwnedNursery;
         fun main() {
             let owner = OwnedNursery::new();
@@ -2428,7 +2428,7 @@ fn a_same_scope_rebinding_binds_each_use_positionally() {
     // a TDZ ReferenceError at runtime from a cleanly-compiling program.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let d = 1;
             print(d);
@@ -2444,7 +2444,7 @@ fn a_same_scope_rebinding_binds_each_use_positionally() {
 fn a_shadowing_initializer_reads_the_prior_binding() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = 1;
             let x = x + 1;
@@ -2461,7 +2461,7 @@ fn a_block_shadow_ends_with_its_block() {
     // one; after the block, it is again.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = 1;
             {
@@ -2480,7 +2480,7 @@ fn a_block_shadow_ends_with_its_block() {
 fn a_let_shadows_a_parameter_from_its_point_on() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun f(x: i32): i32 {
             let y = x;
             let x = 10;
@@ -2498,7 +2498,7 @@ fn a_destructure_initializer_never_sees_its_own_binders() {
     // the END of the whole statement, so `(b, a)` reads the prior pair.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let (a, b) = (1, 2);
             let (a, b) = (b, a);
@@ -2514,7 +2514,7 @@ fn a_destructure_initializer_never_sees_its_own_binders() {
 fn a_for_item_is_shadowable_inside_its_body() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             for x in [1, 2] {
                 let x = x * 10;
@@ -2530,7 +2530,7 @@ fn a_for_item_is_shadowable_inside_its_body() {
 fn a_match_capture_is_shadowable_inside_its_arm() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             match Some(1) {
@@ -2549,7 +2549,7 @@ fn a_match_capture_is_shadowable_inside_its_arm() {
 #[test]
 fn a_use_before_the_declaration_is_an_error_pointing_at_it() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(x);
             let x = 1;
@@ -2586,7 +2586,7 @@ fn a_module_binding_may_still_be_read_before_its_declaration() {
     // positional visibility is a LOCAL rule only.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let early = late + 1;
         let late = 1;
         fun main() { print(early); }
@@ -2772,7 +2772,7 @@ fn r11_std_option_map_at_data_is_untouched() {
     // Data instantiations are never enqueued, so `map` is unchanged for them.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let opt: Option<i32> = Some(2);
@@ -3195,7 +3195,7 @@ fn drop_runs_at_scope_end() {
     // comment then anticipated.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { x: i32 }
         impl Res with Drop {
@@ -3431,7 +3431,7 @@ fn drop_locals_drop_in_reverse_declaration_order() {
     // order: `b` before `a`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3452,7 +3452,7 @@ fn drop_body_runs_before_fields_which_drop_in_reverse() {
     // reverse declaration order: `owner-body`, then `second`, then `first`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Leaf { tag: str }
         impl Leaf with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3473,7 +3473,7 @@ fn drop_enum_payload_drops_with_the_value() {
     // contained `Res`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str }
@@ -3493,7 +3493,7 @@ fn containment_only_resource_drops_its_fields() {
     // its resource field at scope end.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Leaf { tag: str }
         impl Leaf with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3530,7 +3530,7 @@ fn containment_only_resource_drops_its_fields() {
 fn b113_program(body: &str) -> String {
     format!(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Leaf {{ tag: str }}
         impl Leaf with Drop {{ fun drop(&mut self) {{ print(self.tag); }} }}
@@ -3709,7 +3709,7 @@ fn b113_an_inherent_method_named_drop_never_runs() {
     // clears containment: the silence is identical with and without it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Leaf { tag: str }
         impl Leaf { fun drop(own self) { print(i"drop {self.tag}"); } }
         fun main() {
@@ -3727,7 +3727,7 @@ fn drop_runs_on_early_ret() {
     // fall-through path too (both exits run the teardown).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3752,7 +3752,7 @@ fn drop_runs_on_jump_break_leaving_only_the_loop_scope() {
     // function local (`outer`), which drops at the function's end.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3777,7 +3777,7 @@ fn drop_runs_on_jump_continue_each_iteration() {
     // `jump continue` drops the loop-body local it leaves, every iteration.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3802,7 +3802,7 @@ fn overwrite_drops_the_old_value_then_the_new_at_scope_end() {
     // (`old`), then the NEW value drops at the scope end (`new`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3823,7 +3823,7 @@ fn a_module_level_resource_never_drops() {
     // `drop` never runs — only `main` prints.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3843,7 +3843,7 @@ fn a_resource_owned_across_an_await_drops_at_scope_end() {
     // after the await.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::time::sleep;
         resource struct Res { tag: str }
@@ -3899,7 +3899,7 @@ fn a_platform_free_drop_adds_no_coloring() {
     // neutral, so a browser build compiles cleanly.
     assert_compiles_browser(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3950,7 +3950,7 @@ fn a_platform_free_drop_sink_call_adds_no_coloring() {
     // no coloring, so a browser build compiles cleanly.
     assert_compiles_browser(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -3978,7 +3978,7 @@ fn a_drop_runs_synchronously_at_the_scope_exit() {
     // context-requiring drop body is unsupported in this slice (see the report).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -4007,7 +4007,7 @@ fn option_take_on_data_leaves_none_and_yields_the_value() {
     // sees it), and returns the old contents. Data works exactly like a resource.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut opt = Some(5);
@@ -4024,7 +4024,7 @@ fn option_take_on_none_stays_none() {
     // Taking from `None` yields `None` and leaves `None` — the idempotent edge.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut opt: Option<i32> = None;
@@ -4041,7 +4041,7 @@ fn option_replace_on_data_returns_the_old_and_installs_the_new() {
     // `replace` puts the new value in and returns the old — `Some(old)` here.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut opt = Some(1);
@@ -4058,7 +4058,7 @@ fn option_replace_on_none_returns_none() {
     // Replacing into `None` returns `None` and installs `Some(new)` — the edge.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut opt: Option<i32> = None;
@@ -4077,7 +4077,7 @@ fn option_take_on_a_resource_moves_the_payload_out() {
     // slot (`opt`, now `None`) drops nothing. Reverse-order drop is visible.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
         resource struct Res { tag: str }
@@ -4102,7 +4102,7 @@ fn option_replace_returns_the_old_resource_for_the_caller_to_own() {
     // order (`previous` then `slot`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
         resource struct Res { tag: str }
@@ -4142,7 +4142,7 @@ fn option_replace_moves_the_new_value_in_rather_than_loaning_it() {
     // `drop r` TWICE on an accepted program.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
         resource struct Res { tag: str }
@@ -4165,7 +4165,7 @@ fn option_replace_rejects_a_read_of_the_value_it_was_handed() {
     // `own` restores the single-owner rule `List::push` has always enforced.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::Drop;
         resource struct Res { tag: str }
@@ -4200,7 +4200,7 @@ fn r10_refuses_a_native_map_of_a_resource() {
     // reaches `insert` and the bare declaration is honest again.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::native_map::NativeMap;
         import std::drop::Drop;
         resource struct Res { tag: str }
@@ -4223,7 +4223,7 @@ fn r10_refuses_the_measured_native_map_use_after_free() {
     // before the insert is ever reached.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::native_map::NativeMap;
         import std::hash::Hashable;
         import std::drop::Drop;
@@ -4247,7 +4247,7 @@ fn r10_admits_a_native_map_of_a_non_resource() {
     // built on, and every one of their inserts goes through this.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::native_map::NativeMap;
         import std::hash::Hashable;
         fun main() {
@@ -4269,7 +4269,7 @@ fn native_map_insert_loans_its_hash_key() {
     // The key is read after the insert to prove the caller still owns it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::native_map::NativeMap;
         import std::hash::{ Hash, Hashable };
         fun main() {
@@ -4326,7 +4326,7 @@ fn r10_map_construction_never_reports_the_native_map_inside_it() {
     // about `Map`; the storage inside it is not a second thing to fix.
     assert_fails_without(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::drop::Drop;
         resource struct Res { tag: str }
@@ -4344,7 +4344,7 @@ fn r10_map_construction_never_reports_the_native_map_inside_it() {
 fn r10_set_construction_never_reports_the_native_map_inside_it() {
     assert_fails_without(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::drop::Drop;
         resource struct Res { tag: str }
@@ -4427,7 +4427,7 @@ fn option_take_under_a_live_view_is_rejected() {
     // into `opt` is live is rejected. Pinned to prove take opens NO new hole.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut opt: Option<i32> = Some(5);
@@ -4449,7 +4449,7 @@ fn drop_of_a_resource_tears_down_immediately() {
     // to the resource's destructor; `db` then drops nowhere else (no double-drop).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"close {self.tag}"); } }
@@ -4470,7 +4470,7 @@ fn drop_of_data_is_a_no_op() {
     // destructor exists) — the sink is ordinary std surface, useful for both.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::drop;
         fun main() {
             let n = 5;
@@ -4498,7 +4498,7 @@ fn b68_drop_of_a_call_result_destroys_it() {
     // what makes the value droppable, the `own` sink is.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -4522,7 +4522,7 @@ fn b68_drop_of_a_construction_destroys_it() {
     // pinned so the B68 widening cannot regress it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -4541,7 +4541,7 @@ fn b68_drop_of_a_method_call_result_destroys_it() {
     // method's declared return type, which is only known through the call.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -4563,7 +4563,7 @@ fn b68_drop_of_a_nested_call_result_destroys_it() {
     // the OUTER call's result type rather than pattern-matching one call shape.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -4584,7 +4584,7 @@ fn b68_drop_of_a_data_call_result_is_a_no_op() {
     // type query must not conjure a destructor where there is none.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::drop;
         fun sum(a: i32, b: i32): i32 { print("called"); a + b }
         fun main() {
@@ -4606,7 +4606,7 @@ fn b68_a_generic_forwarding_a_call_result_to_the_sink_is_rejected_at_a_resource(
     // than slipping past the check untyped.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -4628,7 +4628,7 @@ fn b68_a_generic_forwarding_a_call_result_to_the_sink_is_accepted_at_data() {
     // stays accepted — `drop` on data is the correct no-op consume.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::drop;
         fun identity<T>(own value: T): T { value }
         fun consume<T>(own x: T) { drop(identity(x)); }
@@ -4648,7 +4648,7 @@ fn the_conditional_teardown_idiom_tears_down_in_both_arms() {
     // it down in the `Some` arm; the `None` arm tears down nothing. Both exercised.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::{ Drop, drop };
         resource struct Res { tag: str }
@@ -4681,7 +4681,7 @@ fn a_concrete_own_resource_parameter_drops_at_the_callee_scope_end() {
     // later statement runs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -4703,7 +4703,7 @@ fn two_own_resource_parameters_drop_in_reverse_declaration_order() {
     // end, like locals — the ordering-sensitive edge (`b` before `a`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -4725,7 +4725,7 @@ fn an_own_parameter_moved_out_on_every_path_drops_nowhere() {
     // NOWHERE in the callee — the caller owns it and drops it once. No double-drop.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -4755,7 +4755,7 @@ fn an_async_own_resource_parameter_drops_after_the_await_at_scope_end() {
     // awaits. (Async — node only, not the interpreter subset.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
 
         [extern("node:timers/promises", "setTimeout")]
@@ -4788,7 +4788,7 @@ fn a_generic_own_t_never_moved_out_is_rejected_at_a_resource_instantiation() {
     // body cannot close, rejected AT the instantiation site with the steer.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Db { tag: str }
         fun leak<T>(own x: T) {}
         fun main() {
@@ -4807,7 +4807,7 @@ fn the_same_generic_own_t_zero_move_at_a_data_type_is_accepted() {
     // nothing leaks and no instantiation is enqueued. Only resources tighten.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         fun leak<T>(own x: T) {}
         fun main() {
             leak(5);
@@ -4825,7 +4825,7 @@ fn the_drop_sink_itself_is_accepted_at_a_resource() {
     // resource compiles.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -4843,7 +4843,7 @@ fn a_generic_own_t_moved_out_by_return_is_accepted_at_a_resource() {
     // is accepted at a resource — the caller receives and owns it.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -4863,7 +4863,7 @@ fn a_generic_own_t_moved_out_on_every_branch_is_accepted() {
     // caller — accepted (not a zero-move; the caller then owns and drops it).
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -4907,7 +4907,7 @@ fn two_own_generics_moved_on_different_branches_is_not_every_path() {
     // diagnostic would fire; the ruling says otherwise, so it names the R7 one.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str }
         fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
@@ -4930,7 +4930,7 @@ fn b67_the_concrete_twin_of_pick_is_rejected_too() {
     // parameters moved, planned no teardown, and `second` was never destroyed.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str }
@@ -4953,7 +4953,7 @@ fn b67_both_divergent_parameters_are_reported() {
     // is not a B5 violation: fixing `first` does not fix `second`. Pinned so a
     // later "report once per branch" tidy-up cannot silently halve the report.
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str }
         fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
@@ -4979,7 +4979,7 @@ fn b67_the_same_binding_returned_from_every_branch_stays_accepted() {
     // instead of two, and it must stay legal.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -5008,7 +5008,7 @@ fn b67_an_is_refined_branch_may_leave_the_none_side_un_moved() {
     // carries nothing to destroy. This is `or_else`'s shape, written by hand.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str }
@@ -5035,7 +5035,7 @@ fn b67_the_refinement_does_not_excuse_a_payload_carrying_complement() {
     // refinement that keyed off the `is` alone would wrongly accept this.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -5061,7 +5061,7 @@ fn b67_a_loop_divergent_move_is_still_r8_not_r7() {
     // exactly the shape B67 now inspects.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         import std::option::Option::{ self, Some, None };
         resource struct Res { tag: str }
@@ -5092,7 +5092,7 @@ fn a_generic_forwarding_own_t_to_the_drop_sink_is_rejected_at_a_resource() {
     // 2026-07-19 ruling). Spanned at the instantiation, with the steer.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
@@ -5114,7 +5114,7 @@ fn a_generic_forwarding_own_t_to_the_drop_sink_is_accepted_at_data() {
     // enqueued, so the R11 drop-forwarding check never runs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::drop;
         fun consume<T>(own x: T) { drop(x); }
         fun main() {
@@ -5135,7 +5135,7 @@ fn a_concrete_own_parameter_dropped_via_the_sink_is_destroyed() {
     // read as untyped and silently leak.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"close {self.tag}"); } }
@@ -5164,7 +5164,7 @@ fn a_resource_match_consume_moves_the_payload_to_its_new_owner() {
     // relies on (impl-plan §7 risk).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -5314,7 +5314,7 @@ fn a_service_struct_owning_a_resource_is_rejected() {
 fn a_module_level_resource_move_into_a_local_is_rejected() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Res { tag: str }
         let shared: Res = Res { tag = "global" };
         fun steal() {
@@ -5353,7 +5353,7 @@ fn a_module_level_data_binding_overwrite_is_accepted() {
     // state stays writable exactly as before.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         mut counter: i32 = 0;
         fun tick() {
             counter = counter + 1;
@@ -5438,7 +5438,7 @@ fn a_module_level_file_initializer_is_refused_for_awaiting() {
     // this pin records that it does not.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::fs::File;
         let log: File = File::append_to("app.log");
         fun main() {
@@ -5458,7 +5458,7 @@ fn the_handles_postfix_idiom_typechecks_off_the_awaited_constructor() {
     // `file.vl` holds the emitted parenthesization.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::bytes::Bytes;
         import std::fs::File;
         fun main() {
@@ -5480,7 +5480,7 @@ fn a_scope_end_file_drop_is_a_finally_that_initiates_the_close() {
     // reddens both assertions (and the `file.vl` corpus golden).
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::fs::File;
         fun main() {
             let file = File::open("data.txt");
@@ -5530,7 +5530,7 @@ fn with_file_awaits_the_close_before_returning() {
     // `with_file` in fs.vl reddens this (and the corpus golden).
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::fs::with_file;
         fun main() {
             let size = with_file("data.txt", |file| file.stat().size);
@@ -5685,7 +5685,7 @@ fn the_three_change_kinds_match_without_a_catch_all() {
     // open-ended kinds.)
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::fs::{ Change, ChangeKind, Watcher };
         fun describe(change: Change): str {
             match change.kind {
@@ -5877,7 +5877,7 @@ fn a_module_level_resource_loan_is_accepted() {
     // A method call and a bare (loan) parameter both borrow the global — accepted.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Res { tag: str }
         impl Res { fun peek(self) { print(self.tag); } }
         let shared: Res = Res { tag = "global" };
@@ -5927,8 +5927,8 @@ fn an_overwrite_whose_new_value_panics_drops_the_old_value_exactly_once() {
     // walking over the corpse.
     let (stdout, _stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
-        import std::panic;
+        import std::io::print;
+        import std::io::panic;
         import std::drop::Drop;
         resource struct Guard { tag: str }
         impl Guard with Drop {
@@ -5960,7 +5960,7 @@ fn an_overwrite_drops_the_old_value_before_the_new_one_is_stored() {
     // right-hand side cannot throw, so its emission is untouched by the fix.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { tag: str }
         impl Guard with Drop {
@@ -5984,7 +5984,7 @@ fn an_overwrite_evaluates_an_effectful_new_value_before_dropping_the_old_one() {
     // value now precede the old value's destructor, and that order is the fix.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { tag: str }
         impl Guard with Drop {
@@ -6011,8 +6011,8 @@ fn an_overwrite_through_a_view_also_evaluates_before_it_destroys() {
     // the caller's `finally` a destroyed value to walk over.
     let (stdout, _stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
-        import std::panic;
+        import std::io::print;
+        import std::io::panic;
         import std::drop::Drop;
         resource struct Guard { tag: str }
         impl Guard with Drop {
@@ -6057,8 +6057,8 @@ fn a_panic_before_an_explicit_drop_still_releases_the_resource() {
     // "acquired" — the `finally` was gone and "released" never printed.
     let (stdout, _stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
-        import std::panic;
+        import std::io::print;
+        import std::io::panic;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -6090,7 +6090,7 @@ fn an_explicit_drop_on_the_normal_path_destroys_exactly_once() {
     // print after it observes a released resource.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -6116,7 +6116,7 @@ fn an_explicit_drop_empties_the_slot_its_finally_tests() {
     // be present — either alone is a leak or a double drop.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -6149,7 +6149,7 @@ fn a_resource_with_no_explicit_drop_keeps_its_unguarded_teardown() {
     // did, with no emptiness test and no rebindable slot.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop {
@@ -6179,8 +6179,8 @@ fn a_panic_before_dropping_an_own_parameter_still_releases_it() {
     // whole body (destruction.md §6) rather than riding a `let`.
     let (stdout, _stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
-        import std::panic;
+        import std::io::print;
+        import std::io::panic;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -6207,7 +6207,7 @@ fn a_panic_before_dropping_an_own_parameter_still_releases_it() {
 fn an_own_parameter_dropped_explicitly_destroys_exactly_once() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -6232,8 +6232,8 @@ fn a_panic_before_dropping_a_match_capture_still_releases_it() {
     // it owes the same exception safety a `let` does.
     let (stdout, _stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
-        import std::panic;
+        import std::io::print;
+        import std::io::panic;
         import std::drop::Drop;
         import std::drop::drop;
         import std::option::Option;
@@ -6269,7 +6269,7 @@ fn a_panic_before_dropping_a_match_capture_still_releases_it() {
 fn a_match_capture_dropped_explicitly_destroys_exactly_once() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
         import std::option::Option;
@@ -6300,7 +6300,7 @@ fn a_binding_reassigned_after_its_explicit_drop_destroys_each_value_once() {
     // the SECOND value only. No overwrite drop fires — the slot was empty.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -6349,7 +6349,7 @@ fn a_resource_drops_after_its_last_use_not_at_the_scope_end() {
     // between the two statements instead of after both.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6370,7 +6370,7 @@ fn a_resource_nothing_reads_drops_at_its_declaration() {
     // fix total — under scope-end that release never arrives.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6392,7 +6392,7 @@ fn a_resource_used_after_a_never_ending_loop_would_start_is_released_before_it()
     // terminate; the point is the release ordering, not the loop.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6417,7 +6417,7 @@ fn two_resources_last_used_in_one_statement_discharge_in_reverse_declaration_ord
     // `a` — and the pair still fires before the statement after it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6440,7 +6440,7 @@ fn resources_last_used_in_different_statements_discharge_at_each_last_use() {
     // came out in reverse declaration order.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6465,7 +6465,7 @@ fn a_resource_used_in_one_branch_arm_releases_on_the_taken_and_the_not_taken_pat
     let program = |taken: &str| {
         format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res {{ tag: str }}
         impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
@@ -6491,7 +6491,7 @@ fn a_resource_used_in_both_arms_still_releases_once_at_the_join() {
     let program = |taken: &str| {
         format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res {{ tag: str }}
         impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
@@ -6514,7 +6514,7 @@ fn a_resource_used_inside_a_loop_drops_once_after_the_loop() {
     // the drop is at the loop's exit — once, not per iteration.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6537,7 +6537,7 @@ fn a_resource_declared_inside_a_loop_drops_at_its_last_use_each_iteration() {
     // precision the old lexical "inside a loop" refusal could not reach.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6563,7 +6563,7 @@ fn a_view_extends_its_owners_liveness_to_the_views_last_use() {
     // view reads through it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"drop {self.label}"); } }
@@ -6589,7 +6589,7 @@ fn a_teardown_region_widens_over_a_name_a_later_closure_reads() {
     // language that lowers them to JS blocks, and it is a hold, never a leak.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6614,7 +6614,7 @@ fn a_resource_read_in_the_scopes_tail_keeps_the_scope_end_teardown() {
     // refusal falls back to — the pass never guesses a drop point.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6638,7 +6638,7 @@ fn last_use_disposal_does_not_reach_a_module_level_resource() {
     // nothing is destroyed.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6660,7 +6660,7 @@ fn an_explicit_drop_coincides_with_the_point_the_pass_infers() {
     // net over the window between acquisition and the sink — closes there
     // rather than at the scope end. The two programs print the same thing.
     let sunk = r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -6673,7 +6673,7 @@ fn an_explicit_drop_coincides_with_the_point_the_pass_infers() {
         }
         "#;
     let inferred = r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6694,7 +6694,7 @@ fn an_own_resource_parameter_drops_after_its_last_use() {
     // read, not at the body's end.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6718,8 +6718,8 @@ fn a_last_use_drop_still_runs_when_a_later_statement_in_its_region_panics() {
     // releases on the way out.
     let (stdout, _stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
-        import std::panic;
+        import std::io::print;
+        import std::io::panic;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6743,7 +6743,7 @@ fn a_teardown_region_never_closes_over_a_name_read_after_it() {
     // cover `value`'s own last read. Found by `OwnedNursery::enter`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6775,7 +6775,7 @@ fn a_teardown_region_inside_an_if_arm_widens_over_a_name_read_after_it() {
     // statements sit two deep in the declaration chain.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6803,7 +6803,7 @@ fn a_teardown_region_inside_a_match_arm_widens_over_a_name_read_after_it() {
     // `match` statement, so its declarations key the `match`, not themselves.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6834,7 +6834,7 @@ fn a_teardown_region_inside_a_loop_body_widens_over_a_name_read_after_it() {
     // way round: the region must close before the read, inside the body.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6864,7 +6864,7 @@ fn a_teardown_region_two_blocks_deep_widens_over_a_name_read_after_it() {
     // the second element of it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6898,7 +6898,7 @@ fn a_teardown_region_widens_whether_its_if_is_a_tail_or_a_statement() {
     // one program, so neither can be fixed at the other's expense.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6937,7 +6937,7 @@ fn a_teardown_region_inside_a_closure_body_widens_over_a_name_read_after_it() {
     // correct. It is pinned so the keying change is held to not disturbing it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -6983,7 +6983,7 @@ fn a_temporary_receiver_drops_at_its_statements_end() {
     // statement runs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7004,7 +7004,7 @@ fn two_temporaries_in_one_statement_drop_in_reverse_construction_order() {
     // reverse birth order, which the nested `finally`s give for free.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7026,7 +7026,7 @@ fn a_temporary_drops_before_a_later_statements_temporary_is_built() {
     // straight-line scope hold ONE resource at a time, not N (P7).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7047,7 +7047,7 @@ fn a_temporary_in_a_loop_body_drops_each_iteration() {
     // P9: peak one, whatever the iteration count.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7072,7 +7072,7 @@ fn a_temporary_bound_into_a_let_still_drops_and_leaves_the_name_readable() {
     // handle is destroyed, and `n` survives.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7094,8 +7094,8 @@ fn a_temporary_drops_when_its_statement_throws() {
     // mid-statement throw releases it instead of leaking it permanently.
     let (stdout, _stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
-        import std::panic;
+        import std::io::print;
+        import std::io::panic;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7121,7 +7121,7 @@ fn a_temporary_moved_into_an_own_parameter_is_not_dropped_twice() {
     // caller's statement must not destroy it as well.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7152,7 +7152,7 @@ fn a_temporary_in_a_bare_loan_parameter_drops_at_its_statements_end() {
     // does. Under the narrowed predicate this leaked: no drop ran at all.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7174,7 +7174,7 @@ fn a_temporary_in_a_bare_extern_parameter_drops_at_its_statements_end() {
     // releases the handle straight after.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7200,7 +7200,7 @@ fn a_temporary_handed_to_a_retaining_extern_is_left_to_the_host() {
     // instead, which is the direction this rule always fails.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7223,7 +7223,7 @@ fn a_temporary_moved_into_the_drop_sink_is_not_dropped_twice() {
     // site. Recording it as a temporary too would destroy it twice.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         import std::drop::drop;
         resource struct Res { tag: str }
@@ -7243,7 +7243,7 @@ fn a_temporary_returned_by_ret_is_not_dropped() {
     // P5 line 3: a value moved OUT of a helper belongs to the caller's binding.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7266,7 +7266,7 @@ fn a_temporary_bound_by_a_let_is_not_a_temporary() {
     // than the statement's.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7290,7 +7290,7 @@ fn a_conditionally_constructed_resource_temporary_is_refused() {
     // flag. A refusal of the SPELLING — the message names the fix.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7311,7 +7311,7 @@ fn the_conditional_temporarys_refusal_names_binding_as_the_fix() {
     // worth of restructuring, exactly the shape R7 already asks for.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7334,7 +7334,7 @@ fn a_temporary_on_the_left_of_a_short_circuit_is_accepted() {
     // the operator.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7358,7 +7358,7 @@ fn a_temporary_in_a_branch_arm_drops_inside_that_arm() {
     let program = |taken: &str| {
         format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res {{ tag: str }}
         impl Res with Drop {{ fun drop(&mut self) {{ print(i"drop {{self.tag}}"); }} }}
@@ -7383,7 +7383,7 @@ fn a_temporary_in_a_tail_position_drops_after_the_value_is_computed() {
     // is what a `finally` around the `return` gives.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7441,7 +7441,7 @@ fn an_unmarked_extern_loan_is_call_bounded() {
     // at its last use like any other.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -7468,7 +7468,7 @@ fn a_retaining_extern_holds_its_argument_to_the_bindings_scope_end() {
     // value host-side (`tag=["<FREED>"]`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res { tag: str }
         impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }

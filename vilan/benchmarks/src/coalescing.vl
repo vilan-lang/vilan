@@ -2,7 +2,7 @@
 // an in-process duplex with a counting bridge. These counts are exact
 // invariants (CI pins them), not timings.
 
-import std::print;
+import std::io::print;
 import std::shared::Shared;
 import std::json::{ Json, json_codec };
 import std::wire::Serializer;

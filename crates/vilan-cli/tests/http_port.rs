@@ -105,7 +105,7 @@ fn a_port_zero_server_reports_the_port_it_bound() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::http::{ Server, Response };
 
 fun main() {

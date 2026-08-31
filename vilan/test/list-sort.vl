@@ -1,4 +1,4 @@
-import std::{ print, compare::Ordering };
+import std::{ io::print, compare::Ordering };
 
 struct Entry {
 	key: i32,

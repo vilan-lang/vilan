@@ -185,7 +185,7 @@ impl StatusBoard {
 ///   redeployed under the client, which is what the reconnect's `__contract`
 ///   re-check exists to catch.
 #[cfg(unix)]
-const SERVER: &str = r#"import std::print;
+const SERVER: &str = r#"import std::io::print;
 import std::reactive::Signal;
 import std::json::json_codec;
 import std::option::Option::{ self, Some, None };
@@ -241,7 +241,7 @@ async fun main() {
 "#;
 
 #[cfg(unix)]
-const CLIENT: &str = r#"import std::print;
+const CLIENT: &str = r#"import std::io::print;
 import std::shared::Shared;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
@@ -325,7 +325,7 @@ async fun main() {
 /// holds that same `DuplexEnd`, which is what makes the disposal visible from
 /// the generated client at all.
 #[cfg(unix)]
-const WATCH_CLIENT: &str = r#"import std::print;
+const WATCH_CLIENT: &str = r#"import std::io::print;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
 import std::time::sleep;
@@ -609,7 +609,7 @@ fn a_server_that_redeploys_a_different_surface_closes_the_socket() {
 /// socket and a real server restart. Same unix gate and the same reason as the
 /// tests above — the outage is produced by killing the server process.
 #[cfg(unix)]
-const DRAFT_CLIENT: &str = r#"import std::print;
+const DRAFT_CLIENT: &str = r#"import std::io::print;
 import std::shared::Shared;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
@@ -770,7 +770,7 @@ fn a_library_service_client_compiles_without_an_rpc_import() {
     write(
         &dir,
         "app/src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
 import common::StatusClient;

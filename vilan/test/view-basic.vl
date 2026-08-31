@@ -1,7 +1,7 @@
 // Phase 3 (views, slice 1): `&mut x` takes a writable view of a place, and
 // mutating through it is visible on the target — a view aliases, it does not
 // copy. Contrast with a plain binding, which copies (rule 1).
-import std::print;
+import std::io::print;
 
 struct Counter { value: i32 }
 

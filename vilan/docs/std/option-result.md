@@ -152,7 +152,6 @@ impl Result<Option<type T>, type E> { fun transpose(self): Option<Result<T, E>> 
 ## Idioms
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 

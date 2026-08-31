@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `borrows`: a method may return a view that projects one of its parameters —
 // rule 3's one sanctioned escape. The view is a `(base, key)` pair into the

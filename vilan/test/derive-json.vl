@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::result::Result::{ self, Ok, Err };
 
 // `[derive(Json)]` synthesizes both directions — `to_json` (a faithful JSON object

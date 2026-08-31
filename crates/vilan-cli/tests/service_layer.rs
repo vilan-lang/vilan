@@ -112,7 +112,7 @@ fn services_answer_before_on_request_regardless_of_call_order() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
@@ -198,7 +198,7 @@ fn two_services_on_distinct_mounts_each_answer_their_own() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
@@ -302,7 +302,7 @@ fn an_upgrade_routes_to_its_mounts_service() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
@@ -506,7 +506,7 @@ fn raw_http_bounded(port: u16, request: &str, timeout: Duration) -> String {
 /// pre-layer `serve_service` (captured 2026-08-11), then `serve_service` as
 /// sugar over the layer, now the builder chain itself (`serve_service`
 /// retired 2026-08-20, E71).
-const BYTE_IDENTICAL_SERVER: &str = r#"import std::print;
+const BYTE_IDENTICAL_SERVER: &str = r#"import std::io::print;
 import std::shared::Shared;
 import std::json::json_codec;
 import std::http::{ Response, Server };

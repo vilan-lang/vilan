@@ -10,7 +10,6 @@
 
 import std::build::require_build;
 import std::http::{ Request, Response, Server };
-import std::print;
 import common::greeting;
 
 async fun main() {

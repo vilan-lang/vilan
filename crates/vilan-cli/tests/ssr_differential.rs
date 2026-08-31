@@ -127,7 +127,7 @@ main();
 "#;
 
 const SERVER: &str = r#"import std::ui::render;
-import std::print;
+import std::io::print;
 import pkg::component::app;
 
 fun main() {

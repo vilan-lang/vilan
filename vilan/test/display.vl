@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::display::Display;
 
 struct Point {

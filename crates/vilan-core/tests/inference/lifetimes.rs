@@ -37,7 +37,7 @@ use crate::support::*;
 fn map_registers_its_subscription_into_the_ambient_owner() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, Disposable, owner_scope };
 
         fun main() {
@@ -63,7 +63,7 @@ fn map_registers_its_subscription_into_the_ambient_owner() {
 fn combine_registers_every_input_subscription_into_the_ambient_owner() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, Disposable, combine, owner_scope };
 
         fun main() {
@@ -94,7 +94,7 @@ fn combine_registers_every_input_subscription_into_the_ambient_owner() {
 fn flatten_registers_its_outer_and_live_inner_subscriptions() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, Disposable, owner_scope };
 
         fun main() {
@@ -127,7 +127,7 @@ fn flatten_registers_its_outer_and_live_inner_subscriptions() {
 fn a_derivation_outside_every_owner_still_tracks_its_source() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
 
         let count: Signal<i32> = Signal::new(1);
@@ -159,7 +159,7 @@ fn a_derivation_outside_every_owner_still_tracks_its_source() {
 fn disposing_a_reactive_server_clears_its_transports_inbound_handler() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::json_codec;
         import std::reactive::{ Disposable, Signal };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
@@ -190,7 +190,7 @@ fn disposing_a_reactive_server_clears_its_transports_inbound_handler() {
 fn disposing_a_reactive_client_clears_its_transports_inbound_handler() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::json_codec;
         import std::reactive::{ Disposable, Signal };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
@@ -224,7 +224,7 @@ fn disposing_a_reactive_client_clears_its_transports_inbound_handler() {
 fn disposing_a_reactive_client_twice_is_harmless() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::json_codec;
         import std::reactive::{ Disposable, Signal };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };

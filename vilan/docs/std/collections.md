@@ -51,8 +51,6 @@ stores the list in a slot that outlives the call, so it copies), which means a
 `push` after `iter()` is not walked, and that `iter()` itself costs a copy:
 
 ```vilan
-import std::print;
-
 fun main() {
 	mut live = [1, 2];
 	mut cursor = live.iter();
@@ -77,8 +75,6 @@ copied when it is stored), and it is why `push` and `sort_by` are written `own`
 a *place*, and a value with no other owner moves in.
 
 ```vilan
-import std::print;
-
 fun main() {
 	let words = ["alpha", "beta", "gamma"];
 	let lengths = words.map(|word| word.len());
@@ -98,8 +94,6 @@ length first. Because the impl is conditional, lists nest
 `List` field can `[derive(PartialEq)]`.
 
 ```vilan
-import std::print;
-
 fun main() {
 	let scores = [40, 91, 65];
 	print(scores.find(|n| n > 50).unwrap_or(0));  // 91
@@ -118,7 +112,7 @@ fun main() {
 `Equal` keep their input order — and both return a new list, as does `reverse`.
 
 ```vilan
-import std::{ print, compare::Ordering };
+import std::{ io::print, compare::Ordering };
 
 fun main() {
 	let ns = [10, 2, 1];
@@ -136,8 +130,6 @@ index, exactly as `list[i]` does — a bad index is a caller bug. Reach for
 `get` when you don't know whether an index is live.
 
 ```vilan
-import std::print;
-
 fun main() {
 	mut xs = [1, 2, 4];
 	xs.insert(2, 3);
@@ -155,7 +147,7 @@ needs, so it is the one `List` method that takes an import — and calling it
 without one names the import in the error.
 
 ```vilan
-import std::{ print, display::Display };
+import std::{ io::print, display::Display };
 
 fun main() {
 	print(["alpha", "beta", "gamma"].join(", "));  // alpha, beta, gamma
@@ -189,7 +181,6 @@ Keys compare **by value**. Scalars work directly, and so does a **backed enum**
 backing value is the key and no derive is needed:
 
 ```vilan
-import std::print;
 import std::map::Map;
 
 enum Align { Start = "flex-start", End = "flex-end" }
@@ -207,7 +198,6 @@ with every other aggregate. A struct, an unbacked or payload-carrying enum, or a
 `List` key works as long as it is `Hashable`. Derive it:
 
 ```vilan
-import std::print;
 import std::map::Map;
 import std::hash::Hashable;
 import std::option::Option::{ self, Some, None };
@@ -238,7 +228,6 @@ walking both together needs no hand-zipping; `contains_value` (needing
 `contains_key`:
 
 ```vilan
-import std::print;
 import std::map::Map;
 
 fun main() {
@@ -280,7 +269,6 @@ iterates the elements in insertion order.
 returning a new `Set` and leaving both receivers untouched:
 
 ```vilan
-import std::print;
 import std::set::Set;
 
 fun main() {
@@ -326,7 +314,6 @@ cannot read the value inside, which is what keeps the representation free to
 change. Equal values hash equal, so `==` on two hashes answers "same key?":
 
 ```vilan
-import std::print;
 import std::hash::Hashable;
 
 [derive(Hashable)]
@@ -360,7 +347,6 @@ range.next(&mut self): Option<i32>
 ```
 
 ```vilan
-import std::print;
 import std::range::Range;
 
 fun main() {
@@ -386,7 +372,6 @@ state — a cursor, a counter, a running total. Implement it on a struct of your
 and the type works in a `for` loop, and satisfies an `I: Iterator<T>` bound:
 
 ```vilan
-import std::print;
 import std::iterator::Iterator;
 import std::option::Option::{ self, Some, None };
 
@@ -426,7 +411,6 @@ empty, your type still iterates — the same `next` you would reach by writing
 `value.next()`:
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 
 trait Countdown<T> {
@@ -511,8 +495,6 @@ runs until something pulls. So a chain makes one pass over the source and builds
 no intermediate lists.
 
 ```vilan
-import std::print;
-
 fun main() {
 	mut pipeline = [1, 2, 3, 4, 5, 6]
 		.iter()
@@ -529,7 +511,6 @@ Laziness is what makes `take` more than a convenience: it never pulls past its
 budget, so it bounds a source that has no end.
 
 ```vilan
-import std::print;
 import std::iterator::Iterator;
 import std::option::Option::{ self, Some, None };
 
@@ -566,8 +547,6 @@ A `for` binding gets the element type the iterator was instantiated at, whatever
 shape it is — a tuple, a struct, another container, a closure:
 
 ```vilan
-import std::print;
-
 struct Point { x: i32, y: i32 }
 
 fun main() {
@@ -606,8 +585,6 @@ which is exactly where an inference-driven `collect` gives up. There is no
 family, never replace it.
 
 ```vilan
-import std::print;
-
 fun main() {
 	let evens = [1, 2, 3, 4, 5, 6].iter().filter(|n| n % 2 == 0).to_list();
 	print(evens.len());                                     // 3
@@ -637,7 +614,6 @@ impl List<(type K: Hashable, type V)>  { fun to_map(self): Map<K, V> }
 ```
 
 ```vilan
-import std::print;
 import std::map::Map;
 import std::set::Set;
 import std::option::Option::{ self, Some, None };

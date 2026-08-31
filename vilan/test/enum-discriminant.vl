@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // A C-like enum: every variant is data-less and has an explicit discriminant, so
 // it lowers to its integer value rather than the `[index]` array form. Variants

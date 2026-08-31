@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // Phase 5: the `borrows` effect is *inferred*. A method that returns a view
 // projecting one of its parameters borrows that parameter automatically — no

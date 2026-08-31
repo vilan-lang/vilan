@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // An unused `let` binding is dropped from codegen — but a side-effecting
 // initializer (here a call that mutates through `&mut`) must still run.

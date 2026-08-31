@@ -193,7 +193,7 @@ fn rpc_round_trips_over_real_http() {
     write(
         &dir,
         "src/main.vl",
-        &r#"import std::print;
+        &r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
@@ -274,7 +274,7 @@ fn realtime_sync_reaches_every_session_over_sse() {
     write(
         &dir,
         "src/main.vl",
-        &r#"import std::print;
+        &r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;
@@ -402,7 +402,7 @@ fn a_closed_connection_tears_its_session_down_and_spares_the_rest() {
     write(
         &server_dir,
         "src/main.vl",
-        &r#"import std::print;
+        &r#"import std::io::print;
 import std::shared::Shared;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
@@ -489,7 +489,7 @@ fun main() {
     // the generated `Client` lives in the server's package.
     let watcher = |name: &str, also_add: &str| {
         format!(
-            r#"import std::print;
+            r#"import std::io::print;
 import std::time::sleep;
 import std::process::exit;
 import std::json::{{ Json, FromJson, json_codec }};
@@ -585,7 +585,7 @@ fn realtime_sync_over_a_true_websocket() {
     write(
         &dir,
         "src/main.vl",
-        &r#"import std::print;
+        &r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;
@@ -716,7 +716,7 @@ fn rpc_and_realtime_multiplex_over_one_socket() {
     write(
         &dir,
         "src/main.vl",
-        &r#"import std::print;
+        &r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;
@@ -859,7 +859,7 @@ fn the_binary_codec_rides_the_socket_end_to_end() {
     write(
         &dir,
         "src/main.vl",
-        &r#"import std::print;
+        &r#"import std::io::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;

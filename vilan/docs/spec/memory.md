@@ -87,8 +87,6 @@ affects `a`, for primitives, structs, enums, tuples, lists, and every
 other value type alike:
 
 ```vilan
-import std::print;
-
 struct Point { x: i32, y: i32 }
 
 fun main() {
@@ -127,8 +125,6 @@ seam at all — it cannot copy (§6.8's R1), so handing one back out of a loan i
 a move out of a loan and is refused, with or without the `&`.
 
 ```vilan
-import std::print;
-
 fun main() {
 	mut xs = [1, 2];
 	mut rows = [xs];        // a copy: the element is not xs's storage
@@ -152,8 +148,6 @@ mutates the storage **in place** — assigning through a **view**, writing a
 a `&mut self` method that does either. None of it is visible through a capture:
 
 ```vilan
-import std::print;
-
 enum Feed { Ready(List<str>, i32), Done }
 
 impl Feed {
@@ -188,8 +182,6 @@ the receiver is right there at the call site — so a write reaching the receive
 reaches the capture's subject by the same reasoning:
 
 ```vilan
-import std::print;
-
 struct Holder { cells: (List<i32>, i32) }
 
 impl Holder {
@@ -458,7 +450,6 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   different names:
 
   ```vilan
-  import std::print;
   import std::drop::Drop;
 
   resource struct Guard { label: str }
@@ -500,7 +491,6 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   or reached through a view.
 
   ```vilan
-  import std::print;
   import std::drop::Drop;
 
   resource struct Guard { label: str }
@@ -934,8 +924,6 @@ moment the pattern matches. A **closure** capture is not a new binding at
 all, so it copies nothing and has no moment to copy at:
 
 ```vilan
-import std::print;
-
 fun main() {
 	mut label = "before";
 	let show = || label;      // captures the binding, not "before"

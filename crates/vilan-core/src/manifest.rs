@@ -2202,7 +2202,7 @@ mod tests {
     // The reserved package names (L12, std-shape.md §4): `std`, `pkg`, and
     // `macro_std` are the import roots the toolchain owns. Before the refusal,
     // a dependency named `std` silently shadowed the whole standard library
-    // (`import std::print` stopped resolving), one named `pkg` was silently
+    // (`import std::io::print` stopped resolving), one named `pkg` was silently
     // unreachable behind the self-package root, and one named `macro_std`
     // shadowed the macro world's std — measured 2026-08-24, the plant these
     // pins were proven red against. `vilan` joined the set 2026-08-26

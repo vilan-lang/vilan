@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::display::{ Display, format };
 
 // `format(value)` renders any `Display` value to its string form, so a complex

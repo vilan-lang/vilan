@@ -139,7 +139,7 @@ fn cancel_aborts_an_in_flight_fetch() {
     write(
         &dir,
         "src/main.vl",
-        &r#"import std::print;
+        &r#"import std::io::print;
 import std::process::exit;
 import std::time::sleep;
 import std::task::nursery;

@@ -33,7 +33,6 @@ in a `common` library both packages depend on instead.
 ```vilan
 import std::ui::{ view, View, render };
 import std::reactive::Signal;
-import std::print;
 
 // The one component both legs build.
 fun app(): View {

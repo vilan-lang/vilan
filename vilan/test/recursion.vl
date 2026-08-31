@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // Codegen emits a function body on demand and memoizes it. A function that calls
 // itself (or a mutually recursive partner) must be recorded as "in progress"

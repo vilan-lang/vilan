@@ -8,8 +8,6 @@
 Types are inferred, and you can annotate when you want to pin one down:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let name = "Ada";
 	mut count = 0;
@@ -45,8 +43,6 @@ The compiler checks every literal against its type's range, so an
 out-of-range literal is a compile error rather than a wrong value.
 
 ```vilan
-import std::print;
-
 fun main() {
 	print(7 / 2);           // 3 — integer division truncates
 	print((3.9).as_i32());  // 3 — conversions are explicit, via as_*
@@ -81,8 +77,6 @@ and the mix won't compile.
 To interpolate, prefix the string with `i`:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let name = "John";
 	print("Hello, {name}!");    // Hello, {name}!  — a plain string
@@ -101,8 +95,6 @@ stripped from every line, so the literal can sit at the indentation of
 the code around it. Prefix it with `i` to get holes as well:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let name = "John";
 	print("""
@@ -142,8 +134,6 @@ the next `"` somewhere below and burying the real mistake.
 apart with a destructuring `let`, or reach one element by position:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let pair = (1, "one");
 	let (number, word) = pair;
@@ -163,8 +153,6 @@ the new tuple, so the type is the two concatenated. Spreads work in any
 position, as many as you like, mixed with ordinary entries:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let pair = (1, 2);
 	let lead = (..pair, 3);       // (i32, i32, i32)
@@ -187,7 +175,6 @@ a spread, and vilan has no range operator for it to be confused with.
 come from std:
 
 ```vilan
-import std::print;
 import std::map::Map;
 import std::set::Set;
 
@@ -221,8 +208,6 @@ and `[i32; 3]` is a different type from `[i32; 4]`. Write `[value; n]`
 to fill `n` slots, or a plain literal under a `[T; n]` annotation:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let buffer = [0; 4];            // [i32; 4] — four zeros
 	mut rgb: [u8; 3] = [255u8, 128u8, 0u8];

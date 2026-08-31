@@ -14,8 +14,6 @@ Put `const` in front of an expression and the compiler evaluates it
 during the build, then writes the *result* into the output as a literal:
 
 ```vilan
-import std::print;
-
 fun squares(): List<i32> {
 	mut result: List<i32> = [];
 	for i in [1, 2, 3, 4] {
@@ -52,8 +50,6 @@ A `release` build also folds ordinary initializers it can work out for
 itself, under the same rules — no keyword needed:
 
 ```vilan
-import std::print;
-
 fun square(n: i32): i32 {
 	n * n
 }
@@ -91,7 +87,6 @@ function that runs at compile time, receives the type it annotates as
 write your own:
 
 ```vilan
-import std::print;
 import std::display::{ Display, format };
 
 macro fun derive_display(item: Item): Source {
@@ -157,8 +152,6 @@ An anonymous macro that expands on the spot. In item position it stamps
 out a family of items; in expression position it folds to a value:
 
 ```vilan
-import std::print;
-
 macro fun labeled(name: str, value: i32): str {
 	i"fun {name}(): i32 \{ {value} \}\n"
 }

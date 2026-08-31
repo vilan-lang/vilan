@@ -10,7 +10,6 @@
 // in `items` like anyone else's would.
 
 import std::display::format;
-import std::print;
 import std::reactive::{ Signal, combine };
 import std::result::Result::{ Err, Ok, self };
 import std::rpc::{ RpcError, SocketTransport };

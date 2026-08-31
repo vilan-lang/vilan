@@ -118,7 +118,6 @@ instead of writing a value. There is one rule about what a variant is
 worth, and the conversions read the same answer the lowering does:
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 
 enum Level { Low = 0, Mid, High }
@@ -408,8 +407,6 @@ expectation), the `ret`s check against that type instead, exactly as a
 declared function's do.
 
 ```vilan
-import std::print;
-
 fun sign(x: i32) {
 	if x > 0 {
 		ret 1;
@@ -588,7 +585,6 @@ Both dispatch through lang-item traits and desugar per expression:
   (flattening). If `v` is bad, the container passes through unchanged.
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 
 fun main() {

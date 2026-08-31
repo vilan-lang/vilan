@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::shared::Shared;
 
 // A generic method that calls other generic methods on `self` — `update` calls

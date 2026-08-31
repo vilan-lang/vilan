@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::option::Option::{ self, Some, None };
 
 // A generic method returning `T` / `Option<T>` resolves `T` from the receiver's

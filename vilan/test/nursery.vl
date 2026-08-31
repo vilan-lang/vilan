@@ -1,7 +1,7 @@
 // Structured concurrency (`std::task::nursery`): every task spawned in the
 // body's dynamic extent — its own, a helper's, and a grandchild spawned by a
 // running child — is joined before `nursery` returns its body's value.
-import std::print;
+import std::io::print;
 import std::task::nursery;
 import std::time::sleep;
 

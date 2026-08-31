@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // Block-scoped imports (backlog H2): `import`/`use` are statements, legal in
 // any block. A binding is visible throughout its enclosing block (like a

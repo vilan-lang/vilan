@@ -74,7 +74,7 @@ fn an_installed_binary_compiles_and_runs_without_a_checkout() {
     let machine = Machine::new("run");
     fs::write(
         machine.root.join("hello.vl"),
-        "import std::print;\n\nfun main() {\n    print(\"hello from an installed vilan\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n    print(\"hello from an installed vilan\");\n}\n",
     )
     .expect("write hello.vl");
 

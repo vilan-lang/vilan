@@ -71,7 +71,7 @@ fn an_exact_case_import_resolves_with_no_diagnostics() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::helper::greet;\n\nfun main() {\n\tprint(greet());\n}\n",
+                "import std::io::print;\nimport pkg::helper::greet;\n\nfun main() {\n\tprint(greet());\n}\n",
             ),
             ("helper.vl", "export fun greet(): str {\n\t\"hello\"\n}\n"),
         ],
@@ -100,7 +100,7 @@ fn a_wrong_case_import_does_not_resolve_on_a_case_sensitive_filesystem() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::Helper::greet;\n\nfun main() {\n\tprint(greet());\n}\n",
+                "import std::io::print;\nimport pkg::Helper::greet;\n\nfun main() {\n\tprint(greet());\n}\n",
             ),
             ("helper.vl", "export fun greet(): str {\n\t\"hello\"\n}\n"),
         ],
@@ -134,7 +134,7 @@ fn an_exact_case_entry_builds_with_no_diagnostics() {
         &root,
         &[(
             "main.vl",
-            "import std::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n",
+            "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n",
         )],
     );
 
@@ -207,7 +207,7 @@ fn a_package_under_a_non_utf8_directory_resolves_its_own_modules() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::helper::greet;\n\nfun main() {\n\tprint(greet());\n}\n",
+                "import std::io::print;\nimport pkg::helper::greet;\n\nfun main() {\n\tprint(greet());\n}\n",
             ),
             ("helper.vl", "export fun greet(): str {\n\t\"hello\"\n}\n"),
         ],
@@ -250,9 +250,14 @@ fn a_std_root_that_is_not_utf8_still_loads_and_still_steers() {
         .expect("symlink macro_std beside it");
 
     let package = root.join("app");
+    // A name NO prelude carries, so the steer is what is under test: `print`
+    // used to serve here and is now ambient, which compiled the fixture clean.
     write_package(
         &package,
-        &[("main.vl", "fun main() {\n\tprint(\"hi\");\n}\n")],
+        &[(
+            "main.vl",
+            "fun main() {\n\tlet m: Map<str, i32> = Map::new();\n}\n",
+        )],
     );
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .current_dir(&package)
@@ -263,14 +268,14 @@ fn a_std_root_that_is_not_utf8_still_loads_and_still_steers() {
         .expect("run vilan");
     let text = combined(&output);
     assert!(
-        text.contains("import std::io::print;"),
+        text.contains("import std::map::Map;"),
         "the import steer must survive a non-UTF-8 std path: {text}"
     );
 
     // And a program that DOES import it compiles through the same root.
     std::fs::write(
         package.join("main.vl"),
-        "import std::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n",
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))

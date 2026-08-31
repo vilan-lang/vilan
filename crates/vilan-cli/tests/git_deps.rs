@@ -184,7 +184,7 @@ fn application(dir: &Path, declaration: &str) {
     write(
         dir,
         "src/main.vl",
-        "import std::print;\nimport shapes::greeting;\n\nfun main() {\n\tprint(greeting())\n}\n",
+        "import std::io::print;\nimport shapes::greeting;\n\nfun main() {\n\tprint(greeting())\n}\n",
     );
 }
 
@@ -578,7 +578,7 @@ fn a_test_file_resolves_a_git_dependency_by_fetching_it() {
     write(
         &app,
         "src/greeting_test.vl",
-        "import std::assert;\nimport shapes::greeting;\n\nfun main() {\n\t\
+        "import std::io::assert;\nimport shapes::greeting;\n\nfun main() {\n\t\
          assert(greeting() == \"hello from v1\", \"the git dependency resolves\");\n}\n",
     );
 

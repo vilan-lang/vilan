@@ -17,7 +17,7 @@ use crate::support::*;
 fn a_struct_literal_is_a_left_operand() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Point {
@@ -38,7 +38,7 @@ fn a_struct_literal_is_a_left_operand() {
 fn a_struct_literal_is_a_right_operand() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Point {
@@ -60,7 +60,7 @@ fn a_struct_literal_folds_a_field_access() {
     // The old dedicated literal member-fold, now the general postfix chain.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point {
             x: i32,
@@ -79,7 +79,7 @@ fn a_struct_literal_folds_a_field_access() {
 fn a_struct_literal_folds_a_method_call() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point {
             x: i32,
@@ -104,7 +104,7 @@ fn a_struct_literal_folds_a_method_call() {
 fn a_struct_literal_operand_composes_with_logical_operators() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Point {
@@ -125,7 +125,7 @@ fn a_struct_literal_operand_composes_with_logical_operators() {
 fn a_generic_struct_literal_is_an_operand() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Holder<T> {
@@ -145,7 +145,7 @@ fn a_generic_struct_literal_is_an_operand() {
 fn a_parenthesized_struct_literal_serves_in_a_condition() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Point {
@@ -275,7 +275,7 @@ fn a_bare_type_parameter_is_not_a_value() {
     // Inside an instantiated generic, `T` names a type, not a runtime value.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun identity<T>(x: T): T {
             let q = T;
@@ -344,7 +344,7 @@ fn an_unparenthesized_struct_literal_condition_is_rejected_not_misparsed() {
     // rejects `Point` as a value, so it's a clear error, not a runtime trap.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Point {
@@ -368,7 +368,7 @@ fn an_unparenthesized_struct_literal_condition_is_rejected_not_misparsed() {
 fn an_enum_variant_and_struct_literal_stay_values() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Color {
             Red,
@@ -397,7 +397,7 @@ fn a_bare_function_name_stays_a_value() {
     // closure parameter) is not rejected — only type-like names are.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun apply(f: |i32| i32, x: i32): i32 {
             f(x)
@@ -425,7 +425,7 @@ fn a_bare_function_name_stays_a_value() {
 fn from_json_decodes_a_valid_scalar() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
         fun main() {
@@ -440,7 +440,7 @@ fn from_json_decodes_a_valid_scalar() {
 fn from_json_rejects_a_wrong_typed_scalar() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
         fun main() {
@@ -455,7 +455,7 @@ fn from_json_rejects_a_wrong_typed_scalar() {
 fn from_json_rejects_malformed_text() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
         fun main() {
@@ -470,7 +470,7 @@ fn from_json_rejects_malformed_text() {
 fn from_json_names_a_missing_struct_field() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::FromJson;
         import std::result::Result::{ self, Ok, Err };
 
@@ -495,7 +495,7 @@ fn from_json_names_a_missing_struct_field() {
 fn from_json_rejects_a_wrong_typed_struct_field() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::FromJson;
         import std::result::Result::{ self, Ok, Err };
 
@@ -517,7 +517,7 @@ fn from_json_rejects_a_wrong_typed_struct_field() {
 fn from_json_ignores_extra_struct_fields() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::FromJson;
         import std::result::Result::{ self, Ok, Err };
 
@@ -539,7 +539,7 @@ fn from_json_ignores_extra_struct_fields() {
 fn from_json_recurses_into_a_nested_struct() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::FromJson;
         import std::result::Result::{ self, Ok, Err };
 
@@ -567,7 +567,7 @@ fn from_json_recurses_into_a_nested_struct() {
 fn from_json_reads_option_null_and_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
 
@@ -586,7 +586,7 @@ fn from_json_reads_option_null_and_value() {
 fn from_json_rejects_a_non_array_for_a_list() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
         fun main() {
@@ -602,7 +602,7 @@ fn from_json_rejects_a_non_array_for_a_list() {
 fn from_json_short_circuits_on_a_bad_list_element() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
 
         fun main() {
@@ -620,7 +620,7 @@ fn from_json_short_circuits_on_a_bad_list_element() {
 fn from_json_rejects_an_unknown_enum_variant() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::FromJson;
         import std::result::Result::{ self, Ok, Err };
 
@@ -642,7 +642,7 @@ fn from_json_rejects_an_unknown_enum_variant() {
 fn from_json_round_trips_a_derived_enum() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::FromJson;
         import std::result::Result::{ self, Ok, Err };
 
@@ -671,7 +671,7 @@ fn from_json_round_trips_a_derived_enum() {
 fn a_derived_struct_key_maps_by_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::Hashable;
         import std::option::Option::{ self, Some, None };
@@ -698,7 +698,7 @@ fn a_derived_struct_key_maps_by_value() {
 fn a_set_dedups_struct_elements_by_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
 
@@ -722,7 +722,7 @@ fn a_set_dedups_struct_elements_by_value() {
 fn a_derived_enum_is_a_valid_key() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
 
@@ -748,7 +748,7 @@ fn a_custom_hashable_impl_is_honored_by_map() {
     // inside the std Map, so two values that hash equal collide.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::{ Hashable, Hash };
 
@@ -774,7 +774,7 @@ fn a_custom_hashable_impl_is_honored_by_map() {
 fn a_list_is_a_valid_key() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::Hashable;
         import std::option::Option::{ self, Some, None };
@@ -796,7 +796,7 @@ fn a_list_is_a_valid_key() {
 fn map_keys_and_set_iteration_return_real_values() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::set::Set;
         import std::hash::Hashable;
@@ -839,7 +839,7 @@ fn an_aggregate_key_is_snapshot_on_insert() {
     // afterward can't desync it (§3.6).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::Hashable;
         import std::option::Option::{ self, Some, None };
@@ -863,7 +863,7 @@ fn hashable_builds_a_reusable_container() {
     // container on `K: Hashable`, calls `key.hash()`, and keys a `Map<Hash, ..>`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::{ Hashable, Hash };
         import std::option::Option::{ self, Some, None };
@@ -917,7 +917,7 @@ fn b110_two_hashes_compare_with_partial_eq() {
     // reported "type 'Hash' does not implement the `PartialEq` operator".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::hash::Hashable;
 
         [derive(Hashable)]
@@ -948,7 +948,7 @@ fn b110_hash_equality_does_not_recurse_into_its_own_impl() {
     // reaches the body directly, so it is the arm the operator lowering skips.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
         import std::hash::Hashable;
 
@@ -969,7 +969,7 @@ fn b110_hash_satisfies_a_partial_eq_bound() {
     // user code. `Option<Hash>` is the conditional impl; `same` is the bound.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
         import std::hash::{ Hashable, Hash };
         import std::option::Option::{ self, Some, None };
@@ -999,7 +999,7 @@ fn b110_hash_is_still_not_ordered_or_arithmetic() {
     // strings lexicographically.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::hash::Hashable;
 
         fun main() {
@@ -1021,7 +1021,7 @@ fn a_scalar_view_read_as_a_value_is_rejected() {
     // `print(b)` for `let b = &mut a[0]` would leak `[[99],0]`.
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [99];
             let b = &mut a[0];
@@ -1049,7 +1049,7 @@ fn a_scalar_view_as_a_value_parameter_is_rejected() {
 fn a_scalar_view_as_a_binary_operand_is_rejected() {
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [99];
             let b = &mut a[0];
@@ -1064,7 +1064,7 @@ fn an_explicit_deref_reads_the_scalar_view() {
     // The fix steers to `*b`, which reads the element.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [99];
             let b = &mut a[0];
@@ -1082,7 +1082,7 @@ fn a_scalar_view_passes_to_a_view_parameter() {
     // compound write-through — neither is a value read.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(v: &mut i32) { v = *v + 1; }
         fun main() {
             mut a = [99];
@@ -1102,7 +1102,7 @@ fn a_mut_bool_view_writes_through() {
     // (`Object.assign`) — a no-op write. It's a scalar `(base, key)` view now.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun set_true(v: &mut bool) { v = true; }
         fun main() {
             mut flags = [false, false];
@@ -1125,7 +1125,7 @@ fn a_mut_bool_view_toggles_through_a_negated_deref() {
     // an ergonomic toggle. Now it reads through (`*v`), negates, and writes back.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun toggle(v: &mut bool) { v = !*v; }
         fun main() {
             mut flags = [true, false];
@@ -1149,7 +1149,7 @@ fn a_mut_bool_view_of_a_scalar_local_writes_through() {
     // pins used list elements (base already an object), so they missed it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun toggle(v: &mut bool) { v = !*v; }
         fun main() {
             mut b = true;
@@ -1175,7 +1175,7 @@ fn a_mut_view_through_a_generic_param_writes_through_for_every_scalar() {
     // struct and the bool enum) so the analyzer and transformer can't drift again.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun set<T>(v: &mut T, x: T) { v = x; }
         fun main() {
             mut n = 1;
@@ -1202,7 +1202,7 @@ fn fixed_array_repeat_literal_and_indexing() {
     // `[value; n]` builds a fixed array; scalar values fill, and indexing reads.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let zeros = [0; 4];        // [i32; 4]
             print(zeros[0]);           // 0
@@ -1222,7 +1222,7 @@ fn fixed_array_repeat_of_an_aggregate_copies_each_slot() {
     // are independent (value semantics) — mutating one leaves the others.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Cell { n: i32 }
         fun main() {
             mut cells = [Cell { n = 7 }; 3];
@@ -1242,7 +1242,7 @@ fn fixed_array_value_copy_is_independent() {
     // leaves `b` untouched.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a: [i32; 3] = [1, 2, 3];
             let b = a;
@@ -1260,7 +1260,7 @@ fn fixed_array_element_view_writes_through() {
     // `&mut arr[i]` is an element view — writing through it reaches the array.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(v: &mut i32) { v += 100; }
         fun main() {
             mut buf: [i32; 3] = [1, 2, 3];
@@ -1279,7 +1279,7 @@ fn fixed_array_iteration_params_returns_and_nesting() {
     // and `[[T; m]; n]` nests.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun total(a: [i32; 3]): i32 {
             mut sum = 0;
             for x in a { sum = sum + x; }
@@ -1390,7 +1390,7 @@ fn a_mixed_literal_under_a_list_of_any_parameter_is_legitimate() {
     // mismatch — the check consults the `List<T>` expectation before reporting.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun describe(values: List<any>): i32 {
             values.len()
         }
@@ -1424,7 +1424,7 @@ fn an_array_annotation_catches_elements_that_unify_with_each_other() {
 fn fixed_array_destructuring_binds_elements() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let rgb: [i32; 3] = [255, 128, 0];
             let [r, g, b] = rgb;
@@ -1441,7 +1441,7 @@ fn fixed_array_destructuring_nests_and_copies() {
     // value semantics: the destructured copies are independent of the source.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut source: [[i32; 2]; 2] = [[1, 2], [3, 4]];
             let [first, second] = source;
@@ -1464,7 +1464,7 @@ fn fixed_array_destructuring_of_aggregate_elements_is_a_copy() {
     // binding leaves the source array's element unchanged.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Cell { n: i32 }
         fun main() {
             let cells: [Cell; 2] = [Cell { n = 1 }, Cell { n = 2 }];
@@ -1486,7 +1486,7 @@ fn fixed_array_destructuring_in_parameter_position() {
     // indexed element read).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun sum([a, b]: [i32; 2]): i32 { a + b }
         fun main() {
             print(sum([40, 2]));   // 42
@@ -1536,7 +1536,7 @@ fn fixed_array_len_folds_to_the_constant_and_types_as_i32() {
     // so it participates in arithmetic and satisfies an `i32` annotation.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let a = [0; 4];
             let n: i32 = a.len();
@@ -1555,7 +1555,7 @@ fn fixed_array_len_on_nested_arrays_and_through_a_view() {
     // view binder (views type transparently).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let grid: [[i32; 2]; 3] = [[1, 2], [3, 4], [5, 6]];
             print(grid.len());      // 3
@@ -1576,7 +1576,7 @@ fn fixed_array_len_evaluates_a_side_effectful_subject_once() {
     // rather than folding the subject away).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(log: &mut List<i32>): [i32; 2] {
             log.push(7);
             [5; 2]
@@ -1626,7 +1626,7 @@ fn an_unused_repeat_of_a_side_effectful_value_still_runs() {
     // effect must land (`expr_has_side_effects` recurses into the repeat).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(log: &mut List<i32>): i32 {
             log.push(1);
             0
@@ -1715,7 +1715,7 @@ fn a_bare_pub_identifier_is_still_an_ordinary_name() {
     // stands immediately before a fresh statement or item.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pub = 1;
             print(pub);
@@ -1730,7 +1730,7 @@ fn a_bare_pub_identifier_is_still_an_ordinary_name() {
 fn let_mut_names_the_two_binding_forms() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let mut x = 1;
             x = 2;
@@ -1758,7 +1758,7 @@ fn let_mut_no_longer_reports_the_let_as_a_non_statement() {
 fn a_literal_brace_in_an_istring_names_the_escape() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(i"body { color: red }");
         }
@@ -1774,7 +1774,7 @@ fn an_empty_brace_pair_in_an_istring_names_the_escape_too() {
     // nobody wrote.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(i"a{}b");
         }
@@ -1789,7 +1789,7 @@ fn an_escaped_brace_in_an_istring_still_prints_the_brace() {
     // real hole beside it still interpolates.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let n = 42;
             print(i"n = {n} and \{literal\}");
@@ -1903,7 +1903,7 @@ fn a_non_tuple_argument_names_the_tuple_bound() {
 fn a_satisfying_tuple_passes_its_arity_bound() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun arity_ok<T: (2..)>(items: T): i32 {
             42
         }
@@ -2037,7 +2037,7 @@ fn a_struct_construction_checks_its_tuple_bound() {
 fn a_spread_call_collects_its_arguments_into_the_pack() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun middle(...items: (i32, i32, i32)): i32 {
             items.1
         }
@@ -2056,7 +2056,7 @@ fn a_spread_call_collects_its_arguments_into_the_pack() {
 fn a_spread_parameter_accepts_every_arity_its_bound_admits() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun width<T: (..)>(...items: T): i32 {
             1
         }
@@ -2076,7 +2076,7 @@ fn a_spread_parameter_accepts_every_arity_its_bound_admits() {
 #[test]
 fn the_empty_and_one_element_packs_emit_their_tuples() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun width<T: (..)>(...items: T): i32 {
             1
         }
@@ -2094,7 +2094,7 @@ fn the_empty_and_one_element_packs_emit_their_tuples() {
 fn a_spread_follows_the_fixed_parameters() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun after<T: (..)>(head: i32, ...rest: T): i32 {
             head
         }
@@ -2187,7 +2187,7 @@ fn a_spread_pack_unifies_its_elements_against_the_element_bound() {
 fn conforming_elements_pass_a_spread_element_bound() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Label {
             fun label(self): str;
         }
@@ -2215,7 +2215,7 @@ fn conforming_elements_pass_a_spread_element_bound() {
 fn a_mapped_spread_pack_inverts_to_its_source_tuple() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {
             let snapshot = || (source in sources => source.get());
@@ -2246,7 +2246,7 @@ fn a_mapped_spread_pack_inverts_to_its_source_tuple() {
 fn a_spread_call_emits_the_flat_tuple_construction() {
     assert_emits_containing(
         r#"
-        import std::print;
+        import std::io::print;
         fun width<T: (..)>(...items: T): i32 {
             1
         }
@@ -2265,7 +2265,7 @@ fn a_spread_call_emits_the_flat_tuple_construction() {
 fn a_spread_parameter_may_be_declared_mut() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun rebind<T: (..)>(mut items: T, n: i32): i32 {
             n
         }
@@ -2288,7 +2288,7 @@ fn a_spread_parameter_may_be_declared_mut() {
 fn a_spread_function_passed_as_a_value_has_the_tuple_form() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun count(...items: (i32, i32)): i32 {
             items.0
         }
@@ -2492,7 +2492,7 @@ fn an_inherent_method_refuses_a_spread_parameter() {
 fn a_function_nested_in_a_member_body_still_takes_a_spread() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point {
             x: i32,
         }
@@ -2531,7 +2531,7 @@ fn an_external_fun_refuses_a_spread_parameter() {
 fn spreading_a_tuple_at_the_call_site_forwards_the_pack() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun pair_up<T: (2..)>(...items: T): i32 {
             1
         }
@@ -2551,7 +2551,7 @@ fn spreading_a_tuple_at_the_call_site_forwards_the_pack() {
 fn a_pack_forwards_to_a_tuple_parameter() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun inner(items: (i32, i32)): i32 {
             items.0
         }
@@ -2574,7 +2574,7 @@ fn a_pack_forwards_to_a_tuple_parameter() {
 fn unannotated_closures_in_a_pack_type_from_their_slots() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun apply_both(...items: (|i32| i32, |i32| i32)): i32 {
             items.0(1) + items.1(2)
         }
@@ -2592,7 +2592,7 @@ fn unannotated_closures_in_a_pack_type_from_their_slots() {
 fn a_spread_call_inside_a_generic_collects_per_instantiation() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun width<T: (..)>(...items: T): i32 {
             1
         }
@@ -2687,7 +2687,7 @@ fn a_comprehension_over_a_bare_pack_still_needs_a_mapped_source() {
 fn a_spread_concatenates_its_operands_elements() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = (1, 2);
             let lead = (..pair, 3);
@@ -2711,7 +2711,7 @@ fn a_spread_concatenates_its_operands_elements() {
 fn a_spread_emits_the_flat_tuple_construction() {
     assert_emits_containing(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let inner = (10, 11);
             let flat = (..inner, 12);
@@ -2728,7 +2728,7 @@ fn a_spread_emits_the_flat_tuple_construction() {
 #[test]
 fn a_spread_and_a_nested_element_emit_the_same_construction() {
     let nested = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let inner = (10, 11);
             let nested = (inner, 12);
@@ -2746,7 +2746,7 @@ fn a_spread_and_a_nested_element_emit_the_same_construction() {
 fn a_lone_spread_is_a_construction_not_a_group() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = (1, 2);
             let copy = (..pair);
@@ -2765,7 +2765,7 @@ fn a_lone_spread_is_a_construction_not_a_group() {
 fn an_empty_tuple_spreads_to_nothing() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun pack<T: (..)>(...items: T): T {
             items
         }
@@ -2784,7 +2784,7 @@ fn an_empty_tuple_spreads_to_nothing() {
 fn spreading_a_non_tuple_is_refused_naming_the_type() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let n = 5;
             let t = (..n, 1);
@@ -2803,7 +2803,7 @@ fn spreading_a_non_tuple_is_refused_naming_the_type() {
 fn concatenation_does_not_deep_flatten() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let inner = (1, 2);
             let outer = (inner, 3);
@@ -2824,7 +2824,7 @@ fn concatenation_does_not_deep_flatten() {
 fn an_annotation_reaches_the_entries_after_a_spread() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = (1, 2);
             let t: (i32, i32, |i32| i32) = (..pair, |n| n + 1);
@@ -2840,7 +2840,7 @@ fn an_annotation_reaches_the_entries_after_a_spread() {
 fn a_concatenation_destructures() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = (1, 2);
             let (a, b, c) = (..pair, 3);
@@ -2859,7 +2859,7 @@ fn a_concatenation_destructures() {
 fn a_spread_of_a_call_result_still_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): (i32, i32) {
             (4, 5)
         }
@@ -2879,7 +2879,7 @@ fn a_spread_of_a_call_result_still_splices() {
 fn a_spread_of_a_conditional_still_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let t = (..if true { (1, 2) } else { (3, 4) }, 9);
             print(t.2);
@@ -2895,7 +2895,7 @@ fn a_spread_of_a_conditional_still_splices() {
 fn a_spread_call_site_mixes_spreads_and_ordinary_arguments() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun pack<T: (..)>(...items: T): T {
             items
         }
@@ -2915,7 +2915,7 @@ fn a_spread_call_site_mixes_spreads_and_ordinary_arguments() {
 fn a_spread_argument_is_bound_checked_on_the_concatenation() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun need3<T: (3..)>(...items: T): i32 {
             1
         }
@@ -2934,7 +2934,7 @@ fn a_spread_argument_is_bound_checked_on_the_concatenation() {
 fn a_spread_at_a_non_spread_call_is_refused_with_the_tuple_form() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun forward(items: (i32, i32)): i32 {
             items.0
         }
@@ -2954,7 +2954,7 @@ fn a_spread_at_a_non_spread_call_is_refused_with_the_tuple_form() {
 fn a_spread_at_a_closure_call_is_refused_too() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let f = |items: (i32, i32)| items.0;
             let pair = (1, 2);
@@ -2973,7 +2973,7 @@ fn a_spread_at_a_closure_call_is_refused_too() {
 fn an_abstract_pack_may_be_spread_alone() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun inner<U: (..)>(...xs: U): i32 {
             1
         }
@@ -3017,7 +3017,7 @@ fn an_abstract_pack_may_not_be_concatenated_with_anything() {
 fn a_mapped_pack_spreads_like_any_tuple() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): i32 {
             1
@@ -3040,7 +3040,7 @@ fn a_mapped_pack_spreads_like_any_tuple() {
 fn three_dots_in_a_value_position_steers_to_two() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = (1, 2);
             let t = (...pair, 3);
@@ -3069,7 +3069,7 @@ fn three_dots_in_a_value_position_steers_to_two() {
 fn a_nested_tuple_element_that_is_a_call_should_still_splice() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): (i32, i32) {
             (4, 5)
         }
@@ -3088,7 +3088,7 @@ fn a_nested_tuple_element_that_is_a_call_should_still_splice() {
 fn a_nested_tuple_element_that_is_a_conditional_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pick = true;
             let n = (if pick { (4, 5) } else { (7, 8) }, 6);
@@ -3105,7 +3105,7 @@ fn a_nested_tuple_element_that_is_a_conditional_splices() {
 fn a_nested_tuple_element_that_is_an_else_if_chain_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let k = 2;
             let n = (if k == 1 { (4, 5) } else if k == 2 { (7, 8) } else { (9, 9) }, 6);
@@ -3122,7 +3122,7 @@ fn a_nested_tuple_element_that_is_an_else_if_chain_splices() {
 fn a_nested_tuple_element_that_is_a_block_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let n = ({ let inner = (4, 5); inner }, 6);
             print(n.1);
@@ -3138,7 +3138,7 @@ fn a_nested_tuple_element_that_is_a_block_splices() {
 fn a_nested_tuple_element_that_is_a_method_call_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Maker { seed: i32 }
         impl Maker {
             fun pair(self): (i32, i32) { (4, 5) }
@@ -3159,7 +3159,7 @@ fn a_nested_tuple_element_that_is_a_method_call_splices() {
 fn a_nested_tuple_element_that_is_a_static_call_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Maker { seed: i32 }
         impl Maker {
             fun pair(): (i32, i32) { (4, 5) }
@@ -3179,7 +3179,7 @@ fn a_nested_tuple_element_that_is_a_static_call_splices() {
 fn a_nested_tuple_element_that_is_a_closure_call_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let make = || (4, 5);
             let n = (make(), 6);
@@ -3196,7 +3196,7 @@ fn a_nested_tuple_element_that_is_a_closure_call_splices() {
 fn a_nested_tuple_element_that_is_an_await_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         async fun make(): (i32, i32) {
             (4, 5)
         }
@@ -3215,7 +3215,7 @@ fn a_nested_tuple_element_that_is_an_await_splices() {
 fn a_nested_tuple_element_that_is_a_dereference_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = (4, 5);
             let view = &pair;
@@ -3235,7 +3235,7 @@ fn a_nested_tuple_element_that_is_a_dereference_splices() {
 fn a_nested_tuple_element_that_is_a_parameter_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun wrap(pair: (i32, i32)): i32 {
             let n = (pair, 6);
             n.1
@@ -3254,7 +3254,7 @@ fn a_nested_tuple_element_that_is_a_parameter_splices() {
 fn a_nested_tuple_element_that_is_a_const_call_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): (i32, i32) {
             (4, 5)
         }
@@ -3275,7 +3275,7 @@ fn a_nested_tuple_element_that_is_a_const_call_splices() {
 fn the_tuple_element_forms_that_already_stored_a_type_still_splice() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun main() {
             let k = 1;
@@ -3299,7 +3299,7 @@ fn the_tuple_element_forms_that_already_stored_a_type_still_splice() {
 fn a_construction_mixing_every_element_form_reads_at_every_offset() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): (i32, i32) {
             (1, 2)
         }
@@ -3324,7 +3324,7 @@ fn a_construction_mixing_every_element_form_reads_at_every_offset() {
 fn a_call_valued_element_of_a_nested_construction_splices() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): (i32, i32) {
             (1, 2)
         }
@@ -3346,7 +3346,7 @@ fn a_call_valued_element_of_a_nested_construction_splices() {
 fn a_construction_holding_a_spread_and_a_call_element_splices_both() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): (i32, i32) {
             (3, 4)
         }
@@ -3374,7 +3374,7 @@ fn a_construction_holding_a_spread_and_a_call_element_splices_both() {
 fn a_generic_valued_tuple_element_stays_nested_so_its_offsets_hold() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun wrap<T>(value: T, tail: i32): i32 {
             let n = (value, tail);
             n.1
@@ -3402,7 +3402,7 @@ fn a_generic_valued_tuple_element_stays_nested_so_its_offsets_hold() {
 fn an_annotated_binding_rejects_a_tuple_of_the_wrong_arity() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let t: (i32, str, bool) = (1, "x");
             print(t.0);
@@ -3417,7 +3417,7 @@ fn an_annotated_binding_rejects_a_tuple_of_the_wrong_arity() {
 fn an_argument_rejects_a_tuple_of_the_wrong_arity() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun need(t: (i32, str, bool)) {
             print(t.0);
         }
@@ -3434,7 +3434,7 @@ fn an_argument_rejects_a_tuple_of_the_wrong_arity() {
 fn a_return_rejects_a_tuple_of_the_wrong_arity() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): (i32, str, bool) {
             (1, "x")
         }
@@ -3451,7 +3451,7 @@ fn a_return_rejects_a_tuple_of_the_wrong_arity() {
 fn an_assignment_rejects_a_tuple_of_the_wrong_arity() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut t = (1, 2);
             t = (1, 2, 3);
@@ -3467,7 +3467,7 @@ fn an_assignment_rejects_a_tuple_of_the_wrong_arity() {
 fn match_legs_reject_tuples_of_different_arities() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let k = 1;
             let t = match k { 1 => (1, 2), _ => (1, 2, 3) };
@@ -3483,7 +3483,7 @@ fn match_legs_reject_tuples_of_different_arities() {
 fn a_list_literal_rejects_tuples_of_different_arities() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let xs = [(1, 2), (1, 2, 3)];
             print(xs.len());
@@ -3500,7 +3500,7 @@ fn a_list_literal_rejects_tuples_of_different_arities() {
 fn one_generic_bound_from_two_arguments_rejects_tuples_of_different_arities() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun pick<T>(a: T, b: T): T {
             a
         }
@@ -3520,7 +3520,7 @@ fn one_generic_bound_from_two_arguments_rejects_tuples_of_different_arities() {
 fn a_conformance_return_rejects_a_tuple_of_the_wrong_arity() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         trait Pairs {
             fun make(self): (i32, i32);
         }
@@ -3543,7 +3543,7 @@ fn a_conformance_return_rejects_a_tuple_of_the_wrong_arity() {
 fn a_conformance_parameter_rejects_a_tuple_of_the_wrong_arity() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         trait Takes {
             fun take(self, p: (i32, i32)): i32;
         }
@@ -3566,7 +3566,7 @@ fn a_conformance_parameter_rejects_a_tuple_of_the_wrong_arity() {
 fn tuples_of_the_same_arity_still_reconcile() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun pick<T>(a: T, b: T): T {
             b
         }
@@ -3596,7 +3596,7 @@ fn a_nested_fun_inside_an_impl_method_emits_once() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             struct S { n: i32 }
             impl S {
                 fun run(self): i32 {
@@ -3623,7 +3623,7 @@ fn a_nested_fun_inside_a_free_function_emits_once() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun run(n: i32): i32 {
                 fun helper(x: i32): i32 { x + 4242 }
                 helper(n)
@@ -3645,7 +3645,7 @@ fn two_nested_funs_each_emit_once() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun run(n: i32): i32 {
                 fun first(x: i32): i32 { x + 4242 }
                 fun second(x: i32): i32 { first(x) + 1 }
@@ -3669,7 +3669,7 @@ fn an_uncalled_nested_fun_emits_nothing() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun run(n: i32): i32 {
                 fun helper(x: i32): i32 { x + 4242 }
                 n
@@ -3691,7 +3691,7 @@ fn an_uncalled_nested_fun_emits_nothing() {
 fn a_nested_fun_shadowing_a_module_level_one_keeps_both_calls_right() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun helper(x: i32): i32 { x + 100 }
         fun run(n: i32): i32 {
             fun helper(x: i32): i32 { x + 1 }
@@ -3715,7 +3715,7 @@ fn a_nested_fun_shadowing_a_module_level_one_keeps_both_calls_right() {
 fn an_unannotated_binding_adopts_its_async_closure() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun main() {
             let f = || {
@@ -3733,7 +3733,7 @@ fn an_unannotated_binding_adopts_its_async_closure() {
 fn a_mut_rebind_adopts_asyncness() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun main() {
             mut f = || 1;
@@ -3752,7 +3752,7 @@ fn a_mut_rebind_adopts_asyncness() {
 fn an_async_field_call_awaits() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         struct Holder {
             handler: async || i32,
@@ -3775,7 +3775,7 @@ fn an_async_field_call_awaits() {
 fn an_async_returning_call_awaits_directly_and_through_a_binding() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun make(): async || i32 {
             || {
@@ -3857,7 +3857,7 @@ fn a_plain_declared_return_of_an_async_closure_is_refused() {
 fn a_void_async_closure_into_a_plain_void_field_stays_legal() {
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         struct Plain {
             run: || ,
@@ -3950,7 +3950,7 @@ fn a_true_method_miss_keeps_the_bare_message() {
 fn a_sync_parameter_accepts_a_sync_closure_and_runs() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun run_now(body: sync || i32): i32 {
             body()
         }
@@ -3998,7 +3998,7 @@ fn a_stray_sync_marker_is_rejected() {
 fn sync_stays_a_legal_name() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct sync {
             n: i32,
         }
@@ -4011,7 +4011,7 @@ fn sync_stays_a_legal_name() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let sync = 9;
             print(sync);
@@ -4032,7 +4032,7 @@ fn an_async_closure_adapts_map_and_runs_sequentially() {
     // contract), and the mapped values are settled — not promises.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun main() {
             let urls = ["ab", "cdef"];
@@ -4053,7 +4053,7 @@ fn an_async_closure_adapts_map_and_runs_sequentially() {
 fn a_non_generic_function_adapts() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun run(f: || i32): i32 {
             f() + 100
@@ -4076,7 +4076,7 @@ fn adaptation_rides_through_a_forwarding_helper() {
     // map both instantiate adapted, and the caller awaits the chain.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun helper(urls: List<str>, f: |str| i32): List<i32> {
             urls.map(f)
@@ -4143,7 +4143,7 @@ fn an_async_closure_into_an_extern_callback_is_refused() {
 #[test]
 fn e68_an_uncovered_effect_reports_only_the_coverage_primary() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
 
         fun main() {
@@ -4164,7 +4164,7 @@ fn e68_an_uncovered_effect_reports_only_the_coverage_primary() {
 #[test]
 fn e68_a_refused_run_shape_reports_only_the_context_primaries() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
 
         fun main() {
@@ -4243,7 +4243,7 @@ fn adaptation_cannot_ride_a_trait_dispatch() {
 fn a_module_initializer_cannot_adapt_await() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         let ids = ["ab"].map(|s| {
             sleep(1);
@@ -4265,7 +4265,7 @@ fn a_module_initializer_cannot_adapt_await() {
 fn a_spawn_types_as_task_and_await_unwraps_it() {
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
         fun label(): str { "ready" }
         fun main() {
@@ -4300,7 +4300,7 @@ fn spawn_typing_falls_back_to_promise_without_std_task() {
     // keeps the old `Promise<T>` spawn typing (an older std has no task.vl).
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::promise::Promise;
         fun label(): str { "ready" }
         fun main() {
@@ -4317,7 +4317,7 @@ fn a_raw_host_promise_still_types_and_awaits() {
     // and `await` unwraps it exactly like a task.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::promise::Promise;
         import std::task::Task;
         [extern(new, "Promise")]
@@ -4335,7 +4335,7 @@ fn a_raw_host_promise_still_types_and_awaits() {
 fn settle_all_preserves_order() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::Task;
         fun delayed(label: str, ms: i32): str {
@@ -4363,7 +4363,7 @@ fn a_task_is_a_handle_copies_observe_the_same_run() {
     // both copies observe its (single) result.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun work(): i32 {
             sleep(1);
@@ -4389,7 +4389,7 @@ fn an_unobserved_task_failure_reports_and_the_program_continues() {
     // to completion with exit 0.
     match compile_and_run_capturing_stderr(
         r#"
-        import std::print;
+        import std::io::print;
         import std::io::panic;
         import std::time::sleep;
         fun doomed(): i32 {
@@ -4419,7 +4419,7 @@ fn a_promptly_awaited_failure_delivers_without_a_report() {
     // no unobserved-failure report fires for an observed task.
     match compile_and_run(
         r#"
-        import std::print;
+        import std::io::print;
         import std::io::panic;
         fun doomed(): i32 {
             panic("boom")
@@ -4448,7 +4448,7 @@ fn a_late_await_still_receives_an_absorbed_failure() {
     // awaiting the task delivers the original failure.
     match compile_and_run(
         r#"
-        import std::print;
+        import std::io::print;
         import std::io::panic;
         import std::time::sleep;
         fun doomed(): i32 {
@@ -4477,7 +4477,7 @@ fn a_late_await_still_receives_an_absorbed_failure() {
 fn nursery_returns_its_body_value_after_joining() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         fun main() {
@@ -4504,7 +4504,7 @@ fn nursery_extent_reaches_helpers_and_grandchildren() {
     // registered while the join is already draining) is joined too.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         fun spawn_step(label: str, ms: i32) {
@@ -4539,7 +4539,7 @@ fn a_spawn_outside_the_nursery_extent_stays_free_floating() {
     // prints when its own timer fires.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         fun work(label: str) {
@@ -4566,7 +4566,7 @@ fn a_spawn_outside_the_nursery_extent_stays_free_floating() {
 fn a_body_throw_wins_and_children_absorb_silently() {
     match compile_and_run(
         r#"
-        import std::print;
+        import std::io::print;
         import std::io::panic;
         import std::time::sleep;
         import std::task::nursery;
@@ -4602,7 +4602,7 @@ fn a_body_throw_wins_and_children_absorb_silently() {
 fn the_earliest_settled_child_failure_wins_with_origin() {
     match compile_and_run(
         r#"
-        import std::print;
+        import std::io::print;
         import std::io::panic;
         import std::time::sleep;
         import std::task::nursery;
@@ -4643,7 +4643,7 @@ fn the_earliest_settled_child_failure_wins_with_origin() {
 fn nested_nurseries_join_inside_out() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         fun main() {
@@ -4676,7 +4676,7 @@ fn an_async_nursery_body_adapts() {
     // rides adaptation (Part A) into the nursery machinery.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         fun main() {
@@ -4702,7 +4702,7 @@ fn spawn_then_settle_composes_with_a_nursery() {
     // already-settled children instantly. Both idioms coexist.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::{ nursery, Task };
         fun delayed(value: i32): i32 {
@@ -4737,7 +4737,7 @@ fn cancel_cuts_a_sleeping_child_short_and_keeps_the_value() {
     // the harness's compile step).
     assert_runs_within(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         fun main() {
@@ -4770,7 +4770,7 @@ fn a_fast_failure_behind_a_slow_sibling_reacts_at_settle_time() {
     // seconds under nextest's full parallelism.
     let (outcome, elapsed) = compile_and_run_timed(
         r#"
-        import std::print;
+        import std::io::print;
         import std::io::panic;
         import std::time::sleep;
         import std::task::nursery;
@@ -4816,7 +4816,7 @@ fn outer_cancel_chains_into_nested_nurseries() {
     // why the compile step is excluded from the budget.
     assert_runs_within(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         fun main() {
@@ -4848,7 +4848,7 @@ fn outer_cancel_chains_into_nested_nurseries() {
 fn is_cancelled_reads_and_an_explicit_cancel_keeps_the_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::nursery;
         fun main() {
             let v = nursery(|n| {
@@ -4868,7 +4868,7 @@ fn is_cancelled_reads_and_an_explicit_cancel_keeps_the_value() {
 fn the_race_idiom_yields_the_first_settled_and_aborts_the_losers() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::{ nursery, Task };
         fun main() {
@@ -4896,7 +4896,7 @@ fn the_race_idiom_yields_the_first_settled_and_aborts_the_losers() {
 fn a_module_initializer_cannot_run_a_nursery() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::task::nursery;
         let banner = nursery(|n| {
@@ -4917,7 +4917,7 @@ fn a_module_initializer_cannot_run_an_awaiting_context_body() {
     // check names the shape instead of a function.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::context::Context;
         let flavor: Context<i32> = Context::new();
@@ -5204,7 +5204,7 @@ fn an_adapted_instance_storing_into_an_async_field_is_the_fix() {
     // `async || T` makes the store legal and awaits the later call through it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         struct Holder {
             hook: async || i32,
@@ -5228,7 +5228,7 @@ fn a_sync_instance_storing_the_same_parameter_into_a_plain_field_stays_legal() {
     // instance, not per function.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder {
             hook: || i32,
         }
@@ -5250,7 +5250,7 @@ fn transitive_adaptation_still_rides_past_a_store_free_body() {
     // call-position flow). Refusing escapes must not disturb it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun helper(f: || i32): i32 {
             f() + 1

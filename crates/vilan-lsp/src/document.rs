@@ -2474,7 +2474,7 @@ impl Document {
         // change what the file means, and leaving it would have the estate
         // carry hundreds of dead statements that every copy-pasted new file
         // reproduces. Matched on the DEFINITION, not the name — `import
-        // my_lib::print;` beside an ambient `std::print` is not redundant and
+        // my_lib::print;` beside an ambient `std::io::print` is not redundant and
         // survives. This is the action's existing contract ("prune the leaves
         // the analyzer reports as unused") reaching one more kind of unused.
         if program.prelude_bindings.contains(&definition_id) {
@@ -2597,9 +2597,21 @@ impl Document {
                     if module_name == "lib" || !seen_modules.insert(module_name.clone()) {
                         continue;
                     }
+                    // Only a module that DECLARES the name is an add-import
+                    // target. This is the analyzer's own rule for the B4 steer
+                    // (`collect_declared_names`: "pointing at a module that
+                    // merely forwards it would name the wrong file"), and the
+                    // quickfix path had drifted from it — harmlessly until std
+                    // gained the prelude modules, whose whole content is
+                    // re-exports, at which point `view` started offering both
+                    // `std::ui` and `std::web` and the menu went ambiguous.
+                    // Nobody should ever be told to `import std::web::view`.
                     if vilan_core::analyzer::module_importables(&module_path)
                         .iter()
-                        .any(|importable| importable.name == name)
+                        .any(|importable| {
+                            importable.name == name
+                                && importable.kind != vilan_core::analyzer::ImportableKind::Reexport
+                        })
                     {
                         candidates.push(vec![origin.clone(), module_name]);
                     }
@@ -3492,7 +3504,7 @@ pub(crate) mod tests {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
+                "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
             ("broken.vl", module),
         ]);
@@ -4259,9 +4271,11 @@ pub(crate) mod tests {
     // request. The per-query cache on `Analysis` (`source_texts`) makes it
     // one read per module per request. The fixture imports from exactly one
     // std module and declares its other functions locally (entry-file docs
-    // slice the analyzed text, no read), so the expected count is exactly 1;
-    // if this goes red after a std reshuffle, first check what the entry
-    // scope now resolves docs from.
+    // slice the analyzed text, no read) — but the PRELUDE now puts std's base
+    // seven in scope too, and `print` is a Function candidate whose docs come
+    // from `std/src/io.vl`. So the expected count is two modules, one read
+    // each, which is the property under test; if this goes red after a std
+    // reshuffle, first check what the entry scope now resolves docs from.
     #[test]
     fn one_completion_request_reads_a_docs_module_text_once() {
         let (dir, document) = analyze_workspace(&[(
@@ -4282,8 +4296,9 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(
-            reads, 1,
-            "three same-module candidates resolve docs from one read of math.vl, not three"
+            reads, 2,
+            "each module's text is read ONCE per request: math.vl for the imported \
+             candidates, io.vl for the prelude's `print`"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4356,7 +4371,7 @@ pub(crate) mod tests {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                "import std::io::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
                  fun main() { print(A); print(Z); }\n",
             ),
             ("alpha.vl", alpha),
@@ -4423,7 +4438,7 @@ pub(crate) mod tests {
     // all in the file that has the mistake.
     #[test]
     fn a_container_resource_in_a_module_publishes_on_the_module() {
-        let module = "import std::print;\nimport std::drop::Drop;\n\
+        let module = "import std::io::print;\nimport std::drop::Drop;\n\
                       resource struct Guard { label: str }\n\
                       impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
                       fun keep() {\n\tmut arr: List<Guard> = [];\n}\n";
@@ -4472,7 +4487,7 @@ pub(crate) mod tests {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::page::{ Widget, Opaque };\n\
+                "import std::io::print;\nimport pkg::page::{ Widget, Opaque };\n\
                  fun main() {\n\tlet w = Widget { item = Opaque { x = 1 } };\n\tprint(w.item.x);\n}\n",
             ),
             ("page.vl", module),
@@ -4510,7 +4525,7 @@ pub(crate) mod tests {
     // (no path), so the squiggle lands under the read the user is looking at.
     #[test]
     fn an_entry_file_initialization_cycle_publishes_on_the_entry() {
-        let entry = "import std::print;\nlet A: i32 = B + 1;\nlet B: i32 = A + 2;\n\
+        let entry = "import std::io::print;\nlet A: i32 = B + 1;\nlet B: i32 = A + 2;\n\
                      fun main() { print(A); print(B); }\n";
         let (dir, document) = analyze_workspace(&[("main.vl", entry)]);
         let published = document.published_diagnostics();
@@ -4550,7 +4565,7 @@ pub(crate) mod tests {
         let (dir, document) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
+                "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
             ("broken.vl", "fun answer(): i32 {\n\t\"not a number\"\n}\n"),
         ]);
@@ -5229,7 +5244,7 @@ pub(crate) mod tests {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
         let store = "import std::fs;\n\nfun load(): bool {\n\tfs::stat(\"state\").is_some()\n}\n";
-        let reach = "import std::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"?\") }\n}\n";
+        let reach = "import std::io::print;\nimport pkg::store::load;\n\nfun main() {\n\tif load() { print(\"?\") }\n}\n";
         let (dir, client) = analyze_workspace(&[
             ("src/client.vl", reach),
             ("vilan.toml", manifest),
@@ -5291,7 +5306,7 @@ pub(crate) mod tests {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
         let shared = "import std::ui::{ view, View, render };\n\nfun page_markup(): str {\n\trender(view(\"main\").text(\"hi\"))\n}\n";
-        let entry = "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),
             ("vilan.toml", manifest),
@@ -5321,7 +5336,7 @@ pub(crate) mod tests {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
         let shared = "import std::ui::{ view, View, mount };\n\nfun attach() {\n\tmount(\"app\", view(\"main\").text(\"hi\"));\n}\n";
-        let entry = "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),
             ("vilan.toml", manifest),
@@ -5713,7 +5728,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_shows_the_full_function_signature() {
         let hover = hover_at_cursor(
-            "import std::print;\n\nfun descr|ibe(count: i32, label: str): str {\n\tlabel\n}\n\nfun main() {\n\tprint(describe(1, \"x\"));\n}\n",
+            "import std::io::print;\n\nfun descr|ibe(count: i32, label: str): str {\n\tlabel\n}\n\nfun main() {\n\tprint(describe(1, \"x\"));\n}\n",
         )
         .expect("hovering the declaration should produce a label");
         assert!(
@@ -5740,7 +5755,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_shows_an_inferred_single_borrows_position() {
         let hover = hover_at_cursor(
-            "import std::print;\n\nstruct Wrapper { value: i32 }\n\nimpl Wrapper {\n\tfun sl|ot(&mut self): &mut i32 {\n\t\t&mut self.value\n\t}\n}\n\nfun main() {\n\tmut w = Wrapper { value = 1 };\n\tw.slot() = 2;\n\tprint(w.value);\n}\n",
+            "import std::io::print;\n\nstruct Wrapper { value: i32 }\n\nimpl Wrapper {\n\tfun sl|ot(&mut self): &mut i32 {\n\t\t&mut self.value\n\t}\n}\n\nfun main() {\n\tmut w = Wrapper { value = 1 };\n\tw.slot() = 2;\n\tprint(w.value);\n}\n",
         )
         .expect("hovering `slot` should produce a label");
         assert!(hover.contains("borrows self"), "{hover}");
@@ -5796,7 +5811,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_surfaces_the_leading_doc_comment() {
         let hover = hover_at_cursor(
-            "import std::print;\n\n/// Renders the badge label.\n/// Two lines of docs.\n[must_use]\nfun bad|ge(count: i32): str {\n\t\"b\"\n}\n\nfun main() {\n\tlet _b = badge(1);\n\tprint(\"x\");\n}\n",
+            "import std::io::print;\n\n/// Renders the badge label.\n/// Two lines of docs.\n[must_use]\nfun bad|ge(count: i32): str {\n\t\"b\"\n}\n\nfun main() {\n\tlet _b = badge(1);\n\tprint(\"x\");\n}\n",
         )
         .expect("hover on the declaration");
         assert!(
@@ -6014,7 +6029,7 @@ pub(crate) mod tests {
     #[test]
     fn attribute_position_completes_macro_names() {
         let completions = completions_at_cursor(
-            "import std::print;\n\n[Hash|]\nstruct Point { x: i32 }\n\nfun main() {\n\tprint(1);\n}\n",
+            "import std::io::print;\n\n[Hash|]\nstruct Point { x: i32 }\n\nfun main() {\n\tprint(1);\n}\n",
         );
         assert!(
             completions.iter().any(|label| label == "Hashable"),
@@ -6025,7 +6040,7 @@ pub(crate) mod tests {
             "{completions:?}"
         );
         let derive_completions = completions_at_cursor(
-            "import std::print;\n\n[derive(Pa|)]\nstruct Point { x: i32 }\n\nfun main() {\n\tprint(1);\n}\n",
+            "import std::io::print;\n\n[derive(Pa|)]\nstruct Point { x: i32 }\n\nfun main() {\n\tprint(1);\n}\n",
         );
         assert!(
             derive_completions.iter().any(|label| label == "PartialEq"),
@@ -6060,7 +6075,7 @@ pub(crate) mod tests {
     // binding and its uses carry `readonly`, a `mut` one does not.
     #[test]
     fn semantic_token_modifiers_split_readonly_and_declarations() {
-        let text = "import std::print;\n\nfun main() {\n\tlet fixed = 1;\n\tmut counter = 2;\n\tprint(fixed + counter);\n}\n";
+        let text = "import std::io::print;\n\nfun main() {\n\tlet fixed = 1;\n\tmut counter = 2;\n\tprint(fixed + counter);\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let tokens = document.semantic_tokens();
         let modifiers_at = |at: usize, len: usize| {
@@ -6099,7 +6114,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_shows_a_constants_value() {
         let hover = hover_at_cursor(
-            "import std::print;\n\nlet SIZE = const 8 * 8;\n\nfun main() {\n\tprint(SI|ZE);\n}\n",
+            "import std::io::print;\n\nlet SIZE = const 8 * 8;\n\nfun main() {\n\tprint(SI|ZE);\n}\n",
         )
         .expect("hover on the constant");
         assert!(hover.contains("= 64"), "{hover}");
@@ -6154,7 +6169,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_clamps_a_long_multibyte_constant_without_panicking() {
         let source = format!(
-            "import std::print;\n\nlet BANNER = const \"ab{}\";\n\nfun main() {{\n\tprint(BAN|NER);\n}}\n",
+            "import std::io::print;\n\nlet BANNER = const \"ab{}\";\n\nfun main() {{\n\tprint(BAN|NER);\n}}\n",
             "—".repeat(70),
         );
         let hover = hover_at_cursor(&source).expect("hover on the constant");
@@ -6609,7 +6624,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_ignores_plain_comment_blocks() {
         let hover = hover_at_cursor(
-            "import std::print;\n\n// An internal note, not docs.\nfun bad|ge(count: i32): str {\n\t\"b\"\n}\n\nfun main() {\n\tlet _b = badge(1);\n\tprint(\"x\");\n}\n",
+            "import std::io::print;\n\n// An internal note, not docs.\nfun bad|ge(count: i32): str {\n\t\"b\"\n}\n\nfun main() {\n\tlet _b = badge(1);\n\tprint(\"x\");\n}\n",
         )
         .expect("hover on the declaration");
         assert!(
@@ -6624,7 +6639,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_shows_struct_fields_and_enum_variants() {
         let hover = hover_at_cursor(
-            "import std::print;\n\nstruct Point { x: i32, name: str }\n\nfun main() {\n\tlet p = Po|int { x = 1, name = \"a\" };\n\tprint(p.name);\n}\n",
+            "import std::io::print;\n\nstruct Point { x: i32, name: str }\n\nfun main() {\n\tlet p = Po|int { x = 1, name = \"a\" };\n\tprint(p.name);\n}\n",
         )
         .expect("hover on the constructor");
         assert!(
@@ -6632,7 +6647,7 @@ pub(crate) mod tests {
             "{hover}"
         );
         let hover = hover_at_cursor(
-            "import std::print;\n\nenum Shape {\n\tDot,\n\tBox2(i32, i32),\n}\n\nfun main() {\n\tlet s = Sha|pe::Dot;\n\tmatch s {\n\t\tShape::Dot => print(\"dot\"),\n\t\tShape::Box2(let _w, let _h) => print(\"box\"),\n\t}\n}\n",
+            "import std::io::print;\n\nenum Shape {\n\tDot,\n\tBox2(i32, i32),\n}\n\nfun main() {\n\tlet s = Sha|pe::Dot;\n\tmatch s {\n\t\tShape::Dot => print(\"dot\"),\n\t\tShape::Box2(let _w, let _h) => print(\"box\"),\n\t}\n}\n",
         )
         .expect("hover on the enum reference");
         assert!(
@@ -6658,7 +6673,7 @@ pub(crate) mod tests {
     #[test]
     fn hover_stays_clean_on_a_colorless_function() {
         let hover = hover_at_cursor(
-            "import std::print;\n\nfun greet() {\n\tprint(\"hi\");\n}\n\nfun main() {\n\tgre|et();\n}\n",
+            "import std::io::print;\n\nfun greet() {\n\tprint(\"hi\");\n}\n\nfun main() {\n\tgre|et();\n}\n",
         );
         assert!(
             hover
@@ -6876,7 +6891,7 @@ pub(crate) mod tests {
     #[test]
     fn member_completion_on_a_call_inside_an_element_attribute_closure() {
         let labels = completions_at_marker(
-            "import std::print;\n\
+            "import std::io::print;\n\
              import std::reactive::Signal;\n\
              import std::result::Result;\n\
              import std::ui::view;\n\
@@ -7228,7 +7243,7 @@ pub(crate) mod tests {
 
     /// The prelude the element-head pins share.
     const ELEMENT_HEAD_PRELUDE: &str =
-        "import std::ui::view;\nimport std::reactive::Signal;\nimport std::print;\n";
+        "import std::ui::view;\nimport std::reactive::Signal;\nimport std::io::print;\n";
 
     fn element_head_completions(body: &str) -> Vec<String> {
         completions_at_marker(
@@ -7366,7 +7381,7 @@ pub(crate) mod tests {
 
     /// The prelude the `css`-block pins share.
     const CSS_BLOCK_PRELUDE: &str =
-        "import std::style::{ Color, Length, Style, space, style };\nimport std::print;\n";
+        "import std::style::{ Color, Length, Style, space, style };\nimport std::io::print;\n";
 
     fn css_block_completions(body: &str) -> Vec<String> {
         completions_at_marker(
@@ -8002,7 +8017,7 @@ pub(crate) mod tests {
         // file's first `import`.
         //
         // The boundary is found as the first line-initial `import `, NOT a
-        // particular one: it used to look for `import std::print`, and when the
+        // particular one: it used to look for `import std::io::print`, and when the
         // formatter's canonical import sort reordered that block the proxy landed
         // past two legitimate imports and the pin fired on them.
         let path =
@@ -8362,16 +8377,25 @@ pub(crate) mod tests {
             labels.contains(&"fs".to_string()),
             "a layered module lists under its own name: {labels:?}"
         );
-        // `lib.vl` is the package SURFACE, not a module of it — and its
-        // re-exports are offered right here, under the origin.
+        // `lib.vl` is the package SURFACE, not a module of it.
         assert!(
             !labels.contains(&"lib".to_string()),
             "`import std::lib` is not a thing: {labels:?}"
         );
+        // std's `lib.vl` surface publishes NOTHING since the alias sweep
+        // (prelude.md §10.2) — its thirteen re-exports were short-name aliases
+        // and each name is spelled at its real home now. The two prelude
+        // modules are ordinary modules and list as such.
         assert!(
-            labels.contains(&"print".to_string()),
-            "std's `lib.vl` surface is reachable as `std::print`: {labels:?}"
+            !labels.contains(&"print".to_string()),
+            "`std::print` was removed; `print` lives at `std::io::print`: {labels:?}"
         );
+        for module in ["prelude", "web", "io"] {
+            assert!(
+                labels.contains(&module.to_string()),
+                "`std::{module}` is a module: {labels:?}"
+            );
+        }
     }
 
     // `import pkg::` lists the package's OWN source files, by the same names the
@@ -8670,7 +8694,7 @@ pub(crate) mod tests {
                 label: "a shuffled run where every leaf is used",
                 files: &[(
                     "main.vl",
-                    "import std::print;\nimport std::result::Result::{ self, Ok };\n\nfun main(): Result<i32, str> {\n\tprint(\"hi\");\n\tOk(1)\n}\n",
+                    "import std::io::print;\nimport std::result::Result::{ self, Ok };\n\nfun main(): Result<i32, str> {\n\tprint(\"hi\");\n\tOk(1)\n}\n",
                 )],
             },
         ];
@@ -9931,9 +9955,8 @@ mod entry_reclaim {
     use crate::document::tests::{on_big_stack, std_root};
     use vilan_core::leak_tally::{self, LeakSite};
 
-    const FIRST: &str = "import std::print;\n\nfun main() {\n\tprint(\"one\");\n}\n";
-    const SECOND: &str =
-        "import std::print;\n\nfun main() {\n\tlet greeting = \"two\";\n\tprint(greeting);\n}\n";
+    const FIRST: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"one\");\n}\n";
+    const SECOND: &str = "import std::io::print;\n\nfun main() {\n\tlet greeting = \"two\";\n\tprint(greeting);\n}\n";
 
     fn analyze_here(text: &str) -> Document {
         Document::analyze_on_this_thread(text, &std_root(), Path::new("reclaim.vl"))
@@ -10591,7 +10614,7 @@ fun main() {
             vilan_core::analyzer::set_document_overlay(&unrelated, Some("x".to_string()));
             leak_tally::reset();
             let document = Document::analyze_on_this_thread(
-                "import std::print;
+                "import std::io::print;
 
 fun main() {
 	print(1);
@@ -11016,7 +11039,7 @@ mod leak_measurement {
     // keystroke), so every analysis re-parses and re-analyzes.
     fn no_macro_text(i: usize) -> String {
         format!(
-            "import std::print;\nimport std::option::Option::{{ self, Some, None }};\n\n\
+            "import std::io::print;\nimport std::option::Option::{{ self, Some, None }};\n\n\
              fun describe(value: Option<i32>): str {{\n\
              \tmatch value {{\n\t\tSome(let n) => int_to_string(n),\n\t\tNone => \"empty {i}\",\n\t}}\n}}\n\n\
              fun int_to_string(n: i32): str {{\n\t\"n\"\n}}\n\n\
@@ -11098,7 +11121,7 @@ mod leak_measurement {
     // that could re-leak on the macro path is the stamped expansion's parse.
     fn gensym_text(tail: usize) -> String {
         format!(
-            "import std::print;\n\n\
+            "import std::io::print;\n\n\
              macro fun unroll(arguments: Arguments): Source {{\n\
              \timport macro_std::source;\n\
              \timport macro_std::fresh;\n\
@@ -11212,7 +11235,7 @@ mod leak_measurement {
     fn broken_world_failure_plateaus_without_releaking() {
         fn broken_macro_text(i: usize) -> String {
             format!(
-                "import std::print;\n\n\
+                "import std::io::print;\n\n\
                  macro fun broken(arguments: Arguments): Source {{\n\
                  \timport macro_std::source;\n\
                  \timport macro_std::meta::{{ Arguments, Source }};\n\
@@ -11254,7 +11277,7 @@ mod leak_measurement {
     // them — with list results fat enough that a stranded root scope holds
     // real bytes. Written for `moving_edit`, so every analysis is a distinct
     // content of identical length.
-    const CONST_HEAVY_BASE: &str = "import std::print;\n\n\
+    const CONST_HEAVY_BASE: &str = "import std::io::print;\n\n\
          fun labels(count: i32): List<str> {\n\
          \tlet describe = |index: i32| { \"a labelled entry in the fixture\" };\n\
          \tmut result: List<str> = List::new();\n\
@@ -11852,7 +11875,7 @@ mod perf_baseline {
     /// statements about one document.
     fn synthetic_text(i: usize) -> String {
         format!(
-            "import std::print;\nimport std::option::Option::{{ self, Some, None }};\n\n\
+            "import std::io::print;\nimport std::option::Option::{{ self, Some, None }};\n\n\
              fun describe(value: Option<i32>): str {{\n\
              \tmatch value {{\n\t\tSome(let n) => int_to_string(n),\n\t\tNone => \"empty {i}\",\n\t}}\n}}\n\n\
              fun int_to_string(n: i32): str {{\n\t\"n\"\n}}\n\n\

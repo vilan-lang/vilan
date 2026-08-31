@@ -63,7 +63,7 @@ const BATTERY: &[(&str, &str)] = &[
         // local counts twice and the copy reappears — a byte-level JS diff.
         "use-once alias elision",
         r#"
-import std::print;
+import std::io::print;
 fun make(): List<i32> {
     mut items: List<i32> = List::new();
     items.push(1);
@@ -90,7 +90,7 @@ fun main() {}
         // accessor queues also re-incremented member reference counts.
         "item imports and static accessors",
         r#"
-import std::print;
+import std::io::print;
 import std::shared::Shared;
 fun main() {
     let cell = Shared::new(41);
@@ -104,7 +104,7 @@ fun main() {
         // must be identical, not doubled or flipped.
         "unused import warning",
         r#"
-import std::print;
+import std::io::print;
 import std::time::sleep;
 fun main() { print(1); }
 "#,
@@ -161,7 +161,7 @@ fn two_phase_build_resolves_chained_generic_calls() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let observation = observe(
         r#"
-import std::print;
+import std::io::print;
 struct Point { x: i32, name: str }
 fun main() {
     let points = [Point { x = 1, name = "abc" }];

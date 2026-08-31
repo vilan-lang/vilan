@@ -9,7 +9,7 @@
 // live to the exit by an opacity fallback, recorded as a pin gap at the
 // order-21 close. Host-free, so the interpreter equivalence gate checks it
 // against `node`.
-import std::print;
+import std::io::print;
 import std::drop::Drop;
 
 resource struct Guard { tag: str }

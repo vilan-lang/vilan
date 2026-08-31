@@ -1,7 +1,7 @@
 // Phase 3 (views, slice 2): `&mut self` receivers and `&mut` parameters parse
 // and carry their convention. Codegen is unchanged this slice (an aggregate is
 // already a JS reference), so these behave like the bare forms.
-import std::print;
+import std::io::print;
 
 struct Counter { value: i32 }
 

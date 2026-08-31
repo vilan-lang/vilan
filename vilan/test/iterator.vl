@@ -1,4 +1,4 @@
-import std::{ print };
+import std::{ io::print };
 
 trait Iterator<T> {
 	fun next(self): T;

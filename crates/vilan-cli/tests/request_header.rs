@@ -117,7 +117,7 @@ fn a_request_header_is_readable_present_absent_and_case_insensitively() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::http::{ Server, Response };
 import std::option::Option::{ None, Some, self };
 

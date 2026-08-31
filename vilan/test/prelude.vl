@@ -1,0 +1,43 @@
+// The prelude (prelude.md §5, §9): the base seven are in scope with no import
+// at all, and a file's own declaration of a prelude name wins over it —
+// silently, and at RUNTIME, which is the property a compile-only pin cannot
+// see. `import std::io` is the only import this program needs, and it is here
+// so the shadowing function has something to delegate to.
+import std::io;
+
+// Shadows the prelude's `print`. If the prelude were implemented as
+// synthesized file-head imports, this function would be dead and the output
+// below would lose its markers.
+fun print(message: str): void {
+	io::print("[mine] " + message);
+}
+
+fun pick(values: List<i32>): Option<i32> {
+	values.get(1)
+}
+
+fun parse(text: str): Result<i32, str> {
+	if text == "7" { Ok(7) } else { Err("not seven") }
+}
+
+fun main() {
+	// `Option`, `Some`, `None` with no import: the language manufactures the
+	// `Option` in `pick`, so a program can also name it.
+	match pick([10, 20, 30]) {
+		Some(let found) => print("some"),
+		None => print("none"),
+	}
+	match pick([]) {
+		Some(let found) => print("some"),
+		None => print("none"),
+	}
+	// `Result`, `Ok`, `Err`, likewise.
+	match parse("7") {
+		Ok(let value) => print("ok"),
+		Err(let reason) => print(reason),
+	}
+	match parse("8") {
+		Ok(let value) => print("ok"),
+		Err(let reason) => print(reason),
+	}
+}

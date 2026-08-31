@@ -2,7 +2,6 @@
 // bottom of the file. Everything from the standard library is imported
 // explicitly, `print` included.
 
-import std::print;
 import pkg::greeting::greeting;
 
 fun main() {

@@ -42,7 +42,7 @@ fn cwd_reports_a_non_empty_absolute_path_to_the_directory_the_process_runs_in() 
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::process::cwd;
 
 fun main() {

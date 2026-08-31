@@ -8,7 +8,6 @@
 // change (this tab's included) arrives over the wire.
 
 import std::json::json_codec;
-import std::print;
 import std::result::Result::{ Err, Ok };
 import std::ui::mount_root;
 import pkg::store::TodoClient;

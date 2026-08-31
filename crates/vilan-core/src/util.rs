@@ -538,14 +538,17 @@ mod tests {
     #[test]
     fn a_leading_byte_order_mark_is_dropped() {
         assert_eq!(
-            strip_bom("\u{feff}import std::print;"),
-            "import std::print;"
+            strip_bom("\u{feff}import std::io::print;"),
+            "import std::io::print;"
         );
     }
 
     #[test]
     fn a_source_without_a_byte_order_mark_is_untouched() {
-        assert_eq!(strip_bom("import std::print;"), "import std::print;");
+        assert_eq!(
+            strip_bom("import std::io::print;"),
+            "import std::io::print;"
+        );
         // Byte-for-byte the same slice, not a re-derived equal one.
         let text = "fun main() {}";
         assert!(std::ptr::eq(strip_bom(text), text));

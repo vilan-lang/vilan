@@ -758,7 +758,7 @@ fn a_read_only_method_under_a_live_view_compiles() {
     // &self methods do not invalidate.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [ 5 ];
             let b = &mut a[0];
@@ -873,7 +873,7 @@ fn a_mut_call_on_a_viewed_scalar_root_compiles() {
     // model permits. E2 exempts scalar roots.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         fun add_ten(value: &mut i32) {
             value += 10;
         }
@@ -1012,7 +1012,7 @@ fn a_shared_read_copy_across_await_compiles() {
     assert_compiles(
         r#"
         import std::shared::Shared;
-        import std::print;
+        import std::io::print;
         async fun tick() {
             let _beat = 1;
         }
@@ -1539,7 +1539,7 @@ fn an_await_with_no_live_views_compiles() {
 fn math_constants_and_moved_free_functions_import() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::math::{ PI, TAU, E, EPSILON, min, max, minmax };
 
         fun main() {
@@ -1563,7 +1563,7 @@ fn math_constants_and_moved_free_functions_import() {
 fn f64_float_classification_predicates() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::math::{ NAN, INFINITY };
 
         fun main() {
@@ -1584,7 +1584,7 @@ fn f64_float_classification_predicates() {
 fn rem_is_truncated_remainder_across_the_families() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print(7.rem(3));
@@ -1603,7 +1603,7 @@ fn rem_is_truncated_remainder_across_the_families() {
 fn sized_types_carry_the_applicable_math_family() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print((0i8 - 5i8).abs());
@@ -1701,7 +1701,7 @@ fn a_same_named_member_from_an_unrelated_trait_does_not_satisfy() {
 fn get_safe_yields_none_outside_and_some_inside_a_run() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
         import std::option::Option::{ Some, None };
 
@@ -1733,7 +1733,7 @@ fn get_safe_wraps_inside_a_strict_covered_region() {
     // Some-wraps the bare value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
         import std::option::Option::{ Some, None };
 
@@ -1769,7 +1769,7 @@ fn get_safe_threads_through_a_transitive_chain() {
     // through it, Some on the covered path and None from the top level.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
         import std::option::Option::{ Some, None };
 
@@ -1802,7 +1802,7 @@ fn get_safe_threads_through_a_transitive_chain() {
 fn get_safe_survives_await_and_stored_closures() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
         import std::option::Option::{ Some, None };
 
@@ -1845,7 +1845,7 @@ fn the_strict_fence_is_unchanged_by_get_safe() {
     // that also uses `get_safe`; and a get_safe-only function pulled onto a
     // strict chain is fenced like any strict code.
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
         import std::option::Option::{ Some, None };
 
@@ -1883,7 +1883,7 @@ fn a_turn_flush_cannot_drain_another_turns_queue() {
     // pending notification.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Turn, turn_scope, flush };
 
         fun main() {
@@ -1911,7 +1911,7 @@ fn a_batch_body_defers_even_at_the_top_level() {
     // now per-extent instead of a global depth counter.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
 
         fun main() {
@@ -1933,7 +1933,7 @@ fn a_batch_body_defers_even_at_the_top_level() {
 fn a_turn_follows_its_extents_continuation_across_await() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Turn, turn_scope, flush };
 
         async fun tick() {
@@ -1967,7 +1967,7 @@ fn a_turn_follows_its_extents_continuation_across_await() {
 fn a_host_invoked_adapter_gives_each_dispatch_its_own_turn() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
 
         fun simulate_events(handler: (|| void) context turn_scope) {
@@ -2001,7 +2001,7 @@ fn a_named_handler_binding_adopts_the_clause() {
     // injected call.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
 
         fun dispatch(handler: (|| void) context turn_scope) {
@@ -2031,7 +2031,7 @@ fn an_annotated_clause_binding_defers_and_forwards() {
     // forwards into same-clause parameters and works as `run`'s body.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let current: Context<i32> = Context::new();
@@ -2095,7 +2095,7 @@ fn a_continuation_set_settles_without_a_manual_flush() {
     // SETTLED; a late enqueue drains itself instead of waiting forever.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
 
         async fun tick() {
@@ -2126,7 +2126,7 @@ fn at_suspension_flushes_before_each_await() {
     // first paint happens before the slow work.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
 
         async fun tick() {
@@ -2158,7 +2158,7 @@ fn at_end_holds_writes_across_the_await_inside_the_extent() {
     // sync drain at the body's first suspension boundary), not before it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
 
         async fun tick() {
@@ -2195,7 +2195,7 @@ fn an_awaiting_turn_body_holds_writes_until_it_completes() {
     // same-signal writes to the final value ("working" never fires).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, turn, FlushPolicy, turn_scope };
 
         async fun tick() {
@@ -2222,7 +2222,7 @@ fn an_awaiting_turn_body_holds_writes_until_it_completes() {
 fn an_awaiting_turn_returns_the_body_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ turn, FlushPolicy, turn_scope };
 
         async fun tick() {
@@ -2249,7 +2249,7 @@ fn a_sync_turn_body_stays_atomic_and_keeps_its_emission() {
     // statement runs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, turn, FlushPolicy, turn_scope };
 
         fun main() {
@@ -2275,7 +2275,7 @@ fn an_async_void_body_through_a_generic_return_parameter_adapts() {
     // while its body still runs.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         fun run_it<T>(body: || T): T {
             body()
@@ -2296,7 +2296,7 @@ fn an_async_void_body_through_a_generic_return_parameter_adapts() {
 fn optimistic_paints_then_reconciles_to_the_confirmed_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, optimistic };
         import std::result::Result::{ self, Ok, Err };
 
@@ -2326,7 +2326,7 @@ fn optimistic_paints_then_reconciles_to_the_confirmed_value() {
 fn optimistic_rolls_back_on_failure() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, optimistic };
         import std::result::Result::{ self, Ok, Err };
 
@@ -2380,7 +2380,7 @@ fn an_optimistic_cell_publishes_pending_then_the_confirmed_value() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{{ Signal, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
@@ -2412,7 +2412,7 @@ fn an_optimistic_cell_rolls_back_and_publishes_the_rejection() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{{ Signal, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
@@ -2445,7 +2445,7 @@ fn a_superseded_optimistic_outcome_does_not_paint_the_cell() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{{ Signal, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
@@ -2484,7 +2484,7 @@ fn a_rollback_lands_on_the_last_confirmation_not_the_original_value() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{{ Signal, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
@@ -2524,7 +2524,7 @@ fn an_out_of_order_confirmation_cannot_walk_the_confirmed_shadow_backwards() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{{ Signal, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
@@ -2568,7 +2568,7 @@ fn an_optimistic_transition_publishes_one_coherent_wave() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{{ Signal, Optimistic, WriteState, combine }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
@@ -2603,7 +2603,7 @@ fn a_held_turn_holds_the_whole_optimistic_lifecycle() {
     // appears.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Optimistic, WriteState, turn, FlushPolicy, turn_scope };
         import std::result::Result::{ self, Ok, Err };
 
@@ -2641,7 +2641,7 @@ fn an_optimistic_cell_reconciles_over_a_real_rpc_round_trip() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::reactive::{{ Signal, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
@@ -2707,7 +2707,7 @@ fn an_optimistic_cell_reconciles_over_a_real_rpc_round_trip() {
 fn a_call_through_an_async_typed_parameter_awaits() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         async fun tick() {
             let _beat = 1;
@@ -2737,7 +2737,7 @@ fn a_sync_closure_into_an_async_parameter_is_fine() {
     // The safe direction: awaiting a plain value just resolves.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun run_job(job: async || i32): i32 {
             job()
@@ -2759,7 +2759,7 @@ fn an_async_closure_into_a_plain_void_parameter_is_spawn_semantics() {
     // machinery; no value is lied about).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         async fun tick() {
             let _beat = 1;
@@ -2791,7 +2791,7 @@ fn an_async_closure_into_a_plain_valued_parameter_adapts() {
     // awaits, and the caller receives the settled value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         async fun tick() {
             let _beat = 1;
         }
@@ -2815,7 +2815,7 @@ fn an_async_closure_into_a_plain_valued_parameter_adapts() {
 fn an_async_closure_type_composes_with_a_context_clause() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let current: Context<i32> = Context::new();
@@ -2845,7 +2845,7 @@ fn an_async_closure_type_composes_with_a_context_clause() {
 fn an_async_annotated_let_awaits_at_its_calls() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         async fun tick() {
             let _beat = 1;
@@ -2875,7 +2875,7 @@ fn an_async_annotated_let_awaits_at_its_calls() {
 fn an_out_of_bounds_read_panics() {
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<i32> = List::new();
             xs.push(10);
@@ -2907,7 +2907,7 @@ fn an_out_of_bounds_write_panics_rather_than_growing() {
 fn a_negative_index_panics() {
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<i32> = List::new();
             xs.push(10);
@@ -2945,7 +2945,7 @@ fn an_empty_list_subscript_panics() {
     // view-invalidation.md §1's P1 case: the empty list, subscripted.
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<i32> = List::new();
             print(xs[0]);
@@ -2962,7 +2962,7 @@ fn in_bounds_subscripts_are_unchanged() {
     // shapes, asserted here so the checked emission can't regress them.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(slot: &mut i32) {
             slot = *slot + 100;
         }
@@ -2988,7 +2988,7 @@ fn an_unused_binding_with_an_indexing_initializer_still_panics() {
     // unused binding must not drop the check.
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<i32> = List::new();
             let _probe = xs[0];
@@ -3004,7 +3004,7 @@ fn an_unused_binding_with_an_indexing_initializer_still_panics() {
 fn list_get_stays_the_option_form() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut xs: List<i32> = List::new();
@@ -3081,7 +3081,7 @@ fn an_ungrounded_element_type_gets_a_direct_message() {
 fn a_triple_quoted_string_trims_to_the_closing_indentation() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let text = """
                     line 1
@@ -3102,7 +3102,7 @@ fn a_triple_quoted_string_trims_to_the_closing_indentation() {
 fn a_triple_quoted_string_is_raw() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let text = """
                 escapes \n and \t stay raw, {braces} too
@@ -3119,7 +3119,7 @@ fn a_triple_quoted_string_is_raw() {
 fn an_empty_triple_quoted_string_is_empty() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let text = """
                 """;
@@ -3204,7 +3204,7 @@ fn a_macro_emits_source_from_a_triple_quoted_string() {
     // concatenation ceremony for its static skeleton.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun gen(item: Item): Source {
             import macro_std::source;
@@ -3248,7 +3248,7 @@ fn an_interpolated_triple_quoted_string_trims_and_interpolates() {
     // indented past the prefix keeps its extra indentation.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let who = "world";
             let text = i"""
@@ -3269,7 +3269,7 @@ fn an_interpolated_triple_quoted_string_trims_and_interpolates() {
 fn an_interpolated_triple_quoted_string_escapes_only_braces() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = "X";
             let text = i"""
@@ -3290,7 +3290,7 @@ fn a_backslash_in_an_interpolated_triple_quoted_string_is_literal() {
     // near-rawness as the plain form.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = "X";
             let text = i"""
@@ -3311,7 +3311,7 @@ fn an_interpolated_triple_quoted_hole_may_hold_a_string_with_braces() {
     // not a nested hole.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = "X";
             let text = i"""
@@ -3329,7 +3329,7 @@ fn an_interpolated_triple_quoted_hole_may_hold_a_string_with_braces() {
 fn an_empty_interpolated_triple_quoted_string_is_empty() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let text = i"""
                 """;
@@ -3348,7 +3348,7 @@ fn adjacent_quotes_inside_an_interpolated_triple_quoted_string_are_content() {
     // ordinary characters — including right before a hole.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = "X";
             let text = i"""
@@ -3422,7 +3422,7 @@ fn a_macro_emits_source_from_an_interpolated_triple_quoted_string() {
     // as it will appear — no concatenation ceremony, no `\n` bookkeeping.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun gen(item: Item): Source {
             import macro_std::source;
@@ -3461,7 +3461,7 @@ fn a_macro_emits_source_from_an_interpolated_triple_quoted_string() {
 fn remainder_on_i32_follows_the_dividend_sign() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(7 % 3);
             print((0 - 7) % 3);
@@ -3477,7 +3477,7 @@ fn remainder_on_i32_follows_the_dividend_sign() {
 fn remainder_on_floats() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(7.5 % 2f);
         }
@@ -3493,7 +3493,7 @@ fn remainder_on_i53_is_exact() {
     // integers is exact with no wrap needed.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(9000000000000000i53 % 7i53);
         }
@@ -3507,7 +3507,7 @@ fn remainder_on_i53_is_exact() {
 fn remainder_on_bigint_values() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(9007199254740993n % 4n);
         }
@@ -3521,7 +3521,7 @@ fn remainder_on_bigint_values() {
 fn u32_remainder_stays_unsigned() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(4000000000u32 % 7u32);
         }
@@ -3535,7 +3535,7 @@ fn u32_remainder_stays_unsigned() {
 fn remainder_binds_with_product() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(1 + 7 % 3);
             print(2 * 7 % 3);
@@ -3551,7 +3551,7 @@ fn remainder_binds_with_product() {
 fn a_compound_remainder_assignment_works() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut x = 17;
             x %= 5;
@@ -3567,7 +3567,7 @@ fn a_compound_remainder_assignment_works() {
 fn a_user_type_dispatches_through_the_rem_trait() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::operators::Rem;
 
         struct Meters {
@@ -3650,7 +3650,7 @@ fn an_empty_literal_pushed_two_incompatible_types_is_an_error() {
 fn an_empty_literals_element_grounds_from_a_push() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [];
             a.push(10);
@@ -3670,7 +3670,7 @@ fn a_push_grounds_reads_earlier_in_the_source() {
     // runtime; this pins TYPING order-independence.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [];
             if a.len() > 0 {
@@ -3749,7 +3749,7 @@ fn a_never_pushed_lists_len_stays_legal() {
     // type work on a never-grounded list.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [];
             print(a.len());
@@ -3764,7 +3764,7 @@ fn a_never_pushed_lists_len_stays_legal() {
 fn a_for_loop_over_a_grounded_literal_types_its_item() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut a = [];
             a.push(10);
@@ -3805,7 +3805,7 @@ fn a_nonempty_literals_push_checks_its_argument() {
 #[test]
 fn a_const_expression_folds_to_a_literal() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let a = const 1 + 2;
             print(a);
@@ -3819,7 +3819,7 @@ fn a_const_expression_folds_to_a_literal() {
 #[test]
 fn const_captures_weakly_to_the_expression_end() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let a = const 1 + 2 * 3;
             print(a);
@@ -3833,7 +3833,7 @@ fn const_captures_weakly_to_the_expression_end() {
 #[test]
 fn parens_narrow_the_capture() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun runtime_part(): i32 {
             5
         }
@@ -3850,7 +3850,7 @@ fn parens_narrow_the_capture() {
 #[test]
 fn a_const_call_evaluates_through_functions() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun square(n: i32): i32 {
             n * n
         }
@@ -3867,7 +3867,7 @@ fn a_const_call_evaluates_through_functions() {
 #[test]
 fn const_chains_through_const_known_bindings() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = const 5;
             let y = const x * 2;
@@ -3883,7 +3883,7 @@ fn const_chains_through_const_known_bindings() {
 fn a_literal_initialized_binding_is_const_known() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = 5;
             let y = const x + 1;
@@ -3898,7 +3898,7 @@ fn a_literal_initialized_binding_is_const_known() {
 #[test]
 fn a_module_level_const_serves_functions() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun doubled(): List<i32> {
             mut result: List<i32> = List::new();
             result.push(2);
@@ -3918,7 +3918,7 @@ fn a_module_level_const_serves_functions() {
 #[test]
 fn a_const_argument_stops_at_the_comma() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun show(a: i32, b: i32) {
             print(a + b);
         }
@@ -3934,7 +3934,7 @@ fn a_const_argument_stops_at_the_comma() {
 #[test]
 fn a_const_block_runs_statements_at_compile_time() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let a = const {
                 let left = 2;
@@ -3953,7 +3953,7 @@ fn a_const_block_runs_statements_at_compile_time() {
 fn mut_initialized_by_const_stays_runtime_mutable() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut cache = const 1 + 2;
             cache = cache + 1;
@@ -4105,7 +4105,7 @@ fn the_js_refugee_hint_names_the_idiom() {
 #[test]
 fn bigint_and_float_results_serialize_faithfully() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let big = const 2n * 3n;
             let precise = const 0.1 + 0.2;
@@ -4122,7 +4122,7 @@ fn bigint_and_float_results_serialize_faithfully() {
 fn struct_and_enum_results_serialize() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct Point {
             x: i32,
@@ -4161,7 +4161,7 @@ fn const_chains_through_computed_bindings() {
     // mini-program declares `x` from the stored result, keyed by its
     // initializer expression.
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun square(n: i32): i32 {
             n * n
         }
@@ -4485,7 +4485,7 @@ fn reaching_functions_inside_const_are_fine() {
     // const chains — legal, and the assets flow.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         fun padding(): i32 {
             emit("css", ".pA3{padding:1rem}");
@@ -4734,7 +4734,7 @@ fn an_indirect_call_rooted_in_const_stays_legal() {
     // interpreter calls through the value happily, and the asset still flows.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         fun styled(): i32 {
             emit("css", ".a{}");
@@ -4752,7 +4752,7 @@ fn an_indirect_call_rooted_in_const_stays_legal() {
     );
     let assets = collected_assets(
         r#"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         fun styled(): i32 {
             emit("css", ".a{}");
@@ -5520,7 +5520,7 @@ fn emit_keyed_inside_a_const_stays_legal_through_a_value() {
     // does for `emit`, and the contribution still flows.
     let assembled = assembled_assets(
         r#"
-        import std::print;
+        import std::io::print;
         import std::asset::emit_keyed;
         fun contribute(): i32 {
             emit_keyed("routes", "0", "x");

@@ -2853,6 +2853,7 @@ pub struct Analyzer<'src> {
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
+    print_fn_id: Option<Id>,
     // `std::asset`'s const-only channel, in the order a diagnostic names its
     // members. One list rather than one field per verb: the channel grows
     // (four verbs in 2026-08, eight after kolt.local 035), and the const
@@ -2974,6 +2975,49 @@ pub enum ImportableKind {
 /// whose source is not the module's own). `export import` is the opposite case:
 /// the module is publishing the name on purpose, and std's `lib.vl` — which
 /// declares nothing at all — is entirely made of them.
+/// The curated steer for a name std's package root used to re-export
+/// (`prelude.md` §10.2). Thirteen aliases lived in `std/src/lib.vl` for one
+/// reason — to let a caller write `std::print` instead of `std::io::print` —
+/// and the prelude serves that better, so they were deleted.
+///
+/// `std::print` will be typed from muscle memory for a long time, and the
+/// generic "cannot find 'print' in the imported path" names neither the
+/// removal nor either way forward. This names both.
+fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String> {
+    if root != "std" || !at_std_root {
+        return None;
+    }
+    // The base prelude carries `print`, so the shortest fix is to write
+    // nothing at all; the others have only their real path.
+    let in_base_prelude = name == "print";
+    let home = match name {
+        "print" | "panic" | "assert" => "io",
+        "Default" => "default",
+        "str" => "string",
+        "BigInt" | "f32" | "f64" | "i8" | "i16" | "i32" | "i53" | "u8" | "u16" | "u32" | "u53" => {
+            "number"
+        }
+        _ => return None,
+    };
+    // The primitives are ambient with no prelude at all (spec §4.7), so
+    // pointing at an import would be pointing at something never needed.
+    if home == "number" || name == "str" {
+        return Some(format!(
+            "`std::{name}` was removed: `{name}` is a primitive and is always \
+             in scope — delete the import (its module path, if you need it, \
+             is `std::{home}::{name}`)"
+        ));
+    }
+    Some(if in_base_prelude {
+        format!(
+            "`std::{name}` was removed: `{name}` is in the default prelude \
+             (no import needed), and its module path is `std::{home}::{name}`"
+        )
+    } else {
+        format!("`std::{name}` was removed: its module path is `std::{home}::{name}`")
+    })
+}
+
 fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'src>>) {
     for item in items {
         if let Node::Export(inner) = &item.0 {
@@ -3428,6 +3472,7 @@ impl<'src> Analyzer<'src> {
             trait_body_scopes: HashSet::default(),
             trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
+            print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
             walk_depth: 0,
@@ -25312,6 +25357,9 @@ impl<'src> Analyzer<'src> {
         self.record_reference(source_id, root_span, module_id);
         let mut target_id = module_id;
         let mut namespace_scope_id = self.modules.get(&module_id).unwrap().body.1;
+        // Which scope is `std`'s own root, so the removed-alias steer fires on
+        // `std::print` and not on `std::io::print`'s deeper segments.
+        let root_scope_id = namespace_scope_id;
         for (part, part_span) in segments {
             match self.member_in_namespace(part, namespace_scope_id) {
                 Some(id) => {
@@ -25336,11 +25384,16 @@ impl<'src> Analyzer<'src> {
                 }
                 None => {
                     if report {
+                        let msg =
+                            removed_std_alias(root, part, namespace_scope_id == root_scope_id)
+                                .unwrap_or_else(|| {
+                                    format!("cannot find '{}' in the imported path", part)
+                                });
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
                             span: part_span,
-                            msg: format!("cannot find '{}' in the imported path", part),
+                            msg,
                         });
                     }
                     return false;
@@ -33702,6 +33755,14 @@ pub struct Program<'src> {
     pub list_push_fn_id: Option<Id>,
     // The `std` `panic` intrinsic (if loaded); its calls lower to a `throw`.
     pub panic_fn_id: Option<Id>,
+    // `std::io::print`, captured beside `panic` for the same reason: the
+    // transformer lowers `print` specially and must name the definition rather
+    // than a spelling. It used to be read out of std's package-root scope,
+    // which worked only because `lib.vl` re-exported it as `std::io::print` — an
+    // alias whose whole job was import brevity, deleted by prelude.md §10.2.
+    // A lang-adjacent function says where it lives; it does not ride on a
+    // convenience re-export.
+    pub print_fn_id: Option<Id>,
     // The std `drop<T>(own value)` sink (if loaded): a call to it is rewritten at
     // the site by the argument's concrete type — a resource lowers to its `__drop`
     // helper, data is a no-op consume (destruction.md §6).
@@ -33876,7 +33937,7 @@ pub struct Program<'src> {
     // covers: an import whose leaf resolves to one of these definitions binds
     // a name that is in scope anyway, so removing it changes nothing about
     // what the file means. Matching on the DEFINITION and not just the name is
-    // what keeps `import my_lib::print;` alive beside an ambient `std::print`.
+    // what keeps `import my_lib::print;` alive beside an ambient `std::io::print`.
     pub prelude_bindings: Vec<Id>,
     // A human-readable type label for every typed expression (e.g. `struct
     // Point`, `type i32`, `enum Option<i32>`), pre-rendered during analysis for
@@ -36018,7 +36079,7 @@ struct ModuleResolution {
 /// are equivalent to an importer. Returns the existing path (the flat form wins
 /// when both somehow exist), and a flag set when *both* exist (an ambiguity the
 /// caller reports). `None` when neither exists — the name isn't a module here
-/// (e.g. the `print` in `std::print`), which the caller simply skips.
+/// (e.g. the `print` in `std::io::print`), which the caller simply skips.
 ///
 /// "Exists" means on disk OR in the open-document overlay. Asking only the disk
 /// made an editor-only module invisible: the buffer was registered, but this
@@ -37115,7 +37176,7 @@ fn analyze_inner<'src>(
     analyzer.module_id_by_name.insert("pkg", pkg_module_id);
 
     // `std` is the package root, integrated from `lib.vl`. Its re-exports bind
-    // into this scope; childing it to the global scope lets `std::i32`,
+    // into this scope; childing it to the global scope lets `std::number::i32`,
     // `std::List`, ... reach the builtins.
     let std_scope = analyzer.create_scope(Some(global_scope_id));
     let std_scope_id = analyzer.push_scope(std_scope);
@@ -37226,7 +37287,7 @@ fn analyze_inner<'src>(
         .collect();
     // The entry program addresses std submodules by path (`std::option::..`), so
     // its imports also seed the reachable set. Names that aren't modules (e.g. the
-    // `print` in `std::print`) simply find no file and are skipped. A cross-target
+    // `print` in `std::io::print`) simply find no file and are skipped. A cross-target
     // std import (e.g. `std::http` in a browser build) is reported here — once, at
     // its import — but still loaded, so the rest of the file types cleanly (P3).
     // (Skipped when compiling std itself, whose internal imports aren't user code.)
@@ -37259,6 +37320,12 @@ fn analyze_inner<'src>(
     // loaded before the registry builds, derives or not.
     for core in [
         "boolean", "list", "null", "promise", "compare", "default", "debug", "json", "hash",
+        // `number` and `string` host the numeric and `str` primitives. They
+        // used to load only as a side effect of `std/src/lib.vl` re-exporting
+        // their members for the `std::number::i32` / `std::string::str` short names; the alias
+        // sweep (prelude.md §10.2) deleted those, so the lang items say so
+        // themselves instead of riding on an alias.
+        "number", "string",
     ] {
         to_load.push((Origin::Std, core));
     }
@@ -38083,6 +38150,10 @@ fn analyze_inner<'src>(
             .scopes
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
+        analyzer.print_fn_id = analyzer
+            .scopes
+            .get(io_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("print").copied());
     }
     // Remember `std::asset`'s const-only compile-time channel — lines out (in
     // both spellings), text in, whole files out (in both spellings), a
@@ -39214,6 +39285,7 @@ fn analyze_over_world<'src>(
         list_new_fn_id,
         list_push_fn_id,
         panic_fn_id: analyzer.panic_fn_id,
+        print_fn_id: analyzer.print_fn_id,
         drop_fn_id: analyzer.drop_fn_id,
         asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),

@@ -15,7 +15,7 @@ use crate::support::*;
 fn bare_ret_returns_void_early() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun guard(flag: bool) {
         	if flag {
@@ -86,7 +86,7 @@ fn bare_ret_in_a_value_returning_function_is_rejected() {
 fn ret_in_tail_position_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(): i32 { ret 1 }
 
@@ -103,7 +103,7 @@ fn ret_in_tail_position_emits_one_return() {
 fn bare_void_ret_in_tail_position_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a() { ret }
 
@@ -122,7 +122,7 @@ fn bare_void_ret_in_tail_position_emits_one_return() {
 fn ret_of_a_block_value_in_tail_position_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(): i32 { ret { 1 } }
 
@@ -140,7 +140,7 @@ fn ret_of_a_block_value_in_tail_position_emits_one_return() {
 fn ret_inside_a_nested_block_tail_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(): i32 { { ret 1 } }
 
@@ -157,7 +157,7 @@ fn ret_inside_a_nested_block_tail_emits_one_return() {
 fn ret_inside_a_doubly_nested_block_tail_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(): i32 { { { ret 1 } } }
 
@@ -175,7 +175,7 @@ fn ret_inside_a_doubly_nested_block_tail_emits_one_return() {
 fn ret_inside_a_block_bound_by_a_let_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(): i32 {
         	let y = { ret 1 };
@@ -196,7 +196,7 @@ fn ret_inside_a_block_bound_by_a_let_emits_one_return() {
 fn ret_in_both_if_tail_arms_emits_one_return_each() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(flag: bool): i32 { if flag { ret 1 } else { ret 2 } }
 
@@ -213,7 +213,7 @@ fn ret_in_both_if_tail_arms_emits_one_return_each() {
 fn ret_in_a_match_arm_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(n: i32): i32 {
         	match n {
@@ -238,7 +238,7 @@ fn ret_in_a_match_arm_emits_one_return() {
 fn ret_inside_a_nested_block_in_an_if_arm_emits_one_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(flag: bool): i32 { if flag { { ret 1 } } else { 2 } }
 
@@ -261,7 +261,7 @@ fn ret_inside_a_nested_block_in_an_if_arm_emits_one_return() {
 fn malformed_json_frames_fail_sticky_instead_of_crashing() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ json_codec, decode_json };
@@ -317,7 +317,7 @@ fn function_tail_is_checked_against_the_declared_return_type() {
 fn a_void_call_tail_is_not_a_value_return() {
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun bad(): i32 {
         	print("side effect")
@@ -335,7 +335,7 @@ fn a_void_call_tail_is_not_a_value_return() {
 fn a_void_call_ret_is_not_a_value_return() {
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun bad(): i32 {
         	ret print("side effect");
@@ -382,7 +382,7 @@ fn one_bad_ret_among_good_ones_is_flagged() {
 fn b126_a_void_ret_agrees_with_a_void_body() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun loud(flag: bool) {
         	if flag {
@@ -416,7 +416,7 @@ fn b126_a_void_ret_agrees_with_a_void_body() {
 fn b126_a_ret_only_body_infers_its_return_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun f(x: bool) {
         	ret 1;
@@ -436,7 +436,7 @@ fn b126_a_ret_only_body_infers_its_return_type() {
 fn b126_a_tail_only_body_still_infers_from_its_tail() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun f() {
         	5
@@ -456,7 +456,7 @@ fn b126_a_tail_only_body_still_infers_from_its_tail() {
 fn b126_a_ret_and_a_tail_that_agree_infer_one_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun f(x: bool) {
         	if x {
@@ -532,7 +532,7 @@ fn b126_a_bare_ret_in_a_value_tailed_function_is_refused() {
 #[test]
 fn b126_a_value_ret_beside_a_fall_through_is_refused() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun f(x: bool) {
         	if x {
@@ -586,7 +586,7 @@ fn b126_a_value_ret_beside_an_else_less_if_tail_is_refused() {
 fn b126_a_void_ret_beside_a_value_tail_is_refused() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun f(x: bool) {
         	if x {
@@ -608,7 +608,7 @@ fn b126_a_void_ret_beside_a_value_tail_is_refused() {
 fn b126_rets_that_agree_infer_one_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun sign(x: i32) {
         	if x > 0 {
@@ -666,7 +666,7 @@ fn b126_rets_that_disagree_are_refused_at_the_later_ret() {
 fn b126_a_ret_of_a_generic_call_binds_from_the_tail() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
 
         fun make(flag: bool) {
@@ -695,7 +695,7 @@ fn b126_a_ret_of_a_generic_call_binds_from_the_tail() {
 fn b126_a_generic_function_infers_from_a_ret_of_its_parameter() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun pick<T>(flag: bool, a: T, b: T) {
         	if flag {
@@ -723,7 +723,7 @@ fn b126_a_generic_function_infers_from_a_ret_of_its_parameter() {
 fn b126_a_nested_closures_rets_stay_on_the_closures_frame() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun label(g: |i32| str): str {
         	g(10)
@@ -786,7 +786,7 @@ fn b126_a_nested_closures_rets_stay_on_the_closures_frame() {
 fn b126_a_recursive_unannotated_function_infers_from_its_other_returns() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun count(n: i32) {
         	if n == 0 {
@@ -829,7 +829,7 @@ fn b126_a_recursive_unannotated_function_infers_from_its_other_returns() {
 fn b126_mutually_recursive_unannotated_functions_infer_together() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun a(n: i32) {
         	if n == 0 {
@@ -868,7 +868,7 @@ fn b126_mutually_recursive_unannotated_functions_infer_together() {
 fn b126_a_let_bound_self_call_read_in_the_tail_resolves() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun g(n: i32) {
         	if n == 0 {
@@ -914,7 +914,7 @@ fn b126_a_function_that_only_calls_itself_is_never() {
 fn b126_an_unannotated_impl_method_conforms_by_its_unified_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Shape {
         	fun area(self): i32;
@@ -937,7 +937,7 @@ fn b126_an_unannotated_impl_method_conforms_by_its_unified_type() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Shape {
         	fun area(self): i32;
@@ -966,7 +966,7 @@ fn b126_an_unannotated_impl_method_conforms_by_its_unified_type() {
 fn b126_an_async_function_without_annotation_infers_from_its_rets() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         async fun f(x: bool) {
         	ret 1;
@@ -999,7 +999,7 @@ fn b126_an_async_function_without_annotation_infers_from_its_rets() {
 fn b126_an_unannotated_next_that_leaves_by_ret_drives_the_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Two { at: i32 }
@@ -1026,7 +1026,7 @@ fn b126_an_unannotated_next_that_leaves_by_ret_drives_the_loop() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Num { at: i32 }
 
@@ -1056,7 +1056,7 @@ fn b126_an_unannotated_next_that_leaves_by_ret_drives_the_loop() {
 fn b126_a_ret_only_function_coerces_to_a_closure_slot() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun run(f: |bool| i32) {
         	print(f(true));
@@ -1081,7 +1081,7 @@ fn b126_a_ret_only_function_coerces_to_a_closure_slot() {
 fn b126_an_exhaustive_if_else_of_rets_infers_from_the_rets() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun f(x: bool) {
         	if x {
@@ -1100,7 +1100,7 @@ fn b126_an_exhaustive_if_else_of_rets_infers_from_the_rets() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun f(x: bool) {
         	if x {
@@ -1224,7 +1224,7 @@ fn missing_return_value_regime_2_if_with_no_else_names_the_gap() {
 fn missing_return_value_a_void_call_tail_keeps_the_generic_message() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(n: i32): str {
         	print(n)
@@ -1286,7 +1286,7 @@ fn missing_return_value_regime_3_context_closure_one_liner_names_the_semicolon()
 fn missing_return_value_regime_3_annotated_closure_is_newly_checked() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let scale: |i32| i32 = |value: i32|: i32 { print(value); };
@@ -1304,7 +1304,7 @@ fn missing_return_value_regime_3_annotated_closure_is_newly_checked() {
 fn an_annotated_closure_whose_body_satisfies_its_own_return_type_compiles() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let scale: |i32| i32 = |value: i32|: i32 { value * 2 };
@@ -1344,7 +1344,7 @@ fn missing_return_value_regime_3_parameter_mismatch_keeps_the_whole_value_anchor
 fn missing_return_value_regime_3_through_a_generic_binding() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1370,7 +1370,7 @@ fn missing_return_value_regime_3_through_a_generic_binding() {
 fn missing_return_value_regime_3_through_a_generic_binding_in_tail_position() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1397,7 +1397,7 @@ fn missing_return_value_regime_3_through_a_generic_binding_in_tail_position() {
 fn missing_return_value_regime_3_through_a_generic_binding_in_ret_position() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1425,7 +1425,7 @@ fn missing_return_value_regime_3_through_a_generic_binding_in_ret_position() {
 fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun apply<U>(xs: List<i32>, f: |i32| U): List<U> {
         	xs.map(f)
@@ -1451,7 +1451,7 @@ fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
 fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
 
         fun main() {
@@ -1480,7 +1480,7 @@ fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
 #[test]
 fn missing_return_value_regime_3_through_a_generic_binding_in_a_block_tail() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1507,7 +1507,7 @@ fn missing_return_value_regime_3_through_a_generic_binding_in_a_block_tail() {
 #[test]
 fn missing_return_value_regime_3_through_a_generic_binding_in_an_if_branch() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1538,7 +1538,7 @@ fn missing_return_value_regime_3_through_a_generic_binding_in_an_if_branch() {
 #[test]
 fn missing_return_value_regime_3_through_a_generic_binding_in_a_match_leg() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1574,7 +1574,7 @@ fn missing_return_value_regime_3_through_a_generic_binding_in_a_match_leg() {
 #[test]
 fn b125_a_void_closure_tail_under_an_annotation_reports_once_at_the_brace() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1596,7 +1596,7 @@ fn b125_a_void_closure_tail_under_an_annotation_reports_once_at_the_brace() {
 #[test]
 fn b125_a_closure_tail_disagreeing_with_the_annotation_reports_once_at_the_brace() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1625,7 +1625,7 @@ fn b125_a_closure_tail_disagreeing_with_the_annotation_reports_once_at_the_brace
 #[test]
 fn b132_a_bare_closure_body_disagreeing_with_the_annotation_reports_on_the_expression() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1648,7 +1648,7 @@ fn b132_a_bare_closure_body_disagreeing_with_the_annotation_reports_on_the_expre
 #[test]
 fn b132_a_void_bare_closure_body_reports_on_the_expression() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1673,7 +1673,7 @@ fn b132_a_void_bare_closure_body_reports_on_the_expression() {
 #[test]
 fn b132_a_bare_if_without_else_body_names_the_gap() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1698,7 +1698,7 @@ fn b132_a_bare_if_without_else_body_names_the_gap() {
 #[test]
 fn b132_the_free_function_spelling_reports_on_the_expression() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun apply<U>(xs: List<i32>, f: |i32| U): List<U> {
         	xs.map(f)
@@ -1721,7 +1721,7 @@ fn b132_the_free_function_spelling_reports_on_the_expression() {
 #[test]
 fn b132_an_annotated_bare_body_reports_on_the_expression() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let f = |x: i32|: str x + 1;
@@ -1738,7 +1738,7 @@ fn b132_an_annotated_bare_body_reports_on_the_expression() {
 fn b132_an_agreeing_bare_body_still_compiles_and_runs() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1769,7 +1769,7 @@ fn b132_an_agreeing_bare_body_still_compiles_and_runs() {
 fn b133_a_ret_only_closure_body_infers_its_return_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let f = |x: i32| {
@@ -1791,7 +1791,7 @@ fn b133_a_ret_only_closure_body_infers_its_return_type() {
 fn b133_a_closure_ret_binds_a_callers_return_generic() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun apply<U>(f: || U): U {
         	f()
@@ -1815,7 +1815,7 @@ fn b133_a_closure_ret_binds_a_callers_return_generic() {
 #[test]
 fn b133_a_dead_tail_ret_is_checked_against_the_target() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun run(f: |i32| i32): i32 {
         	f(1)
@@ -1845,7 +1845,7 @@ fn b133_a_dead_tail_ret_is_checked_against_the_target() {
 #[test]
 fn b133_a_dead_tail_ret_reports_once_under_an_expectation() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1874,7 +1874,7 @@ fn b133_a_dead_tail_ret_reports_once_under_an_expectation() {
 fn b133_an_agreeing_ret_closure_binds_from_the_expectation_and_runs() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -1904,7 +1904,7 @@ fn b133_an_agreeing_ret_closure_binds_from_the_expectation_and_runs() {
 fn b133_a_ret_of_a_generic_call_binds_from_the_target() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun run(f: |i32| List<i32>): List<i32> {
         	f(3)
@@ -1938,7 +1938,7 @@ fn b133_a_ret_of_a_generic_call_binds_from_the_target() {
 fn b133_a_from_fn_callback_that_leaves_by_ret_types() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
         import std::option::Option::{ self, Some, None };
 
@@ -1964,7 +1964,7 @@ fn b133_a_from_fn_callback_that_leaves_by_ret_types() {
 #[test]
 fn b133_a_value_ret_beside_a_reachable_fall_through_keeps_the_steer() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let helper = |x: i32| {
@@ -1986,7 +1986,7 @@ fn b133_a_value_ret_beside_a_reachable_fall_through_keeps_the_steer() {
 #[test]
 fn b133_a_value_ret_beside_an_else_less_if_tail_keeps_the_steer() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let f = |x: i32| {
@@ -2013,7 +2013,7 @@ fn b133_a_value_ret_beside_an_else_less_if_tail_keeps_the_steer() {
 #[test]
 fn b133_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let f = |x: bool| {
@@ -2038,7 +2038,7 @@ fn b133_a_ret_disagreeing_with_the_tail_is_refused_at_the_ret() {
 #[test]
 fn b133_rets_that_disagree_are_refused_at_the_later_ret() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let f = |x: i32| {
@@ -2061,7 +2061,7 @@ fn b133_rets_that_disagree_are_refused_at_the_later_ret() {
 #[test]
 fn b133_a_bare_ret_beside_a_value_tail_is_still_refused() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let f = |x: i32| {
@@ -2086,7 +2086,7 @@ fn b133_a_bare_ret_beside_a_value_tail_is_still_refused() {
 fn b133_an_async_block_of_rets_settles_with_their_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let t = async {
@@ -2105,7 +2105,7 @@ fn b133_an_async_block_of_rets_settles_with_their_type() {
 #[test]
 fn b133_an_async_blocks_disagreeing_rets_are_refused() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let flag = true;
@@ -2136,7 +2136,7 @@ fn b133_an_async_blocks_disagreeing_rets_are_refused() {
 fn b133_a_never_called_ret_closure_stays_quiet() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let f = |x| {
@@ -2154,7 +2154,7 @@ fn b133_a_never_called_ret_closure_stays_quiet() {
 #[test]
 fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -2178,7 +2178,7 @@ fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
 #[test]
 fn b125_a_closure_disagreeing_with_receiver_and_annotation_reports_once() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -2201,7 +2201,7 @@ fn b125_a_closure_disagreeing_with_receiver_and_annotation_reports_once() {
 #[test]
 fn b125_an_argument_bound_generic_outranks_the_expectation() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let xs = [1, 2];
@@ -2223,7 +2223,7 @@ fn b125_an_argument_bound_generic_outranks_the_expectation() {
 fn b125_an_unannotated_let_keeps_the_bottom_up_binding() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Point { x: i32, y: i32 }
 
@@ -2248,7 +2248,7 @@ fn b125_an_unannotated_let_keeps_the_bottom_up_binding() {
 fn b125_an_expectation_naming_the_enclosing_generic_binds_through() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun ident<T>(xs: List<T>): List<T> {
         	xs.map(|x| x)
@@ -2329,7 +2329,7 @@ fn a_mistyped_ret_value_no_longer_duplicates_the_synthesized_tail_diagnostic() {
 fn an_exhaustive_if_else_of_bare_rets_is_not_a_missing_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	if value > 0 {
@@ -2354,7 +2354,7 @@ fn an_exhaustive_if_else_of_bare_rets_is_not_a_missing_return() {
 fn an_if_else_if_else_chain_of_bare_rets_is_not_a_missing_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	if value > 0 {
@@ -2383,7 +2383,7 @@ fn an_if_else_if_else_chain_of_bare_rets_is_not_a_missing_return() {
 fn a_nested_if_else_of_bare_rets_is_not_a_missing_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	if value > 0 {
@@ -2414,7 +2414,7 @@ fn a_nested_if_else_of_bare_rets_is_not_a_missing_return() {
 fn a_block_of_rets_in_tail_position_is_not_a_missing_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	{
@@ -2437,7 +2437,7 @@ fn a_block_of_rets_in_tail_position_is_not_a_missing_return() {
 fn a_match_whose_every_leg_rets_is_not_a_missing_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	match value {
@@ -2466,7 +2466,7 @@ fn a_match_whose_every_leg_rets_is_not_a_missing_return() {
 fn an_if_branch_that_rets_beside_one_that_yields_takes_the_yielded_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	if value > 0 {
@@ -2492,7 +2492,7 @@ fn an_if_branch_that_rets_beside_one_that_yields_takes_the_yielded_type() {
 fn a_match_leg_that_rets_beside_one_that_yields_takes_the_yielded_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	match value {
@@ -2518,7 +2518,7 @@ fn a_match_leg_that_rets_beside_one_that_yields_takes_the_yielded_type() {
 fn a_diverging_if_branch_in_a_let_takes_the_live_branchs_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	let label = if value > 0 {
@@ -2546,7 +2546,7 @@ fn a_diverging_if_branch_in_a_let_takes_the_live_branchs_type() {
 fn a_last_statement_if_that_diverges_leaves_no_tail_to_check() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	let doubled = value * 2;
@@ -2574,7 +2574,7 @@ fn a_last_statement_if_that_diverges_leaves_no_tail_to_check() {
 fn a_last_statement_match_that_diverges_leaves_no_tail_to_check() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun classify(value: i32): str {
         	match value {
@@ -2602,7 +2602,7 @@ fn a_last_statement_match_that_diverges_leaves_no_tail_to_check() {
 fn an_async_function_whose_tail_is_an_if_else_of_rets_is_not_a_missing_return() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
 
         fun classify(value: i32): str {
@@ -2633,7 +2633,7 @@ fn an_async_function_whose_tail_is_an_if_else_of_rets_is_not_a_missing_return() 
 fn b133_a_closure_of_rets_infers_like_a_function() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun run(f: |i32| str): str {
         	f(1)
@@ -2662,7 +2662,7 @@ fn b133_a_closure_of_rets_infers_like_a_function() {
 fn a_closure_whose_body_is_an_if_else_of_bare_rets_stays_legal() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun run(f: |i32|) {
         	f(1);
@@ -2779,7 +2779,7 @@ fn a_mistyped_ret_inside_an_exhaustive_if_else_is_still_diagnosed() {
 fn generic_return_rets_bind_like_the_tail() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
 
         fun pick<T>(flag: bool, a: T, b: T): T {
@@ -2804,7 +2804,7 @@ fn generic_return_rets_bind_like_the_tail() {
 fn ret_directs_return_position_generics() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
 
         fun fresh(flag: bool): List<i32> {
@@ -2849,7 +2849,7 @@ fn async_function_rets_check_against_the_declared_type() {
 fn ret_inside_a_closure_exits_the_closure() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
 
         fun apply(f: |i32| i32): i32 {
@@ -3181,7 +3181,7 @@ fn use_segment_error_spans_the_segment() {
 fn bang_unwraps_good_and_returns_bad() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -3242,7 +3242,7 @@ fn bang_unwraps_good_and_returns_bad() {
 fn a_user_try_type_behaves_like_the_std_pair() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::operators::{ Try, Verdict };
 
@@ -3298,7 +3298,7 @@ fn a_user_try_type_behaves_like_the_std_pair() {
 fn bang_works_in_async_functions() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::result::Result::{ self, Ok, Err };
 
@@ -3336,7 +3336,7 @@ fn bang_works_in_async_functions() {
 fn bang_spacing_against_not_equals() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         fun pick(): Option<i32> {
@@ -3424,7 +3424,7 @@ fn explicit_error_conversion_composes_with_bang() {
     // `Err`. All three run and the converted error reaches the caller.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
         import std::option::Option::{ self, Some, None };
 
@@ -3586,7 +3586,7 @@ fn user_try_requires_the_exact_return_type() {
 fn void_is_the_unit_expression() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
 
@@ -3628,7 +3628,7 @@ fn void_is_the_unit_expression() {
 fn lift_maps_flattens_and_short_circuits() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::option::Option::{ self, Some, None };
 
@@ -3685,7 +3685,7 @@ fn lift_maps_flattens_and_short_circuits() {
 fn lift_works_on_results() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -3730,7 +3730,7 @@ fn lift_works_on_results() {
 fn lift_composes_with_bang() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Wrap {
@@ -3850,7 +3850,7 @@ fn lift_is_not_an_assignment_target() {
 fn bang_directs_return_position_generics_into_its_receiver() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::result::Result::{ self, Ok, Err };
         import std::json::FromJson;
@@ -3904,7 +3904,7 @@ fn bare_ret_in_a_value_yielding_closure_is_rejected() {
 fn value_ret_in_a_void_closure_is_rejected() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let helper = |x: i32| {
@@ -3926,7 +3926,7 @@ fn value_ret_in_a_void_closure_is_rejected() {
 fn bare_ret_in_a_void_closure_is_allowed() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let helper = |x: i32| {
@@ -3970,7 +3970,7 @@ fn async_block_rets_check_against_the_tail() {
 fn a_user_lift_container_dispatches_to_its_own_map_and_and_then() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::operators::Lift;
 
@@ -4049,7 +4049,7 @@ fn expression_lift_maps_a_single_receiver() {
     // region types as the container of the body (`Option<i32>` here).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let count = Some(2);
@@ -4069,7 +4069,7 @@ fn expression_lift_operands_are_symmetrical() {
     // runs (source evaluation order; the hoisted eval step).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun bump(log: &mut List<i32>): i32 {
             log.push(1);
@@ -4095,7 +4095,7 @@ fn expression_lift_applicative_short_circuits_lazily() {
     // evaluated (the `&&` precedent) — pinned through the log.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun fetch(log: &mut List<i32>, value: Option<i32>): Option<i32> {
             log.push(1);
@@ -4120,7 +4120,7 @@ fn expression_lift_applicative_short_circuits_lazily() {
 fn expression_lift_on_results_first_error_wins() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ self, Ok, Err };
         fun parse(tag: str): Result<i32, str> {
             if tag == "good" { Ok(21) } else { Err("bad: " + tag) }
@@ -4183,7 +4183,7 @@ fn expression_lift_flattens_a_container_body() {
     // (the chain rule, inherited; pinned by the annotation).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let rows: Option<List<Option<i32>>> = Some([Some(7), None]);
@@ -4211,7 +4211,7 @@ fn expression_lift_identity_is_rejected() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun describe(value: Option<i32>): str { "x" }
         fun main() {
@@ -4232,7 +4232,7 @@ fn expression_lift_in_a_condition_is_rejected() {
     // branch), with the match steer.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let a = Some(1);
@@ -4251,7 +4251,7 @@ fn expression_lift_never_absorbs_a_chain() {
     // absorption rejection): the chain is a sealed atom inside the region.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct User { name: str }
         fun main() {
@@ -4272,7 +4272,7 @@ fn expression_lift_parens_delimit_the_region() {
     // type error.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let a = Some(41);
@@ -4318,7 +4318,7 @@ fn expression_lift_composes_with_bang_outside() {
     // paren, `!` applies to the whole `Option`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun total(a: Option<i32>, b: Option<i32>): Option<i32> {
             let sum = (a? + b?)!;
@@ -4337,7 +4337,7 @@ fn expression_lift_composes_with_bang_outside() {
 fn expression_lift_twice_evaluated_receiver_is_legal() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let size = Some(4);
@@ -4356,7 +4356,7 @@ fn expression_lift_match_subject_region_works() {
     // nothing needs `bool`, so it stays legal.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let count = Some(2);
@@ -4382,7 +4382,7 @@ fn expression_lift_bare_iterable_is_the_identity_error() {
     // match first.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let items = Some([1, 2]);

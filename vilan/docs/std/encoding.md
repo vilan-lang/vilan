@@ -35,7 +35,6 @@ is the one to call when a value is nested inside another decode, and the
 one to write when implementing the trait by hand.
 
 ```vilan
-import std::print;
 import std::json::{ Json, FromJson, JsonValue, parse_json_value };
 import std::result::Result::{ self, Ok, Err };
 
@@ -79,7 +78,6 @@ Written by hand — for a type whose encoding isn't its shape — the
 signatures are the trait's, `Self` included:
 
 ```vilan
-import std::print;
 import std::json::{ Json, FromJson, JsonValue };
 import std::result::Result::{ self, Ok, Err };
 
@@ -151,7 +149,6 @@ two shapes: on a number or a bool it yields `"undefined"`, and on `null` it
 throws. Reach for `kind()` unless you are decoding an enum by hand.
 
 ```vilan
-import std::print;
 import std::json::{ JsonKind, parse_json_value };
 
 fun main() {

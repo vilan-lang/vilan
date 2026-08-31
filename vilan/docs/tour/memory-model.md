@@ -28,8 +28,6 @@ says so. Here's the decision tree you'll internalize quickly:
 Either way, binding an existing value makes a copy:
 
 ```vilan
-import std::print;
-
 struct Counter { value: i32 }
 
 fun main() {
@@ -56,8 +54,6 @@ Sometimes you *want* a function to mutate your value. You lend it a
 **view** with `&mut`:
 
 ```vilan
-import std::print;
-
 struct Counter { value: i32 }
 
 fun bump(&mut c: Counter) {
@@ -110,8 +106,6 @@ copies each element; `for e in &mut list` gives you writable views
 instead:
 
 ```vilan
-import std::print;
-
 fun main() {
 	mut xs: List<i32> = [1, 2, 3];
 	for e in &mut xs {
@@ -157,7 +151,6 @@ When two places need to see the same mutable state, reach for
 the *handle*, and both handles point at one cell. That's the point:
 
 ```vilan
-import std::print;
 import std::shared::Shared;
 
 fun main() {

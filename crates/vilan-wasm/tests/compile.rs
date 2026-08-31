@@ -60,7 +60,7 @@ fn compile(source: &str) -> CompileOutput {
 
 #[test]
 fn a_hello_program_compiles_with_no_filesystem() {
-    let output = compile("import std::print;\nfun main() { print(42); }\n");
+    let output = compile("import std::io::print;\nfun main() { print(42); }\n");
     assert!(
         output.diagnostics.is_empty(),
         "expected a clean compile, got: {:#?}",
@@ -73,7 +73,7 @@ fn a_hello_program_compiles_with_no_filesystem() {
     );
 }
 
-/// The point of the whole slice: `import std::print` resolves out of the
+/// The point of the whole slice: `import std::io::print` resolves out of the
 /// embedded toolchain, through the overlay, with nothing on disk.
 #[test]
 fn a_std_import_resolves_from_the_embedded_toolchain() {
@@ -346,7 +346,7 @@ fn compile_time_styles_come_back_as_css() {
 /// page keep one alive across runs.
 #[test]
 fn compiling_twice_gives_the_same_result() {
-    let source = "import std::print;\nfun main() { print(7); }\n";
+    let source = "import std::io::print;\nfun main() { print(7); }\n";
     let first = compile(source);
     let second = compile(source);
     assert_eq!(
@@ -360,8 +360,8 @@ fn compiling_twice_gives_the_same_result() {
 /// the entry file is replaced, not merged.
 #[test]
 fn a_second_compile_replaces_the_first_program() {
-    let first = compile("import std::print;\nfun main() { print(1); }\n");
-    let second = compile("import std::print;\nfun main() { print(2); }\n");
+    let first = compile("import std::io::print;\nfun main() { print(1); }\n");
+    let second = compile("import std::io::print;\nfun main() { print(2); }\n");
     assert!(first.diagnostics.is_empty());
     assert!(
         second.diagnostics.is_empty(),
@@ -432,7 +432,7 @@ fn the_reported_version_is_the_crate_version() {
 fn recompiling_identical_source_interns_the_entry_text() {
     use vilan_core::leak_tally::{self, LeakSite};
 
-    let source = "import std::print;\nfun main() { print(41047); }\n";
+    let source = "import std::io::print;\nfun main() { print(41047); }\n";
     // The tally is THREAD-LOCAL: every reset, both compiles, and every read
     // ride one spawn — `compile()` would nest a second thread and lose it.
     let _guard = compiler();
@@ -500,7 +500,7 @@ fn compile_for_node(source: &str) -> CompileOutput {
 }
 
 const SERVER_PROGRAM: &str = "import std::http::{ Response, Server };\n\
-    import std::print;\n\n\
+    import std::io::print;\n\n\
     async fun main() {\n\
     \tServer::builder().port(3000).on_request(|request| {\n\
     \t\tResponse::builder().body(\"ok\").build()\n\
@@ -722,10 +722,19 @@ fn import_path_completion_enumerates_the_embedded_toolchain() {
             "std::{module} missing: {offered:?}"
         );
     }
+    // std's `lib.vl` surface publishes NOTHING since the alias sweep
+    // (prelude.md §10.2). The two prelude modules are ordinary modules of the
+    // embedded toolchain and enumerate as such.
     assert!(
-        offered.contains(&"print"),
-        "the surface's re-exports are offered too: {offered:?}"
+        !offered.contains(&"print"),
+        "`std::print` was removed; `print` lives at `std::io::print`: {offered:?}"
     );
+    for module in ["prelude", "web", "io"] {
+        assert!(
+            offered.contains(&module),
+            "std::{module} missing: {offered:?}"
+        );
+    }
     assert!(
         !offered.contains(&"lib"),
         "the surface file is not a module: {offered:?}"
@@ -753,7 +762,7 @@ fn import_path_completion_enumerates_the_embedded_toolchain() {
 /// keyword as plain text.
 #[test]
 fn construct_snippets_and_call_shapes_come_back_as_snippets() {
-    let program = "import std::print;\n\nfun main() {\n\t\n}\n";
+    let program = "import std::io::print;\n\nfun main() {\n\t\n}\n";
     let items = complete_after(program, program, 3, 1);
     let for_snippet = named(&items, "for … in { }");
     assert_eq!(for_snippet.kind, "snippet");
@@ -814,7 +823,7 @@ fn completion_before_any_compile_is_empty_and_an_out_of_range_position_clamps() 
             vilan_wasm::complete_program("fun main() {}\n", 0, 5).is_empty(),
             "no analysis retained on this thread yet (the fresh spawn guarantees it)"
         );
-        let program = "import std::print;\n\nfun main() {\n\tprint(1);\n}\n";
+        let program = "import std::io::print;\n\nfun main() {\n\tprint(1);\n}\n";
         compile_program(program);
         vilan_wasm::complete_program(program, 999, 999)
     });

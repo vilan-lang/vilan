@@ -7,8 +7,6 @@
 A struct is a named record type:
 
 ```vilan
-import std::print;
-
 struct Task {
 	id: i32,
 	name: str,
@@ -35,8 +33,6 @@ data. If you've used discriminated unions in TypeScript, this is that
 idea with language support:
 
 ```vilan
-import std::print;
-
 enum Shape {
 	Circle(f64),
 	Rectangle(f64, f64),
@@ -69,7 +65,6 @@ A variant with no payload can instead carry the value it stands for —
 the number or string the outside world already speaks:
 
 ```vilan
-import std::print;
 import std::option::Option;
 
 enum Align {
@@ -123,8 +118,6 @@ wire change.
 Methods live in `impl` blocks, separate from the data:
 
 ```vilan
-import std::print;
-
 struct Counter {
 	value: i32,
 }
@@ -162,7 +155,6 @@ Type parameters work on functions, structs, enums, and impls. A bound
 constrains what the code may do with the parameter:
 
 ```vilan
-import std::print;
 import std::compare::PartialOrd;
 
 struct Pair<T> {
@@ -202,8 +194,6 @@ A trait declares a capability. `impl Type with Trait` provides it. Trait
 methods can have default bodies written in terms of the required ones:
 
 ```vilan
-import std::print;
-
 trait Greet {
 	fun name(self): str;
 
@@ -234,8 +224,6 @@ bound on a function or an impl is inside theirs — so a default can call
 the bound's methods on a value of that type:
 
 ```vilan
-import std::print;
-
 trait Label {
 	fun label(self): str;
 }
@@ -313,7 +301,6 @@ write the boilerplate:
 | `Wire` | serialization for rpc payloads (`std::wire`) |
 
 ```vilan
-import std::print;
 import std::debug::Debug;
 
 [derive(PartialEq, Debug)]

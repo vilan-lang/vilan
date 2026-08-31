@@ -19,7 +19,6 @@ impl Shared<type T> {
 ```
 
 ```vilan
-import std::print;
 import std::shared::Shared;
 
 fun main() {
@@ -64,7 +63,6 @@ impl Arena<type T> {
 ```
 
 ```vilan
-import std::print;
 import std::arena::{ Arena, Handle };
 import std::option::Option::{ self, Some, None };
 
@@ -109,7 +107,6 @@ phantom; only `{ index, generation }` travels, so a handle names entities
 whose type is not itself Wire.
 
 ```vilan
-import std::print;
 import std::arena::{ Arena, Handle };
 import std::json::{ encode_json, decode_json };
 import std::result::Result::{ self, Ok, Err };
@@ -152,7 +149,6 @@ resolves to `None` in every other one rather than naming that arena's slot of
 the same index.
 
 ```vilan
-import std::print;
 import std::arena::{ Arena, Handle };
 import std::option::Option::{ self, Some, None };
 

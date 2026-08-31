@@ -43,7 +43,6 @@ body argument must be a closure literal (or an injected closure value,
 a `List<T>`'s element type is inferred from `push`.
 
 ```vilan
-import std::print;
 import std::context::Context;
 
 let flavor: Context<i32> = Context::new();
@@ -152,7 +151,6 @@ at its creation site**, and the capture is what its body reads,
 regardless of where the closure is later called:
 
 ```vilan
-import std::print;
 import std::context::Context;
 
 let flavor: Context<i32> = Context::new();

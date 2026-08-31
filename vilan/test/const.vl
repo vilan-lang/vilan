@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `const expr` evaluates at compile time (proposal/const-eval.md): a
 // weak-precedence prefix capturing to the bracket/comma boundary; the

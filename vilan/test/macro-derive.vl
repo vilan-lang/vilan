@@ -1,5 +1,5 @@
 import std::display::{ Display, format };
-import std::print;
+import std::io::print;
 
 // The macro engine, Phase 1 (macro-engine.md §2): a user-land derive. The
 // macro compiles hermetically against macro_std, runs in the expansion

@@ -62,7 +62,7 @@ pub fn round_budget(first_round: Duration) -> Duration {
 ///
 /// | project                            | idle    | load avg ~28 |
 /// |------------------------------------|---------|--------------|
-/// | the reference (`std::print` only)  | 227 ms  | 490 ms       |
+/// | the reference (`std::io::print` only)  | 227 ms  | 490 ms       |
 /// | a node app importing `std::time`   | 6.07 s  | 11.4 s       |
 /// | `vilan/benchmarks`, the heaviest   | 13.4 s  | 24.5 s       |
 ///
@@ -109,7 +109,7 @@ pub fn run_liveness() -> Duration {
 /// bounds above are denominated in. Measured once, lazily, and only by a test
 /// that needs it.
 ///
-/// The reference project imports `std::print` and nothing else, which is what
+/// The reference project imports `std::io::print` and nothing else, which is what
 /// keeps the probe cheap (~0.23 s idle) rather than representative in weight:
 /// per the table on `RUN_LIVENESS_REFERENCE_UNITS`, a 60x heavier compile slows
 /// down by the same factor under the same contention, so the cheap one measures
@@ -137,7 +137,7 @@ fn measure_reference_compile() -> Duration {
         )?;
         std::fs::write(
             project.join("src/main.vl"),
-            "import std::print;\n\nfun main() {\n\tprint(\"reference\");\n}\n",
+            "import std::io::print;\n\nfun main() {\n\tprint(\"reference\");\n}\n",
         )
     });
     if written.is_err() {

@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 trait Combine<B = Self> {
 	fun value_of(self): i32;

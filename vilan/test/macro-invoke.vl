@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // The macro engine, Phase 2 (macro-engine.md §2): `macro name(args)`
 // invocations. Item position stamps out declarations; expression position

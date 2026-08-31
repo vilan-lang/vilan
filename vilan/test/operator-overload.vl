@@ -1,5 +1,5 @@
 import std::operators::{ Add, Mul };
-import std::print;
+import std::io::print;
 
 struct Vec2 { x: i32, y: i32 }
 

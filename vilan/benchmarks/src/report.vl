@@ -1,6 +1,6 @@
 // Shared report helpers.
 
-import std::print;
+import std::io::print;
 
 [extern("Math.round")]
 external fun round(value: f64): i32;

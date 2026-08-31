@@ -3,7 +3,6 @@
 // the editor commits per keystroke through drafts.
 
 import std::option::Option::{ None, Some, self };
-import std::print;
 import std::reactive::{ Draft, DraftState, Signal, draft };
 import std::result::Result::{ Err, Ok, self };
 import std::router::{ link, navigate };

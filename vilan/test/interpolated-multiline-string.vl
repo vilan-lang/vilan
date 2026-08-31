@@ -1,5 +1,5 @@
 import std::display::{ Display, format };
-import std::print;
+import std::io::print;
 
 // `i"""` is H4's raw multi-line string with H7's holes. Two rules, in this
 // order: the trimming is applied to the literal's RAW text (holes and `\{`/`\}`

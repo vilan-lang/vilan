@@ -4,7 +4,7 @@
 // paren-delimited regions composing with `!`, a twice-evaluated receiver, and
 // §4's TRAIT path — a user `Lift` container lifting through its own
 // `map`/`and_then`, nested left to right.
-import std::print;
+import std::io::print;
 import std::display::format;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };

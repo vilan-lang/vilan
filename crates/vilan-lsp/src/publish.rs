@@ -699,7 +699,7 @@ mod tests {
         let (dir, _) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                "import std::io::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
                  fun main() { print(A); print(Z); }\n",
             ),
             (
@@ -757,7 +757,7 @@ mod tests {
     // exactly the chain.
     #[test]
     fn a_cross_file_requirement_chain_publishes_each_hop_as_related_information() {
-        let main_text = "import std::print;\nimport pkg::lib::read_it;\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
+        let main_text = "import std::io::print;\nimport pkg::lib::read_it;\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
         let lib_text = "import std::context::Context;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\n";
         let (dir, _) = analyze_workspace(&[("main.vl", main_text), ("lib.vl", lib_text)]);
         let mut state = PublishState::new();
@@ -828,7 +828,7 @@ mod tests {
     // its related information.
     #[test]
     fn a_trace_call_hop_publishes_its_own_diagnostic_at_the_call() {
-        let text = "import std::context::Context;\nimport std::print;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
+        let text = "import std::context::Context;\nimport std::io::print;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
         let group = published(text);
         let hops: Vec<&Diagnostic> = group
             .iter()
@@ -887,7 +887,7 @@ mod tests {
     // of both stories, not a stacked pair of identical squiggles.
     #[test]
     fn two_reads_sharing_an_upstream_call_merge_into_one_hop_diagnostic() {
-        let text = "import std::context::Context;\nimport std::print;\nlet current: Context<i32> = Context::new();\nfun first(): i32 {\n\tcurrent.get()\n}\nfun second(): i32 {\n\tcurrent.get() + first()\n}\nfun main() {\n\tprint(second());\n}\nmain();\n";
+        let text = "import std::context::Context;\nimport std::io::print;\nlet current: Context<i32> = Context::new();\nfun first(): i32 {\n\tcurrent.get()\n}\nfun second(): i32 {\n\tcurrent.get() + first()\n}\nfun main() {\n\tprint(second());\n}\nmain();\n";
         let group = published(text);
         let hops: Vec<&Diagnostic> = group
             .iter()
@@ -966,7 +966,7 @@ mod tests {
     // related-information pin above, now asserting main.vl's own group.
     #[test]
     fn a_cross_file_chains_hop_diagnostics_publish_in_the_hops_file() {
-        let main_text = "import std::print;\nimport pkg::lib::read_it;\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
+        let main_text = "import std::io::print;\nimport pkg::lib::read_it;\nfun relay(): i32 {\n\tread_it()\n}\nfun main() {\n\tprint(relay());\n}\nmain();\n";
         let lib_text = "import std::context::Context;\nlet current: Context<i32> = Context::new();\nfun read_it(): i32 {\n\tcurrent.get()\n}\n";
         let (dir, _) = analyze_workspace(&[("main.vl", main_text), ("lib.vl", lib_text)]);
         let mut state = PublishState::new();
@@ -1015,7 +1015,7 @@ mod tests {
     // package's file carried the diagnostic.
     #[test]
     fn a_dependency_reads_demotion_publishes_at_the_users_call() {
-        let main_text = "import std::print;\nimport depctx::read_it;\nfun main() {\n\tprint(read_it());\n}\nmain();\n";
+        let main_text = "import std::io::print;\nimport depctx::read_it;\nfun main() {\n\tprint(read_it());\n}\nmain();\n";
         let (dir, _) = analyze_workspace(&[
             ("app/src/main.vl", main_text),
             (
@@ -1092,7 +1092,7 @@ mod tests {
         let (dir, _) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::marked::answer;\nfun main() { print(answer()); }\n",
+                "import std::io::print;\nimport pkg::marked::answer;\nfun main() { print(answer()); }\n",
             ),
             ("marked.vl", &format!("\u{feff}{stripped}")),
         ]);
@@ -1199,7 +1199,7 @@ mod tests {
         let (dir, _) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
+                "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
             ("broken.vl", "fun answer(): i32 {\n\t\"not a number\"\n}\n"),
         ]);
@@ -1291,11 +1291,11 @@ mod tests {
         let (dir, _) = analyze_workspace(&[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
+                "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
             (
                 "other.vl",
-                "import std::print;\nimport pkg::broken::answer;\nfun main() { print(answer() + 1); }\n",
+                "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer() + 1); }\n",
             ),
             ("broken.vl", broken),
         ]);
@@ -1335,7 +1335,7 @@ mod tests {
         // the last-writer-wins case the union exists for.
         std::fs::write(
             dir.join("main.vl"),
-            "import std::print;\nfun main() { print(1); }\n",
+            "import std::io::print;\nfun main() { print(1); }\n",
         )
         .unwrap();
         let (_, main_edited) = open(&dir, "main.vl");

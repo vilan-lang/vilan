@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::style::{ Color, Length, Style, space, style };
 
 // The `css` block (proposal/css-block.md): CSS-shaped sugar over the `style()`

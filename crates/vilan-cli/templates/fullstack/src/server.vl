@@ -6,7 +6,6 @@
 import std::build::require_build;
 import std::document::require_shell;
 import std::http::{ Request, Response, Server };
-import std::print;
 import pkg::shared::greeting;
 
 async fun main() {

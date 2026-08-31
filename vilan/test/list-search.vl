@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 fun main() {
 	let xs = [10, 20, 30, 20];

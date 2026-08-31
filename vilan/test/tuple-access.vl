@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // Positional tuple access (spec §5.9): `.0`/`.1` read elements, chains
 // traverse nested tuples over the FLAT storage (a tuple-typed element is a

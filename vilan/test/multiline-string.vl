@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `"""` is a RAW multi-line string: the whitespace before the closing
 // delimiter is the indentation prefix stripped from every line, the newlines

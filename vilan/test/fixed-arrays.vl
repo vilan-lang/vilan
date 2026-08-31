@@ -4,7 +4,7 @@
 // value-copy independence (scalar and aggregate), params/returns, nesting, and
 // `.len()` (folds to the constant; a call subject still evaluates — §10), and
 // destructuring `let [a, b] = arr` (irrefutable, count = the type's length).
-import std::print;
+import std::io::print;
 
 struct Cell {
 	n: i32,

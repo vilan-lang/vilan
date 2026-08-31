@@ -9,7 +9,7 @@
 // Every call folds at compile time, so the emitted JS holds plain strings and
 // no runtime call survives.
 import std::asset;
-import std::print;
+import std::io::print;
 
 fun estate(): List<str> {
 	mut urls: List<str> = [];

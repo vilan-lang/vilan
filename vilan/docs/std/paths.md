@@ -23,7 +23,6 @@ fun relative(from: str, to: str): Option<str>
 ```
 
 ```vilan
-import std::print;
 import std::path;
 
 fun main() {
@@ -67,7 +66,6 @@ not modelled is said plainly rather than half-supported:
 ## `normalize` is canonical, which means the trailing separator goes
 
 ```vilan
-import std::print;
 import std::path;
 
 fun main() {
@@ -93,7 +91,6 @@ somewhere else.
 ## `join` concatenates; `resolve` follows a reference
 
 ```vilan
-import std::print;
 import std::path;
 
 fun main() {
@@ -115,7 +112,6 @@ file as hidden — it does not name a type — and getting this wrong is the mos
 common bug in hand-rolled path code.
 
 ```vilan
-import std::print;
 import std::path;
 
 fun main() {
@@ -134,7 +130,6 @@ holds for every `p`.
 ## `starts_with` compares components, `str::starts_with` compares text
 
 ```vilan
-import std::print;
 import std::path;
 
 fun main() {
@@ -151,7 +146,6 @@ derive a key or an asset URL is the same mistake in the other direction.
 divide the same work on text:
 
 ```vilan
-import std::print;
 import std::path;
 import std::option::{ Some, None };
 
@@ -174,7 +168,6 @@ it; `strip_prefix` is "is this mine, and if so what do I call it", and says
 ## `relative` inverts `resolve`
 
 ```vilan
-import std::print;
 import std::path;
 import std::option::{ Some, None };
 

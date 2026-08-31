@@ -2,7 +2,7 @@
 // order, so the output is a, b, c regardless of each task's delay. It is
 // `async`, so the call is implicitly awaited to a `List<str>` — no explicit
 // `await`.
-import std::print;
+import std::io::print;
 import std::task::Task;
 
 [extern("node:timers/promises", "setTimeout")]

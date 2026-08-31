@@ -145,7 +145,7 @@ fn assert_release_matches_debug(source: &str, expected_stdout: &str) {
 fn two_module_level_functions_never_share_a_name() {
     assert_release_matches_debug(
         r#"
-import std::{ print, u32 };
+import std::{ io::print, number::u32 };
 
 trait Default {
 	fun default(): Self;
@@ -189,7 +189,7 @@ fun main() {
 fn a_generic_instance_never_collides_with_a_module_binding() {
     assert_release_matches_debug(
         r#"
-import std::print;
+import std::io::print;
 
 fun main() {
 	mut numbers = List::new();
@@ -212,7 +212,7 @@ fun main() {
 fn a_match_temp_never_collides_inside_its_own_function() {
     assert_release_matches_debug(
         r#"
-import std::print;
+import std::io::print;
 
 fun total_width(rows: List<(List<i32>, i32)>): i32 {
 	mut total = 0;
@@ -247,7 +247,7 @@ fn a_module_level_temp_never_redeclares_a_module_binding() {
         r#"
 import std::option::Option::{ self, Some, None };
 import std::iterator::Iterator;
-import std::print;
+import std::io::print;
 
 mut produced = 0;
 
@@ -294,7 +294,7 @@ fun main() {
 fn an_inference_fold_cannot_expose_a_collision() {
     assert_release_matches_debug(
         r#"
-import std::print;
+import std::io::print;
 import std::option::Option::{ self, Some, None };
 
 fun twice(n: i32): i32 {
@@ -331,7 +331,7 @@ fun main() {
 fn tight_printing_never_fuses_two_operators_into_one_token() {
     assert_release_matches_debug(
         r#"
-import std::print;
+import std::io::print;
 
 fun main() {
 	let n = 2;
@@ -349,7 +349,7 @@ fun main() {
     // its correctness with one space at one junction, not with padding
     // everywhere.
     let emitted = compile(
-        "import std::print;\n\nfun main() {\n\tprint(7 - 9);\n\tprint(3 - -2);\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(7 - 9);\n\tprint(3 - -2);\n}\n",
         BuildOptions::from_preset(Preset::Release),
     )
     .expect("the release build");
@@ -372,7 +372,7 @@ fn a_loop_condition_is_reevaluates_under_release() {
     // pin holds it under both release configurations too.
     assert_release_matches_debug(
         r#"
-import std::print;
+import std::io::print;
 
 import std::option::Option::{ None, Some, self };
 

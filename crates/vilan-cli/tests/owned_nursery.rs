@@ -94,7 +94,7 @@ fn owner_drop_cancels_an_in_flight_task_runs_its_drops_and_stays_silent() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::drop::Drop;
 import std::task::OwnedNursery;
 import std::time::sleep;
@@ -172,7 +172,7 @@ fn a_detached_failure_reports_with_origin_and_does_not_cancel_the_sibling() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::io::panic;
 import std::task::OwnedNursery;
 import std::time::sleep;
