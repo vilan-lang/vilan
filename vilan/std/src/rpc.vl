@@ -1303,12 +1303,18 @@ impl ReactiveClient with Disposable {
 	/// transport → handler → client, and one line cuts it. Clearing `routes`
 	/// releases the mirrors themselves.
 	///
-	/// Nothing in std calls this today: a browser app's `ReactiveClient` is one
-	/// per connection and lives as long as the tab, which is why A29 measured
-	/// the SERVER half (one session per connection, churned per disconnect) as
-	/// the leak that costs. It exists so the two halves are symmetric, and so a
-	/// host that DOES retire a client — a test, an HMR teardown, a reconnect
-	/// that builds a fresh one — has the seam to call.
+	/// std calls this on ONE path (`close_for_good`, backlog A30): a connection
+	/// that reaches the terminal `Closed` because its mirrors can never be
+	/// rebound disposes the client holding them. Everything else is the host's —
+	/// a test, an HMR teardown, a reconnect that builds a fresh client — which is
+	/// why it stays public. A browser app's `ReactiveClient` is otherwise one per
+	/// connection and lives as long as the tab, which is why A29 measured the
+	/// SERVER half (one session per connection, churned per disconnect) as the
+	/// leak that costs.
+	///
+	/// IDEMPOTENT: both lines assign an empty, so disposing an
+	/// already-disposed client — an app that tore its own down before the socket
+	/// closed for good — is a no-op rather than a fault.
 	fun dispose(self) {
 		(self.transport).clear_on_frame();
 		self.routes.write() = [];
@@ -1515,6 +1521,20 @@ fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
 	dialed.map_err(|reason: str| RpcError::Transport(reason))
 }
 
+/// The terminal refusal, shared by both branches that reach it: the duplex goes
+/// to `Closed`, the socket is closed, and the client half disposes ITSELF
+/// (backlog A30). The mirrors on this socket can never be rebound — that is
+/// precisely what put us here — so the routes and the transport's inbound
+/// handler are holding a graph nothing can ever update again; clearing them
+/// completes the honest report instead of leaving a wedged client retaining it.
+/// A `ReactiveClient` an app already disposed is unharmed: `dispose` is
+/// idempotent (it assigns empties, it does not consume).
+fun close_for_good(socket: SocketDuplex, client: ReactiveClient) {
+	socket.state.set(ConnectionState::Closed);
+	socket.socket.read().close();
+	client.dispose();
+}
+
 /// Re-attach a generated client's mirrors after a reconnect (§2.5): re-verify
 /// the contract (a REDEPLOYED server with a drifted surface must not feed
 /// typed mirrors — the duplex closes for good instead), re-`__attach` under
@@ -1524,21 +1544,24 @@ fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
 ///
 /// Either round-trip can fail, and the two failures are NOT the same. An
 /// UNREACHABLE server is a delay: the socket is already dying, the next drop
-/// cycle redials, and this run leaves the mirrors alone. A server that answers
-/// and REFUSES — a drifted contract, or an `__attach` it will not honour — is
-/// a desync: the mirrors can never be rebound on this connection, so the
-/// duplex goes to the terminal `Closed` rather than reporting Connected over
-/// the previous connection's dead channel ids.
+/// cycle redials, and this run leaves the mirrors alone — nothing is disposed,
+/// because those mirrors resync on the next successful re-attach. A server that
+/// answers and REFUSES — a drifted contract, or an `__attach` it will not
+/// honour — is a desync: the mirrors can never be rebound on this connection,
+/// so the duplex goes to the terminal `Closed` (`close_for_good`) rather than
+/// reporting Connected over the previous connection's dead channel ids.
 fun reattach_mirrors(
 	socket: SocketDuplex,
 	transport: SocketTransport,
 	codec: Codec,
+	client: ReactiveClient,
 	expected_contract: str,
 	rebinds: List<|i32, Frame| void>,
 ) {
 	let remote: Result<str, RpcError> = call(transport, codec, "__contract", []);
 	match remote {
-		// Unreachable again already — the next drop cycle handles it.
+		// Unreachable again already — the next drop cycle handles it, and the
+		// mirrors it will resync must still be routed when it does.
 		Err(let _unreachable) => {},
 		Ok(let hash) => {
 			if hash == expected_contract {
@@ -1553,10 +1576,7 @@ fun reattach_mirrors(
 					// typed desync the drift branch below refuses, only
 					// quieter. Close for good; the app restarts on its own
 					// terms.
-					Err(let _failed) => {
-						socket.state.set(ConnectionState::Closed);
-						socket.socket.read().close();
-					},
+					Err(let _failed) => close_for_good(socket, client),
 					Ok(let channels) => {
 						mut index = 0;
 						for rebind in rebinds {
@@ -1569,8 +1589,7 @@ fun reattach_mirrors(
 			} else {
 				// The service surface changed under us: a typed desync in
 				// waiting. Close for good; the app restarts on its own terms.
-				socket.state.set(ConnectionState::Closed);
-				socket.socket.read().close();
+				close_for_good(socket, client)
 			}
 		},
 	}
@@ -1887,7 +1906,7 @@ macro fun service(item: Item): Source {
 	};
 	connect = connect
 		.line(i"let rebinds: List<|i32, Frame| void> = {rebind_list};")
-		.line("socket.on_reconnect.write().push(|| {\n" + indent("reattach_mirrors(socket, transport, codec, " + quote(hash) + ", rebinds);", 1) + "\n});");
+		.line("socket.on_reconnect.write().push(|| {\n" + indent("reattach_mirrors(socket, transport, codec, reactive, " + quote(hash) + ", rebinds);", 1) + "\n});");
 	let field_lines = join(ok_fields, ",\n");
 	connect = connect.expr(i"Result::Ok({target.client_name} \{\n" + indent(field_lines, 1) + "\n})");
 	let connect_impl = impl_of(target.client_name)

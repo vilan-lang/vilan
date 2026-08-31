@@ -355,8 +355,10 @@ at-least-once — see
 > re-running the contract check and re-attaching each subscription; you
 > never re-subscribe manually — and if either step is refused, the
 > connection goes `Closed` too, rather than reporting itself live over
-> mirrors that can no longer update. The full state machine is in the
-> [rpc reference](../std/rpc.md).
+> mirrors that can no longer update. A refusal also tears the client's
+> own wiring down, since those mirrors are unreachable from that socket
+> forever; a redial that is merely slow does not. The full state machine
+> is in the [rpc reference](../std/rpc.md).
 
 ## Authentication
 
