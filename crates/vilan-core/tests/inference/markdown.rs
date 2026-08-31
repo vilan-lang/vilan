@@ -3600,6 +3600,192 @@ value
     );
 }
 
+// --- F14: `str`'s case-mapping surface says what it does ---------------------
+//
+// `to_lowercase_ascii` used to lower to the host's `toLowerCase` — the FULL
+// Unicode mapping wearing an ASCII name, so `"STRASSE-Ǳ".to_lowercase_ascii()`
+// case-mapped U+01F1 as no ASCII operation could. The full pair is now
+// `to_uppercase`/`to_lowercase` and the `_ascii` suffix means what it says:
+// `A`..`Z` shifted, every other code unit untouched, the length preserved.
+//
+// Every pin below is a BEHAVIOR pin, because behavior is the whole claim — the
+// spelling `to_lowercase_ascii` never stopped compiling, it started meaning
+// something narrower, so no diagnostic marks the difference and only a run
+// does.
+
+#[test]
+fn to_uppercase_maps_full_unicode_and_can_grow() {
+    // One-to-many mappings apply, so the length is NOT preserved: that is the
+    // tell that this is the host's mapping and not a code-unit shift.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print("Straße".to_uppercase());
+            print("Straße".len());
+            print("Straße".to_uppercase().len());
+            print("ǳ".to_uppercase());
+        }
+        main();
+        "#,
+        "STRASSE
+6
+7
+Ǳ
+",
+    );
+}
+
+#[test]
+fn to_lowercase_is_the_full_unicode_mirror() {
+    // The rename's subject: `to_lowercase` exists, and it is the full mapping.
+    // U+01F1 `Ǳ` lowers to U+01F3 `ǳ`, which no ASCII operation could reach,
+    // and `İ` lowers to TWO code units — so indices do not survive the call.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print("STRASSE-Ǳ".to_lowercase());
+            print("İ".len());
+            print("İ".to_lowercase().len());
+        }
+        main();
+        "#,
+        "strasse-ǳ
+1
+2
+",
+    );
+}
+
+#[test]
+fn to_lowercase_ascii_shifts_only_the_twenty_six_letters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print("AbC-123_xYz".to_lowercase_ascii());
+            // `ß`, `Ǳ`, `İ` and every accented letter pass through untouched,
+            // and the result is the same LENGTH as the receiver — which is what
+            // makes an index into one an index into the other.
+            let mixed = "Straße-Ǳ-İ-É";
+            print(mixed.to_lowercase_ascii());
+            print(mixed.len() == mixed.to_lowercase_ascii().len());
+            print("".to_lowercase_ascii().is_empty());
+        }
+        main();
+        "#,
+        "abc-123_xyz
+straße-Ǳ-İ-É
+true
+true
+",
+    );
+}
+
+#[test]
+fn to_uppercase_ascii_shifts_only_the_twenty_six_letters() {
+    // The mirror, with the length contrast that names the difference: the full
+    // `to_uppercase` expands `ß` to `SS` and grows the string; the ASCII one
+    // leaves it alone and cannot grow at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print("AbC-123_xYz".to_uppercase_ascii());
+            print("straße".to_uppercase_ascii());
+            print("straße".to_uppercase_ascii().len());
+            print("straße".to_uppercase().len());
+            print("Ǳ-İ-é".to_uppercase_ascii());
+            print("".to_uppercase_ascii().is_empty());
+        }
+        main();
+        "#,
+        "ABC-123_XYZ
+STRAßE
+6
+7
+Ǳ-İ-é
+true
+",
+    );
+}
+
+#[test]
+fn the_ascii_case_pair_round_trips_mixed_input() {
+    // Up-then-down returns the ASCII letters to lower case and leaves every
+    // other unit exactly where it started — the property std's protocol call
+    // sites (mime rows, header names, tag names) actually depend on.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let mixed = "Content-Type: text/HTML; charset=UTF-8 — Straße/Ǳ";
+            print(mixed.to_uppercase_ascii().to_lowercase_ascii() == mixed.to_lowercase_ascii());
+            print(mixed.to_lowercase_ascii().to_uppercase_ascii() == mixed.to_uppercase_ascii());
+            print(mixed.to_lowercase_ascii().len() == mixed.len());
+            print(mixed.to_uppercase_ascii().len() == mixed.len());
+        }
+        main();
+        "#,
+        "true
+true
+true
+true
+",
+    );
+}
+
+#[test]
+fn the_ascii_fold_leaves_the_kelvin_sign_where_the_unicode_fold_moves_it() {
+    // The receipt for `document.vl`'s tag scanner. U+212A KELVIN SIGN lowers to
+    // a plain ASCII `k` under the host's full mapping, so `is_name_start` —
+    // "lower it, then test `a` <= c <= `z`" — answered TRUE for it and opened a
+    // tag on a character HTML says can start no name. The ASCII fold does not
+    // touch it. (The literal below is U+212A, NOT the ASCII `K` it renders as.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let kelvin = "K";
+            print(kelvin.to_lowercase() == "k");
+            print(kelvin.to_lowercase_ascii() == "k");
+            print(kelvin.to_lowercase_ascii() == kelvin);
+        }
+        main();
+        "#,
+        "true
+false
+true
+",
+    );
+}
+
+#[test]
+fn heading_id_folds_ascii_and_non_ascii_by_their_own_rules() {
+    // `heading_id` is the one std site that wants BOTH folds, and the migration
+    // split it accordingly: an ASCII `A`..`Z` takes the ASCII shift (the
+    // guarded branch), while a kept non-ASCII letter takes the host's full
+    // fold — mdBook's own case rule, which `école-été` is the evidence for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::markdown::{ heading_id, Inline };
+        fun main() {
+        	mut ascii: List<Inline> = [];
+        	ascii.push(Inline::Text("Setup AND Teardown"));
+        	print(heading_id(ascii));
+        	mut accented: List<Inline> = [];
+        	accented.push(Inline::Text("École Été"));
+        	print(heading_id(accented));
+        }
+        "#,
+        "setup-and-teardown
+école-été
+",
+    );
+}
+
 // --- B139: the recorded return answer is the FUNCTION's, never a caller's ----
 //
 // `infer_function_returns` serves `inferred_return_types` to skip re-deriving a

@@ -163,6 +163,7 @@ fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<Shel
 			let file = file_name_of(src);
 			if file == build.bundle {
 				loads_bundle = true;
+				// `type` is matched ASCII-case-insensitively, the HTML rule.
 				if build.classic_script && attribute(script, "type").to_lowercase_ascii() == "module" {
 					faults.push(ShellFault::ModuleScriptWithChunks(build.bundle));
 				}
@@ -664,8 +665,8 @@ fun attribute(tag: Tag, name: str): str {
 }
 
 /// Whether a `<link rel>` value names a stylesheet. The attribute is a
-/// space-separated, case-insensitive token list (`rel="stylesheet preload"` is
-/// legal), so it is read as one rather than compared whole.
+/// space-separated, ASCII-case-insensitive token list (`rel="stylesheet
+/// preload"` is legal), so it is read as one rather than compared whole.
 fun is_stylesheet_rel(rel: str): bool {
 	for token in rel.to_lowercase_ascii().split(" ") {
 		if token == "stylesheet" {
@@ -876,8 +877,11 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 /// Past a raw-text element's body (`<script>`, `<style>`): its content is not
 /// markup, so the scanner resumes at its closing tag.
 fun skip_raw_text(markup: str, from: i32, name: str): i32 {
-	// Lowercased for the search only — `to_lowercase_ascii` maps ASCII in
-	// place, so the index it reports is an index into `markup` too.
+	// Lowercased for the search only — `to_lowercase_ascii` maps `A`..`Z` in
+	// place and touches nothing else, so the index it reports is an index
+	// into `markup` too. That claim was FALSE while the name lowered to the
+	// host's full fold, which is length-changing (`İ` becomes two units);
+	// F14's honest ASCII pair is what makes it true.
 	past(index_of(markup.to_lowercase_ascii(), "</" + name, from), 0, markup.len())
 }
 
@@ -909,7 +913,9 @@ fun index_of(text: str, needle: str, from: i32): Option<i32> {
 	None
 }
 
-/// Whether `character` can open a tag name.
+/// Whether `character` can open a tag name. ASCII alpha only, the HTML rule,
+/// and it is the ASCII fold that delivers it: under the host's full fold
+/// U+212A KELVIN SIGN lowers to a plain `k` and opened a tag here.
 fun is_name_start(character: str): bool {
 	let lower = character.to_lowercase_ascii();
 	lower >= "a" && lower <= "z"

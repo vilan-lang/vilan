@@ -32918,8 +32918,8 @@ pub enum Intrinsic {
     Scan,
     // `str.trim()` -> native `.trim()`.
     StrTrim,
-    // `str.to_lowercase_ascii()` -> native `.toLowerCase()`.
-    StrToLowercaseAscii,
+    // `str.to_lowercase()` -> native `.toLowerCase()`.
+    StrToLowercase,
     // `str.to_uppercase()` -> native `.toUpperCase()`.
     StrToUppercase,
     // `str.len(): i32` -> native `.length` (property read).
@@ -38398,7 +38398,7 @@ fn analyze_over_world<'src>(
             if subject_is_str {
                 for (name, intrinsic) in [
                     ("trim", Intrinsic::StrTrim),
-                    ("to_lowercase_ascii", Intrinsic::StrToLowercaseAscii),
+                    ("to_lowercase", Intrinsic::StrToLowercase),
                     ("to_uppercase", Intrinsic::StrToUppercase),
                     ("len", Intrinsic::StrLen),
                     ("contains", Intrinsic::StrContains),

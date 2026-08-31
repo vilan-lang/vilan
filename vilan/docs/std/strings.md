@@ -13,8 +13,10 @@ impl str {
 	fun len(self): i32
 	fun is_empty(self): bool
 	fun trim(self): str
-	fun to_uppercase(self): str
-	fun to_lowercase_ascii(self): str
+	fun to_uppercase(self): str                      // full Unicode; see below
+	fun to_lowercase(self): str                      // full Unicode; see below
+	fun to_uppercase_ascii(self): str                // A-Z only, length-preserving
+	fun to_lowercase_ascii(self): str                // A-Z only, length-preserving
 	fun contains(self, needle: str): bool
 	fun starts_with(self, prefix: str): bool
 	fun ends_with(self, suffix: str): bool
@@ -31,6 +33,43 @@ impl str {
 	fun parse_f64(self): Option<f64>                 // likewise
 }
 ```
+
+### Case: the full pair and the ASCII pair
+
+There are two case mappings here, and which one a call site wants is a
+question about the *text*, not about convenience.
+
+`to_uppercase` / `to_lowercase` are **the host's full Unicode mapping**,
+locale-independent. Non-ASCII letters map, and one-to-many mappings apply — so
+the result can be a different **length** than the receiver, and an index into
+one is not an index into the other. This is the pair for human text.
+
+`to_uppercase_ascii` / `to_lowercase_ascii` shift **exactly the 26 ASCII
+letters** and touch nothing else. `ß`, `Ǳ`, `İ`, `É` and every other code unit
+come back unchanged, so the length is always preserved and indices survive.
+This is the pair for protocol text — file extensions, mime rows, HTTP header
+names, HTML tag names, hex — where "case-insensitive" is defined over ASCII to
+begin with.
+
+```vilan
+import std::print;
+
+fun main() {
+	print("Straße".to_uppercase());          // "STRASSE" — ß became SS
+	print("Straße".to_uppercase().len());    // 7, from a 6-unit receiver
+	print("Straße".to_uppercase_ascii());    // "STRAßE" — ß untouched
+	print("Straße".to_uppercase_ascii().len());  // 6, always
+	print("STRASSE-Ǳ".to_lowercase());       // "strasse-ǳ" — U+01F1 mapped
+	print("STRASSE-Ǳ".to_lowercase_ascii()); // "strasse-Ǳ" — U+01F1 kept
+}
+```
+
+**Reaching for the full fold on protocol text is a bug, not a nicety.** U+212A
+KELVIN SIGN lowers to a plain `k` under `to_lowercase`, so a full fold makes a
+character that is not an ASCII letter compare equal to one — which is how a
+tag-name test in `std::process` came to accept it. The `_ascii` pair cannot do
+that, and its length guarantee is what lets a scanner lowercase a whole
+document and keep using the indices it already computed.
 
 ### Locating: `index_of` and `last_index_of`
 

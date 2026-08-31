@@ -183,6 +183,9 @@ impl Request {
 	/// `=== null` does not catch — and hasOwn also keeps an inherited name
 	/// (`header("constructor")`) from reading back as a header.
 	fun header(self, name: str): Option<str> {
+		// An HTTP field name is an ASCII token by RFC 9110, and the
+		// case-insensitive match over it is an ASCII one: the full Unicode
+		// fold would map letters no field name can contain.
 		let lowered = name.to_lowercase_ascii();
 		let headers = self.node.headers();
 		if !headers.has_field(lowered) {
