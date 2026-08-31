@@ -4377,6 +4377,50 @@ fn r11_still_reports_a_container_the_caller_cannot_see() {
 }
 
 #[test]
+fn r11_reports_an_independent_body_container_beside_a_refused_signature() {
+    // E104: the stand-down is asked PER OFFENDING TYPE, not once for the whole
+    // instantiation. `Map<str, A>` is refused at the signature and the caller
+    // was told at the type it wrote, so nothing more is owed for it; the body's
+    // `List<Other>` is built out of a DIFFERENT parameter, is a type no caller
+    // holds, and is nobody's consequence — so it still reports. Both heads,
+    // once each.
+    let source = r#"
+        import std::map::Map;
+        resource struct Guard { handle: i32 }
+        resource struct Other { handle: i32 }
+        fun two<type A, type B>(a: Map<str, A>, own b: B) { let items = [b]; }
+        fun caller(table: Map<str, Guard>) {
+            two(table, Other { handle = 2 });
+        }
+        fun main() {}
+        "#;
+    assert_fails_once_with(source, "`Map` cannot hold the resource `Guard`");
+    assert_fails_once_with(source, "`List` cannot hold the resource `Other`");
+}
+
+#[test]
+fn r11_stands_down_on_a_body_container_built_from_the_refused_parameter() {
+    // The mixed case, the other side of the same predicate: one parameter is
+    // refused at the signature AND that same parameter's container is built in
+    // the body. The body's `List<A>` is a structure the caller never holds, so
+    // no dedup reaches it — only the stand-down does, and it should, because
+    // `A` is exactly the parameter the reported `Map<str, Guard>` covers. One
+    // decision the caller made, one report.
+    assert_fails_once_with(
+        r#"
+        import std::map::Map;
+        resource struct Guard { handle: i32 }
+        fun wrap<type A>(own a: A, table: Map<str, A>) { let items = [a]; }
+        fun caller(table: Map<str, Guard>) {
+            wrap(Guard { handle = 1 }, table);
+        }
+        fun main() {}
+        "#,
+        "cannot hold the resource",
+    );
+}
+
+#[test]
 fn option_take_under_a_live_view_is_rejected() {
     // `take` is an invalidating mutation, so rule 4 / E2 fences it exactly as it
     // fences any geometry-bumping write: taking through `opt` while a `&mut` view
