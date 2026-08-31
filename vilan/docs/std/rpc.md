@@ -114,13 +114,16 @@ at the previous connection's dead channels: it would never update again, and
 the socket would say nothing was wrong. Bind `Closed` and offer the restart;
 that decision is the app's.
 
-On those same two paths the client **disposes itself**: its update routes
-are emptied and its transport forgets it. Nothing on that socket can ever
-reach those mirrors again, so nothing keeps holding them — the mirrors read
-their last value forever, exactly as they did before, and the graph behind
-them is released instead of wedged open. A redial that is merely *slow* —
-the server unreachable when the re-attach runs — disposes nothing: that
-socket keeps trying, and its mirrors resync when it succeeds.
+On **every** path that reaches `Closed` the client **disposes itself**: its
+update routes are emptied and its transport forgets it. The state is what
+decides, not the reason for it — a spent budget releases exactly as a drifted
+contract does. `Closed` is terminal, so nothing on that socket can ever reach
+those mirrors again and nothing keeps holding them: the mirrors read their
+last value forever, exactly as they did before, and the graph behind them is
+released instead of wedged open. What does *not* dispose is a connection that
+is merely slow — a redial in progress, or a server unreachable when the
+re-attach runs — because that socket is `Reconnecting`, not `Closed`: it keeps
+trying, and its mirrors resync when it succeeds.
 
 `on_reconnect` is where that decision goes. Hooks run after each successful
 re-dial, awaited in order, and the generated client registers its own mirror
