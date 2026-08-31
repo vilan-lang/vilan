@@ -104,25 +104,58 @@ too.
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
 | `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, `Signal<str>` tracks |
-| `style_var` | `(name: str, source: Signal<str>): View` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
+| `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
 | `child` | `(content: C): View`; `C: Slot` | element, text node (`str`/`Signal<str>`), or `List<View>` |
 | `children` | `(items: List<View>): View` | append several |
-| `bind_text` | `(source: Signal<str>): View` | reactive text |
-| `bind_class` | `(source: Signal<str>): View` | reactive class |
-| `bind_styled` | `(source: Signal<Style>): View` | reactive compiled style — `styled`'s reactive twin |
-| `bind_attr` | `(name: str, source: Signal<str>): View` | reactive attribute |
-| `bind_value` | `(signal: Signal<str>): View` | two-way input bind |
+| `bind_text` | `(source: S): View`; `S: Source<str>` | reactive text |
+| `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |
+| `bind_styled` | `(source: S): View`; `S: Source<Style>` | reactive compiled style — `styled`'s reactive twin |
+| `bind_attr` | `(name: str, source: S): View`; `S: Source<str>` | reactive attribute |
+| `bind_value` | `(signal: Signal<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
-| `bind_each` | `(source: Signal<List<T>>, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq` | keyed rows; each row is a disposal boundary |
-| `when` | `(condition: Signal<bool>, body: (sync \|\| View) context owner_scope): View` | state-DROPPING conditional |
-| `swap` | `(source: Signal<T>, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq` | dispose + rebuild per changed value |
+| `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | keyed rows; each row is a disposal boundary |
+| `when` | `(condition: S, body: (sync \|\| View) context owner_scope): View`; `S: Source<bool>` | state-DROPPING conditional |
+| `swap` | `(source: Signal<T>, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq` | dispose + rebuild per changed value — concrete `Signal` for now (see below) |
 | `swap_split` | same signature as `swap`; `T: PartialEq` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
-| `show` | `(condition: Signal<bool>): View` | state-PRESERVING visibility toggle |
+| `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
+
+### A binding takes a `Source`, not a `Signal`
+
+Every binding above that only READS its argument is generic over
+[`Source<T>`](reactive.md#source), so a `Signal`, a derived signal, a
+`RemoteSource` mirror or a type of your own all drive it:
+
+```vilan,fragment
+struct Stored<T> { inner: Signal<T> }
+
+impl Stored<type T> with Source<T> {
+	fun get(self): T { self.inner.get() }
+	[must_use]
+	fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+}
+```
+
+`Stored<str>` now feeds `bind_text`, `bind_class`, `bind_attr`,
+`bind_styled`, `style_var`, `bind_each`, `when` and `show` — on both the
+browser layer and the SSR twin.
+
+Three things deliberately still ask for the concrete type:
+
+- **`bind_value` and `bind_draft`**, because they WRITE BACK. `Source`
+  declares `get` and `sub` and no `set`, so there is nothing to widen to
+  yet — the write side is its own design question.
+- **`swap` and `swap_split`**, which read like `when` does and would widen
+  with it, but a `Source<T>` bound over a bare parameter does not yet
+  resolve inside a generic body, and `swap_split` calls `swap` from one.
+- **`attr` and `child`**, whose reactive arms are the `AttrValue` and
+  `Slot` traits — so `<div href(source)>` and `<p>{source}</p>` still want
+  a `Signal<str>`. Widening a trait ARM is a blanket impl rather than a
+  bound on a parameter, and that is a separate piece of machinery.
 
 ## std::router
 

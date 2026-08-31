@@ -94,6 +94,68 @@ fun main() {
   then on every change; its `Subscription` is yours to dispose (or hand to
   `owner.take`).
 
+## Source
+
+```vilan,fragment
+trait Source<T> {
+	fun get(self): T
+	[must_use]
+	fun sub(self, observer: |T| void): Subscription
+	fun effect(self, observer: |T| void)    // trait default; owner-registered
+}
+```
+
+The read-only half of a reactive value. `Signal<T>` implements it, and so does
+any type of yours — a storage-backed cell, a mirror over a transport, a wrapper
+that logs. Implement `get` and `sub` and `effect` comes free.
+
+```vilan
+import std::print;
+import std::reactive::{ Owner, Signal, Source, Subscription };
+
+/// A signal with a place to hang persistence, and no `set` on the trait.
+struct Stored<T> {
+	inner: Signal<T>,
+}
+
+impl Stored<type T> with Source<T> {
+	fun get(self): T {
+		self.inner.get()
+	}
+
+	[must_use]
+	fun sub(self, observer: |T| void): Subscription {
+		self.inner.sub(observer)
+	}
+}
+
+impl Stored<type T> {
+	fun new(value: T): Stored<T> {
+		Stored { inner = Signal::new(value) }
+	}
+
+	fun set(self, value: T) {
+		self.inner.set(value);
+	}
+}
+
+fun main() {
+	let owner = Owner::new();
+	let width: Stored<i32> = Stored::new(400);
+	owner.take(width.sub(|value| print(value)));   // 400
+	width.set(320);                                // 320
+}
+```
+
+**Anything that only reads takes a `Source`, not a `Signal`.** Every read-only
+binding in [`std::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
+`bind_attr`, `bind_styled`, `style_var`, `bind_each`, `when`, `show` — is
+generic over `Source<T>`, so `Stored<str>` above drives them exactly like a
+signal does, on the browser layer and on the SSR twin alike. `ReactiveServer`'s
+`expose` is generic the same way. What still asks for a `Signal` is what
+**writes** it: `bind_value`, `bind_draft`, `optimistic` and `Optimistic::over`
+all need `set`, which `Source` does not declare.
+
 ## combine
 
 ```vilan,fragment

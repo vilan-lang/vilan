@@ -2,8 +2,15 @@
 //
 // A `View` describes a DOM element; methods chain to build it. Plain setters
 // (`text`/`class`/`attr`) set static content; the `bind_*` setters take a
-// `Signal` and keep one DOM property in sync — each is an `effect`, so when
-// the signal changes only that property updates, with no re-render.
+// `Source` and keep one DOM property in sync — each is an `effect`, so when
+// the source changes only that property updates, with no re-render.
+//
+// A READ-ONLY binding demands only `Source<T>`, never the concrete `Signal<T>`
+// (A33): a binding that never writes its argument has no business insisting on
+// the writable type, and a user's own `Source` — a storage-backed cell, a
+// `RemoteSource`, any custom mirror — drives them exactly like a signal.
+// `bind_value` and `bind_draft` stay concrete because they WRITE BACK; the
+// write side is A32's ruling, not this one's.
 //
 // OWNERSHIP LIVES AT DISPOSAL BOUNDARIES (proposal/ambient-owner.md §4): a
 // subscription must die exactly when its subtree becomes garbage, and
@@ -39,6 +46,7 @@ import pkg::reactive::{
 	Owner,
 	RowStep,
 	Signal,
+	Source,
 	comp,
 	get_owner,
 	owner_scope,
@@ -145,7 +153,7 @@ impl View {
 	/// never through runtime rule construction. Registers with the nearest
 	/// enclosing boundary (an ambient `effect`), exactly like every `bind_*`:
 	/// a subscription parked in a `let _sub` outlives the view it writes to.
-	fun style_var(self, name: str, source: Signal<str>): View {
+	fun style_var<S: Source<str>>(self, name: str, source: S): View {
 		let element = self.element;
 		source.effect(|value| {
 			element.set_style_property(name, value);
@@ -202,8 +210,10 @@ impl View {
 	}
 
 	/// Reactive text content — re-set whenever `source` changes. Registers
-	/// with the nearest enclosing boundary (an ambient `effect`).
-	fun bind_text(self, source: Signal<str>): View {
+	/// with the nearest enclosing boundary (an ambient `effect`). Any
+	/// `Source<str>` drives it: a `Signal`, a derived signal, a `RemoteSource`
+	/// mirror, a user's own cell (A33).
+	fun bind_text<S: Source<str>>(self, source: S): View {
 		let element = self.element;
 		source.effect(|value| {
 			element.set_text(value);
@@ -212,7 +222,7 @@ impl View {
 	}
 
 	/// Reactive CSS class.
-	fun bind_class(self, source: Signal<str>): View {
+	fun bind_class<S: Source<str>>(self, source: S): View {
 		let element = self.element;
 		source.effect(|value| {
 			element.set_attribute("class", value);
@@ -225,7 +235,7 @@ impl View {
 	/// Nothing is CONSTRUCTED here: every candidate style emitted its rules
 	/// inside its own `const` expression, and `class_list` is a map read, so
 	/// the construct-in-const rule holds with a signal in the middle.
-	fun bind_styled(self, source: Signal<Style>): View {
+	fun bind_styled<S: Source<Style>>(self, source: S): View {
 		let element = self.element;
 		source.effect(|value| {
 			element.set_attribute("class", value.class_list());
@@ -234,7 +244,7 @@ impl View {
 	}
 
 	/// Reactive attribute.
-	fun bind_attr(self, name: str, source: Signal<str>): View {
+	fun bind_attr<S: Source<str>>(self, name: str, source: S): View {
 		let element = self.element;
 		source.effect(|value| {
 			element.set_attribute(name, value);
@@ -244,6 +254,12 @@ impl View {
 
 	/// Two-way bind an `<input>`'s value to a signal: the input shows the
 	/// signal, and typing writes it back.
+	///
+	/// CONCRETE `Signal`, deliberately (A33): this binding WRITES — the read
+	/// half would take a `Source<str>` like every other, but the write-back
+	/// half needs `set`, which `Source` does not declare. Widening it waits on
+	/// the write-side ruling (A32); until then a custom source drives every
+	/// read-only binding and this one asks for a signal.
 	///
 	/// The listener reaches NO element (`proposal/lifetimes.md` §5, V3), which
 	/// takes both halves of `write_back_value`'s note: the typed text comes off
@@ -264,6 +280,9 @@ impl View {
 	/// `adopt`ed remote change writes `local` without passing through here,
 	/// so it never re-pushes — and a DIRTY draft ignores adoption entirely,
 	/// so an echo never touches a focused input's caret.
+	///
+	/// Concrete `Draft`, with `bind_value` (A33): a draft is the write side by
+	/// construction — this pushes.
 	fun bind_draft(self, draft: Draft<str>): View {
 		let element = self.element;
 		draft.local.effect(|value| {
@@ -285,9 +304,9 @@ impl View {
 	/// A row whose key survives is reused (its element MOVES into the new
 	/// order, subscriptions intact); it re-renders only when its item's value
 	/// changed (`T: PartialEq`).
-	fun bind_each<T: PartialEq, K: PartialEq>(
+	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
 		self,
-		source: Signal<List<T>>,
+		source: S,
 		key: sync |T| K,
 		render: (sync |T| View) context owner_scope,
 	): View {
@@ -357,7 +376,7 @@ impl View {
 	/// true the body's view is mounted under a fresh owner; when it turns
 	/// false the owner is disposed and the content removed. Toggling back on
 	/// re-renders from scratch. (For a state-PRESERVING toggle, use `show`.)
-	fun when(self, condition: Signal<bool>, body: (sync || View) context owner_scope): View {
+	fun when<S: Source<bool>>(self, condition: S, body: (sync || View) context owner_scope): View {
 		let element = self.element;
 		let live_view: Shared<Option<View>> = Shared::new(None);
 		let live_owner: Shared<Option<Owner>> = Shared::new(None);
@@ -400,6 +419,19 @@ impl View {
 	/// disposal boundary like a `bind_each` row; whichever is live when the
 	/// enclosing boundary goes is disposed with it. Routing is the first
 	/// customer (`std::router`): `swap(route, |current| match current { .. })`.
+	///
+	/// CONCRETE `Signal`, and NOT because it writes (A33's sweep classifies it
+	/// read-only, exactly like `when`). It is BLOCKED: a `Source<T>` bound whose
+	/// argument is a BARE generic parameter loses its link to the caller's own
+	/// `T` when the argument's type is `Signal<T>` inside a generic body — the
+	/// callee's `T: PartialEq` is then checked against the impl's unbound
+	/// parameter and refused. `swap_split` below calls `self.swap(gated, render)`
+	/// from exactly such a body, so widening this signature makes std itself
+	/// uncompilable. (`Source<List<T>>` — `bind_each`'s bound, a CONSTRUCTED
+	/// argument — resolves fine; the gap is the bare parameter alone. Pinned
+	/// `#[ignore]`d in `tests/inference/generics.rs`; un-ignore it and this
+	/// signature, `swap_split`'s and `chunk_preload`'s widen together, in that
+	/// generic-parameter order — the split gate rebinds them by position.)
 	fun swap<T: PartialEq>(
 		self,
 		source: Signal<T>,
@@ -438,7 +470,7 @@ impl View {
 	/// Show or hide the element on a reactive condition — present when
 	/// `condition` is true, hidden otherwise. A pure visibility toggle: the
 	/// content stays mounted and its state (bindings, input text) survives.
-	fun show(self, condition: Signal<bool>): View {
+	fun show<S: Source<bool>>(self, condition: S): View {
 		let element = self.element;
 		condition.effect(|visible| {
 			element.set_hidden(!visible);
@@ -627,6 +659,13 @@ fun clear_chunk_error() {
 /// the type-directed half of `child`: the value's type carries the
 /// static-vs-tracked distinction, and ordinary trait dispatch decides what
 /// lands in the DOM.
+///
+/// The tracked arm is `Signal<str>` and not `Source<str>` — DEFERRED, not an
+/// oversight (A33). `bind_text` and friends widened to a `Source` BOUND, which
+/// is an ordinary generic parameter; the trait arms here would have to widen to
+/// a BLANKET impl (`impl S: Source<str> with Slot`), and that machinery is
+/// B158's. When it lands, this impl and `AttrValue`'s twin below collapse into
+/// one blanket arm each and the element syntax follows for free.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 trait Slot {
 	fun place(self, parent: View);
@@ -669,6 +708,10 @@ impl List<View> with Slot {
 }
 
 /// Something that can fill an attribute value (proposal/element-syntax.md §5).
+/// This is what `<div name(value)>` desugars through — element syntax builds
+/// `.attr(name, value)`, never `.bind_attr` — so the arms below are exactly the
+/// element-syntax attribute vocabulary. Widening the tracked arm past
+/// `Signal<str>` is the blanket-impl question deferred to B158 (see `Slot`).
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 trait AttrValue {
 	fun apply(self, parent: View, name: str);

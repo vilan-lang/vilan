@@ -6225,3 +6225,184 @@ fn a_supertrait_member_under_a_sub_bound_resolves_and_runs() {
         "8\n2\n",
     );
 }
+
+// ── A33: a read-only binding demands `Source`, not `Signal` ───────────────────
+//
+// Every `bind_*` in `std::ui` took the CONCRETE `Signal`, so a user type that
+// implements `Source<T>` — kolt's `StorageSignal`, a `RemoteSource`, any custom
+// mirror — could not drive a binding it only ever reads from. A33 swept std,
+// classified each site READ-ONLY or WRITE-BACK, and widened the read-only ones
+// to a `Source<T>` bound in BOTH `ui` twins.
+//
+// The exhibit below is `StorageSignal` in miniature: a struct wrapping a
+// `Signal`, implementing `Source` by delegation, with `set` kept OFF the trait —
+// so a binding that reached for `set` would not compile against it, which is
+// what makes the write-back refusals further down non-vacuous.
+
+/// The acceptance exhibit's type, shared by the pins in this block.
+const A_USER_SOURCE: &str = r#"
+        struct Stored<T> { inner: Signal<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
+
+        impl Stored<type T> {
+            fun new(value: T): Stored<T> { Stored { inner = Signal::new(value) } }
+            fun set(self, value: T) { self.inner.set(value); }
+        }
+"#;
+
+/// Every widened binding on the BROWSER twin, driven by a user `Source`. Before
+/// A33 each of these was a type error naming `Signal`.
+#[test]
+fn a_user_source_drives_every_read_only_browser_binding() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::style::{{ Color, Style, style }};
+        import std::ui::{{ View, mount_root, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let label: Stored<str> = Stored::new("alpha");
+            let flag: Stored<bool> = Stored::new(true);
+            let items: Stored<List<str>> = Stored::new(["x", "y"]);
+            let skin: Stored<Style> = Stored::new(const style().color(Color::gray(500)));
+            let _root = mount_root("app", || view("main")
+                .child(view("h1").bind_text(label))
+                .child(view("p").bind_class(label))
+                .child(view("a").bind_attr("href", label))
+                .child(view("div").style_var("--w", label))
+                .child(view("span").bind_styled(skin))
+                .child(view("i").show(flag))
+                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
+                .child(view("aside").when(flag, || view("b").text("here"))));
+        }}
+        "#
+    ));
+}
+
+/// The same surface on the PROCESS twin, and it renders: the two `ui` halves
+/// widened in lockstep, so a custom-source component is not client-only. The
+/// markup is the claim — a read-once binding that dropped its value would
+/// serve empty attributes and pass a compile-only pin.
+#[test]
+fn a_user_source_drives_the_process_twin_and_renders() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ View, render, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let label: Stored<str> = Stored::new("alpha");
+            let items: Stored<List<str>> = Stored::new(["x", "y"]);
+            let shown: Stored<bool> = Stored::new(true);
+            let hidden: Stored<bool> = Stored::new(false);
+            print(render(view("main")
+                .child(view("h1").bind_text(label))
+                .child(view("p").bind_class(label))
+                .child(view("a").bind_attr("href", label))
+                .child(view("div").style_var("--w", label))
+                .child(view("i").show(hidden))
+                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
+                .child(view("aside").when(shown, || view("b").text("here")))));
+        }}
+        main();
+        "#
+        ),
+        "<main><h1>alpha</h1><p class=\"alpha\"></p><a href=\"alpha\"></a>\
+         <div style=\"--w:alpha\"></div><i hidden=\"\"></i>\
+         <ul><li>x</li><li>y</li></ul><aside><b>here</b></aside></main>\n",
+    );
+}
+
+/// The HOLD, half one: `bind_value` WRITES back, so it keeps its concrete
+/// `Signal` until A32 rules on the write side. A `Source` has no `set`, so this
+/// is a refusal and not an oversight — and pinning it means a later blanket
+/// widening cannot take the write side by accident.
+#[test]
+fn bind_value_still_demands_a_signal() {
+    assert_fails_browser_with(
+        &format!(
+            r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ View, mount_root, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let typed: Stored<str> = Stored::new("");
+            let _root = mount_root("app", || view("input").bind_value(typed));
+        }}
+        "#
+        ),
+        "Signal",
+    );
+}
+
+/// The HOLD, half two: `bind_draft` pushes through a `Draft`, which is the
+/// write side by construction.
+#[test]
+fn bind_draft_still_demands_a_draft() {
+    assert_fails_browser_with(
+        &format!(
+            r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ View, mount_root, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let typed: Stored<str> = Stored::new("");
+            let _root = mount_root("app", || view("input").bind_draft(typed));
+        }}
+        "#
+        ),
+        "Draft",
+    );
+}
+
+/// The B158 DEFERRAL, stated as a test rather than only as a comment.
+/// `attr`/`child` dispatch through the `AttrValue`/`Slot` TRAITS, whose tracked
+/// arms are `impl Signal<str> with …`. Widening a trait arm is a BLANKET impl
+/// (`impl S: Source<str> with AttrValue`), which is B158's machinery, not a
+/// bound on a generic parameter — so a user source is still refused here while
+/// it drives every `bind_*`. Un-ignore nothing when B158 lands: replace this
+/// pin with its positive twin.
+#[test]
+fn the_attr_and_slot_trait_arms_are_still_signal_only() {
+    let program = |value: &str| {
+        format!(
+            r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ View, mount_root, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let label: Stored<str> = Stored::new("alpha");
+            let _root = mount_root("app", || {value});
+        }}
+        "#
+        )
+    };
+    assert_fails_browser_with(&program(r#"view("a").attr("href", label)"#), "AttrValue");
+    assert_fails_browser_with(&program(r#"view("p").child(label)"#), "Slot");
+}
+
+/// …and the concrete arms are untouched, which is the no-regression half: the
+/// element syntax desugars an attribute to `.attr(name, value)` and a hole to
+/// `.child(value)`, never to `bind_attr`/`bind_text`, so the widening must not
+/// have moved what `<div id(signal)>` and `<p>{signal}</p>` resolve to.
+#[test]
+fn element_syntax_still_routes_attributes_through_attr_value() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::Signal;
+        import std::ui::{ View, mount_root, view };
+
+        fun main() {
+            let label = Signal::new("alpha");
+            let _root = mount_root("app", || <div id(label) class("static")>{label}</div>);
+        }
+        "#,
+    );
+}
