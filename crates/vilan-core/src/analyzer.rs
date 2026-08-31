@@ -34448,18 +34448,26 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
 ///
 /// `reported` is the analysis-wide seen set. The same module loads through
 /// several seams (a lib re-export and a direct import, say) and the cache hands
-/// each the same errors — one diagnostic per distinct error is enough. It is
-/// keyed by PATH as well as position, because the messages no longer name their
-/// file: two modules can hold the same reason at the same offset, and those are
-/// two errors.
+/// each the same errors — one diagnostic per distinct error is enough. What
+/// makes an error distinct is all three of file, position and reason (E102):
+///
+/// - PATH, because the messages no longer name their file — two modules can hold
+///   the same reason at the same offset, and those are two errors.
+/// - POSITION, because the same reason recurs down a file and each occurrence is
+///   its own error.
+/// - REASON, because two different refusals land on one offset. A stray `"` is
+///   the ordinary case: the lexer refuses the unterminated string and the parser,
+///   over the tokens that survive, refuses the unterminated statement, both
+///   spanning that one character. Keying on place alone dropped the second — the
+///   regression E100 introduced over the message-keyed dedup it replaced.
 fn report_module_parse_errors(
     diagnostics: &mut Vec<Error>,
-    reported: &mut HashSet<(PathBuf, Span)>,
+    reported: &mut HashSet<(PathBuf, Span, String)>,
     path: &Path,
     loaded: &LoadedModule,
 ) {
     for (span, reason) in loaded.parse_errors {
-        if !reported.insert((path.to_path_buf(), *span)) {
+        if !reported.insert((path.to_path_buf(), *span, reason.clone())) {
             continue;
         }
         diagnostics.push(Error {
@@ -36768,10 +36776,10 @@ fn analyze_inner<'src>(
         .insert(std_module_id, Expr::Module(std_module_id));
     analyzer.module_id_by_name.insert("std", std_module_id);
 
-    // Every module parse error reported in this analysis, keyed by file and
-    // position: one module reaches the loader through several seams, and the
-    // cache hands each seam the same errors.
-    let mut reported_parse_errors: HashSet<(PathBuf, Span)> = HashSet::default();
+    // Every module parse error reported in this analysis, keyed by file,
+    // position and reason: one module reaches the loader through several seams,
+    // and the cache hands each seam the same errors.
+    let mut reported_parse_errors: HashSet<(PathBuf, Span, String)> = HashSet::default();
 
     // Load `lib.vl` plus every module reachable through `pkg::` references,
     // transitively. Each becomes a module registered in the `pkg` namespace;

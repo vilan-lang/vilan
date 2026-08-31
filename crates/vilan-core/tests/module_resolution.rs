@@ -1360,6 +1360,101 @@ fn a_module_parse_error_is_the_parsers_own_error_unaltered() {
     assert_eq!(module_error.2, expected_span, "{spanned:?}");
 }
 
+// --- E102: the seen set keys on the REASON as well as the place ---------------
+//
+// E100's dedup exists because one module reaches the loader through several
+// seams and the cache hands each seam the same errors. It keyed `(path, span)`,
+// where the code it replaced keyed the full rendered message — so two DISTINCT
+// errors at one offset collapsed into one and the second was never reported.
+// A stray `"` is exactly that shape: the LEXER refuses the unterminated string
+// and the PARSER, over the token stream that survives, refuses the statement
+// that has no terminator, both spanning the same one character.
+
+#[test]
+fn two_distinct_module_errors_at_one_offset_are_both_reported() {
+    let helper = "fun answer(): i32 { 1 }\"\nfun other(): i32 { 2 }\n";
+    // The fixture's premise, checked against the parser itself rather than
+    // assumed: two errors, distinct reasons, one shared span.
+    let (_tree, parse_errors) = vilan_core::parsing::parse(helper);
+    assert_eq!(parse_errors.len(), 2, "the fixture holds two parse errors");
+    assert_eq!(
+        parse_errors[0].span.into_range(),
+        parse_errors[1].span.into_range(),
+        "the two errors share one span, which is the whole point"
+    );
+    assert_ne!(
+        vilan_core::parsing::render(&parse_errors[0]),
+        vilan_core::parsing::render(&parse_errors[1]),
+        "and they are distinct errors"
+    );
+
+    let spanned = analyze_package_spanned(
+        &[
+            (
+                "main.vl",
+                "import pkg::util::answer;\nfun main() { let _ = answer(); }\n",
+            ),
+            ("util.vl", helper),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    let at_the_offset: Vec<_> = spanned
+        .iter()
+        .filter(|(_, file, range)| file == "util.vl" && *range == (23..24))
+        .collect();
+    assert_eq!(
+        at_the_offset.len(),
+        2,
+        "both errors at the offset survive the dedup: {spanned:?}"
+    );
+    assert!(
+        at_the_offset
+            .iter()
+            .any(|(message, ..)| message.contains("a string cannot span lines")),
+        "the lexer's refusal: {spanned:?}"
+    );
+    assert!(
+        at_the_offset
+            .iter()
+            .any(|(message, ..)| message.contains("expected `;` to end this statement")),
+        "the parser's refusal: {spanned:?}"
+    );
+}
+
+#[test]
+fn the_same_module_error_reached_through_two_seams_is_reported_once() {
+    // The other half of the same key: widening it must not undo E100's dedup.
+    // `util.vl` reaches the loader twice — once directly and once through the
+    // re-export in `bridge.vl` — and its errors are still reported once each.
+    let helper = "fun answer(): i32 { 1 }\"\nfun other(): i32 { 2 }\n";
+    let spanned = analyze_package_spanned(
+        &[
+            (
+                "main.vl",
+                "import pkg::util::answer;\nimport pkg::bridge::relay;\n\
+                 fun main() { let _ = answer(); let _ = relay(); }\n",
+            ),
+            ("util.vl", helper),
+            (
+                "bridge.vl",
+                "import pkg::util::other;\nfun relay(): i32 { other() }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    let at_the_offset: Vec<_> = spanned
+        .iter()
+        .filter(|(_, file, range)| file == "util.vl" && *range == (23..24))
+        .collect();
+    assert_eq!(
+        at_the_offset.len(),
+        2,
+        "two distinct errors, each once — not four: {spanned:?}"
+    );
+}
+
 // --- E82: the post-fixpoint (`finalize_build`) checks attribute like every
 // other check. That pass ran after the per-constraint attribution wrap with
 // `current_source_id` parked at the entry, so ALL of its diagnostics claimed
