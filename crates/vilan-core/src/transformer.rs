@@ -6,6 +6,7 @@ use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
+use crate::impl_select;
 use crate::interpreter::ConstValue;
 use crate::node::{BinaryOp, Convention, ExternBinding};
 use crate::options::BuildOptions;
@@ -1620,17 +1621,6 @@ fn helper_source(name: &str) -> &'static str {
              }"
         }
         _ => "",
-    }
-}
-
-/// Whether two types name the same nominal struct/enum, ignoring type
-/// arguments — so an `impl List<T>` (subject `List<Generic>`) matches a concrete
-/// `List<i32>` value when resolving a member to emit.
-fn nominal_matches(a: &Type, b: &Type) -> bool {
-    match (a, b) {
-        (Type::Struct(a_id, _), Type::Struct(b_id, _)) => a_id == b_id,
-        (Type::Enum(a_id, _), Type::Enum(b_id, _)) => a_id == b_id,
-        _ => a == b,
     }
 }
 
@@ -6807,62 +6797,15 @@ impl<'src> Transformer<'src> {
         self.resolve_dispatch_with(type_id, member, &[], None)
     }
 
-    /// Whether `implementation` provides `trait_id` at an instantiation the
-    /// re-dispatch demonstrably does NOT want — B73's R1 on the emission side.
-    ///
-    /// The filter is deliberately one-sided: it excludes an impl only when a
-    /// wanted argument and the impl's written one resolve to two *different
-    /// nominal types* (`Conv<Bar>` against a bound written `Conv<Baz>`). A
-    /// position still abstract on either side after `resolve_type_id` — the
-    /// impl's own binder (`impl Signal<type T> with Readable<T>`), or a bound
-    /// argument the current monomorphization has not fixed — proves nothing
-    /// here and keeps the impl, so every program whose arguments already agreed
-    /// emits exactly the bytes it emitted before.
-    fn trait_instantiation_conflicts(
-        &self,
-        implementation: &crate::analyzer::Implementation<'src>,
-        trait_id: Id,
-        wanted_arguments: &[TypeId],
-    ) -> bool {
-        if wanted_arguments.is_empty() {
-            return false;
-        }
-        let Some((_, written_arguments)) = implementation
-            .trait_args
+    /// The trait arguments a bound wrote, resolved through the current
+    /// monomorphization — what [`crate::impl_select`] needs to tell an impl
+    /// providing `MaybeSignal<str>` from one providing
+    /// `MaybeSignal<Signal<str>>` on the same receiver.
+    fn wanted_trait_arguments(&self, arguments: &[TypeId]) -> Vec<TypeId> {
+        arguments
             .iter()
-            .find(|(id, _)| *id == trait_id)
-        else {
-            return false;
-        };
-        if written_arguments.len() != wanted_arguments.len() {
-            return false;
-        }
-        written_arguments
-            .iter()
-            .zip(wanted_arguments)
-            .any(|(written, wanted)| self.nominally_different(*written, *wanted))
-    }
-
-    /// Whether two types are provably distinct nominal types — the only
-    /// judgement [`trait_instantiation_conflicts`] is willing to act on. Type
-    /// ids are minted, not interned, so identity is compared through the types
-    /// they name and never through the ids themselves.
-    fn nominally_different(&self, left: TypeId, right: TypeId) -> bool {
-        let left = self.resolve_type_id(left);
-        let right = self.resolve_type_id(right);
-        if left == right {
-            return false;
-        }
-        match (
-            self.program.type_id_to_type_map.get(&left),
-            self.program.type_id_to_type_map.get(&right),
-        ) {
-            (Some(Type::Struct(left_id, _)), Some(Type::Struct(right_id, _)))
-            | (Some(Type::Enum(left_id, _)), Some(Type::Enum(right_id, _))) => left_id != right_id,
-            (Some(Type::Struct(..)), Some(Type::Enum(..)))
-            | (Some(Type::Enum(..)), Some(Type::Struct(..))) => true,
-            _ => false,
-        }
+            .map(|argument| self.resolve_type_id(*argument))
+            .collect()
     }
 
     /// `resolve_dispatch`, additionally binding the target method's OWN generics
@@ -6971,7 +6914,8 @@ impl<'src> Transformer<'src> {
 
     /// A member provided by `type_id`'s impl OF `trait_id` specifically — the
     /// trait-scoped counterpart of `resolve_member_on_type`, immune to inherent
-    /// name collisions.
+    /// name collisions. The selection is [`crate::impl_select`]'s, so a blanket
+    /// impl is reachable here (B158) and a constructor-headed impl outranks it.
     fn resolve_member_on_trait_impl(
         &self,
         type_id: TypeId,
@@ -6979,29 +6923,17 @@ impl<'src> Transformer<'src> {
         trait_arguments: &[TypeId],
         member: &str,
     ) -> Option<(Id, TypeId)> {
-        let type_ = self.program.type_id_to_type_map.get(&type_id)?;
-        self.program
-            .implementations
-            .iter()
-            .filter(|implementation| {
-                implementation.trait_ids.contains(&trait_id)
-                    && !self.trait_instantiation_conflicts(
-                        implementation,
-                        trait_id,
-                        trait_arguments,
-                    )
-                    && self
-                        .program
-                        .type_id_to_type_map
-                        .get(&implementation.subject)
-                        .is_some_and(|subject| nominal_matches(subject, type_))
-            })
-            .find_map(|implementation| {
-                implementation
-                    .declarations
-                    .get(member)
-                    .map(|member_id| (*member_id, implementation.subject))
-            })
+        let arguments = self.wanted_trait_arguments(trait_arguments);
+        let selected = impl_select::select_member(
+            self.program,
+            type_id,
+            member,
+            Some(impl_select::WantedTrait {
+                trait_id,
+                arguments: &arguments,
+            }),
+        )?;
+        Some((selected.member_id, selected.impl_subject))
     }
 
     /// Lowers a resolved [`Dispatch`] to its call node with `args` (the receiver
@@ -7082,9 +7014,6 @@ impl<'src> Transformer<'src> {
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
         let mut substitution = HashMap::default();
-        let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
-            return substitution;
-        };
         // The default's own trait — the one whose declarations hold it. A
         // supertrait's default reached through a subtrait's impl keeps its own
         // parameters, so key on the declaring trait, not the implemented one.
@@ -7099,17 +7028,14 @@ impl<'src> Transformer<'src> {
         if trait_.generic_parameter_constraint_ids.is_empty() {
             return substitution;
         }
-        // The impl of THAT trait for this type, matched nominally like every
-        // other dispatch lookup here (the impl subject is in its own generic
-        // terms, the receiver in concrete ones).
-        let Some(implementation) = self.program.implementations.iter().find(|implementation| {
-            implementation.trait_ids.contains(trait_id)
-                && self
-                    .program
-                    .type_id_to_type_map
-                    .get(&implementation.subject)
-                    .is_some_and(|subject| nominal_matches(subject, type_))
-        }) else {
+        // The impl of THAT trait for this type, selected like every other
+        // dispatch lookup here (the impl subject is in its own generic terms,
+        // the receiver in concrete ones) — so the arguments this default
+        // specializes under are the ones the WINNING impl writes, not the
+        // first-declared one's.
+        let Some(implementation) =
+            impl_select::select_implementation(self.program, type_id, *trait_id)
+        else {
             return substitution;
         };
         self.bind_generics(implementation.subject, type_id, &mut substitution);
@@ -7801,23 +7727,15 @@ impl<'src> Transformer<'src> {
     /// member none of the type's impls declare, but a (super)trait it implements
     /// provides with a body. Mirrors the analyzer's Gap E resolution.
     fn resolve_inherited_default(&self, type_id: TypeId, member: &str) -> Option<Id> {
-        let type_ = self.program.type_id_to_type_map.get(&type_id)?.clone();
-        self.program
-            .implementations
-            .iter()
-            .filter(|implementation| {
-                // NOMINAL matching, like `resolve_member_on_type`: the impl
-                // subject is written in its own generic terms (`Signal<T>`),
-                // the receiver in concrete ones (`Signal<i32>`) — exact type
-                // equality only ever matched non-generic subjects, silently
-                // dropping inherited defaults on generic types (the emitted
-                // call then bound to the trait's abstract member).
-                self.program
-                    .type_id_to_type_map
-                    .get(&implementation.subject)
-                    .is_some_and(|subject| nominal_matches(subject, &type_))
-            })
-            .flat_map(|implementation| implementation.trait_ids.iter().copied())
+        // The impl subject is written in its own generic terms (`Signal<T>`),
+        // the receiver in concrete ones (`Signal<i32>`), so the search is over
+        // the impls that APPLY to the receiver ([`crate::impl_select`]) — exact
+        // type equality only ever matched non-generic subjects, silently
+        // dropping inherited defaults on generic types (the emitted call then
+        // bound to the trait's abstract member), and a nominal head match
+        // never saw a blanket impl at all (B158).
+        impl_select::applying_trait_ids(self.program, type_id)
+            .into_iter()
             .find_map(|trait_id| self.trait_default_member(trait_id, member))
     }
 
@@ -8423,75 +8341,26 @@ impl<'src> Transformer<'src> {
     /// `List<Generic(T)>`) so the caller can bind the impl's generics from the
     /// concrete type's arguments.
     fn resolve_member_on_type(&self, type_id: TypeId, member: &str) -> Option<(Id, TypeId)> {
-        let type_ = self.program.type_id_to_type_map.get(&type_id)?;
-        match type_ {
-            Type::Struct(_, _) | Type::Enum(_, _) => self
-                .program
-                .implementations
-                .iter()
-                .filter(|implementation| {
-                    self.program
-                        .type_id_to_type_map
-                        .get(&implementation.subject)
-                        .is_some_and(|subject| nominal_matches(subject, type_))
-                })
-                .find_map(|implementation| {
-                    implementation
-                        .declarations
-                        .get(member)
-                        .map(|member_id| (*member_id, implementation.subject))
-                }),
-            _ => None,
+        // Nominal subjects only: a re-dispatch with no trait to steer by is the
+        // fallback path, and widening it to every impl subject shape would
+        // change which body existing programs reach without a bound asking.
+        if !matches!(
+            self.program.type_id_to_type_map.get(&type_id),
+            Some(Type::Struct(..) | Type::Enum(..))
+        ) {
+            return None;
         }
+        let selected = impl_select::select_member(self.program, type_id, member, None)?;
+        Some((selected.member_id, selected.impl_subject))
     }
 
     /// Binds the generic parameters in `pattern` (an impl subject in its own
     /// generic terms, `List<Generic(T)>`) from the matching positions of the
-    /// concrete `type_id` (`List<i32>`), accumulating `{T -> i32}`. Recurses
-    /// through nominal arguments, tuples, and closures so a nested parameter
-    /// (`List<List<T>>` -> `T = i32`) is reached.
+    /// concrete `type_id` (`List<i32>`), accumulating `{T -> i32}` — the
+    /// shared walk [`crate::impl_select`] owns, since selecting an impl and
+    /// monomorphizing the member it declares must recover the same bindings.
     fn bind_generics(&self, pattern: TypeId, type_id: TypeId, out: &mut HashMap<TypeId, TypeId>) {
-        let Some(pattern_type) = self.program.type_id_to_type_map.get(&pattern).cloned() else {
-            return;
-        };
-        if let Type::Generic(constraint_id) = pattern_type {
-            out.insert(constraint_id, type_id);
-            return;
-        }
-        let Some(concrete_type) = self.program.type_id_to_type_map.get(&type_id).cloned() else {
-            return;
-        };
-        let zip_args = |out: &mut HashMap<TypeId, TypeId>,
-                        pattern_args: &[TypeId],
-                        concrete_args: &[TypeId],
-                        this: &Self| {
-            for (pattern_arg, concrete_arg) in pattern_args.iter().zip(concrete_args.iter()) {
-                this.bind_generics(*pattern_arg, *concrete_arg, out);
-            }
-        };
-        match (pattern_type, concrete_type) {
-            (Type::Struct(a, pattern_args), Type::Struct(b, concrete_args)) if a == b => {
-                zip_args(out, &pattern_args, &concrete_args, self);
-            }
-            (Type::Enum(a, pattern_args), Type::Enum(b, concrete_args)) if a == b => {
-                zip_args(out, &pattern_args, &concrete_args, self);
-            }
-            (Type::Tuple(pattern_args), Type::Tuple(concrete_args)) => {
-                zip_args(out, &pattern_args, &concrete_args, self);
-            }
-            // `[T; n]` against `[i32; n]` binds `T = i32` through the element.
-            (Type::Array(pattern_element, _), Type::Array(concrete_element, _)) => {
-                self.bind_generics(pattern_element, concrete_element, out);
-            }
-            (
-                Type::Closure(pattern_params, pattern_ret),
-                Type::Closure(concrete_params, concrete_ret),
-            ) => {
-                zip_args(out, &pattern_params, &concrete_params, self);
-                self.bind_generics(pattern_ret, concrete_ret, out);
-            }
-            _ => {}
-        }
+        impl_select::bind_subject(self.program, pattern, type_id, out);
     }
 }
 

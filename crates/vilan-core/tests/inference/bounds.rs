@@ -5678,3 +5678,348 @@ fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
          diagnostic intact: {messages:#?}"
     );
 }
+
+// --- B158: a blanket impl (`impl type T with Trait<T>`) reached through a  ---
+// --- BOUND. Declared, it analyzed cleanly; the first dispatch through it   ---
+// --- died with B55's internal error, because the emission-side re-dispatch ---
+// --- matched impl subjects by nominal head and could not see a generic     ---
+// --- subject at all. The rule that resolves it is SPECIFICITY              ---
+// --- (`spec/types.md` §5.4): a blanket is the least-specific tier.         ---
+
+/// B157's probe program, verbatim — the exhibit B158 was filed from. One
+/// trait, one blanket static impl, one generic `Signal` impl, and a bounded
+/// generic taking both a `str` and a `Signal<str>` with no call-site ceremony.
+/// The `Signal` leg must REACT (the second `badge` line comes from `set`),
+/// which is what makes the trait route answer B157's first problem.
+#[test]
+fn b158_the_maybe_signal_probe_dispatches_through_a_blanket_and_a_signal_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+
+        trait MaybeSignal<T> {
+            fun bind(self, react: |T| void);
+        }
+
+        impl type T with MaybeSignal<T> {
+            fun bind(self, react: |T| void) {
+                react(self);
+            }
+        }
+
+        impl Signal<type T> with MaybeSignal<T> {
+            fun bind(self, react: |T| void) {
+                let _watching = self.sub(react);
+            }
+        }
+
+        fun badge<V: MaybeSignal<str>>(label: V) {
+            label.bind(|text| print(i"[{text}]"));
+        }
+
+        fun count<V: MaybeSignal<i32>>(value: V) {
+            value.bind(|n| print(i"n={n}"));
+        }
+
+        fun main() {
+            badge("static");
+            let live = Signal::new("first");
+            badge(live);
+            live.set("second");
+            count(41);
+            let n = Signal::new(1);
+            count(n);
+            n.set(2);
+        }
+        main();
+        "#,
+        "[static]\n[first]\n[second]\nn=41\nn=1\nn=2\n",
+    );
+}
+
+/// A blanket ALONE — no constructor-headed impl to fall back on — answers a
+/// bounded call for every type the bound admits. This is the shape that ICEd
+/// most bluntly: nothing else could have answered, and nothing did.
+#[test]
+fn b158_a_blanket_alone_answers_a_bounded_call_for_every_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Show2 { fun show2(self): str; }
+
+        impl type T with Show2 { fun show2(self): str { "blanket" } }
+
+        fun tell<V: Show2>(v: V) { print(v.show2()); }
+
+        fun main() {
+            tell("x");
+            tell(3);
+        }
+        main();
+        "#,
+        "blanket\nblanket\n",
+    );
+}
+
+/// The specificity rule itself, through a bound: a value matching BOTH a
+/// blanket and a constructor-headed impl takes the constructor one. The
+/// direct-receiver spelling already answered this (B73's R3); the bounded
+/// spelling could not, and reached the trait's body-less requirement.
+#[test]
+fn b158_a_constructor_headed_impl_outranks_a_blanket_through_a_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Show2 { fun show2(self): str; }
+        struct Bag {}
+
+        impl type T with Show2 { fun show2(self): str { "blanket" } }
+        impl Bag with Show2 { fun show2(self): str { "specific" } }
+
+        fun tell<V: Show2>(v: V) { print(v.show2()); }
+
+        fun main() {
+            let bag = Bag {};
+            print(bag.show2());
+            tell(bag);
+            tell("x");
+        }
+        main();
+        "#,
+        "specific\nspecific\nblanket\n",
+    );
+}
+
+/// The case the owner's proposed `not Signal` bound would have DELETED
+/// (B158's follow-up analysis): under a `MaybeSignal<Signal<str>>` bound, a
+/// bare `Signal<str>` is a legitimate STATIC value, reached through the
+/// blanket — while the same value under a `MaybeSignal<str>` bound is the
+/// reactive source, reached through the constructor impl. The bound decides
+/// which INSTANTIATION is wanted before specificity is consulted, so both
+/// readings of one type stay reachable in one program.
+#[test]
+fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matches() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+
+        trait MaybeSignal<T> {
+            fun bind(self, react: |T| void);
+        }
+
+        impl type T with MaybeSignal<T> {
+            fun bind(self, react: |T| void) { react(self); }
+        }
+
+        impl Signal<type T> with MaybeSignal<T> {
+            fun bind(self, react: |T| void) { let _watching = self.sub(react); }
+        }
+
+        fun badge<V: MaybeSignal<str>>(label: V) {
+            label.bind(|text| print(i"badge {text}"));
+        }
+
+        fun holder<V: MaybeSignal<Signal<str>>>(slot: V) {
+            slot.bind(|inner| print(i"holder {inner.get()}"));
+        }
+
+        fun main() {
+            let live = Signal::new("one");
+            badge(live);
+            live.set("two");
+            holder(live);
+        }
+        main();
+        "#,
+        "badge one\nbadge two\nholder two\n",
+    );
+}
+
+/// The bounds tier of the same order, through a bound — a silent WRONG BODY
+/// before B158, not an internal error: the direct receiver took
+/// `Box2<type T: Marker>` and the bounded call took `Box2<type T>`, because
+/// the emission side ranked nothing and answered in declaration order.
+#[test]
+fn b158_a_stronger_binder_bound_outranks_through_a_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Marker { fun marker(self): str; }
+        trait Show2 { fun show2(self): str; }
+        struct Box2<T> { v: T }
+        struct Foo {}
+        impl Foo with Marker { fun marker(self): str { "m" } }
+
+        impl Box2<type T> with Show2 { fun show2(self): str { "plain" } }
+        impl Box2<type T: Marker> with Show2 { fun show2(self): str { "marked" } }
+
+        fun tell<V: Show2>(v: V) { print(v.show2()); }
+
+        fun main() {
+            let b = Box2 { v = Foo {} };
+            print(b.show2());
+            tell(b);
+        }
+        main();
+        "#,
+        "marked\nmarked\n",
+    );
+}
+
+/// §13.2 row 17 through a BOUND: an impl that declares nothing and inherits
+/// its trait's default still outranks a blanket that declares the name, in
+/// either declaration order. The specificity order ranks IMPLS, not
+/// declarations, so an inheriting winner answers with the default.
+#[test]
+fn b158_an_inheriting_impl_outranks_a_declaring_blanket_through_a_bound() {
+    let program = |blanket_first: bool| {
+        let impls = match blanket_first {
+            true => {
+                "impl type T with Tag { fun tag(self): i32 { 1 } }\n\
+                     impl Foo with Tag { }"
+            }
+            false => {
+                "impl Foo with Tag { }\n\
+                      impl type T with Tag { fun tag(self): i32 { 1 } }"
+            }
+        };
+        format!(
+            r#"
+            import std::print;
+
+            trait Tag {{ fun tag(self): i32 {{ 9 }} }}
+            struct Foo {{ n: i32 }}
+
+            {impls}
+
+            fun tell<V: Tag>(v: V) {{ print(v.tag()); }}
+
+            fun main() {{ tell(Foo {{ n = 1 }}); }}
+            main();
+            "#
+        )
+    };
+    assert_compiles_and_runs(&program(true), "9\n");
+    assert_compiles_and_runs(&program(false), "9\n");
+}
+
+/// Const evaluation reaches trait dispatch, so it reaches the blanket — and
+/// must reach the SAME body the runtime path does, at both tiers.
+#[test]
+fn b158_const_evaluation_selects_the_same_impl_a_runtime_call_does() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Label { fun label(self): str; }
+        struct Tagged { n: i32 }
+
+        impl type T with Label { fun label(self): str { "any" } }
+        impl Tagged with Label { fun label(self): str { "tagged" } }
+
+        fun describe<V: Label>(v: V): str { v.label() }
+
+        fun main() {
+            print(const describe(7));
+            print(const describe(Tagged { n = 1 }));
+            print(describe(9));
+            print(describe(Tagged { n = 2 }));
+        }
+        main();
+        "#,
+        "any\ntagged\nany\ntagged\n",
+    );
+}
+
+/// The overlap refusal, at the DECLARATION: two blankets of one trait have no
+/// specificity order at any type, so the second is refused where it is
+/// written, named, with the fix — never accepted and then answered by
+/// declaration order.
+#[test]
+fn b158_a_second_blanket_of_one_trait_is_refused_at_its_declaration() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Show2 { fun show2(self): str; }
+
+        impl type T with Show2 { fun show2(self): str { "one" } }
+        impl type U with Show2 { fun show2(self): str { "two" } }
+
+        fun main() { print("x".show2()); }
+        main();
+        "#,
+        "'Show2' is already implemented for 'U'; remove or merge this impl",
+    );
+}
+
+/// Two BOUNDED blankets are two overlapping impls, not one written twice, so
+/// they stand — until a type satisfying both reaches them. Through a bound
+/// that landed in B55's internal error ("please report this program") for a
+/// program that was the author's to fix; it is now the same refusal the
+/// direct-receiver spelling gives, naming both subjects and the fix.
+#[test]
+fn b158_unrankable_overlapping_impls_are_refused_at_the_bound_that_reaches_them() {
+    let source = r#"
+        import std::print;
+
+        trait Alpha { fun alpha(self): str; }
+        trait Beta { fun beta(self): str; }
+        trait Show2 { fun show2(self): str; }
+
+        impl type T: Alpha with Show2 { fun show2(self): str { "via-alpha" } }
+        impl type U: Beta with Show2 { fun show2(self): str { "via-beta" } }
+
+        struct Both {}
+        impl Both with Alpha { fun alpha(self): str { "a" } }
+        impl Both with Beta { fun beta(self): str { "b" } }
+
+        fun tell<V: Show2>(v: V) { print(v.show2()); }
+
+        fun main() { tell(Both {}); }
+        main();
+        "#;
+    assert_fails_with(
+        source,
+        "'show2' cannot be dispatched on 'Both' through this call's 'Show2' bound",
+    );
+    assert_fails_without(source, "please report this program");
+}
+
+/// The same pair with only ONE of the two bounds satisfied is ranked by
+/// applicability alone and answers — the refusal above must not spread to
+/// every program that writes two conditional blankets.
+#[test]
+fn b158_two_bounded_blankets_still_answer_where_only_one_applies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        trait Alpha { fun alpha(self): str; }
+        trait Beta { fun beta(self): str; }
+        trait Show2 { fun show2(self): str; }
+
+        impl type T: Alpha with Show2 { fun show2(self): str { "via-alpha" } }
+        impl type U: Beta with Show2 { fun show2(self): str { "via-beta" } }
+
+        struct OnlyAlpha {}
+        impl OnlyAlpha with Alpha { fun alpha(self): str { "a" } }
+        struct OnlyBeta {}
+        impl OnlyBeta with Beta { fun beta(self): str { "b" } }
+
+        fun tell<V: Show2>(v: V) { print(v.show2()); }
+
+        fun main() {
+            tell(OnlyAlpha {});
+            tell(OnlyBeta {});
+        }
+        main();
+        "#,
+        "via-alpha\nvia-beta\n",
+    );
+}
