@@ -13120,9 +13120,100 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// [`method_member_in_trait`] with the arguments the trait is used AT, and
+    /// returning the trait that DECLARES the member together with the
+    /// arguments THAT trait is reached with — the pair a caller needs to
+    /// substitute the member's signature (B164). A member found on the trait
+    /// itself returns `(trait_id, arguments)` unchanged; one found on a
+    /// supertrait returns the supertrait and the arguments the chain passes
+    /// it, so `get(): T` under `S: Sig<u32>` with `trait Sig<T> with Src<T>`
+    /// is `u32` and not `Src`'s abstract `T`.
+    fn method_member_in_trait_at(
+        &mut self,
+        trait_id: Id,
+        arguments: &[TypeId],
+        member_name: &str,
+    ) -> Option<(Id, Id, Vec<TypeId>)> {
+        self.trait_with_supertraits_at(trait_id, arguments)
+            .into_iter()
+            .find_map(|(id, id_arguments)| {
+                let member_id = self
+                    .traits
+                    .get(&id)
+                    .and_then(|trait_| trait_.declarations.get(member_name).copied())
+                    .filter(|member_id| self.is_self_method(*member_id))?;
+                Some((member_id, id, id_arguments))
+            })
+    }
+
+    /// The substitution a trait's members are typed under when the trait is
+    /// used at `arguments` (`Get<i32>` -> `{ Get::T: i32 }`). Empty when the
+    /// trait takes no parameters, or when none were supplied.
+    fn trait_parameter_substitution(
+        &self,
+        trait_id: Id,
+        arguments: &[TypeId],
+    ) -> SubstitutionContext {
+        if arguments.is_empty() {
+            return SubstitutionContext::default();
+        }
+        self.traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .zip(arguments.iter().copied())
+            .collect()
+    }
+
+    /// [`trait_with_supertraits`] with each trait paired with the type
+    /// arguments it is reached WITH: the sub-trait's arguments substituted
+    /// into the supertrait's WRITTEN ones, so `trait Sig<T> with Src<T>`
+    /// reached at `Sig<u32>` yields `Src<u32>` and not `Src<T>`. Dropping that
+    /// substitution is what let a supertrait's `T` leak out of a sub-trait
+    /// bound as a wildcard that unified with anything (B164), and it is
+    /// carried HERE — at the walk that answers "what does this bound provide?"
+    /// — rather than reconstructed by each lookup.
+    ///
+    /// The walk order matches `trait_with_supertraits` exactly, so the trait a
+    /// member resolves to is unchanged; only its arguments are now known. A
+    /// trait reached twice keeps the FIRST path's arguments, as it keeps the
+    /// first path at all.
+    fn trait_with_supertraits_at(
+        &mut self,
+        trait_id: Id,
+        arguments: &[TypeId],
+    ) -> Vec<(Id, Vec<TypeId>)> {
+        let mut result: Vec<(Id, Vec<TypeId>)> = Vec::new();
+        let mut stack = vec![(trait_id, arguments.to_vec())];
+        while let Some((id, arguments)) = stack.pop() {
+            if result.iter().any(|(seen, _)| *seen == id) {
+                continue;
+            }
+            result.push((id, arguments.clone()));
+            let Some(trait_) = self.traits.get(&id) else {
+                continue;
+            };
+            let supertraits = trait_.supertraits.clone();
+            let substitution = self.trait_parameter_substitution(id, &arguments);
+            for supertrait_type_id in supertraits {
+                if let Type::Trait(super_id, super_arguments) = supertrait_type_id.get_type(self) {
+                    let super_arguments = match substitution.is_empty() {
+                        true => super_arguments,
+                        false => self.substitute_argument_types(&super_arguments, &substitution),
+                    };
+                    stack.push((super_id, super_arguments));
+                }
+            }
+        }
+        result
+    }
+
     /// `trait_id` plus its transitive supertraits (each supertrait's `TypeId`
     /// resolved to a trait id). A trait's full interface — for method resolution
     /// and impl conformance — includes everything its supertraits declare.
+    /// [`trait_with_supertraits_at`] answers the same question keeping each
+    /// trait's arguments; this one is for the callers that need only the ids.
     fn trait_with_supertraits(&self, trait_id: Id) -> Vec<Id> {
         let mut result = Vec::new();
         let mut stack = vec![trait_id];
@@ -27029,7 +27120,13 @@ impl<'src> Analyzer<'src> {
             Type::Trait(trait_id, trait_arguments) => {
                 let trait_id = *trait_id;
                 let trait_arguments = trait_arguments.clone();
-                let member = self.method_member_in_trait(trait_id, member_name);
+                // The member and the trait that DECLARES it, with the arguments
+                // THAT trait is reached at — the sub-trait's own when it
+                // declares the member, the substituted supertrait's when a
+                // supertrait does (B164).
+                let declared =
+                    self.method_member_in_trait_at(trait_id, &trait_arguments, member_name);
+                let member = declared.as_ref().map(|(member_id, _, _)| *member_id);
                 // The only legitimate bare-`Type::Trait` receiver is `self`/`Self`
                 // inside a trait default body, re-dispatched at codegen to the
                 // concrete specialization. A *value* typed as a bare trait
@@ -27042,23 +27139,20 @@ impl<'src> Analyzer<'src> {
                     // Inside a trait default body `self`/`Self` is `Type::Trait`;
                     // record the call so codegen re-dispatches it to whatever
                     // concrete type the default is specialized for.
-                    if member.is_some() {
+                    if let Some((_, declaring_trait_id, declaring_arguments)) = &declared {
                         self.generic_dispatch
                             .insert(id, GenericDispatch::OnType(None, member_name));
                         // A parameterized trait substitutes its generic parameters
                         // with the concrete arguments, so the method's signature
                         // (`got(): T`) types against them (`Get<i32>::got` -> `i32`).
-                        if !trait_arguments.is_empty() {
-                            let parameter_ids = self
-                                .traits
-                                .get(&trait_id)
-                                .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-                                .unwrap_or_default();
-                            let substitution: SubstitutionContext =
-                                parameter_ids.into_iter().zip(trait_arguments).collect();
-                            if !substitution.is_empty() {
-                                self.method_call_substitution.insert(id, substitution);
-                            }
+                        // The parameters are the DECLARING trait's: a member
+                        // inherited from a supertrait is written in that
+                        // trait's terms, and zipping the sub-trait's parameters
+                        // over it substituted nothing at all (B164).
+                        let substitution = self
+                            .trait_parameter_substitution(*declaring_trait_id, declaring_arguments);
+                        if !substitution.is_empty() {
+                            self.method_call_substitution.insert(id, substitution);
                         }
                     }
                     found(member)
@@ -27093,8 +27187,8 @@ impl<'src> Analyzer<'src> {
                     let mut member = None;
                     let mut member_trait = None;
                     for (trait_id, trait_arguments) in &bound_traits {
-                        let Some(found_member) =
-                            self.method_member_in_trait(*trait_id, member_name)
+                        let Some((found_member, declaring_trait_id, declaring_arguments)) =
+                            self.method_member_in_trait_at(*trait_id, trait_arguments, member_name)
                         else {
                             continue;
                         };
@@ -27107,19 +27201,20 @@ impl<'src> Analyzer<'src> {
                         // trait's abstract parameter. Without this, a closure argument's
                         // parameter loses its bound and a trait-method call on it fails
                         // to resolve. (Mirrors the `Type::Trait` arm above.)
-                        if !trait_arguments.is_empty() {
-                            let parameter_ids = self
-                                .traits
-                                .get(trait_id)
-                                .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-                                .unwrap_or_default();
-                            let substitution: SubstitutionContext = parameter_ids
-                                .into_iter()
-                                .zip(trait_arguments.clone())
-                                .collect();
-                            if !substitution.is_empty() {
-                                self.method_call_substitution.insert(id, substitution);
-                            }
+                        //
+                        // The parameters substituted are the DECLARING trait's,
+                        // which is the sub-trait itself unless a SUPERTRAIT
+                        // declares the member — and then they are the
+                        // supertrait's, at the arguments the chain passes it
+                        // (B164). Zipping the sub-trait's parameters over a
+                        // supertrait's signature substituted nothing, and the
+                        // leaked parameter unified with whatever the call site
+                        // claimed: `fun bad<S: Sig<u32>>(s: S): str { s.get() }`
+                        // compiled with `trait Sig<T> with Src<T>`.
+                        let substitution = self
+                            .trait_parameter_substitution(declaring_trait_id, &declaring_arguments);
+                        if !substitution.is_empty() {
+                            self.method_call_substitution.insert(id, substitution);
                         }
                         break;
                     }

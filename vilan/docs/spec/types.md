@@ -313,7 +313,12 @@ verify field trees syntactically rather than through trait bounds.*
 
 A trait declares required methods (signature-only) and defaults (with
 bodies). `trait X with Y` makes `Y` a supertrait: implementing `X`
-requires `Y`. A trait's generic parameters may carry defaults
+requires `Y`. A supertrait's members are reachable through the
+sub-trait — a `T: Ord` value may call `eq` — and they are typed at the
+arguments the sub-trait passes the supertrait, not at the supertrait's
+own parameters: under `trait Sig<T> with Src<T>`, a `S: Sig<u32>` bound
+sees `Src`'s `get(): T` as `get(): u32`. A trait's generic parameters
+may carry defaults
 (`trait PartialEq<B = Self>`) and **bounds** (`trait Holder<T: Bound>`);
 `Self` in a trait body denotes the implementing type. Traits are used as
 **bounds**; a trait is not a type: `let x: Display` is a compile error

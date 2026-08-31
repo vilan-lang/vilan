@@ -5678,3 +5678,205 @@ fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
          diagnostic intact: {messages:#?}"
     );
 }
+
+// --- B164: a supertrait's type argument is substituted through a sub-trait ---
+// --- bound, so a member inherited from the supertrait is typed at the      ---
+// --- arguments the chain passes it, not at its own abstract parameter.     ---
+// Before the fix the member set of a bound was resolved by walking the trait
+// and its supertraits for the NAME, then substituting the SUB-trait's
+// parameters over whatever was found. A member declared by the supertrait is
+// written in the supertrait's parameters, which that substitution never
+// mentions, so the leaked parameter behaved as a wildcard and unified with
+// whatever the call site claimed.
+
+// The item's own shape: `get` comes from `Src<T>` under a `Sig<u32>` bound,
+// and the function claims it returns `str`.
+#[test]
+fn a_supertrait_member_is_typed_at_the_sub_bounds_argument() {
+    assert_fails_with(
+        r#"
+        trait Src<T> { fun get(self): T; }
+        trait Sig<T> with Src<T> { fun set(self, value: T); }
+
+        struct C { v: u32 }
+        impl C with Src<u32> { fun get(self): u32 { self.v } }
+        impl C with Sig<u32> { fun set(self, value: u32) { } }
+
+        fun bad<S: Sig<u32>>(s: S): str { s.get() }
+
+        fun main() {
+        	let _ = bad(C { v = 7 });
+        }
+        "#,
+        "Expected str, but got u32 instead.",
+    );
+}
+
+// Two supertrait levels: the argument threads `Top` -> `Mid` -> `Base`.
+#[test]
+fn a_supertrait_argument_threads_two_levels_deep() {
+    assert_fails_with(
+        r#"
+        trait Base<T> { fun get(self): T; }
+        trait Mid<T> with Base<T> { fun mid(self); }
+        trait Top<T> with Mid<T> { fun top(self); }
+
+        struct C { v: u32 }
+        impl C with Base<u32> { fun get(self): u32 { self.v } }
+        impl C with Mid<u32> { fun mid(self) { } }
+        impl C with Top<u32> { fun top(self) { } }
+
+        fun deep<S: Top<u32>>(s: S): str { s.get() }
+
+        fun main() {
+        	let _ = deep(C { v = 7 });
+        }
+        "#,
+        "Expected str, but got u32 instead.",
+    );
+}
+
+// The parameters are matched by POSITION, not by name: a supertrait written
+// with a different spelling of the parameter substitutes the same way.
+#[test]
+fn a_supertrait_with_a_different_parameter_spelling_still_substitutes() {
+    assert_fails_with(
+        r#"
+        trait Src<A> { fun get(self): A; }
+        trait Sig<A> with Src<A> { fun set(self, value: A); }
+
+        struct C { v: u32 }
+        impl C with Src<u32> { fun get(self): u32 { self.v } }
+        impl C with Sig<u32> { fun set(self, value: u32) { } }
+
+        fun bad<S: Sig<u32>>(s: S): str { s.get() }
+
+        fun main() {
+        	let _ = bad(C { v = 7 });
+        }
+        "#,
+        "Expected str, but got u32 instead.",
+    );
+}
+
+// The supertrait takes the sub-trait's SECOND parameter: the walk substitutes
+// the supertrait's written arguments, so which slot they came from is the
+// sub-trait's business and not the lookup's.
+#[test]
+fn a_supertrait_taking_a_later_parameter_substitutes_that_one() {
+    assert_fails_with(
+        r#"
+        trait Src<T> { fun get(self): T; }
+        trait Sig<A, B> with Src<B> { fun set(self, value: A); }
+
+        struct C { v: u32 }
+        impl C with Src<u32> { fun get(self): u32 { self.v } }
+        impl C with Sig<str, u32> { fun set(self, value: str) { } }
+
+        fun bad<S: Sig<str, u32>>(s: S): str { s.get() }
+
+        fun main() {
+        	let _ = bad(C { v = 7 });
+        }
+        "#,
+        "Expected str, but got u32 instead.",
+    );
+}
+
+// A supertrait named at a CONCRETE argument mentions none of the sub-trait's
+// parameters, and is typed at that argument whatever the bound says.
+#[test]
+fn a_supertrait_at_a_concrete_argument_is_typed_at_it() {
+    assert_fails_with(
+        r#"
+        trait Src<T> { fun get(self): T; }
+        trait Sig<T> with Src<u32> { fun set(self, value: T); }
+
+        struct C { v: u32 }
+        impl C with Src<u32> { fun get(self): u32 { self.v } }
+        impl C with Sig<str> { fun set(self, value: str) { } }
+
+        fun bad<S: Sig<str>>(s: S): str { s.get() }
+
+        fun main() {
+        	let _ = bad(C { v = 7 });
+        }
+        "#,
+        "Expected str, but got u32 instead.",
+    );
+}
+
+// The control that fixes the boundary: a DIRECT bound on the supertrait, and
+// the sub-trait's OWN member under a sub-trait bound, both substituted
+// correctly before B164 and still do.
+#[test]
+fn a_direct_supertrait_bound_substitutes_as_it_always_did() {
+    assert_fails_with(
+        r#"
+        trait Src<T> { fun get(self): T; }
+
+        struct C { v: u32 }
+        impl C with Src<u32> { fun get(self): u32 { self.v } }
+
+        fun bad<S: Src<u32>>(s: S): str { s.get() }
+
+        fun main() {
+        	let _ = bad(C { v = 7 });
+        }
+        "#,
+        "Expected str, but got u32 instead.",
+    );
+}
+
+#[test]
+fn a_sub_traits_own_member_substitutes_as_it_always_did() {
+    assert_fails_with(
+        r#"
+        trait Src<T> { fun get(self): T; }
+        trait Sig<T> with Src<T> { fun set(self, value: T); }
+
+        struct C { v: u32 }
+        impl C with Src<u32> { fun get(self): u32 { self.v } }
+        impl C with Sig<u32> { fun set(self, value: u32) { } }
+
+        fun writes<S: Sig<u32>>(s: S) { s.set("not a number"); }
+
+        fun main() {
+        	writes(C { v = 7 });
+        }
+        "#,
+        "Expected u32, but got str instead.",
+    );
+}
+
+// The green side, and the shape the hole surfaced as in practice: calling a
+// method ON the result used to fail with `cannot call method 'to_string' on
+// T`, because the leaked parameter was what the call landed on. It now types
+// as `u32` and runs, and arithmetic on it agrees.
+#[test]
+fn a_supertrait_member_under_a_sub_bound_resolves_and_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::display::Display;
+
+        trait Base<T> { fun get(self): T; }
+        trait Mid<T> with Base<T> { fun mid(self); }
+        trait Top<T> with Mid<T> { fun top(self); }
+
+        struct C { v: u32 }
+        impl C with Base<u32> { fun get(self): u32 { self.v } }
+        impl C with Mid<u32> { fun mid(self) { } }
+        impl C with Top<u32> { fun top(self) { } }
+
+        fun via_sub<S: Top<u32>>(s: S): u32 { s.get() }
+        fun shows<S: Top<u32>>(s: S) { print(s.get().to_string()); }
+
+        fun main() {
+        	print(via_sub(C { v = 7 }) + 1u32);
+        	shows(C { v = 2 });
+        }
+        "#,
+        "8\n2\n",
+    );
+}
