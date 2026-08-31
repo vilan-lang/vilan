@@ -72,10 +72,23 @@ parameter  = [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
 binder     = IDENT | "(" binder "," binder { "," binder } [ "," ] ")" ;
 
-extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] ")" "]" ;
-extern-args = STRING [ "," STRING ]           (* module/global binding *)
-            | ("method"|"get"|"set") [ "," STRING ] ;
+extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] [ "," ] ")" "]" ;
+extern-args = STRING [ "," STRING ]              (* global, or module and symbol *)
+            | "method" [ "," STRING ]            (* method on the receiver *)
+            | ( "get" | "set" ) "," STRING       (* property read / write *)
+            | "new" "," STRING [ "," STRING ] ;  (* construction *)
 ```
+
+The four arms are the four host bindings. `"method"` is the only form
+word that stands alone: `[extern(method)]` binds the receiver method of
+the same name as the vilan function, and `[extern(method, "on")]` names a
+different one. `get` and `set` always take their property name — a bare
+`[extern(get)]` is not an accessor, it is a malformed attribute, and
+lowers as one. `new` reads its strings exactly as the first arm does: one
+is a global class (`[extern(new, "TextDecoder")]`), two are a module and
+the class imported from it (`[extern(new, "node:sqlite", "DatabaseSync")]`),
+and the call sites emit `new Symbol(…)` because a host constructor
+rejects a plain call.
 
 `retains` is a **flag**, not a binding form: it is recognized in trailing
 position only — the one place it cannot displace a form word — and so

@@ -88,7 +88,9 @@ Where the cursor is decides what is offered.
   (`md`, `hover`, `within`, …). A value offers nothing: it is source text,
   not an expression, so a name in scope would be the wrong answer. A `{…}`
   hole is an ordinary expression and completes as one, which is how a typed
-  value gets in.
+  value gets in. All four answers hold in a block you are still **writing** —
+  one whose closing `}` you have not typed yet — because that is when
+  completion is most use; a nested rule left open the same way is a body too.
 - **After `::`** offers an enum's variants and statics, a struct's statics,
   or a module's members — and only when the name on the left is actually
   **in scope**. It used to match that name against every type the compiler

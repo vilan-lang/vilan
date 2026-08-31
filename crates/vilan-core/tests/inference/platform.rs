@@ -3838,6 +3838,94 @@ fn an_unknown_trait_steers_to_its_std_import() {
     );
 }
 
+// E103: the steer was not the value resolver's private property. A pattern's
+// variant path and a `use` statement's root each grew their OWN scope lookup
+// and raised the identical `cannot find 'X' in this scope` sentence without
+// ever joining the steer — so the same missing `Some` came with the one-line
+// fix in value position and bare in pattern position. That, not the `List`
+// method the census happened to reach it through, is the class.
+
+#[test]
+fn a_variant_pattern_steers_to_its_std_import() {
+    // The reported shape: the `Option` is minted by a `List` method, so
+    // `Some` appears ONLY in the pattern — nothing in the program takes the
+    // value-position path that used to be the steer's only door.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let numbers = [1, 2, 3];
+            let picked = match numbers.get(1) {
+                Some(value) => value,
+                None => 0,
+            };
+        }
+        "#,
+        "cannot find 'Some' in this scope; import it first (`import std::option::Some;`)",
+    );
+}
+
+#[test]
+fn the_value_position_some_still_steers() {
+    // The green control on the sibling path: the bare `Some` steered before
+    // E103 and must go on steering after it — the fix joins a second door to
+    // the steer, it does not move the first one.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let value = Some(1);
+        }
+        "#,
+        "cannot find 'Some' in this scope; import it first (`import std::option::Some;`)",
+    );
+}
+
+#[test]
+fn a_use_statement_root_steers_to_its_std_import() {
+    // The class's other member: `use`'s root miss raised the same sentence
+    // from its own lookup, equally unsteered.
+    assert_fails_with(
+        r#"
+        fun main() {
+            use Ordering::{ Less };
+        }
+        "#,
+        "cannot find 'Ordering' in this scope; import it first (`import std::compare::Ordering;`)",
+    );
+}
+
+#[test]
+fn a_variant_pattern_whose_head_resolves_gets_no_steer() {
+    // The steer names the head an import could supply. Here the head IS in
+    // scope and a later segment is the miss, so no import fixes anything —
+    // the message must stay plain rather than point at a name already there.
+    let diagnostics = failure_diagnostics(
+        r#"
+        enum Signal { Quit, Go }
+        fun main() {
+            let s = Signal::Quit;
+            let n = match s {
+                Signal::Nope => 1,
+                _ => 0,
+            };
+        }
+        "#,
+    );
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _)| message.contains("cannot find 'Signal::Nope'"))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "expected the unresolved-variant error: {diagnostics:#?}"
+    );
+    assert!(
+        matching
+            .iter()
+            .all(|(message, _)| !message.contains("import it first")),
+        "a resolvable head must not be steered at: {matching:#?}"
+    );
+}
+
 #[test]
 fn an_unknown_name_gets_no_bogus_steer() {
     // No module exports `zzz_missing`; the message stays plain.

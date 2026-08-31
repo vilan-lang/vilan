@@ -21409,11 +21409,12 @@ impl<'src> Analyzer<'src> {
                     match self.resolve_variant_path(path, lookup_scope_id, expected_type_id) {
                         Some(entity) => entity,
                         None => {
+                            let steer = self.scope_miss_steer(path, lookup_scope_id);
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
                                 note: None,
                                 span,
-                                msg: format!("cannot find '{}' in this scope", name),
+                                msg: format!("cannot find '{}' in this scope{}", name, steer),
                             });
                             return None;
                         }
@@ -28914,6 +28915,30 @@ impl<'src> Analyzer<'src> {
         self.web_prelude_index = Some(names);
     }
 
+    /// The B4 import steer for a PATH whose resolution missed in scope (E103) —
+    /// the shape shared by every `cannot find 'X' in this scope` the analyzer
+    /// raises out of its own scope lookup rather than out of the value-name
+    /// resolver: a pattern's variant path (`match .. { Some(x) => .. }`) and a
+    /// `use` statement's root. Those two sites each grew their own lookup and
+    /// never joined the steer, so the identical sentence arrived with the
+    /// one-line fix in value position and without it in pattern position — the
+    /// class behind E103, not the `List` method that happened to expose it.
+    ///
+    /// A path resolves HEAD-FIRST, so the name an import could supply is always
+    /// `path[0]`: for a bare `Some` that is the name itself, and for a qualified
+    /// `Option::Some` it is the `Option` the descent starts from. A head that
+    /// DOES resolve means a later segment is the miss, and no import fixes that
+    /// — the steer stays silent rather than point at a name already in scope.
+    fn scope_miss_steer(&mut self, path: &[&'src str], scope_id: Id) -> String {
+        let Some(head) = path.first().copied() else {
+            return String::new();
+        };
+        if self.try_get_expr_id_by_name(head, scope_id).is_some() {
+            return String::new();
+        }
+        self.import_steer(head).unwrap_or_default()
+    }
+
     /// The lazy std-wide scan behind both B4 steers: every std module file,
     /// parsed through the process-global cache, indexed by the top-level names
     /// it declares (the NAME steer) and by the methods its `impl` blocks
@@ -30915,11 +30940,12 @@ impl<'src> Analyzer<'src> {
             let mut current = match self.try_get_expr_id_by_name(root, scope_id) {
                 Some(entity) => entity,
                 None => {
+                    let steer = self.scope_miss_steer(&[root], scope_id);
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note: None,
                         span: root_span,
-                        msg: format!("cannot find '{}' in this scope", root),
+                        msg: format!("cannot find '{}' in this scope{}", root, steer),
                     });
                     self.attribute_new_diagnostics(use_diagnostics_before, source_id);
                     continue;

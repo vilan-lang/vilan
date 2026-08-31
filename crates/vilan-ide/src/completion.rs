@@ -710,10 +710,17 @@ fn css_position(
     offset: usize,
 ) -> Option<CssPosition> {
     let mut best: Option<(usize, usize)> = None;
-    for item in &root?.0 {
-        innermost_css_body_start(item, offset, &mut best);
+    if let Some(root) = root {
+        for item in &root.0 {
+            innermost_css_body_start(item, offset, &mut best);
+        }
     }
-    let (_, body_start) = best?;
+    // The parse stays the authority wherever it has an answer; a block still
+    // being typed is the one shape it cannot have one for (E105).
+    let body_start = match best {
+        Some((_, body_start)) => body_start,
+        None => unclosed_css_body_start(tokens, offset)?,
+    };
     let mut depth = 0usize;
     let mut dotted = false;
     let mut after_colon = false;
@@ -790,7 +797,8 @@ fn css_position(
 /// leaves the block's own `Node::Css` in the tree with the items around the
 /// mistake intact — which is why this needs no `Node::Error` arm of the kind
 /// the element head's recovery does. A block that never closes at all declines
-/// its atom and leaves no node, and completion simply does not fire there.
+/// its atom and leaves no node; [`unclosed_css_body_start`] answers that shape
+/// from the live lexis instead.
 fn innermost_css_body_start(
     node: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
     offset: usize,
@@ -823,6 +831,96 @@ fn css_body_start(
             css_body_start(&nested.body, offset, best);
         }
     }
+}
+
+/// The body start (one past the `{`) of the innermost `css` body still OPEN at
+/// `offset` — the mid-edit shape [`innermost_css_body_start`] cannot answer,
+/// because a block whose `}` has not been typed leaves no node to read (E105).
+///
+/// Read from the LIVE buffer's lexis for the same reason the position walk
+/// above it is: text the author has not finished writing is in no parse tree,
+/// and `css {` with the block still open is exactly that. The parse is not
+/// second-guessed — this is consulted only where it has nothing to say — and
+/// the parser is left alone deliberately: `parse_css_atom` declines an unclosed
+/// block because the region has no end, so its span is not a fact about the
+/// program, and the statement recovery's located `unclosed \`{\`` at the opener
+/// is the diagnostic the author needs. Minting a node to end-of-input would
+/// trade that message, and hand the desugar a block nobody has finished, to
+/// answer a question the editor can answer for itself.
+///
+/// One pass with a stack of open brackets, each remembering whether it is a css
+/// BODY. Two markers decide, and they are the grammar's own (§3): a block's own
+/// `{` is the one directly after the `css` keyword, and a nested rule's is one
+/// opened while the enclosing body's item has taken the `.` that commits it to
+/// a condition. Every other `{` — a hole, a condition head's argument, an
+/// ordinary block — is not a body, so a cursor inside one is not in css
+/// position and the walk says so by leaving a non-body on top of the stack.
+///
+/// Comments and string bodies cannot plant a phantom `css {` here: comments are
+/// trivia and never reach the token stream, and a string is one token.
+fn unclosed_css_body_start(tokens: &[(Token<'_>, Span)], offset: usize) -> Option<usize> {
+    /// One open bracket: where its css body starts (`None` when it is not a
+    /// body), and the enclosing item's `dotted` state to restore when it closes.
+    struct OpenBracket {
+        body_start: Option<usize>,
+        enclosing_dotted: bool,
+    }
+    let mut open: Vec<OpenBracket> = Vec::new();
+    // The innermost body's current item: whether it has taken the `.`, and
+    // whether it is past the `:` that separates a property from its value (a
+    // `.` in a value commits nothing — the same guard the position walk uses).
+    let mut dotted = false;
+    let mut after_colon = false;
+    let mut previous_was_css = false;
+    for (token, span) in tokens {
+        let range = span.into_range();
+        if range.start >= offset {
+            break;
+        }
+        let in_css_body = open
+            .last()
+            .is_some_and(|bracket| bracket.body_start.is_some());
+        match token {
+            Token::Ctrl('{') => {
+                let body_start = if previous_was_css || (in_css_body && dotted) {
+                    Some(range.end)
+                } else {
+                    None
+                };
+                open.push(OpenBracket {
+                    body_start,
+                    enclosing_dotted: dotted,
+                });
+                dotted = false;
+                after_colon = false;
+            }
+            Token::Ctrl('(' | '[') => {
+                open.push(OpenBracket {
+                    body_start: None,
+                    enclosing_dotted: dotted,
+                });
+                dotted = false;
+                after_colon = false;
+            }
+            Token::Ctrl(')' | ']' | '}') => {
+                if let Some(bracket) = open.pop() {
+                    dotted = bracket.enclosing_dotted;
+                    after_colon = false;
+                }
+            }
+            Token::Ctrl(';') if in_css_body => {
+                dotted = false;
+                after_colon = false;
+            }
+            // The declaration's separator is an OPERATOR token, not a control
+            // one (`parse_css_declaration` reads it with `peek_is_op`).
+            Token::Op(":") if in_css_body => after_colon = true,
+            Token::Ctrl('.') if in_css_body && !after_colon => dotted = true,
+            _ => {}
+        }
+        previous_was_css = matches!(token, Token::Css);
+    }
+    open.last().and_then(|bracket| bracket.body_start)
 }
 
 /// Where in a `css` block's body the cursor is (css-block.md §7.1) — the four
