@@ -27,6 +27,9 @@
 //!     `write_chunks` would otherwise DELETE a resource parked on one.
 //!   - **A source that is already its destination is not copied** — `fs::copy`
 //!     over itself truncates, so carrying the file would destroy it.
+//!   - **A copy the build stops naming is swept**, because a stale file in
+//!     `dist/` SHIPS — on the per-kind prune's law and not a second one: only
+//!     what the build recorded, never a file it merely found.
 //!   - **The call is compile-time-only**, like its `std::asset` siblings.
 //!
 //! The last block pins kolt.local 035's three additions on the same machinery:
@@ -607,6 +610,16 @@ fn a_file_added_to_a_listed_directory_joins_the_next_build() {
         !javascript.contains("\"/late.svg\""),
         "disappearance is the same event:\n{javascript}"
     );
+    // Its `dist/` half (backlog G13). The listing no longer names the file, so
+    // nothing routes to the copy — but `dist/` is the DEPLOY artifact, and a
+    // static host in front of it would go on serving a resource the source tree
+    // no longer has. This is the case that needs no source edit at all to
+    // reach: only the tree moved.
+    assert!(
+        !dir.join("dist/late.svg").exists(),
+        "the copy of a file the build stopped naming must go with it — a stale \
+         file in dist/ SHIPS"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -657,6 +670,19 @@ fn a_fingerprinted_url_is_the_files_digest_and_moves_with_it() {
         !javascript.contains("ba7816bf"),
         "an edited file must re-mint its url — the digested file is a tracked \
          build input:\n{javascript}"
+    );
+    // And the copy the old url named goes with the url (backlog G13). This is
+    // the unbounded case: the recipe mints a NEW name on every save, so without
+    // the sweep a `--watch` session accumulates one orphaned copy per edit for
+    // its whole life, each of them served.
+    assert!(
+        !dir.join("dist/logo.ba7816bf.svg").exists(),
+        "the copy on the old fingerprint is orphaned the moment the url moves, \
+         and must not survive the build that moved it"
+    );
+    assert!(
+        dir.join("dist/logo.88d4266f.svg").is_file(),
+        "sha-256(\"abcd\") begins `88d4266f` — the new url has its copy"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -841,6 +867,175 @@ fn a_target_a_legs_build_owns_is_refused() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// --- backlog G13: `dist/` sweeps what the build stopped naming ----------------
+//
+// `write_bundled` copied and recorded nothing, alone among the four writers
+// that share one `dist/`. The two above pin the disappearances; these pin the
+// LAW that makes the sweep safe, which is G6's and not a second one: the
+// pruner acts only on its own record, so a user's file, another leg's copies
+// and anything unrecorded are untouchable however bundle-shaped their names.
+
+/// A leg that stops bundling loses its copies — and the build touches nothing
+/// else on the way. The record (`.vilan-bundled`, beside the outputs) is the
+/// whole authority: it names what to remove, it is removed with its last row,
+/// and a hand-placed file it never named survives the sweep that empties it.
+#[test]
+fn a_bundle_the_build_stops_naming_is_swept_from_dist() {
+    let dir = temp_project("estate-sweep");
+    stage_estate(&dir);
+    write(&dir, "src/client.vl", ESTATE_CLIENT);
+    build_ok(&dir);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dist/.vilan-bundled"))
+            .ok()
+            .as_deref(),
+        Some(
+            "client/icons/close.svg\n\
+             client/icons/open.svg\n\
+             client/logo.svg\n\
+             client/robots.txt\n"
+        ),
+        "the build records what it carried, keyed by leg and sorted — the only \
+         thing the next build's prune may act on"
+    );
+
+    // Placed by hand, in the same directory, named by no `const`. The sweep
+    // about to run must not so much as look at it.
+    write(&dir, "dist/hand-written.txt", ORPHAN);
+    // The estate recipe, gone. No file moved in `static/`: the CALL that named
+    // them is what left.
+    write(
+        &dir,
+        "src/client.vl",
+        "import std::ui::{ mount_root, view };\n\
+         \n\
+         fun main() {\n\
+         \tlet _root = mount_root(\"app\", || view(\"p\"));\n\
+         }\n",
+    );
+    build_ok(&dir);
+
+    for gone in [
+        "dist/robots.txt",
+        "dist/logo.svg",
+        "dist/icons/open.svg",
+        "dist/icons/close.svg",
+    ] {
+        assert!(
+            !dir.join(gone).exists(),
+            "{gone} outlived the build that stopped naming it"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dist/hand-written.txt"))
+            .ok()
+            .as_deref(),
+        Some(ORPHAN),
+        "an unrecorded file is not the build's to remove — one law with the \
+         per-kind prune's"
+    );
+    assert!(
+        !dir.join("dist/.vilan-bundled").exists(),
+        "an empty record is removed, not left behind as its own stale artifact"
+    );
+    assert!(
+        dir.join("dist/client.js").is_file() && dir.join("dist/server.mjs").is_file(),
+        "and the sweep touches nothing but the copies it recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `dist/` is ONE directory and every leg copies into it, so the record is
+/// keyed by leg — and a name is still not one leg's to delete just because that
+/// leg stopped naming it. Two legs bundling the same file to the same target is
+/// legal and expected (the copy is idempotent), so the sweep removes a file
+/// only when the record it is about to write no longer names it AT ALL.
+#[test]
+fn a_sweep_leaves_the_other_legs_bundles_alone() {
+    let dir = temp_project("estate-crossleg-sweep");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"twolegs\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/first.txt", "the client's own\n");
+    write(&dir, "src/second.txt", "the server's own\n");
+    write(&dir, "src/both.txt", "carried by both legs\n");
+    write(
+        &dir,
+        "src/client.vl",
+        "import std::asset;\n\
+         import std::ui::{ mount_root, view };\n\
+         \n\
+         let MINE = const asset::bundle_as(\"first.txt\", \"/client-only.txt\");\n\
+         let OURS = const asset::bundle_as(\"both.txt\", \"/shared.txt\");\n\
+         \n\
+         fun main() {\n\
+         \tlet _root = mount_root(\"app\", || view(\"a\").attr(\"href\", MINE + OURS));\n\
+         }\n",
+    );
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::asset;\n\
+         import std::io::print;\n\
+         \n\
+         let MINE = const asset::bundle_as(\"second.txt\", \"/server-only.txt\");\n\
+         let OURS = const asset::bundle_as(\"both.txt\", \"/shared.txt\");\n\
+         \n\
+         fun main() {\n\
+         \tprint(MINE);\n\
+         \tprint(OURS);\n\
+         }\n",
+    );
+    build_ok(&dir);
+    for present in [
+        "dist/client-only.txt",
+        "dist/server-only.txt",
+        "dist/shared.txt",
+    ] {
+        assert!(dir.join(present).is_file(), "{present} must be carried");
+    }
+
+    // Only the SERVER stops bundling — the leg that builds SECOND, so its prune
+    // is the last word on `dist/`. Dropping the client's instead would prove
+    // nothing: the server's copy runs after it and would put the shared file
+    // back, hiding a prune that had no business removing it.
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+    );
+    build_ok(&dir);
+    assert!(
+        !dir.join("dist/server-only.txt").exists(),
+        "the server's own copy goes with the call that named it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dist/client-only.txt"))
+            .ok()
+            .as_deref(),
+        Some("the client's own\n"),
+        "one leg's prune may never reach another leg's copies"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dist/shared.txt"))
+            .ok()
+            .as_deref(),
+        Some("carried by both legs\n"),
+        "a name the OTHER leg still bundles is not stale — the record this \
+         build is about to write still carries it, so it is not the pruner's"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dist/.vilan-bundled"))
+            .ok()
+            .as_deref(),
+        Some("client/client-only.txt\nclient/shared.txt\n"),
+        "and the record keeps exactly the rows that survived"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Polls for `path` to hold `expected`, up to a bounded deadline. Returns the
