@@ -13,8 +13,15 @@ organized by message instead of by topic.
 - **A bare integer literal adapts to its peer; two typed variables
   don't.** `stamp + 1000` and `stamp < 1000` are fine on an `i53` (the
   literal takes the peer's type), but mixing two differently-typed
-  *variables* in a comparison is an error: there are no implicit
-  conversions. Convert with `as_*` or unify the declarations.
+  *variables* in a comparison or an addition is an error: there are no
+  implicit conversions. Convert with `as_*` or unify the declarations.
+- **Concatenation renders nothing for you, and an i-string is
+  concatenation.** `"p=" + point` and `i"p={point}"` are the same
+  expression, and both refuse a value with no string form rather than
+  printing its runtime shape (`p=1,2`). Call `to_string()` — writing an
+  `impl … with Display` if the type has none. The string also has to be
+  on the *left*: an expression takes its type from its left operand, so
+  `count + "!"` is an error, not an `i32` holding `"1!"`.
 - **A guarded last `match` arm proves nothing.** A guard tests the value
   and exhaustiveness reasons about the type, so `B if ready => …` leaves
   `B` missing. Write the arm you meant to fall through to:

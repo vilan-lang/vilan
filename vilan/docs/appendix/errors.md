@@ -239,6 +239,43 @@ no implicit conversions. An unsuffixed literal adapts to its peer
 **"`&&` takes `bool` operands"** (Vilan has no truthiness).
 → [Values and types](../tour/values-and-types.md)
 
+**"`+` on `str` concatenates, and `…` has no string form: concatenating it
+renders the value's runtime shape …"**
+A value with no string form was concatenated into one. Only `str`, the
+numbers and `bool` render themselves; a struct lowers to a tuple, an
+enum to a tagged array and a `List` to an array, so the host would have
+printed `1,2` for a `Point { x = 1, y = 2 }`. Render it first —
+`point.to_string()`, adding an `impl Point with Display` if the type has
+none. **An interpolated string is this same concatenation** (`i"a{x}b"`
+*is* `("" + "a" + x + "b")`), so a hole gets the identical error and the
+identical fix; the same goes for a `css` block value that mixes text
+with holes. A backed enum is included in the refusal on purpose: its
+backing is a lowering detail, not a rendering the program chose.
+→ [Values and types](../tour/values-and-types.md), [Strings](../std/strings.md)
+
+**"`+` on `…` adds, and `str` is not a number: only a `str` LEFT operand
+concatenates …"**
+The concatenation is the right way round only when the string is on the
+left, because the expression takes its type from its left operand:
+`count + "!"` would have typed as `i32` while producing a string. Write
+`"!" + count`, or convert with `count.to_string() + "!"`.
+→ [Values and types](../tour/values-and-types.md)
+
+**"`+` adds two values of the same type, but the operands are `…` and `…`"**
+The `==`/`<` rule above, for addition: no implicit conversions between
+numeric types. An unsuffixed literal still adapts to its peer
+(`stamp + 1000` is fine for an `i53` stamp); two differently-typed
+*variables* need a suffix or an `as_*` conversion (`ratio + count.as_f64()`).
+→ [Values and types](../tour/values-and-types.md)
+
+**"`+` adds numbers and concatenates `str`, and `…` is neither: it has no
+`Add` …"**
+`bool` and backed enums are native for `==` and `<` without being
+numbers, so `+` on one would have added its *lowering*: `true + true` is
+`2`, typed as a `bool`, and two backings sum to something that is rarely
+a variant. Match on the variant, or hold the number you mean.
+→ [Values and types](../tour/values-and-types.md)
+
 **"type '…' does not implement the `…` operator; add `impl … with …` providing `…`"**
 An operator was used on a type without the matching trait impl: `+`
 needs `Add`, `==` needs `PartialEq`, `<`/`<=`/`>`/`>=` need

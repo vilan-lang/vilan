@@ -91,8 +91,37 @@ fun main() {
 }
 ```
 
-Concatenation is `+`. The full method list (split, trim, contains, and so
-on) is in the [strings reference](../std/strings.md).
+Concatenation is `+`, and an interpolated string is exactly that: a hole
+is a `+` operand, so both spellings take the same right-hand values —
+another `str`, a number, or a `bool`. Anything else has no string form
+and is refused rather than printed as its runtime shape, which is what
+`"p=" + point` would have done (`p=1,2`). Render it yourself:
+
+```vilan
+import std::print;
+import std::display::Display;
+
+struct Point { x: i32, y: i32 }
+
+impl Point with Display {
+	fun to_string(self): str {
+		i"({self.x}, {self.y})"
+	}
+}
+
+fun main() {
+	let point = Point { x = 1, y = 2 };
+	print("p=" + point.to_string());
+	print(i"p={point.to_string()}");
+}
+```
+
+The order matters too, because the expression takes its type from its
+left operand: `"n=" + count` concatenates, and `count + "n="` is an
+error rather than a silently `i32`-typed string.
+
+The full method list (split, trim, contains, and so on) is in the
+[strings reference](../std/strings.md).
 
 For text that spans lines, `"""…"""` is a **raw** multiline string:
 nothing follows the opening delimiter on its line, the closing delimiter

@@ -6,7 +6,9 @@ The string type `str` (built in, immutable), plus the text-facing traits
 ## str
 
 Concatenate with `+`. Interpolate with `i"…{expr}…"` (see
-[Values and types](../tour/values-and-types.md)).
+[Values and types](../tour/values-and-types.md)) — the two are one
+construct, so both take the same right-hand values: a `str`, a number,
+or a `bool`. Everything else needs `to_string()` first.
 
 ```vilan,fragment
 impl str {
@@ -197,8 +199,10 @@ fun format<T: Display>(value: T): str
 
 Implement `Display` for values that have a natural user-facing rendering;
 `format(value)` (from `std::display`) is the generic entry point.
-Interpolation accepts anything already `str`-shaped; call
-`format`/`to_string` explicitly for custom types.
+Concatenation and interpolation accept only what already has a string
+form — a `str`, a number, a `bool` — and refuse everything else by name,
+so `format`/`to_string` on a custom type is a call you write rather than
+one the compiler guesses at.
 
 ## Debug: developer-facing text
 

@@ -533,6 +533,11 @@ fn a_method_on_a_generic_type_is_also_excluded() {
 /// the inferred mode panics this test rather than passing it.
 #[test]
 fn the_sweep_never_produces_a_diagnostic() {
+    // `started` is read through `to_iso()` rather than added into the sum
+    // beside the integers: `scale(derived) + started` was an `i32 + Instant`,
+    // which B148's operand rule refuses. The fixture only ever needed each
+    // binding READ, so the sum keeps the integers and the `Instant` gets a use
+    // of its own.
     let program = analyze(
         "import std::print;\n\
          import std::time;\n\
@@ -546,7 +551,8 @@ fn the_sweep_never_produces_a_diagnostic() {
          \tlet loud = noisy();\n\
          \tlet xs = [1, 2, 3];\n\
          \tlet boom = xs[9];\n\
-         \tprint(scale(derived) + started + loud + boom);\n\
+         \tprint(scale(derived) + loud + boom);\n\
+         \tprint(started.to_iso());\n\
          }\n\
          main();\n",
     );

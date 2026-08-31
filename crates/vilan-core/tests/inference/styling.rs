@@ -5129,6 +5129,49 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
 }
 
 #[test]
+fn a_mixed_css_value_refuses_a_struct_hole() {
+    // B148's css end. A value that MIXES text and holes is built to the
+    // i-string's shape — `("" + "calc(" + space(4) + " + 2px)")`
+    // (`css::build_value`) — so it inherited the concatenation's hole: a
+    // `Length` is a two-field struct, and the host rendered the tuple straight
+    // into the declaration, sheet fragment and all
+    // (`calc(var(--space-4),:root{--space-4:1rem} + 2px)`). The concatenation
+    // rule refuses it here for the same reason it refuses `"x" + point`.
+    //
+    // A `str` or a number hole in a mixed value is unaffected — those render —
+    // so what this closes is the typed style values (`Length`, `Color`) used
+    // MID-value. There is no correct spelling for that today: `.text` reaches
+    // the var reference but drops the `:root` line the one-hole row above
+    // carries, which is the hazard S1 closed. Refusing is the honest state.
+    assert_fails_with(
+        r#"
+        import std::style::{ style, space };
+        let _s = const css { padding: calc({space(4)} + 2px); };
+        fun main() {}
+        main();
+        "#,
+        "`+` on `str` concatenates, and `Length` has no string form",
+    );
+}
+
+#[test]
+fn a_mixed_css_value_still_admits_a_string_hole() {
+    // The other half of the rule: a hole that renders still rides through a
+    // mixed value, so the form itself is untouched.
+    let css = style_css(
+        r#"
+        import std::style::style;
+        fun main() {}
+        let width = "100%";
+        let inset = 2;
+        let _s = const css { width: calc({width} - {inset}rem); };
+        main();
+        "#,
+    );
+    assert!(css.contains("{width:calc(100% - 2rem)}"), "{css}");
+}
+
+#[test]
 fn a_hole_free_value_is_its_own_source_slice() {
     // A value is a TOKEN RUN, not a typed grammar: commas, parens and a quoted
     // string ride through verbatim, and the quotes survive the round trip into
