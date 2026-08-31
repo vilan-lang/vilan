@@ -14,8 +14,15 @@
 //! defect is not tracked unless it has an item. Nothing enforced the join, and
 //! audit runs 2, 3 and 4 each found an ignored pin whose defect lived nowhere
 //! but its reason string — a bug the tracker had never heard of, discoverable
-//! only by reading test attributes. So every reason must name a tracker item,
-//! or be one of the few ignores that are deliberately not bugs.
+//! only by reading test attributes. So every reason must LEAD with a tracker
+//! item id, or be one of the few ignores that are deliberately not bugs.
+//!
+//! The leading id, and the scanner's fence around this file's own fixture, are
+//! N33: run 5 found the first version of both halves too weak to be worth the
+//! green tick. "Capitals then a digit" accepted `ARM64` and `UTF8`, and let a
+//! reason satisfy the gate by mentioning any of the three ids in its prose
+//! while the OPEN owner of the defect went unnamed; and the sweep read this
+//! file's own string-literal fixture as a real attribute, passing by luck.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -166,32 +173,61 @@ const DELIBERATE_NON_BUG_IGNORES: &[&str] = &[
      every heading id to mdbook_heading_ids",
 ];
 
-/// Whether `reason` carries something shaped like a tracker item id — one or
-/// more capitals followed immediately by digits (`B154`, `E102`, `N31`). The
-/// shape, not a roster: this gate lives in the compiler repo and the tracker
-/// lives in another, so it can insist that a reason POINT somewhere without
-/// pretending to know what exists there.
+/// The tracker's family letters — the sections of its `INDEX.md`, one letter
+/// each. A deliberate coupling to the other repo, and the smallest one
+/// available: the roster of FAMILIES changes when a section is added, which is
+/// rare and deliberate, where the roster of ITEMS changes several times a
+/// cycle and could not be tracked from here at all.
+///
+/// The cost is honest and its direction is the safe one. A tracker that gains a
+/// section reddens this gate on the first pin that names an item in it, and the
+/// fix is one character in this list — a decision visible in a diff, exactly
+/// like adding a member to [`DELIBERATE_NON_BUG_IGNORES`]. What it buys is the
+/// refusal the shape alone could not make: `ARM64`, `UTF8`, `ES6` and `ISO8601`
+/// are all "capitals then a digit", and none of them points anywhere.
+const TRACKER_FAMILIES: &[char] = &['A', 'B', 'C', 'D', 'E', 'G', 'I', 'J', 'K', 'L', 'M', 'N'];
+
+/// Whether `reason` LEADS with a tracker item id — a single family letter, one
+/// to three digits, and then the end of the id (`B154: …`, `C13 — …`).
+///
+/// Both halves of that shape close a hole the audit found (N33), and neither
+/// closes the other's:
+///
+/// - **The letter set.** "One or more capitals then a digit" is the shape of an
+///   ACRONYM as much as of an id, so `ARM64`, `UTF8`, `ES6` and `ISO8601` all
+///   satisfied it. An id is one family letter, and the run must stop there:
+///   `ES6` fails because `S` is not a digit, `ISO8601` for the same reason, and
+///   the id must end at a non-alphanumeric so `I18n` is not read as item 18.
+/// - **The lead.** A reason that merely MENTIONS an id somewhere in its prose
+///   has as many candidate owners as it has capitals. `borrows.rs` passed this
+///   gate by naming `P4c` (a proposal slice label) and `C12` (closed) while the
+///   OPEN owner of the defect, `C13`, went unnamed — three plausible ids, none
+///   of them the answer. Leading with the id makes the reason POINT: there is
+///   exactly one candidate, and it is the first thing a reader sees.
 fn names_a_tracker_item(reason: &str) -> bool {
-    let characters: Vec<char> = reason.chars().collect();
-    let mut index = 0;
-    while index < characters.len() {
-        if !characters[index].is_ascii_uppercase() {
-            index += 1;
+    let mut characters = reason.trim_start().chars();
+    let Some(family) = characters.next() else {
+        return false;
+    };
+    if !TRACKER_FAMILIES.contains(&family) {
+        return false;
+    }
+    let mut digits = 0;
+    for character in characters {
+        if character.is_ascii_digit() {
+            digits += 1;
+            // Three digits is already 999 items in one family; a longer run is
+            // a year or a version, not an id.
+            if digits > 3 {
+                return false;
+            }
             continue;
         }
-        let mut after_capitals = index;
-        while after_capitals < characters.len() && characters[after_capitals].is_ascii_uppercase() {
-            after_capitals += 1;
-        }
-        if characters
-            .get(after_capitals)
-            .is_some_and(char::is_ascii_digit)
-        {
-            return true;
-        }
-        index = after_capitals;
+        // The id ends where the number does, and it must END: a letter or an
+        // underscore straight after the digits makes this a word, not an id.
+        return digits > 0 && !character.is_alphanumeric() && character != '_';
     }
-    false
+    digits > 0
 }
 
 /// Every tracked `.rs` file, as `(repo-relative name, contents)`. `git
@@ -216,15 +252,63 @@ fn tracked_rust_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The fence a file writes around a block of Rust that is a FIXTURE rather than
+/// code — a `#[ignore]` written inside a string literal, for a test about the
+/// sweep itself. Spelled with `concat!` so the joined marker never appears in
+/// this file except at the two places that really fence something: a scanner
+/// looking for its own marker text would otherwise find these very lines.
+const FIXTURE_FENCE_OPEN: &str = concat!("ignore-sweep-fixture", ":start");
+const FIXTURE_FENCE_CLOSE: &str = concat!("ignore-sweep-fixture", ":end");
+
+/// `text` with every fenced fixture region blanked to spaces, newlines kept so
+/// every line number after one is unchanged.
+///
+/// Why a fence and not a Rust-literate scanner (N33): the sweep is line
+/// oriented, so an `#[ignore` written at column 0 INSIDE a string literal reads
+/// as an attribute — which is exactly what this file's own fixture is, and it
+/// passed the gate only by coincidence, `read_string_literal` swallowing the
+/// fixture and `read_attribute` picking up a later quoted string as the reason.
+/// The general fix would be to track string state while scanning, and that is
+/// the wrong trade here: this tree has 63 files using raw strings (`r#"…"#`)
+/// and dozens containing a `'"'` char literal (`main.rs` alone has seven), so a
+/// quote-toggling scanner desyncs, and the direction it fails in is a SILENT
+/// gate — blind to every attribute after the desync. A fence fails the other
+/// way: what is skipped is exactly what somebody wrote a marker around, and the
+/// markers are inventoried by [`the_fixture_fence_is_used_once_and_only_here`],
+/// so it cannot quietly become an escape hatch.
+fn without_fixture_fences(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut fenced = false;
+    for line in text.split_inclusive('\n') {
+        if !fenced && line.contains(FIXTURE_FENCE_OPEN) {
+            fenced = true;
+        } else if fenced && line.contains(FIXTURE_FENCE_CLOSE) {
+            fenced = false;
+        }
+        if fenced || line.contains(FIXTURE_FENCE_CLOSE) {
+            result.extend(
+                line.chars()
+                    .map(|character| if character == '\n' { '\n' } else { ' ' }),
+            );
+        } else {
+            result.push_str(line);
+        }
+    }
+    result
+}
+
 /// Every `#[ignore]` attribute in `text`, as `(1-based line, reason)` — `None`
 /// when the attribute carries no reason at all.
 ///
 /// An attribute is recognized only where one is written: at the start of a
 /// line, whitespace aside. That is what keeps the sweep off the many `#[ignore]`
 /// mentions in this tree's prose — doc comments explaining the house rule,
-/// including the ones in this very file — without needing to parse Rust.
+/// including the ones in this very file — without needing to parse Rust. The
+/// other place an `#[ignore` is not an attribute is inside a string literal,
+/// and [`without_fixture_fences`] is how a file says so.
 fn ignore_attributes(text: &str) -> Vec<(usize, Option<String>)> {
     const ATTRIBUTE: &str = "#[ignore";
+    let text = &without_fixture_fences(text);
     let bytes = text.as_bytes();
     let mut attributes = Vec::new();
     let mut line = 1;
@@ -361,8 +445,9 @@ fn the_item_id_shape_accepts_an_id_and_refuses_prose() {
     for reason in [
         "B154 — the internal `NativeMap::insert` frees the caller's value",
         "E102 residue",
-        "waiting on N31",
         "C11's predicate, narrowed",
+        "N33: the id ends at the digits, and a colon is a fine terminator",
+        "  B1: leading whitespace is not prose",
     ] {
         assert!(
             names_a_tracker_item(reason),
@@ -375,6 +460,21 @@ fn the_item_id_shape_accepts_an_id_and_refuses_prose() {
         "OPEN, not yet filed",
         "b154 in lower case is not an id",
         "",
+        // N33's first weakness: capitals-then-a-digit is the shape of an
+        // ACRONYM too, and none of these points at anything.
+        "ARM64 has no ignored pins",
+        "UTF8 decoding is host business",
+        "ES6 modules, not an item",
+        "ISO8601 timestamps drift under load",
+        "I18n is a word, not item 18 of the collections family",
+        "A2026 is a year wearing a family letter",
+        // N33's second weakness: a reason that MENTIONS an id has as many
+        // candidate owners as it has capitals. `borrows.rs` named `P4c` and
+        // `C12` while the open owner `C13` went unwritten.
+        "waiting on N31",
+        "not C12's hole — the capture here is a view parameter",
+        "P4c: a proposal slice label is not a tracker item",
+        "F14: an audit finding is not a tracker item either",
     ] {
         assert!(
             !names_a_tracker_item(reason),
@@ -383,11 +483,82 @@ fn the_item_id_shape_accepts_an_id_and_refuses_prose() {
     }
 }
 
+// The fence, and the inventory that keeps it from becoming an escape hatch.
+// Skipping a region is the same kind of decision as allowlisting a reason, so
+// it is held the same way: an exact list, edited on purpose, in a diff.
+#[test]
+fn the_fixture_fence_is_used_once_and_only_here() {
+    let fenced: Vec<String> = tracked_rust_sources()
+        .into_iter()
+        .filter(|(_, text)| text.contains(FIXTURE_FENCE_OPEN))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        fenced,
+        vec!["crates/vilan-cli/tests/ci_ignored_pins.rs".to_string()],
+        "the fixture fence exists for this file's own scanner fixture. A second \
+         user is a decision, not a detail: say why here"
+    );
+    let text = tracked_rust_sources()
+        .into_iter()
+        .find(|(name, _)| name == "crates/vilan-cli/tests/ci_ignored_pins.rs")
+        .expect("this file is tracked")
+        .1;
+    assert_eq!(
+        text.matches(FIXTURE_FENCE_OPEN).count(),
+        1,
+        "one fenced region, not a fence anyone can reopen"
+    );
+    assert_eq!(text.matches(FIXTURE_FENCE_CLOSE).count(), 1);
+    // And the point of it, stated against the real sweep rather than a
+    // constructed source: this file holds no ignored PIN, so the whole-repo
+    // scan must find nothing here. Without the fence it finds the fixture's,
+    // and what it reads as the reason is whatever the string scan happens to
+    // run into next — the coincidence audit run 5 caught.
+    assert!(
+        ignore_attributes(&text).is_empty(),
+        "the sweep must see no attribute in the file that owns the scanner: {:?}",
+        ignore_attributes(&text)
+    );
+}
+
+// And the fence does what it says: an `#[ignore` written at column 0 inside a
+// fenced block is invisible to the sweep, while one outside it is not, and the
+// line numbers on the far side of a fence are unmoved.
+#[test]
+fn the_sweep_skips_a_fenced_fixture_and_keeps_its_line_numbers() {
+    // Assembled rather than written out, markers included: an attribute or a
+    // marker spelled at the head of a line in THIS file would be read by the
+    // whole-repo sweep as the real thing, which is the exact confusion the
+    // fence exists to end. The one place this file spells either is the fenced
+    // region below.
+    let attribute = |reason: &str| format!("#[ignore = \"{reason}\"]");
+    let source = format!(
+        "// {FIXTURE_FENCE_OPEN}\n\
+         let fixture = \"…\n\
+         {}\n\
+         fn inside() {{}}\n\
+         \";\n\
+         // {FIXTURE_FENCE_CLOSE}\n\
+         #[test]\n\
+         {}\n\
+         fn outside() {{}}\n",
+        attribute("B1: a fixture, not a pin"),
+        attribute("C13: a real one, after the fence"),
+    );
+    assert_eq!(
+        ignore_attributes(&source),
+        vec![(8, Some("C13: a real one, after the fence".to_string()))],
+        "the fenced `#[ignore` is a fixture; the one after it is a pin, on line 8"
+    );
+}
+
 // And the scanner: it must find the attribute where one is written, across the
 // line break a long reason takes, and must NOT find the ones this tree's prose
 // talks about — a false positive there would redden the gate over a comment.
 #[test]
 fn the_sweep_reads_attributes_and_not_prose_about_them() {
+    // ignore-sweep-fixture:start
     let source = "\
 /// A known-but-unfixed bug is pinned `#[ignore]`d and un-ignored when fixed.
 #[test]
@@ -399,6 +570,7 @@ fn pinned() {}
 #[ignore]
 fn bare() {}
 ";
+    // ignore-sweep-fixture:end
     let found = ignore_attributes(source);
     assert_eq!(
         found,

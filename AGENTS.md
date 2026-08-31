@@ -71,7 +71,12 @@ Rust workspace, six crates, plus the language's own tree:
    `crates/vilan-core/tests/inference/` (`assert_compiles`,
    `assert_compiles_and_runs`, `assert_fails`) — one pin per case, including the edge
    cases (multi-parameter, nested, mixed, ordering-sensitive), not one representative
-   example. A known-but-unfixed gap is pinned `#[ignore]` with a comment saying why.
+   example. A known-but-unfixed gap is pinned `#[ignore]` with a comment saying why —
+   and the reason must **lead with its tracker item id** (`#[ignore = "C13: …"]`), so
+   the defect lives in the tracker and not in a test attribute. A gate enforces it
+   (`crates/vilan-cli/tests/ci_ignored_pins.rs`): the id is one family letter and one
+   to three digits, and an ignore that is deliberately NOT a bug — cost, a missing
+   tool — is added to `DELIBERATE_NON_BUG_IGNORES` by its exact reason string.
    B145 split the old single 69k-line `tests/inference.rs` into subject modules of
    ONE binary: `main.rs` declares them, the harness is `support.rs`, and a new pin
    goes in the subject module that owns its area (a new subject is a new `mod`).
