@@ -124,16 +124,19 @@ impl HashBuffer {
 async external fun sleep(ms: i32): void;
 ```
 
-The four binding forms:
+The binding forms:
 
 | Form | Binds |
 |---|---|
 | `[extern("module", "name")]` | an import from a host module |
 | `[extern("global.path")]` | a dotted global, like `history.pushState` |
 | `[extern(method, "name")]` | a method on a host object |
+| `[extern(method)]` | the same, taking the host name from the vilan function's own |
 | `[extern(get, "prop")]` / `[extern(set, "prop")]` | a property read / write |
+| `[extern(new, "Class")]` | construction — `new Class(…)`, which a host constructor requires |
+| `[extern(new, "module", "Class")]` | the same, on a class imported from a host module |
 
-Any of the four takes a trailing `retains` —
+Any of them takes a trailing `retains` —
 `[extern(method, "addEventListener", retains)]` — and you need it whenever
 the host *keeps* what you hand it instead of reading it only until the
 call returns: an event listener, a queued callback, a stashed value.
