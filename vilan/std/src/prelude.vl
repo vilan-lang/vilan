@@ -1,0 +1,22 @@
+// The BASE prelude — the ambient scope every vilan package resolves under
+// unless its manifest says otherwise (`prelude.md` §5.1). Seven names, each
+// admitted by a rule and not by rank alone: universal (base layer, reachable on
+// every target), language-level (the language itself produces it, or every
+// program uses it whatever its domain), unambiguous (exactly one std definition
+// claims the name), and top-of-census in more than one corpus.
+//
+// `Option` is the strongest case: `Option<T>` is a lang item, manufactured by
+// `?.` and by view-returning lookups, so a program can be handed one without
+// ever naming its type — and then, before this module, could not take it apart.
+// `Result` travels with it as the `!` operator's canonical type. `print` is the
+// one name a program needs before it can be observed at all.
+//
+// This module is nothing but re-exports, and that is the rule rather than an
+// accident: a prelude's ambient names are exactly the names it publishes, so a
+// reader answers "what is in scope here" by reading this file.
+//
+// Selected as `prelude = "std::prelude"`, which is also what omitting the key
+// means. The web set is next door in `web.vl`.
+export import pkg::io::print;
+export import pkg::option::Option::{ self, None, Some };
+export import pkg::result::Result::{ self, Err, Ok };

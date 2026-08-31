@@ -34,8 +34,6 @@ PATH.
 ## A first program
 
 ```vilan
-import std::print;
-
 fun main() {
 	print("hello");
 }
@@ -52,10 +50,12 @@ vilan check hello.vl    # just type-check — writes nothing
 `fun main` is the entrypoint. It runs automatically, so there is no
 `main()` call at the bottom of the file.
 
-Two small things you'll notice compared to JS. First, the standard library
-is imported explicitly, even `print`. Your files will start with a few
-`import` lines, like ES modules. Second, indentation is tabs by
-convention, and `vilan fmt` will format files for you.
+Two small things you'll notice compared to JS. First, no import: `print`
+is in the **prelude**, the small set of names every package gets for
+free. So are `Option`/`Some`/`None` and `Result`/`Ok`/`Err`. Everything
+else in the standard library is imported explicitly, so your files will
+start with a few `import` lines, like ES modules. Second, indentation is
+tabs by convention, and `vilan fmt` will format files for you.
 
 ## Start a project
 
@@ -148,7 +148,7 @@ workspaces are covered in [Projects and dependencies](projects.md).
 ## Imports
 
 ```vilan,fragment
-import std::print;                          // one item
+import std::json::json_codec;               // one item
 import std::reactive::{ Signal, combine };  // several at once
 import std::option::Option::{ self, Some, None };  // a type plus its variants
 import pkg::routes::{ Route, parse };       // another file in YOUR package
@@ -165,7 +165,40 @@ There are three places an import can come from:
   `vilan.toml`.
 
 The `{ self, Some, None }` form imports the `Option` type *and* its
-variants, so you can write `Some(x)` without qualifying it.
+variants, so you can write `Some(x)` without qualifying it. (That
+particular line is redundant in most packages — `Option` and its variants
+are in the prelude already — but it is the form to use for any other
+enum, and writing it is harmless: an explicit import of a prelude name
+simply wins, silently.)
+
+### The prelude
+
+A **prelude** is a set of names in scope with no import. Every package
+gets one, chosen in `vilan.toml`:
+
+```toml
+[package]
+name = "app"
+prelude = "std::web"    # omit the key for the default set
+```
+
+The default set is `print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`.
+The **web** set adds `Signal`, `view`, `View`, and the modules `style`
+and `ui` — so a UI file writes `view("div")` and `style::Display::Flex`
+with no import at all. `prelude = false` turns it off entirely.
+
+Two rules worth knowing:
+
+- **It is the weakest scope.** Declaring your own `print`, or importing a
+  different one, wins silently. Nothing you write can be broken by a
+  name the prelude happens to carry.
+- **It is per package.** A dependency resolves under the prelude *its*
+  author chose, never yours — so a library can never inject names into
+  your files, and you can never change what its source means.
+
+Your editor knows: Organize Imports removes an import the prelude
+already covers, and completion offers prelude names with no import edit
+attached.
 
 ## The shape of a full-stack app
 

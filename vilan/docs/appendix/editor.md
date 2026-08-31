@@ -136,6 +136,7 @@ and two source actions:
 | Action | Does |
 |---|---|
 | **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses) and prunes unused leaves, shrinking a brace set rather than deleting it. Offered only when it would change something |
+| | It also **strips imports the prelude already covers** — `import std::io::print;` in a package whose prelude binds `print` is redundant, and removing it changes nothing about what the file means. Matched on the definition, not the name: an import of a *different* `print` survives |
 | **Add All Missing Imports** | applies every unambiguous import quickfix in the file at once, skipping the ambiguous ones |
 
 Organizing prunes only against a clean, current analysis: a file with

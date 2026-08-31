@@ -295,6 +295,9 @@ fn embedded_std_spec() -> PackageSpec {
         dependencies: Vec::new(),
         surface: true,
         member: false,
+        // std compiles with no ambient scope (`prelude.md` §10.1), which its
+        // shipped manifest states; the parity test below compares the two.
+        prelude: vilan_core::manifest::PreludeSpec::Off,
     }
 }
 

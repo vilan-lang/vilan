@@ -2804,6 +2804,7 @@ fn analyze_workspace_with_dependencies(
             dependencies: Vec::new(),
             surface: true,
             member: dependency.member,
+            prelude: Default::default(),
         });
         entry_dependencies.push((dependency.import_name.to_string(), index));
     }

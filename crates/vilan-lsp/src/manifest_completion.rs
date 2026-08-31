@@ -225,6 +225,17 @@ pub const TABLES: &[Table] = &[
                 values: ValueSet::Open,
             },
             Key {
+                name: "prelude",
+                documentation: "The module whose exports are in scope in every file of this \
+                                package with no `import`. Omit for std's base set \
+                                (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`); \
+                                `\"std::web\"` adds `Signal`, `view`/`View` and the `style` \
+                                and `ui` modules; any module path names a custom one; \
+                                `false` is no prelude. Per package — never inherited, and \
+                                never imposed on a dependency.",
+                values: ValueSet::Open,
+            },
+            Key {
                 name: "dependencies",
                 documentation: "The packages this one may import, by the name it imports \
                                 them under. Usually written as `[package.dependencies]`.",
@@ -259,6 +270,15 @@ pub const TABLES: &[Table] = &[
                                 this manifest. `vilan fmt` leaves everything under it \
                                 byte-identical, so a build hook's generated module stops \
                                 re-staling. Inside the library, and not `root`.",
+                values: ValueSet::Open,
+            },
+            Key {
+                name: "prelude",
+                documentation: "The module whose exports are in scope in every file of this \
+                                library with no `import`. Omit for std's base set; \
+                                `\"std::web\"` for the web set; any module path names a \
+                                custom one; `false` is no prelude — which is what std \
+                                itself declares, so its own resolution stays greppable.",
                 values: ValueSet::Open,
             },
             Key {

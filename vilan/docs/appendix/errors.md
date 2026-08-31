@@ -10,10 +10,19 @@ topic rather than by message.)
 ## Names and imports
 
 **"cannot find '…' in this scope"** · **"cannot find type '…'"**
-The name isn't visible here. Usually a missing `import`: everything,
-even `print`, is imported explicitly. If you did import it,
-check for a typo or a shadowing local.
-→ [Hello Vilan](../tour/hello-vilan.md), [spec §4](../spec/names.md)
+The name isn't visible here. Usually a missing `import` — though the
+basics (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) are in the
+prelude and need none. If you did import it, check for a typo or a
+shadowing local.
+→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md)
+
+**"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
+The name (`Signal`, `view`, `View`, `style`, `ui`) is one std's **web**
+prelude makes ambient, and this package is on the base one. Either set
+`prelude = "std::web"` in `vilan.toml`, or import the name explicitly —
+both work, and the steer only means the manifest line is usually what
+you wanted.
+→ [Projects](../tour/projects.md), [spec §4.7](../spec/names.md)
 
 **"`std` is a namespace, not a value; import the module first …"**
 You wrote a qualified path like `std::math::min(1, 2)` inline. That

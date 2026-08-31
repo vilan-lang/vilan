@@ -1,0 +1,39 @@
+// The WEB prelude — the ambient scope for applications, selected with
+// `prelude = "std::web"` (`prelude.md` §5.3). The census that drew it is blunt:
+// `print` is not the most-imported name in real vilan code, `Signal` is, and
+// nine of the top sixteen application names are the style/UI cluster. No single
+// fixed set serves both a test corpus and an application, so std ships both and
+// the manifest picks.
+//
+// The base seven are re-stated rather than derived. That is the override rule
+// (§8) applied to std itself: a prelude REPLACES, extension is spelled by
+// re-export, and std does not get a merge mechanism its users lack.
+export import pkg::io::print;
+export import pkg::option::Option::{ self, None, Some };
+export import pkg::result::Result::{ self, Err, Ok };
+
+// `Signal` — rank 1 in application code (21 of 42 app files, ahead of `print`
+// at 15). Base layer, so a server-rendered build reaches it too.
+export import pkg::reactive::Signal;
+
+// `view` and `View` — ranks 3 and 4, the builder and its type, one idea. A view
+// tree is dense with `view("div")` calls, which is why these are bare members
+// and not left to `ui::`. `std::ui` is declared by BOTH platform layers, so
+// neither name colors this prelude to one target.
+export import pkg::ui::{ view, View };
+
+// Ambient MODULES (§5.2). A module entry costs one name in the bare namespace —
+// its own — and buys a whole namespace behind one qualifying segment.
+//
+// `style` is the move that dissolves the `Display` collision: the CSS enum is
+// `style::Display` and the `to_string` trait keeps bare `Display` to itself, so
+// neither has to rename. It carries sixteen enums for one name. A file that
+// wants the builder bare still writes `import std::style::style;` — an explicit
+// import beats an ambient module, so all 60 existing `style()` call sites are
+// untouched.
+//
+// `ui` carries `mount_root` and the rest of the UI surface without putting a
+// once-per-app name into the bare namespace. `ui::mount_root` on a node build
+// is an error at the call, which is where a platform error reads.
+export import pkg::style;
+export import pkg::ui;

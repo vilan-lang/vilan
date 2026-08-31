@@ -136,9 +136,13 @@ match, payloads to bind (`Some(let x)`), a literal, or `_`.
 browser. Decides which std [layers](#layer) are importable.
 [Platforms](../tour/platforms.md).
 
-<a id="prelude"></a>**prelude**: the few names available without imports: the primitive
-types, `List`, `void`. Everything else is imported explicitly.
-[Spec §4](../spec/names.md).
+<a id="prelude"></a>**prelude**: the names available without imports. Two layers: the
+built-in set the language always has (the primitive types, `List`,
+`void`), and a per-package set named by `[package] prelude` — std's base
+one (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) by default,
+`"std::web"` for applications, any module for a custom one, or `false`
+for none. A prelude is the weakest scope: declaring or importing one of
+its names shadows it silently. [Spec §4.7](../spec/names.md).
 
 <a id="resource"></a>**resource**: a value with a single owner that *moves* instead of copying
 and is destroyed deterministically after its last use (a `Database`, an

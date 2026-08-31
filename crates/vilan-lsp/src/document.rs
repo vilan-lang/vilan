@@ -2469,6 +2469,17 @@ impl Document {
             // pruning on no evidence is how a green build gets broken.
             return true;
         };
+        // (0) The PRELUDE already binds this definition ambiently
+        // (`prelude.md` §11.1): the import is redundant, so removing it cannot
+        // change what the file means, and leaving it would have the estate
+        // carry hundreds of dead statements that every copy-pasted new file
+        // reproduces. Matched on the DEFINITION, not the name — `import
+        // my_lib::print;` beside an ambient `std::print` is not redundant and
+        // survives. This is the action's existing contract ("prune the leaves
+        // the analyzer reports as unused") reaching one more kind of unused.
+        if program.prelude_bindings.contains(&definition_id) {
+            return false;
+        }
         let definition = Definition::Entity(definition_id);
 
         // A reference written by the file's IMPORT LIST is not the file using
@@ -8746,6 +8757,57 @@ pub(crate) mod tests {
         assert_eq!(
             result,
             "import pkg::helper::alpha;\nfun main() {\n\talpha();\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Organize Imports STRIPS what the prelude covers (prelude.md §11.1). The
+    // import is USED here — `print` is called — but it is redundant, because
+    // the base prelude binds the same definition ambiently. That is the whole
+    // point of the determination: leaving it would have every file carry the
+    // statement the feature exists to delete.
+    #[test]
+    fn organize_strips_an_import_the_prelude_already_covers() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::helper::alpha;\nfun main() {\n\tprint(\"x\");\n\talpha();\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let result = organized(&document).expect("a prelude-covered import offers a strip edit");
+        assert_eq!(
+            result,
+            "import pkg::helper::alpha;\nfun main() {\n\tprint(\"x\");\n\talpha();\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The same-DEFINITION half of §11.1: a local `print` that merely shares the
+    // prelude name is a different definition, so its import survives.
+    #[test]
+    fn organize_keeps_an_import_that_only_shares_a_prelude_name() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::print;\nfun main() {\n\tprint(\"x\");\n}\n",
+            ),
+            ("helper.vl", "export fun print(message: str): void {}\n"),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "an import naming a DIFFERENT definition is not prelude-covered"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

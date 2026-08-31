@@ -789,6 +789,10 @@ fn compile_world(
         packages: vec![macro_std.clone()],
         entry_dependencies: vec![("macro_std".to_string(), 0)],
         macro_limits: MacroLimits::default(),
+        // A macro world takes NO program prelude (prelude.md §5.2): its
+        // ambient scope is `world_prelude_nodes`' meta vocabulary, and a
+        // macro body talks to the compiler, not to `std::option`.
+        entry_prelude: crate::manifest::PreludeSpec::Off,
     };
     let previously_in_world = IN_MACRO_WORLD.with(|flag| flag.replace(true));
     let (program, errors) = analyze_source(

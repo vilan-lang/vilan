@@ -50,6 +50,14 @@
           "description": "Which `[entry.<name>]` `vilan run` executes when several are runnable. `--entry` overrides it.",
           "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
         },
+        "prelude": {
+          "description": "The module whose exports are in scope in every file of this package with no `import`. Omit for std's base set (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`); `\"std::web\"` adds `Signal`, `view`/`View` and the ambient `style` and `ui` modules; any module path (`pkg::…`, `std::…`, a dependency) names a custom one; `false` is no prelude at all. Per package, never inherited — a dependency resolves under its own.",
+          "oneOf": [
+            { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)+$" },
+            { "type": "boolean", "enum": [false] }
+          ],
+          "default": "std::prelude"
+        },
         "dependencies": {
           "$ref": "#/definitions/dependencies"
         }
@@ -78,6 +86,14 @@
         "generated": {
           "type": "string",
           "description": "Where this library's generated sources live, relative to this manifest. `vilan fmt` leaves everything under it byte-identical — formatting a build hook's generated module would re-stale the hook forever. Must be inside the library, and not the source root. Absent by default."
+        },
+        "prelude": {
+          "description": "The module whose exports are in scope in every file of this library with no `import`. Omit for std's base set (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`); `\"std::web\"` adds `Signal`, `view`/`View` and the ambient `style` and `ui` modules; any module path (`pkg::…`, `std::…`, a dependency) names a custom one; `false` is no prelude at all. Per package, never inherited — a dependency resolves under its own.",
+          "oneOf": [
+            { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)+$" },
+            { "type": "boolean", "enum": [false] }
+          ],
+          "default": "std::prelude"
         },
         "dependencies": {
           "$ref": "#/definitions/dependencies"
