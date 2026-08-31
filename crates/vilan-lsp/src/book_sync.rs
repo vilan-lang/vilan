@@ -774,9 +774,14 @@ fn table_data_rows(text: &str) -> Vec<Vec<String>> {
 /// A `title:` string literal as the server writes it, with the constructor it
 /// sits in (`QuickFix` or `CodeAction`) — a `format!` template keeps its
 /// `{holes}`.
+///
+/// `refactor` splits the `CodeAction` constructor by the KIND the same literal
+/// declares: a `refactor.*` action is offered on a construct the cursor is in,
+/// not on the file, so the book documents it in its own section (css-block S5).
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TitleLiteral {
     constructor: &'static str,
+    refactor: bool,
     template: String,
 }
 
@@ -804,6 +809,7 @@ fn server_code_action_titles() -> Vec<TitleLiteral> {
             if let Some(template) = string_literal(literal) {
                 titles.push(TitleLiteral {
                     constructor,
+                    refactor: body.contains("CodeActionKind::REFACTOR"),
                     template,
                 });
             }
@@ -914,6 +920,20 @@ fn editor_page_code_action_titles_are_the_servers() {
             );
         }
     }
+    // The refactors live in their own section: a `refactor.*` action is offered
+    // on the construct the cursor is in, which is a different thing from a
+    // source action over the file.
+    let mut page_refactors = Vec::new();
+    for row in table_data_rows(section(&page, "Refactors")) {
+        let cell = row.first().cloned().unwrap_or_default();
+        let inner = cell
+            .strip_prefix("**")
+            .and_then(|cell| cell.strip_suffix("**"))
+            .unwrap_or_else(|| {
+                panic!("{EDITOR_PAGE}: a Refactors row whose first cell is not **title**: {cell:?}")
+            });
+        page_refactors.push(inner.to_string());
+    }
     let server = server_code_action_titles();
     let server_quick_fixes: Vec<&TitleLiteral> = server
         .iter()
@@ -921,8 +941,15 @@ fn editor_page_code_action_titles_are_the_servers() {
         .collect();
     let server_source_actions: Vec<&TitleLiteral> = server
         .iter()
-        .filter(|title| title.constructor == "CodeAction")
+        .filter(|title| title.constructor == "CodeAction" && !title.refactor)
         .collect();
+    let server_refactors: Vec<&TitleLiteral> =
+        server.iter().filter(|title| title.refactor).collect();
+    assert_eq!(
+        page_refactors.len(),
+        server_refactors.len(),
+        "{EDITOR_PAGE} documents {page_refactors:?} refactors; main.rs constructs {server_refactors:?}"
+    );
     // Shape: both sides non-empty, and the same number of kinds.
     assert!(
         server_quick_fixes.len() >= 4 && server_source_actions.len() >= 2,
@@ -963,6 +990,7 @@ fn editor_page_code_action_titles_are_the_servers() {
     for (documented, produced) in [
         (&page_quick_fixes, &server_quick_fixes),
         (&page_source_actions, &server_source_actions),
+        (&page_refactors, &server_refactors),
     ] {
         for title in documented {
             assert!(

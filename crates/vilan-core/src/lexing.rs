@@ -882,7 +882,10 @@ enum IStringEnd {
 /// spelling routes the value through `Color`, which carries its own `:root`
 /// line, where a raw hex would be the one spelling that can silently produce a
 /// literal outside the token system. Curated (diagnostics-standard.md B6).
-const HASH_IS_NOT_A_TOKEN: &str = "`#` is not a vilan token; in a `css` block a colour is a hole — \
+///
+/// Public because the language server's quickfix keys on it (css-block S5,
+/// §7.2 fix 1) — one constant rather than a second copy to drift from.
+pub const HASH_IS_NOT_A_TOKEN: &str = "`#` is not a vilan token; in a `css` block a colour is a hole — \
      `color: {Color::hex(\"#333\")};` — which routes it through the `Color` type that carries its \
      own `:root` line";
 
@@ -890,7 +893,11 @@ const HASH_IS_NOT_A_TOKEN: &str = "`#` is not a vilan token; in a `css` block a 
 /// `css` block has no at-rules of any kind (proposal/css-block.md §10). A media
 /// query's spelling is the breakpoint combinator; `@supports`, `@font-face` and
 /// `@keyframes` have none yet.
-const AT_IS_NOT_A_TOKEN: &str = "`@` is not a vilan token; a `css` block has no at-rules — a media query is a \
+///
+/// Public for the same reason as [`HASH_IS_NOT_A_TOKEN`]: §7.2's fix 2 keys on
+/// it. That the combinator spelling exists only for a min-width media query is
+/// exactly why the fix offers nothing for the other three at-rules.
+pub const AT_IS_NOT_A_TOKEN: &str = "`@` is not a vilan token; a `css` block has no at-rules — a media query is a \
      breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is \
      `std::style::declare`";
 

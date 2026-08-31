@@ -8,7 +8,7 @@
 //! `grammar_sync` shape (Order 11): the source of truth is read out of the real
 //! artefact, and the hand-written table is held to it in BOTH directions.
 //!
-//! Four gates, each derived from `style.vl` rather than restated:
+//! Five gates, each derived from `style.vl` rather than restated:
 //!
 //!   1. **Completeness** — every `fun name(self, …)` in an `impl Style` block is
 //!      claimed by exactly one of the three tables, and every table row names a
@@ -23,8 +23,12 @@
 //!      connected by entanglement (so the column cannot over-group either, which
 //!      would silently stop the sort doing its work).
 //!   4. **Condition axes** — a condition that delegates to another condition
-//!      (`hover` is `pseudo("hover", …)`, `md` is `media("48rem", …)`) must be
+//!      (`hover` is `pseudo("hover", …)`, `md` is `media("768px", …)`) must be
 //!      recorded on the axis it delegates to.
+//!   5. **Breakpoint widths** — each breakpoint's `STYLE_BREAKPOINT_WIDTHS` row
+//!      must be the min-width its body actually delegates with, and every
+//!      delegating media combinator must have a row. The language server's
+//!      `@media` quickfix (css-block.md §7.2) reads that map.
 //!
 //! The behaviour the table drives is pinned in `formatter.rs`'s
 //! `mod style_chain_order`; the proof that a reorder preserves the rendered
@@ -34,7 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use vilan_core::formatter::{
-    ConditionAxis, STYLE_BARRIER_METHODS, STYLE_CONDITION_METHODS, STYLE_PROPERTY_METHODS,
+    ConditionAxis, STYLE_BARRIER_METHODS, STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS,
+    STYLE_PROPERTY_METHODS,
 };
 
 /// The std style surface this table describes.
@@ -554,4 +559,51 @@ fn a_delegating_condition_is_recorded_on_the_axis_it_delegates_to() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// --- 5. Breakpoint widths ----------------------------------------------------
+
+#[test]
+fn every_breakpoint_width_is_the_one_std_delegates_to() {
+    let source = style_source();
+    let bodies: BTreeMap<String, Vec<String>> = declared_methods(&source).into_iter().collect();
+    for (name, width) in STYLE_BREAKPOINT_WIDTHS {
+        let body = bodies
+            .get(*name)
+            .unwrap_or_else(|| panic!("`{name}` is not a `Style` method in {STYLE_SOURCE}"));
+        // Each breakpoint's whole body is one `self.media("<width>", inner)`;
+        // the width is that call's first argument, read out rather than
+        // restated. A breakpoint that stopped delegating — or that changed its
+        // width — reddens here, which is what keeps the language server's
+        // `@media` quickfix (css-block.md §7.2 fix 2) from naming a combinator
+        // that no longer means what it says.
+        let call = body
+            .iter()
+            .find_map(|line| line.trim().strip_prefix("self.media("))
+            .unwrap_or_else(|| panic!("`{name}` no longer delegates to `media`: {body:?}"));
+        let declared = arguments(call)
+            .first()
+            .and_then(|argument| string_literal(argument.trim()).map(str::to_string))
+            .unwrap_or_else(|| panic!("`{name}`'s min-width is not a string literal: {call}"));
+        assert_eq!(
+            declared, *width,
+            "`{name}` delegates to `media(\"{declared}\")`, but STYLE_BREAKPOINT_WIDTHS says \
+             `{width}`"
+        );
+    }
+    // Both directions: every media-axis combinator that DELEGATES is named
+    // here, so a new breakpoint cannot be added to std without the quickfix
+    // learning it. `media` itself is the primitive — it takes its width as an
+    // argument rather than naming one.
+    for (condition, axis) in STYLE_CONDITION_METHODS {
+        if *axis != ConditionAxis::Media || *condition == "media" {
+            continue;
+        }
+        assert!(
+            STYLE_BREAKPOINT_WIDTHS
+                .iter()
+                .any(|(name, _)| name == condition),
+            "`{condition}` is a breakpoint with no width in STYLE_BREAKPOINT_WIDTHS"
+        );
+    }
 }

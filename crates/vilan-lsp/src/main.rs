@@ -1699,10 +1699,14 @@ fn server_capabilities() -> ServerCapabilities {
         // WO-2: the "Organize Imports" source action (sort + prune).
         // E54: QUICKFIX (add-import, and E58's field-name rename) and
         // the "add all missing imports" source action.
+        // css-block S5: REFACTOR_REWRITE, the server's first — the
+        // block/chain conversion is not diagnostic-driven, so it needs a kind
+        // of its own for the editor to ask for it.
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
             code_action_kinds: Some(vec![
                 CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                 CodeActionKind::QUICKFIX,
+                CodeActionKind::REFACTOR_REWRITE,
                 fix_all_imports_kind(),
             ]),
             ..Default::default()
@@ -2451,9 +2455,11 @@ impl LanguageServer for Backend {
                 action_kind_requested(&params.context.only, &CodeActionKind::QUICKFIX);
             let wants_fix_all_imports =
                 action_kind_requested(&params.context.only, &fix_all_imports_kind());
+            let wants_refactor =
+                action_kind_requested(&params.context.only, &CodeActionKind::REFACTOR_REWRITE);
             // Skip the work entirely when the client asked for a kind none of
-            // these three answer.
-            if !wants_organize && !wants_quickfix && !wants_fix_all_imports {
+            // these four answer.
+            if !wants_organize && !wants_quickfix && !wants_fix_all_imports && !wants_refactor {
                 return Ok(None);
             }
             let uri = params.text_document.uri;
@@ -2500,6 +2506,42 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     }));
                 }
+            }
+            // css-block S5 (§7.2's refactor): the first NON-diagnostic-driven
+            // action in the server, and the only one that needs no `program` —
+            // both spellings are read from a raw parse, since neither survives
+            // desugaring.
+            if wants_refactor
+                && let Some(conversion) =
+                    document.css_spelling_conversion(live_span(&document, params.range))
+            {
+                let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: document.line_index.range(&conversion.span),
+                        new_text: conversion.replacement,
+                    }],
+                );
+                let edit = Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                });
+                actions.push(CodeActionOrCommand::CodeAction(if conversion.to_chain {
+                    CodeAction {
+                        title: "Convert to a `style()` chain".to_string(),
+                        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                        edit,
+                        ..Default::default()
+                    }
+                } else {
+                    CodeAction {
+                        title: "Convert to a `css` block".to_string(),
+                        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                        edit,
+                        ..Default::default()
+                    }
+                }));
             }
             if let Some(program) = document.program.as_ref() {
                 if wants_quickfix {
@@ -2826,14 +2868,17 @@ mod snapshot_consistency_tests {
 
     // A code-action request for a kind we don't offer AT ALL is answered
     // before the staleness gate: refusing there would make every unrelated
-    // request fail mid-typing.
+    // request fail mid-typing. (`refactor.extract` rather than the bare
+    // `refactor` this used to name: css-block S5 registered
+    // `refactor.rewrite`, and the bare kind is its ANCESTOR — so it is a kind
+    // the server now partly answers, and it belongs with the group below.)
     #[tokio::test]
     async fn a_stale_document_still_answers_an_unoffered_code_action_kind() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = open_with_live_edit(backend, EDITED);
         let mut params = code_action_params(&uri);
-        params.context.only = Some(vec![CodeActionKind::REFACTOR]);
+        params.context.only = Some(vec![CodeActionKind::REFACTOR_EXTRACT]);
         assert!(
             backend
                 .code_action(params)
@@ -2861,6 +2906,28 @@ mod snapshot_consistency_tests {
             .await
             .expect_err("a stale quickfix request refuses");
         assert_eq!(error.code, ErrorCode::ContentModified);
+    }
+
+    // css-block S5: `refactor.rewrite` is an OFFERED kind, so it joins the
+    // group above — and so does the bare `refactor` an editor's refactor menu
+    // asks with, since the kind hierarchy makes it an ancestor. The conversion
+    // itself reads a raw parse rather than `program`, but the handler's
+    // refusal is one answer for the whole request, and half-answering a menu
+    // is not better than refusing it.
+    #[tokio::test]
+    async fn a_stale_document_refuses_a_refactor_request() {
+        for kind in [CodeActionKind::REFACTOR_REWRITE, CodeActionKind::REFACTOR] {
+            let (service, _socket) = backend();
+            let backend = service.inner();
+            let uri = open_with_live_edit(backend, EDITED);
+            let mut params = code_action_params(&uri);
+            params.context.only = Some(vec![kind.clone()]);
+            let error = backend
+                .code_action(params)
+                .await
+                .expect_err("a stale refactor request refuses");
+            assert_eq!(error.code, ErrorCode::ContentModified, "{kind:?}");
+        }
     }
 
     #[tokio::test]
@@ -2928,6 +2995,44 @@ mod snapshot_consistency_tests {
             .expect("an edit for this file");
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, "import pkg::topic::help_topic;\n");
+    }
+
+    // css-block S5, end to end: the server's first `refactor.rewrite` action
+    // is registered, routed, and carries its edit — through
+    // `Backend::code_action` itself, and driven by where the CURSOR is rather
+    // than by a diagnostic, which is what makes it a new code path rather than
+    // a fifth quickfix.
+    #[tokio::test]
+    async fn the_css_spelling_refactor_is_offered_through_the_real_handler() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay: flex;\n\t}\n}\n";
+        let (_dir, document) = crate::document::tests::analyze_workspace(&[("main.vl", source)]);
+        let cursor = document
+            .line_index
+            .position(source.find("display").expect("the fixture"));
+        let (uri, _range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = Range::new(cursor, cursor);
+        params.context.only = Some(vec![CodeActionKind::REFACTOR_REWRITE]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("a refactor is offered");
+        let CodeActionOrCommand::CodeAction(action) = &response[0] else {
+            panic!("expected a CodeAction, got {:?}", response[0]);
+        };
+        assert_eq!(action.kind, Some(CodeActionKind::REFACTOR_REWRITE));
+        assert_eq!(action.title, "Convert to a `style()` chain");
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("an edit for this file");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "style().raw(\"display\", \"flex\")");
     }
 
     // E54(d), end to end: "Add All Missing Imports" is registered under its

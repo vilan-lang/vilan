@@ -167,7 +167,10 @@ const CSS_ITEM_EXPECTED: &str =
 /// (diagnostics-standard.md B6): the prohibition explains itself and names the
 /// sanctioned spelling — which is "nothing at all", because a later
 /// declaration on the same property already wins (proposal/css-block.md §10).
-const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
+///
+/// Public because the language server's quickfix keys on it (css-block S5,
+/// §7.2 fix 3) — one constant rather than a second copy to drift from.
+pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` block: a `Style` merges by record update, so a later \
      declaration on the same property already wins — remove it";
 
 /// The rule a program written with a Rust/Swift visibility marker breaks.
