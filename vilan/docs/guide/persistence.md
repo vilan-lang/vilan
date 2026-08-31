@@ -331,6 +331,11 @@ fun stat(path: str): Option<Stat>           // async — None if the path isn't 
 
 resource external struct File               // an open file — the handle tier
 fun with_file<T>(path: str, body: |File| T): T   // open, run, close (awaited)
+fun with_file_create<T>(path: str, body: |File| T): T   // …and one per constructor
+
+resource struct Reader                      // a cursor over an open file
+fun Reader::of(own file: File): Reader      // takes the handle; starts at byte 0
+fun Reader::next(self, size: i32): Bytes    // the next chunk; empty at end of file
 
 resource external struct Watcher            // a live watch — the watch tier
 fun Watcher::watch(path: str): Watcher      // the path, and a directory's own entries
@@ -381,7 +386,41 @@ main();
 parameter, and closes it before returning — with the close *awaited*, so
 a failure to close is a failure of `with_file`; a `File` you hold
 yourself closes through its destructor instead, which starts the close
-without waiting on it. Full signatures:
+without waiting on it. There is one scoped form per constructor
+(`with_file_create`, `with_file_create_new`, `with_file_append`,
+`with_file_modify`), and on a *writing* handle the awaited close is the
+one that earns its keep: the OS is entitled to report a write's failure
+at close time — a full disk, a quota — and only the scoped form makes
+that a failure of your call rather than a line on stderr.
+
+To read a big file without holding it all in memory, wrap the handle in a
+`Reader` and pull chunks. `next(size)` advances a cursor this program
+owns — the handle itself stays positional, so nothing hidden moves — and
+answers an **empty** chunk at end of file:
+
+```vilan,norun
+import std::fs::{ File, Reader };
+import std::print;
+
+fun main() {
+	let reader = Reader::of(File::open("big.bin"));
+	mut total = 0;
+	for {
+		let chunk = reader.next(65536);
+		if chunk.len() == 0 {
+			jump break;
+		}
+		total += chunk.len();
+	}
+	print(total);
+}
+main();
+```
+
+Stop on empty, not on short: a chunk shorter than you asked for is
+ordinary near the end, and only the empty one means the file is done. A
+`Reader` owns its `File`, so it is a resource too — it moves, and dropping
+it closes the file. Full signatures:
 [the process reference](../std/process.md#stdfs).
 
 When you want to know that a file changed rather than to read it once,

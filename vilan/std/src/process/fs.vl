@@ -34,6 +34,7 @@ import pkg::bytes::Bytes;
 import pkg::crypto::random_uuid;
 import pkg::drop::Drop;
 import pkg::option::Option::{ None, Some, self };
+import pkg::shared::Shared;
 import pkg::task::{ CancelSignal, ambient_signal };
 
 /// Reads a file, decoded as text under `encoding` (a `node:fs` encoding name —
@@ -615,26 +616,197 @@ impl File with Drop {
 [extern("__fs_close_awaited")]
 async external fun close_awaited(file: File): void;
 
-/// Opens `path` for reading, runs `body` with the open file, closes it, and
-/// hands back what `body` returned — with the close AWAITED, which the
-/// destructor's close deliberately is not (kolt.local 031 Q1's ruling): the
-/// documented idiom for handle use, and the only spelling in which a failure
-/// to close is observable.
+/// The scoped form's one body, shared by the five `with_file*` functions
+/// below: run `body` with the open file, then AWAIT the close, then hand back
+/// what `body` returned. Written once so the ordering that IS the idiom —
+/// close before return — has one implementation to be right, and so a form
+/// added later cannot quietly drop the await. Kept behind the five the way
+/// `open_with_flags` is kept behind `File`'s constructors: what a caller
+/// wants to say is which mode, and the five names say it.
 ///
 /// The file arrives as `body`'s PARAMETER — per-call, not a capture — which
 /// is why a closure can be handed a resource at all (destruction.md R9). And
 /// `body` is a plain value-returning closure, so it is asyncness-polymorphic
 /// (async-polymorphism.md): a body that awaits makes that `with_file` await
 /// too, with nothing to write at either site. Should `body` throw, the
-/// scope-end `Drop` still closes the handle — the safety net behind the
-/// awaited path; the host close is idempotent, so the net stays benign when
-/// both run.
-fun with_file<T>(path: str, body: |File| T): T {
-	let file = File::open(path);
+/// scope-end `Drop` of the `own` handle still closes it — the safety net
+/// behind the awaited path; the host close is idempotent, so the net stays
+/// benign when both run.
+fun scoped_file<T>(own file: File, body: |File| T): T {
 	let result = body(file);
 	close_awaited(file);
 	result
 }
+
+/// Opens `path` for reading (`File::open`), runs `body` with the open file,
+/// closes it, and hands back what `body` returned — with the close AWAITED,
+/// which the destructor's close deliberately is not (kolt.local 031 Q1's
+/// ruling): the documented idiom for handle use, and the only spelling in
+/// which a failure to close is observable.
+///
+/// Five scoped forms, one per constructor, because §3.3's argument against a
+/// flags string does not stop at `File`: a mode is a name here too, and the
+/// suffix IS the constructor this opens with. They earn their place in the
+/// free-function tier by the tier's own admission test — each is a complete
+/// operation on a path (open, act, close) holding no state between calls.
+fun with_file<T>(path: str, body: |File| T): T {
+	scoped_file(File::open(path), body)
+}
+
+/// `File::create` scoped: creates `path` for writing, truncating anything
+/// already there, and AWAITS the close.
+///
+/// The awaited close matters more on a writing handle than on a reading one,
+/// and this is where kolt.local 031 Q1's (c) earns its keep. A write that has
+/// resolved was handed to the OS, but the OS is entitled to report its
+/// failure at close time rather than at write time — a full disk, a quota, a
+/// network filesystem that defers the error to `close(2)` (NFS is the classic
+/// case). Under the destructor that error goes to stderr and the program
+/// carries on believing it wrote; under `with_file_create` it is a failure of
+/// the call, at the call, and the caller cannot miss it. Durability against
+/// power loss is still `sync()`'s job, not the close's.
+fun with_file_create<T>(path: str, body: |File| T): T {
+	scoped_file(File::create(path), body)
+}
+
+/// `File::create_new` scoped: creates `path` and FAILS if anything is already
+/// there, then AWAITS the close — the exclusive claim (a lockfile, a
+/// once-only artifact) with its close error observable.
+fun with_file_create_new<T>(path: str, body: |File| T): T {
+	scoped_file(File::create_new(path), body)
+}
+
+/// `File::append_to` scoped: opens `path` for appending, creating it if
+/// missing, and AWAITS the close. Host semantics carry through unchanged —
+/// every write lands at the END and `write_at`'s position is ignored (see
+/// `File::append_to`).
+fun with_file_append<T>(path: str, body: |File| T): T {
+	scoped_file(File::append_to(path), body)
+}
+
+/// `File::modify` scoped: opens `path` for reading AND writing without
+/// truncating it (the path must exist), and AWAITS the close — the scoped
+/// form of editing in place.
+fun with_file_modify<T>(path: str, body: |File| T): T {
+	scoped_file(File::modify(path), body)
+}
+
+// --- the incremental reader (kolt.local 031 S5, filesystem.md §3.4) --------
+
+/// A sequential cursor over an open file: `next(size)` hands back the next
+/// chunk and advances, so a 2 GiB file is read in pieces the size of the
+/// caller's choosing rather than materialized whole by `read_bytes`. The
+/// incremental read the vision named, and the last thing the handle tier was
+/// built to unlock.
+///
+/// BUILT OVER `read_at`, NEVER OVER A HOST CURSOR — the whole of §3.4's
+/// argument, and the reason the primitive had to ship first. Node's
+/// `FileHandle.read` keeps an implicit position when the caller passes no
+/// position, and binding THAT would have put mutable state under a loan where
+/// the move checker cannot see it: two loans of one `File`, each reading,
+/// would silently interleave and each would move the other's position. So
+/// `File` stays positional and stateless, and the cursor is an ordinary vilan
+/// value layered on top, whose position is a field in this program. A cursor
+/// can always be built from a position; a position can never be recovered
+/// from a cursor.
+///
+/// The position is a `Shared<i53>` rather than a plain field behind
+/// `&mut self`, and that is FORCED rather than chosen: `next` awaits the read,
+/// and an async function cannot take a `&mut` view — the view would be held
+/// across the suspension. A `Shared` cell is the shape the language leaves,
+/// and it is the shape §3.4 sketched.
+///
+/// A `resource` by containment (destruction.md §3), so everything the handle
+/// tier's rules say holds here without a word added: a `Reader` moves rather
+/// than copies, a closure cannot capture one, no `List`/`Map`/`Set` can hold
+/// one, and its scope-end teardown closes the `File` it owns —
+/// `drop(reader)` is the early form.
+///
+/// Both fields are reachable as LOANS, which is the point rather than an
+/// oversight: `reader.file.read_at(buffer, position)` reads any part of the
+/// file WITHOUT disturbing the cursor, because `read_at` is positional and
+/// stateless. Cursored and positional reads interleave soundly on one open
+/// file, which is exactly the property the host's hidden cursor would have
+/// destroyed. (R5 keeps the door one-way: the `File` cannot be moved out of a
+/// live `Reader`.)
+resource struct Reader {
+	file: File,
+	cursor: Shared<i53>,
+}
+
+impl Reader {
+	/// Takes ownership of `file` and starts reading at byte 0. A move, so the
+	/// `File` binding is dead afterwards and the `Reader` is the one owner —
+	/// `Reader::of(File::open(path))` is the ordinary spelling, and the
+	/// temporary is moved in rather than closed at the statement's end.
+	///
+	/// There is deliberately no `Reader::open(path)` convenience: composing
+	/// the two names says WHICH constructor opened the file, and a reader over
+	/// a `modify` handle is as legitimate as one over an `open` handle. A
+	/// single-name form would have to pick `"r"` silently.
+	fun of(own file: File): Reader {
+		Reader { file = file, cursor = Shared::new(0i53) }
+	}
+
+	/// The next `size` bytes from the cursor, advancing it by however many
+	/// arrived. Shorter than `size` near the end of the file; EMPTY at end of
+	/// file, which is the loop's terminating condition:
+	///
+	/// ```text
+	/// let reader = Reader::of(File::open("big.bin"));
+	/// for {
+	///     let chunk = reader.next(65536);
+	///     if chunk.len() == 0 { jump break; }
+	///     consume(chunk);
+	/// }
+	/// ```
+	///
+	/// That is `std::fetch`'s `BodyReader` chunk loop with the mechanism
+	/// swapped out — the ergonomics mirrored, not the machinery (§3.4).
+	/// `BodyReader` answers a `ChunkResult { done, value }` because a
+	/// `ReadableStream` may legitimately yield an empty chunk mid-stream, so
+	/// emptiness cannot carry the end there. A file's read cannot: `read_at`
+	/// answers `0` only at or past the end, so the emptiness IS the signal and
+	/// a second field would be one the caller could always derive. STOP ON
+	/// EMPTY, NOT ON SHORT — a short chunk is not a promise that the next one
+	/// is empty.
+	///
+	/// Each call allocates a fresh buffer and hands back a slice of exactly
+	/// what was read, so a chunk is never a window on a buffer the next call
+	/// overwrites. A caller reusing one buffer across reads wants `read_at`
+	/// directly.
+	fun next(self, size: i32): Bytes {
+		let buffer = Bytes::alloc(size);
+		let count = self.file.read_at(buffer, self.cursor.read());
+		self.cursor.write() = self.cursor.read() + count.as_i53();
+		buffer.slice(0, count)
+	}
+
+	/// Where the cursor is — the byte offset the next `next` will read from.
+	/// Visible because it is ordinary program state; the host cursor this
+	/// replaces is not readable at all.
+	fun position(self): i53 {
+		self.cursor.read()
+	}
+
+	/// Move the cursor to `position`. The write half of the same visibility:
+	/// a seek here is a field assignment the move checker can see, not a host
+	/// side effect. Seeking past the end is not an error — the next read is
+	/// simply empty.
+	fun seek(self, position: i53) {
+		self.cursor.write() = position;
+	}
+}
+
+// NO `Writer` TWIN, deliberately. A write cursor would be state with nothing
+// to hold: `File::append_to`'s handle IS the sequential writer, because the
+// host ignores position on it (POSIX `O_APPEND`), and every other write is
+// positional by choice. And NO `with_reader` scoped form: the awaited close
+// exists so a close FAILURE is observable, and a close failure is information
+// only when something was written — a `Reader` never writes, so its `Drop`'s
+// fire-and-forget close loses nothing a caller could act on. (`with_file`'s
+// body receives its file as a loan in any case, and `Reader::of` needs an
+// owned one.)
 
 // --- the watch tier (kolt.local 020, which owns this surface whole) --------
 //
@@ -791,7 +963,7 @@ impl Watcher {
 	///
 	/// ```text
 	/// let watcher = Watcher::watch_all("src");
-	/// loop {
+	/// for {
 	///     let change = watcher.next();
 	///     rebuild(change.path);
 	/// }

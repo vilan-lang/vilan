@@ -386,7 +386,22 @@ impl File {
     fun data_sync(self)              // fdatasync — data only
 }
 
-fun with_file<T>(path: str, body: |File| T): T   // open, run, close — close AWAITED
+// the scoped forms — open, run, close, one per constructor; the close is AWAITED
+fun with_file<T>(path: str, body: |File| T): T              // File::open
+fun with_file_create<T>(path: str, body: |File| T): T       // File::create
+fun with_file_create_new<T>(path: str, body: |File| T): T   // File::create_new
+fun with_file_append<T>(path: str, body: |File| T): T       // File::append_to
+fun with_file_modify<T>(path: str, body: |File| T): T       // File::modify
+
+// the incremental reader — a cursor over an open file, built on read_at
+resource struct Reader { file: File, cursor: Shared<i53> }
+
+impl Reader {
+    fun of(own file: File): Reader     // takes the handle; starts at byte 0
+    fun next(self, size: i32): Bytes   // the next chunk; EMPTY at end of file
+    fun position(self): i53            // where the cursor is
+    fun seek(self, position: i53)      // move it
+}
 
 // the watch tier — a live watch, pulled one change at a time
 resource external struct Watcher
@@ -568,6 +583,62 @@ container, so "a pool of open files" is not expressible today. A
 module-level `File` is not expressible either — every constructor is
 async and a module-level `let` cannot await — so a process-lifetime
 handle is a local in `main`, held across whatever `main` awaits.
+
+There is one scoped form per constructor — `with_file_create`,
+`with_file_create_new`, `with_file_append`, `with_file_modify` — and the
+suffix names the constructor it opens with, for the same reason the
+constructors replaced a flags string. The awaited close is worth most on
+a **writing** handle: a write that resolved was handed to the OS, but the
+OS may report its failure at close time rather than at write time (a full
+disk, a quota, a network filesystem that defers the error), and under the
+destructor that error goes to stderr while your program carries on
+believing it wrote. Durability against power loss is still `sync()`'s
+job, not the close's.
+
+Reading a file *incrementally* is the `Reader`: a cursor built over
+`read_at`, so nothing hidden ever moves it. `next(size)` hands back the
+next chunk and advances; the chunk is shorter near the end and **empty at
+end of file**, which is the loop's terminating condition — stop on empty,
+not on short, since a short chunk is not a promise that the next one is
+empty.
+
+```vilan,norun
+import std::drop::drop;
+import std::fs::{ File, Reader };
+import std::print;
+
+fun main() {
+	let reader = Reader::of(File::open("big.bin"));
+	let out = File::create("big.copy");
+	mut at = 0i53;
+	for {
+		let chunk = reader.next(65536);
+		if chunk.len() == 0 {
+			jump break;
+		}
+		out.write_at(chunk, at);
+		at += chunk.len().as_i53();
+	}
+	print(at);
+	drop(out);
+	drop(reader);
+}
+main();
+```
+
+Chunks are **bytes**, and a chunk boundary can fall in the middle of a
+multi-byte character — so decode a chunk at a time only when you know it
+cannot (counting newlines is fine; reassembling text is not). Note also
+what the copy above does *not* use: a scoped `with_file_create` cannot
+wrap this loop, because a closure cannot capture a resource and the
+`Reader` is one. Two handles held as locals is the shape that works.
+
+A `Reader` is a resource because it holds one: it moves, no closure or
+`List` can hold it, and dropping it closes the file. Its cursor is
+readable and writable (`position()`, `seek()`), and — because the
+primitive under it is positional — `reader.file.read_at(buffer, p)` reads
+anywhere in the file *without* moving the cursor, so a header probe and a
+sequential scan can share one open file.
 
 Reading a build's assets, rewriting one, and putting the result somewhere
 new is the shape most of this is for:
