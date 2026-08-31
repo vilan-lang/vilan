@@ -7338,6 +7338,14 @@ impl<'src> Transformer<'src> {
 
     /// Grow `extent` until every name declared in `statements[start..extent]`
     /// has its last read inside it. Monotone and bounded by `end`.
+    ///
+    /// `statements[index]` is a DIRECT statement of the region being emitted,
+    /// which is exactly how `liveness::LastUse::declared_binding_extents` keys
+    /// its map: the innermost statement enclosing each declaration. The two
+    /// sides must agree, and `statements` is whatever range this call owns — an
+    /// `if` arm's, a `match` leg's, a loop body's — so a key measured from the
+    /// enclosing function instead would match only at a body's top level and
+    /// silently skip every nested region (B159).
     fn widen_over_declarations(
         &self,
         mut extent: usize,

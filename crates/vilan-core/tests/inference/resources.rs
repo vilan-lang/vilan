@@ -6715,6 +6715,208 @@ fn a_teardown_region_never_closes_over_a_name_read_after_it() {
     );
 }
 
+// The same scoping law, once per NESTED shape (B159). The widening above ran
+// only at a function body's top level: the extents the transformer consults
+// were keyed on the OUTERMOST enclosing statement, so inside an `if` arm, a
+// `match` leg, a loop body or a block two deep the key never matched the
+// statement being emitted, the fixpoint never ran, and the `try` closed over a
+// `const` read after it — a `ReferenceError` from accepted vilan, released in
+// v0.39.0. Every pin here RUNS the program, because the emitted JavaScript
+// parses fine and only fails when the trapped name is reached.
+
+#[test]
+fn a_teardown_region_inside_an_if_arm_widens_over_a_name_read_after_it() {
+    // The audit's exact repro: a resource and a later-read binding in an `if`
+    // arm, with a statement after the `if` — which is what makes the arm's
+    // statements sit two deep in the declaration chain.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun probe(flag: bool) {
+            if flag {
+                let r = Res { tag = "r" };
+                let value = 7;
+                print(r.tag);
+                print(value);
+                print("arm-end");
+            }
+            print("after-if");
+        }
+        fun main() {
+            probe(true);
+        }
+        "#,
+        "r\n7\ndrop r\narm-end\nafter-if\n",
+    );
+}
+
+#[test]
+fn a_teardown_region_inside_a_match_arm_widens_over_a_name_read_after_it() {
+    // The `match` leg is the same nesting: the leg's block is walked under the
+    // `match` statement, so its declarations key the `match`, not themselves.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun probe(n: i32) {
+            match n {
+                1 => {
+                    let r = Res { tag = "m" };
+                    let value = 7;
+                    print(r.tag);
+                    print(value);
+                    print("arm-end");
+                },
+                _ => { print("other"); },
+            }
+            print("after-match");
+        }
+        fun main() {
+            probe(1);
+        }
+        "#,
+        "m\n7\ndrop m\narm-end\nafter-match\n",
+    );
+}
+
+#[test]
+fn a_teardown_region_inside_a_loop_body_widens_over_a_name_read_after_it() {
+    // A loop body, where the trapped name is also read on the next iteration's
+    // way round: the region must close before the read, inside the body.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun probe(n: i32) {
+            mut i = 0;
+            for i < n {
+                let r = Res { tag = "loop" };
+                let value = 7;
+                print(r.tag);
+                print(value);
+                i = i + 1;
+            }
+            print("after-loop");
+        }
+        fun main() {
+            probe(2);
+        }
+        "#,
+        "loop\n7\ndrop loop\nloop\n7\ndrop loop\nafter-loop\n",
+    );
+}
+
+#[test]
+fn a_teardown_region_two_blocks_deep_widens_over_a_name_read_after_it() {
+    // Depth is not the point — a chain LONGER than one is — but the two-deep
+    // shape is the one that proves the fix resolves the whole chain rather than
+    // the second element of it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun probe(flag: bool) {
+            if flag {
+                if flag {
+                    let r = Res { tag = "deep" };
+                    let value = 7;
+                    print(r.tag);
+                    print(value);
+                    print("inner-end");
+                }
+                print("mid");
+            }
+            print("outer");
+        }
+        fun main() {
+            probe(true);
+        }
+        "#,
+        "deep\n7\ndrop deep\ninner-end\nmid\nouter\n",
+    );
+}
+
+#[test]
+fn a_teardown_region_widens_whether_its_if_is_a_tail_or_a_statement() {
+    // The DIFFERENTIAL the audit isolated the defect with. `tail_form`'s `if`
+    // is the body's tail, so the arm's declarations key themselves and the
+    // widening always ran; `statement_form` adds one statement after the `if`
+    // and nothing else, which is what used to break it. Both shapes here, in
+    // one program, so neither can be fixed at the other's expense.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun tail_form(flag: bool) {
+            if flag {
+                let r = Res { tag = "tail" };
+                let value = 7;
+                print(r.tag);
+                print(value);
+                print("tail-end");
+            }
+        }
+        fun statement_form(flag: bool) {
+            if flag {
+                let r = Res { tag = "stmt" };
+                let value = 7;
+                print(r.tag);
+                print(value);
+                print("stmt-end");
+            }
+            print("after");
+        }
+        fun main() {
+            tail_form(true);
+            statement_form(true);
+        }
+        "#,
+        "tail\n7\ndrop tail\ntail-end\nstmt\n7\ndrop stmt\nstmt-end\nafter\n",
+    );
+}
+
+#[test]
+fn a_teardown_region_inside_a_closure_body_widens_over_a_name_read_after_it() {
+    // The negative half of the matrix: a closure body is its own walk region,
+    // so its statement chains start at the closure and this shape was already
+    // correct. It is pinned so the keying change is held to not disturbing it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun run(f: || void) { f(); }
+        fun probe() {
+            print("start");
+            run(|| {
+                let r = Res { tag = "c" };
+                let value = 7;
+                print(r.tag);
+                print(value);
+                print("closure-end");
+            });
+            print("after");
+        }
+        fun main() {
+            probe();
+        }
+        "#,
+        "start\nc\n7\ndrop c\nclosure-end\nafter\n",
+    );
+}
+
 // ============================================================================
 // C11 — the resource temporary (`temporary-drop.md`, RULED 2026-08-28)
 // ============================================================================
