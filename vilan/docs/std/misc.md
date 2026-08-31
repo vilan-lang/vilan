@@ -289,6 +289,16 @@ recopies an edited resource. They are **not** charged by size: their
 bytes never enter the program, so the fuel budget bounds build work
 rather than how large a resource may be.
 
+A resource the build stops naming stops shipping, exactly as a kind that
+stops being emitted does: the build records the copies it carried
+(`.vilan-bundled`, beside the outputs, keyed by leg) and the next build
+removes a recorded copy no leg names any more — only recorded copies,
+never a file it merely found beside them. Dropping a `bundle` call takes
+its copy in `dist/` with it, so does deleting a file out of a listed
+directory, and a fingerprinted url leaves no orphan behind when the
+bytes change and the name moves. Two legs bundling one file to one url
+still get one copy, and it survives until neither of them names it.
+
 This is what lets a built app need nothing but `dist/`. A browser leg's
 build manifest lists what it bundled, so
 [`serve_build`](web.md#stdhttp) serves every one of them with no route

@@ -1385,11 +1385,13 @@ fn build_and_spawn_run(
             let output_path = unit.entry.with_extension(platform.script_extension());
             write_assets(&output_path, &compiled.assets);
             // Bundled resources land beside that same canonical output, so a
-            // watched lone package serves what this round produced.
+            // watched lone package serves what this round produced — and are
+            // recorded under the same leg name `write_assets` just used, so a
+            // resource this round stopped naming leaves with it.
             write_bundled(
                 output_path.parent().unwrap_or(Path::new(".")),
                 &compiled.bundled,
-                "",
+                &leg_name(&output_path),
                 &[],
                 &mut BTreeMap::new(),
             )
@@ -3097,9 +3099,10 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
     if write_bundled(
         output_path.parent().unwrap_or(Path::new(".")),
         &compiled.bundled,
-        // `run` never explains — `--explain` is a `vilan build` flag — so the
-        // leg name here is recorded by nothing.
-        "",
+        // `run` never explains — `--explain` is a `vilan build` flag — so this
+        // reaches the report never and the bundled record always: the leg name
+        // `write_assets` just pruned this directory's kind files under.
+        &leg_name(&output_path),
         &[],
         &mut BTreeMap::new(),
     )
@@ -3629,10 +3632,7 @@ fn write_assets(
     assets: &[vilan_core::const_eval::EmittedAsset],
 ) -> Option<String> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
-    let leg = output_js
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let leg = leg_name(output_js);
     let assembled = vilan_core::const_eval::assemble_assets(assets);
     let flushed: BTreeSet<String> = assembled
         .keys()
@@ -3668,6 +3668,18 @@ fn write_assets(
     }
     sweep_stale_sidecar(output_js, styles.as_deref());
     styles
+}
+
+/// The leg an output path belongs to: the stem `<leg>.<ext>` is named after.
+/// A workspace leg carries its manifest name instead — same string, reached
+/// without a filesystem round trip — but everything a leg name is USED for is
+/// keyed on this one: the kind flush's file, both build records' rows, and the
+/// group `--explain` reports under.
+fn leg_name(output_path: &std::path::Path) -> String {
+    output_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// The file a leg's `kind` flush writes: `<leg>.<kind>` beside the bundle.
@@ -3707,11 +3719,10 @@ fn recordable_emit_kind(kind: &str) -> bool {
 
 /// The build's own record of the non-`css` asset kinds each leg's last flush
 /// wrote — one `leg/kind` line per file, sorted, beside the outputs (in
-/// `dist/` for a workspace, beside the entry for a bare build). Unambiguous
-/// because neither half can contain `/` (a leg name is a manifest-checked
-/// identifier or a file stem; E94 fences kinds). It exists exactly while some
-/// leg flushes a recordable kind; [`write_asset_kind_record`] removes it with
-/// its last entry, so the record never becomes its own stale artifact.
+/// `dist/` for a workspace, beside the entry for a bare build). It exists
+/// exactly while some leg flushes a recordable kind; [`write_leg_record`]
+/// removes it with its last entry, so the record never becomes its own stale
+/// artifact.
 ///
 /// This is what lets the NEXT build prune a kind's file when the kind stops
 /// emitting (backlog G6; `build-hooks.md` §10 Q7's per-kind half) without
@@ -3723,36 +3734,64 @@ fn recordable_emit_kind(kind: &str) -> bool {
 /// it): deleting unrecorded files needs its own ruling.
 const ASSET_KIND_RECORD: &str = ".vilan-asset-kinds";
 
-/// The record's `(leg, kind)` rows. A missing or unreadable record reads as
-/// empty — nothing is pruned, because pruning without a record would mean
-/// guessing at filenames. A row that does not parse, or names a kind the
-/// prune may not touch, is dropped on the same principle.
-fn read_asset_kind_record(directory: &std::path::Path) -> Vec<(String, String)> {
-    let Ok(text) = fs::read_to_string(directory.join(ASSET_KIND_RECORD)) else {
+/// The same record for the copies [`write_bundled`] carried (backlog G13), and
+/// a SEPARATE file rather than more rows in [`ASSET_KIND_RECORD`]. The reason
+/// is one reason wearing three costumes — a record is a row *and* the file that
+/// row names, and these two rows name their files by different rules:
+///
+/// - A kind row names [`asset_kind_path`]'s `<leg>.<kind>`; a bundled row names
+///   its target VERBATIM. In one file `client/logo.svg` would be ambiguous
+///   between `dist/client.logo.svg` and `dist/logo.svg`, and a pruner that
+///   guessed wrong would delete a file it does not own — the one thing G6's law
+///   forbids.
+/// - A bundled name may carry `/`: a subdirectory is what `bundle` keeps ("the
+///   path is the name") and what `bundle_as` may spell, and a subdirectory is
+///   the sanctioned escape from a name a leg's build owns. E94 fences a kind to
+///   one segment instead. One file would need two row grammars to tell a
+///   nested bundle from a leg-and-kind pair.
+/// - Each record is removed with its last row, so that it never becomes its own
+///   stale artifact. Sharing would tie one mechanism's tidiness to whether the
+///   other happened to have something to say.
+///
+/// What the two DO share is the row shape and both primitives below, so there
+/// is one record format and one pruning law, not two.
+const BUNDLED_RECORD: &str = ".vilan-bundled";
+
+/// A record's `(leg, name)` rows, keeping only those the reading pruner may
+/// act on. A missing or unreadable record reads as empty — nothing is pruned,
+/// because pruning without a record would mean guessing at filenames. A row
+/// that does not parse, or names something the prune may not touch, is dropped
+/// on the same principle.
+///
+/// The split is at the FIRST `/`, which is unambiguous whatever the right half
+/// holds: a leg name is a manifest-checked identifier or a file stem, so it can
+/// never contain one.
+fn read_leg_record(path: &std::path::Path, recordable: fn(&str) -> bool) -> Vec<(String, String)> {
+    let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
     text.lines()
         .filter_map(|line| {
-            let (leg, kind) = line.split_once('/')?;
-            (!leg.is_empty() && recordable_emit_kind(kind))
-                .then(|| (leg.to_string(), kind.to_string()))
+            let (leg, name) = line.split_once('/')?;
+            (!leg.is_empty() && recordable(name)).then(|| (leg.to_string(), name.to_string()))
         })
         .collect()
 }
 
-/// Writes the record back — sorted, so its bytes are a function of the set of
+/// Writes a record back — sorted, so its bytes are a function of the set of
 /// rows — or removes it when nothing is left to record. A failure is reported
-/// and otherwise ignored, like the sweeps': the record is bookkeeping for the
-/// NEXT build's tidiness, never this build's correctness.
-fn write_asset_kind_record(directory: &std::path::Path, mut entries: Vec<(String, String)>) {
+/// and otherwise ignored, like the sweeps': a record is bookkeeping for the
+/// NEXT build's tidiness, never this build's correctness. `noun` names the
+/// record in that report, because a reader deserves to know which of the two
+/// could not be written.
+fn write_leg_record(path: &std::path::Path, mut entries: Vec<(String, String)>, noun: &str) {
     entries.sort();
     entries.dedup();
-    let path = directory.join(ASSET_KIND_RECORD);
     if entries.is_empty() {
         if path.is_file() {
-            if let Err(error) = fs::remove_file(&path) {
+            if let Err(error) = fs::remove_file(path) {
                 eprintln!(
-                    "{} cannot remove the asset-kind record {}: {error}",
+                    "{} cannot remove the {noun} {}: {error}",
                     paint::warning_prefix(),
                     path.display()
                 );
@@ -3762,13 +3801,13 @@ fn write_asset_kind_record(directory: &std::path::Path, mut entries: Vec<(String
     }
     let mut text = entries
         .iter()
-        .map(|(leg, kind)| format!("{leg}/{kind}"))
+        .map(|(leg, name)| format!("{leg}/{name}"))
         .collect::<Vec<_>>()
         .join("\n");
     text.push('\n');
-    if let Err(error) = fs::write(&path, text) {
+    if let Err(error) = fs::write(path, text) {
         eprintln!(
-            "{} cannot write the asset-kind record {}: {error}",
+            "{} cannot write the {noun} {}: {error}",
             paint::warning_prefix(),
             path.display()
         );
@@ -3794,7 +3833,8 @@ fn prune_and_record_asset_kinds(
     if leg.is_empty() {
         return;
     }
-    let mut entries = read_asset_kind_record(directory);
+    let record = directory.join(ASSET_KIND_RECORD);
+    let mut entries = read_leg_record(&record, recordable_emit_kind);
     for (recorded_leg, kind) in &entries {
         if recorded_leg != leg || flushed.contains(kind) {
             continue;
@@ -3815,7 +3855,86 @@ fn prune_and_record_asset_kinds(
     for kind in flushed {
         entries.push((leg.to_string(), kind.clone()));
     }
-    write_asset_kind_record(directory, entries);
+    write_leg_record(&record, entries, "asset-kind record");
+}
+
+/// Whether the bundle prune records — and so may later remove — the copy that
+/// landed on `name`. This is the prune's OWN guard, kept for the reason
+/// [`recordable_emit_kind`] keeps one: what a build may DELETE must not depend
+/// on a check made somewhere else. Every shape refused here is one
+/// `const_eval`'s `bundled_name` / `bundled_target` fences already refuse
+/// before a copy is registered — an absolute target, a `..`, a `.` — so the
+/// guard is not expected to fire; the one refusal it owns alone is a name
+/// carrying a line break, which cannot ride a `leg/name` line.
+///
+/// Refusal means "never pruned", not "never copied": a copy this cannot record
+/// is simply one the next build leaves where it is.
+fn recordable_bundled_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(['\n', '\r'])
+        && std::path::Path::new(name)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+/// Removes the copies `leg`'s previous build carried and this one no longer
+/// names, then re-records what it did carry — the bundled half of the doctrine
+/// [`prune_and_record_asset_kinds`] already enforces for kinds, and the same
+/// law rather than a second one (backlog G13).
+///
+/// A stale file in `dist/` SHIPS, which is worse than a missing one: `dist/` is
+/// the deploy artifact, so a static host in front of it serves a `robots.txt`
+/// the build stopped naming forever. `serve_build` routes from the manifest and
+/// would not, which is exactly why the gap was invisible. Two reachable ways in
+/// with no source edit at all: `read_dir_all` makes a DELETION from a listed
+/// tree invisible to the copy, and a `digest`-minted fingerprint orphans one
+/// copy per save under `--watch`, unbounded for the life of the session.
+///
+/// The pruner acts ONLY on its own record. A user-placed file, another leg's
+/// outputs, and anything unrecorded are untouchable however bundle-shaped their
+/// names — G6's law, and it stays one law.
+///
+/// Rows are keyed by leg because `dist/` is one directory that every leg copies
+/// into. But a name is NOT one leg's to delete merely because that leg stopped
+/// naming it: two legs bundling the same file to the same target is legal and
+/// expected (the copy is idempotent, and `write_bundled` refuses only two
+/// DIFFERENT sources on one name). So the prune removes a file only when the
+/// record it is about to WRITE no longer names it at all — this leg's rows
+/// replaced, every other leg's carried through.
+fn prune_and_record_bundled(directory: &std::path::Path, leg: &str, bundled: &BTreeSet<String>) {
+    if leg.is_empty() {
+        return;
+    }
+    let record = directory.join(BUNDLED_RECORD);
+    let previous = read_leg_record(&record, recordable_bundled_name);
+    let mut next: Vec<(String, String)> = previous
+        .iter()
+        .filter(|(recorded_leg, _)| recorded_leg != leg)
+        .cloned()
+        .collect();
+    for name in bundled {
+        if recordable_bundled_name(name) {
+            next.push((leg.to_string(), name.clone()));
+        }
+    }
+    let kept: BTreeSet<&str> = next.iter().map(|(_, name)| name.as_str()).collect();
+    for (recorded_leg, name) in &previous {
+        if recorded_leg != leg || kept.contains(name.as_str()) {
+            continue;
+        }
+        let path = directory.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!(
+                "{} cannot remove the stale bundled asset {}: {error}",
+                paint::warning_prefix(),
+                path.display()
+            );
+        }
+    }
+    write_leg_record(&record, next, "bundled-asset record");
 }
 
 /// Copies every file `const asset::bundle` registered into the build's output
@@ -3853,17 +3972,29 @@ fn prune_and_record_asset_kinds(
 /// A failed copy fails the build. Unlike a stray chunk, a missing asset is not
 /// a tidiness problem: the manifest is about to name it, and `load_build`
 /// stops a server whose build names a file that is not on disk.
+///
+/// Every copy that MOVED BYTES is recorded, so the next build can prune the one
+/// this build stopped naming ([`prune_and_record_bundled`]) — the sweep the
+/// three beside this one already perform for their own outputs.
 fn write_bundled(
     output_directory: &std::path::Path,
     bundled: &[(PathBuf, String)],
-    // Whose copies these are — the leg name `--explain` groups them under, so
-    // a report can tell `client`'s copy of a shared file from `server`'s. Only
-    // the report reads it; the copy itself is a leg-agnostic file operation.
+    // Whose copies these are: the leg name `--explain` groups them under, so a
+    // report can tell `client`'s copy of a shared file from `server`'s, AND the
+    // key the bundled record files them under, so one leg's prune cannot reach
+    // another's copies. Empty means neither — a caller with no leg to name
+    // records nothing and prunes nothing.
     leg: &str,
     reserved: &[LegNamespace],
     written_names: &mut BTreeMap<String, PathBuf>,
 ) -> Result<Vec<String>, ExitCode> {
     let mut written = Vec::new();
+    // What the record will say. Not the same list as `written`: a resource that
+    // is ALREADY its own destination is carried without being copied, and
+    // recording it would put the build's own SOURCE tree on a future build's
+    // deletion list — the file `same_file` exists to protect would be destroyed
+    // by the sweep instead of by `fs::copy`.
+    let mut recorded = BTreeSet::new();
     for (source, name) in bundled {
         match written_names.get(name) {
             Some(earlier) if earlier != source => {
@@ -3930,7 +4061,12 @@ fn write_bundled(
         );
         explain::bundled(destination, leg, source.clone(), name);
         written.push(name.clone());
+        recorded.insert(name.clone());
     }
+    // After the copies, on the success path alone: a build that failed halfway
+    // has not written the tree its record would be describing, and a DELETION
+    // on the way to a failure is the worst outcome available.
+    prune_and_record_bundled(output_directory, leg, &recorded);
     Ok(written)
 }
 
