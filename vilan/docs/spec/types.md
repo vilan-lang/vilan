@@ -297,7 +297,11 @@ trait's default body where it declares none.
 Two impls that neither subsumes the other — `Box<type T: Display>` and
 `Box<type U: Ord>` for a `Box<i32>` that satisfies both — are not ranked.
 They are legal to write, and a call that reaches both is reported at the
-call site; narrowing one subject is the fix.
+call site; narrowing one subject is the fix. Two impls with the *same*
+subject are refused at the second declaration instead, since no type
+could ever separate them — so a second blanket for one trait
+(`impl type T with Show` beside `impl type U with Show`) never reaches a
+call site at all.
 
 Which trait *instantiation* a call means is decided before specificity is
 consulted: `impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` are two
@@ -305,6 +309,45 @@ implementations, so `bag.into()` is answered by the one whose result fits
 the type the call site expects (`let cup: Cup = bag.into()`). A call with
 no such expectation, or one that fits both or neither, is reported rather
 than resolved.
+
+### Dispatch through a bound
+
+A call on a generic parameter (`fun f<V: Show>(v: V) { v.show(); }`)
+resolves through the parameter's bound and selects an implementation at
+monomorphization, by the same order — applicability, then instantiation,
+then specificity — with the bound supplying the instantiation the call
+site would otherwise have to. That order is total wherever the program
+compiles: every such call reaches one implementation's member, or the
+trait's default where the winning impl declares none, or the program is
+refused before it runs. A binding whose implementations the order cannot
+rank is reported at the call that made it, naming both subjects.
+
+A blanket implementation is reachable this way like any other — it is
+simply the least specific tier — which is what makes one trait cover a
+static value and a reactive one at once:
+
+```vilan,fragment
+trait MaybeSignal<T> { fun bind(self, react: |T| void); }
+
+impl type T with MaybeSignal<T> {              // every type, statically
+	fun bind(self, react: |T| void) { react(self); }
+}
+impl Signal<type T> with MaybeSignal<T> {      // signals, reactively
+	fun bind(self, react: |T| void) { let _watching = self.sub(react); }
+}
+
+fun badge<V: MaybeSignal<str>>(label: V) { … }  // takes both, no ceremony
+```
+
+Because the instantiation is decided first, a `Signal<str>` reaches the
+`Signal` impl under a `MaybeSignal<str>` bound and the blanket under a
+`MaybeSignal<Signal<str>>` bound, where it is a static value of that
+type. The two impls never overlap at one bound: the blanket provides
+`MaybeSignal<Signal<str>>` there and the `Signal` impl provides
+`MaybeSignal<str>`, and `T = Signal<T>` has no solution at any finite
+`T`. There is no way to write "every type *except* a signal" — a
+negative bound would make adding an implementation a breaking change for
+everyone who wrote one — and by this order there is no need to.
 
 *Implementation note (tracked): derive-based checks (`Wire`, `Json`)
 verify field trees syntactically rather than through trait bounds.*

@@ -19,6 +19,7 @@ pub mod formatter;
 pub mod fx;
 pub mod git_dep;
 pub mod id;
+pub mod impl_select;
 pub mod init_order;
 pub mod interpreter;
 pub mod leak_tally;

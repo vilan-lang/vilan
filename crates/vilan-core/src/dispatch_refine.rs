@@ -124,7 +124,17 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
 /// member wins outright; else the trait defaults the matching impls inherit
 /// (the `dispatch_candidates_for` shape, widened to primitive subjects —
 /// `impl str with Slot` is real here).
-pub fn impl_members_for(program: &Program, resolved: &Type, member: &str) -> Vec<Id> {
+///
+/// Matching is deliberately LOOSER than emission's
+/// ([`crate::impl_select::select_member`]): the nominal head alone, plus every
+/// impl whose subject pattern applies — which is what brings a blanket
+/// `impl type T with Trait` into view, B158's body that these consumers could
+/// not see at all. The extra impls only ever add members, which is the
+/// direction this module's guarantee allows.
+pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str) -> Vec<Id> {
+    let Some(resolved) = program.type_id_to_type_map.get(&subject_type_id) else {
+        return Vec::new();
+    };
     let matches_subject = |subject: &Type| match (subject, resolved) {
         (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => a == b,
         (a, b) => a == b,
@@ -137,6 +147,11 @@ pub fn impl_members_for(program: &Program, resolved: &Type, member: &str) -> Vec
                 .type_id_to_type_map
                 .get(&implementation.subject)
                 .is_some_and(matches_subject)
+                || crate::impl_select::subject_applies(
+                    program,
+                    implementation.subject,
+                    subject_type_id,
+                )
         })
         .collect();
     let declared: Vec<Id> = matching
@@ -300,17 +315,8 @@ pub fn refined_edges(
                 // enumeration. A receiver resolving to a generic or opaque
                 // type keeps the union, as does an empty selection.
                 match program.type_id_to_type_map.get(&receiver) {
-                    Some(resolved)
-                        if !matches!(
-                            resolved,
-                            Type::Generic(_)
-                                | Type::Any
-                                | Type::Unknown
-                                | Type::Unresolved
-                                | Type::Trait(..)
-                        ) =>
-                    {
-                        let selected = impl_members_for(program, resolved, member);
+                    Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
+                        let selected = impl_members_for(program, receiver, member);
                         if selected.is_empty() {
                             union_fallback(&mut edges);
                         } else {
@@ -338,11 +344,7 @@ pub fn refined_edges(
         // empty selection (defensive — the bound audit rejects no-impl
         // types) falls back to every candidate.
         let selected_for = |resolved: TypeId| -> Vec<Id> {
-            let selected = program
-                .type_id_to_type_map
-                .get(&resolved)
-                .map(|type_| impl_members_for(program, type_, member))
-                .unwrap_or_default();
+            let selected = impl_members_for(program, resolved, member);
             if selected.is_empty() {
                 site.candidates.clone()
             } else {

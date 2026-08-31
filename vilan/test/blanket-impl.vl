@@ -1,0 +1,93 @@
+import std::print;
+import std::reactive::Signal;
+
+// A BLANKET impl (`impl type T with Trait<T>`) implements a trait for every
+// type at once. It is the LEAST SPECIFIC tier of `spec/types.md` §5.4's
+// specificity order: any constructor-headed impl that also matches wins,
+// and a call through a bound reaches exactly one body or is refused (B158).
+
+trait MaybeSignal<T> {
+	fun bind(self, react: |T| void);
+}
+
+// Every type is its own static source: the handler fires once, now.
+impl type T with MaybeSignal<T> {
+	fun bind(self, react: |T| void) {
+		react(self);
+	}
+}
+
+// A signal is a reactive source: the handler subscribes and fires again on
+// every `set`. `Signal<T>` is constructor-headed, so it outranks the blanket
+// wherever both match.
+impl Signal<type T> with MaybeSignal<T> {
+	fun bind(self, react: |T| void) {
+		let _watching = self.sub(react);
+	}
+}
+
+// One parameter, no call-site ceremony: a `str` takes the blanket, a
+// `Signal<str>` takes the signal impl, and neither call site says which.
+fun badge<V: MaybeSignal<str>>(label: V) {
+	label.bind(|text| print(i"[{text}]"));
+}
+
+// The SAME `Signal<str>` under a bound written at `Signal<str>` is a static
+// value of that type, through the blanket — the bound decides which
+// instantiation is wanted before specificity is consulted.
+fun holder<V: MaybeSignal<Signal<str>>>(slot: V) {
+	slot.bind(|inner| print(i"holder {inner.get()}"));
+}
+
+// The specificity order ranks binder BOUNDS too, once the subject shapes
+// agree: `Box<type T: Marker>` is more specific than `Box<type T>`.
+trait Marker {
+	fun marker(self): str;
+}
+
+trait Show {
+	fun show(self): str;
+}
+
+struct Box<T> {
+	v: T,
+}
+
+struct Plain {}
+
+struct Tagged {}
+
+impl Tagged with Marker {
+	fun marker(self): str {
+		"tagged"
+	}
+}
+
+impl Box<type T> with Show {
+	fun show(self): str {
+		"plain box"
+	}
+}
+
+impl Box<type T: Marker> with Show {
+	fun show(self): str {
+		"marked box"
+	}
+}
+
+fun describe<B: Show>(box: B) {
+	print(box.show());
+}
+
+fun main() {
+	badge("static");
+
+	let live = Signal::new("first");
+	badge(live);
+	live.set("second");
+
+	holder(live);
+
+	describe(Box { v = Plain {} });
+	describe(Box { v = Tagged {} });
+}

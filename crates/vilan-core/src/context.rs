@@ -681,18 +681,9 @@ fn analyze(
         match crate::async_infer::dispatch_at(program, call_id) {
             Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
                 match program.type_id_to_type_map.get(&receiver) {
-                    Some(resolved)
-                        if !matches!(
-                            resolved,
-                            Type::Generic(_)
-                                | Type::Any
-                                | Type::Unknown
-                                | Type::Unresolved
-                                | Type::Trait(..)
-                        ) =>
-                    {
+                    Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
                         let selected =
-                            crate::dispatch_refine::impl_members_for(program, resolved, member);
+                            crate::dispatch_refine::impl_members_for(program, receiver, member);
                         selected.is_empty() || selected.contains(&candidate)
                     }
                     _ => true,

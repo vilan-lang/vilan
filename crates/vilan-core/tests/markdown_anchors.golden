@@ -258,6 +258,7 @@ spec/types.md h3 enum-representation
 spec/types.md h3 backed-enum-conversions
 spec/types.md h3 the-trap-arm
 spec/types.md h2 54-impls
+spec/types.md h3 dispatch-through-a-bound
 spec/types.md h2 55-traits
 spec/types.md h2 56-generic-binding-and-inference
 spec/types.md h2 57-operator-and-method-dispatch

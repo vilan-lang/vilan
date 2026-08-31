@@ -3831,6 +3831,26 @@ impl<'src> Analyzer<'src> {
                         &required_arguments,
                         0,
                     ) {
+                        // The bound HOLDS — but a call through it still has to
+                        // reach exactly one body, and the specificity order is
+                        // what picks it (B158, spec §5.4). A binding whose
+                        // impls of this trait the order cannot rank has no
+                        // answer at monomorphization; report it here, where
+                        // the binding that produced it is visible, rather than
+                        // letting emission fall through to the trait's
+                        // body-less requirement (B55's internal error, which
+                        // asked the author to report a program that was
+                        // theirs to fix).
+                        if let Some(msg) =
+                            self.unrankable_bound_impls(&value_type, *required_trait_id)
+                        {
+                            errors.push((
+                                call_id,
+                                **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                                msg,
+                                constraint_id,
+                            ));
+                        }
                         continue;
                     }
                     let Some(trait_label) =
@@ -12541,6 +12561,73 @@ impl<'src> Analyzer<'src> {
             true => Ok(first),
             false => Err(maxima.into_iter().cloned().collect()),
         }
+    }
+
+    /// B158: the same R3 residue, asked of a BOUND rather than a receiver.
+    ///
+    /// A generic bound that holds says only that some impl provides the trait;
+    /// dispatch through it still has to name one body, and it is the
+    /// specificity order that names it. Where that order leaves two maxima the
+    /// binding has no answer — the emission side would have taken whichever
+    /// impl was declared first, or (before the blanket became reachable at all)
+    /// fallen through to the trait's body-less requirement. Reported at the
+    /// call that made the binding, in the shape §13.4(a)(3)'s call-site report
+    /// uses, so the two spellings of the same failure read alike.
+    ///
+    /// `None` — the answer for almost every bound in almost every program — as
+    /// soon as the trait has fewer than two implementations, which is the gate
+    /// that keeps this off the hot path.
+    fn unrankable_bound_impls(&mut self, value_type: &Type, trait_id: Id) -> Option<String> {
+        if !crate::impl_select::is_resolvable(value_type) {
+            return None;
+        }
+        let implementing = self
+            .implementations
+            .iter()
+            .filter(|implementation| implementation.trait_ids.contains(&trait_id))
+            .count();
+        if implementing < 2 {
+            return None;
+        }
+        let member_names: Vec<&'src str> = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.declarations.keys().copied().collect())
+            .unwrap_or_default();
+        for member_name in member_names {
+            // The bound path reaches `[trait_only]` members too — they are
+            // exactly what a bound is for — so the candidate scan allows them.
+            let candidates = self.impl_member_candidates(value_type, member_name, true, true);
+            let home: Vec<&ImplMemberCandidate> = candidates
+                .iter()
+                .filter(|candidate| candidate.home_trait == Some(trait_id))
+                .collect();
+            let Err(unranked) = self.most_specific_in_home(&home) else {
+                continue;
+            };
+            if unranked.len() < 2 {
+                continue;
+            }
+            let type_label = self.pretty_print_type(value_type, &HashMap::default());
+            let trait_label = self
+                .traits
+                .get(&trait_id)
+                .map(|trait_| trait_.name)
+                .unwrap_or("the bound trait");
+            let subjects: Vec<String> = unranked
+                .iter()
+                .map(|candidate| format!("'{}'", self.impl_subject_label(candidate.impl_subject)))
+                .collect();
+            return Some(format!(
+                "'{member_name}' cannot be dispatched on '{type_label}' through this call's \
+                 '{trait_label}' bound: {}{} provide it and neither impl subject is more \
+                 specific than the other; vilan picks the more specific of two overlapping \
+                 impls, so narrow one subject until it is",
+                if subjects.len() == 2 { "both " } else { "" },
+                join_with(&subjects, "and"),
+            ));
+        }
+        None
     }
 
     /// B73's R2: the type the call site expects picks among argument-distinct
@@ -33499,6 +33586,13 @@ pub struct Program<'src> {
     pub method_call_substitution: HashMap<Id, SubstitutionContext>,
     pub global_scope_id: Id,
     pub implementations: Vec<Implementation<'src>>,
+    /// Every generic parameter's bound list, by constraint type id — a
+    /// multi-bound's entries, where a single bound is the constraint id
+    /// itself. Carried out of the analyzer because the specificity order
+    /// (`impl_select`) ranks two impls of equal subject SHAPE by their
+    /// binders' bounds, and the emission side has to reach the same verdict
+    /// the analyzer did or a call through a bound lands in the wrong body.
+    pub generic_bounds: HashMap<TypeId, Vec<TypeId>>,
     /// The `value()` members synthesized on backed enums (backed-enums.md
     /// §3.8), by member id. `x.value()` lowers to `x` — the receiver already IS
     /// the backing value at runtime — so the transformer folds the call away
@@ -38893,6 +38987,7 @@ fn analyze_over_world<'src>(
         intrinsics,
         global_scope_id,
         implementations: analyzer.implementations,
+        generic_bounds: analyzer.generic_bounds,
         backed_value_members,
         list_new_fn_id,
         list_push_fn_id,
