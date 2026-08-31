@@ -258,6 +258,24 @@ struct Subscription {
 	release: Shared<Option<|| void>>,
 }
 
+impl Subscription {
+	/// A subscription over NO signal: `dispose` runs `release` once and does
+	/// nothing else. The registration shape for a source outside the signal
+	/// graph — `std::dom`'s `listen`, whose whole teardown is the call that
+	/// unhooks the DOM listener (`proposal/router.md` §5.2).
+	///
+	/// The one-shot is the `release` cell's, so an owner releasing a handle the
+	/// app already disposed by hand cannot unhook twice.
+	fun teardown(release: || void): Subscription {
+		mut subscribers: List<Subscriber> = [];
+		Subscription {
+			subscribers = Shared::new(subscribers),
+			id = fresh_id(),
+			release = Shared::new(Some(release)),
+		}
+	}
+}
+
 impl Subscription with Disposable {
 	fun dispose(self) {
 		mut kept: List<Subscriber> = [];

@@ -12,7 +12,7 @@
 // route VALUE (`Routable`), so every link's path comes from the enum. Only
 // available when building for the browser.
 
-import pkg::dom::Event;
+import pkg::dom::{ Event, window };
 import pkg::option::Option;
 import pkg::reactive::{ FlushPolicy, Signal, turn };
 import pkg::shared::Shared;
@@ -26,10 +26,6 @@ external fun history_push(state: str, title: str, path: str): void;
 [extern("__router_path")]
 external fun location_path(): str;
 
-/// `window.addEventListener` — the back/forward (`popstate`) subscription.
-[extern("window.addEventListener", retains)]
-external fun window_listen(event: str, handler: || void): void;
-
 /// The path-signal singleton (the `std::reactive` module-state pattern) —
 /// created empty at load, wired to the real location on first use.
 let path_signal: Signal<str> = Signal::new("");
@@ -37,12 +33,15 @@ let wired: Shared<bool> = Shared::new(false);
 
 /// Wire the singleton once: read the current location and subscribe
 /// back/forward. A `popstate` is a DOM event, so it dispatches inside a fresh
-/// turn exactly as `View.on` does.
+/// turn exactly as `View.on` does — `std::dom`'s window verbs are raw, like
+/// `element.on`, so the turn wrapper is the caller's (`proposal/router.md`
+/// §5.1). The subscription is deliberately never removed: the path singleton
+/// lives as long as the program.
 fun ensure_wired() {
 	if !wired.read() {
 		wired.write() = true;
 		path_signal.set(location_path());
-		window_listen("popstate", || turn(FlushPolicy::AtSuspension, || {
+		window().on("popstate", || turn(FlushPolicy::AtSuspension, || {
 			path_signal.set(location_path());
 		}));
 	}

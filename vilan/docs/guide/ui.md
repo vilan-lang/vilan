@@ -36,7 +36,9 @@ view so you can keep going:
   `.attr(name, value)`, `.styled(style)` (see [Styling](styling.md)).
 - **Structure**: `.child(content)`, `.children(views)`.
 - **Events**: `.on(event, handler)`, or `.on_event(event, |e| …)` when
-  you need the DOM event itself (`prevent_default`, `key()`, modifiers).
+  you need the DOM event itself (`prevent_default`, `key()`, modifiers,
+  `pointer_x()`/`pointer_y()`). For window-level events, and for a listener
+  you need to remove, drop to `std::dom` — [Escaping to the DOM](#escaping-to-the-dom).
 - **Reactive bindings**: `.bind_text(signal)`, `.bind_class(signal)`,
   `.bind_attr(name, signal)`, `.style_var(name, signal)`.
 
@@ -391,6 +393,33 @@ Two rules make one component serve both legs:
 directly: `get_element_by_id`, `query_selector`,
 `element.set_attribute`, and so on. See the
 [browser reference](../std/browser.md).
+
+Two things live only down there, because they aren't about a view at all.
+Events that no element receives — `resize`, `popstate`, `storage`, `message` —
+hang off `window()`, which carries the same `on` / `on_event` verbs an element
+does. And when a listener has to *stop* before its target does, `listen` is the
+removable form: it hands back a `Subscription`, and disposing it unhooks the
+listener.
+
+A pointer drag needs both, which is why it can't be a `View` method: the
+pointer leaves the element the moment the drag starts moving, so the stream has
+to come from the window, and it has to stop on `pointerup`.
+
+```vilan,fragment
+element.on_event("pointerdown", |down| {
+	let start = down.pointer_x();
+	mut stop;
+	let moves = window().listen("pointermove", |event| {
+		width.set(start_width + event.pointer_x() - start);
+	});
+	let ups = window().listen("pointerup", |_| { stop(); });
+	stop = || { moves.dispose(); ups.dispose(); };
+})
+```
+
+Window handlers are raw, like `element.on`: they establish no turn, so wrap the
+body in `turn(FlushPolicy::AtSuspension, …)` when a handler writes several
+signals that should settle as one wave.
 
 ## Traps
 

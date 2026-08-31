@@ -125,10 +125,18 @@ fun main() {
 ```vilan,fragment
 trait Disposable { fun dispose(self); }
 struct Subscription { … }        // impl Disposable
+impl Subscription {
+	fun teardown(release: || void): Subscription   // a subscription over no signal
+}
 ```
 
 Disposing a subscription guarantees no *later* deliveries; a delivery already
 queued in the currently-draining turn may still land once.
+
+`Subscription::teardown` is the registration shape for a source **outside** the
+signal graph: `dispose` runs the hook once and does nothing else. `std::dom`'s
+`listen` is built on it — a DOM listener's whole teardown is the call that
+unhooks it. The hook is one-shot, so disposing twice is safe.
 
 ## Owner
 

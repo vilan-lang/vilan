@@ -704,6 +704,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_watch_stop",
         "__local_get",
         "__session_get",
+        "__dom_window",
         "__router_path",
         "__nursery_new",
         "__nursery_new_detached",
@@ -926,6 +927,11 @@ fn helper_source(name: &str) -> &'static str {
         "__session_get" => {
             "function __session_get(key) {\n\treturn sessionStorage.getItem(key) ?? \"\";\n}"
         }
+        // DOM glue (std::dom): `window` is a global property, and the
+        // function-extern form addresses only callables — the same reason
+        // `__router_path` exists. This is what makes `window` a listen TARGET
+        // with the same verbs `Element` carries (`proposal/router.md` §5.1).
+        "__dom_window" => "function __dom_window() {\n\treturn window;\n}",
         // Router glue (std::router): `location.pathname` is a global property,
         // which the function-extern form can't address directly.
         "__router_path" => "function __router_path() {\n\treturn location.pathname;\n}",

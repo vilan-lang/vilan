@@ -4837,6 +4837,19 @@ mod reformats {
             "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
             "[extern(\"queueMicrotask\")]\nexternal fun queue(callback: || void);\n",
         );
+        // The shape `std::dom`'s listen surface is declared in (`router.md`
+        // §5.2): a MARKED registration and an UNMARKED removal, adjacent, on
+        // the same host object. The audit rule draws its line between these two
+        // lines — `addEventListener` stores the closure, `removeEventListener`
+        // keeps nothing — so a printer that normalized the flag onto both (or
+        // off both) would erase the distinction in the one place it is written.
+        let listen_pair = "impl Window {\n\
+             \t[extern(method, \"addEventListener\", retains)]\n\
+             \texternal fun on_event(self, event: str, handler: |Event| void): void;\n\n\
+             \t[extern(method, \"removeEventListener\")]\n\
+             \texternal fun off_event(self, event: str, handler: |Event| void): void;\n\
+             }\n";
+        assert_formats(listen_pair, listen_pair);
     }
 
     // `async`/`sync` closure-type markers round-trip (they used to BAIL,

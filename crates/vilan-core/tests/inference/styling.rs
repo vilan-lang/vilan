@@ -4753,6 +4753,64 @@ fn on_event_hands_the_handler_the_dom_event() {
 }
 
 #[test]
+fn the_window_is_a_listen_target_with_the_elements_verbs() {
+    // A27 / kolt.local 037, `proposal/router.md` §5.1: `window` is a handle, not
+    // a suffix, so `on` / `on_event` / `listen` mean the same thing on both
+    // targets — this program uses each verb on each target and would not compile
+    // if either surface were spelled differently.
+    assert_compiles_browser(
+        r#"
+        import std::dom::{ Event, get_element_by_id, window };
+        import std::reactive::{ Disposable, Owner };
+
+        fun main() {
+            let element = get_element_by_id("app");
+
+            element.on("click", || {});
+            element.on_event("keydown", |event| { event.prevent_default(); });
+            window().on("resize", || {});
+            window().on_event("message", |event| { event.prevent_default(); });
+
+            // `listen` hands back a `Subscription` on both targets. It satisfies
+            // `Disposable`, so an owner takes it exactly as it takes a signal
+            // subscription — the documented idiom for a listener that should die
+            // with a scope (§5.2).
+            let owner = Owner::new();
+            let element_subscription = owner.take(element.listen("input", |_| {}));
+            let window_subscription = owner.take(window().listen("scroll", |_| {}));
+            element_subscription.dispose();
+            window_subscription.dispose();
+            owner.dispose();
+        }
+        "#,
+    );
+}
+
+#[test]
+fn pointer_coordinates_are_f64_accessors_on_the_event() {
+    // `proposal/router.md` §5.3. The arithmetic a drag does — subtracting a
+    // start from a current position — is the point of the accessors, so the pin
+    // does it: `f64` in, `f64` out, no conversion at the boundary.
+    assert_compiles_browser(
+        r#"
+        import std::dom::{ Event, get_element_by_id, window };
+
+        fun main() {
+            let element = get_element_by_id("app");
+            element.on_event("pointerdown", |down| {
+                let start = (down.pointer_x(), down.pointer_y());
+                window().on_event("pointermove", |move_event| {
+                    let offset: (f64, f64) =
+                        (move_event.pointer_x() - start.0, move_event.pointer_y() - start.1);
+                    element.set_attribute("data-dx", i"{offset.0}");
+                });
+            });
+        }
+        "#,
+    );
+}
+
+#[test]
 fn link_accepts_any_routable_and_chains() {
     // `link<R: Routable>` dispatches `to_path` through the bound, and the
     // returned `View` chains like any other.

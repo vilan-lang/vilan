@@ -31,6 +31,17 @@ impl Element {
 	fun set_value(self, value: str)
 	fun on(self, event: str, handler: || void)
 	fun on_event(self, event: str, handler: |Event| void)
+	fun off_event(self, event: str, handler: |Event| void)   // listen's teardown
+	fun listen(self, event: str, handler: |Event| void): Subscription   // must_use
+}
+
+external struct Window;              // the window — a listen target, like Element
+fun window(): Window
+impl Window {
+	fun on(self, event: str, handler: || void)
+	fun on_event(self, event: str, handler: |Event| void)
+	fun off_event(self, event: str, handler: |Event| void)
+	fun listen(self, event: str, handler: |Event| void): Subscription   // must_use
 }
 
 external struct Text;                // a text node — text only, no attributes
@@ -48,11 +59,43 @@ impl Event {
 	fun alt_key(self): bool
 	fun key(self): str           // "Enter", "Escape", "a", …
 	fun target_value(self): str  // event.target.value — the input's text
+	fun pointer_x(self): f64     // clientX — where the pointer is, in the viewport
+	fun pointer_y(self): f64     // clientY
 }
 ```
 
 Raw `element.on` handlers do **not** establish a turn: that's `View.on`'s
-job. Prefer the `View` layer; drop to `dom` for what it doesn't cover.
+job — and the `Window` verbs are raw in the same way, so a window handler that
+writes signals should wrap its body in `turn(FlushPolicy::AtSuspension, …)`
+itself. Prefer the `View` layer; drop to `dom` for what it doesn't cover.
+
+**`window` is a listen target.** Events that aren't delivered to any element —
+`resize`, `popstate`, `storage`, `message`, and the pointer stream a drag needs
+once the pointer has left the element it started on — hang off `window()`,
+which carries exactly the verbs `Element` does.
+
+**`on`/`on_event` are fire-and-forget; `listen` is the removable form.** An
+element listener dies with its element, which is usually the whole answer.
+Nothing about the window ever dies, so a window listener you can't remove is a
+leak by construction. `listen` hands back a
+[`Subscription`](reactive.md#subscription-disposable) — the same handle
+`Source::sub` returns, `[must_use]` for the same reason — and disposing it
+unhooks the listener. Later events then deliver nothing. Ownership is yours,
+as `sub`'s is: `get_owner().take(window().listen(…))` ties it to a scope, or
+call `dispose()` by hand. Disposing twice is safe.
+
+```vilan,fragment
+let moves = window().listen("pointermove", |event| {
+	track(event.pointer_x(), event.pointer_y());
+});
+// … later, or when the enclosing scope ends:
+moves.dispose();
+```
+
+`off_event` is what `listen` is built on, and removal is **identity-matched**:
+the handler you pass must be the same value the host was handed, so a freshly
+written closure removes nothing. `listen` exists so you don't have to hold that
+pairing right.
 
 `target_value` is how a listener reads what the user typed **without holding
 the element**. An element that reaches its own listener and back is a cycle

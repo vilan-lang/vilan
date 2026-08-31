@@ -6,6 +6,8 @@
 // reference, not a value: methods mutate the node in place and binding/passing it
 // shares the one node rather than snapshotting it.
 
+import pkg::reactive::Subscription;
+
 external struct Element;
 
 /// `document.getElementById(id)` — the element with that id (the mount point a
@@ -99,6 +101,72 @@ impl Element {
 	/// ignores it.
 	[extern(method, "addEventListener", retains)]
 	external fun on_event(self, event: str, handler: |Event| void): void;
+
+	/// `element.removeEventListener(event, handler)` — `listen`'s teardown.
+	/// Removal is IDENTITY-matched: `handler` must be the same value the host
+	/// was handed, so a freshly written closure removes nothing. `listen` is the
+	/// form that holds the pairing for you; reach for this only when you already
+	/// hold both halves. Unmarked by `retains` deliberately — removal keeps
+	/// nothing past the call (`proposal/router.md` §5.2).
+	[extern(method, "removeEventListener")]
+	external fun off_event(self, event: str, handler: |Event| void): void;
+
+	/// Registers `handler` on `event` and hands back the `Subscription` that
+	/// unhooks it — the REMOVABLE form of `on_event` (`proposal/router.md`
+	/// §5.2). `on`/`on_event` are fire-and-forget: an element listener dies with
+	/// its element, which is usually the whole answer. `listen` is for the rest —
+	/// a listener that must stop before its target does.
+	///
+	/// `[must_use]` exactly as `Source::sub` is, and ownership is the caller's
+	/// exactly as `sub`'s is: hand it to a scope with
+	/// `get_owner().take(element.listen(..))`, or `dispose` it by hand. Disposing
+	/// twice is safe.
+	[must_use]
+	fun listen(self, event: str, handler: |Event| void): Subscription {
+		self.on_event(event, handler);
+		Subscription::teardown(|| {
+			self.off_event(event, handler);
+		})
+	}
+}
+
+/// The host `window` — a listen TARGET, opaque exactly as `Element` is
+/// (`proposal/router.md` §5.1). It carries the events no element is given:
+/// `resize`, `popstate`, `storage`, `message`, and the pointer stream a drag
+/// needs after the pointer has left the element it started on.
+external struct Window;
+
+/// The one `window` object (via a helper — a global property has no function
+/// form, the same reason `std::router`'s `location.pathname` needs one).
+[extern("__dom_window")]
+external fun window(): Window;
+
+impl Window {
+	/// Registers `handler` to run on `event` (e.g. `"resize"`, `"popstate"`) —
+	/// `Element::on`'s twin on the window, and fire-and-forget in the same way.
+	[extern(method, "addEventListener", retains)]
+	external fun on(self, event: str, handler: || void): void;
+
+	/// Like `on`, but the handler receives the `Event`.
+	[extern(method, "addEventListener", retains)]
+	external fun on_event(self, event: str, handler: |Event| void): void;
+
+	/// `window.removeEventListener(event, handler)` — `listen`'s teardown, and
+	/// identity-matched exactly as `Element::off_event` is.
+	[extern(method, "removeEventListener")]
+	external fun off_event(self, event: str, handler: |Event| void): void;
+
+	/// Registers `handler` on `event` and hands back the `Subscription` that
+	/// unhooks it. This is the form window listeners actually want: nothing
+	/// about the window ever goes away, so a window listener that cannot be
+	/// removed is a leak by construction.
+	[must_use]
+	fun listen(self, event: str, handler: |Event| void): Subscription {
+		self.on_event(event, handler);
+		Subscription::teardown(|| {
+			self.off_event(event, handler);
+		})
+	}
 }
 
 /// A DOM text node — an opaque handle like `Element`, carrying text only: no
@@ -141,6 +209,20 @@ impl Event {
 	/// The key for a keyboard event (`event.key`): `"Enter"`, `"Escape"`, `"a"`, ….
 	[extern(get, "key")]
 	external fun key(self): str;
+
+	/// Where the pointer is, in viewport coordinates (`event.clientX` /
+	/// `event.clientY`) — the numbers a drag subtracts.
+	///
+	/// Named for the pointer, not for the DOM's coordinate space
+	/// (`proposal/router.md` §5.3): `clientX`'s "client" means *viewport* for
+	/// purely historical reasons, and the transliteration would teach that
+	/// history to every reader. The document-relative pair (`pageX`/`pageY`)
+	/// lands as `page_x`/`page_y` when something reads it.
+	[extern(get, "clientX")]
+	external fun pointer_x(self): f64;
+
+	[extern(get, "clientY")]
+	external fun pointer_y(self): f64;
 
 	/// The value of the element the event was dispatched to
 	/// (`event.target.value`) — what an `<input>` holds right now, read from
