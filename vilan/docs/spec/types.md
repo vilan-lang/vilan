@@ -356,7 +356,12 @@ verify field trees syntactically rather than through trait bounds.*
 
 A trait declares required methods (signature-only) and defaults (with
 bodies). `trait X with Y` makes `Y` a supertrait: implementing `X`
-requires `Y`. A trait's generic parameters may carry defaults
+requires `Y`. A supertrait's members are reachable through the
+sub-trait — a `T: Ord` value may call `eq` — and they are typed at the
+arguments the sub-trait passes the supertrait, not at the supertrait's
+own parameters: under `trait Sig<T> with Src<T>`, a `S: Sig<u32>` bound
+sees `Src`'s `get(): T` as `get(): u32`. A trait's generic parameters
+may carry defaults
 (`trait PartialEq<B = Self>`) and **bounds** (`trait Holder<T: Bound>`);
 `Self` in a trait body denotes the implementing type. Traits are used as
 **bounds**; a trait is not a type: `let x: Display` is a compile error
@@ -654,8 +659,11 @@ Normative rejection cases (each is a compile error):
   enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the
   bound …`).
-- A `match` whose VALUE legs' types don't unify. Diverging legs
-  (`ret`, `panic`, `jump`) are `Never` and don't participate (§5.1).
+- A `match` whose VALUE legs' types don't unify, and — by the same rule
+  — a value `if` (one with a final `else`, §5.1) whose arms' don't. An
+  `else if` chain is one construct: every arm unifies with the rest, not
+  just with its neighbour. Diverging legs and arms (`ret`, `panic`,
+  `jump`) are `Never` and don't participate (§5.1).
 - An `i53`/`i32` operand mix (no implicit widening; suffix the
   literal).
 

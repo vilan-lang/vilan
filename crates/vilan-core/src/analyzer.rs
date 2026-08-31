@@ -287,6 +287,24 @@ fn if_branch_has_final_else(branch: &ExprIfBranch) -> bool {
     }
 }
 
+/// Every arm's BODY — statement list and trailing expression — in source
+/// order, an `else if` chain flattened to one arm per branch. The statements
+/// come along because they decide whether the trailing expression is reached
+/// at all (a branch that leaves contributes `Never`, not its synthesized void
+/// tail — B124). One enumeration for every reader: the inference of an `if`'s
+/// type, and the arm-unification check that refuses a mismatch (B163).
+fn if_branch_bodies(branch: &ExprIfBranch, out: &mut Vec<(Vec<Id>, Id)>) {
+    match branch {
+        ExprIfBranch::If(_, (statements, trailing), next) => {
+            out.push((statements.clone(), *trailing));
+            if let Some(next) = next {
+                if_branch_bodies(next, out);
+            }
+        }
+        ExprIfBranch::Else((statements, trailing)) => out.push((statements.clone(), *trailing)),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExprMatchLeg {
     pub pattern: ExprPattern,
@@ -1908,6 +1926,12 @@ enum Constraint<'src> {
     /// patterns and guards, checks exhaustiveness, and types the match as the
     /// unification of its leg bodies.
     Match(PreppedMatch<'src>),
+    /// `if c { .. } else { .. }` with a final `else` — unifies the arm bodies
+    /// once they type, by the same rule the leg bodies of a `match` go through
+    /// (B163). The `if`'s own type still comes from `infer_type_path`'s
+    /// `Expr::If` arm, which folds the same merge; this is the CHECK that
+    /// refuses a pair that will not unify.
+    IfArms { id: Id, span: Span },
     /// `let v = value` (plus any reassignments) — grounds the variable's type
     /// from its first value, then checks the reassignments against it.
     Variable(VariableConstraint),
@@ -2010,6 +2034,7 @@ impl Constraint<'_> {
             Constraint::FieldAccessor(constraint) => constraint.id,
             Constraint::StructInitializer(constraint) => constraint.initializer_id,
             Constraint::Match(prepped) => prepped.id,
+            Constraint::IfArms { id, .. } => *id,
             Constraint::Variable(constraint) => constraint.variable_id,
             Constraint::Destructure(constraint) => constraint.id,
             Constraint::MethodCall { id, .. } => *id,
@@ -2059,6 +2084,13 @@ impl Constraint<'_> {
             Constraint::ClosureReturns { .. } => 10,
             Constraint::FunctionReturns { .. } => 10,
             Constraint::CallSubject(_) => 11,
+            // Last. Unlike `Match` — which must run early because it TYPES the
+            // match every dependent then reads — the arm check produces
+            // nothing anything else consumes (`seed_tail_expectations` seeded
+            // the arms at walk time, and `infer_type_path` types the `if`), so
+            // it can wait until every value-typing kind has landed and read
+            // settled arm types instead of deferring on each of them.
+            Constraint::IfArms { .. } => 12,
         }
     }
 }
@@ -13175,9 +13207,100 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// [`method_member_in_trait`] with the arguments the trait is used AT, and
+    /// returning the trait that DECLARES the member together with the
+    /// arguments THAT trait is reached with — the pair a caller needs to
+    /// substitute the member's signature (B164). A member found on the trait
+    /// itself returns `(trait_id, arguments)` unchanged; one found on a
+    /// supertrait returns the supertrait and the arguments the chain passes
+    /// it, so `get(): T` under `S: Sig<u32>` with `trait Sig<T> with Src<T>`
+    /// is `u32` and not `Src`'s abstract `T`.
+    fn method_member_in_trait_at(
+        &mut self,
+        trait_id: Id,
+        arguments: &[TypeId],
+        member_name: &str,
+    ) -> Option<(Id, Id, Vec<TypeId>)> {
+        self.trait_with_supertraits_at(trait_id, arguments)
+            .into_iter()
+            .find_map(|(id, id_arguments)| {
+                let member_id = self
+                    .traits
+                    .get(&id)
+                    .and_then(|trait_| trait_.declarations.get(member_name).copied())
+                    .filter(|member_id| self.is_self_method(*member_id))?;
+                Some((member_id, id, id_arguments))
+            })
+    }
+
+    /// The substitution a trait's members are typed under when the trait is
+    /// used at `arguments` (`Get<i32>` -> `{ Get::T: i32 }`). Empty when the
+    /// trait takes no parameters, or when none were supplied.
+    fn trait_parameter_substitution(
+        &self,
+        trait_id: Id,
+        arguments: &[TypeId],
+    ) -> SubstitutionContext {
+        if arguments.is_empty() {
+            return SubstitutionContext::default();
+        }
+        self.traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .zip(arguments.iter().copied())
+            .collect()
+    }
+
+    /// [`trait_with_supertraits`] with each trait paired with the type
+    /// arguments it is reached WITH: the sub-trait's arguments substituted
+    /// into the supertrait's WRITTEN ones, so `trait Sig<T> with Src<T>`
+    /// reached at `Sig<u32>` yields `Src<u32>` and not `Src<T>`. Dropping that
+    /// substitution is what let a supertrait's `T` leak out of a sub-trait
+    /// bound as a wildcard that unified with anything (B164), and it is
+    /// carried HERE — at the walk that answers "what does this bound provide?"
+    /// — rather than reconstructed by each lookup.
+    ///
+    /// The walk order matches `trait_with_supertraits` exactly, so the trait a
+    /// member resolves to is unchanged; only its arguments are now known. A
+    /// trait reached twice keeps the FIRST path's arguments, as it keeps the
+    /// first path at all.
+    fn trait_with_supertraits_at(
+        &mut self,
+        trait_id: Id,
+        arguments: &[TypeId],
+    ) -> Vec<(Id, Vec<TypeId>)> {
+        let mut result: Vec<(Id, Vec<TypeId>)> = Vec::new();
+        let mut stack = vec![(trait_id, arguments.to_vec())];
+        while let Some((id, arguments)) = stack.pop() {
+            if result.iter().any(|(seen, _)| *seen == id) {
+                continue;
+            }
+            result.push((id, arguments.clone()));
+            let Some(trait_) = self.traits.get(&id) else {
+                continue;
+            };
+            let supertraits = trait_.supertraits.clone();
+            let substitution = self.trait_parameter_substitution(id, &arguments);
+            for supertrait_type_id in supertraits {
+                if let Type::Trait(super_id, super_arguments) = supertrait_type_id.get_type(self) {
+                    let super_arguments = match substitution.is_empty() {
+                        true => super_arguments,
+                        false => self.substitute_argument_types(&super_arguments, &substitution),
+                    };
+                    stack.push((super_id, super_arguments));
+                }
+            }
+        }
+        result
+    }
+
     /// `trait_id` plus its transitive supertraits (each supertrait's `TypeId`
     /// resolved to a trait id). A trait's full interface — for method resolution
     /// and impl conformance — includes everything its supertraits declare.
+    /// [`trait_with_supertraits_at`] answers the same question keeping each
+    /// trait's arguments; this one is for the callers that need only the ids.
     fn trait_with_supertraits(&self, trait_id: Id) -> Vec<Id> {
         let mut result = Vec::new();
         let mut stack = vec![trait_id];
@@ -19495,7 +19618,17 @@ impl<'src> Analyzer<'src> {
                         }
                     }
                 }
-                Some(Expr::If(walk_branch(self, if_, scope_id)))
+                let branch = walk_branch(self, if_, scope_id);
+                // A value `if` — one with a final `else` — has its arms unified
+                // by the same rule a `match`'s legs go through (B163). Queued
+                // here rather than folded into the inference so the check runs
+                // ONCE per `if`, with a resolved world to read; a statement
+                // `if` produces no value, so there is nothing to unify.
+                if if_branch_has_final_else(&branch) {
+                    self.constraints
+                        .push(Constraint::IfArms { id, span: node.1 });
+                }
+                Some(Expr::If(branch))
             }
             Node::Func(function) => {
                 let name = function.name.0;
@@ -23564,26 +23697,9 @@ impl<'src> Analyzer<'src> {
             // miscompiled the call to its trait's abstract body (B17). Without
             // a final `else` the `if` is a statement, so it is void.
             Expr::If(branch) => {
-                // Every branch's BODY — statement list and trailing expression
-                // — in source order. The statements come along because they
-                // decide whether the trailing expression is reached at all
-                // (B124, below).
-                fn branch_bodies(branch: &ExprIfBranch, out: &mut Vec<(Vec<Id>, Id)>) {
-                    match branch {
-                        ExprIfBranch::If(_, (statements, trailing), next) => {
-                            out.push((statements.clone(), *trailing));
-                            if let Some(next) = next {
-                                branch_bodies(next, out);
-                            }
-                        }
-                        ExprIfBranch::Else((statements, trailing)) => {
-                            out.push((statements.clone(), *trailing))
-                        }
-                    }
-                }
                 if if_branch_has_final_else(branch) {
                     let mut bodies = Vec::new();
-                    branch_bodies(branch, &mut bodies);
+                    if_branch_bodies(branch, &mut bodies);
                     // The `if`'s type is the unification of its branches; infer
                     // each against the constraint so each branch's tail directs
                     // its own inference (the branches must agree, checked
@@ -23629,7 +23745,8 @@ impl<'src> Analyzer<'src> {
                             // Branches that don't unify (a real mismatch, or a
                             // never-typed `panic` arm) keep the first concrete
                             // type — diagnosis is the checker's job, not this
-                            // inference's.
+                            // inference's, and `resolve_if_arms` does it
+                            // (B163) with the rule `match` legs already used.
                             None => {
                                 if matches!(result, Type::Unknown | Type::Never) {
                                     branch_type
@@ -25569,6 +25686,7 @@ impl<'src> Analyzer<'src> {
                 self.resolve_struct_initializer(constraint)
             }
             Constraint::Match(prepped) => self.resolve_match(prepped),
+            Constraint::IfArms { id, span } => self.resolve_if_arms(*id, *span),
             Constraint::Variable(constraint) => self.resolve_variable(constraint),
             Constraint::Destructure(constraint) => self.resolve_destructure(constraint),
             Constraint::Comprehension {
@@ -27089,7 +27207,13 @@ impl<'src> Analyzer<'src> {
             Type::Trait(trait_id, trait_arguments) => {
                 let trait_id = *trait_id;
                 let trait_arguments = trait_arguments.clone();
-                let member = self.method_member_in_trait(trait_id, member_name);
+                // The member and the trait that DECLARES it, with the arguments
+                // THAT trait is reached at — the sub-trait's own when it
+                // declares the member, the substituted supertrait's when a
+                // supertrait does (B164).
+                let declared =
+                    self.method_member_in_trait_at(trait_id, &trait_arguments, member_name);
+                let member = declared.as_ref().map(|(member_id, _, _)| *member_id);
                 // The only legitimate bare-`Type::Trait` receiver is `self`/`Self`
                 // inside a trait default body, re-dispatched at codegen to the
                 // concrete specialization. A *value* typed as a bare trait
@@ -27102,23 +27226,20 @@ impl<'src> Analyzer<'src> {
                     // Inside a trait default body `self`/`Self` is `Type::Trait`;
                     // record the call so codegen re-dispatches it to whatever
                     // concrete type the default is specialized for.
-                    if member.is_some() {
+                    if let Some((_, declaring_trait_id, declaring_arguments)) = &declared {
                         self.generic_dispatch
                             .insert(id, GenericDispatch::OnType(None, member_name));
                         // A parameterized trait substitutes its generic parameters
                         // with the concrete arguments, so the method's signature
                         // (`got(): T`) types against them (`Get<i32>::got` -> `i32`).
-                        if !trait_arguments.is_empty() {
-                            let parameter_ids = self
-                                .traits
-                                .get(&trait_id)
-                                .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-                                .unwrap_or_default();
-                            let substitution: SubstitutionContext =
-                                parameter_ids.into_iter().zip(trait_arguments).collect();
-                            if !substitution.is_empty() {
-                                self.method_call_substitution.insert(id, substitution);
-                            }
+                        // The parameters are the DECLARING trait's: a member
+                        // inherited from a supertrait is written in that
+                        // trait's terms, and zipping the sub-trait's parameters
+                        // over it substituted nothing at all (B164).
+                        let substitution = self
+                            .trait_parameter_substitution(*declaring_trait_id, declaring_arguments);
+                        if !substitution.is_empty() {
+                            self.method_call_substitution.insert(id, substitution);
                         }
                     }
                     found(member)
@@ -27153,8 +27274,8 @@ impl<'src> Analyzer<'src> {
                     let mut member = None;
                     let mut member_trait = None;
                     for (trait_id, trait_arguments) in &bound_traits {
-                        let Some(found_member) =
-                            self.method_member_in_trait(*trait_id, member_name)
+                        let Some((found_member, declaring_trait_id, declaring_arguments)) =
+                            self.method_member_in_trait_at(*trait_id, trait_arguments, member_name)
                         else {
                             continue;
                         };
@@ -27167,19 +27288,20 @@ impl<'src> Analyzer<'src> {
                         // trait's abstract parameter. Without this, a closure argument's
                         // parameter loses its bound and a trait-method call on it fails
                         // to resolve. (Mirrors the `Type::Trait` arm above.)
-                        if !trait_arguments.is_empty() {
-                            let parameter_ids = self
-                                .traits
-                                .get(trait_id)
-                                .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-                                .unwrap_or_default();
-                            let substitution: SubstitutionContext = parameter_ids
-                                .into_iter()
-                                .zip(trait_arguments.clone())
-                                .collect();
-                            if !substitution.is_empty() {
-                                self.method_call_substitution.insert(id, substitution);
-                            }
+                        //
+                        // The parameters substituted are the DECLARING trait's,
+                        // which is the sub-trait itself unless a SUPERTRAIT
+                        // declares the member — and then they are the
+                        // supertrait's, at the arguments the chain passes it
+                        // (B164). Zipping the sub-trait's parameters over a
+                        // supertrait's signature substituted nothing, and the
+                        // leaked parameter unified with whatever the call site
+                        // claimed: `fun bad<S: Sig<u32>>(s: S): str { s.get() }`
+                        // compiled with `trait Sig<T> with Src<T>`.
+                        let substitution = self
+                            .trait_parameter_substitution(declaring_trait_id, &declaring_arguments);
+                        if !substitution.is_empty() {
+                            self.method_call_substitution.insert(id, substitution);
                         }
                         break;
                     }
@@ -29524,6 +29646,96 @@ impl<'src> Analyzer<'src> {
             .join(", ")
     }
 
+    /// Unify the body types of a multi-armed value expression, and refuse a
+    /// pair that will not unify. ONE rule for two constructs (B163): a
+    /// `match`'s legs and a value `if`'s arms both come through here, so
+    /// "the arms must agree on one type" is stated once and cannot drift
+    /// between them.
+    ///
+    /// Each body is inferred against the whole expression's OWN expectation
+    /// (a declared return type, an annotated `let`), so a return-position
+    /// generic call in any arm binds from it rather than from whatever the
+    /// first arm happened to settle on. A body that definitely LEAVES
+    /// contributes `Type::Never`, the merge's identity — its tail is the
+    /// synthesized void control never reaches, and unifying on that void made
+    /// an all-`ret` construct `void` and reported a `ret` arm beside a value
+    /// arm (B124). A mismatch is anchored at the OFFENDING body, not at the
+    /// whole construct (E7), and the merge carries on with the type it
+    /// already had, so one bad arm does not cascade into the rest.
+    ///
+    /// `None` means a body's type is not known yet and the caller must defer.
+    /// `construct` names the arms in the message ("match legs", "`if` arms").
+    fn unify_arm_bodies(
+        &mut self,
+        expression_id: Id,
+        bodies: &[(Vec<Id>, Id)],
+        fallback_span: Span,
+        construct: &str,
+    ) -> Option<Type> {
+        let expected = self.expected_types.get(&expression_id).copied();
+        let mut unified: Option<Type> = None;
+        for (statements, body_id) in bodies {
+            let arm_constraint = expected
+                .map(|type_id| type_id.get_type(self))
+                .unwrap_or(Type::Unknown);
+            let body_type = if self.block_diverges(statements, *body_id) {
+                Type::Never
+            } else {
+                let inferred = self.infer_type(*body_id, &arm_constraint, &HashMap::default());
+                if matches!(inferred, Type::Unresolved) {
+                    return None;
+                }
+                inferred
+            };
+            unified = Some(match unified {
+                None => body_type,
+                Some(current) => {
+                    match self.reconcile_type(&current, &body_type, &HashMap::default()) {
+                        Some((unified_type, _)) => unified_type,
+                        None => {
+                            let expected = self.pretty_print_type(&current, &HashMap::default());
+                            let got = self.pretty_print_type(&body_type, &HashMap::default());
+                            let arm_span = self
+                                .span_map
+                                .get(body_id)
+                                .map(|span| **span)
+                                .unwrap_or(fallback_span);
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: arm_span,
+                                msg: format!(
+                                    "{construct} have mismatched types: expected {expected}, but got {got} instead."
+                                ),
+                            });
+                            current
+                        }
+                    }
+                }
+            });
+        }
+        // No arms at all is `void`, the same value an armless construct has.
+        Some(unified.unwrap_or(Type::Void))
+    }
+
+    /// `if c { .. } else { .. }`: unify the arm bodies, by the rule `match`
+    /// legs go through (B163). Only the CHECK lives here — the `if`'s type is
+    /// `infer_type_path`'s, which folds the same merge without a voice to
+    /// report with. Defers while an arm is unresolved.
+    fn resolve_if_arms(&mut self, id: Id, span: Span) -> Resolution {
+        let Some(Expr::If(branch)) = self.expr_id_to_expr_map.get(&id).cloned() else {
+            // The walk queues this only for a value `if` it has just built, so
+            // a missing entry is a program the walk abandoned; nothing to check.
+            return Resolution::Resolved;
+        };
+        let mut bodies = Vec::new();
+        if_branch_bodies(&branch, &mut bodies);
+        match self.unify_arm_bodies(id, &bodies, span, "`if` arms") {
+            Some(_) => Resolution::Resolved,
+            None => Resolution::Deferred,
+        }
+    }
+
     /// `match subject { .. }`: once the subject type is known, resolve each leg's
     /// patterns (typing captures) and guard, check exhaustiveness, and type the
     /// match as the unification of its leg bodies. Defers while the subject, a
@@ -29721,62 +29933,18 @@ impl<'src> Analyzer<'src> {
             }
         }
 
-        // The match's type unifies the leg body types. When the match itself sits
-        // in an expected-type position (a function's return tail), that type is
-        // the expectation for every leg body too — so a return-position generic
-        // call inside a leg binds from it. Propagate it into each leg (so a nested
-        // match/leg inherits the expectation) and infer the legs against it.
-        let expected = self.expected_types.get(&prepped.id).copied();
-        let mut unified: Option<Type> = None;
-        for (_, _, body_id) in &resolved_legs {
-            let leg_constraint = expected
-                .map(|type_id| type_id.get_type(self))
-                .unwrap_or(Type::Unknown);
-            // A leg that definitely LEAVES contributes no value to the merge
-            // (B124), the same way an `if` branch that leaves does: its body's
-            // tail is the synthesized void control never reaches, so unifying
-            // on it made an all-`ret` match `void` — and made a `ret` leg
-            // beside a value leg report `match legs have mismatched types`.
-            // `Type::Never` yields in `reconcile_type`, so the live legs decide
-            // the match's type and an all-diverging match is `never`.
-            let body_type = if self.expr_diverges(*body_id) {
-                Type::Never
-            } else {
-                let inferred = self.infer_type(*body_id, &leg_constraint, &HashMap::default());
-                if matches!(inferred, Type::Unresolved) {
-                    return Resolution::Deferred;
-                }
-                inferred
-            };
-            unified = Some(match unified {
-                None => body_type,
-                Some(current) => {
-                    match self.reconcile_type(&current, &body_type, &HashMap::default()) {
-                        Some((unified_type, _)) => unified_type,
-                        None => {
-                            let expected = self.pretty_print_type(&current, &HashMap::default());
-                            let got = self.pretty_print_type(&body_type, &HashMap::default());
-                            // Anchor at the OFFENDING leg's body, not the whole
-                            // match (E7 — the pertinent expression).
-                            let leg_span = self
-                                .span_map
-                                .get(body_id)
-                                .map(|span| **span)
-                                .unwrap_or(prepped.span);
-                            self.diagnostics.push(Error { trace: Vec::new(), note: None,
-                            span: leg_span,
-                            msg: format!(
-                                "match legs have mismatched types: expected {}, but got {} instead.",
-                                expected, got
-                            ),
-                        });
-                            current
-                        }
-                    }
-                }
-            });
-        }
-        let match_type = unified.unwrap_or(Type::Void);
+        // The match's type unifies the leg body types — one leg body per arm,
+        // with no leading statements of its own (a leg body that IS a block
+        // carries them inside it, and `block_diverges` reads through).
+        let bodies: Vec<(Vec<Id>, Id)> = resolved_legs
+            .iter()
+            .map(|(_, _, body_id)| (Vec::new(), *body_id))
+            .collect();
+        let Some(match_type) =
+            self.unify_arm_bodies(prepped.id, &bodies, prepped.span, "match legs")
+        else {
+            return Resolution::Deferred;
+        };
         let match_type_id = match_type.get_type_id(self);
         self.resolved_types.insert(prepped.id, match_type_id);
         // Expand each or-pattern leg into one leg per alternative, all sharing the

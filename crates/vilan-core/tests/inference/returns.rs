@@ -4394,3 +4394,163 @@ fn expression_lift_bare_iterable_is_the_identity_error() {
         "`?` lifts nothing here",
     );
 }
+
+// --- B163: an `if`'s arms are unified, by the rule `match`'s legs go through ---
+// Before the fix the arms were never checked against each other: the `if` took
+// its type from the FIRST arm and the others' values flowed out unchecked, so
+// `let mixed = if c { 1 } else { "two" }` typed as `i32` and `mixed + 1`
+// printed `two1`. `match` legs were already unified; the two constructs now
+// share `unify_arm_bodies`, so the rule is stated once.
+
+// The item's own shape: an unannotated `let` over a two-armed `if`.
+#[test]
+fn if_arms_of_different_types_are_refused_in_a_let() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let c = false;
+        	let mixed = if c { 1 } else { "two" };
+        	print(mixed);
+        }
+        "#,
+        "`if` arms have mismatched types: expected i32, but got str instead.",
+    );
+}
+
+// The same mismatch through a declared return type: the `if` is the tail, and
+// the wrong-typed arm used to be returned as the declared type.
+#[test]
+fn if_arms_of_different_types_are_refused_in_a_function_tail() {
+    assert_fails_with(
+        r#"
+        fun pick(c: bool): i32 {
+        	if c { 1 } else { "two" }
+        }
+
+        fun main() {
+        	let _ = pick(false);
+        }
+        "#,
+        "`if` arms have mismatched types",
+    );
+}
+
+// An `else if` chain is one construct with three arms, not a nested pair: the
+// mismatch in the MIDDLE arm is caught, and so is one in the final `else`.
+#[test]
+fn a_nested_else_if_chain_unifies_every_arm() {
+    assert_fails_with(
+        r#"
+        fun pick(a: bool, b: bool): i32 {
+        	if a { 1 } else if b { "two" } else { 3 }
+        }
+
+        fun main() {
+        	let _ = pick(true, false);
+        }
+        "#,
+        "`if` arms have mismatched types: expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn a_nested_else_if_chain_catches_a_mismatch_in_its_final_else() {
+    assert_fails_with(
+        r#"
+        fun pick(a: bool, b: bool): i32 {
+        	if a { 1 } else if b { 2 } else { "three" }
+        }
+
+        fun main() {
+        	let _ = pick(true, false);
+        }
+        "#,
+        "`if` arms have mismatched types: expected i32, but got str instead.",
+    );
+}
+
+// The mismatch is anchored at the OFFENDING arm's tail, not at the whole `if`
+// (E7 — the pertinent expression), exactly as a match leg's is.
+#[test]
+fn if_arm_mismatch_spans_the_offending_arm() {
+    assert_fails_spanning(
+        r#"
+        fun pick(c: bool): i32 {
+        	if c { 1 } else { "oops" }
+        }
+
+        fun main() {
+        	let _ = pick(true);
+        }
+        "#,
+        "\"oops\"",
+        "`if` arms have mismatched types",
+    );
+}
+
+// The green side of the rule: arms that genuinely unify still compile and run.
+// A literal arm and a call arm agreeing on `i32`, and a nullable-shaped pair
+// agreeing through an annotation.
+#[test]
+fn if_arms_that_unify_still_compile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(value: i32): i32 { value * 2 }
+
+        fun main() {
+        	let c = false;
+        	let picked = if c { 1 } else { double(4) };
+        	print(picked);
+        	let word: str = if c { "yes" } else { "no" };
+        	print(word);
+        }
+        "#,
+        "8\nno\n",
+    );
+}
+
+// The B124 guard, re-pinned through the shared merge: an arm that LEAVES
+// contributes `Never`, not its synthesized void tail, so a `ret` arm beside a
+// value arm is not a mismatch.
+#[test]
+fn a_diverging_if_arm_does_not_report_a_mismatch() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun pick(c: bool): i32 {
+        	let value = if c { 1 } else { ret 0; };
+        	value + 1
+        }
+
+        fun main() {
+        	print(pick(true));
+        	print(pick(false));
+        }
+        "#,
+        "2\n0\n",
+    );
+}
+
+// The control the rule was copied from: the same program written with `match`
+// fails the same way, and has since before B163. One rule, two constructs —
+// the messages differ only in what they name.
+#[test]
+fn the_match_control_refuses_the_same_mismatch() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let c = false;
+        	let mixed = match c { true => 1, false => "two" };
+        	print(mixed);
+        }
+        "#,
+        "match legs have mismatched types: expected i32, but got str instead.",
+    );
+}
