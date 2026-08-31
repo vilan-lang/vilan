@@ -4186,7 +4186,6 @@ import std::io::print;
 fn a_bare_parameter_source_bound_resolves_inside_a_generic_body() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::compare::PartialEq;
         import std::reactive::{ Signal, Source };
 
@@ -4213,7 +4212,6 @@ fn a_bare_parameter_source_bound_resolves_inside_a_generic_body() {
 fn a_constructed_source_bound_resolves_inside_a_generic_body() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::compare::PartialEq;
         import std::reactive::{ Signal, Source };
 

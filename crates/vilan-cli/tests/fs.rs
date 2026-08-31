@@ -1671,8 +1671,7 @@ fn a_reader_reads_a_file_through_in_chunks_that_do_not_divide_it() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
-import std::bytes::decode_utf8;
+        r#"import std::bytes::decode_utf8;
 import std::fs::{ File, Reader };
 import std::drop::drop;
 
@@ -1719,8 +1718,7 @@ fn a_reader_handles_a_file_shorter_than_one_chunk_and_an_empty_one() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
-import std::bytes::decode_utf8;
+        r#"import std::bytes::decode_utf8;
 import std::fs::{ File, Reader };
 import std::drop::drop;
 
@@ -1766,8 +1764,7 @@ fn a_positional_read_through_a_readers_file_leaves_the_cursor_alone() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
-import std::bytes::{ Bytes, decode_utf8 };
+        r#"import std::bytes::{ Bytes, decode_utf8 };
 import std::fs::{ File, Reader };
 import std::drop::drop;
 
@@ -1816,8 +1813,7 @@ fn the_writing_scoped_forms_each_open_in_their_own_mode() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
-import std::bytes::encode_utf8;
+        r#"import std::bytes::encode_utf8;
 import std::fs::{ read_file_to_str, with_file, with_file_append, with_file_create, with_file_modify };
 
 fun main() {
@@ -1865,8 +1861,7 @@ fn with_file_create_new_refuses_an_occupied_path_and_leaves_it_alone() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
-import std::bytes::encode_utf8;
+        r#"import std::bytes::encode_utf8;
 import std::fs::with_file_create_new;
 
 fun main() {
@@ -1908,8 +1903,7 @@ fn a_throwing_body_fails_the_scoped_call_and_the_write_before_it_still_landed() 
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
-import std::bytes::encode_utf8;
+        r#"import std::bytes::encode_utf8;
 import std::fs::{ File, with_file_create };
 
 fun main() {
@@ -1971,8 +1965,7 @@ fn a_writing_scoped_form_returns_with_its_descriptor_already_closed() {
     write(
         &dir,
         "probe.vl",
-        r#"import std::print;
-import std::bytes::encode_utf8;
+        r#"import std::bytes::encode_utf8;
 import std::fs::{ File, Reader, read_dir, with_file_append, with_file_create };
 import std::drop::drop;
 import std::range::Range;

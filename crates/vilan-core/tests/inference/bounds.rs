@@ -5695,7 +5695,6 @@ fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
 fn b158_the_maybe_signal_probe_dispatches_through_a_blanket_and_a_signal_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::reactive::Signal;
 
         trait MaybeSignal<T> {
@@ -5745,7 +5744,6 @@ fn b158_the_maybe_signal_probe_dispatches_through_a_blanket_and_a_signal_impl() 
 fn b158_a_blanket_alone_answers_a_bounded_call_for_every_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         trait Show2 { fun show2(self): str; }
 
@@ -5771,7 +5769,6 @@ fn b158_a_blanket_alone_answers_a_bounded_call_for_every_type() {
 fn b158_a_constructor_headed_impl_outranks_a_blanket_through_a_bound() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         trait Show2 { fun show2(self): str; }
         struct Bag {}
@@ -5804,7 +5801,6 @@ fn b158_a_constructor_headed_impl_outranks_a_blanket_through_a_bound() {
 fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matches() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::reactive::Signal;
 
         trait MaybeSignal<T> {
@@ -5847,7 +5843,6 @@ fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matc
 fn b158_a_stronger_binder_bound_outranks_through_a_bound() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         trait Marker { fun marker(self): str; }
         trait Show2 { fun show2(self): str; }
@@ -5890,7 +5885,6 @@ fn b158_an_inheriting_impl_outranks_a_declaring_blanket_through_a_bound() {
         };
         format!(
             r#"
-            import std::print;
 
             trait Tag {{ fun tag(self): i32 {{ 9 }} }}
             struct Foo {{ n: i32 }}
@@ -5914,7 +5908,6 @@ fn b158_an_inheriting_impl_outranks_a_declaring_blanket_through_a_bound() {
 fn b158_const_evaluation_selects_the_same_impl_a_runtime_call_does() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         trait Label { fun label(self): str; }
         struct Tagged { n: i32 }
@@ -5944,7 +5937,6 @@ fn b158_const_evaluation_selects_the_same_impl_a_runtime_call_does() {
 fn b158_a_second_blanket_of_one_trait_is_refused_at_its_declaration() {
     assert_fails_with(
         r#"
-        import std::print;
 
         trait Show2 { fun show2(self): str; }
 
@@ -5966,7 +5958,6 @@ fn b158_a_second_blanket_of_one_trait_is_refused_at_its_declaration() {
 #[test]
 fn b158_unrankable_overlapping_impls_are_refused_at_the_bound_that_reaches_them() {
     let source = r#"
-        import std::print;
 
         trait Alpha { fun alpha(self): str; }
         trait Beta { fun beta(self): str; }
@@ -5998,7 +5989,6 @@ fn b158_unrankable_overlapping_impls_are_refused_at_the_bound_that_reaches_them(
 fn b158_two_bounded_blankets_still_answer_where_only_one_applies() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         trait Alpha { fun alpha(self): str; }
         trait Beta { fun beta(self): str; }
@@ -6202,7 +6192,6 @@ fn a_sub_traits_own_member_substitutes_as_it_always_did() {
 fn a_supertrait_member_under_a_sub_bound_resolves_and_runs() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::display::Display;
 
         trait Base<T> { fun get(self): T; }
@@ -6293,7 +6282,6 @@ fn a_user_source_drives_the_process_twin_and_renders() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::print;
         import std::reactive::{{ Signal, Source, Subscription }};
         import std::ui::{{ View, render, view }};
         {A_USER_SOURCE}

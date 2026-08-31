@@ -3285,10 +3285,7 @@ fn the_removed_std_print_alias_names_the_prelude_and_the_real_path() {
     // removal nor either way forward; this arm names both.
     let errors = analyze_under_prelude(
         base_prelude(),
-        &[(
-            "main.vl",
-            "import std::print;\nfun main() { print(\"x\"); }\n",
-        )],
+        &[("main.vl", "fun main() { print(\"x\"); }\n")],
         "main.vl",
         Platform::default(),
     );

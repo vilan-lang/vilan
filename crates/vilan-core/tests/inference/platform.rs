@@ -3847,35 +3847,37 @@ fn an_unknown_trait_steers_to_its_std_import() {
 
 #[test]
 fn a_variant_pattern_steers_to_its_std_import() {
-    // The reported shape: the `Option` is minted by a `List` method, so
-    // `Some` appears ONLY in the pattern — nothing in the program takes the
-    // value-position path that used to be the steer's only door.
+    // The reported shape: a variant name appearing ONLY in the pattern —
+    // nothing in the program takes the value-position path that used to be
+    // the steer's only door. (The original exhibit used `Some`, which the
+    // prelude has since made ambient — `Ordering::Less` keeps the shape with
+    // a name still outside the prelude.)
     assert_fails_with(
         r#"
         fun main() {
-            let numbers = [1, 2, 3];
-            let picked = match numbers.get(1) {
-                Some(value) => value,
-                None => 0,
+            let picked = match 1 {
+                Ordering::Less => 1,
+                _ => 0,
             };
         }
         "#,
-        "cannot find 'Some' in this scope; import it first (`import std::option::Some;`)",
+        "cannot find 'Ordering::Less' in this scope; import it first (`import std::compare::Ordering;`)",
     );
 }
 
 #[test]
 fn the_value_position_some_still_steers() {
-    // The green control on the sibling path: the bare `Some` steered before
-    // E103 and must go on steering after it — the fix joins a second door to
-    // the steer, it does not move the first one.
+    // The green control on the sibling path: a bare value-position name
+    // steered before E103 and must go on steering after it — the fix joins a
+    // second door to the steer, it does not move the first one. (`Some` left
+    // this pin when the prelude made it ambient; `Ordering` keeps the claim.)
     assert_fails_with(
         r#"
         fun main() {
-            let value = Some(1);
+            let order = Ordering::Less;
         }
         "#,
-        "cannot find 'Some' in this scope; import it first (`import std::option::Some;`)",
+        "cannot find type 'Ordering'; import it first (`import std::compare::Ordering;`)",
     );
 }
 
@@ -4627,7 +4629,6 @@ fn the_to_string_steer_the_refusal_names_compiles_and_renders() {
     // spellings of the concatenation.
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::display::Display;
 
         struct Point { x: i32, y: i32 }
@@ -4654,7 +4655,6 @@ fn a_string_concatenation_still_admits_the_renderable_primitives() {
     // std's own `impl i32 with Display` is `i"{self}"`, which is `"" + self`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::display::Display;
 
         fun main() {
@@ -4676,7 +4676,6 @@ fn the_numeric_additions_still_compile_and_run() {
     // `T + T`, and an unsuffixed literal still adapts to its peer.
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         fun main() {
             let counted: u32 = 5;
@@ -4765,7 +4764,6 @@ fn a_user_add_impl_still_dispatches_with_its_own_right_operand() {
     // operand, and it need not be `Self`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
         import std::operators::Add;
 
         struct Metres { value: i32 }

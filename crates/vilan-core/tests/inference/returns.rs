@@ -4407,7 +4407,6 @@ fn expression_lift_bare_iterable_is_the_identity_error() {
 fn if_arms_of_different_types_are_refused_in_a_let() {
     assert_fails_with(
         r#"
-        import std::print;
 
         fun main() {
         	let c = false;
@@ -4497,7 +4496,6 @@ fn if_arm_mismatch_spans_the_offending_arm() {
 fn if_arms_that_unify_still_compile() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         fun double(value: i32): i32 { value * 2 }
 
@@ -4520,7 +4518,6 @@ fn if_arms_that_unify_still_compile() {
 fn a_diverging_if_arm_does_not_report_a_mismatch() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
 
         fun pick(c: bool): i32 {
         	let value = if c { 1 } else { ret 0; };
@@ -4543,7 +4540,6 @@ fn a_diverging_if_arm_does_not_report_a_mismatch() {
 fn the_match_control_refuses_the_same_mismatch() {
     assert_fails_with(
         r#"
-        import std::print;
 
         fun main() {
         	let c = false;

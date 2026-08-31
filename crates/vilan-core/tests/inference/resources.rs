@@ -5644,7 +5644,6 @@ fn a_readers_file_is_loanable_but_cannot_be_moved_out_of_it() {
     // `Reader` is refused — the door is one-way.
     assert_compiles(
         r#"
-        import std::print;
         import std::bytes::Bytes;
         import std::fs::{ File, Reader };
         fun main() {
@@ -5714,7 +5713,6 @@ fn every_writing_scoped_form_awaits_its_close() {
     ] {
         let js = compile(&format!(
             r#"
-            import std::print;
             import std::fs::{form};
             fun main() {{
                 let size = {form}("data.txt", |file| file.stat().size);
