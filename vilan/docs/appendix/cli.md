@@ -346,6 +346,16 @@ Attribute order in the output is not stylistic: the parser reads
 `[extern(…)]` before `[platform(…)]`, and the other way round is a parse
 error. Keep the pair in that order if you edit a generated file.
 
+One thing a `.d.ts` cannot tell bindgen is whether the host *keeps* an
+argument past the call — a listener it registers, a callback it queues, a
+value it stashes. It generates no `retains` flag, so add the trailing
+`retains` to `[extern(…)]` yourself on any binding that hands the host
+something it holds on to (`[extern(method, "on", retains)]` for the
+`Marker.on` below): without it the compiler is free to destroy the
+argument's binding at its last use while the host is still reading it. See
+[Externs and retention](../spec/memory.md#externs-and-retention) for what
+the flag promises.
+
 ### What you get
 
 ```ts

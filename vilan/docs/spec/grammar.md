@@ -72,10 +72,19 @@ parameter  = [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
 binder     = IDENT | "(" binder "," binder { "," binder } [ "," ] ")" ;
 
-extern-attr = "[" "extern" "(" extern-args ")" "]" ;
+extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] ")" "]" ;
 extern-args = STRING [ "," STRING ]           (* module/global binding *)
             | ("method"|"get"|"set") [ "," STRING ] ;
 ```
+
+`retains` is a **flag**, not a binding form: it is recognized in trailing
+position only — the one place it cannot displace a form word — and so
+composes with every shape above rather than needing an arm per
+combination. It declares that the host keeps an argument past the call;
+§6.8's [Externs and retention](memory.md#externs-and-retention) gives the
+semantics. Elsewhere in the argument list it is an unknown argument, and
+the attribute lowers to the empty global symbol as any other malformed
+extern attribute does.
 
 A `;` body is a signature-only declaration: legal for `external`
 functions and required trait methods. A parameter's **convention** may

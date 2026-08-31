@@ -1,15 +1,24 @@
-//! The weekly ignored-pins leg (backlog N27), held to the decisions that make
-//! it worth having.
+//! The ignored set, gated from two sides.
 //!
-//! Nothing else in the tree runs `.github/workflows/ignored-pins.yml` — it
-//! fires on a cron, once a week, and a leg that has quietly stopped excluding
-//! the 247-second pin, stopped being non-blocking, or started using nextest's
-//! deprecated flag spelling would first be noticed by whoever waits on it. So
-//! these pins read the workflow and hold the four decisions in it, plus the one
-//! fact outside it the leg depends on: that the test it filters by name is
-//! still a test.
+//! **The weekly leg** (backlog N27), held to the decisions that make it worth
+//! having. Nothing else in the tree runs `.github/workflows/ignored-pins.yml` —
+//! it fires on a cron, once a week, and a leg that has quietly stopped
+//! excluding the 247-second pin, stopped being non-blocking, or started using
+//! nextest's deprecated flag spelling would first be noticed by whoever waits
+//! on it. So these pins read the workflow and hold the four decisions in it,
+//! plus the one fact outside it the leg depends on: that the test it filters by
+//! name is still a test.
+//!
+//! **The reasons themselves** (backlog N31). Two house rules meet at an
+//! `#[ignore]`: a known-but-unfixed bug is pinned `#[ignore]`d, and an open
+//! defect is not tracked unless it has an item. Nothing enforced the join, and
+//! audit runs 2, 3 and 4 each found an ignored pin whose defect lived nowhere
+//! but its reason string — a bug the tracker had never heard of, discoverable
+//! only by reading test attributes. So every reason must name a tracker item,
+//! or be one of the few ignores that are deliberately not bugs.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -127,5 +136,282 @@ fn the_required_check_does_not_wait_on_the_advisory_leg() {
     assert!(
         !ci.contains("ignored-pins"),
         "the advisory leg lives in its own workflow so `ci / check` cannot wait on it"
+    );
+}
+
+// ── N31: every `#[ignore]` reason names a tracker item ────────────────────────
+
+/// The ignores that are deliberately NOT bugs, and so have no item to name.
+/// Listed by their exact reason string rather than matched by a pattern: a
+/// pattern is how "run deliberately" quietly becomes an escape hatch anyone can
+/// spell their way into, and the whole point of this gate is that adding a
+/// member is a decision somebody makes on purpose, in a diff.
+///
+/// The first three are cost and tooling, not defects — nothing is broken, and
+/// running them in the ordinary suite would buy a wrong answer (a timing
+/// measurement under suite load) or none at all (a build tool that is not
+/// installed).
+const DELIBERATE_NON_BUG_IGNORES: &[&str] = &[
+    // The perf baseline, in both places it is measured (the CLI's corpus timing
+    // and the LSP's edit latency): minutes of measurement whose number means
+    // nothing on a machine running forty other test binaries.
+    "the performance baseline: minutes of measurement, run deliberately \
+     (proposal/perf-baseline.md §3)",
+    // The leak soak: thousands of analyses per corpus, same reason.
+    "the leak soak: thousands of analyses per corpus, run deliberately \
+     (proposal/leak-soak.md §5)",
+    // A tool gate: the book-heading differential needs a pinned `mdbook` on
+    // PATH, which CI has and a contributor's machine may not.
+    "needs the pinned `mdbook` v0.5.4 on PATH: builds the book and compares \
+     every heading id to mdbook_heading_ids",
+    // TODO(orchestrator): this one is NOT a deliberate non-bug — it is a known
+    // gap (an async call's type does not assimilate its awaited result) with no
+    // tracker item, found by N31's own sweep. It is allowlisted so the gate can
+    // land without inventing an item for it; file the item and replace this
+    // entry with the id in the reason string.
+    "async-fun return assimilation needs the async fixpoint at typing time",
+];
+
+/// Whether `reason` carries something shaped like a tracker item id — one or
+/// more capitals followed immediately by digits (`B154`, `E102`, `N31`). The
+/// shape, not a roster: this gate lives in the compiler repo and the tracker
+/// lives in another, so it can insist that a reason POINT somewhere without
+/// pretending to know what exists there.
+fn names_a_tracker_item(reason: &str) -> bool {
+    let characters: Vec<char> = reason.chars().collect();
+    let mut index = 0;
+    while index < characters.len() {
+        if !characters[index].is_ascii_uppercase() {
+            index += 1;
+            continue;
+        }
+        let mut after_capitals = index;
+        while after_capitals < characters.len() && characters[after_capitals].is_ascii_uppercase() {
+            after_capitals += 1;
+        }
+        if characters
+            .get(after_capitals)
+            .is_some_and(char::is_ascii_digit)
+        {
+            return true;
+        }
+        index = after_capitals;
+    }
+    false
+}
+
+/// Every tracked `.rs` file, as `(repo-relative name, contents)`. `git
+/// ls-files` is the enumerator on purpose: it is exactly the committed tree, so
+/// the sweep can never wander into `target/` or into a sibling worktree under
+/// `.claude/` (both ignored) and mistake somebody else's branch for this one.
+fn tracked_rust_sources() -> Vec<(String, String)> {
+    let repository_root = repository_root();
+    let listing = Command::new("git")
+        .args(["ls-files", "-z", "*.rs"])
+        .current_dir(&repository_root)
+        .output()
+        .expect("git ls-files");
+    assert!(listing.status.success(), "git ls-files failed");
+    String::from_utf8_lossy(&listing.stdout)
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| {
+            let text = std::fs::read_to_string(repository_root.join(name)).ok()?;
+            Some((name.to_string(), text))
+        })
+        .collect()
+}
+
+/// Every `#[ignore]` attribute in `text`, as `(1-based line, reason)` — `None`
+/// when the attribute carries no reason at all.
+///
+/// An attribute is recognized only where one is written: at the start of a
+/// line, whitespace aside. That is what keeps the sweep off the many `#[ignore]`
+/// mentions in this tree's prose — doc comments explaining the house rule,
+/// including the ones in this very file — without needing to parse Rust.
+fn ignore_attributes(text: &str) -> Vec<(usize, Option<String>)> {
+    const ATTRIBUTE: &str = "#[ignore";
+    let bytes = text.as_bytes();
+    let mut attributes = Vec::new();
+    let mut line = 1;
+    let mut still_leading_whitespace = true;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            line += 1;
+            still_leading_whitespace = true;
+            index += 1;
+            continue;
+        }
+        if !bytes[index].is_ascii_whitespace() {
+            if still_leading_whitespace && text[index..].starts_with(ATTRIBUTE) {
+                let (reason, after) = read_attribute(text, index + ATTRIBUTE.len());
+                attributes.push((line, reason));
+                line += text[index..after].matches('\n').count();
+                index = after;
+                // Resume AT the character after the bracket, never past it: a
+                // newline swallowed here loses a line for everything below.
+                still_leading_whitespace = false;
+                continue;
+            }
+            still_leading_whitespace = false;
+        }
+        index += 1;
+    }
+    attributes
+}
+
+/// Reads one attribute from just past `#[ignore` to its closing `]`, returning
+/// the string literal inside it (decoded) and the offset after the bracket. The
+/// scan understands string literals because a reason may span lines with `\`
+/// continuations and may contain a bracket.
+fn read_attribute(text: &str, from: usize) -> (Option<String>, usize) {
+    let bytes = text.as_bytes();
+    let mut reason = None;
+    let mut index = from;
+    while index < bytes.len() {
+        match bytes[index] {
+            b']' => return (reason, index + 1),
+            b'"' => {
+                let (literal, after) = read_string_literal(text, index);
+                reason = Some(literal);
+                index = after;
+            }
+            _ => index += 1,
+        }
+    }
+    (reason, bytes.len())
+}
+
+/// The contents of the Rust string literal starting at the quote at `from`,
+/// with its escapes resolved, and the offset just past its closing quote. A
+/// backslash before a newline swallows the break and the next line's
+/// indentation, exactly as rustc does — which is what lets a long reason be
+/// written across lines and still compare equal to a one-line allowlist entry.
+fn read_string_literal(text: &str, from: usize) -> (String, usize) {
+    let bytes = text.as_bytes();
+    let mut literal = String::new();
+    let mut index = from + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return (literal, index + 1),
+            b'\\' => {
+                index += 1;
+                match bytes.get(index) {
+                    Some(b'n') => literal.push('\n'),
+                    Some(b't') => literal.push('\t'),
+                    Some(b'\n') => {
+                        index += 1;
+                        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    Some(_) => {
+                        let rest = &text[index..];
+                        let character = rest.chars().next().expect("a character follows `\\`");
+                        literal.push(character);
+                        index += character.len_utf8();
+                        continue;
+                    }
+                    None => return (literal, bytes.len()),
+                }
+                index += 1;
+            }
+            _ => {
+                let rest = &text[index..];
+                let character = rest.chars().next().expect("a character at a boundary");
+                literal.push(character);
+                index += character.len_utf8();
+            }
+        }
+    }
+    (literal, bytes.len())
+}
+
+// The gate itself. A pin that says only what is wrong, and not WHERE that is
+// written down, is how a defect ends up living in a test attribute — which is
+// the shape three consecutive audit runs found and the reason this exists.
+#[test]
+fn every_ignored_pin_names_a_tracker_item_or_is_a_declared_non_bug() {
+    let mut offenders = Vec::new();
+    for (name, text) in tracked_rust_sources() {
+        for (line, reason) in ignore_attributes(&text) {
+            let Some(reason) = reason else {
+                offenders.push(format!("{name}:{line}: `#[ignore]` with no reason at all"));
+                continue;
+            };
+            if names_a_tracker_item(&reason) {
+                continue;
+            }
+            if DELIBERATE_NON_BUG_IGNORES.contains(&reason.as_str()) {
+                continue;
+            }
+            offenders.push(format!("{name}:{line}: {reason:?}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "an `#[ignore]` reason must name its tracker item (`B154`, `E102`, …) so the \
+         defect lives somewhere other than this attribute — or, for an ignore that is \
+         deliberately not a bug, be added to `DELIBERATE_NON_BUG_IGNORES` here, on \
+         purpose. Offending:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+// The sweep is only worth what its predicate is worth, and a predicate that
+// answered `true` to everything would make the gate above green forever.
+#[test]
+fn the_item_id_shape_accepts_an_id_and_refuses_prose() {
+    for reason in [
+        "B154 — the internal `NativeMap::insert` frees the caller's value",
+        "E102 residue",
+        "waiting on N31",
+        "C11's predicate, narrowed",
+    ] {
+        assert!(
+            names_a_tracker_item(reason),
+            "should name an item: {reason}"
+        );
+    }
+    for reason in [
+        "needs the pinned mdbook on PATH",
+        "run deliberately: minutes of measurement",
+        "OPEN, not yet filed",
+        "b154 in lower case is not an id",
+        "",
+    ] {
+        assert!(
+            !names_a_tracker_item(reason),
+            "should NOT count as naming an item: {reason}"
+        );
+    }
+}
+
+// And the scanner: it must find the attribute where one is written, across the
+// line break a long reason takes, and must NOT find the ones this tree's prose
+// talks about — a false positive there would redden the gate over a comment.
+#[test]
+fn the_sweep_reads_attributes_and_not_prose_about_them() {
+    let source = "\
+/// A known-but-unfixed bug is pinned `#[ignore]`d and un-ignored when fixed.
+#[test]
+#[ignore = \"B1: a reason \\
+            written across lines\"]
+fn pinned() {}
+
+#[test]
+#[ignore]
+fn bare() {}
+";
+    let found = ignore_attributes(source);
+    assert_eq!(
+        found,
+        vec![
+            (3, Some("B1: a reason written across lines".to_string())),
+            (8, None),
+        ],
+        "the doc comment's `#[ignore]` is prose, not an attribute"
     );
 }

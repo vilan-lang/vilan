@@ -4181,7 +4181,7 @@ fn option_replace_rejects_a_read_of_the_value_it_was_handed() {
 }
 
 #[test]
-#[ignore = "OPEN: R10's rejecting heads omit the internal `NativeMap`"]
+#[ignore = "B154 OPEN: R10's rejecting heads omit the internal `NativeMap`"]
 fn r10_refuses_a_native_map_of_a_resource() {
     // The one sibling the sweep found still broken, filed rather than fixed
     // here. `NativeMap::insert` stores a bare `value: V` exactly as `replace`
