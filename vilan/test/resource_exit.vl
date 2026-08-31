@@ -1,9 +1,14 @@
 // A value-returning `main` that owns a resource must run its `drop` BEFORE it
 // exits (destruction.md §5/§7): `process.exit` does NOT run pending `finally`
-// blocks, so the compiler captures the exit code inside the drop scope, lets the
-// finally (teardown) run, and only then calls `process.exit`. The `teardown`
-// print therefore lands after `body` and before the process ends. Host-free, so
-// the interpreter equivalence gate checks it against `node`.
+// blocks. Under last-use disposal (lifetimes.md S3) this program's guard is
+// never read, so its teardown runs AT THE DECLARATION — `teardown` prints
+// before `body`, with no `finally` in the emitted bytes at all — and the
+// exit-code capture is still resource-driven (a no-resource `main(): i32`
+// emits a bare `process.exit`). What this golden no longer holds is the
+// pending-`finally`-at-exit ordering itself; that shape needs a guard held
+// live to the exit by an opacity fallback, recorded as a pin gap at the
+// order-21 close. Host-free, so the interpreter equivalence gate checks it
+// against `node`.
 import std::print;
 import std::drop::Drop;
 

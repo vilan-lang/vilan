@@ -1660,10 +1660,12 @@ impl<'a> Interpreter<'a> {
             // const function looping over paths without capping any one file.
             //
             // ONE ARM for both spellings, for the reason the emit pair shares
-            // one: `bundle(path)` IS `bundle_as(path, "/" + path)`, and this
-            // is where that identity is spelled — one fence call, one
-            // registration, one place a target can be decided. A second arm
-            // would be a second implementation of the same rule.
+            // one: for any path free of `.` segments, `bundle(path)` IS
+            // `bundle_as(path, "/" + path)` — `bundle` skips a `./` in the
+            // source spelling when minting the name, where the target grammar
+            // refuses one — and this is where the shared rule is spelled: one
+            // fence call, one registration, one place a target can be decided.
+            // A second arm would be a second implementation of the same rule.
             "__bundle_asset" | "__bundle_asset_as" => {
                 let spelling = if name == "__bundle_asset_as" {
                     "asset::bundle_as"

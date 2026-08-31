@@ -7026,7 +7026,7 @@ fn reading_the_value_out_before_the_closure_is_the_fix_the_message_names() {
 }
 
 #[test]
-#[ignore = "P4c residue: the escape rule does not follow a closure through an ordinary call (spec §6.9's honesty limit). Not C12's hole — the capture here is a view PARAMETER — and closing it needs the closure-escape analysis rule 4's dynamic remainder is future work for."]
+#[ignore = "C13: the escape rule does not follow a closure through an ordinary call (spec §6.9's honesty limit). Not C12's hole — the capture here is a view PARAMETER — and closing it needs the closure-escape analysis rule 4's dynamic remainder is future work for."]
 fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
     // Measured on this tree: prints 3. `make` captures its `&mut` parameter,
     // hands the closure to an ordinary function, and `keep` stores it in a
