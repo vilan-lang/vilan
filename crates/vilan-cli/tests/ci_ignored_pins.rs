@@ -164,12 +164,6 @@ const DELIBERATE_NON_BUG_IGNORES: &[&str] = &[
     // PATH, which CI has and a contributor's machine may not.
     "needs the pinned `mdbook` v0.5.4 on PATH: builds the book and compares \
      every heading id to mdbook_heading_ids",
-    // TODO(orchestrator): this one is NOT a deliberate non-bug — it is a known
-    // gap (an async call's type does not assimilate its awaited result) with no
-    // tracker item, found by N31's own sweep. It is allowlisted so the gate can
-    // land without inventing an item for it; file the item and replace this
-    // entry with the id in the reason string.
-    "async-fun return assimilation needs the async fixpoint at typing time",
 ];
 
 /// Whether `reason` carries something shaped like a tracker item id — one or

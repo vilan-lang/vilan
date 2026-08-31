@@ -2882,7 +2882,7 @@ fn an_async_function_returning_a_task_is_assimilated_at_runtime_only() {
 /// The residual's desired end state — `#[ignore]`d until the seam above closes.
 /// Un-ignore when an async call's type assimilates its awaited result.
 #[test]
-#[ignore = "async-fun return assimilation needs the async fixpoint at typing time"]
+#[ignore = "B149: async-fun return assimilation needs the async fixpoint at typing time"]
 fn an_async_function_returning_a_task_should_type_as_the_value() {
     assert_compiles(
         r#"
