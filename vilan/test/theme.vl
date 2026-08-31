@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::style::{ Color, Length, Style, declarations, declare, space, style };
 
 // The theme system a real app hand-rolled through `asset::emit`, expressed

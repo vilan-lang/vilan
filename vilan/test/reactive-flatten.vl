@@ -2,7 +2,7 @@
 // the outer currently holds. A DYNAMIC dependency: switching the outer
 // detaches the replaced inner (its later sets must not leak through) and
 // follows the new inner from its current value.
-import std::print;
+import std::io::print;
 import std::reactive::Signal;
 
 fun main() {

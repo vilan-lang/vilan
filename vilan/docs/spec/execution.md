@@ -137,7 +137,6 @@ type arises — including a generic `T` that instantiates at a task — so
 `Task<..>` is idempotent: `Task<Task<T>>` is not a type any expression has.
 
 ```vilan
-import std::print;
 import std::task::Task;
 
 fun wrap<T>(value: T): Task<T> {
@@ -166,7 +165,6 @@ that is never observed is reported to the host console with its spawn
 origin; it does not terminate the program.
 
 ```vilan
-import std::print;
 import std::time::{ sleep_for, Duration };
 
 fun step(label: str): str {

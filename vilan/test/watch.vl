@@ -1,6 +1,6 @@
 import std::drop::drop;
 import std::fs::{ Change, ChangeKind, Watcher };
-import std::print;
+import std::io::print;
 
 // The watch tier (kolt.local 020): the pull-shaped `next`, the three-variant
 // `ChangeKind` matched with no catch-all, and both spellings of teardown — an

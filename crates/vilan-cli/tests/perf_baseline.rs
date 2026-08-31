@@ -378,12 +378,13 @@ fn phase_rows(
     ]
 }
 
-/// The tiny subject: `std::print` and nothing else. Not representative of
+/// The tiny subject: `std::io::print` and nothing else. Not representative of
 /// anything a user compiles — it is the *unit*, the same role
 /// `support::reference_compile`'s project plays for the suite's liveness
 /// bounds, and it is here so every other number can be read as a multiple of
 /// the smallest compile the toolchain can do.
-const TINY_SOURCE: &str = "import std::print;\n\nfun main() {\n\tprint(\"perf baseline\");\n}\n";
+const TINY_SOURCE: &str =
+    "import std::io::print;\n\nfun main() {\n\tprint(\"perf baseline\");\n}\n";
 
 /// The wide subject: one entry that imports broadly across `std`, which is how
 /// a 57-file, 15k-line standard library becomes a *cold whole-world compile*
@@ -404,7 +405,7 @@ import std::list::List;
 import std::map::Map;
 import std::math;
 import std::option::Option::{ None, Some, self };
-import std::print;
+import std::io::print;
 import std::process::env;
 import std::random;
 import std::reactive::{ Owner, Signal, run_with_owner };
@@ -466,7 +467,7 @@ fn check_once(directory: &Path) -> (Duration, bool) {
     }
 }
 
-/// Writes the reference project — `std::print` and nothing else, the same
+/// Writes the reference project — `std::io::print` and nothing else, the same
 /// program `support::reference_compile` builds — into a fresh temporary
 /// directory. The unit every end-to-end row is also reported in.
 fn write_reference_project() -> Option<PathBuf> {
@@ -730,7 +731,7 @@ fn run(scale: Scale) -> Vec<Row> {
 /// however clever it gets.
 fn style_heavy_source(sites: usize) -> String {
     let mut source = String::from(
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::style::{ Color, Display, Length, space, style };\n\n",
     );
     for site in 0..sites {

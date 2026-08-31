@@ -357,7 +357,6 @@ shell. The [server-side rendering guide](ssr.md) walks the whole loop.
 ```vilan
 import std::ui::{ view, View, render };
 import std::reactive::Signal;
-import std::print;
 
 fun greeting(name: Signal<str>): View {
 	view("p").class("greeting").bind_text(name)

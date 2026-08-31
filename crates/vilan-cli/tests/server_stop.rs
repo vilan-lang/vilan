@@ -221,7 +221,7 @@ fn on_stop_fires_once_the_listener_has_actually_closed() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::shared::Shared;
 import std::option::Option::{ self, Some, None };
 import std::http::{ Response, Server };
@@ -297,7 +297,7 @@ fn on_stop_never_fires_when_the_server_is_never_stopped() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::http::{ Response, Server };
 import std::process::exit;
 

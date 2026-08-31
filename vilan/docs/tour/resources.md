@@ -12,7 +12,6 @@ deterministically when their owner's scope ends.
 You mark one with `resource` and, if it needs cleanup, give it a `Drop`:
 
 ```vilan
-import std::print;
 import std::drop::Drop;
 
 resource struct Guard {
@@ -60,7 +59,6 @@ and keep it. Lend a **loan** (a view, `&` or `&mut`), as with ordinary
 values:
 
 ```vilan
-import std::print;
 import std::drop::Drop;
 
 resource struct Guard { label: str }
@@ -127,7 +125,6 @@ consumes what you matched, so the capture becomes the payload's owner —
 and it drops at the end of the arm that bound it:
 
 ```vilan
-import std::print;
 import std::drop::Drop;
 import std::option::Option::{ self, Some, None };
 
@@ -160,7 +157,6 @@ Sometimes you want a resource gone *before* its scope ends. Move it into
 `drop`:
 
 ```vilan
-import std::print;
 import std::drop::{ Drop, drop };
 
 resource struct Guard { label: str }
@@ -188,7 +184,6 @@ one. `take()` moves the resource out and leaves `None` behind, which is
 what "tear it down only if it's there" needs:
 
 ```vilan
-import std::print;
 import std::drop::{ Drop, drop };
 import std::option::Option::{ self, Some, None };
 
@@ -220,7 +215,6 @@ server that runs forever wants the opposite, so it keeps the database at
 **module level**, where it lives for the whole process and never drops:
 
 ```vilan,norun
-import std::print;
 import std::db::{ Database, Row };
 import std::option::Option::{ self, Some, None };
 
@@ -288,7 +282,6 @@ that starts them. `OwnedNursery` is the answer: a resource that *owns* the tasks
 spawned inside its `enter`, and cancels them when it drops.
 
 ```vilan,norun
-import std::print;
 import std::time::sleep;
 import std::task::OwnedNursery;
 

@@ -32,8 +32,6 @@ Because overflow is undefined, the boundary values have to be *askable*.
 Every integer type carries its two bounds as niladic functions:
 
 ```vilan
-import std::print;
-
 fun main() {
 	print(i32::max_value());   // 2147483647
 	print(i32::min_value());   // -2147483648
@@ -126,8 +124,6 @@ floats are deliberately *not* `Ord` (NaN has no place in a total order), so
 `f64` and `f32` carry their own — same recipe, same result.
 
 ```vilan
-import std::print;
-
 fun main() {
 	print(9.clamp(0, 5));       // 5   — i32, through Ord
 	print(9f.clamp(0f, 5f));    // 5
@@ -142,8 +138,6 @@ Floats truncate toward zero; integers fold two's-complement into the
 target width:
 
 ```vilan
-import std::print;
-
 fun main() {
 	print((3.9).as_i32());    // 3
 	print((-1).as_u8());      // 255 — folded
@@ -172,7 +166,6 @@ fun range<T: Random>(low: T, high: T): T   // uniform in [low, high)
 ```
 
 ```vilan
-import std::print;
 import std::random;
 
 fun main() {

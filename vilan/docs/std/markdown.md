@@ -25,7 +25,6 @@ Decoding untrusted input is fallible the same way `from_json` is: handle
 the `Err` with `match`, `!`, or `unwrap_or_else`.
 
 ```vilan
-import std::print;
 import std::markdown::{ parse, Block, Doc, Inline, ParseError };
 import std::result::Result::{ Err, Ok };
 
@@ -118,7 +117,6 @@ anchor shape. The point of the refusal is the docs gate: the first page
 to write a footnote fails the suite loudly instead of rendering wrong.
 
 ```vilan
-import std::print;
 import std::markdown::{ parse, Doc, ParseError };
 import std::result::Result::{ Err, Ok };
 
@@ -158,7 +156,6 @@ order of appearance. The consequences are unintuitive enough to pin:
 need to predict an anchor — a link checker, a table of contents.
 
 ```vilan
-import std::print;
 import std::markdown::{ heading_id, Inline };
 
 fun main() {

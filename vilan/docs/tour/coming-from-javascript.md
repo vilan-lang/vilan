@@ -16,8 +16,6 @@ the receiver its own copy. Nothing is shared unless you ask for sharing
 explicitly.
 
 ```vilan
-import std::print;
-
 struct Point { x: i32, y: i32 }
 
 fun main() {

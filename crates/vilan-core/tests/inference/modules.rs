@@ -952,7 +952,7 @@ fn an_argument_less_self_defaulted_generic_impl_still_compiles() {
 fn std_instant_arithmetic_conforms_through_the_real_library() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ now, Duration };
 
         fun main() {
@@ -980,7 +980,7 @@ fn std_instant_arithmetic_conforms_through_the_real_library() {
 fn a_module_level_closure_binding_referenced_only_by_call_still_emits_its_declaration() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         let f = || 0;
 
@@ -1000,7 +1000,7 @@ fn a_module_level_closure_binding_referenced_only_by_call_still_emits_its_declar
 fn a_module_binding_called_only_inside_another_bindings_initializer_survives() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         let a = || 7;
         let b = a();
@@ -1021,7 +1021,7 @@ fn a_module_binding_called_only_inside_another_bindings_initializer_survives() {
 fn transitive_module_closure_calls_are_all_kept() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         let a = || 5;
         let b = || a();
@@ -1041,7 +1041,7 @@ fn transitive_module_closure_calls_are_all_kept() {
 fn a_nested_mod_closure_binding_referenced_only_by_call_survives() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         mod inner {
             export let f = || 3;
@@ -1063,7 +1063,7 @@ fn a_nested_mod_closure_binding_referenced_only_by_call_survives() {
 fn a_module_closure_called_through_a_try_region_postfix_survives() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         let g = |n: i32| Some(n);
@@ -1083,7 +1083,7 @@ fn a_module_closure_called_through_a_try_region_postfix_survives() {
 fn a_module_closure_called_through_a_force_postfix_survives() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         let g = |n: i32| Some(n);
@@ -1109,7 +1109,7 @@ fn a_module_closure_called_through_a_force_postfix_survives() {
 fn a_module_closure_called_at_the_head_of_a_try_chain_survives() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Book { title: str }
@@ -1132,7 +1132,7 @@ fn a_module_closure_called_at_the_head_of_a_try_chain_survives() {
 fn a_module_closure_passed_as_an_argument_survives() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun apply(g: || i32): i32 {
             g()
@@ -1158,7 +1158,7 @@ fn a_module_closure_passed_as_an_argument_survives() {
 fn a_genuinely_dead_module_closure_is_still_tree_shaken() {
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
 
         let kept_leaf = || 1;
         let unused_leaf = || 2;
@@ -1179,7 +1179,7 @@ fn a_genuinely_dead_module_closure_is_still_tree_shaken() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         let kept_leaf = || 1;
         let unused_leaf = || 2;
@@ -1488,7 +1488,7 @@ fn ssr_renders_static_view_with_ordered_attributes_and_nesting() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("div").class("card").attr("data-id", "7").child(view("p").text("hi"))));
         }
@@ -1505,7 +1505,7 @@ fn ssr_svg_root_carries_its_namespace() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("svg")
                 .attr("viewBox", "0 0 24 24")
@@ -1557,7 +1557,7 @@ fn ssr_bind_text_embeds_current_signal_value() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("h1").bind_text(Signal::new("world"))));
         }
@@ -1572,7 +1572,7 @@ fn ssr_bind_class_and_bind_attr_read_once() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("a").bind_class(Signal::new("active")).bind_attr("href", Signal::new("/x")).text("go")));
         }
@@ -1591,7 +1591,7 @@ fn ssr_bind_styled_reads_the_current_style_once() {
         import std::ui::{ view, View, render };
         import std::style::{ style, space, Style };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             let compact = const style().padding(space(2));
             let roomy = const style().padding(space(6));
@@ -1615,7 +1615,7 @@ fn bind_styled_cannot_construct_its_style_at_runtime() {
         import std::ui::{ view, View, render };
         import std::style::{ style, space, Style };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             let theme: Signal<Style> = Signal::new(style().padding(space(2)));
             print(render(view("div").bind_styled(theme)));
@@ -1632,7 +1632,7 @@ fn ssr_bind_each_renders_current_list() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             let items: Signal<List<str>> = Signal::new(["a", "b", "c"]);
             print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
@@ -1648,7 +1648,7 @@ fn ssr_bind_each_over_empty_list_renders_no_rows() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             let items: Signal<List<str>> = Signal::new([]);
             print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
@@ -1665,7 +1665,7 @@ fn ssr_when_renders_the_taken_branch_only() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("div").when(Signal::new(true), || view("p").text("shown"))));
             print(render(view("div").when(Signal::new(false), || view("p").text("shown"))));
@@ -1681,7 +1681,7 @@ fn ssr_swap_renders_the_current_value_branch() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         [derive(PartialEq)]
         enum Tab { A, B }
         fun main() {
@@ -1703,7 +1703,7 @@ fn ssr_show_toggles_the_hidden_attribute() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("span").show(Signal::new(true))));
             print(render(view("span").show(Signal::new(false))));
@@ -1719,7 +1719,7 @@ fn ssr_style_var_folds_into_the_style_attribute() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("div").style_var("--w", Signal::new("40px")).style_var("--h", Signal::new("10px"))));
         }
@@ -1734,7 +1734,7 @@ fn ssr_bind_value_renders_the_input_value() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("input").attr("type", "text").bind_value(Signal::new("hello"))));
         }
@@ -1750,7 +1750,7 @@ fn ssr_bind_draft_renders_the_local_value() {
         import std::ui::{ view, View, render };
         import std::reactive::{ Signal, draft, Draft };
         import std::option::Option::{ self, Some, None };
-        import std::print;
+        import std::io::print;
         fun main() {
             let name = draft("initial", |value: str| {
                 let _ignore = value;
@@ -1768,7 +1768,7 @@ fn ssr_children_appends_all_views() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("ul").children([view("li").text("x"), view("li").text("y")])));
         }
@@ -1784,7 +1784,7 @@ fn ssr_escapes_text_nodes() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("p").text("<script>alert(\"&\")</script>")));
         }
@@ -1800,7 +1800,7 @@ fn ssr_escapes_attribute_values() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("a").attr("title", "a \"b\" & <c>")));
         }
@@ -1814,7 +1814,7 @@ fn ssr_void_elements_have_no_closing_tag() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("br")));
             print(render(view("img").attr("src", "/x.png")));
@@ -1832,7 +1832,7 @@ fn ssr_void_element_drops_children() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("br").child(view("span").text("nope"))));
         }
@@ -1849,7 +1849,7 @@ fn ssr_event_handler_is_discarded_and_never_runs() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("button").text("click me").on("click", || print("HANDLER RAN"))));
         }
@@ -1864,7 +1864,7 @@ fn ssr_text_replaces_children() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("div").child(view("span").text("old")).text("new")));
         }
@@ -1879,7 +1879,7 @@ fn ssr_nested_component_composition() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun badge(label: str): View {
             view("span").class("badge").text(label)
         }
@@ -1899,7 +1899,7 @@ fn ssr_child_interleaves_text_and_element_children() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("p")
                 .child("Take ")
@@ -1919,7 +1919,7 @@ fn ssr_child_reads_a_signal_text_node_once() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("p").child("now: ").child(Signal::new("a & b"))));
         }
@@ -1934,7 +1934,7 @@ fn ssr_child_accepts_a_list_of_views() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair: List<View> = [view("i").text("a"), view("b").text("b")];
             print(render(view("p").child(pair)));
@@ -1952,7 +1952,7 @@ fn ssr_attr_reads_a_signal_value_once() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("a").attr("href", Signal::new("/x")).text("go")));
         }
@@ -1968,7 +1968,7 @@ fn ssr_text_replaces_text_node_children_too() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("p").child("gone").text("kept")));
         }
@@ -2007,7 +2007,7 @@ fn element_lowering_is_the_chain_byte_for_byte() {
     // Element-syntax §4's contract at the strongest level: the desugar builds
     // the very trees the chain parses to, so the emitted JS is byte-identical.
     let element = r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::ui::{ View, render, view };
         fun main() {
@@ -2021,7 +2021,7 @@ fn element_lowering_is_the_chain_byte_for_byte() {
         }
         "#;
     let chain = r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::ui::{ View, render, view };
         fun main() {
@@ -2082,7 +2082,7 @@ fn ssr_element_renders_mixed_content() {
     // attributes, escaped text children, a nested element.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::ui::{ View, render, view };
         fun main() {
             print(render(<p title("a & b")>
@@ -2106,7 +2106,7 @@ fn hyphenated_attribute_names_parse_and_emit_verbatim() {
     // check, and the emitted attributes verbatim.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::ui::{ View, render, view };
         fun main() {
             print(render(<div data-foo-bar("x") aria-label("y")>"z"</div>));
@@ -2186,7 +2186,7 @@ fn a_macro_generated_element_desugars() {
     // macro lowers like hand-written markup.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::ui::{ View, render, view };
         fun main() {
             let banner = macro {
@@ -2224,7 +2224,7 @@ fn a_generic_method_dispatches_a_bound_on_a_closure_parameter() {
     // once the closure's owning call lands the type.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Speak {
             fun speak(self): str;
         }
@@ -2264,7 +2264,7 @@ fn bind_each_rows_dispatch_slot_children() {
     // `.child(t)` dropped the text (empty stub) while a literal child worked.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::ui::{ View, render, view };
         fun main() {
@@ -2329,7 +2329,7 @@ fn an_annotated_closure_parameter_dispatches_directly() {
     // types immediately) — it must stay direct.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Speak {
             fun speak(self): str;
         }
@@ -2367,7 +2367,7 @@ fn a_generic_free_function_dispatches_a_bound_on_a_closure_parameter() {
     // rule (`resolve_call_subject`); the method fix must not disturb it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Speak {
             fun speak(self): str;
         }
@@ -2883,7 +2883,7 @@ fn ssr_std_dom_import_fails_on_a_process_build() {
     assert_fails_with(
         r#"
         import std::dom::{ create_element };
-        import std::print;
+        import std::io::print;
         fun main() {
             let element = create_element("div");
             print("built");
@@ -2901,7 +2901,7 @@ fn ssr_on_event_is_accepted_and_discarded() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::print;
+        import std::io::print;
         fun main() {
             print(render(view("button").text("x").on_event("click", |_event| print("HANDLER RAN"))));
         }
@@ -2921,7 +2921,7 @@ fn ssr_process_build_can_import_a_browser_module_that_binds_on_event() {
     assert_compiles(
         r#"
         import std::router::navigate;
-        import std::print;
+        import std::io::print;
         fun unused() {
             navigate("/home");
         }
@@ -2948,7 +2948,7 @@ fn ssr_example_app_renders_the_served_markup() {
         r#"
         import std::ui::{ view, View, render };
         import std::reactive::Signal;
-        import std::print;
+        import std::io::print;
         fun app(): View {
             let tasks: Signal<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
             let show_note = Signal::new(true);
@@ -3097,7 +3097,7 @@ fn a_mixed_crlf_program_emits_byte_identical_javascript() {
     // multi-line strings, an interpolation. The whole file, not one literal.
     let javascript = assert_crlf_twin_emits_identically(
         r#"
-        import std::print;
+        import std::io::print;
 
         // A greeting, with a comment above it.
         fun greeting(name: str): str {
@@ -3130,7 +3130,7 @@ fn emitted_javascript_from_crlf_source_has_no_carriage_return_through_a_macro() 
     // generated code and out into the bundle.
     let javascript = assert_crlf_twin_emits_identically(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun constants(arguments: Arguments): Source {
             import macro_std::source;
@@ -3169,7 +3169,7 @@ fn a_macro_observing_a_multi_line_argument_sees_lf_from_crlf_source() {
     // number, which the byte-identity assertion catches.
     let javascript = assert_crlf_twin_emits_identically(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun measure(arguments: Arguments): Source {
             import macro_std::source;
@@ -3537,7 +3537,7 @@ fn module_binding_may_reference_one_declared_below_it() {
     // emission followed declaration order.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B * 2;
         let B: i32 = 21;
         fun main() {
@@ -3560,7 +3560,7 @@ fn a_dependency_in_a_later_loading_module_is_declared_first() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                "import std::io::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
                  fun main() { print(A); print(Z); }\n",
             ),
             (
@@ -3591,9 +3591,9 @@ fn import_statement_order_cannot_change_module_binding_order() {
         ),
         ("zeta.vl", "let Z: i32 = 21;\n"),
     ];
-    let alpha_first = "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+    let alpha_first = "import std::io::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
                        fun main() { print(A); print(Z); }\n";
-    let zeta_first = "import std::print;\nimport pkg::zeta::{ Z };\nimport pkg::alpha::{ A };\n\
+    let zeta_first = "import std::io::print;\nimport pkg::zeta::{ Z };\nimport pkg::alpha::{ A };\n\
                       fun main() { print(A); print(Z); }\n";
 
     let mut with_alpha_first = vec![("main.vl", alpha_first)];
@@ -3618,7 +3618,7 @@ fn mutually_recursive_module_closures_stay_legal() {
     // this working program.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let EVEN: |i32| bool = |n: i32| {
             if n == 0 { true } else { ODD(n - 1) }
         };
@@ -3642,7 +3642,7 @@ fn edgeless_module_closures_emit_in_canonical_order() {
     // spurious one would have to reorder them or make them cycle leftovers.)
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         let EVEN: |i32| bool = |n: i32| {
             if n == 0 { true } else { ODD(n - 1) }
         };
@@ -3667,7 +3667,7 @@ fn a_call_through_a_global_orders_what_that_body_reads() {
     // last and the run died with `Cannot access 'Y' before initialization`.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         let FETCH: || i32 = || { Y };
         let X: i32 = FETCH();
         let Y: i32 = 7;
@@ -3685,7 +3685,7 @@ fn a_call_through_a_global_orders_what_that_body_reads() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let FETCH: || i32 = || { Y };
         let X: i32 = FETCH();
         let Y: i32 = 7;
@@ -3701,7 +3701,7 @@ fn a_direct_call_at_init_orders_what_the_callee_reads() {
     // the callee's global reads charge to the initializing binding.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun read_y(): i32 { Y * 3 }
         let X: i32 = read_y();
         let Y: i32 = 7;
@@ -3722,12 +3722,12 @@ fn unrelated_effectful_initializers_run_in_canonical_order() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::zeta::{ Z };\nimport pkg::alpha::{ A };\n\
+                "import std::io::print;\nimport pkg::zeta::{ Z };\nimport pkg::alpha::{ A };\n\
                  fun main() { print(A + Z); }\n",
             ),
             (
                 "util.vl",
-                "import std::print;\nfun announce(label: str): i32 { print(label); 1 }\n",
+                "import std::io::print;\nfun announce(label: str): i32 { print(label); 1 }\n",
             ),
             (
                 "alpha.vl",
@@ -3752,7 +3752,7 @@ fn a_const_binding_still_folds_and_orders_as_a_plain_value() {
     // `const STEP = 7;` declaration must still precede the binding that reads it.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         fun seven(): i32 { 7 }
         let DOUBLE: i32 = STEP * 2;
         let STEP: i32 = const seven();
@@ -3770,7 +3770,7 @@ fn a_const_binding_still_folds_and_orders_as_a_plain_value() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun seven(): i32 { 7 }
         let DOUBLE: i32 = STEP * 2;
         let STEP: i32 = const seven();
@@ -3789,7 +3789,7 @@ fn a_dispatching_initializer_is_accepted_and_ordered() {
     // accepted and both reads are ordered before `TOTAL`.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         trait Weight { fun weight(self): i32; }
         struct Feather {}
         struct Anvil {}
@@ -3811,7 +3811,7 @@ fn a_dispatching_initializer_is_accepted_and_ordered() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Weight { fun weight(self): i32; }
         struct Feather {}
         struct Anvil {}
@@ -3836,7 +3836,7 @@ fn a_self_referential_binding_is_an_initialization_cycle() {
     // binding evaluating itself — rather than as a `via A → A` chain.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = A + 1;
         fun main() { print(A); }
         "#,
@@ -3852,7 +3852,7 @@ fn a_self_referential_binding_is_spanned_at_the_read_and_carries_no_note() {
     // read, so "`A` is declared here" would point at what the reader is
     // already looking at.
     let source = r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = A + 1;
         fun main() { print(A); }
         "#;
@@ -3876,7 +3876,7 @@ fn a_cycle_does_not_disturb_the_bindings_around_it() {
     // the diagnostic: exactly one error, naming only the cycle's member.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = A + 1;
         let OK: i32 = 5;
         fun main() { print(OK); print(A); }
@@ -3897,7 +3897,7 @@ fn a_call_through_a_closure_built_by_a_function_is_ordered() {
     // (`make`'s own body reads nothing).
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): || i32 { || { Y } }
         let MAKER: || i32 = make();
         let X: i32 = MAKER();
@@ -3912,7 +3912,7 @@ fn a_call_through_a_closure_built_by_a_function_is_ordered() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(): || i32 { || { Y } }
         let MAKER: || i32 = make();
         let X: i32 = MAKER();
@@ -3930,7 +3930,7 @@ fn a_call_through_a_struct_field_closure_is_ordered() {
     // TDZ before the projection arms existed.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { get: || i32 }
         let HOLDER: Holder = Holder { get = || { Y } };
         let X: i32 = (HOLDER.get)();
@@ -3947,7 +3947,7 @@ fn a_call_through_an_indexed_closure_is_ordered() {
     // distinct `Expr` arms, so three cases.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let TABLE: List<|| i32> = [|| { Y }];
         let X: i32 = TABLE[0]();
         let Y: i32 = 7;
@@ -3957,7 +3957,7 @@ fn a_call_through_an_indexed_closure_is_ordered() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let PAIR: (|| i32, i32) = (|| { Y }, 1);
         let X: i32 = (PAIR.0)();
         let Y: i32 = 7;
@@ -3976,7 +3976,7 @@ fn a_const_binding_contributes_no_ordering_edges() {
     // `BASE`, and no cycle can be manufactured out of const chains.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         let STEP: i32 = const BASE * 2;
         let BASE: i32 = const 6;
         fun main() { print(STEP); print(BASE); }
@@ -3994,7 +3994,7 @@ fn a_const_binding_contributes_no_ordering_edges() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let STEP: i32 = const BASE * 2;
         let BASE: i32 = const 6;
         fun main() { print(STEP); print(BASE); }
@@ -4016,7 +4016,7 @@ fn a_const_binding_contributes_no_ordering_edges() {
 
 /// The shared entry for the argument-passing fixtures: `alpha` holds the
 /// binding under test, `zeta` holds the global its closure reads.
-const ARGUMENT_ENTRY: &str = "import std::print;\nimport pkg::zeta::{ Y };\n\
+const ARGUMENT_ENTRY: &str = "import std::io::print;\nimport pkg::zeta::{ Y };\n\
                               import pkg::alpha::{ A };\nfun main() { print(A); }\n";
 
 #[test]
@@ -4068,7 +4068,7 @@ fn a_closure_argument_to_a_std_iterator_method_is_entered() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::zeta::{ Y };\nimport pkg::alpha::{ A };\n\
+                "import std::io::print;\nimport pkg::zeta::{ Y };\nimport pkg::alpha::{ A };\n\
                  fun main() { print(A.len()); }\n",
             ),
             ("zeta.vl", "let Y: i32 = 7;\n"),
@@ -4113,7 +4113,7 @@ fn a_two_level_def_chain_is_followed() {
     // created closures missed `Y`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun inner(): || i32 { || { Y } }
         fun make(): || i32 { inner() }
         let MAKER: || i32 = make();
@@ -4132,7 +4132,7 @@ fn a_conditional_call_subject_enters_both_branches() {
     // exhaustive match is what forces this arm to exist.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         let FLAG: bool = true;
         let CB_A: || i32 = || { Y };
         let CB_B: || i32 = || { 0 };
@@ -4148,7 +4148,7 @@ fn a_conditional_call_subject_enters_both_branches() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         let FLAG: bool = true;
         let CB_A: || i32 = || { Y };
         let CB_B: || i32 = || { 0 };
@@ -4176,7 +4176,7 @@ fn a_dispatch_manufactured_cycle_is_an_error_that_explains_the_over_approximatio
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::zeta::{ TOTAL, total, Anvil };\n\
+                "import std::io::print;\nimport pkg::zeta::{ TOTAL, total, Anvil };\n\
                  import pkg::alpha::{ DOWNSTREAM };\n\
                  fun main() { print(DOWNSTREAM); print(total(Anvil {})); }\n",
             ),
@@ -4220,7 +4220,7 @@ fn a_binding_downstream_of_a_cycle_is_not_named_in_the_error() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::zeta::{ TOTAL, total, Anvil };\n\
+                "import std::io::print;\nimport pkg::zeta::{ TOTAL, total, Anvil };\n\
                  import pkg::alpha::{ DOWNSTREAM };\n\
                  fun main() { print(DOWNSTREAM); print(total(Anvil {})); }\n",
             ),
@@ -4256,7 +4256,7 @@ fn an_unreachable_dispatch_candidates_reads_still_order() {
     // decision rather than a silent drift.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         trait Weight { fun weight(self): i32; }
         struct Feather {}
         struct Anvil {}
@@ -4289,7 +4289,7 @@ fn two_bindings_that_read_each_other_are_an_initialization_cycle() {
     // B33 S2 pin 2 — the smallest true cycle, with the chain text asserted.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = A + 2;
         fun main() { print(A); print(B); }
@@ -4299,7 +4299,7 @@ fn two_bindings_that_read_each_other_are_an_initialization_cycle() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = A + 2;
         fun main() { print(A); print(B); }
@@ -4314,7 +4314,7 @@ fn a_two_binding_cycle_is_spanned_at_the_read_that_closes_it() {
     // canonically FIRST member's initializer — not the `let`, not the second
     // member's read, and not a function of enumeration order.
     let source = r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = A + 2;
         fun main() { print(A); print(B); }
@@ -4330,7 +4330,7 @@ fn a_two_binding_cycle_notes_the_other_declaration() {
     // file — see `a_cross_module_cycle_is_reported_in_the_module_that_reads`.)
     assert_fails_noting(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = A + 2;
         fun main() { print(A); print(B); }
@@ -4349,7 +4349,7 @@ fn a_three_binding_cycle_renders_the_whole_round_trip() {
     // canonically first member and takes the shortest way back to it.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = C + 2;
         let C: i32 = A + 3;
@@ -4381,7 +4381,7 @@ fn a_cycle_closed_through_a_load_time_call_is_reported() {
     // and the anchor lands on the read inside the callee, which is the read
     // that closes the cycle.
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun read_b(): i32 { B * 2 }
         let A: i32 = read_b() + 1;
         let B: i32 = A + 2;
@@ -4400,7 +4400,7 @@ fn a_cycle_closed_through_a_closure_held_by_a_global_is_reported() {
     // member. `FETCH` itself is not a participant — it is only entered.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::print;
+        import std::io::print;
         let FETCH: || i32 = || { B };
         let A: i32 = FETCH();
         let B: i32 = A + 2;
@@ -4436,7 +4436,7 @@ fn a_cross_module_cycle_is_reported_in_the_module_that_reads() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                "import std::io::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
                  fun main() { print(A); print(Z); }\n",
             ),
             ("alpha.vl", alpha),
@@ -4490,7 +4490,7 @@ fn a_cycle_is_the_only_diagnostic_however_often_its_members_are_used() {
     // is reported once and nothing downstream of it produces a second error.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = A + 2;
         let USES: i32 = A + B;
@@ -4516,7 +4516,7 @@ fn an_analysis_error_suppresses_the_cycle_check() {
     // surfaces the cycle, which the pins above cover.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = A + 2;
         let BROKEN: i32 = "not a number";
@@ -4537,7 +4537,7 @@ fn two_independent_cycles_report_one_diagnostic_each_in_canonical_order() {
     // declaration order here) — deterministic, per diagnostics-standard C1.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = B + 1;
         let B: i32 = A + 2;
         let Y: i32 = Z + 1;
@@ -4569,7 +4569,7 @@ fn a_cycle_through_a_const_binding_cannot_form() {
     // the ordering relation deliberately does not have.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         let STEP: i32 = const 6;
         let DOUBLE: i32 = STEP * 2;
         fun main() { print(DOUBLE); }
@@ -4623,7 +4623,7 @@ fn one_call_graph_per_analysis() {
     assert_eq!(
         call_graphs_built_by_one_analysis(
             r#"
-            import std::print;
+            import std::io::print;
             let SEED: i32 = 21;
             let DOUBLE: i32 = double(SEED);
             fun double(value: i32): i32 { value * 2 }
@@ -4681,7 +4681,7 @@ fn the_const_pass_builds_one_name_seed_however_many_const_sites_there_are() {
     // Three sites rather than one, because a per-site rebuild reads 1 on a
     // one-site program and would slip through.
     let three_sites = r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = const 1 + 2;
         let B: i32 = const 3 * 4;
         let C: i32 = const 5 - 6;
@@ -4695,7 +4695,7 @@ fn the_const_pass_builds_one_name_seed_however_many_const_sites_there_are() {
     // And the count must not move with the site count — the property that makes
     // the pass linear in its sites rather than linear in sites × program size.
     let six_sites = r#"
-        import std::print;
+        import std::io::print;
         let A: i32 = const 1 + 2;
         let B: i32 = const 3 * 4;
         let C: i32 = const 5 - 6;
@@ -4721,7 +4721,7 @@ fn a_const_site_reads_its_dependency_afresh_in_a_second_analysis() {
     let fold = |literal: &str| -> String {
         let source = format!(
             r#"
-            import std::print;
+            import std::io::print;
             let STEP: i32 = {literal};
             let SCALED: i32 = const STEP * 10;
             fun main() {{ print(SCALED); }}
@@ -4817,7 +4817,7 @@ fn the_const_pass_lowers_its_world_once_however_many_sites_reach_it() {
         let sum: Vec<String> = (0..count).map(|index| format!("SITE{index}")).collect();
         format!(
             r#"
-            import std::print;
+            import std::io::print;
             fun doubled(value: i32): i32 {{ value * 2 }}
             {bindings}
             fun main() {{ print({}); }}
@@ -4850,7 +4850,7 @@ fn const_sites_sharing_a_world_compute_what_they_computed_alone() {
     // site folded) folds against the shared world too.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         let SCALE: i32 = 10;
 
@@ -4892,7 +4892,7 @@ fn a_const_site_reads_its_module_bindings_afresh_and_never_another_sites() {
     // together are why sharing the lowering is safe.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun seed(): List<i32> {
             mut result: List<i32> = List::new();
@@ -4932,7 +4932,7 @@ fn no_const_site_can_reach_mutable_module_state_at_all() {
     // constants (`const-eval.md` §10.6).
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         mut COUNTER: i32 = 0;
         fun bump(): i32 {
             COUNTER = COUNTER + 1;
@@ -4945,7 +4945,7 @@ fn no_const_site_can_reach_mutable_module_state_at_all() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun seed(): List<i32> {
             mut result: List<i32> = List::new();
             result.push(1);
@@ -4978,7 +4978,7 @@ fn a_const_site_is_refused_only_for_what_it_itself_reaches() {
         };
         format!(
             r#"
-            import std::print;
+            import std::io::print;
             import std::random;
             fun doubled(value: i32): i32 {{ value * 2 }}
             fun impure(): i32 {{ random::range(1, 6) }}
@@ -4994,7 +4994,7 @@ fn a_const_site_is_refused_only_for_what_it_itself_reaches() {
     // reaches it is refused, the site beside it folds.
     assert_fails_once_with(
         r#"
-        import std::print;
+        import std::io::print;
         mut COUNTER: i32 = 0;
         fun bump(): i32 { COUNTER = COUNTER + 1; COUNTER }
         fun doubled(value: i32): i32 { value * 2 }
@@ -5017,7 +5017,7 @@ fn a_const_failure_names_the_function_that_failed_not_the_name_it_was_emitted_un
     // subject entirely, which is what this saw before the fix.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun table(): List<i32> {
             mut result: List<i32> = List::new();
@@ -5058,7 +5058,7 @@ fn a_const_function_evaluates_again_after_an_earlier_sites_scopes_were_cleared()
     // site cannot read `__const_result` back and this is red.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun bump_twice(value: i32): i32 {
             let bump = |x: i32| { x + 1 };
@@ -5133,7 +5133,7 @@ fn every_interpreter_scope_dies_with_its_const_run() {
     // loop iterations between them.
     let (alive, lowered) = scopes_alive_after_one_analysis(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun labels(count: i32): List<str> {
             let describe = |index: i32| { "a labelled entry" };
@@ -5190,7 +5190,7 @@ fn every_interpreter_scope_dies_with_its_macro_expansion() {
     // process-global expansion cache cannot serve it without running it.
     let (alive, _) = scopes_alive_after_one_analysis(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun sum_to_eleven(arguments: Arguments): Source {
             import macro_std::source;
@@ -5232,7 +5232,7 @@ fn context_threading_owns_the_one_graph_that_cannot_be_shared() {
     assert_eq!(
         call_graphs_built_by_one_analysis(
             r#"
-            import std::print;
+            import std::io::print;
             import std::context::Context;
 
             let flavor: Context<i32> = Context::new();
@@ -5262,7 +5262,7 @@ fn the_call_graph_is_built_once_and_stays_current() {
     // Analysis is the only thing that fills those tables; if a pass ever starts
     // rewriting them afterwards, the second assertion is what fails.
     let source = r#"
-        import std::print;
+        import std::io::print;
         let SEED: i32 = 21;
         let DOUBLE: i32 = double(SEED);
         fun double(value: i32): i32 { value * 2 }
@@ -5318,7 +5318,7 @@ fn indexing_a_call_result_keeps_the_element_type() {
     // The gotchas page's own example: `shared.read()[i]`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
         import std::shared::Shared;
         fun main() {
@@ -5338,7 +5338,7 @@ fn a_field_read_through_an_indexed_call_result_keeps_the_element_type() {
     // `rows()[0].name` — the element is a struct, and its field must resolve.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
         struct Row { name: str }
         fun rows(): List<Row> {
@@ -5359,7 +5359,7 @@ fn a_method_call_on_an_indexed_element_keeps_the_element_type() {
     // `words[1].len()` — the element type must survive to dispatch a method.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
         fun main() {
             mut words: List<str> = List::new();
@@ -5377,7 +5377,7 @@ fn indexing_a_generic_methods_result_keeps_the_element_type() {
     // `h.all()[1]` — the element type arrives through the impl's binder.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
         struct Holder<T> { items: List<T> }
         impl Holder<type T> {
@@ -5402,7 +5402,7 @@ fn indexing_a_map_value_keeps_the_element_type() {
     // A `List` stored as a `Map` value, indexed after the `Option` unwraps.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
         import std::map::Map;
         import std::option::Option::{ self, Some, None };
@@ -5429,7 +5429,7 @@ fn indexing_an_indexed_call_result_keeps_the_element_type() {
     // the outer one can index again.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
         fun grid(): List<List<i32>> {
             mut out: List<List<i32>> = List::new();
@@ -5463,7 +5463,7 @@ fn an_async_divergence_in_a_module_is_attributed_to_the_module() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::alpha::go;\nfun main() { print(go()); }\n",
+                "import std::io::print;\nimport pkg::alpha::go;\nfun main() { print(go()); }\n",
             ),
             (
                 "alpha.vl",

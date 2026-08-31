@@ -18,7 +18,6 @@ sync by hand. The compiler knows both sides.
 Here's a complete little server:
 
 ```vilan,norun
-import std::print;
 import std::reactive::Signal;
 import std::json::json_codec;
 import std::http::{ Response, Server };
@@ -71,7 +70,6 @@ fields are typed **mirrors** (`RemoteSource<T>`, one per `[expose]`) and
 whose rpc methods are ordinary calls that return `Result`:
 
 ```vilan,browser
-import std::print;
 import std::reactive::Signal;
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
@@ -262,7 +260,6 @@ about the type pretends otherwise. You read it one of four ways:
   (`Waiting` / `Ready`) — passive reads. They open nothing.
 
 ```vilan,browser
-import std::print;
 import std::json::json_codec;
 import std::reactive::Signal;
 import std::result::Result::{ self, Ok, Err };
@@ -439,7 +436,6 @@ and a service sit on the same builder chain instead of one replacing the
 other:
 
 ```vilan,norun
-import std::print;
 import std::shared::Shared;
 import std::json::json_codec;
 import std::http::{ Response, Server };

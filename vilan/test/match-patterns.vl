@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // String-literal patterns, or-patterns (`"y", ""`), qualified variant patterns
 // (`Signal::Quit`), `let NAME if CONDITION` match guards, and a guarded FINAL

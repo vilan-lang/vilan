@@ -2,7 +2,7 @@
 // method family, sized-type parity, and truncated `rem`. Every printed value
 // is exactly representable, so the output is deterministic.
 import std::math::{ E, EPSILON, INFINITY, NAN, PI, TAU, max, min, minmax };
-import std::print;
+import std::io::print;
 
 fun main() {
 	// Constants.

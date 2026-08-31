@@ -21,7 +21,7 @@ fn b76_a_string_backed_enum_lowers_to_its_bare_string() {
     // exactly as `Ordering::Greater` IS `1` (P1). No array, no wrapper.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         fun main() { print(Align::Start); }
         "#,
@@ -59,7 +59,7 @@ fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
     // exact bytes.
     let backed = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "start", End = "end", Center = "center" }
         fun classify(a: Align): str {
             match a { Align::Start => "s", Align::End => "e", Align::Center => "c" }
@@ -70,7 +70,7 @@ fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
     .expect("a clean compile");
     let raw = compile(
         r#"
-        import std::print;
+        import std::io::print;
         fun classify(a: str): str {
             match a { "start" => "s", "end" => "e", "center" => "c", _ => "trap" }
         }
@@ -115,7 +115,7 @@ fn b76_an_exhaustive_string_backed_match_traps_instead_of_falling_through() {
     // and the raw value.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
         fun label(align: Align): str {
             match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
@@ -146,7 +146,7 @@ fn b76_an_exhaustive_integer_backed_match_traps_too() {
     // is the corpus golden that moved for it.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Ordering { Less = -1, Equal = 0, Greater = 1 }
         fun describe(order: Ordering): str {
             match order { Ordering::Less => "less", Ordering::Equal => "equal", Ordering::Greater => "greater" }
@@ -173,7 +173,7 @@ fn b76_the_trap_arm_is_the_exhaustive_case_only() {
     // honest. Nothing changes — no extra test, no trap, no helper.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
         fun label(align: Align): str {
             match align { Align::Start => "s", _ => "other" }
@@ -202,7 +202,7 @@ fn b76_the_trap_arm_reaches_only_backed_enums() {
     // backing value (§3.4 rejects a `bool` backing) and is not covered either.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option;
         enum Plain { A, B, C }
         fun plain(p: Plain): str { match p { Plain::A => "a", Plain::B => "b", Plain::C => "c" } }
@@ -232,7 +232,7 @@ fn b76_the_trap_arm_fires_on_a_host_supplied_value() {
     // hands vilan a value outside `Align`'s set with nothing in between.
     let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
         [extern("Array.prototype.forEach.call")]
         external fun for_each_align(values: List<str>, handler: |Align| void): void;
@@ -274,7 +274,7 @@ fn b76_the_trap_arm_reaches_the_edge_shapes_of_a_match() {
     // the final `if (!matched)`.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option;
         enum One { Only = "only" }
         enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
@@ -333,7 +333,7 @@ fn b114_the_trap_arm_reaches_a_nested_backed_pattern() {
     // not the subject.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align) }
         fun label(p: Pair): str {
@@ -364,7 +364,7 @@ fn b114_a_nested_trap_names_the_out_of_set_payload() {
     // a bare string, which is `panic()`'s shape.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align) }
         fun label(p: Pair): str {
@@ -391,7 +391,7 @@ fn b114_a_trap_reads_through_every_payload_it_is_nested_under() {
     // `compile_pattern`'s own, so it tracks the nesting exactly.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Mid { Of(Align) }
         enum Outer { Of(Mid) }
@@ -439,7 +439,7 @@ fn b114_several_backed_tests_in_one_leg_name_the_one_that_left_its_set() {
     // check: it is what is left when none of the others answered.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Display { Block = "block", Inline = "inline" }
         enum Two { Of(Align, Display) }
@@ -486,7 +486,7 @@ fn b114_a_nested_backed_test_reaches_the_sequence_emitter_too() {
     // through the same appended leg, so it needs to learn nothing.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align) }
@@ -530,7 +530,7 @@ fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
     // the narrow rule ever claimed here.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Inner { A, B }
         enum Pair { Of(Inner) }
         enum Wrapped { Of(i32) }
@@ -564,7 +564,7 @@ fn b114_a_written_catch_all_is_still_the_authors_own_arm() {
     // arm, and the compiler must not add a second one behind it.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align) }
         fun label(p: Pair): str {
@@ -593,7 +593,7 @@ fn b121_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
     // still runs the author's own arm.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align), Other }
         fun label(p: Pair): str {
@@ -631,7 +631,7 @@ fn b121_an_out_of_set_payload_in_an_earlier_leg_traps_instead_of_misfiling() {
     // a bad `Align` — only `[0, "middle"]`, built by hand, can.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align), Other }
         fun label(p: Pair): str {
@@ -664,7 +664,7 @@ fn b121_two_partitioned_variants_each_trap_their_own_enum() {
     // only its own enum — the K=1 shape per tag, §12.1's format unchanged.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Display { Block = "block", Inline = "inline" }
         enum Pair { Of(Align), Alt(Display), Other }
@@ -720,7 +720,7 @@ fn b121_a_variant_with_a_written_catch_all_payload_never_reaches_the_trap() {
     // present in the source (harmless dead code) but never the path taken.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align), Other }
         fun label(p: Pair): str {
@@ -752,7 +752,7 @@ fn b121_earlier_legs_over_an_unbacked_nested_enum_keep_the_bare_else() {
     // was, byte for byte.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Inner { A, B }
         enum Pair { Of(Inner), Other }
         fun label(p: Pair): str {
@@ -782,7 +782,7 @@ fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
     // coverage walk, which asks the pattern TREE rather than its root.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         enum Inner { A, B }
         enum Pair { Of(Inner) }
         fun label(p: Pair): str {
@@ -798,7 +798,7 @@ fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
 fn b76_a_string_backed_enum_runs() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end", Center = "center" }
         fun main() {
             let a = Align::End;
@@ -987,7 +987,7 @@ fn b76_ordering_operators_are_rejected_on_a_string_backing() {
     // `PartialOrd` defaults depend on.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Level { Low = 0, High = 1 }
         fun main() { print(Level::Low < Level::High); }
         "#,
@@ -1002,7 +1002,7 @@ fn b76_adding_a_string_backing_does_not_move_the_integer_path() {
     // JavaScript.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Ordering2 { Less = -1, Equal = 0, Greater = 1 }
         fun main() {
             print(match Ordering2::Greater {
@@ -1029,7 +1029,7 @@ fn b76_a_plain_enum_keeps_its_array_form() {
     // every existing program.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Plain { A, B }
         fun main() { print(match Plain::B { Plain::A => "a", Plain::B => "b" }); }
         "#,
@@ -1047,7 +1047,7 @@ fn b76_a_backing_string_keeps_its_escapes() {
     // string, so a backing value may hold whatever the host speaks.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Quoted { Tab = "a\tb", Quote = "say \"hi\"" }
         fun main() {
             print(match Quoted::Quote { Quoted::Tab => "tab", Quoted::Quote => "quote" });
@@ -1069,7 +1069,7 @@ fn b76_a_backing_string_keeps_its_escapes() {
 fn b76_value_returns_the_backing_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Level { Low = -1, High = 2 }
         fun main() {
@@ -1089,7 +1089,7 @@ fn b76_value_lowers_to_the_identity() {
     // folded-away body then has no callers and emits nothing.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         fun render(value: Align): str { value.value() }
         fun main() { print(render(Align::Start)); }
@@ -1110,7 +1110,7 @@ fn b76_value_lowers_to_the_identity() {
 fn b76_parse_round_trips_and_answers_none_outside_the_set() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Level { Low = -1, High = 2 }
@@ -1211,7 +1211,7 @@ fn b76_a_wide_integer_backing_widens_the_conversion_type() {
     // discriminant does not fit.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Wide { Big = 3000000000, Small = 1 }
         fun main() { print(Wide::Big.value()); }
         "#,
@@ -1225,7 +1225,7 @@ fn b76_std_ordering_gains_the_conversions() {
     // `value()` is the identity over the bare discriminant.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::Ordering;
         import std::option::Option;
         fun main() {
@@ -1252,7 +1252,7 @@ fn b76_std_ordering_gains_the_conversions() {
 fn b76_a_backed_enum_encodes_as_its_backing_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::Json;
         [derive(Json)]
         enum Align { Start = "flex-start", End = "flex-end" }
@@ -1273,7 +1273,7 @@ fn b76_a_backed_enum_decodes_from_its_backing_value() {
     // outside the set is `Err` rather than a confidently wrong variant.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result;
         [derive(Json)]
@@ -1294,7 +1294,7 @@ fn b76_a_backed_enum_decodes_from_its_backing_value() {
 fn b76_a_backed_enum_round_trips_through_wire() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::json_codec;
         import std::result::Result;
         import std::wire::{ Wire, encode, decode };
@@ -1327,7 +1327,7 @@ fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
     // exactly as before.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result;
         [derive(Json)]
@@ -1421,7 +1421,7 @@ fn b76_an_external_returned_backed_enum_round_trips_and_traps() {
     // reaches a `match` and is NAMED rather than becoming `Align::End`.
     let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
         [extern("String")]
         external fun host_align(text: str): Align;
@@ -1460,7 +1460,7 @@ fn b76_a_callback_parameter_is_covered_by_the_trap_not_by_enumeration() {
     // never had to be listed.
     let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
         [extern("Array.prototype.forEach.call")]
         external fun on_each_align(values: List<str>, handler: |Align| void): void;
@@ -1493,7 +1493,7 @@ fn b76_the_parse_path_is_the_non_panicking_alternative() {
     // answers `None` where the direct return would have trapped.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option;
         enum Align { Start = "flex-start", End = "flex-end" }
         [extern("String")]
@@ -1531,7 +1531,7 @@ fn b76_the_parse_path_is_the_non_panicking_alternative() {
 fn b76_json_kind_is_a_backed_enum_carrying_the_intrinsic_strings() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ JsonKind, parse_json_value };
         fun main() {
             let value = parse_json_value("{\"n\":1,\"s\":\"x\",\"b\":true,\"a\":[],\"z\":null}");
@@ -1557,7 +1557,7 @@ fn b76_json_kind_comparisons_emit_what_the_predicates_compiled_to() {
     // why the rewrite is a net REDUCTION rather than a cost.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ JsonKind, parse_json_value };
         fun main() { print(parse_json_value("1").kind() == JsonKind::Number); }
         "#,
@@ -1591,7 +1591,7 @@ fn b76_a_json_kind_outside_the_set_compares_false_and_traps_in_a_match() {
     // exactly what §9's trap is for.
     let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ JsonKind, parse_json_value };
         fun main() {
             let absent = parse_json_value("{}").field("nope");
@@ -1634,7 +1634,7 @@ fn b76_a_json_kind_outside_the_set_compares_false_and_traps_in_a_match() {
 fn b76_style_keyword_enums_carry_their_css_keywords() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ AlignItems, Display, JustifyContent, UserSelect };
         fun main() {
             // The five §2.1 names no case convention produces.
@@ -1658,7 +1658,7 @@ fn b76_style_wrappers_still_write_the_same_declaration() {
     // (`vilan/test/style.css` pins the declaration text itself, byte for byte.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ AlignItems, Display, RadialExtent, Style, style };
         fun main() {
             let card = const style().display(Display::InlineBlock).align_items(AlignItems::End);
@@ -1681,7 +1681,7 @@ fn b76_style_wrappers_still_write_the_same_declaration() {
 fn a_resource_backed_enum_declares_without_synthesized_conversions() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource enum Handle { Open = 1, Closed = 2 }
         fun main() {
             let handle = Handle::Open;
@@ -1696,7 +1696,7 @@ fn a_resource_backed_enum_declares_without_synthesized_conversions() {
 fn a_resource_backed_enum_has_no_value_member() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource enum Handle { Open = 1, Closed = 2 }
         fun main() { print(Handle::Open.value()); }
         "#,
@@ -1710,7 +1710,7 @@ fn a_resource_backed_enum_is_not_hashable() {
     // hashed by value, so it is not a key however it lowers.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         resource enum Handle { Open = 1, Closed = 2 }
         fun main() {
@@ -1872,7 +1872,7 @@ fn b117_the_other_derives_on_a_resource_survive_the_refusal() {
     // (`resource_struct_carries_a_derive_through_expansion`).
     assert_fails_once_with(
         r#"
-        import std::print;
+        import std::io::print;
         [derive(PartialEq, Wire, Debug)]
         resource struct Session { id: i32, name: str }
         fun main() {
@@ -1904,7 +1904,7 @@ fn b117_a_resource_by_containment_still_names_its_field() {
 fn b117_a_plain_data_wire_derive_is_untouched() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::encode_json;
         [derive(Wire)]
         struct Note { id: i32, text: str }
@@ -1976,7 +1976,7 @@ fn b120_derive_json_rejects_a_resource_enum_payload() {
 fn b120_a_json_derived_struct_with_no_resource_stays_legal() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::Json;
         [derive(Json)]
         struct Note { id: i32, text: str }
@@ -2068,7 +2068,7 @@ fn b120_a_resource_by_containment_still_names_only_its_field() {
 fn b76_a_string_backed_enum_keys_a_map() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         enum Align { Start = "flex-start", End = "flex-end" }
         fun main() {
@@ -2091,7 +2091,7 @@ fn b76_a_string_backed_enum_keys_a_map() {
 fn b76_an_integer_backed_enum_keys_a_set() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         enum Level { Low = 0, High = 1 }
         fun main() {
@@ -2115,7 +2115,7 @@ fn b76_an_auto_incremented_backing_keys_a_set() {
     // rule `value()`/`parse()` need — so the C-style tail comes along.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         enum Walked { A = 5, B, C }
         fun main() {
@@ -2139,7 +2139,7 @@ fn b76_a_backed_enums_hash_is_its_backing_values_hash() {
     // rests on.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::{ Hash, Hashable };
         enum Align { Start = "flex-start", End = "flex-end" }
@@ -2167,7 +2167,7 @@ fn b76_an_integer_backed_enums_hash_is_its_numbers_hash() {
     // enum does NOT collide with an unrelated key of the other shape.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::{ Hash, Hashable };
         enum Level { Low = 0, High = 1 }
@@ -2187,7 +2187,7 @@ fn b76_std_ordering_keys_a_map() {
     // The backed enum std already shipped, now a key without ceremony.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::compare::Ordering;
         fun main() {
@@ -2209,7 +2209,7 @@ fn b76_a_backed_enum_key_emits_its_bare_value() {
     // probe found for a call.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         enum Align { Start = "flex-start", End = "flex-end" }
         fun main() {
@@ -2232,7 +2232,7 @@ fn b76_a_plain_enum_is_still_not_hashable() {
     // It needs `[derive(Hashable)]` like any other aggregate.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         enum Plain { A, B, C }
         fun main() {
@@ -2250,7 +2250,7 @@ fn b76_a_plain_enum_keys_a_set_with_the_derive() {
     // The escape hatch the previous pin points at, and it works by value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         [derive(Hashable)]
@@ -2273,7 +2273,7 @@ fn b76_a_payload_enum_is_still_not_hashable() {
     // diagnostic rather than a runtime surprise.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         enum Payload { Num(i32), Text(str) }
         fun main() {
@@ -2291,7 +2291,7 @@ fn b76_a_payload_enum_keys_a_set_with_the_derive() {
     // Its route is unchanged by this arc: the derive, with its all-fields gate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         [derive(Hashable)]
@@ -2313,7 +2313,7 @@ fn b76_a_backed_enum_field_of_a_derived_hashable_type_is_accepted() {
     // the derive's syntactic all-fields check must not reject it as a FIELD.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         enum Align { Start = "flex-start", End = "flex-end" }
@@ -2336,7 +2336,7 @@ fn b76_a_plain_enum_field_of_a_derived_hashable_type_still_needs_its_own_derive(
     // the lowering, not "is an enum".
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::hash::Hashable;
         enum Plain { A, B }
         [derive(Hashable)]
@@ -2354,7 +2354,7 @@ fn b76_a_redundant_hashable_derive_on_a_backed_enum_is_a_no_op() {
     // program written before the impl was synthesized keeps compiling.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         [derive(Hashable)]
@@ -2376,7 +2376,7 @@ fn b76_a_hand_written_hashable_impl_on_a_backed_enum_collides() {
     // author's impl with a note saying the other one is the compiler's.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::hash::{ Hashable, Hash, canonical_hash };
         enum Align { Start = "flex-start", End = "flex-end" }
         impl Align with Hashable {
@@ -2394,7 +2394,7 @@ fn b76_a_generic_backed_enum_gets_no_hashable() {
     // all, `Hashable` included.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         enum Phantom<T> { A = 1, B = 2 }
         fun main() {
@@ -2419,7 +2419,7 @@ fn a_compound_assignment_evaluates_an_impure_index_once() {
     // The filed repro, counted: one call, and the increment lands once.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         mut calls = 0;
         fun bump(): i32 {
             calls = calls + 1;
@@ -2443,7 +2443,7 @@ fn a_compound_assignment_evaluates_the_index_before_the_value() {
     // its arguments left to right), so the temp must not reorder anything.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun index(): i32 { print("index"); 0 }
         fun amount(): i32 { print("amount"); 5 }
         fun main() {
@@ -2463,7 +2463,7 @@ fn a_compound_assignment_with_a_pure_index_mints_no_temp() {
     // unconditionally is *correct* and was measured — it moves this shape's
     // golden and buys nothing (proposal/transparent-references.md).
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut ys = [10, 20];
             let index = 1;
@@ -2487,7 +2487,7 @@ fn a_compound_assignment_hoists_an_index_in_the_targets_subject() {
     // is a FIELD of an indexed element — so the hoist walks the whole spine.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Cell { n: i32 }
         mut calls = 0;
         fun bump(): i32 {
@@ -2511,7 +2511,7 @@ fn a_compound_assignment_hoists_every_index_of_a_nested_target() {
     // so the calls run in source order.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun row(): i32 { print("row"); 0 }
         fun column(): i32 { print("column"); 1 }
         fun main() {
@@ -2530,7 +2530,7 @@ fn a_compound_assignment_through_a_view_hoists_its_index() {
     // so the analyzer's compound mark sits one node down. The hoist looks under it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         mut calls = 0;
         fun bump(): i32 {
             calls = calls + 1;
@@ -2556,7 +2556,7 @@ fn a_plain_indexed_assignment_still_evaluates_its_index_once() {
     // target once, and the hoist must not touch it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         mut calls = 0;
         fun bump(): i32 {
             calls = calls + 1;
@@ -2581,7 +2581,7 @@ fn two_hand_written_subscripts_are_not_collapsed_into_one() {
     // indices.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun first(): i32 { print("first"); 0 }
         fun second(): i32 { print("second"); 1 }
         fun main() {
@@ -2611,7 +2611,7 @@ fn b106_the_i53_edge_is_a_legal_discriminant() {
     // that round-trips through the emitted literal.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Edge { Zero = 0, Max = 9007199254740991 }
         fun main() {
             print(match Edge::Max { Edge::Zero => "zero", Edge::Max => "max" });
@@ -2645,7 +2645,7 @@ fn b106_the_negative_i53_edge_is_legal_and_one_past_it_is_refused() {
     // is the last legal value in that direction too.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Edge { Zero = 0, Min = -9007199254740991 }
         fun main() {
             print(match Edge::Min { Edge::Zero => "zero", Edge::Min => "min" });
@@ -2702,7 +2702,7 @@ fn b106_a_hex_discriminant_is_range_checked_too() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Mask { Zero = 0, Edge = 0x1FFFFFFFFFFFFF }
         fun main() {
             print(match Mask::Edge { Mask::Zero => "zero", Mask::Edge => "edge" });
@@ -2729,7 +2729,7 @@ fn b111_a_walked_discriminant_gets_value_and_parse() {
     // round trip goes out through `value()` and back through `parse()`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         enum Walked { A = 5, B, C }
@@ -2758,7 +2758,7 @@ fn b111_a_walk_from_the_implicit_zero_gets_them_too() {
     // value converts the whole declaration, so the other two walk from it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         enum Level { Low = 0, Mid, High }
@@ -2782,7 +2782,7 @@ fn b111_a_negative_walk_gets_them_too() {
     // compared at all — the reason §3.8 chose that shape.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         enum Signed { Less = -1, Equal, Greater }
@@ -2809,7 +2809,7 @@ fn b111_a_written_literal_keeps_its_own_spelling() {
     // rendered from the resolved value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         enum Hexed { A = 0x10, B, C = 0x20 }
@@ -2853,7 +2853,7 @@ fn b111_a_broken_walk_generates_no_conversions() {
     // which is what a broken enum has always produced.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         enum Walked { A = 5, B, C = 6 }
         fun main() { print(Walked::A.value()); }
         "#,
@@ -2882,7 +2882,7 @@ fn b111_a_fully_written_string_enum_is_unchanged() {
     // conversions, and they still carry the author's own text.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         enum Align { Start = "flex-start", End = "flex-end" }
@@ -2921,7 +2921,7 @@ fn b111_the_i53_continuation_edge_still_holds_through_the_unified_reader() {
     // `i32` cannot narrow to the default integer.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Walk { A = 9007199254740990, B }
         fun main() {
             let widest: i53 = Walk::B.value();
@@ -2939,7 +2939,7 @@ fn b111_a_walked_enum_serializes_as_its_backing_value() {
     // variant NAME — `Walked::B` was the number 6 and went out as `"B"`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
 
@@ -2969,7 +2969,7 @@ fn b111_a_walked_enum_is_hashable_and_keys_by_its_value() {
     // generators' stricter rule — this is the pin that would catch it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::hash::Hashable;
 
@@ -2992,7 +2992,7 @@ fn b111_a_plain_enum_is_still_not_backed() {
     // enum keeps its `[index, ..data]` array form and gets no conversions.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         enum Plain { A, B }
         fun main() { print(Plain::A.value()); }
         "#,
@@ -3193,7 +3193,7 @@ fn b115_a_tuple_of_binders_is_still_a_catch_all() {
     // catch-all that is emitted as the `else`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun f(p: (i32, i32), count: i32): str {
             match p {
                 (1, 2) => "x",
@@ -3215,7 +3215,7 @@ fn b115_a_guarded_leg_before_a_catch_all_runs_both_ways() {
     // guarded leg was last instead.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum E { A, B }
         fun f(e: E, count: i32): str {
             match e {
@@ -3243,7 +3243,7 @@ fn b115_a_guarded_final_leg_keeps_its_guard() {
     // legs above it already took.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum E { A, B }
         fun f(e: E, count: i32): str {
             match e {
@@ -3275,7 +3275,7 @@ fn b115_a_guarded_final_leg_runs_the_leg_the_earlier_legs_cover() {
     // green. The emission pins above and below are where the drop shows.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum E { A, B }
         fun f(e: E, count: i32): str {
             match e {
@@ -3299,7 +3299,7 @@ fn b115_the_trap_composes_with_a_guarded_final_leg() {
     // value this guard rejects was taken by one of the legs above.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "s", End = "e" }
         fun f(a: Align, count: i32): str {
             match a {
@@ -3330,7 +3330,7 @@ fn b115_a_guarded_final_leg_keeps_its_guard_in_the_sequence_emitter() {
     // there too, and with it the prelude the guard's temporary lives in.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum E { A, B }
         enum Wrap { One(i32), Two }
         fun f(e: E, w: Wrap): str {
@@ -3362,7 +3362,7 @@ fn b115_a_guarded_final_leg_in_the_sequence_emitter_runs_the_covering_leg() {
     // match.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum E { A, B }
         enum Wrap { One(i32), Two }
         fun f(e: E, w: Wrap): str {
@@ -3395,7 +3395,7 @@ fn b115_a_guarded_final_leg_keeps_its_guard_behind_a_nested_proof() {
     // shape it demonstrated no longer exists to test.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Pair { Of(Align) }
         fun f(p: Pair, count: i32): str {
@@ -3465,7 +3465,7 @@ fn b118_a_refutable_payload_pattern_is_not_exhaustive_unguarded() {
     // involved. The witness names the value that had no leg.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Pair { Of(Align) }
         fun label(p: Pair): str {
@@ -3484,7 +3484,7 @@ fn b118_full_nested_variant_coverage_is_exhaustive() {
     // is total. Run, so the answer is pinned and not merely the verdict.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Pair { Of(Align) }
         fun label(p: Pair): str {
@@ -3503,7 +3503,7 @@ fn b118_a_binder_or_wildcard_payload_covers_its_variant() {
     // cover all of it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Pair { Of(Align) }
         fun bound(p: Pair): str { match p { Pair::Of(let a) => "bound" } }
@@ -3540,7 +3540,7 @@ fn b118_a_tuple_subject_of_literals_is_not_exhaustive() {
     // which the walk knows how to ask.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun f(p: (i32, i32)): str {
             match p { (1, 2) => "x", (3, 4) => "y" }
         }
@@ -3556,7 +3556,7 @@ fn b118_a_tuple_of_binders_is_still_exhaustive_and_runs() {
     // leg matches every tuple. `(1, 2)` before it keeps its test.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun f(p: (i32, i32)): str {
             match p { (1, 2) => "x", (let a, let b) => "rest" }
         }
@@ -3593,7 +3593,7 @@ fn b118_a_tuple_of_enums_fully_covered_runs() {
     // answers are pinned in both elements' directions.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         fun f(p: (Align, Align)): str {
             match p {
@@ -3615,7 +3615,7 @@ fn b118_a_tuple_element_binder_covers_that_element() {
     // exhaustively, the second is bound. Two legs cover four values.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         fun f(p: (Align, bool)): str {
             match p { (Align::Start, let flag) => "s", (Align::End, let flag) => "e" }
@@ -3651,7 +3651,7 @@ fn b118_a_literal_payload_does_not_prove_coverage() {
     // that would.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         enum Wrapped { Of(i32) }
         fun f(w: Wrapped): str {
             match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }
@@ -3684,7 +3684,7 @@ fn b118_a_binder_payload_over_an_open_domain_runs() {
     // binder leg takes everything else.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Wrapped { Of(i32) }
         fun f(w: Wrapped): str {
             match w { Wrapped::Of(1) => "one", Wrapped::Of(let n) => "many" }
@@ -3758,7 +3758,7 @@ fn b118_a_multi_payload_variant_fully_covered_runs() {
     // Its twin, total and run — the product written out.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Two { Of(Align, bool) }
         fun f(t: Two): str {
@@ -3799,7 +3799,7 @@ fn b118_a_recursive_enum_covered_one_level_down_runs() {
     // walk stops there rather than unfolding the type forever.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Tree { Leaf, Node(Tree, Tree) }
         fun depth(t: Tree): i32 {
             match t {
@@ -3840,7 +3840,7 @@ fn b118_leg_order_does_not_change_the_verdict() {
     // legs, not the walk.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Pair { Of(Align), Other }
         fun forward(p: Pair): str {
@@ -3866,7 +3866,7 @@ fn b118_an_or_pattern_contributes_each_alternative() {
     // the payload exactly as two legs would.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Pair { Of(Align) }
         fun f(p: Pair): str {
@@ -3910,7 +3910,7 @@ fn b118_a_catch_all_still_proves_everything_below_the_top_level() {
     // non-exhaustive.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, Middle, End }
         enum Mid { Of(Align) }
         enum Outer { Of(Mid) }
@@ -3953,7 +3953,7 @@ fn b118_the_membership_trap_no_longer_fires_on_an_in_set_value() {
     // payload answers, the invented one traps and names itself.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start = "flex-start", End = "flex-end" }
         enum Pair { Of(Align) }
         fun label(p: Pair): str {
@@ -3981,7 +3981,7 @@ fn b118_the_witness_is_a_pattern_that_closes_the_hole() {
     // multi-slot variant with an untested slot, and a tuple.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Align { Start, End }
         enum Holder { Of((Align, bool)) }
         enum Two { Of(Align, bool) }

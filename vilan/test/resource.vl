@@ -4,7 +4,7 @@
 // before its fields (reverse field order), and a containment-only resource
 // (no `Drop` impl) still freeing its fields. Synchronous + host-free, so the
 // interpreter equivalence gate checks it against `node` too.
-import std::print;
+import std::io::print;
 import std::drop::Drop;
 
 // A leaf resource that announces its teardown.

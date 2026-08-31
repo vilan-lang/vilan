@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::map::Map;
 import std::set::Set;
 

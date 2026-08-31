@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::option::Option::{ self, Some, None };
 
 // B55/B56: a bounded generic reached through a re-dispatched callee. The

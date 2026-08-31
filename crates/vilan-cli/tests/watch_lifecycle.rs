@@ -28,7 +28,7 @@ fn temp_package(tag: &str) -> PathBuf {
     std::fs::write(dir.join("vilan.toml"), "[package]\nname = \"app\"\n").unwrap();
     std::fs::write(
         dir.join("src/main.vl"),
-        "import std::print;\n\nfun main() {\n\tprint(\"round\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"round\");\n}\n",
     )
     .unwrap();
     dir
@@ -121,7 +121,7 @@ fn build_hooks_run_once_per_watch_round() {
     // A source edit starts a second round, which must run the hook again.
     std::fs::write(
         dir.join("src/main.vl"),
-        "import std::print;\n\nfun main() {\n\tprint(\"round two\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"round two\");\n}\n",
     )
     .unwrap();
     wait_for("the second round's hook", || lines() >= 2);

@@ -7,7 +7,6 @@ import std::build::require_build;
 import std::document::require_shell;
 import std::http::{ Response, Server };
 import std::json::json_codec;
-import std::print;
 import std::rpc_server::Service;
 import pkg::store::boot;
 

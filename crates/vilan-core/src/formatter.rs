@@ -7135,8 +7135,8 @@ mod import_set_layout {
         // the whole file silently bails — the corpus's async-promise-all.vl
         // shape, caught by exactly that bail.
         assert_construct(
-            "import std::{ print };\nimport std::task::Task;\n",
-            "import std::print;\nimport std::task::Task;\n",
+            "import std::{ io::print };\nimport std::task::Task;\n",
+            "import std::io::print;\nimport std::task::Task;\n",
         );
     }
 
@@ -8575,7 +8575,8 @@ mod insert {
     // probe (the string entry pays it per call, which is the cost §9 measured).
     #[test]
     fn a_parsed_source_answers_every_probe_identically_from_one_parse() {
-        let source = "import std::json::{ Alpha, Zeta };\nimport std::print;\n\nfun main() {}\n";
+        let source =
+            "import std::json::{ Alpha, Zeta };\nimport std::io::print;\n\nfun main() {}\n";
         let probes: [(&[&str], &str); 4] = [
             (&["std", "json"], "Mid"),   // inserts into the brace set
             (&["std"], "read"),          // extends the surface import
@@ -8659,12 +8660,14 @@ mod insert {
     }
 
     // The one-segment (package-surface) form extends the same way — the
-    // module path is just `["std"]`, not `["std", <module>]`.
+    // module path is just `["std"]`, not `["std", <module>]`. Spelled with a
+    // stand-in surface: std's own package root publishes nothing since the
+    // alias sweep (prelude.md §10.2), and this assertion is textual.
     #[test]
     fn a_surface_level_bare_leaf_becomes_a_set() {
         assert_eq!(
-            apply("import std::print;\n", &["std"], "read").unwrap(),
-            "import std::{ print, read };\n",
+            apply("import shapes::alpha;\n", &["shapes"], "beta").unwrap(),
+            "import shapes::{ alpha, beta };\n",
         );
     }
 

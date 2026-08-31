@@ -2,7 +2,7 @@ import std::bytes::{ Bytes, decode_utf8 };
 import std::drop::drop;
 import std::fs;
 import std::fs::{ File, with_file };
-import std::print;
+import std::io::print;
 
 // The handle tier (kolt.local 031 S3, proposal/filesystem.md §3.2): positional
 // reads off an open file, the postfix-off-an-awaited-call spellings the tier

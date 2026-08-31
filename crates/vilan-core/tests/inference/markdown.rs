@@ -49,7 +49,7 @@ fn assert_reports_all(source: &str, expected: &[&str]) {
 #[test]
 fn a_parse_error_does_not_hide_the_analyzer_errors_in_another_function() {
     assert_reports_all(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun broken() {\n\
          \tlet a: i32 = 1\n\
          \tprint(a);\n\
@@ -155,7 +155,7 @@ fn a_recovered_region_produces_no_analyzer_diagnostics_of_its_own() {
 #[test]
 fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
     let messages = all_diagnostics(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tlet origin: i32 = 3\n\
          \tlet total: i32 = origin + 1;\n\
@@ -196,7 +196,7 @@ fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
 fn b73_an_annotated_into_call_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
 
         struct Foo { n: i32 }
@@ -228,7 +228,7 @@ fn b73_an_annotated_into_call_reaches_the_user_impl() {
 fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_first_declared() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
         import std::string::str;
 
@@ -262,7 +262,7 @@ fn b73_an_unannotated_into_call_is_ambiguous_rather_than_silently_first_declared
 fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
         import std::string::str;
 
@@ -298,7 +298,7 @@ fn b73_an_into_call_in_return_position_reaches_the_user_impl() {
 fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
         import std::string::str;
 
@@ -336,7 +336,7 @@ fn b73_a_trait_qualified_into_call_reaches_the_user_impl() {
 #[test]
 fn b73_a_user_blanket_loses_to_a_specific_impl_whatever_the_order() {
     let blanket_first = r#"
-        import std::print;
+        import std::io::print;
 
         trait Conv<T> { fun conv(self): T; }
 
@@ -353,7 +353,7 @@ fn b73_a_user_blanket_loses_to_a_specific_impl_whatever_the_order() {
         }
         "#;
     let specific_first = r#"
-        import std::print;
+        import std::io::print;
 
         trait Conv<T> { fun conv(self): T; }
 
@@ -381,7 +381,7 @@ fn b73_a_user_blanket_loses_to_a_specific_impl_whatever_the_order() {
 #[test]
 fn b73_a_concrete_impl_subject_outranks_a_generic_one() {
     let generic_first = r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32; }
 
@@ -394,7 +394,7 @@ fn b73_a_concrete_impl_subject_outranks_a_generic_one() {
         fun main() { print(Box { v = 5 }.tag()); }
         "#;
     let concrete_first = r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32; }
 
@@ -417,7 +417,7 @@ fn b73_a_concrete_impl_subject_outranks_a_generic_one() {
 #[test]
 fn b73_a_bounded_impl_subject_outranks_an_unbounded_one() {
     let unbounded_first = r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
 
         trait Tag { fun tag(self): i32; }
@@ -431,7 +431,7 @@ fn b73_a_bounded_impl_subject_outranks_an_unbounded_one() {
         fun main() { print(Box { v = 5 }.tag()); }
         "#;
     let bounded_first = r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
 
         trait Tag { fun tag(self): i32; }
@@ -454,7 +454,7 @@ fn b73_a_bounded_impl_subject_outranks_an_unbounded_one() {
 #[test]
 fn b73_a_nested_concrete_impl_subject_outranks_a_generic_one() {
     let generic_first = r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
 
         trait Tag { fun tag(self): i32; }
@@ -468,7 +468,7 @@ fn b73_a_nested_concrete_impl_subject_outranks_a_generic_one() {
         fun main() { print(Box { v = [1, 2, 3] }.tag()); }
         "#;
     let concrete_first = r#"
-        import std::print;
+        import std::io::print;
         import std::list::List;
 
         trait Tag { fun tag(self): i32; }
@@ -495,7 +495,7 @@ fn b73_a_nested_concrete_impl_subject_outranks_a_generic_one() {
 fn b73_an_applicable_unbounded_impl_survives_an_inapplicable_bounded_one() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
 
         trait Tag { fun tag(self): i32; }
@@ -525,7 +525,7 @@ fn b73_an_applicable_unbounded_impl_survives_an_inapplicable_bounded_one() {
 #[test]
 fn b73_a_specific_impl_taking_the_trait_default_outranks_a_blanket_declaration() {
     let blanket_first = r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32 { 9 } }
 
@@ -538,7 +538,7 @@ fn b73_a_specific_impl_taking_the_trait_default_outranks_a_blanket_declaration()
         fun main() { print(Foo { n = 1 }.tag()); }
         "#;
     let specific_first = r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32 { 9 } }
 
@@ -567,7 +567,7 @@ fn b73_a_specific_impl_taking_the_trait_default_outranks_a_blanket_declaration()
 #[test]
 fn b73_two_impls_of_one_trait_at_different_arguments_are_both_reachable() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         trait Conv<T> { fun conv(self): T; }
 
@@ -600,7 +600,7 @@ fn b73_two_impls_of_one_trait_at_different_arguments_are_both_reachable() {
 fn b73_a_bound_selects_the_impl_matching_its_trait_arguments() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::string::str;
 
         trait Conv<T> { fun conv(self): T; }
@@ -637,7 +637,7 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
     // import path and the two impls' declarations.
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
         import std::string::str;
 
@@ -674,7 +674,7 @@ fn b73_the_argument_ambiguity_names_both_homes_as_the_receiver_instantiates_them
 fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
         import std::string::str;
 
@@ -705,7 +705,7 @@ fn b73_an_expectation_matching_no_home_leaves_the_call_ambiguous() {
 fn b73_two_bounds_at_different_arguments_each_reach_their_own_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::string::str;
 
         trait Conv<T> { fun conv(self): T; }
@@ -742,7 +742,7 @@ fn b73_two_bounds_at_different_arguments_each_reach_their_own_impl() {
 fn b73_an_impl_whose_trait_argument_is_its_own_binder_survives_the_filter() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Tagged<T> { fun tagged(self): i32 { 1 } }
 
@@ -769,7 +769,7 @@ fn b73_an_impl_whose_trait_argument_is_its_own_binder_survives_the_filter() {
 fn b73_two_impls_bounded_by_unrelated_traits_are_an_unrankable_overlap() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         import std::compare::Ord;
 
@@ -803,7 +803,7 @@ fn b73_two_impls_bounded_by_unrelated_traits_are_an_unrankable_overlap() {
 fn b73_a_conditional_impl_does_not_satisfy_a_bound_its_binder_refuses() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Marker { fun mark(self): i32; }
 
@@ -828,7 +828,7 @@ fn b73_a_conditional_impl_does_not_satisfy_a_bound_its_binder_refuses() {
 fn b73_an_inapplicable_impl_that_is_the_only_one_still_reports_its_bound() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
 
         trait Tag { fun tag(self): i32; }
@@ -850,7 +850,7 @@ fn b73_an_inapplicable_impl_that_is_the_only_one_still_reports_its_bound() {
 #[test]
 fn b73_an_applicable_impl_wins_whichever_side_of_the_inapplicable_one_it_sits() {
     let applicable_first = r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
 
         trait Tag { fun tag(self): i32; }
@@ -875,7 +875,7 @@ fn b73_an_applicable_impl_wins_whichever_side_of_the_inapplicable_one_it_sits() 
 fn b73_an_inherent_member_still_outranks_the_most_specific_trait_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32 { 9 } }
 
@@ -901,7 +901,7 @@ fn b73_an_inherent_member_still_outranks_the_most_specific_trait_impl() {
 fn b73_a_blanket_declaring_nothing_leaves_the_specific_impl_alone() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32; }
 
@@ -928,7 +928,7 @@ fn b73_a_blanket_declaring_nothing_leaves_the_specific_impl_alone() {
 #[test]
 fn b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins() {
     let direct = r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32; }
 
@@ -941,7 +941,7 @@ fn b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins() {
         fun main() { print(Foo { n = 1 }.tag()); }
         "#;
     let through_a_bound = r#"
-        import std::print;
+        import std::io::print;
 
         trait Tag { fun tag(self): i32; }
 
@@ -980,7 +980,7 @@ fn b73_a_direct_call_and_a_bounded_call_agree_on_which_impl_wins() {
 fn b127_an_into_call_with_no_user_impl_is_a_missing_method() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
 
         struct Foo { n: i32 }
@@ -1003,7 +1003,7 @@ fn b127_an_into_call_with_no_user_impl_is_a_missing_method() {
 fn b127_an_unannotated_into_call_with_one_user_impl_selects_it() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
         import std::string::str;
 
@@ -1035,7 +1035,7 @@ fn b127_an_unannotated_into_call_with_one_user_impl_selects_it() {
 #[test]
 fn b130_an_into_bound_fed_its_target_without_an_impl_is_refused_cleanly() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
 
         struct Foo { n: i32 }
@@ -1066,7 +1066,7 @@ fn b130_an_into_bound_fed_its_target_without_an_impl_is_refused_cleanly() {
 fn b130_a_user_reflexive_impl_carries_the_bound_path() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::into::Into;
 
         struct Foo { n: i32 }
@@ -1104,7 +1104,7 @@ fn b130_a_user_reflexive_impl_carries_the_bound_path() {
 fn b128_an_expectation_selecting_an_unrankable_home_reports_its_overlap() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         import std::compare::Ord;
         import std::string::str;
@@ -1139,7 +1139,7 @@ fn b128_an_expectation_selecting_an_unrankable_home_reports_its_overlap() {
 fn b128_an_expectation_selecting_a_ranked_home_beside_an_unrankable_one_runs() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         import std::compare::Ord;
         import std::string::str;
@@ -1196,7 +1196,7 @@ fn a25_disposing_the_last_remote_subscription_sends_unsubscribe() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
@@ -1252,7 +1252,7 @@ fn a25_a_second_watcher_opens_no_second_server_forward() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
@@ -1291,7 +1291,7 @@ fn a25_a_second_subscribe_frame_opens_no_second_forward() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveServer, duplex_pair, encode_control };
         import std::wire::Frame;
@@ -1334,7 +1334,7 @@ fn a25_a_same_turn_resubscribe_cancels_the_pending_unsubscribe() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
@@ -1394,7 +1394,7 @@ fn a25_a_pending_unsubscribe_does_not_cross_a_rebind() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, batch };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair, encode_control };
         import std::wire::Frame;
@@ -1452,7 +1452,7 @@ fn a25_a_counted_subscription_releases_its_lease_once() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
@@ -1512,7 +1512,7 @@ fn a25_map_carries_a_fallback_and_the_count_rides_the_owner() {
         r#"
         import std::json::json_codec;
         import std::option::Option::{ None, Some, self };
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, Status, duplex_pair };
         import std::wire::Frame;
@@ -1584,7 +1584,7 @@ fn a25_map_outside_an_owner_scope_is_a_compile_error() {
         r#"
         import std::json::json_codec;
         import std::option::Option::{ None, Some, self };
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
@@ -1610,7 +1610,7 @@ fn a25_or_outside_an_owner_scope_is_a_compile_error() {
     assert_fails_with(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
@@ -1635,7 +1635,7 @@ fn a25_or_outside_an_owner_scope_is_a_compile_error() {
 fn e74_a25_map_anchors_at_the_users_call() {
     let source = r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
@@ -1666,7 +1666,7 @@ fn e74_a25_map_anchors_at_the_users_call() {
 fn e74_a25_or_anchors_at_the_users_call() {
     let source = r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
@@ -1703,7 +1703,7 @@ fn a25_or_reads_the_initial_before_the_first_frame_and_the_value_after() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::shared::Shared;
@@ -1765,7 +1765,7 @@ fn a25_two_maps_under_one_owner_take_one_subscribe() {
         r#"
         import std::json::json_codec;
         import std::option::Option::{ None, Some, self };
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
         import std::wire::Frame;
@@ -1833,7 +1833,7 @@ fn a25_status_alone_opens_nothing_and_stays_waiting() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, Status, duplex_pair };
         import std::wire::Frame;
@@ -1908,7 +1908,7 @@ fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
     assert_compiles_and_runs(
         r#"
         import std::json::json_codec;
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 
@@ -1949,7 +1949,7 @@ fn a25_or_of_an_empty_list_infers_the_element_type_without_an_annotation() {
 fn b129_unwrap_or_of_an_empty_list_takes_the_element_from_the_receiver() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some, None };
 
         [derive(PartialEq, Debug)]
@@ -1984,7 +1984,7 @@ fn b129_unwrap_or_of_an_empty_list_takes_the_element_from_the_receiver() {
 fn b129_a_none_arm_empty_list_takes_the_type_from_the_sibling_arm() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some, None };
 
         [derive(PartialEq, Debug)]
@@ -2024,7 +2024,7 @@ fn b129_a_none_arm_empty_list_takes_the_type_from_the_sibling_arm() {
 fn b129_a_match_of_only_empty_lists_takes_the_declared_return_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq, Debug)]
         struct Note { id: i32, done: bool }
@@ -2053,7 +2053,7 @@ fn b129_a_match_of_only_empty_lists_takes_the_declared_return_type() {
 fn b129_an_empty_list_with_no_expected_type_still_errors() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let things = [];
@@ -2072,7 +2072,7 @@ fn b129_an_empty_list_with_no_expected_type_still_errors() {
 fn b129_an_empty_list_argument_binding_a_free_generic_still_errors() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq, Debug)]
         struct Note { id: i32, done: bool }
@@ -2106,7 +2106,7 @@ fn b129_an_empty_list_argument_binding_a_free_generic_still_errors() {
 fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
 
         [derive(PartialEq, Debug)]
@@ -2142,7 +2142,7 @@ fn b129_a_map_on_a_let_bound_signal_types_its_closure_parameter() {
 fn b129_indexing_an_unannotated_closure_parameter_waits_for_its_owning_call() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Todo { id: i32, done: bool }
 
@@ -2162,7 +2162,7 @@ fn b129_indexing_an_unannotated_closure_parameter_waits_for_its_owning_call() {
 fn b129_iterating_an_unannotated_closure_parameter_waits_for_its_owning_call() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Todo { id: i32, done: bool }
 
@@ -2192,7 +2192,7 @@ fn b129_iterating_an_unannotated_closure_parameter_waits_for_its_owning_call() {
 fn b129_the_inline_chain_types_its_closure_parameter_too() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Signal, owner_scope };
 
         struct Todo { id: i32, done: bool }
@@ -2231,7 +2231,7 @@ fn b129_the_inline_chain_types_its_closure_parameter_too() {
 fn b129_a_never_called_closures_parameter_still_reports() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let first = |xs| xs[0];
@@ -2242,7 +2242,7 @@ fn b129_a_never_called_closures_parameter_still_reports() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let walk = |xs| {
@@ -2270,7 +2270,7 @@ fn b131_a_never_called_closures_parameter_reports_at_the_parameter() {
     // could not be resolved" over the whole `let`.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let first = |xs| xs[0];
@@ -2286,7 +2286,7 @@ fn b131_a_never_called_closures_parameter_reports_at_the_parameter() {
     // from the cause.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let walk = |xs| {
@@ -2310,7 +2310,7 @@ fn b131_a_never_called_closures_parameter_reports_at_the_parameter() {
 #[test]
 fn b131_the_leftover_sweep_stays_silent_behind_the_parameter_refusal() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let walk = |xs| {
@@ -2331,7 +2331,7 @@ fn b131_the_leftover_sweep_stays_silent_behind_the_parameter_refusal() {
 fn b131_a_called_closure_still_infers_from_its_first_call() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let double = |x| x * 2;
@@ -2348,7 +2348,7 @@ fn b131_a_called_closure_still_infers_from_its_first_call() {
 #[test]
 fn b131_only_the_starved_parameter_is_named() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
         	let pick = |rows, fallback| rows[0];
@@ -2375,7 +2375,7 @@ fn markdown_parses_atx_headings_with_mdbook_ids() {
     // each space becomes its own hyphen — measured against mdBook v0.5.4.
     assert_compiles_and_runs(
         r##"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2406,7 +2406,7 @@ fn markdown_heading_ids_match_the_adversarial_corpus() {
     // against a local mdBook v0.5.4 build of this exact page.
     assert_compiles_and_runs(
         r####"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2435,7 +2435,7 @@ fn markdown_dedupes_repeated_ids_in_document_order() {
     // order, exactly as a renderer meets it.
     assert_compiles_and_runs(
         r####"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun emit(blocks: List<Block>) {
@@ -2464,7 +2464,7 @@ fn markdown_heading_id_is_the_dedupe_free_base() {
     // no dedupe state between calls.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ heading_id, Inline };
         fun main() {
         	mut content: List<Inline> = [];
@@ -2485,7 +2485,7 @@ fn markdown_parses_inline_code_strong_emph_and_links() {
     // at a word boundary (snake_case stays text).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun show(inlines: List<Inline>) {
@@ -2524,7 +2524,7 @@ fn markdown_parses_the_a_id_passthrough_and_autolink() {
     // autolinks become links labeled with their destination.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2560,7 +2560,7 @@ fn markdown_parses_fenced_code_with_info_string_and_verbatim_body() {
     // — the docs gate's extraction shape — blank lines included.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2590,7 +2590,7 @@ fn markdown_parses_flat_lists_ordered_and_unordered() {
     // Items block; a simple item is one Paragraph of inlines.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2623,7 +2623,7 @@ fn markdown_a_list_item_carries_blocks() {
     // glommed into the item's first line.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2659,7 +2659,7 @@ fn markdown_parses_blockquotes_recursively() {
     // §2's probed recursion: a quote holds blocks, including another quote.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun depth(blocks: List<Block>, level: i32) {
@@ -2692,7 +2692,7 @@ fn markdown_parses_pipe_tables_and_unescapes_cell_pipes() {
     // the code span carries a real `|`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2731,7 +2731,7 @@ fn markdown_bullet_indented_fence_extracts_and_dedents() {
     // own indent.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun emit(blocks: List<Block>) {
@@ -2762,7 +2762,7 @@ fn markdown_deeper_fence_body_lines_keep_relative_indent() {
     // fence's columns come off; deeper indentation survives.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2790,7 +2790,7 @@ fn markdown_an_indented_fence_does_not_swallow_following_prose() {
     // prose, and the flush fence after it survives.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun emit(blocks: List<Block>) {
@@ -2823,7 +2823,7 @@ fn markdown_a_fence_like_line_at_a_different_indent_does_not_close() {
     // not_close`: a ``` deeper than the opener is body, not the closer.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ parse, Block, Doc, Inline, ParseError };
         import std::result::Result::{ Err, Ok };
         fun main() {
@@ -2852,7 +2852,7 @@ fn assert_markdown_refuses(source_literal: &str, expected_error: &str) {
     // print the error (or a loud "parsed" if the refusal regressed).
     let program = format!(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{{ parse, Doc, ParseError }};
         import std::result::Result::{{ Err, Ok }};
         fun main() {{
@@ -3043,7 +3043,7 @@ fn b136_an_is_in_a_loop_condition_reads_the_current_subject() {
     // so the second condition evaluation must see `Some` and stop at 1.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             mut found: Option<i32> = None;
@@ -3067,7 +3067,7 @@ fn b136_an_unbounded_is_condition_loop_terminates() {
     // the budget is generous because it only guards against the hang.
     assert_runs_within(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             mut found: Option<i32> = None;
@@ -3089,7 +3089,7 @@ fn b136_a_jump_break_bounded_is_condition_loop_exits_on_reassignment() {
     // the stale hoist rode the valve to 3.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             mut found: Option<i32> = None;
@@ -3114,7 +3114,7 @@ fn b136_nested_loops_each_reevaluate_their_is_condition() {
     // per OUTER iteration). One inner pass and one outer pass is correct.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             mut outer: Option<i32> = None;
@@ -3142,7 +3142,7 @@ fn b136_a_loop_condition_is_binding_reads_the_current_payload() {
     // rebinds the capture each iteration: 3+2+1+0 = 6.
     assert_runs_within(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             mut next: Option<i32> = Some(3);
@@ -3168,7 +3168,7 @@ fn b136_two_is_tests_in_one_condition_both_reevaluate() {
     // Two subjects, two hoists in one condition — both must move inside.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             mut a: Option<i32> = None;
@@ -3192,7 +3192,7 @@ fn b136_a_result_is_condition_reevaluates() {
     // same shape over `Err`, with a binding to boot.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::result::Result::{ Ok, Err, self };
         fun main() {
             mut state: Result<i32, str> = Err("pending");
@@ -3215,7 +3215,7 @@ fn b136_an_is_in_an_if_inside_a_loop_stays_fresh() {
     // `None` only on the first pass, so `found` pins to 0.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             mut found: Option<i32> = None;
@@ -3247,7 +3247,7 @@ fn b136_an_is_in_an_if_inside_a_loop_stays_fresh() {
 fn substring_with_a_negative_literal_start_is_a_compile_error() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() { print("hello".substring(-1, 3)); }
         main();
         "#,
@@ -3261,7 +3261,7 @@ fn substring_with_a_negative_literal_end_is_a_compile_error() {
     // The exact spelling the ban is named for.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() { print("hello, world".substring(7, -1)); }
         main();
         "#,
@@ -3276,7 +3276,7 @@ fn substring_with_literal_bounds_inverted_is_a_compile_error() {
     // which is why the rule is stated as one inequality rather than a sign check.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() { print("hello".substring(5, 2)); }
         main();
         "#,
@@ -3291,7 +3291,7 @@ fn substring_past_the_end_of_a_string_literal_is_a_compile_error() {
     // writes `s.len()`.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() { print("hello".substring(0, 100)); }
         main();
         "#,
@@ -3304,7 +3304,7 @@ fn substring_past_the_end_of_a_string_literal_is_a_compile_error() {
 fn substring_names_the_replacement_verbs_in_its_note() {
     assert_fails_noting(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() { print("hello".substring(2, -1)); }
         main();
         "#,
@@ -3320,7 +3320,7 @@ fn substring_admits_its_boundary_ranges() {
     // the degenerate ones inside it: both empty ends and the whole string work.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let s = "hello";
             print(s.substring(0, 0).len());
@@ -3338,7 +3338,7 @@ fn substring_admits_its_boundary_ranges() {
 fn substring_with_a_computed_negative_start_panics() {
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let s = "hello";
             let start = 0 - 1;
@@ -3354,7 +3354,7 @@ fn substring_with_a_computed_negative_start_panics() {
 fn substring_with_a_computed_negative_end_panics() {
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let s = "hello, world";
             let offset = 7;
@@ -3371,7 +3371,7 @@ fn substring_with_a_computed_negative_end_panics() {
 fn substring_with_a_computed_inverted_range_panics() {
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let s = "hello";
             let start = 4;
@@ -3388,7 +3388,7 @@ fn substring_with_a_computed_inverted_range_panics() {
 fn substring_with_a_computed_end_past_the_length_panics() {
     assert_run_panics(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let s = "hello";
             let end = 100;
@@ -3407,7 +3407,7 @@ fn substring_out_of_range_fails_const_evaluation() {
     // the build instead of failing it.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun cut(text: str, start: i32, end: i32): str { text.substring(start, end) }
         fun main() { let bad = const cut("hello", 4, 2); print(bad); }
         main();
@@ -3422,7 +3422,7 @@ fn strip_prefix_and_strip_suffix_cut_or_report_absence() {
     // reaching for `substring(offset, -1)` actually wanted.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             match "data: 42".strip_prefix("data: ") {
@@ -3454,7 +3454,7 @@ fn stripping_a_whole_match_is_some_empty_not_none() {
     // empty" are different answers, and a bare `str` could not tell them apart.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             match "ab".strip_prefix("ab") {
@@ -3484,7 +3484,7 @@ fn stripping_a_whole_match_is_some_empty_not_none() {
 fn index_of_locates_the_first_occurrence_or_reports_absence() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             match "a=1;b=2".index_of("=") {
@@ -3513,7 +3513,7 @@ absent
 fn last_index_of_locates_the_final_occurrence() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             match "a.b.c".last_index_of(".") {
@@ -3540,7 +3540,7 @@ fn an_absent_needle_is_none_not_minus_one() {
     // later, inside `substring`, about a number this call produced.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print("abc".index_of("z").unwrap_or(-99));
             print("abc".last_index_of("z").unwrap_or(-99));
@@ -3559,7 +3559,7 @@ fn an_empty_needle_sits_at_each_end() {
     // string is at `0` from the front and at `len()` from the back.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print("abc".index_of("").unwrap_or(-1));
             print("abc".last_index_of("").unwrap_or(-1));
@@ -3580,7 +3580,7 @@ fn index_of_composes_with_substring_to_cut_at_a_separator() {
     // nothing computed, which is why the evidence run parsed by `split`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ None, Some, self };
         fun main() {
             let line = "key: value";
@@ -3619,7 +3619,7 @@ fn to_uppercase_maps_full_unicode_and_can_grow() {
     // tell that this is the host's mapping and not a code-unit shift.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print("Straße".to_uppercase());
             print("Straße".len());
@@ -3643,7 +3643,7 @@ fn to_lowercase_is_the_full_unicode_mirror() {
     // and `İ` lowers to TWO code units — so indices do not survive the call.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print("STRASSE-Ǳ".to_lowercase());
             print("İ".len());
@@ -3662,7 +3662,7 @@ fn to_lowercase_is_the_full_unicode_mirror() {
 fn to_lowercase_ascii_shifts_only_the_twenty_six_letters() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print("AbC-123_xYz".to_lowercase_ascii());
             // `ß`, `Ǳ`, `İ` and every accented letter pass through untouched,
@@ -3690,7 +3690,7 @@ fn to_uppercase_ascii_shifts_only_the_twenty_six_letters() {
     // leaves it alone and cannot grow at all.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print("AbC-123_xYz".to_uppercase_ascii());
             print("straße".to_uppercase_ascii());
@@ -3718,7 +3718,7 @@ fn the_ascii_case_pair_round_trips_mixed_input() {
     // sites (mime rows, header names, tag names) actually depend on.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let mixed = "Content-Type: text/HTML; charset=UTF-8 — Straße/Ǳ";
             print(mixed.to_uppercase_ascii().to_lowercase_ascii() == mixed.to_lowercase_ascii());
@@ -3745,7 +3745,7 @@ fn the_ascii_fold_leaves_the_kelvin_sign_where_the_unicode_fold_moves_it() {
     // touch it. (The literal below is U+212A, NOT the ASCII `K` it renders as.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let kelvin = "K";
             print(kelvin.to_lowercase() == "k");
@@ -3769,7 +3769,7 @@ fn heading_id_folds_ascii_and_non_ascii_by_their_own_rules() {
     // fold — mdBook's own case rule, which `école-été` is the evidence for.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::markdown::{ heading_id, Inline };
         fun main() {
         	mut ascii: List<Inline> = [];
@@ -3834,7 +3834,7 @@ fn records_served_under_substitution(source: &str) -> u64 {
 /// a trait (the `b102`/`i5` shape whose records this suite was measured on), and
 /// a plain generic function.
 const CALLER_SHAPED_RETURN_PLANT: &str = r#"
-        import std::print;
+        import std::io::print;
 
         trait Producer<T> {
             fun produce(self): T;
@@ -3923,7 +3923,7 @@ fn b139_the_caller_shaped_return_plant_runs_at_both_instantiations() {
 fn path_normalize_collapses_separators_and_resolves_dot() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::normalize("a//b/./c"));
@@ -3948,7 +3948,7 @@ fn path_normalize_drops_a_trailing_separator_where_node_keeps_it() {
     // with two entries for one file.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::normalize("a/b/"));
@@ -3969,7 +3969,7 @@ fn path_normalize_stops_at_an_absolute_root_but_keeps_a_relative_climb() {
     // leading `..` on a relative path is kept, because it names something.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::normalize("/../a"));
@@ -3993,7 +3993,7 @@ fn path_functions_never_fold_case() {
     // case it was given.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         import std::option::Option::{ None, Some, self };
         fun main() {
@@ -4020,7 +4020,7 @@ fn path_join_does_not_reset_on_an_absolute_second_argument_but_resolve_does() {
     // name.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::join("/a", "/b"));
@@ -4040,7 +4040,7 @@ fn path_join_treats_an_empty_side_as_nothing() {
     // no separator, it contributes nothing at all.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::join("", "b"));
@@ -4059,7 +4059,7 @@ fn path_join_treats_an_empty_side_as_nothing() {
 fn path_join_all_folds_left_and_answers_the_empty_list() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             let parts: List<str> = ["a", "b", "c"];
@@ -4079,7 +4079,7 @@ fn path_join_all_folds_left_and_answers_the_empty_list() {
 fn path_basename_ignores_trailing_separators_and_the_root_has_none() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::basename("/a/b.txt"));
@@ -4102,7 +4102,7 @@ fn path_dirname_stops_at_the_root_and_answers_dot_without_a_separator() {
     // be normalized away by whoever receives it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::dirname("/a/b.txt"));
@@ -4128,7 +4128,7 @@ fn path_extname_gives_a_dotfile_no_extension() {
     // `path.extname` answers the same way and hand-rolled versions rarely do.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::extname(".gitignore"));
@@ -4149,7 +4149,7 @@ fn path_extname_reads_the_last_dot_of_the_last_component() {
     // about the file — and a trailing dot is an empty extension spelled ".".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::extname("index.html"));
@@ -4172,7 +4172,7 @@ fn path_stem_and_extname_cut_the_basename_in_two() {
     // together instead of re-deriving the split at each call site.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun holds(candidate: str): bool {
             path::stem(candidate) + path::extname(candidate) == path::basename(candidate)
@@ -4203,7 +4203,7 @@ fn path_starts_with_compares_components_where_the_str_verb_compares_text() {
     // kolt.local 023 filed.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print("/a/bc".starts_with("/a/b"));
@@ -4227,7 +4227,7 @@ fn path_relative_inverts_resolve() {
     // that makes the pair usable for rebasing a whole tree of paths.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         import std::option::Option::{ None, Some, self };
         fun step(from: str, to: str) {
@@ -4261,7 +4261,7 @@ fn path_relative_is_none_where_there_is_no_lexical_answer() {
     // reason — "no answer" and "the answer is `.`" are different.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         import std::option::Option::{ None, Some, self };
         fun show(from: str, to: str) {
@@ -4294,7 +4294,7 @@ fn std_path_is_colorless_and_serves_a_browser_build() {
     // reach of half the program.
     assert_compiles_browser(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             print(path::join("/assets", "app.css"));
@@ -4311,7 +4311,7 @@ fn path_arithmetic_folds_under_const() {
     // a `node:path` binding could never have had.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         fun main() {
             let folded = const path::join("dist", "../dist/app.js");
@@ -4338,7 +4338,7 @@ fn path_strip_prefix_cuts_only_where_starts_with_agrees() {
     // answer for a path to itself.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::path;
         import std::option::Option::{ None, Some, self };
         fun show(path: str, prefix: str) {

@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // Iterating a list *view* binds each element as a view rather than a copy:
 // `&mut list` yields writable element views (`e = …` / `e.field = …` writes

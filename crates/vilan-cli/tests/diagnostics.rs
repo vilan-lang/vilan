@@ -217,7 +217,7 @@ fn a_module_diagnostic_renders_in_the_module_file() {
             ("vilan.toml", MANIFEST),
             (
                 "src/main.vl",
-                "import std::print;\nimport pkg::alpha::value;\n\nfun main() {\n\tprint(value());\n}\n",
+                "import std::io::print;\nimport pkg::alpha::value;\n\nfun main() {\n\tprint(value());\n}\n",
             ),
             (
                 "src/alpha.vl",
@@ -248,7 +248,7 @@ fn a_crlf_entry_does_not_make_a_cross_source_span_fatal() {
     // offset, so the module's span (33..39, the `"nope"` literal in `alpha.vl`)
     // lands INSIDE a character rather than between two.
     let entry = format!(
-        "//  {}\r\nimport std::print;\r\nimport pkg::alpha::value;\r\n\r\nfun main() {{\r\n\tprint(value());\r\n}}\r\n",
+        "//  {}\r\nimport std::io::print;\r\nimport pkg::alpha::value;\r\n\r\nfun main() {{\r\n\tprint(value());\r\n}}\r\n",
         "é".repeat(40)
     );
     let dir = temp_files(
@@ -290,7 +290,7 @@ fn an_entry_file_diagnostic_still_renders_against_the_entry() {
             ("vilan.toml", MANIFEST),
             (
                 "src/main.vl",
-                "import std::print;\n\nfun main() {\n\tlet x: i32 = \"not an int\";\n\tprint(x);\n}\n",
+                "import std::io::print;\n\nfun main() {\n\tlet x: i32 = \"not an int\";\n\tprint(x);\n}\n",
             ),
         ],
     );
@@ -315,7 +315,7 @@ fn a_post_analysis_pass_diagnostic_renders_in_the_module_file() {
             ("vilan.toml", MANIFEST),
             (
                 "src/main.vl",
-                "import std::print;\nimport pkg::alpha::N;\n\nfun main() {\n\tprint(N);\n}\n",
+                "import std::io::print;\nimport pkg::alpha::N;\n\nfun main() {\n\tprint(N);\n}\n",
             ),
             (
                 "src/alpha.vl",
@@ -505,7 +505,7 @@ fn the_codegen_failure_renders_in_the_entry_that_lacks_main() {
 fn leak_report_env_var_prints_the_per_site_split() {
     let dir = temp_package(
         "leakreport",
-        "import std::print;\nfun main() { print(7); }\n",
+        "import std::io::print;\nfun main() { print(7); }\n",
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command
@@ -548,7 +548,7 @@ fn leak_report_env_var_prints_the_per_site_split() {
 fn phase_timing_env_var_prints_the_phase_split() {
     let dir = temp_package(
         "phasetiming",
-        "import std::print;\nfun main() { print(7); }\n",
+        "import std::io::print;\nfun main() { print(7); }\n",
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command
@@ -593,7 +593,7 @@ fn phase_timing_env_var_prints_the_phase_split() {
 fn phase_timing_env_var_prints_the_post_pass_breakdown() {
     let dir = temp_package(
         "phasepostpasses",
-        "import std::print;\nfun main() { print(7); }\n",
+        "import std::io::print;\nfun main() { print(7); }\n",
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command
@@ -639,7 +639,7 @@ fn phase_timing_env_var_prints_the_post_pass_breakdown() {
 fn depth_stats_env_var_prints_the_depth_line() {
     let dir = temp_package(
         "depthstats",
-        "import std::print;\nfun main() { print(7); }\n",
+        "import std::io::print;\nfun main() { print(7); }\n",
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command
@@ -688,7 +688,7 @@ fn depth_stats_env_var_prints_the_depth_line() {
 ///
 /// `build` keeps its contract, which is the other half of the pin: it reports the
 /// parse errors and stops, because a recovered tree is not something to emit from.
-const BROKEN_PLUS_TYPE_ERRORS: &str = "import std::print;\n\
+const BROKEN_PLUS_TYPE_ERRORS: &str = "import std::io::print;\n\
                                        fun broken() {\n\
                                        \tlet a: i32 = 1\n\
                                        \tprint(a);\n\
@@ -793,7 +793,7 @@ fn e76_the_coverage_notes_sub_header_agrees_with_its_label() {
     // `reactive.vl`, whose sub-header must head the very line it labels.
     let dir = temp_package(
         "e76_coverage",
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::reactive::Signal;\n\
          \n\
          fun main() {\n\
@@ -917,7 +917,7 @@ fn e84_a_dependency_read_reports_at_the_users_call() {
             ),
             (
                 "app/src/main.vl",
-                "import std::print;\nimport depctx::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+                "import std::io::print;\nimport depctx::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
             ),
             ("depctx/vilan.toml", "[library]\nname = \"depctx\"\n"),
             (
@@ -975,7 +975,7 @@ fn e90_a_workspace_member_read_reports_at_itself() {
             ),
             (
                 "app/src/main.vl",
-                "import std::print;\nimport common::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+                "import std::io::print;\nimport common::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
             ),
             ("common/vilan.toml", "[library]\nname = \"common\"\n"),
             (

@@ -56,7 +56,7 @@ fn the_reflection_surface_works_end_to_end() {
     write(
         &dir,
         "app/src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::option::Option::{ self, Some, None };
 import reflection::source;
 import reflection::meta::{ TypeExpr, Item, StructItem, Field };
@@ -137,7 +137,7 @@ fn a_library_macro_expands_in_the_consuming_app() {
     write(
         &dir,
         "app/src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import macros;
 
 [derive_tag]
@@ -167,7 +167,7 @@ main();
     write(
         &dir,
         "app/src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import macros::derive_tag;
 
 [derive_tag]
@@ -274,7 +274,7 @@ fn the_output_builders_render_and_splice() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 
 macro fun make_shape(): Source {
 	import macro_std::source;

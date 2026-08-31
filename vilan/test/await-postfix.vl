@@ -7,7 +7,7 @@
 // reads the member off the PROMISE and yields `undefined` with no diagnostic.
 // This program is the byte-level gate on those parentheses. Output is
 // deterministic (`sleep(0)`).
-import std::print;
+import std::io::print;
 import std::time::sleep;
 
 struct Row { id: i32, name: str }

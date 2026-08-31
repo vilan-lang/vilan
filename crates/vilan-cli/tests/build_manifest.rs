@@ -88,7 +88,7 @@ fun main() {
     write(
         &directory,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
     );
     directory
 }
@@ -196,7 +196,7 @@ fn a_node_leg_writes_no_build_manifest() {
 /// A server leg that reports what `build_of` said, so the channel is pinned
 /// through the same surface a real server uses.
 const PROBE_SERVER: &str = r#"import std::build::build_of;
-import std::print;
+import std::io::print;
 import std::result::Result::{ Err, Ok };
 
 async fun main() {
@@ -259,7 +259,7 @@ fn build_of_on_a_leg_that_was_never_built_is_a_named_error() {
         &directory,
         "src/server.vl",
         r#"import std::build::build_of;
-import std::print;
+import std::io::print;
 import std::result::Result::{ Err, Ok };
 
 async fun main() {
@@ -363,7 +363,7 @@ fn require_build_stops_the_boot_naming_the_missing_manifest() {
         &directory,
         "src/server.vl",
         r#"import std::build::require_build;
-import std::print;
+import std::io::print;
 
 async fun main() {
 	let build = require_build("client");

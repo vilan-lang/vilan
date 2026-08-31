@@ -5,7 +5,7 @@
 //
 //     vilan run vilan/benchmarks
 
-import std::print;
+import std::io::print;
 import std::process::exit;
 import pkg::payload;
 import pkg::codec;

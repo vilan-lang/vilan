@@ -49,7 +49,7 @@ fn build_writes_assets_beside_the_output() {
     write(
         &dir,
         "app.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::asset::emit;
 
 fun base(): i32 {
@@ -106,7 +106,7 @@ fn a_kind_colliding_with_the_build_namespace_never_reaches_the_filesystem() {
     // which is the part that cannot be inferred from a green analyzer — the
     // fence has to bite before the flush, not merely before the exit code.
     let dir = temp_project("owned_kind");
-    let source = "import std::print;\nimport std::asset::emit;\n\nfun clobber(): i32 {\n\temit(\"vl\", \"CLOBBERED\");\n\t1\n}\n\nlet _c = const clobber();\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    let source = "import std::io::print;\nimport std::asset::emit;\n\nfun clobber(): i32 {\n\temit(\"vl\", \"CLOBBERED\");\n\t1\n}\n\nlet _c = const clobber();\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
     write(&dir, "app.vl", source);
     let entry = dir.join("app.vl");
     let output = vilan(&["build", entry.to_str().unwrap()]);
@@ -144,7 +144,7 @@ fn routes_program(spelling: &str, contributions: &[(&str, &str)]) -> String {
         })
         .collect::<String>();
     format!(
-        "import std::print;\nimport std::asset::{spelling};\n\nfun outputs(): i32 {{\n{calls}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"routes\");\n}}\nmain();\n"
+        "import std::io::print;\nimport std::asset::{spelling};\n\nfun outputs(): i32 {{\n{calls}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"routes\");\n}}\nmain();\n"
     )
 }
 
@@ -214,7 +214,7 @@ fn kind_program(kinds: &[(&str, &str)]) -> String {
         .map(|(kind, line)| format!("\temit(\"{kind}\", \"{line}\");\n"))
         .collect::<String>();
     format!(
-        "import std::print;\nimport std::asset::emit;\n\nfun outputs(): i32 {{\n\temit(\"css\", \".k{{color:red}}\");\n{extra}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"kinds\");\n}}\nmain();\n"
+        "import std::io::print;\nimport std::asset::emit;\n\nfun outputs(): i32 {{\n\temit(\"css\", \".k{{color:red}}\");\n{extra}\t1\n}}\n\nlet _o = const outputs();\n\nfun main() {{\n\tprint(\"kinds\");\n}}\nmain();\n"
     )
 }
 
@@ -449,7 +449,7 @@ fn a_watch_round_prunes_a_kind_that_stopped_emitting_from_dist() {
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\nimport std::asset::emit;\n\nfun routes(): i32 {\n\temit(\"routes\", \"GET /health\");\n\t1\n}\n\nlet _r = const routes();\n\nfun main() {\n\tprint(\"srv\");\n}\n",
+        "import std::io::print;\nimport std::asset::emit;\n\nfun routes(): i32 {\n\temit(\"routes\", \"GET /health\");\n\t1\n}\n\nlet _r = const routes();\n\nfun main() {\n\tprint(\"srv\");\n}\n",
     );
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
@@ -466,7 +466,7 @@ fn a_watch_round_prunes_a_kind_that_stopped_emitting_from_dist() {
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"srv\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"srv\");\n}\n",
     );
     let round_two = wait_for_gone(&routes, deadline);
 
@@ -482,7 +482,7 @@ fn a_watch_round_prunes_a_kind_that_stopped_emitting_from_dist() {
 /// spawn under `--watch` and kill).
 fn quick_exit_program(marker: &str) -> String {
     format!(
-        "import std::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\nmain();\n"
+        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\nmain();\n"
     )
 }
 
@@ -524,12 +524,12 @@ fn workspace_run_writes_fresh_dist_css() {
     write(
         &dir,
         "src/client.vl",
-        "import std::print;\nimport std::asset::emit;\n\nfun styles(): i32 {\n\temit(\"css\", \".ws{margin:0}\");\n\t1\n}\n\nlet _s = const styles();\n\nfun main() {\n\tprint(\"ui\");\n}\n",
+        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {\n\temit(\"css\", \".ws{margin:0}\");\n\t1\n}\n\nlet _s = const styles();\n\nfun main() {\n\tprint(\"ui\");\n}\n",
     );
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"fresh\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"fresh\");\n}\n",
     );
     let output = vilan(&["run", dir.to_str().unwrap()]);
     assert!(
@@ -545,7 +545,7 @@ fn workspace_run_writes_fresh_dist_css() {
 /// The same program with the styles taken out — `run`'s round after the edit
 /// that G8 is about.
 fn styleless_program(marker: &str) -> String {
-    format!("import std::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\nmain();\n")
+    format!("import std::io::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\nmain();\n")
 }
 
 #[test]

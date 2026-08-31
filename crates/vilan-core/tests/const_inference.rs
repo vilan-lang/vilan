@@ -100,7 +100,7 @@ fn fold_of<'a>(
 #[test]
 fn a_plain_arithmetic_initializer_folds() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tlet a = 1 + 2 * 3;\n\
          \tprint(a);\n\
@@ -118,7 +118,7 @@ fn a_plain_arithmetic_initializer_folds() {
 #[test]
 fn a_call_with_const_known_arguments_folds() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun square(n: i32): i32 { n * n }\n\
          fun main() {\n\
          \tlet nine = square(3);\n\
@@ -139,7 +139,7 @@ fn a_call_with_const_known_arguments_folds() {
 #[test]
 fn inference_chains_through_inferred_bindings() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tlet a = 1 + 2;\n\
          \tlet b = a * 2;\n\
@@ -170,7 +170,7 @@ fn inference_chains_through_inferred_bindings() {
 #[test]
 fn a_mutable_bindings_initializer_folds() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tmut cache = 10 * 10;\n\
          \tcache = cache + 1;\n\
@@ -195,7 +195,7 @@ fn a_mutable_bindings_initializer_folds() {
 #[test]
 fn the_debug_preset_folds_nothing() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tlet a = 1 + 2 * 3;\n\
          \tprint(a);\n\
@@ -220,7 +220,7 @@ fn the_debug_preset_folds_nothing() {
 #[test]
 fn the_manifest_override_reaches_the_sweep_both_ways() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tlet a = 1 + 2 * 3;\n\
          \tprint(a);\n\
@@ -252,7 +252,7 @@ fn the_manifest_override_reaches_the_sweep_both_ways() {
 #[test]
 fn an_initializer_reading_a_parameter_falls_back() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun scale(n: i32): i32 {\n\
          \tlet doubled = n * 2;\n\
          \tdoubled\n\
@@ -268,7 +268,7 @@ fn an_initializer_reading_a_parameter_falls_back() {
 #[test]
 fn an_initializer_reading_a_mutable_binding_falls_back() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tmut counter = 1;\n\
          \tcounter = counter + 1;\n\
@@ -287,7 +287,7 @@ fn an_initializer_reading_a_mutable_binding_falls_back() {
 #[test]
 fn an_initializer_reaching_a_host_capability_falls_back() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::time;\n\
          fun main() {\n\
          \tlet started = time::now();\n\
@@ -308,7 +308,7 @@ fn an_initializer_reaching_a_host_capability_falls_back() {
 #[test]
 fn an_initializer_over_the_fuel_budget_falls_back() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::range::Range;\n\
          fun spin(): i32 {\n\
          \tmut total = 0;\n\
@@ -331,7 +331,7 @@ fn an_initializer_over_the_fuel_budget_falls_back() {
 #[test]
 fn the_size_cap_refuses_a_wide_result_and_admits_a_small_one() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::range::Range;\n\
          fun build(limit: i32, stride: i32): List<i32> {\n\
          \tmut out: List<i32> = List::new();\n\
@@ -373,7 +373,7 @@ fn the_size_cap_refuses_a_wide_result_and_admits_a_small_one() {
 #[test]
 fn a_panicking_initializer_falls_back_without_erroring() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tlet xs = [1, 2, 3];\n\
          \tlet boom = xs[9];\n\
@@ -392,7 +392,7 @@ fn a_panicking_initializer_falls_back_without_erroring() {
 #[test]
 fn a_printing_initializer_falls_back() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun noisy(): i32 {\n\
          \tprint(\"side effect!\");\n\
          \t7\n\
@@ -418,7 +418,7 @@ fn a_printing_initializer_falls_back() {
 #[test]
 fn an_emit_reaching_initializer_falls_back_without_erroring() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::asset;\n\
          fun styled(): i32 {\n\
          \tasset::emit(\"css\", \".x{color:red}\");\n\
@@ -457,7 +457,7 @@ fn an_emit_reaching_initializer_falls_back_without_erroring() {
 #[test]
 fn a_binding_inside_a_generic_function_never_folds() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::default::Default;\n\
          fun head_or_default<T: Default>(items: List<T>): T {\n\
          \tlet fallback = T::default();\n\
@@ -497,7 +497,7 @@ fn a_binding_inside_a_generic_function_never_folds() {
 #[test]
 fn a_method_on_a_generic_type_is_also_excluded() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun main() {\n\
          \tlet empty: List<i32> = List::new();\n\
          \tprint(empty.sum());\n\
@@ -534,7 +534,7 @@ fn a_method_on_a_generic_type_is_also_excluded() {
 #[test]
 fn the_sweep_never_produces_a_diagnostic() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          import std::time;\n\
          fun scale(n: i32): i32 { let doubled = n * 2; doubled }\n\
          fun noisy(): i32 { print(\"x\"); 7 }\n\
@@ -570,7 +570,7 @@ fn the_sweep_never_produces_a_diagnostic() {
 #[test]
 fn folding_is_identical_across_repeated_sweeps() {
     let program = analyze(
-        "import std::print;\n\
+        "import std::io::print;\n\
          fun square(n: i32): i32 { n * n }\n\
          fun main() {\n\
          \tlet a = 1 + 2;\n\
@@ -608,7 +608,7 @@ fn folding_is_identical_across_repeated_sweeps() {
 /// other, which is the one thing a code-generation knob may never do.
 #[test]
 fn an_explicit_const_still_rejects_a_plain_runtime_binding() {
-    let source = "import std::print;\n\
+    let source = "import std::io::print;\n\
                   fun main() {\n\
                   \tlet base = 2 + 3;\n\
                   \tlet doubled = const base * 2;\n\

@@ -21,7 +21,7 @@ use crate::support::*;
 fn list_find_returns_the_first_match() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let xs = [3, 8, 5, 9];
             print(xs.find(|n| n > 4).unwrap_or(0));   // 8 — first, not last
@@ -40,7 +40,7 @@ fn list_find_short_circuits_at_the_first_match() {
     // short-circuit; this one does, and the visit count proves it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let xs = [1, 2, 3, 4];
             mut visits = 0;
@@ -57,7 +57,7 @@ fn list_find_short_circuits_at_the_first_match() {
 fn list_contains_and_index_of_compare_by_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let xs = [10, 20, 30, 20];
             print(xs.contains(20));                 // true
@@ -77,7 +77,7 @@ fn list_contains_and_index_of_compare_by_value() {
 fn list_reverse_returns_a_new_list() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let xs = [1, 2, 3];
             let ys = xs.reverse();
@@ -96,7 +96,7 @@ fn list_reverse_returns_a_new_list() {
 fn list_sort_orders_by_ord() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let xs = [3, 1, 2];
             let sorted = xs.sort();
@@ -118,7 +118,7 @@ fn list_sort_is_not_a_lexicographic_string_sort() {
     // elements, which would order these 1, 10, 2. `sort` passes `Ord::compare`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let sorted = [10, 2, 1].sort();
             print(sorted[0]);
@@ -134,7 +134,7 @@ fn list_sort_is_not_a_lexicographic_string_sort() {
 fn list_sort_by_uses_the_comparator() {
     assert_compiles_and_runs(
         r#"
-        import std::{ print, compare::Ordering };
+        import std::{ io::print, compare::Ordering };
         fun main() {
             let xs = [3, 1, 2];
             let descending = xs.sort_by(|a, b| {
@@ -159,7 +159,7 @@ fn list_sort_by_is_stable() {
     // key, distinct secondary data — equal keys must keep their input order.
     assert_compiles_and_runs(
         r#"
-        import std::{ print, compare::Ordering };
+        import std::{ io::print, compare::Ordering };
         struct Item {
             key: i32,
             tag: str,
@@ -185,7 +185,7 @@ fn list_sort_by_is_stable() {
 fn list_insert_shifts_the_tail_and_appends_at_len() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [1, 2, 4];
             xs.insert(2, 3);
@@ -208,7 +208,7 @@ fn list_insert_shifts_the_tail_and_appends_at_len() {
 fn list_remove_returns_the_element_and_closes_the_gap() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [1, 2, 3];
             print(xs.remove(1));   // 2
@@ -272,7 +272,7 @@ fn list_insert_past_len_panics() {
 fn list_join_renders_display_elements() {
     assert_compiles_and_runs(
         r#"
-        import std::{ print, display::Display };
+        import std::{ io::print, display::Display };
         fun main() {
             let words = ["alpha", "beta", "gamma"];
             print(words.join(", "));
@@ -290,7 +290,7 @@ fn list_join_renders_display_elements() {
 fn list_join_renders_a_user_display_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::{ print, display::Display };
+        import std::{ io::print, display::Display };
         struct Tag {
             name: str,
         }
@@ -316,7 +316,7 @@ fn floats_clamp_without_being_ord() {
     // floats are deliberately not `Ord` (NaN), so they had none. Same recipe.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(5f.clamp(0f, 3f));      // 3
             print((0f - 2f).clamp(0f, 3f)); // 0
@@ -337,7 +337,7 @@ fn the_std_surface_batch_needs_no_import() {
     // that imports nothing but `print` reaches all of it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [3, 1, 2];
             print(xs.reverse()[0]);
@@ -370,7 +370,7 @@ fn the_std_surface_batch_needs_no_import() {
 fn map_entries_pairs_keys_and_values_in_insertion_order() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         fun main() {
             mut scores: Map<str, i32> = Map::new();
@@ -396,7 +396,7 @@ fn map_entries_pairs_keys_and_values_in_insertion_order() {
 fn map_entries_on_an_empty_map_is_empty() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         fun main() {
             mut empty: Map<str, i32> = Map::new();
@@ -412,7 +412,7 @@ fn map_entries_on_an_empty_map_is_empty() {
 fn map_contains_value_compares_by_value_not_by_key() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         fun main() {
             mut scores: Map<str, i32> = Map::new();
@@ -431,7 +431,7 @@ fn map_contains_value_compares_by_value_not_by_key() {
 fn map_contains_value_on_an_empty_map_is_false() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         fun main() {
             mut empty: Map<str, i32> = Map::new();
@@ -446,7 +446,7 @@ fn map_contains_value_on_an_empty_map_is_false() {
 fn set_union_combines_and_dedupes_the_overlap() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         fun main() {
             mut a: Set<i32> = Set::new();
@@ -472,7 +472,7 @@ fn set_union_combines_and_dedupes_the_overlap() {
 fn set_union_with_an_empty_set_is_identity_either_direction() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         fun main() {
             mut a: Set<i32> = Set::new();
@@ -492,7 +492,7 @@ fn set_union_with_an_empty_set_is_identity_either_direction() {
 fn set_intersection_keeps_only_the_shared_elements() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         fun main() {
             mut a: Set<i32> = Set::new();
@@ -521,7 +521,7 @@ fn set_intersection_keeps_only_the_shared_elements() {
 fn set_difference_keeps_elements_absent_from_the_other_side() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         fun main() {
             mut a: Set<i32> = Set::new();
@@ -553,7 +553,7 @@ fn the_map_set_parity_batch_needs_only_its_own_type_import() {
     // carry no extra bound beyond `Set`'s own `T: Hashable`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::set::Set;
         fun main() {
@@ -598,7 +598,7 @@ fn a_set_loop_over_self_inside_its_own_generic_impl_walks_the_elements() {
     // convention since I4; the direct form is what a user writes first.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         impl Set<type T: Hashable> {
@@ -629,7 +629,7 @@ fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
     // yields the `NativeMap` itself, which does not add.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         impl Set<type T: Hashable> {
@@ -673,7 +673,7 @@ fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
     // pins is that the convention is no longer load-bearing.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         impl Set<type T: Hashable> {
@@ -707,7 +707,7 @@ fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
 fn a_set_loop_over_a_mut_self_receiver_walks_the_elements() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         impl Set<type T: Hashable> {
@@ -737,7 +737,7 @@ fn a_set_loop_over_a_plain_parameter_walks_the_elements() {
     // generic `Set<T>` one were equally broken.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::hash::Hashable;
         fun count_concrete(s: Set<i32>): i32 {
@@ -774,7 +774,7 @@ fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
     // here as the regression half of the same pin.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         struct Holder {
             inner: Set<i32>,
@@ -827,7 +827,7 @@ fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
 fn a_set_loop_survives_nesting_and_a_closure_parameter() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         fun make(): Set<i32> {
             mut s: Set<i32> = Set::new();
@@ -865,7 +865,7 @@ fn the_sibling_containers_iterate_inside_their_own_impls_too() {
     // here so the B85 change is proven not to have moved them either.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         impl List<type T> {
             fun count(self): i32 {
                 mut n = 0;
@@ -913,7 +913,7 @@ fn a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field() {
     // `map.entries()` already covers the need.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         fun main() {
             mut scores: Map<str, i32> = Map::new();
@@ -942,7 +942,7 @@ fn a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field() {
 fn a_missing_to_string_steers_to_the_display_import() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let x = 42;
             print(x.to_string());
@@ -988,7 +988,7 @@ fn the_join_miss_steers_to_the_display_import() {
     // program cannot see it — the steer is the mitigation the audit specified.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let words = ["a", "b"];
             print(words.join(", "));
@@ -1005,7 +1005,7 @@ fn the_import_steer_does_not_survive_the_import() {
     // so there is no diagnostic left to carry a hint.
     assert_compiles_and_runs(
         r#"
-        import std::{ print, display::Display };
+        import std::{ io::print, display::Display };
         fun main() {
             print(42.to_string());
         }
@@ -1063,7 +1063,7 @@ fn an_unsatisfied_bound_is_reported_as_a_bound_not_as_a_steered_miss() {
     // there is no diagnostic left to tell the reader to import what they have.
     let diagnostics = failure_diagnostics(
         r#"
-        import std::{ print, display::Display };
+        import std::{ io::print, display::Display };
         struct Opaque {
             n: i32,
         }
@@ -1899,7 +1899,7 @@ fn a_generic_impl_grounds_the_traits_parameter_through_its_own_binder() {
 
 /// The `resource struct Res` + `Drop` preamble every B62 pin below shares.
 const B62_PRELUDE: &str = r#"
-    import std::print;
+    import std::io::print;
     import std::option::Option::{ self, Some, None };
     import std::drop::{ Drop, drop };
     resource struct Res {
@@ -2575,7 +2575,7 @@ fn b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation
 fn a_nested_task_awaits_to_the_inner_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun main() {
@@ -2596,7 +2596,7 @@ fn a_nested_task_awaits_to_the_inner_value() {
 fn an_async_body_that_is_a_task_assimilates_at_construction() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun main() {
@@ -2653,7 +2653,7 @@ fn a_nested_task_no_longer_types_one_layer_deep() {
 fn a_chain_of_nested_tasks_collapses_to_one_layer() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun main() {
@@ -2694,7 +2694,7 @@ fn a_chain_of_nested_tasks_rejects_the_deep_type() {
 fn an_async_literal_body_assimilates() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun main() {
@@ -2715,7 +2715,7 @@ fn an_async_literal_body_assimilates() {
 fn a_generic_wrapper_instantiated_at_a_task_assimilates() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun wrap<T>(t: T): Task<T> { async { t } }
@@ -2755,7 +2755,7 @@ fn a_generic_wrapper_at_a_task_rejects_the_deep_type() {
 fn settle_all_over_generically_wrapped_tasks_yields_values() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun wrap<T>(t: T): Task<T> { async { t } }
@@ -2777,7 +2777,7 @@ fn settle_all_over_generically_wrapped_tasks_yields_values() {
 fn a_generic_wrapper_at_a_non_task_is_unaffected() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun wrap<T>(t: T): Task<T> { async { t } }
@@ -2798,7 +2798,7 @@ fn a_generic_wrapper_at_a_non_task_is_unaffected() {
 fn non_task_nesting_is_untouched_by_assimilation() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         fun hold<T>(value: T): Option<T> { Some(value) }
@@ -2825,7 +2825,7 @@ fn non_task_nesting_is_untouched_by_assimilation() {
 fn a_plain_function_returning_a_task_still_yields_a_handle() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         fun make(): Task<i32> { async { 7 } }
@@ -2855,7 +2855,7 @@ fn an_async_function_returning_a_task_is_assimilated_at_runtime_only() {
     // The runtime: the call site receives the VALUE.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
 
         async fun make(): Task<i32> { async { 7 } }
@@ -3014,7 +3014,7 @@ fn b66_a_generic_overwrite_that_would_drop_the_old_value_is_rejected() {
     // rather than filed: the whole point of this arc is that a rule enforced at
     // one position and stated at all of them is how these holes are made.
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -3056,7 +3056,7 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
     // type, where the body CAN destroy. Only a generic body is asked.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{ Drop, drop };
         resource struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
@@ -3083,7 +3083,7 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
 fn b101_program(body: &str) -> String {
     format!(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::{{ Drop, drop }};
         import std::option::Option::{{ self, Some, None }};
         resource struct Guard {{ label: str }}
@@ -3592,7 +3592,7 @@ fn b65_a_loaned_capture_consumed_inside_a_generic_reports_at_the_instantiation()
 fn b57_an_inherent_method_outranks_a_trait_method() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait Iter<T> { fun pick(self): str; }
         impl Bag with Iter<i32> { fun pick(self): str { "TRAIT" } }
@@ -3610,7 +3610,7 @@ fn b57_an_inherent_method_outranks_a_trait_method() {
 fn b57_inherent_precedence_does_not_depend_on_impl_order() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait Iter<T> { fun pick(self): str; }
         impl Bag { fun pick(self): str { "INHERENT" } }
@@ -3627,7 +3627,7 @@ fn b57_inherent_precedence_does_not_depend_on_impl_order() {
 fn b57_a_trait_method_still_resolves_without_an_inherent_one() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait Iter<T> { fun pick(self): str; }
         impl Bag with Iter<i32> { fun pick(self): str { "TRAIT" } }
@@ -3644,7 +3644,7 @@ fn b57_a_trait_method_still_resolves_without_an_inherent_one() {
 fn b57_inherent_precedence_holds_for_a_generic_subject() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag<T> { x: T }
         trait Iter<T> { fun pick(self): T; }
         impl Bag<type T> with Iter<T> { fun pick(self): T { print("TRAIT"); self.x } }
@@ -3720,7 +3720,7 @@ fn b57_an_extra_method_in_a_trait_impl_block_counts_as_inherent() {
 fn b57_the_same_method_name_on_two_types_is_not_a_duplicate() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         struct Box { y: i32 }
         impl Bag { fun pick(self): str { "bag" } }
@@ -3738,7 +3738,7 @@ fn b57_the_same_method_name_on_two_types_is_not_a_duplicate() {
 fn b57_two_traits_providing_one_name_are_ambiguous() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait A { fun pick(self): str; }
         trait B { fun pick(self): str; }
@@ -3759,7 +3759,7 @@ fn b57_two_traits_providing_one_name_are_ambiguous() {
 fn b57_two_inherited_defaults_of_one_name_are_ambiguous() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait A { fun tag(self): str; fun pick(self): str { "from-A" } }
         trait B { fun mark(self): str; fun pick(self): str { "from-B" } }
@@ -3779,7 +3779,7 @@ fn b57_two_inherited_defaults_of_one_name_are_ambiguous() {
 fn b57_a_supertrait_reached_twice_is_not_ambiguous() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait Base { fun tag(self): str { "base" } }
         trait Left with Base { fun l(self): str; }
@@ -3798,7 +3798,7 @@ fn b57_a_supertrait_reached_twice_is_not_ambiguous() {
 fn b57_a_bound_list_supplying_one_name_twice_is_ambiguous() {
     assert_fails_spanning_nth(
         r#"
-        import std::print;
+        import std::io::print;
         trait A { fun pick(self): str; }
         trait B { fun pick(self): str; }
         fun through<T: A + B>(value: T): str { value.pick() }
@@ -3820,7 +3820,7 @@ fn b57_a_bound_list_supplying_one_name_twice_is_ambiguous() {
 fn b57_a_bound_list_reaching_one_declaration_twice_is_not_ambiguous() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Base { fun tag(self): str; }
         trait Extra with Base { fun more(self): str; }
         fun show<T: Base + Extra>(value: T): str { value.tag() }
@@ -3838,7 +3838,7 @@ fn b57_a_bound_list_reaching_one_declaration_twice_is_not_ambiguous() {
 fn b57_trait_qualified_calls_disambiguate_two_traits() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait A { fun pick(self): str; }
         trait B { fun pick(self): str; }
@@ -3857,7 +3857,7 @@ fn b57_trait_qualified_calls_disambiguate_two_traits() {
 fn b57_a_trait_qualified_call_reaches_past_an_inherent_method() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait Iter<T> { fun pick(self): str; }
         impl Bag with Iter<i32> { fun pick(self): str { "TRAIT" } }
@@ -3880,7 +3880,7 @@ fn b57_a_trait_qualified_call_reaches_past_an_inherent_method() {
 fn b57_a_type_qualified_call_does_not_fall_through_to_a_trait() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait A { fun pick(self): str; }
         impl Bag with A { fun pick(self): str { "A" } }
@@ -3899,7 +3899,7 @@ fn b57_a_type_qualified_call_does_not_fall_through_to_a_trait() {
 fn b57_a_trait_qualified_call_picks_between_inherited_defaults() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait A { fun tag(self): str; fun pick(self): str { "from-A" } }
         trait B { fun mark(self): str; fun pick(self): str { "from-B" } }
@@ -3918,7 +3918,7 @@ fn b57_a_trait_qualified_call_picks_between_inherited_defaults() {
 fn b57_a_trait_qualified_call_works_on_a_generic_receiver() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait A { fun pick(self): str; }
         trait B { fun pick(self): str; }
@@ -3938,7 +3938,7 @@ fn b57_a_trait_qualified_call_works_on_a_generic_receiver() {
 fn b57_a_trait_qualified_call_takes_arguments_and_chains() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         trait A { fun join(self, left: str, right: str): str; }
         impl Bag with A { fun join(self, left: str, right: str): str { left + right } }
@@ -3961,7 +3961,7 @@ fn b57_a_trait_qualified_call_takes_arguments_and_chains() {
 fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { x: i32 }
         struct Box { y: i32 }
         trait A { fun pick(self): str; }
@@ -4111,7 +4111,7 @@ fn b72_the_bound_generic_form_is_what_works() {
     // is advice, not a fix. This is the program the message asks for.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
@@ -4352,7 +4352,7 @@ fn b4_no_route_to_the_internal_error_survives() {
 fn b4_a_trait_stays_legal_as_a_generic_bound() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
@@ -4368,7 +4368,7 @@ fn b4_a_trait_stays_legal_as_a_generic_bound() {
 fn b4_a_trait_stays_legal_as_a_supertrait() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait A { fun name(self): str; }
         trait B with A { fun louder(self): str { self.name() } }
         struct Bag { n: i32 }
@@ -4404,7 +4404,7 @@ fn b4_a_trait_stays_legal_as_a_qualified_call_head() {
     // is not a value position.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
@@ -4423,7 +4423,7 @@ fn b4_a_self_defaulted_parameter_stays_legal() {
     // type it produces, so a generic parameter is never mistaken for the trait.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Combine<B = Self> { fun combine(self, other: B): str; }
         struct Bag { n: i32 }
         impl Bag with Combine { fun combine(self, other: Bag): str { "combined" } }
@@ -4459,7 +4459,7 @@ fn b98_duplicate_trait_impls_are_refused_at_both_call_paths() {
     // P11, exactly — the program whose two calls both used to print `first`.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         trait Show { fun show(self): str; }
         struct Bag { n: i32 }
         impl Bag with Show { fun show(self): str { "first" } }
@@ -4661,7 +4661,7 @@ fn b98_one_trait_for_two_subjects_and_two_traits_for_one_subject_stay_legal() {
     // repeating on its own is a duplicate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Show { fun show(self): str; }
         trait Label { fun label(self): str; }
         struct Bag { n: i32 }
@@ -4750,7 +4750,7 @@ fn a_resource_binding_runs_its_destructor() {
     // P8's control arm, concrete annotation: `drop` runs at scope end.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
@@ -4772,7 +4772,7 @@ fn a_bare_trait_binding_cannot_swallow_a_resources_destructor() {
     // `closing` — one changed word in the annotation deleted the destructor.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
@@ -4794,7 +4794,7 @@ fn a_resource_field_runs_its_destructor() {
     // a CONCRETE field is a resource, and its scope end destroys it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
@@ -4817,7 +4817,7 @@ fn a_bare_trait_field_cannot_swallow_a_resources_destructor() {
     // reachable, owned, and invisible to containment inference.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
@@ -4840,7 +4840,7 @@ fn a_resource_field_keeps_its_single_owner() {
     // resource and refuses the second owner.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
@@ -4865,7 +4865,7 @@ fn a_bare_trait_field_cannot_launder_the_single_owner_rule() {
     // `const holder = [ [ 1 ] ];` — one resource, two live owners, no drop.
     assert_fails(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
@@ -4994,7 +4994,7 @@ fn b74_a_trait_provided_static_does_not_collide_with_an_inherent_one() {
     // what B57 claims. Both at once, on one program.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::default::Default;
 
         struct Bag { n: i32 }
@@ -5021,7 +5021,7 @@ fn b74_the_same_static_name_on_two_types_is_not_a_duplicate() {
     // is two declarations, not a duplicate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { n: i32 }
         struct Box { n: i32 }
         impl Bag { fun new(): Bag { Bag { n = 1 } } }
@@ -5078,7 +5078,7 @@ fn b74_a_static_still_resolves_when_it_is_the_only_one() {
     // The check must not disturb the ordinary path: one static, one home.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { n: i32 }
         impl Bag {
             fun new(n: i32): Bag { Bag { n = n } }

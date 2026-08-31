@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `for item in iterable` lowers to a native JS `for...of`. `List` is a JS array,
 // so iterating one works directly; `jump break`/`continue` map to JS

@@ -153,7 +153,6 @@ on your server's builder chain does it:
 import std::build::require_build;
 import std::document::require_shell;
 import std::http::{ Response, Server };
-import std::print;
 
 async fun main() {
 	let build = require_build("client");

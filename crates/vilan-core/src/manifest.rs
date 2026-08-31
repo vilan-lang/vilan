@@ -96,8 +96,70 @@ pub struct Package {
     /// several node entries (A15's follow-up). `--entry` still overrides it.
     #[serde(rename = "default-entry")]
     pub default_entry: Option<String>,
+    /// The package's ambient scope — the module whose exports are in scope in
+    /// every one of this package's files with no `import` (`prelude.md` §6).
+    /// Absent means [`DEFAULT_PRELUDE`]. See [`PreludeDecl`].
+    pub prelude: Option<PreludeDecl>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
+}
+
+/// A declared `prelude` value: a module path, or the boolean `false`
+/// (`prelude.md` §6.2 determination 2). Untagged, because toml offers no other
+/// way to accept a string *or* a bool in one key — which is also why
+/// `prelude = true` has to be refused in validation rather than by the type.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum PreludeDecl {
+    Path(String),
+    Off(bool),
+}
+
+/// The module path a package with no `prelude` key resolves under: std's base
+/// prelude, the seven names of `prelude.md` §5.1.
+pub const DEFAULT_PRELUDE: &str = "std::prelude";
+
+/// std's web prelude (`prelude.md` §5.3) — named here only so the diagnostics
+/// that steer toward it cannot drift from the module that implements it.
+pub const WEB_PRELUDE: &str = "std::web";
+
+/// A package's *resolved* ambient scope, after the key's default is applied.
+/// The compiler sees this, never [`PreludeDecl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreludeSpec {
+    /// The module whose exports are this package's ambient names.
+    Module(String),
+    /// `prelude = false`: no ambient names beyond the §4.7 primitives.
+    Off,
+}
+
+impl Default for PreludeSpec {
+    /// The omitted-key answer: std's base prelude (§6.2 determination 3).
+    fn default() -> Self {
+        PreludeSpec::Module(DEFAULT_PRELUDE.to_string())
+    }
+}
+
+impl PreludeSpec {
+    /// The declared module path, or `None` for `prelude = false`.
+    pub fn module_path(&self) -> Option<&str> {
+        match self {
+            PreludeSpec::Module(path) => Some(path),
+            PreludeSpec::Off => None,
+        }
+    }
+}
+
+/// Applies the omitted-means-default rule of `prelude.md` §6.2 determination 3.
+/// A `true` value cannot reach here cleanly — validation refuses it — so it is
+/// read as the default rather than panicking a build that already has an error.
+fn prelude_spec(declared: Option<&PreludeDecl>) -> PreludeSpec {
+    match declared {
+        None => PreludeSpec::Module(DEFAULT_PRELUDE.to_string()),
+        Some(PreludeDecl::Path(path)) => PreludeSpec::Module(path.clone()),
+        Some(PreludeDecl::Off(false)) => PreludeSpec::Off,
+        Some(PreludeDecl::Off(true)) => PreludeSpec::Module(DEFAULT_PRELUDE.to_string()),
+    }
 }
 
 /// A library: an importable unit with a public surface (`lib.vl`) and no app
@@ -119,6 +181,11 @@ pub struct Library {
     /// both sections and on neither `[project]` (which declares members, not
     /// sources).
     pub generated: Option<PathBuf>,
+    /// The library's ambient scope — `[package] prelude`'s twin, with the same
+    /// meaning and the same rules (`prelude.md` §6.2 determination 1). The key
+    /// belongs on both sections because std, which must state
+    /// `prelude = false`, is a `[library]` and not a `[package]`.
+    pub prelude: Option<PreludeDecl>,
     /// Overlay layers, keyed by layer name (`process`, `browser`, …).
     #[serde(default)]
     pub layer: BTreeMap<String, LayerDecl>,
@@ -141,6 +208,11 @@ impl Library {
     /// The base source root (default `src`).
     pub fn base_root(&self) -> &Path {
         self.root.as_deref().unwrap_or(Path::new("src"))
+    }
+
+    /// The resolved ambient scope (`prelude.md` §6.2).
+    pub fn prelude(&self) -> PreludeSpec {
+        prelude_spec(self.prelude.as_ref())
     }
 }
 
@@ -585,6 +657,86 @@ impl Package {
     pub fn splits(&self) -> bool {
         self.split.unwrap_or(false)
     }
+
+    /// The resolved ambient scope (`prelude.md` §6.2).
+    pub fn prelude(&self) -> PreludeSpec {
+        prelude_spec(self.prelude.as_ref())
+    }
+}
+
+/// What is wrong with a declared `prelude` value, or `None` when it is
+/// well-formed (`prelude.md` §6.2 determinations 4, 6 and 7). `section` is the
+/// manifest spelling to name in the message (`[package]` / `[library]`);
+/// `dependencies` is that section's own table, since a prelude may live in a
+/// dependency.
+///
+/// Every refusal here is **lexical** — decided from the declared string alone,
+/// with no module lookup, exactly as `generated_root_problem` decides from two
+/// strings with no filesystem look. Whether the named module exists and exports
+/// anything is a build-time question, diagnosed where modules resolve; whether
+/// the string could *ever* name a module is decidable now, and a typo caught at
+/// manifest load is a typo the user never has to bisect a resolution failure
+/// for. Manifest diagnostics carry no span in this compiler, so each message
+/// names its own key.
+fn prelude_problem(
+    section: &str,
+    declared: &PreludeDecl,
+    dependencies: &BTreeMap<String, Dependency>,
+) -> Option<String> {
+    let path = match declared {
+        // The affirmative is spelled by omitting the key or naming a module.
+        // An untagged string-or-bool accepts `true` syntactically, so the
+        // refusal has to be explicit — `[project] project = false` sets the
+        // precedent for a bool whose one useful value is the negative.
+        PreludeDecl::Off(true) => {
+            return Some(format!(
+                "`{section} prelude = true` is not a value: omit the key for the \
+                 default set (`{DEFAULT_PRELUDE}`), name a module, or write \
+                 `prelude = false` for no prelude at all"
+            ));
+        }
+        PreludeDecl::Off(false) => return None,
+        PreludeDecl::Path(path) => path.as_str(),
+    };
+    let segments: Vec<&str> = path.split("::").collect();
+    if segments.iter().any(|segment| !is_identifier(segment)) {
+        return Some(format!(
+            "`{section} prelude` must be a module path — identifiers joined by \
+             `::` (got `{path}`)"
+        ));
+    }
+    // A single segment names a package ROOT, never a module. `std` is the one
+    // worth catching by name: it is the most obvious guess in the language,
+    // and after the alias sweep (prelude.md §10.2) std's root exports nothing,
+    // so accepting it would mean a silently EMPTY prelude — the failure mode
+    // this key can least afford.
+    if segments.len() < 2 {
+        return Some(if path == "std" {
+            format!(
+                "invalid `{section} prelude`: `std` is the package root, not a \
+                 prelude module; use `\"{DEFAULT_PRELUDE}\"` (the default set) \
+                 or `\"{WEB_PRELUDE}\"` (the web set)"
+            )
+        } else {
+            format!(
+                "invalid `{section} prelude`: `{path}` names a package root, not \
+                 a module; a prelude is a module whose exports are the ambient \
+                 names (e.g. `\"pkg::{path}\"`)"
+            )
+        });
+    }
+    let root = segments[0];
+    if root == "pkg" || root == "std" || dependencies.contains_key(root) {
+        return None;
+    }
+    let mut known: Vec<String> = vec!["pkg".to_string(), "std".to_string()];
+    known.extend(dependencies.keys().cloned());
+    Some(format!(
+        "invalid `{section} prelude`: `{root}` is not an import root here — \
+         a prelude path starts at `pkg`, `std`, or a declared dependency \
+         (known: {})",
+        known.join(", ")
+    ))
 }
 
 /// What is wrong with a declared `generated` root, or `None` when it is
@@ -862,6 +1014,9 @@ impl Manifest {
                 package.root(),
             ));
         }
+        if let Some(prelude) = &package.prelude {
+            errors.extend(prelude_problem("[package]", prelude, &package.dependencies));
+        }
         if package.splits() && self.entries.is_empty() {
             let declared = package.target.as_deref().unwrap_or("node");
             if !matches!(Platform::parse(declared), Ok(Platform::Browser)) {
@@ -978,6 +1133,9 @@ impl Manifest {
                 generated,
                 library.base_root(),
             ));
+        }
+        if let Some(prelude) = &library.prelude {
+            errors.extend(prelude_problem("[library]", prelude, &library.dependencies));
         }
         for (name, layer) in &library.layer {
             if layer.platform.is_empty() {
@@ -1356,6 +1514,14 @@ pub fn resolve_workspace_with_hook_report(
             depth: section.depth.unwrap_or(defaults.depth),
         })
         .unwrap_or(defaults);
+    // The ENTRY package's ambient scope (prelude.md §6.2), from whichever
+    // section this manifest carries — the key lives on both, because std,
+    // which must state `prelude = false`, is a `[library]`.
+    let entry_prelude = match (&manifest.package, &manifest.library) {
+        (Some(package), _) => package.prelude(),
+        (None, Some(library)) => library.prelude(),
+        (None, None) => PreludeSpec::default(),
+    };
     let declared = match (&manifest.package, &manifest.library) {
         (Some(package), _) => &package.dependencies,
         (None, Some(library)) => &library.dependencies,
@@ -1363,6 +1529,7 @@ pub fn resolve_workspace_with_hook_report(
             return Ok((
                 Workspace {
                     macro_limits,
+                    entry_prelude,
                     ..Workspace::default()
                 },
                 Vec::new(),
@@ -1402,6 +1569,7 @@ pub fn resolve_workspace_with_hook_report(
             packages,
             entry_dependencies,
             macro_limits,
+            entry_prelude,
         },
         hook_report.into_values().collect(),
     ))
@@ -1434,6 +1602,7 @@ pub fn resolve_library(dir: &Path) -> PackageSpec {
         dependencies: Vec::new(),
         surface: true,
         member: false,
+        prelude: PreludeSpec::default(),
     }
 }
 
@@ -1499,6 +1668,7 @@ fn library_spec(
         dependencies,
         surface: true,
         member,
+        prelude: library.prelude(),
     }
 }
 
@@ -1761,6 +1931,14 @@ fn resolve_dependency_edges(
         // inferentially, and reaching an off-platform function is the
         // analyzer's chain diagnostic. This is the blessed client→server
         // service shape (proposal/platform-coloring.md §7.3).
+        // Per-package, never inherited (prelude.md §7): a `[package]`
+        // dependency resolves under the prelude ITS manifest declares. Read
+        // here, before the manifest is taken apart below.
+        let package_prelude = manifest
+            .package
+            .as_ref()
+            .map(|package| package.prelude())
+            .unwrap_or_default();
         let (library, package_dependencies) = match (&manifest.library, &manifest.package) {
             (Some(_), _) => (Some(manifest.library.unwrap()), None),
             (None, Some(package)) => (None, Some(package.dependencies.clone())),
@@ -1809,6 +1987,7 @@ fn resolve_dependency_edges(
                 dependencies: dependency_edges,
                 surface: false,
                 member,
+                prelude: package_prelude,
             },
         };
         packages.push(spec);
@@ -2023,7 +2202,7 @@ mod tests {
     // The reserved package names (L12, std-shape.md §4): `std`, `pkg`, and
     // `macro_std` are the import roots the toolchain owns. Before the refusal,
     // a dependency named `std` silently shadowed the whole standard library
-    // (`import std::print` stopped resolving), one named `pkg` was silently
+    // (`import std::io::print` stopped resolving), one named `pkg` was silently
     // unreachable behind the self-package root, and one named `macro_std`
     // shadowed the macro world's std — measured 2026-08-24, the plant these
     // pins were proven red against. `vilan` joined the set 2026-08-26
@@ -3636,6 +3815,151 @@ mod tests {
         let manifest = parse("[library]\nname = \"icons\"\ngenerated = \"gen\"\n");
         assert!(manifest.validate().is_empty());
         assert_eq!(manifest.generated_root(), Some(Path::new("gen")));
+    }
+
+    // --- `prelude` (prelude.md §6.2) ---------------------------------------
+
+    /// The refusals and acceptances of one `prelude` value, on `[package]`.
+    fn prelude_errors(value: &str) -> Vec<String> {
+        parse(&format!("[package]\nname = \"app\"\nprelude = {value}\n")).validate()
+    }
+
+    #[test]
+    fn an_omitted_prelude_is_the_base_std_set() {
+        // The feature's whole point is that the common case is silent: every
+        // manifest in the estate gains the base prelude with no edit at all.
+        let manifest = parse("[package]\nname = \"app\"\n");
+        assert_eq!(
+            manifest.package.as_ref().unwrap().prelude(),
+            PreludeSpec::Module(DEFAULT_PRELUDE.to_string())
+        );
+        assert_eq!(manifest.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_web_prelude_is_an_ordinary_module_path() {
+        // §6.2 determination 2: selecting the web set is not a mode the
+        // compiler knows about — `std::web` is a module like any other, which
+        // is why there is no enumerated list of set names anywhere.
+        let manifest = parse("[package]\nname = \"app\"\nprelude = \"std::web\"\n");
+        assert_eq!(
+            manifest.package.as_ref().unwrap().prelude(),
+            PreludeSpec::Module(WEB_PRELUDE.to_string())
+        );
+        assert_eq!(manifest.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn prelude_false_is_no_prelude_at_all() {
+        let manifest = parse("[package]\nname = \"app\"\nprelude = false\n");
+        assert_eq!(
+            manifest.package.as_ref().unwrap().prelude(),
+            PreludeSpec::Off
+        );
+        assert_eq!(
+            manifest.package.as_ref().unwrap().prelude().module_path(),
+            None
+        );
+        assert_eq!(manifest.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_prelude_parses_on_a_library_too() {
+        // The key exists on both sections precisely so std — a `[library]`,
+        // not a `[package]` — can state its own posture (§6.2 determination 1).
+        let manifest = parse("[library]\nname = \"std\"\nprelude = false\n");
+        assert_eq!(
+            manifest.library.as_ref().unwrap().prelude(),
+            PreludeSpec::Off
+        );
+        assert_eq!(manifest.validate(), Vec::<String>::new());
+        let errors = parse("[library]\nname = \"icons\"\nprelude = \"std\"\n").validate();
+        assert!(
+            errors.iter().any(|e| e.contains("`[library] prelude`")),
+            "the library twin must refuse what the package twin refuses: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn prelude_std_is_refused_and_names_the_two_std_sets() {
+        // The most obvious wrong guess in the language. After the alias sweep
+        // (§10.2) std's root exports nothing, so accepting `"std"` would mean a
+        // silently EMPTY prelude — caught by name and redirected instead.
+        let errors = prelude_errors("\"std\"");
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("`[package] prelude`")
+                    && e.contains("package root")
+                    && e.contains("std::prelude")
+                    && e.contains("std::web")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn prelude_true_is_refused_rather_than_read_as_the_default() {
+        // An untagged string-or-bool accepts `true` syntactically; the
+        // affirmative is spelled by omitting the key or naming a module.
+        let errors = prelude_errors("true");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`[package] prelude = true` is not a value")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_segment_prelude_is_refused_as_a_package_root() {
+        let errors = prelude_errors("\"pkg\"");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("names a package root, not a module")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_prelude_rooted_at_an_undeclared_dependency_is_refused() {
+        // Lexical, like every other manifest refusal: no module is looked up,
+        // only whether this root could ever name one here.
+        let errors = prelude_errors("\"nope::theirs\"");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("`nope` is not an import root here")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_prelude_rooted_at_a_declared_dependency_is_accepted() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\nprelude = \"shapes::theirs\"\n\n\
+             [package.dependencies]\nshapes = { path = \"../shapes\" }\n",
+        );
+        assert_eq!(manifest.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_prelude_path_with_a_non_identifier_segment_is_refused() {
+        let errors = prelude_errors("\"1bad::theirs\"");
+        assert!(
+            errors.iter().any(|e| e.contains("must be a module path")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_prelude_is_not_inherited_from_a_project_root() {
+        // §6.2 determination 5: a SEMANTIC key must not travel any edge, so
+        // `[project]` has no `prelude` at all — an unknown key there is
+        // ignored, and each member states its own.
+        let manifest = parse("[project]\npackages = [\"a\"]\nprelude = \"std::web\"\n");
+        assert_eq!(manifest.validate(), Vec::<String>::new());
+        assert!(manifest.package.is_none());
     }
 
     #[test]

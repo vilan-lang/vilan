@@ -1,7 +1,7 @@
 // Adaptation (proposal/async-polymorphism.md A.1): an async closure argument
 // instantiates an ASYNC instance of the callee — awaited sequentially, over a
 // snapshot of the receiver — while sync call sites keep the plain instance.
-import std::print;
+import std::io::print;
 import std::time::sleep;
 
 fun run(f: || i32): i32 {

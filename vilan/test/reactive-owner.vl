@@ -2,7 +2,7 @@
 // establishes the extent, `effect` self-registers into it — stored callbacks
 // keep firing after the extent exits and die with their owner. Extents nest;
 // the nearest wins.
-import std::print;
+import std::io::print;
 import std::reactive::{ Signal, Owner, Disposable, owner_scope, get_owner, run_with_owner, comp };
 
 fun main() {

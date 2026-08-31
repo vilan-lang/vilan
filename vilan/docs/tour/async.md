@@ -10,7 +10,6 @@ type. The compiler figures out which functions suspend and awaits the
 calls for you.
 
 ```vilan
-import std::print;
 import std::time::{ sleep_for, Duration };
 
 fun fetch_label(): str {
@@ -38,7 +37,6 @@ express: *not* waiting.
 - `await task` collects a task you spawned earlier.
 
 ```vilan
-import std::print;
 import std::time::{ sleep_for, Duration };
 
 fun step(label: str): str {
@@ -106,7 +104,6 @@ awaited), while every sync call site keeps the untouched original.
 `map` is one function, not two:
 
 ```vilan,norun
-import std::print;
 import std::time::sleep;
 
 fun fetch_len(url: str): i32 {
@@ -127,7 +124,6 @@ hundred seconds. When the elements are independent, opt into
 concurrency by starting them all first:
 
 ```vilan,norun
-import std::print;
 import std::time::sleep;
 
 fun fetch_len(url: str): i32 {
@@ -177,7 +173,6 @@ spawn should be accounted for, run the work in a **nursery** from
 `std::task`:
 
 ```vilan,norun
-import std::print;
 import std::time::sleep;
 import std::task::nursery;
 
@@ -219,7 +214,6 @@ The contract:
 The body's handle cancels the whole extent:
 
 ```vilan,norun
-import std::print;
 import std::time::sleep;
 import std::task::{ nursery, Task };
 
@@ -271,7 +265,6 @@ A `Timer` is a delay you keep hold of. It starts on construction, and
 you either wait for its verdict or call it off:
 
 ```vilan
-import std::print;
 import std::time::Timer;
 
 fun main() {
@@ -304,7 +297,6 @@ Details in the [time reference](../std/time.md).
   the work just as early and keeps independent work overlapping:
 
   ```vilan,norun
-  import std::print;
   import std::time::sleep;
   import std::task::Task;
 

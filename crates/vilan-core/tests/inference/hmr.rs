@@ -14,7 +14,7 @@ fn hmr_value_binding_wraps_initializer_and_exposes_it() {
     // <init>)`, and exposes it with a `() => <name>` getter at the module tail.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         mut count = 0;
         fun main() { count = count + 1; print(count); }
         "#,
@@ -45,7 +45,7 @@ fn hmr_mut_binding_is_let_and_immutable_binding_is_const() {
     // JS `let`, an immutable one stays `const`.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         mut counter = 0;
         let label = "hi";
         fun main() { counter = counter + 1; print(label); }
@@ -67,7 +67,7 @@ fn hmr_signal_binding_uses_payload_form() {
     // cell (`[0].v`) so only the value crosses — old subscribers die.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         let ticker = Signal::new(0);
         fun main() { print(ticker.get()); }
@@ -89,7 +89,7 @@ fn hmr_shared_binding_uses_payload_form() {
     // (`.v`).
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         let cell = Shared::new(0);
         fun main() { print(cell.read()); }
@@ -112,7 +112,7 @@ fn hmr_excluded_binding_is_emitted_unwrapped_and_unexposed() {
     // is never exposed.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { action: || i32 }
         let holder = Holder { action = || 42 };
         fun main() { print((holder.action)()); }
@@ -134,7 +134,7 @@ fn hmr_nested_module_binding_key_carries_the_module_path() {
     // DECLARING scope, so a `use` re-export cannot relabel its home.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         mod inner { export let greeting = "hey"; }
         use inner::greeting;
         fun main() { print(greeting); }
@@ -157,7 +157,7 @@ fn hmr_fingerprint_is_stable_for_equal_types_and_differs_on_a_type_change() {
     // stale shape). The fingerprint is over the structural type, not the value.
     let same = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         let a = 1;
         let b = 2;
         fun main() { print(a); print(b); }
@@ -169,7 +169,7 @@ fn hmr_fingerprint_is_stable_for_equal_types_and_differs_on_a_type_change() {
 
     let point_i32 = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32 }
         let p = Point { x = 1 };
         fun main() { print(p.x); }
@@ -177,7 +177,7 @@ fn hmr_fingerprint_is_stable_for_equal_types_and_differs_on_a_type_change() {
     );
     let point_str = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: str }
         let p = Point { x = "a" };
         fun main() { print(p.x); }
@@ -198,7 +198,7 @@ fn hmr_function_local_is_not_wrapped_or_exposed() {
     // never a root / `mod` body, so it is never classified — no adopt, no expose.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() { let local = 5; print(local); }
         "#,
     );
@@ -220,7 +220,7 @@ fn hmr_module_and_local_same_name_only_wraps_the_module_binding() {
     // emits unwrapped.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         mut n = 0;
         fun helper() { let n = 99; print(n); }
         fun main() { n = n + 1; helper(); print(n); }
@@ -259,7 +259,7 @@ fn hmr_closure_body_local_is_not_wrapped() {
     // module-level — no adopt wrap.
     let js = compile_hmr(
         r#"
-        import std::print;
+        import std::io::print;
         let make = || { let inner = 7; inner };
         fun main() { print(make()); }
         "#,
@@ -276,7 +276,7 @@ fn hmr_disabled_is_byte_identical_and_has_no_instrumentation() {
     // no `__hmr_` tokens at all — the equivalence-gate guarantee that `build`
     // output is untouched.
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         mut count = 0;
         let ticker = Signal::new(0);

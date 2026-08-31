@@ -15,7 +15,6 @@
 
 import std::json::json_codec;
 import std::option::Option::{ None, Some, self };
-import std::print;
 import std::reactive::{ Signal, Source, batch };
 import std::result::Result::{ Err, Ok, self };
 import std::rpc::{

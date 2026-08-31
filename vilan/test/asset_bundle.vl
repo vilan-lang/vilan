@@ -3,7 +3,7 @@
 // into the output directory and folds to the url the copy answers on, so the
 // emitted JS holds a plain string and no runtime call survives.
 import std::asset::bundle;
-import std::print;
+import std::io::print;
 
 let note = const bundle("asset_bundle_note.txt");
 

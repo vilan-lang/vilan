@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::option::Option::{ self, Some, None };
 
 // Phase 5: a view may be returned wrapped in an enum payload — `Option<&mut T>`

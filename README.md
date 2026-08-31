@@ -29,7 +29,6 @@ the running browser app updates in place, reactive state intact.
 Reactive state, from the first page of the guide:
 
 ```vilan
-import std::print;
 import std::reactive::{ Signal, Owner, run_with_owner };
 
 fun main() {
@@ -135,8 +134,6 @@ cargo install --path crates/vilan-cli   # installs the `vilan` binary
 Then put this in `hello.vl`:
 
 ```vilan
-import std::print;
-
 fun main() {
 	print("hello");
 }

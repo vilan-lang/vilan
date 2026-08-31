@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `[derive(Debug)]` synthesizes `debug(self): str` — a `Type { field = value, … }`
 // representation. Scalars format via `JSON.stringify` (numbers raw, strings

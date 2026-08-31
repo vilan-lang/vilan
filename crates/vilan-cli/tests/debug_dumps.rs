@@ -46,7 +46,7 @@ fn build(project_source: &PathBuf, arguments: &[&str]) -> String {
 
 /// A `?` in an expression — the desugar `lift::rewrite_items` performs, and the
 /// one whose nodes E99's probe found in `.parse.out`.
-const LIFTING_ENTRY: &str = r#"import std::print;
+const LIFTING_ENTRY: &str = r#"import std::io::print;
 import std::option::Option::{ self, Some, None };
 
 fun pick(): Option<i32> {

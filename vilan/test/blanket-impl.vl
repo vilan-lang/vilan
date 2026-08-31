@@ -1,4 +1,3 @@
-import std::print;
 import std::reactive::Signal;
 
 // A BLANKET impl (`impl type T with Trait<T>`) implements a trait for every

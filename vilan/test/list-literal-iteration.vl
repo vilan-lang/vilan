@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // A list literal carries its element type (`[Point, Point]` is `List<Point>`),
 // so a `for`-loop binding is typed concretely and can answer method calls.

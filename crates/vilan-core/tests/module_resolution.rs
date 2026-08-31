@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use vilan_core::manifest::PreludeSpec;
 use vilan_core::{
     Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, Workspace, analyze_source,
 };
@@ -91,7 +92,7 @@ fn analyze_overlay_package(files: &[(&str, &str)], entry: &str, platform: Platfo
     errors.into_iter().map(|error| error.msg).collect()
 }
 
-const ENTRY: &str = "import std::print;\nimport pkg::foo::bar;\nfun main() { print(bar()); }\n";
+const ENTRY: &str = "import std::io::print;\nimport pkg::foo::bar;\nfun main() { print(bar()); }\n";
 const MODULE: &str = "fun bar(): i32 { 7 }\n";
 
 /// D11 S1, and the LSP's unsaved-file bug: a module that exists ONLY as an open
@@ -273,7 +274,7 @@ fn none_platform_rejects_reaching_platform_std() {
 #[test]
 fn none_platform_allows_base_std() {
     // Base std (e.g. `print`) is universal — a `none` platform still type-checks it.
-    let entry = "import std::print;\nfun main() { print(1); }\n";
+    let entry = "import std::io::print;\nfun main() { print(1); }\n";
     let errors = analyze_package(&[("main.vl", entry)], "main.vl", Platform::None);
     assert!(
         errors.is_empty(),
@@ -335,6 +336,7 @@ fn analyze_workspace_files(
             dependencies: Vec::new(),
             surface: true,
             member: false,
+            prelude: Default::default(),
         });
         entry_dependencies.push((dep.import_name.to_string(), index));
     }
@@ -342,6 +344,7 @@ fn analyze_workspace_files(
         packages,
         entry_dependencies,
         macro_limits: MacroLimits::default(),
+        entry_prelude: Default::default(),
     };
 
     let source = std::fs::read_to_string(&entry_path).unwrap();
@@ -360,7 +363,8 @@ fn analyze_workspace_files(
 
 #[test]
 fn cross_package_import_resolves() {
-    let entry = "import std::print;\nimport common::greeting;\nfun main() { print(greeting()); }\n";
+    let entry =
+        "import std::io::print;\nimport common::greeting;\nfun main() { print(greeting()); }\n";
     let common = Dep {
         import_name: "common",
         files: &[("lib.vl", "fun greeting(): str { \"hi\" }\n")],
@@ -376,7 +380,8 @@ fn cross_package_import_resolves() {
 fn cross_package_submodule_resolves() {
     // `common::shape::area` descends into a submodule of the dependency, whose own
     // `pkg::` self-reference (from `lib.vl`) stays within `common`.
-    let entry = "import std::print;\nimport common::shape::area;\nfun main() { print(area(2)); }\n";
+    let entry =
+        "import std::io::print;\nimport common::shape::area;\nfun main() { print(area(2)); }\n";
     let common = Dep {
         import_name: "common",
         files: &[
@@ -397,7 +402,7 @@ fn dependency_pkg_self_reference_is_isolated() {
     // entry's same-named module. The entry also has a `helper` with a different
     // signature; if `pkg::` leaked across packages, one side would mistype.
     let entry = concat!(
-        "import std::print;\n",
+        "import std::io::print;\n",
         "import pkg::helper::entry_value;\n",
         "import common::greeting;\n",
         "fun main() { print(entry_value()); print(greeting()); }\n",
@@ -434,9 +439,11 @@ fn dependency_pkg_self_reference_is_isolated() {
             dependencies: Vec::new(),
             surface: true,
             member: false,
+            prelude: Default::default(),
         }],
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
+        entry_prelude: Default::default(),
     };
     let entry_path = app_dir.join("main.vl");
     let source = std::fs::read_to_string(&entry_path).unwrap();
@@ -467,7 +474,7 @@ fn a_workspace_dependency_edge_named_std_is_refused() {
     // one name, two resolvers, two answers. The `analyze` funnel now reports
     // the edge and drops it, so `std::` keeps meaning the standard library
     // for every resolver.
-    let entry = "import std::print;\nfun main() { print(\"hi\") }\n";
+    let entry = "import std::io::print;\nfun main() { print(\"hi\") }\n";
     let imposter = Dep {
         import_name: "std",
         files: &[("lib.vl", "fun shadow(): str { \"shadow\" }\n")],
@@ -479,12 +486,12 @@ fn a_workspace_dependency_edge_named_std_is_refused() {
             .any(|error| error.contains("`std` is a reserved package name")),
         "expected the reserved-name refusal, got: {errors:#?}"
     );
-    // Dropped, not fatal: `std::print` still resolves to the real standard
+    // Dropped, not fatal: `std::io::print` still resolves to the real standard
     // library, so the refusal is the only diagnostic.
     assert_eq!(
         errors.len(),
         1,
-        "`std::print` must keep resolving to the standard library: {errors:#?}"
+        "`std::io::print` must keep resolving to the standard library: {errors:#?}"
     );
 }
 
@@ -665,9 +672,11 @@ fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
             dependencies: Vec::new(),
             surface: true,
             member: false,
+            prelude: Default::default(),
         }],
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
+        entry_prelude: Default::default(),
     };
     let source = std::fs::read_to_string(&entry_path).unwrap();
     let leaked: &'static str = Box::leak(source.into_boxed_str());
@@ -767,9 +776,11 @@ fn base_lib_reexporting_a_layer_module_errors() {
             dependencies: Vec::new(),
             surface: true,
             member: false,
+            prelude: Default::default(),
         }],
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
+        entry_prelude: Default::default(),
     };
     let source = std::fs::read_to_string(&entry_path).unwrap();
     let leaked: &'static str = Box::leak(source.into_boxed_str());
@@ -891,6 +902,7 @@ fn contract_violations(
         dependencies: Vec::new(),
         surface: true,
         member: false,
+        prelude: Default::default(),
     };
     let violations = vilan_core::analyzer::check_library_contract(&spec)
         .into_iter()
@@ -1183,7 +1195,7 @@ fn a_type_error_in_an_imported_module_is_attributed_to_that_module() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
+                "import std::io::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
             ),
             ("broken.vl", "fun answer(): i32 {\n\t\"not a number\"\n}\n"),
         ],
@@ -1470,7 +1482,7 @@ fn a_derive_refusal_in_a_module_is_attributed_to_the_deriving_module() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::page::{ Widget, Opaque };\n\
+                "import std::io::print;\nimport pkg::page::{ Widget, Opaque };\n\
                  fun main() {\n\tlet w = Widget { item = Opaque { x = 1 } };\n\tprint(w.item.x);\n}\n",
             ),
             (
@@ -1498,7 +1510,7 @@ fn an_operator_refusal_in_a_module_is_attributed_to_that_module() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::helper::check;\nfun main() { print(check()); }\n",
+                "import std::io::print;\nimport pkg::helper::check;\nfun main() { print(check()); }\n",
             ),
             (
                 "helper.vl",
@@ -1523,7 +1535,7 @@ fn a_condition_error_in_a_module_is_attributed_to_that_module() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::helper::check;\nfun main() { print(check()); }\n",
+                "import std::io::print;\nimport pkg::helper::check;\nfun main() { print(check()); }\n",
             ),
             (
                 "helper.vl",
@@ -1550,7 +1562,7 @@ fn an_uniterable_for_each_in_a_module_is_attributed_to_that_module() {
             ),
             (
                 "helper.vl",
-                "import std::print;\n\nstruct Cursor { items: List<i32> }\n\n\
+                "import std::io::print;\n\nstruct Cursor { items: List<i32> }\n\n\
                  fun run() {\n\tlet cursor = Cursor { items = [1] };\n\
                  \tfor item in cursor {\n\t\tprint(item);\n\t}\n}\n",
             ),
@@ -1571,7 +1583,7 @@ fn an_out_of_range_literal_in_a_module_is_attributed_to_that_module() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::helper::level;\nfun main() { print(level()); }\n",
+                "import std::io::print;\nimport pkg::helper::level;\nfun main() { print(level()); }\n",
             ),
             (
                 "helper.vl",
@@ -1598,7 +1610,7 @@ fn an_out_of_range_literal_in_a_module_is_attributed_to_that_module() {
 fn local_module_sharing_a_std_name_resolves_for_both_roots() {
     // `json` is one of std's always-loaded core modules — the strongest collision:
     // std's `json` registers whether or not the program imports it.
-    let entry = "import std::print;\nimport std::json::encode_json;\nimport pkg::json::stamp;\n\
+    let entry = "import std::io::print;\nimport std::json::encode_json;\nimport pkg::json::stamp;\n\
                  \nfun main() { print(stamp()); print(encode_json(7)); }\n";
     let errors = analyze_package(
         &[
@@ -1637,7 +1649,7 @@ fn local_module_sharing_a_layered_std_name_resolves_for_both_roots() {
 fn local_module_sharing_a_primitive_hosts_name_keeps_the_captures() {
     // `string.vl` hosts the `str` primitive. A local module of the same name must
     // not displace it in the analyzer's capture map — `"abc".len()` still types.
-    let entry = "import std::print;\nimport pkg::string::shout;\n\
+    let entry = "import std::io::print;\nimport pkg::string::shout;\n\
                  \nfun main() { print(shout()); print(\"abc\".len()); }\n";
     let errors = analyze_package(
         &[
@@ -1656,7 +1668,7 @@ fn local_module_sharing_a_primitive_hosts_name_keeps_the_captures() {
 #[test]
 fn local_io_module_does_not_displace_std_io() {
     // `io.vl` hosts `print`/`panic`; the entry's own `io.vl` must not shadow it.
-    let entry = "import std::print;\nimport pkg::io::log_line;\n\
+    let entry = "import std::io::print;\nimport pkg::io::log_line;\n\
                  \nfun main() { print(log_line(\"x\")); }\n";
     let errors = analyze_package(
         &[
@@ -1691,7 +1703,7 @@ fn pkg_root_does_not_alias_std_modules() {
 fn workspace_entry_local_module_sharing_a_std_name_resolves() {
     // The with-dependencies path: the entry is `packages[0]`, std is a later
     // package — the collision must resolve identically, alongside a dep import.
-    let entry = "import std::print;\nimport std::json::encode_json;\n\
+    let entry = "import std::io::print;\nimport std::json::encode_json;\n\
                  import pkg::json::stamp;\nimport common::greeting;\n\
                  \nfun main() { print(stamp()); print(encode_json(7)); print(greeting()); }\n";
     let common = Dep {
@@ -1746,7 +1758,7 @@ fn dependency_display_names_intern_across_analyses() {
     use vilan_core::leak_tally::{self, LeakSite};
 
     let entry =
-        "import std::print;\nimport internpin::greeting;\nfun main() { print(greeting()); }\n";
+        "import std::io::print;\nimport internpin::greeting;\nfun main() { print(greeting()); }\n";
     let dep = Dep {
         import_name: "internpin",
         files: &[("lib.vl", "fun greeting(): str { \"hi\" }\n")],
@@ -1812,6 +1824,7 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
         dependencies: Vec::new(),
         surface: true,
         member: false,
+        prelude: Default::default(),
     };
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -1859,7 +1872,7 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
 fn the_reclaimable_entry_analysis_hands_back_the_tree_it_leaked() {
     use vilan_core::leak_tally::{self, LeakSite};
 
-    let source: &'static str = "import std::print;\n\nfun main() {\n\tprint(\"reclaim\");\n}\n";
+    let source: &'static str = "import std::io::print;\n\nfun main() {\n\tprint(\"reclaim\");\n}\n";
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
@@ -1949,7 +1962,7 @@ fn the_reclaimable_entry_analysis_hands_back_the_tree_it_leaked() {
 fn a_macro_worlds_tree_records_at_its_own_site_not_the_entrys() {
     use vilan_core::leak_tally::{self, LeakSite};
 
-    let source: &'static str = "import std::print;\n\n\
+    let source: &'static str = "import std::io::print;\n\n\
         macro fun twice(arguments: Arguments): Source {\n\
         \timport macro_std::source;\n\
         \timport macro_std::meta::{ Arguments, Source };\n\
@@ -2190,9 +2203,11 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
             dependencies: Vec::new(),
             surface: true,
             member: false,
+            prelude: Default::default(),
         }],
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
+        entry_prelude: Default::default(),
     };
     let overlaid = "fun dep_value(): i32 { 424242 }\n".to_string();
     let overlaid_bytes = overlaid.len();
@@ -2269,7 +2284,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
 
 /// The `resource Guard` preamble the resource-rule cases share, since a `Guard`
 /// declaration is most of each of them.
-const GUARD_PREAMBLE: &str = "import std::print;\nimport std::drop::Drop;\n\
+const GUARD_PREAMBLE: &str = "import std::io::print;\nimport std::drop::Drop;\n\
     resource struct Guard { label: str }\n\
     impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n";
 
@@ -2365,7 +2380,7 @@ fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
         ),
         (
             "`Drop` on a non-resource",
-            "import std::print;\nimport std::drop::Drop;\nstruct Plain { n: i32 }\n\
+            "import std::io::print;\nimport std::drop::Drop;\nstruct Plain { n: i32 }\n\
              impl Plain with Drop { fun drop(&mut self) { print(\"x\"); } }\nfun go() {}\n"
                 .to_string(),
             call_go,
@@ -2423,7 +2438,7 @@ fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
         ),
         (
             "the tuple-spread rule",
-            "import std::print;\nfun forward(items: (i32, i32)): i32 { items.0 }\n\
+            "import std::io::print;\nfun forward(items: (i32, i32)): i32 { items.0 }\n\
              fun go() {\n\tlet pair = (1, 2);\n\tprint(forward(..pair));\n}\n"
                 .to_string(),
             call_go,
@@ -2526,7 +2541,7 @@ fn b112_an_r11_violation_splits_across_the_caller_and_the_generic() {
             ),
             (
                 "generic.vl",
-                "import std::print;\nfun twice<T>(own value: T) {\n\tlet a = value;\n\
+                "import std::io::print;\nfun twice<T>(own value: T) {\n\tlet a = value;\n\
                  \tlet b = value;\n\tprint(\"x\");\n}\n",
             ),
             (
@@ -2683,14 +2698,24 @@ fn module_importables_reads_a_modules_declarations_on_demand() {
 }
 
 #[test]
-fn module_importables_publishes_a_libs_reexports() {
-    // std's `lib.vl` declares nothing at all — it is entirely `export import`,
-    // and those leaves are exactly what `import std::print` names.
+fn module_importables_publishes_a_modules_reexports() {
+    // `std/src/prelude.vl` declares nothing at all — it is entirely
+    // `export import`, and those leaves are exactly the names the base prelude
+    // makes ambient. This is also the query `seed_preludes` rests on: the
+    // ambient set is a module's IMPORTABLES, read syntactically.
+    //
+    // It used to read `lib.vl`, whose re-exports were the `std::print` /
+    // `std::panic` short-name ALIASES. The alias sweep (prelude.md §10.2)
+    // deleted those, and `lib.vl` now publishes nothing — pinned below.
     let spec = std_spec();
-    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("lib.vl"));
+    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("prelude.vl"));
     let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
-    assert!(names.contains(&"print"), "std's surface: {names:?}");
-    assert!(names.contains(&"panic"), "std's surface: {names:?}");
+    for expected in ["print", "Option", "Some", "None", "Result", "Ok", "Err"] {
+        assert!(
+            names.contains(&expected),
+            "the base prelude's surface is missing `{expected}`: {names:?}"
+        );
+    }
     assert!(
         importables
             .iter()
@@ -2700,10 +2725,674 @@ fn module_importables_publishes_a_libs_reexports() {
 }
 
 #[test]
+fn stds_package_root_publishes_nothing_after_the_alias_sweep() {
+    // Thirteen aliases lived in `std/src/lib.vl` to let a caller write
+    // `std::print` instead of `std::io::print`. The prelude serves that, so
+    // they are gone — and `prelude = "std"` is refused by the manifest partly
+    // because accepting it would now mean a silently EMPTY prelude.
+    let spec = std_spec();
+    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("lib.vl"));
+    assert!(
+        importables.is_empty(),
+        "std's root must publish nothing: {:?}",
+        importables.iter().map(|item| item.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_web_preludes_surface_is_its_members_and_its_ambient_modules() {
+    // §5.2/§5.3: three members and two MODULES, published by the one
+    // mechanism — `export import pkg::style;` publishes the module `style`
+    // exactly as `export import pkg::reactive::Signal;` publishes a member.
+    let spec = std_spec();
+    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("web.vl"));
+    let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
+    for expected in [
+        "print", "Option", "Some", "None", "Result", "Ok", "Err", "Signal", "view", "View",
+        "style", "ui",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "the web prelude's surface is missing `{expected}`: {names:?}"
+        );
+    }
+}
+
+#[test]
 fn module_importables_of_an_unreadable_file_is_empty() {
     // A module that fails to load answers EMPTY. An editor query degrades; it
     // never fails, and it never panics.
     assert!(
         vilan_core::analyzer::module_importables(&PathBuf::from("/no/such/module.vl")).is_empty()
+    );
+}
+
+// --- The prelude (prelude.md §5, §7, §9) ---------------------------------
+//
+// The prelude is a RESOLUTION SCOPE, never synthesized file-head imports
+// (§9.2). That distinction is the whole risk of the feature and it is what
+// these pins exist to hold: in this compiler an explicit import BEATS a
+// same-file declaration, so a prelude spliced in as imports would silently
+// replace a file's own `fun print` / `enum Signal` with std's. Every shadowing
+// pin below goes red the moment the implementation drifts that way.
+
+/// Analyzes `entry` against a package whose manifest declares `prelude`, with
+/// `files` written beside it. Returns the diagnostic messages.
+fn analyze_under_prelude(
+    prelude: PreludeSpec,
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_prelude_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let workspace = Workspace {
+        entry_prelude: prelude,
+        ..Workspace::default()
+    };
+    let (_program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &workspace,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    errors.into_iter().map(|error| error.msg).collect()
+}
+
+fn base_prelude() -> PreludeSpec {
+    PreludeSpec::Module(vilan_core::manifest::DEFAULT_PRELUDE.to_string())
+}
+
+fn web_prelude() -> PreludeSpec {
+    PreludeSpec::Module(vilan_core::manifest::WEB_PRELUDE.to_string())
+}
+
+#[test]
+fn the_base_prelude_binds_its_seven_names_with_no_import() {
+    // §5.1. The `Option` case is the argument for the whole feature: the
+    // language MANUFACTURES an `Option` here (a view-returning lookup, a lang
+    // item) and before the prelude refused to let the user take it apart,
+    // because they had not imported names they never wrote.
+    let entry = "fun main() {\n\
+        \tlet found = [1, 2, 3].get(1);\n\
+        \tmatch found {\n\
+        \t\tSome(let n) => print(\"some\"),\n\
+        \t\tNone => print(\"none\"),\n\
+        \t}\n\
+        \tlet outcome: Result<i32, str> = Ok(1);\n\
+        \tmatch outcome {\n\
+        \t\tOk(let v) => print(\"ok\"),\n\
+        \t\tErr(let e) => print(e),\n\
+        \t}\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_local_declaration_shadows_a_prelude_name_silently() {
+    // §9.1/§9.2, and the single most important pin in this file. An explicit
+    // import beats a same-file declaration in this compiler, so a prelude
+    // implemented as synthesized imports would make this file's own `print`
+    // DEAD CODE — silently. It must be the file's own, with no diagnostic.
+    let entry = "import std::io;\n\
+        fun print(message: str): void { io::print(message); }\n\
+        fun main() { print(\"mine\"); }\n";
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "a local declaration must win over the prelude, silently: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_local_type_declaration_shadows_a_web_prelude_name_silently() {
+    // The estate's one real collision (`vilan/test/match-patterns.vl` declares
+    // `enum Signal`), staged against the set that actually binds the name.
+    let entry = "enum Signal { Quit, Finished }\n\
+        fun main() {\n\
+        \tlet s = Signal::Quit;\n\
+        \tmatch s { Signal::Quit => print(\"q\"), Signal::Finished => print(\"f\") }\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "the file's own `enum Signal` must win over the web prelude's: {errors:#?}"
+    );
+}
+
+#[test]
+fn an_explicit_import_shadows_a_prelude_name_silently() {
+    // The prelude is the WEAKEST scope, so re-importing what it already binds
+    // is a no-op rather than a redeclaration error — which is what makes the
+    // whole estate's 419 now-redundant import statements keep compiling (§12).
+    let entry = "import std::io::print;\n\
+        import std::option::Option::{ self, None, Some };\n\
+        fun main() {\n\
+        \tlet found: Option<i32> = Some(1);\n\
+        \tmatch found { Some(let n) => print(\"s\"), None => print(\"n\") }\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_module_files_own_declaration_shadows_the_prelude_too() {
+    // The entry file and a module file are seeded at DIFFERENT points — the
+    // entry before its walk (so ordering alone protects it), a module after
+    // its walk and after its imports (so the seed must yield with
+    // `or_insert`). A prelude that plain-`insert`s would leave this module's
+    // own `fun print` dead while every entry-file shadowing pin stayed green,
+    // which is exactly how that gap was found.
+    // The module's own `print` takes an `i32` and RETURNS one, so a prelude
+    // that clobbered it would not merely call the wrong function — it would
+    // fail to type. That is deliberate: the real defect here is a miscompile,
+    // and an analyze-only harness can only see it if the shadowed signature
+    // disagrees.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[
+            (
+                "main.vl",
+                "import pkg::helper::speak;\nfun main() { speak(); }\n",
+            ),
+            (
+                "helper.vl",
+                "fun print(count: i32): i32 { count + 1 }\n\
+export fun speak(): void {\n\
+\tlet next: i32 = print(1);\n\
+}\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "a module's own declaration must win over the prelude: {errors:#?}"
+    );
+    // And the same for an explicit import inside a module file.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[
+            (
+                "main.vl",
+                "import pkg::helper::pick;\nfun main() { print(\"x\"); }\n",
+            ),
+            (
+                "helper.vl",
+                "import std::option::Option::{ self, None, Some };\n\
+export fun pick(): Option<i32> { Some(1) }\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn prelude_false_leaves_the_ambient_names_unbound() {
+    // §10.1's posture, and the path std itself takes. The steer still points
+    // at the real module path, which is what the alias sweep leaves behind.
+    let errors = analyze_under_prelude(
+        PreludeSpec::Off,
+        &[("main.vl", "fun main() { print(\"hi\"); }\n")],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("cannot find 'print' in this scope")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn the_prelude_reaches_a_packages_modules_not_only_its_entry() {
+    // The entry walks in the global scope and a module walks in its own, so
+    // the two are seeded at different points; a prelude that reached only one
+    // of them would pass every single-file pin here.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[
+            (
+                "main.vl",
+                "import pkg::helper::pick;\nfun main() { print(\"x\"); }\n",
+            ),
+            ("helper.vl", "export fun pick(): Option<i32> { Some(1) }\n"),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn the_web_prelude_binds_signal_view_and_the_ambient_modules() {
+    // §5.3: three members and two modules. `style::Display` is the dissolution
+    // of §3.4's collision — the CSS enum reached through the ambient MODULE,
+    // with bare `Display` left to `std::display::Display` alone.
+    let entry = "fun card(): View { view(\"div\") }\n\
+        fun main() {\n\
+        \tlet count = Signal::new(0);\n\
+        \tlet shown = style::Display::Flex;\n\
+        \tlet gap = style::space(4);\n\
+        \tprint(\"web\");\n\
+        }\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn an_ambient_module_is_beaten_by_an_explicit_member_import() {
+    // §4.1/§13.11, and the reason the `style` module costs the estate nothing:
+    // `std::style::style` is a FUNCTION whose name equals its module's, and 60
+    // call sites write it bare. Each carries this import, which outranks the
+    // ambient module — so `style()` keeps meaning the builder.
+    let entry = "import std::style::style;\n\
+import std::style::Style;\n\
+fun styled(): Style { style() }\n\
+fun main() { print(\"styled\"); }\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn shadowing_an_ambient_module_costs_that_files_qualified_spelling() {
+    // The other half of the pin above, and a consequence worth pinning rather
+    // than discovering: a name has ONE binding, so a file that imports the
+    // FUNCTION `style` no longer reaches the MODULE `style` — `style::Display`
+    // stops resolving there. This costs the estate nothing (its 60 `style()`
+    // call sites import the enums they use explicitly and never write
+    // `style::…`), and it is the ordinary shadowing rule rather than anything
+    // the prelude adds. Recorded in prelude.md §4.1.
+    let entry = "import std::style::style;\n\
+fun main() {\n\
+\tlet shown = style::Display::Flex;\n\
+\tprint(\"styled\");\n\
+}\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("is not a module") && e.contains("Display")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn the_ambient_module_carries_the_style_cluster_when_nothing_shadows_it() {
+    // The admission argument for an ambient MODULE (§5.2): one name in the
+    // bare namespace buys a whole namespace. `Display` here is the CSS enum
+    // through `style::`, which is how §3.4's collision dissolves — bare
+    // `Display` stays `std::display::Display`'s alone.
+    let entry = "fun main() {\n\
+\tlet shown = style::Display::Flex;\n\
+\tlet gap = style::space(4);\n\
+\tlet builder = style::style();\n\
+\tprint(\"cluster\");\n\
+}\n";
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn the_base_prelude_does_not_bind_the_web_sets_names() {
+    // The two sets are genuinely different scopes: a base-prelude package
+    // reaching for `Signal` gets a diagnostic, not a silent bind.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[(
+            "main.vl",
+            "fun main() { let s = Signal::new(0); print(\"x\"); }\n",
+        )],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(errors.iter().any(|e| e.contains("Signal")), "{errors:#?}");
+}
+
+#[test]
+fn a_dependency_resolves_under_its_own_prelude_not_the_consumers() {
+    // §7, the composability rule: two packages that disagree about what
+    // `Signal` means must both keep compiling in one build. The consumer takes
+    // the WEB set; the dependency declares none of its own, so it takes the
+    // base one — `Some` resolves inside it and `Signal` must not.
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_preliso_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("main.vl"),
+        "import common::greeting;\nfun main() { let s = Signal::new(0); print(\"app\"); }\n",
+    )
+    .unwrap();
+    let dep_root = root.join("common");
+    std::fs::create_dir_all(&dep_root).unwrap();
+    std::fs::write(
+        dep_root.join("lib.vl"),
+        // Its own base prelude gives it `Option`/`Some`; the consumer's web
+        // prelude must NOT give it `Signal`.
+        "export fun greeting(): Option<i32> { Some(1) }\nfun leak(): i32 { let s = Signal::new(0); 0 }\n",
+    )
+    .unwrap();
+    let workspace = Workspace {
+        packages: vec![PackageSpec {
+            base_root: dep_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        }],
+        entry_dependencies: vec![("common".to_string(), 0)],
+        macro_limits: MacroLimits::default(),
+        entry_prelude: web_prelude(),
+    };
+    let entry_path = app_dir.join("main.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (_program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &app_dir,
+        &entry_path,
+        Some(Platform::Browser),
+        &workspace,
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let errors: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+    assert!(
+        errors.iter().any(|e| e.contains("Signal")),
+        "the consumer's web prelude must not reach into the dependency: {errors:#?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.contains("'Some'") || e.contains("'Option'")),
+        "the dependency's OWN base prelude must still bind: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_web_set_name_steers_to_the_manifest_key_not_to_an_import() {
+    // §11.4 determination 1. A base-prelude package reaching for `Signal` is
+    // the one new confusion two sets create, and the repair is a manifest
+    // line — so the ordinary "import it first" steer would send the user the
+    // wrong way. This arm fires ahead of it.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[(
+            "main.vl",
+            "fun main() { let s = Signal::new(0); print(\"x\"); }\n",
+        )],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("in the prelude of the web set") && e.contains("prelude = \"std::web\"")
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn a_name_in_neither_std_prelude_keeps_the_ordinary_import_steer() {
+    // The arm must be narrow: `Map` is in no prelude, so the B4 import steer
+    // still answers, and the LSP quickfix it drives still fires.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[(
+            "main.vl",
+            "fun main() { let m: Map<str, i32> = Map::new(); print(\"x\"); }\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("import it first (`import std::map::Map;`)")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn a_package_already_on_the_web_set_never_gets_the_web_steer() {
+    // "You are not on the web set" is only true when it is true. On `std::web`
+    // a genuinely missing name gets the ordinary steer.
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[(
+            "main.vl",
+            "fun main() { let m: Map<str, i32> = Map::new(); print(\"x\"); }\n",
+        )],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.contains("in the prelude of the web set")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn the_base_seven_never_steer_toward_the_web_set() {
+    // Both sets carry them, so a `prelude = false` package missing `print`
+    // must be told to import it, not to switch sets.
+    let errors = analyze_under_prelude(
+        PreludeSpec::Off,
+        &[("main.vl", "fun main() { print(\"x\"); }\n")],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("import it first (`import std::io::print;`)")),
+        "{errors:#?}"
+    );
+    assert!(!errors.iter().any(|e| e.contains("web set")), "{errors:#?}");
+}
+
+// --- The alias sweep (prelude.md §10.2) ----------------------------------
+
+#[test]
+fn the_removed_std_print_alias_names_the_prelude_and_the_real_path() {
+    // `std::print` will be typed from muscle memory for a long time. The
+    // generic "cannot find 'print' in the imported path" names neither the
+    // removal nor either way forward; this arm names both.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[(
+            "main.vl",
+            "import std::print;\nfun main() { print(\"x\"); }\n",
+        )],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("`std::print` was removed")
+                && e.contains("in the default prelude")
+                && e.contains("std::io::print")
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn a_removed_alias_the_prelude_does_not_carry_names_only_its_real_path() {
+    // `panic`, `assert` and `Default` are in neither std prelude, so telling
+    // the user "no import needed" would be false.
+    for (line, expected) in [
+        (
+            "import std::panic;",
+            "`std::panic` was removed: its module path is `std::io::panic`",
+        ),
+        (
+            "import std::assert;",
+            "`std::assert` was removed: its module path is `std::io::assert`",
+        ),
+        (
+            "import std::Default;",
+            "`std::Default` was removed: its module path is `std::default::Default`",
+        ),
+    ] {
+        let source = format!("{line}\nfun main() {{ }}\n");
+        let errors = analyze_under_prelude(
+            base_prelude(),
+            &[("main.vl", &source)],
+            "main.vl",
+            Platform::default(),
+        );
+        assert!(
+            errors.iter().any(|e| e.contains(expected)),
+            "{line}: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_removed_primitive_alias_says_the_name_is_already_in_scope() {
+    // The numerics and `str` are §4.7 primitives, ambient with no prelude at
+    // all — so steering toward an import would point at something that was
+    // never needed. Their aliases had zero uses in the whole estate.
+    for name in ["i32", "u32", "f64", "BigInt", "str"] {
+        let source = format!("import std::{name};\nfun main() {{ }}\n");
+        let errors = analyze_under_prelude(
+            base_prelude(),
+            &[("main.vl", &source)],
+            "main.vl",
+            Platform::default(),
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains(&format!("`std::{name}` was removed"))
+                    && e.contains("is a primitive and is always in scope")
+            }),
+            "{name}: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn the_real_module_paths_still_resolve_after_the_sweep() {
+    // The sweep deleted the SHORT spellings, not the names. Every alias's real
+    // home must still import cleanly — this is what the estate migrated onto.
+    let entry = "import std::io::print;\n\
+import std::io::panic;\n\
+import std::default::Default;\n\
+import std::string::str;\n\
+import std::number::u32;\n\
+fun main() { print(\"x\"); }\n";
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", entry)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_deeper_std_path_is_not_mistaken_for_a_removed_alias() {
+    // The arm must fire only directly under `std`'s root: a typo inside a real
+    // module keeps the ordinary message.
+    let errors = analyze_under_prelude(
+        base_prelude(),
+        &[("main.vl", "import std::io::prnt;\nfun main() { }\n")],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("cannot find 'prnt' in the imported path")),
+        "{errors:#?}"
     );
 }

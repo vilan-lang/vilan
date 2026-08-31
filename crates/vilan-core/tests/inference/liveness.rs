@@ -25,7 +25,7 @@ fn a_read_then_move_elides_the_move() {
     // take the list's storage.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some };
         fun total(xs: List<i32>): i32 {
             mut sum = 0;
@@ -55,7 +55,7 @@ fn a_read_then_move_still_prints_the_same_values() {
     // run, must answer exactly as it did when the store deep-copied.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some };
         fun total(xs: List<i32>): i32 {
             mut sum = 0;
@@ -83,7 +83,7 @@ fn a_binding_the_loop_body_declares_elides_at_its_last_use() {
     // away whole. The loop rule asks the question relative to the DECLARATION.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut fresh: List<List<i32>> = [];
             let rounds: List<i32> = [0, 1, 2];
@@ -108,7 +108,7 @@ fn loop_local_rows_stay_independent_when_the_copy_is_elided() {
     // re-declared per iteration, so each `push` donates a different array.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut fresh: List<List<i32>> = [];
             let rounds: List<i32> = [0, 1, 2];
@@ -139,7 +139,7 @@ fn a_generic_own_store_elides_at_the_last_use() {
     // rather than sweeping the whole program.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Vault<T> { held: List<T> }
         impl Vault<type T> {
             fun keep(&mut self, own item: T) {
@@ -171,7 +171,7 @@ fn a_read_inside_a_loop_of_an_outer_binding_still_copies() {
     // next one. This is what `collect_repeatable_interiors` was approximating.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut base: List<i32> = [1, 2];
             mut collected: List<List<i32>> = [];
@@ -197,7 +197,7 @@ fn loop_carried_rows_stay_independent_of_the_source() {
     // through every one of them.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut base: List<i32> = [1, 2];
             mut collected: List<List<i32>> = [];
@@ -222,7 +222,7 @@ fn a_captured_binding_never_elides() {
     // refuses wholesale rather than trying to time.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some };
         fun main() {
             mut captured: List<i32> = [7];
@@ -246,7 +246,7 @@ fn a_captured_binding_and_its_stored_copy_stay_independent() {
     // the stored value must not be the binding's own list.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some, None };
         fun main() {
             mut captured: List<i32> = [7];
@@ -271,7 +271,7 @@ fn a_module_level_binding_read_by_a_function_never_elides() {
     // module body's own last read is therefore not the program's last read.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some };
         let table: List<i32> = [1, 2, 3];
         fun size(): i32 { table.len() }
@@ -297,7 +297,7 @@ fn a_move_past_a_dead_view_elides() {
     // nothing after it: the owner is dead at the store and donates its storage.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some };
         struct Box { items: List<i32> }
         fun main() {
@@ -323,7 +323,7 @@ fn a_move_under_a_live_view_still_copies() {
     // the copy stands — the one shape a value-only last-use rule gets wrong.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some };
         struct Box { items: List<i32> }
         fun main() {
@@ -349,7 +349,7 @@ fn a_loan_to_a_resolved_callee_is_call_bounded() {
     // and nothing more, so it does not keep the owner alive past it.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{ Option, Some };
         struct Box { items: List<i32> }
         fun peek(view: &Box): i32 { view.items.len() }
@@ -378,7 +378,7 @@ fn an_elided_own_argument_is_still_a_move_to_the_checker() {
     // use after the `own` argument is still rejected, with the same message.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Session { id: i32 }
         fun take(own s: Session): i32 { s.id }
         fun main() {
@@ -398,7 +398,7 @@ fn a_resource_beside_an_elided_copy_still_runs_its_single_owner() {
     // one ever emitted a `__clone` to remove.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Session { id: i32 }
         fun take(own s: Session): i32 { s.id }
         struct Vault { held: List<List<i32>> }

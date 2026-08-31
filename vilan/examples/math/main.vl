@@ -1,4 +1,3 @@
-import std::print;
 import pkg::square::sum_of_squares;
 
 fun main() {

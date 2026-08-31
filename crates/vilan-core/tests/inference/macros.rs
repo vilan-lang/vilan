@@ -16,7 +16,7 @@ use crate::support::*;
 
 /// The shared fixture: `Boxy` tags every member it runs through.
 const USER_LIFT_CONTAINER: &str = r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::operators::Lift;
 
@@ -221,7 +221,7 @@ fn expression_lift_never_absorbs_a_user_container_chain() {
 fn primitive_operator_impls_dispatch_generically() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
         import std::operators::{ Add, BitAnd };
 
@@ -252,7 +252,7 @@ fn primitive_operator_impls_dispatch_generically() {
 fn format_covers_u32_and_bigint() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::format;
 
         fun main() {
@@ -334,8 +334,6 @@ fn a_body_import_is_confined_to_its_function() {
 fn an_inner_block_import_is_confined_to_the_block() {
     assert_fails_spanning(
         r#"
-        import std::print;
-
         fun escaped() {
             io::print("outside");
         }
@@ -439,7 +437,7 @@ fn a_nested_function_sees_its_blocks_import() {
 fn an_import_inside_an_impl_body_serves_its_methods() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Greeter {
             name: str,
@@ -470,7 +468,7 @@ fn an_import_inside_an_impl_body_serves_its_methods() {
 fn a_scoped_use_shadows_and_restores() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         mod alpha {
             export fun tag(): str {
@@ -546,7 +544,7 @@ fn a_body_import_of_a_missing_module_errors_cleanly() {
 fn a_macro_attribute_expands_and_the_generated_impl_dispatches() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::{ Display, format };
 
         macro fun derive_display(item: Item): Source {
@@ -598,7 +596,7 @@ fn a_macro_attribute_expands_and_the_generated_impl_dispatches() {
 fn a_derive_name_dispatches_to_a_registered_macro() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun Tagged(item: Item): Source {
             import macro_std::source;
@@ -632,7 +630,7 @@ fn a_derive_name_dispatches_to_a_registered_macro() {
 fn a_macro_receives_its_arguments_as_source_text() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun labelled(item: Item, arguments: Arguments): Source {
             import macro_std::source;
@@ -681,7 +679,7 @@ fn a_macro_receives_its_arguments_as_source_text() {
 fn a_macros_output_can_carry_a_builtin_derive() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun make_pair(item: Item): Source {
             import macro_std::source;
@@ -906,7 +904,7 @@ fn a_macro_fun_inside_a_body_is_rejected() {
 fn an_item_invocation_stamps_out_declarations() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun constants(arguments: Arguments): Source {
             import macro_std::source;
@@ -938,7 +936,7 @@ fn an_item_invocation_stamps_out_declarations() {
 fn an_expression_invocation_splices_in_place() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun double_of(arguments: Arguments): Source {
             import macro_std::source;
@@ -968,7 +966,7 @@ fn an_expression_invocation_splices_in_place() {
 fn a_unit_macro_invokes_with_no_arguments() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun answer(): Source {
             import macro_std::source;
@@ -1031,7 +1029,7 @@ fn gensyms_do_not_capture_across_splice_sites() {
 fn an_item_invocation_with_a_gensym_binds_and_references_it() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun genfun(arguments: Arguments): Source {
             import macro_std::source;
@@ -1129,7 +1127,7 @@ fn an_expression_macro_must_generate_one_expression() {
 fn a_direct_call_types_an_unannotated_closure_parameter() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun accumulate(i: i32): i32 {
             i * 10
@@ -1152,7 +1150,7 @@ fn a_direct_call_types_an_unannotated_closure_parameter() {
 fn code_at_reads_utf16_units() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print("A".code_at(0));
@@ -1200,7 +1198,7 @@ fn an_unimported_macro_from_another_module_is_not_in_scope() {
 fn a_user_macro_shadows_a_prelude_derive_in_its_file() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun PartialEq(item: Item): Source {
             import macro_std::source;
@@ -1235,7 +1233,7 @@ fn a_user_macro_shadows_a_prelude_derive_in_its_file() {
 fn prelude_derives_need_no_import() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Point {
@@ -1266,7 +1264,7 @@ fn prelude_derives_need_no_import() {
 fn i4_empty_lists_are_equal() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let a: List<i32> = [];
             let b: List<i32> = [];
@@ -1284,7 +1282,7 @@ fn i4_equal_lists_compare_equal_through_both_spellings() {
     // generic `T: PartialEq` world calls — same impl, both pinned.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let a = [1, 2, 3];
             let b = [1, 2, 3];
@@ -1304,7 +1302,7 @@ fn i4_lists_of_unequal_length_are_not_equal() {
     // shorter side never indexes past its end.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print(["a", "b"] == ["a", "b", "c"]);
             print(["a", "b", "c"] == ["a", "b"]);
@@ -1320,7 +1318,7 @@ fn i4_lists_with_a_differing_element_are_not_equal() {
     // Same length, one pair disagrees — first, middle, and last position.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print([9, 2, 3] == [1, 2, 3]);
             print([1, 9, 3] == [1, 2, 3]);
@@ -1339,7 +1337,7 @@ fn i4_nested_lists_compare_element_wise() {
     // element impl, and a deep disagreement surfaces.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             print([[1, 2], [3]] == [[1, 2], [3]]);
             print([[1, 2], [3]] == [[1, 2], [4]]);
@@ -1357,7 +1355,7 @@ fn i4_a_struct_with_a_list_field_derives_partial_eq() {
     // derive emits `self.tags == other.tags`, which lands on the new impl.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Row {
@@ -1386,7 +1384,7 @@ fn i4_a_struct_with_a_list_field_derives_partial_eq() {
 fn the_meta_vocabulary_is_ambient_in_macro_bodies() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun tag(item: Item): Source {
             import macro_std::option::Option::{ self, Some, None };
@@ -1419,7 +1417,7 @@ fn the_meta_vocabulary_is_ambient_in_macro_bodies() {
 fn fresh_is_ambient_in_macro_bodies() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun doubled(arguments: Arguments): Source {
             let slot = fresh();
@@ -1444,7 +1442,7 @@ fn fresh_is_ambient_in_macro_bodies() {
 fn a_macro_fun_shadows_the_ambient_prelude() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun fresh(): str {
             "__custom"
@@ -1474,7 +1472,7 @@ fn a_macro_fun_shadows_the_ambient_prelude() {
 fn an_item_position_macro_block_splices_items() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro {
             source("fun answer(): i32 {\n42\n}\n")
@@ -1496,7 +1494,7 @@ fn an_item_position_macro_block_splices_items() {
 fn an_expression_position_macro_block_splices_an_expression() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let folded = macro {
@@ -1522,7 +1520,7 @@ fn an_expression_position_macro_block_splices_an_expression() {
 fn a_macro_block_calls_a_same_file_helper() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         macro fun doubled(value: i32): str {
             i"{value * 2}"
@@ -1663,7 +1661,7 @@ main();
 fn sized_numeric_literals_type_and_run() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let a = 5i8;
@@ -1789,7 +1787,7 @@ fn an_expected_type_literal_is_range_checked() {
 fn type_bounds_are_the_documented_per_type_ranges() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print(i8::max_value());
@@ -1822,7 +1820,7 @@ fn type_bounds_are_the_documented_per_type_ranges() {
 fn type_bounds_equal_the_literals_the_compiler_admits() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print(i8::max_value() == 127i8);
@@ -1907,7 +1905,7 @@ fn a_u53_literal_past_the_window_errors() {
 fn the_signed_literal_looseness_reaches_one_past_max_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print(128i8 > i8::max_value());
@@ -1927,7 +1925,7 @@ fn the_signed_literal_looseness_reaches_one_past_max_value() {
 fn integer_division_truncates_toward_zero() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::operators::Div;
 
         fun halve<T: Div>(value: T, divisor: T): T {
@@ -1966,7 +1964,7 @@ fn generic_numeric_operators_apply_their_verdict_for_every_width() {
     // impl — the one prior generic-division pin used `i16`, so it hid `i32`/`u32`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::operators::{ Div, Shr, BitAnd };
         fun halve<T: Div>(v: T, d: T): T { v / d }
         fun shift<T: Shr>(v: T, by: T): T { v >> by }
@@ -1990,7 +1988,7 @@ fn generic_numeric_operators_apply_their_verdict_for_every_width() {
 fn numeric_conversions_fold_into_the_target_width() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print((300).as_u8());
@@ -2018,7 +2016,7 @@ fn numeric_conversions_fold_into_the_target_width() {
 fn a_macro_stamps_a_numeric_family() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::operators::Add;
 
         macro fun arithmetic_family(arguments: Arguments): Source {
@@ -2071,7 +2069,7 @@ fn a_macro_stamps_a_numeric_family() {
 fn flatten_follows_the_current_inner_and_detaches_the_old() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
 
         fun main() {
@@ -2100,7 +2098,7 @@ fn flatten_follows_the_current_inner_and_detaches_the_old() {
 fn reconcile_plans_keep_refresh_fresh_and_removals() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ reconcile, RowStep };
 
         fun main() {
@@ -2129,7 +2127,7 @@ fn reconcile_plans_keep_refresh_fresh_and_removals() {
 fn owner_defer_runs_cleanups_on_dispose() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, Disposable };
 
         fun main() {
@@ -2153,7 +2151,7 @@ fn owner_defer_runs_cleanups_on_dispose() {
 fn effect_registers_into_the_ambient_owner_and_dies_with_it() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, Disposable, owner_scope };
 
         fun main() {
@@ -2180,7 +2178,7 @@ fn effect_registers_into_the_ambient_owner_and_dies_with_it() {
 fn effect_outside_an_owner_scope_is_a_compile_error() {
     let diagnostics = failure_diagnostics(
         r#"
-import std::print;
+import std::io::print;
 import std::reactive::Signal;
 
 fun main() {
@@ -2204,7 +2202,7 @@ main();
 #[test]
 fn e74_an_uncovered_effect_anchors_at_the_users_call() {
     let source = r#"
-import std::print;
+import std::io::print;
 import std::reactive::Signal;
 
 fun main() {
@@ -2232,7 +2230,7 @@ main();
 #[test]
 fn e74_a_module_initializer_entry_anchors_at_the_initializer_call() {
     let source = r#"
-import std::print;
+import std::io::print;
 import std::reactive::{ Owner, get_owner };
 
 let scope: Owner = get_owner();
@@ -2259,7 +2257,7 @@ main();
 #[test]
 fn e74_a_direct_strict_read_still_anchors_at_itself() {
     let source = r#"
-import std::print;
+import std::io::print;
 import std::reactive::owner_scope;
 
 fun main() {
@@ -2288,7 +2286,7 @@ main();
 fn e74_a_covered_call_beside_the_uncovered_one_is_not_blamed() {
     assert_fails_spanning(
         r#"
-import std::print;
+import std::io::print;
 import std::reactive::{ Owner, Signal, owner_scope };
 
 fun main() {
@@ -2446,7 +2444,7 @@ fun main() {
 #[test]
 fn e78_a_dispatch_hop_says_may_flow() {
     let source = r#"
-import std::print;
+import std::io::print;
 import std::context::Context;
 
 let current: Context<i32> = Context::new();
@@ -2586,7 +2584,7 @@ fun main() {
 #[test]
 fn e78_the_std_read_chain_labels_the_frames_above_the_entry() {
     let source = r#"
-import std::print;
+import std::io::print;
 import std::reactive::Signal;
 
 fun watch(count: Signal<i32>) {
@@ -2642,7 +2640,7 @@ main();
 #[test]
 fn e78_each_uncovered_entry_gets_its_own_diagnostic() {
     let source = r#"
-import std::print;
+import std::io::print;
 import std::reactive::Signal;
 
 fun main() {
@@ -2673,7 +2671,7 @@ main();
 #[test]
 fn e78_an_uncovered_injected_call_traces_its_chain() {
     let source = r#"
-import std::print;
+import std::io::print;
 import std::context::Context;
 
 let current: Context<i32> = Context::new();
@@ -2804,6 +2802,7 @@ fn analyze_workspace_with_dependencies(
             dependencies: Vec::new(),
             surface: true,
             member: dependency.member,
+            prelude: Default::default(),
         });
         entry_dependencies.push((dependency.import_name.to_string(), index));
     }
@@ -2920,7 +2919,7 @@ fn e84_a_dependency_read_anchors_at_the_users_call() {
     let diagnostics = analyze_workspace_with_dependencies(
         &[(
             "main.vl",
-            "import std::print;\nimport depctx::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+            "import std::io::print;\nimport depctx::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
         )],
         &[DependencyFixture {
             import_name: "depctx",
@@ -2983,7 +2982,7 @@ fn e84_a_dependency_chains_hops_exclude_package_internals() {
     let diagnostics = analyze_workspace_with_dependencies(
         &[(
             "main.vl",
-            "import std::print;\nimport depctx::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+            "import std::io::print;\nimport depctx::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
         )],
         &[DependencyFixture {
             import_name: "depctx",
@@ -3039,7 +3038,7 @@ fn e84_a_dependency_injected_call_demotes_the_same_way() {
     let diagnostics = analyze_workspace_with_dependencies(
         &[(
             "main.vl",
-            "import std::print;\nimport depctx::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
+            "import std::io::print;\nimport depctx::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
         )],
         &[DependencyFixture {
             import_name: "depctx",
@@ -3104,7 +3103,7 @@ fn e84_a_workspace_sibling_read_still_anchors_at_itself() {
         &[
             (
                 "main.vl",
-                "import std::print;\nimport pkg::helper::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+                "import std::io::print;\nimport pkg::helper::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
             ),
             (
                 "helper.vl",
@@ -3169,7 +3168,7 @@ fn e90_a_member_package_read_anchors_at_itself_with_its_chain_labeled() {
     let diagnostics = analyze_workspace_with_dependencies(
         &[(
             "main.vl",
-            "import std::print;\nimport common::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
+            "import std::io::print;\nimport common::entry;\n\nfun main() {\n\tprint(entry());\n}\nmain();\n",
         )],
         &[DependencyFixture {
             import_name: "common",
@@ -3237,7 +3236,7 @@ fn e90_a_member_packages_module_read_anchors_at_itself() {
     let diagnostics = analyze_workspace_with_dependencies(
         &[(
             "main.vl",
-            "import std::print;\nimport common::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+            "import std::io::print;\nimport common::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
         )],
         &[DependencyFixture {
             import_name: "common",
@@ -3298,7 +3297,7 @@ fn e90_a_member_packages_injected_call_anchors_at_itself() {
     let diagnostics = analyze_workspace_with_dependencies(
         &[(
             "main.vl",
-            "import std::print;\nimport common::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
+            "import std::io::print;\nimport common::call_it;\n\nfun main() {\n\tcall_it(|| print(1));\n}\nmain();\n",
         )],
         &[DependencyFixture {
             import_name: "common",
@@ -3361,7 +3360,7 @@ fn e90_an_external_packages_module_read_still_demotes() {
     let diagnostics = analyze_workspace_with_dependencies(
         &[(
             "main.vl",
-            "import std::print;\nimport depctx::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
+            "import std::io::print;\nimport depctx::util::read_it;\n\nfun main() {\n\tprint(read_it());\n}\nmain();\n",
         )],
         &[DependencyFixture {
             import_name: "depctx",
@@ -3418,7 +3417,7 @@ fn e90_an_external_packages_module_read_still_demotes() {
 fn importing_reactive_without_the_ambient_layer_compiles() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Subscription, Disposable };
 
         fun main() {
@@ -3439,7 +3438,7 @@ fn importing_reactive_without_the_ambient_layer_compiles() {
 fn a_dead_ambient_reader_does_not_poison_covered_paths() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, Disposable, owner_scope, get_owner };
 
         // Never called: exempt, and it must not unbind `get_owner` for the
@@ -3471,7 +3470,7 @@ fn a_dead_ambient_reader_does_not_poison_covered_paths() {
 fn a_trait_default_body_reads_context_through_covered_dispatch() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let current: Context<i32> = Context::new();
@@ -3514,7 +3513,7 @@ fn a_trait_default_body_reads_context_through_covered_dispatch() {
 fn an_inherited_default_on_a_generic_subject_dispatches() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Doubler<T> {
             fun once(self): T;
@@ -3552,7 +3551,7 @@ fn an_inherited_default_on_a_generic_subject_dispatches() {
 fn an_injected_closure_rides_a_plain_wrapper_into_run() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let current: Context<i32> = Context::new();
@@ -3578,7 +3577,7 @@ fn an_injected_closure_rides_a_plain_wrapper_into_run() {
 fn injected_closures_forward_and_thread_through_calls() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let current: Context<i32> = Context::new();
@@ -3608,7 +3607,7 @@ fn injected_closures_forward_and_thread_through_calls() {
 fn a_multi_context_clause_injects_both_values() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let left: Context<i32> = Context::new();
@@ -3637,7 +3636,7 @@ fn a_multi_context_clause_injects_both_values() {
 fn an_uncovered_injected_call_is_a_compile_error() {
     let diagnostics = failure_diagnostics(
         r#"
-import std::print;
+import std::io::print;
 import std::context::Context;
 
 let current: Context<i32> = Context::new();
@@ -3920,7 +3919,7 @@ main();
 fn an_unused_context_compiles_and_runs() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let current: Context<i32> = Context::new();
@@ -3941,7 +3940,7 @@ fn an_unused_context_compiles_and_runs() {
 fn run_yields_the_body_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::context::Context;
 
         let current: Context<i32> = Context::new();
@@ -3967,7 +3966,7 @@ fn run_yields_the_body_value() {
 fn comp_returns_the_product_and_the_scope() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, Disposable, comp };
 
         fun main() {
@@ -3994,7 +3993,7 @@ fn comp_returns_the_product_and_the_scope() {
 fn run_with_owner_yields_the_body_value() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Owner, run_with_owner };
 
         fun main() {
@@ -4015,7 +4014,7 @@ fn run_with_owner_yields_the_body_value() {
 fn a_clause_can_name_an_imported_context() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, Disposable, owner_scope, run_with_owner };
 
         fun boundary(body: (|| void) context owner_scope) {

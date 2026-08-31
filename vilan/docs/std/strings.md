@@ -52,8 +52,6 @@ names, HTML tag names, hex — where "case-insensitive" is defined over ASCII to
 begin with.
 
 ```vilan
-import std::print;
-
 fun main() {
 	print("Straße".to_uppercase());          // "STRASSE" — ß became SS
 	print("Straße".to_uppercase().len());    // 7, from a 6-unit receiver
@@ -80,7 +78,6 @@ counts UTF-16 code units — `substring`'s own unit, so a bound one of these
 returns feeds `substring` directly, non-BMP text included.
 
 ```vilan
-import std::print;
 import std::option::{ Some, None };
 
 fun main() {
@@ -147,7 +144,6 @@ the arithmetic in the first place. Prefer the verbs, which return `Option<str>`
 so that "absent" is distinguishable from "present but empty":
 
 ```vilan
-import std::print;
 import std::option::{ Some, None };
 
 fun main() {
@@ -166,8 +162,6 @@ fun main() {
 ```
 
 ```vilan
-import std::print;
-
 fun main() {
 	let path = "/w/3/task/7";
 	let parts = path.split("/").filter(|part| !part.is_empty());

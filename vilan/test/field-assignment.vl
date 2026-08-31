@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 struct Counter { value: i32 }
 

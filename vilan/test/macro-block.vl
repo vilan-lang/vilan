@@ -4,7 +4,7 @@
 // spliced expression (compile-time constant folding). Bodies are hermetic
 // macro-world code with the ambient meta prelude — the minimal block needs no
 // imports at all.
-import std::print;
+import std::io::print;
 
 // A helper `macro fun` — a block calls it as a plain in-world function.
 macro fun labeled(name: str, value: i32): str {

@@ -360,7 +360,7 @@ fn an_impure_capability_is_a_clean_unsupported_error() {
     let (kind, message) = interpret(
         r#"
         import std::random;
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print(random::range_i32(1, 6));

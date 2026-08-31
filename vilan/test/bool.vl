@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `bool` is the source-defined `enum bool { false, true }` lowered to a native
 // JS boolean: literals are `true`/`false`, comparisons emit `===`/`<`, `&&` is

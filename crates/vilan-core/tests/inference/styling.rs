@@ -49,7 +49,7 @@ fn last_wins_within_a_chain() {
     // later one's.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style };
         fun padded(): Style {
             style().padding(space(4)).padding(space(6))
@@ -71,7 +71,7 @@ fn last_wins_within_a_chain() {
 fn add_merges_per_property_right_wins() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style, Color };
         fun base(): Style {
             style().padding(space(4)).background(Color::gray(50))
@@ -95,7 +95,7 @@ fn add_merges_per_property_right_wins() {
 fn extend_with_override_is_a_property_method_on_a_style() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
             let base = const style().padding(space(4));
@@ -789,7 +789,7 @@ fn the_border_family_emits_one_declaration_per_edge() {
 #[test]
 fn border_none_replaces_the_border_slot_rather_than_racing_it() {
     let program = r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Color, Length };
         fun cleared(): Style {
             style().border(Length::px(1), Color::gray(300)).border_none()
@@ -817,7 +817,7 @@ fn border_none_replaces_the_border_slot_rather_than_racing_it() {
 #[test]
 fn the_typed_methods_mint_the_rules_their_raw_sites_did() {
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Length };
         fun escaped(): Style {
             style()
@@ -1105,7 +1105,7 @@ fn a_longhand_after_a_shorthand_keeps_both_classes() {
     // edges it still owns, so its class stays on the element.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
             let boxed = const style().padding(space(4)).padding_top(space(0));
@@ -1124,7 +1124,7 @@ fn a_shorthand_after_a_longhand_clears_the_whole_family() {
     // `padding(4)` mints — the family is gone, not merely outranked.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
             let boxed = const style().padding_top(space(0)).padding(space(4));
@@ -1190,7 +1190,7 @@ fn border_and_border_colour_resolve_by_authoring_order() {
 
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Color, Length };
         fun main() {
             let framed = const style()
@@ -1212,7 +1212,7 @@ fn a_merge_resolves_a_family_the_way_a_chain_does() {
     // an order and not a shorthand SPLIT: the drop is a map removal.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Color, Length };
         fun main() {
             let base = const style().border(Length::px(1), Color::gray(300));
@@ -1282,7 +1282,7 @@ fn a_condition_never_clears_the_base_family() {
 
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
             let themed = const style().padding_top(space(0)).within("data-theme", "dark", style().padding(space(4)));
@@ -1360,7 +1360,7 @@ fn raw_belongs_to_its_property_s_family() {
     // does — which is what `border_none()` has always relied on.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
             let pushed = const style().raw("margin-left", "auto").raw("margin", "0");
@@ -1454,7 +1454,7 @@ fn a_border_edge_survives_the_family_it_narrows() {
 
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Color, Length };
         fun main() {
             let framed = const style()
@@ -1559,7 +1559,7 @@ fn calc_still_wraps_and_raw_does_not() {
 fn line_height_length_shares_the_line_height_slot() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Length };
         fun main() {
             let unitless_last = const style().line_height_length(Length::px(24)).line_height(1.5);
@@ -1580,7 +1580,7 @@ fn line_height_length_shares_the_line_height_slot() {
 fn background_image_and_background_gradient_share_one_slot() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Color, Gradient, RadialExtent };
         fun main() {
             let painted = const style()
@@ -1635,7 +1635,7 @@ fn the_new_background_slots_are_longhands_of_their_family() {
     // And the shorthand written LAST clears them, the ordinary family drop.
     assert_compiles_and_runs(
         r##"
-        import std::print;
+        import std::io::print;
         import std::style::{ style };
         fun main() {
             let reset = const style()
@@ -1813,7 +1813,7 @@ fn converting_a_background_shorthand_to_a_longhand_keeps_authoring_order() {
     // `background_gradient` was given its own slot in §0bis.3.
     assert_compiles_and_runs(
         r##"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Color, Gradient, RadialExtent };
         fun main() {
             let converted = const style()
@@ -1867,7 +1867,7 @@ fn the_two_value_padding_sites_compose_from_the_axis_methods() {
     // four — one class, exactly as it would have replaced a raw shorthand.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Length };
         fun main() {
             let boxed = const style()
@@ -1919,7 +1919,7 @@ fn size_writes_the_width_and_height_slots() {
 fn a_height_after_size_narrows_by_last_wins() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Length };
         fun main() {
             let squared = const style().size(Length::rem(1.0)).height(Length::rem(2.0));
@@ -2312,7 +2312,7 @@ fn an_attribute_value_with_a_quote_fails_the_build() {
 fn attribute_slots_merge_per_condition_and_property() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style };
         fun main() {
             let togged = const style()
@@ -2337,7 +2337,7 @@ fn attribute_slots_merge_per_condition_and_property() {
 fn ssr_renders_attribute_conditioned_classes() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, Style, Color };
         import std::ui::{ view, render };
         fun main() {
@@ -2418,7 +2418,7 @@ fn divide_emits_the_layered_not_first_child_refinement() {
 fn relation_slots_merge_per_relation_and_property() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space, Style };
         fun main() {
             // same relation, same property, twice: ONE slot, last wins —
@@ -3417,7 +3417,7 @@ fn a_declaration_chain_carries_its_tokens_rather_than_emitting_them() {
     // declared reaches the sheet with nothing — including its tokens.
     let assets = collected_assets(
         r##"
-        import std::print;
+        import std::io::print;
         import std::style::{ declarations, space };
         fun main() {
             let dropped = declarations().raw("--pad", space(6));
@@ -3440,7 +3440,7 @@ fn a_declaration_chain_builds_outside_a_const_expression() {
     // have made every declaration chain, `str` ones included, compile-time-only.
     assert_compiles_and_runs(
         r##"
-        import std::print;
+        import std::io::print;
         import std::style::{ declarations, space, Color };
         fun main() {
             let block = declarations()
@@ -3506,7 +3506,7 @@ fn a_typed_declaration_value_is_checked_like_a_str_one() {
 fn emit_reached_through_a_bounded_generic_is_const_only() {
     assert_fails_with(
         r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3540,7 +3540,7 @@ fn a_clean_impl_through_the_same_bounded_generic_stays_admitted() {
     // reaches nothing.
     assert_compiles_and_runs(
         r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3580,7 +3580,7 @@ fn a_bounded_generic_is_charged_per_call_site_not_per_function() {
     // `Plain` entry draws no diagnostic at all. This is the property that
     // separates the refinement from putting `render` itself in R.
     let source = r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3636,7 +3636,7 @@ fn a_forwarding_wrapper_charges_the_entry_that_resolves_it() {
     // anchors at main's call — the outermost runtime crossing, exactly where
     // the concrete spelling anchors.
     let source = r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3678,7 +3678,7 @@ fn a_second_generic_parameter_still_charges_its_entry() {
     // resolves independently at the entry.
     assert_fails_with(
         r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3716,7 +3716,7 @@ fn a_second_generic_parameter_still_charges_its_entry() {
 fn a_clean_two_parameter_generic_dispatch_stays_admitted() {
     assert_compiles_and_runs(
         r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3757,7 +3757,7 @@ fn a_generic_dispatch_reaching_emit_inside_const_stays_legal() {
     // runtime crossings and a `const` entry is not one.
     assert_compiles_and_runs(
         r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3792,7 +3792,7 @@ fn an_inherited_trait_default_reaching_emit_is_refused_on_a_concrete_receiver() 
     // default, which is in R.
     assert_fails_with(
         r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3820,7 +3820,7 @@ fn a_module_level_initializer_entry_is_a_boundary_for_generic_dispatch() {
     // a direct call to an R-function lands.
     assert_fails_with(
         r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3859,7 +3859,7 @@ fn a_shared_default_self_call_refuses_conservatively_even_for_a_clean_receiver()
     // run time. If per-receiver refinement of shared default bodies ever
     // ships, this pin is the one to revisit.
     let source = r##"
-        import std::print;
+        import std::io::print;
         import std::asset::emit;
         struct Token {
             value: str,
@@ -3911,7 +3911,7 @@ fn base64url_round_trips_every_tail_length() {
     // 0, 1, 2 leftover bytes each exercise a distinct decode tail.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::base64::{ encode_url, decode_url };
         import std::bytes::{ encode_utf8, decode_utf8 };
         import std::option::Option::{ self, Some, None };
@@ -3939,7 +3939,7 @@ fn hmac_sha512_matches_the_rfc_vector() {
     // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::crypto::hmac_sha512;
         import std::bytes::encode_utf8;
         async fun main() {
@@ -3959,7 +3959,7 @@ fn the_unkeyed_digests_match_their_published_vectors() {
     // anything against a value published independently of this implementation.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::crypto::{ sha256, sha384, sha512 };
         import std::bytes::encode_utf8;
         async fun main() {
@@ -3986,7 +3986,7 @@ fn sha256_digests_the_empty_input_and_mints_a_fingerprint_prefix() {
     // RECOGNIZE the shape.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::crypto::sha256;
         import std::bytes::encode_utf8;
         async fun main() {
@@ -4011,7 +4011,7 @@ fn etag_of_mints_a_quoted_truncated_sha256_validator() {
     // width or the quoting is a breaking change, not a tweak.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::http::etag_of;
         import std::bytes::encode_utf8;
         async fun main() {
@@ -4037,7 +4037,7 @@ fn if_none_match_handles_the_exact_list_star_and_weak_forms() {
     // fragments must not false-positive against a well-formed target.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::http::if_none_match_matches;
         fun main() {
             let tag = "\"abc123\"";
@@ -4065,7 +4065,7 @@ fn if_none_match_handles_the_exact_list_star_and_weak_forms() {
 fn a_jwt_round_trips_signs_and_verifies() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::jwt::{ sign_hs512, verify_hs512 };
         import std::bytes::encode_utf8;
         import std::option::Option::{ self, Some, None };
@@ -4097,7 +4097,7 @@ fn a_jwt_round_trips_signs_and_verifies() {
 fn a_tampered_or_wrong_key_jwt_is_rejected() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::jwt::{ sign_hs512, verify_hs512 };
         import std::bytes::encode_utf8;
         import std::option::Option::{ self, Some, None };
@@ -4133,7 +4133,7 @@ fn a_tampered_or_wrong_key_jwt_is_rejected() {
 fn constant_time_equality_is_correct() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::crypto::equals_constant_time;
         import std::bytes::encode_utf8;
         fun main() {
@@ -4157,7 +4157,7 @@ fn a_generic_call_in_an_else_branch_binds_its_type_argument() {
     // to its abstract body. The await in the discovering case was incidental.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ encode_json, decode_json };
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -4205,7 +4205,7 @@ fn a_generic_call_in_a_match_arm_binds_its_type_argument() {
     // if -> else -> match Some-arm -> if then -> generic decode.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ encode_json, decode_json };
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
@@ -4255,7 +4255,7 @@ fn a_generic_call_after_a_branch_nested_await_monomorphizes() {
     // the same B17 else-branch bug).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ encode_json, decode_json };
         import std::crypto::hmac_sha512;
         import std::bytes::{ Bytes, encode_utf8 };
@@ -4307,7 +4307,7 @@ fn a_generic_call_after_a_branch_nested_await_monomorphizes() {
 fn a_database_round_trips_inserts_and_queries() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::db::{ Database, Statement, Row };
         import std::option::Option::{ self, Some, None };
         fun main() {
@@ -4340,7 +4340,7 @@ fn a_database_round_trips_inserts_and_queries() {
 fn null_columns_are_detectable() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::db::{ Database, Row };
         import std::option::Option::{ self, Some, None };
         fun main() {
@@ -4371,7 +4371,7 @@ fn calling_a_method_call_result_binds_first() {
     // working shape; the direct form is the ignored pin below.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         struct Holder { hook: Shared<|str| i32> }
         impl Holder {
@@ -4498,7 +4498,7 @@ fn a_field_mapped_element_types_without_annotation() {
     // element must be concrete enough to dispatch `len()`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32, name: str }
         fun main() {
             let points = [Point { x = 1, name = "ab" }];
@@ -4514,7 +4514,7 @@ fn a_field_mapped_element_types_without_annotation() {
 fn a_field_mapped_element_meets_an_annotated_expectation() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32, name: str }
         fun main() {
             let points = [Point { x = 1, name = "abc" }];
@@ -4530,7 +4530,7 @@ fn a_field_mapped_element_meets_an_annotated_expectation() {
 fn a_field_mapped_result_chains_immediately() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32, name: str }
         fun main() {
             let points = [Point { x = 1, name = "ab" }];
@@ -4545,7 +4545,7 @@ fn a_field_mapped_result_chains_immediately() {
 fn mapped_maps_thread_the_element_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32, name: str }
         fun main() {
             let points = [Point { x = 1, name = "abc" }];
@@ -4561,7 +4561,7 @@ fn mapped_maps_thread_the_element_type() {
 fn a_nested_accessor_closure_return_grounds() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { v: i32 }
         struct Point { inner: Inner }
         fun main() {
@@ -4578,7 +4578,7 @@ fn a_nested_accessor_closure_return_grounds() {
 fn a_struct_element_map_dispatches_members_downstream() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32, name: str }
         fun main() {
             let points = [Point { x = 1, name = "ab" }];
@@ -4598,7 +4598,7 @@ fn a_slot_grounded_list_maps_a_field_closure() {
     // the constraint wake.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32, name: str }
         fun main() {
             mut ps = List::new();
@@ -4616,7 +4616,7 @@ fn a_slot_grounded_list_maps_and_sums() {
     // The exact deadlock reproducer from the reverted attempt.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = List::new();
             xs.push(1);
@@ -4900,7 +4900,7 @@ const CSS_RENAME_NOTE: &str = "`Length::css(…)` is now `Length::raw(…)`";
 fn a_css_member_access_refuses_naming_the_rename() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::space;
         fun main() {
             print(space(4).css);
@@ -4931,7 +4931,7 @@ fn a_css_path_segment_refuses_naming_the_rename() {
 fn a_binding_named_css_refuses_naming_the_rename() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let css = 1;
             print(css);
@@ -5006,7 +5006,7 @@ fn the_renamed_length_surface_is_what_compiles_instead() {
 /// two programs differ in NOTHING but the style's spelling — a stray difference
 /// elsewhere would make the byte comparison pass for the wrong reason.
 const TWIN_PROGRAM: &str = r#"
-    import std::print;
+    import std::io::print;
     import std::style::{ Color, Length, Style, space, style };
     fun card(): Style {
         {TWIN}
@@ -5098,7 +5098,7 @@ fn a_css_block_is_an_ordinary_expression() {
     // chain that composes natively.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space };
         fun main() {
             let base = const css { padding: {space(4)}; };
@@ -5261,7 +5261,7 @@ fn a_macro_generated_css_block_desugars() {
     // elements had to have.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::{ style, space };
         fun main() {
             let made = macro {
@@ -5360,7 +5360,7 @@ fn a_block_in_condition_position_asks_for_parentheses() {
     // literal is, and takes the same escape hatch.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             if css { color: red; } { print("x"); }
         }
@@ -5375,7 +5375,7 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
     // The other half of the rule: the escape hatch works.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::style::style;
         fun main() {
             if (const css { color: red; }).class_list() != "" {

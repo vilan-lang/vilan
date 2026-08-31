@@ -271,7 +271,7 @@ fn report_one_rendering(renderings: BTreeMap<Vec<String>, usize>) -> Vec<String>
 fn the_whole_diagnostic_rendering_is_identical_on_every_cold_analysis() {
     let rendering = assert_cold_rendering_is_stable(
         r#"
-        import std::print;
+        import std::io::print;
         import std::math::min;
 
         trait Greet { fun greet(self): str; }
@@ -396,7 +396,7 @@ fn an_adapted_instance_violation_names_the_same_call_site_every_time() {
 fn the_overlay_cap_selects_the_same_diagnostics_every_time() {
     let rendering = assert_cold_rendering_is_stable(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun escapes(): i32 {
             let value = 1;
@@ -527,7 +527,7 @@ fn the_const_only_reports_are_one_per_site_on_every_cold_analysis() {
 /// them, which is the point.
 #[test]
 fn a_multi_file_programs_diagnostics_group_by_file_every_time() {
-    let entry = "import std::print;\nimport std::drop::Drop;\nimport pkg::store::keep;\n\
+    let entry = "import std::io::print;\nimport std::drop::Drop;\nimport pkg::store::keep;\n\
                  resource struct Guard { label: str }\n\
                  impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
                  fun main() {\n\tkeep();\n\tmut mine: List<Guard> = [];\n}\n";

@@ -2,7 +2,7 @@
 // node-testable: per new item KEEP an unchanged same-key row, REFRESH a
 // changed one, render FRESH for a new key; absent keys report as removed;
 // a duplicate key claims its old row once.
-import std::print;
+import std::io::print;
 import std::reactive::{ reconcile, RowStep, ReconcilePlan };
 
 fun show(plan: ReconcilePlan) {

@@ -1304,7 +1304,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// Report it at the gap and KEEP the statement.
     ///
     /// Skipping it instead would be honest about the syntax and wrong about the
-    /// program: dropping `import std::print` because its `;` is missing unbinds
+    /// program: dropping `import std::io::print` because its `;` is missing unbinds
     /// `print` at every call site below, and dropping `let origin = …` unbinds
     /// `origin` — a screenful of "cannot find" on lines that are correct, from a
     /// statement the parser read perfectly well. This is `editing-dx.md` §8

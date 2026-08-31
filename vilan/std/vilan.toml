@@ -6,6 +6,18 @@
 # cross-platform error.
 [library]
 name = "std"
+# std compiles with NO ambient scope (`prelude.md` §10.1). Three reasons, in
+# order of weight: std's own resolution stays greppable — 264 names across 59
+# files, every symbol somebody's lang item, and "where does this name come from"
+# must be answerable by reading the file; the bootstrapping order becomes
+# trivial rather than delicate, since the prelude's members are std definitions;
+# and it exercises the `false` path in the one package every user of the
+# language builds. Stated here rather than special-cased in the compiler, so a
+# reader sees the posture and no "std is different" branch can drift.
+#
+# std still CONTAINS the two prelude modules (`src/prelude.vl`, `src/web.vl`) —
+# that is a fact about contents, not about resolution.
+prelude = false
 
 # The process-having runtimes (node today; deno/bun join `@process` when added).
 # Its `node:`-compat bindings are portable across them, so no per-runtime split.

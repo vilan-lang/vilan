@@ -444,6 +444,7 @@ tour/hello-vilan.md h2 start-a-project
 tour/hello-vilan.md h2 the-cli
 tour/hello-vilan.md h2 projects-vilantoml
 tour/hello-vilan.md h2 imports
+tour/hello-vilan.md h3 the-prelude
 tour/hello-vilan.md h2 the-shape-of-a-full-stack-app
 tour/macros-and-const.md h1 macros--const
 tour/macros-and-const.md h2 const-compute-it-at-compile-time
@@ -465,6 +466,7 @@ tour/platforms.md h2 externs-talking-to-the-host
 tour/platforms.md h2 assets
 tour/projects.md h1 projects-and-dependencies
 tour/projects.md h2 git-dependencies
+tour/projects.md h2 the-prelude-key
 tour/projects.md h2 reserved-names
 tour/projects.md h2 pre-build-commands-and-default-entry
 tour/projects.md h2 workspaces

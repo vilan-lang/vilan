@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // `list[i]` indexes a List (read, in-place write, and `&mut list[i]` element
 // views via the (base, key) representation). Subscripts are CHECKED: read,

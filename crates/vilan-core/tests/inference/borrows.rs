@@ -32,7 +32,7 @@ fn generic_method_calls_generic_methods_on_self() {
 fn reactive_map_sub_and_set_with() {
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner };
         fun main() {
             let owner = Owner::new();
@@ -53,7 +53,7 @@ fn owner_disposes_subscriptions_across_re_renders() {
     // the count stays bounded (a leak would give 6, not 2).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::reactive::{ Signal, Owner };
         fun main() {
@@ -83,7 +83,7 @@ fn generic_dispatch_to_extern_impl() {
     // A trait method on a generic, dispatching to a primitive's `[extern]` impl.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::{ Display, format };
         fun show<T: Display>(x: T): str { x.to_string() }
         fun main() { print(format(42)); print(show("hi")); }
@@ -96,7 +96,7 @@ fn return_type_only_generic() {
     // A generic fixed only by the return type (no argument binds it).
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::default::Default;
         fun make<T: Default>(): T { T::default() }
         fun main() { let n: i32 = make(); print(n); }
@@ -108,7 +108,7 @@ fn return_type_only_generic() {
 fn collection_json_roundtrip() {
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::{ Json, FromJson };
         import std::result::Result::{ self, Ok, Err };
         fun main() {
@@ -124,7 +124,7 @@ fn nested_generic_containers() {
     // `Option<List<i32>>` etc. — generic args nested several deep must resolve.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let x: Option<List<i32>> = Some([1, 2, 3]);
@@ -141,7 +141,7 @@ fn nested_generic_containers() {
 fn recursion_self_and_mutual() {
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         fun fib(n: i32): i32 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
         fun is_even(n: i32): bool { if n == 0 { true } else { is_odd(n - 1) } }
         fun is_odd(n: i32): bool { if n == 0 { false } else { is_even(n - 1) } }
@@ -169,7 +169,7 @@ fn generic_struct_infers_type_arg_from_literal() {
     // inferred arg (`Box<>`), leaving `T` abstract.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         struct Box<T> { value: T }
         impl Box<type T> { fun get(self): T { self.value } }
@@ -186,7 +186,7 @@ fn generic_struct_infers_type_arg_from_constructor() {
     // abstract only because `count` itself was an abstract `Signal<T>`.)
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         struct Box<T> { value: T }
         impl Box<type T> {
@@ -207,7 +207,7 @@ fn generic_call_on_closure_parameter() {
     // `Signal<i32>`, `n` is `i32` and `to_string` dispatches.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::display::Display;
         fun main() {
@@ -231,7 +231,7 @@ fn format_through_nested_generic() {
     // instantiation.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::{ Display, format };
         fun show<T: Display>(x: T): str { format(x) }
         fun main() { print(show(7)); print(show("hi")); }
@@ -249,7 +249,7 @@ fn chained_derive_binds_method_generic_from_closure_return() {
     // their own generics from arguments, like free-function calls do.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::display::format;
         fun main() {
@@ -274,7 +274,7 @@ fn format_in_closure_argument() {
     // unknown closure *receiver* — so it re-resolves once `n` becomes `i32`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         import std::display::format;
         fun main() {
@@ -296,7 +296,7 @@ fn method_closure_param_inferred_from_argument_generic() {
     // This is the `bind_each(source: Signal<List<T>>, |todo| todo.id, ..)` shape.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         struct P { id: i32 }
         struct Holder { tag: i32 }
@@ -320,7 +320,7 @@ fn logical_or_operator() {
     // closure `|| body` still parses (it's tried before the operator).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun boom(): bool { print("evaluated"); true }
         fun main() {
             let a = "x";
@@ -344,7 +344,7 @@ fn reactive_combine_variadic() {
     // a closure tuple binder.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         import std::reactive::{ Signal, combine };
         fun main() {
@@ -369,7 +369,7 @@ fn tuple_comprehension_over_mapped_source() {
     // `.map`, so it's arity-independent.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun lengths<T: (2..)>(sources: (U in T: List<U>)): T {
             (source in sources => source.len())
@@ -390,7 +390,7 @@ fn mapped_tuple_forward_expansion() {
     // dispatches concretely.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun main() {
             let pair: (U in (i32, str): List<U>) = ([1, 2], ["x", "y", "z"]);
@@ -410,7 +410,7 @@ fn mapped_tuple_inverted_inference() {
     // `(List<i32>, List<str>)`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun id<T: (2..)>(sources: (U in T: List<U>)): (U in T: List<U>) { sources }
         fun main() {
@@ -429,7 +429,7 @@ fn tuple_arity_bounds_parse() {
     // tuple. (Arity isn't enforced, mirroring trait bounds, which aren't either.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun any<T: (..)>(x: T): T { x }
         fun two<T: (2..)>(x: T): T { x }
@@ -452,7 +452,7 @@ fn nested_tuple_flat_lowering() {
     // transparent. Distinct types are preserved: the pattern must match the nesting.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun main() {
             let a = (1, 2);
@@ -475,7 +475,7 @@ fn parameter_tuple_destructuring() {
     // typing each binding from the matched tuple element.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun sum_pair((a, b): (i32, i32)): i32 { a + b }
         fun apply(pair: (i32, str), f: |(i32, str)| str): str { f(pair) }
@@ -494,7 +494,7 @@ fn nested_parameter_tuple_destructuring() {
     // reactive `derive` so the parameter type is inferred, not annotated.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun main() {
             let f = |(a, (b, c)): (i32, (i32, str))| i"{a.to_string()} {b.to_string()} {c}";
@@ -511,7 +511,7 @@ fn let_tuple_destructuring() {
     // element types (so a method call on a binding dispatches concretely).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::display::Display;
         fun pair(): (i32, str) { (7, "x") }
         fun main() {
@@ -534,7 +534,7 @@ fn transparent_references_write_through() {
     // view as a value keeps its explicit `*`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun add_ten(x: &mut i32) { x += 10; }
         fun same(x: &mut i32): &mut i32 borrows x { x }
@@ -628,7 +628,7 @@ fn an_inline_option_view_transient_writes_through() {
     // c { Some(..) } else { None }`, the inline analogue of `Arena::get`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut a = 5;
@@ -657,7 +657,7 @@ fn an_inline_aggregate_option_view_transient_writes_through() {
     // the value's own reference and `.field` write-through reaches the original.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct Node { value: i32 }
         fun main() {
@@ -680,7 +680,7 @@ fn a_view_parameter_forwarded_into_an_inline_transient_writes_through() {
     // write reaches the caller's value. Scalar (`(base, key)`) and aggregate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct Node { value: i32 }
         fun bump_scalar(p: &mut i32) {
@@ -762,7 +762,7 @@ fn arena_get_returns_a_readable_view() {
     // graph-walk shape a view-returning `get` exists for.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::option::Option::{ self, Some, None };
         struct Node { value: i32, edges: List<i32> }
@@ -791,7 +791,7 @@ fn arena_get_on_a_stale_handle_is_none() {
     // old handle to it stays stale; an untouched handle keeps reading.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::option::Option::{ self, Some, None };
         fun read(arena: Arena<i32>, handle: Handle<i32>): i32 {
@@ -819,7 +819,7 @@ fn arena_get_on_a_data_arena_round_trips() {
     // read via `get`, overwrite via `set`, `remove` (owned `Option<T>`), `len`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::option::Option::{ self, Some, None };
         fun main() {
@@ -870,7 +870,7 @@ fn arena_mutation_under_a_live_get_view_is_rejected() {
     // row; the accept twin is `arena_set_under_a_live_get_view_is_accepted`.)
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::option::Option::{ self, Some, None };
         fun main() {
@@ -893,7 +893,7 @@ fn arena_set_under_a_live_get_view_is_accepted() {
     // holding the view across it is legal.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::option::Option::{ self, Some, None };
         fun main() {
@@ -921,7 +921,7 @@ fn a_handle_round_trips_through_the_json_codec() {
     // encodes as `{index, generation}`, decodes back, and still resolves.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::json::{ encode_json, decode_json };
         import std::result::Result::{ self, Ok, Err };
@@ -948,7 +948,7 @@ fn a_handle_round_trips_through_the_binary_codec() {
     // are codec-neutral, so both channels rebuild the same two integers.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::binary::{ encode_binary, decode_binary };
         import std::result::Result::{ self, Ok, Err };
@@ -977,7 +977,7 @@ fn a_stale_handle_from_the_wire_resolves_to_none() {
     // boundary.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::json::{ encode_json, decode_json };
         import std::result::Result::{ self, Ok, Err };
@@ -1010,7 +1010,7 @@ fn a_wire_type_may_carry_a_handle_field() {
     // outright ("which is not Wire"). The `T` never reaches the payload.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::json::{ encode_json, decode_json };
         import std::result::Result::{ self, Ok, Err };
@@ -1085,7 +1085,7 @@ fn a_branded_arena_rejects_a_foreign_handle() {
     // belt to it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::option::Option::{ self, Some, None };
         fun main() {
@@ -1118,7 +1118,7 @@ fn a_branded_arenas_generational_cycle_is_unchanged() {
     // is `arena_get_on_a_stale_handle_is_none`.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::arena::{ Arena, Handle };
         import std::option::Option::{ self, Some, None };
         fun main() {
@@ -1152,7 +1152,7 @@ fn direct_projection_borrows_the_receiver() {
     // binding of the call is a writable view. The inferred twin of `borrows.vl`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Wrapper { value: i32 }
         impl Wrapper { fun slot(&mut self): &mut i32 { &mut self.value } }
         fun main() {
@@ -1176,7 +1176,7 @@ fn chained_projection_maps_through_a_borrows_call() {
     // recognized as a view (it miscompiled); the chain now lowers it correctly.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Wrapper { value: i32 }
         impl Wrapper {
             fun inner(&mut self): &mut i32 borrows self { &mut self.value }
@@ -1200,7 +1200,7 @@ fn chained_projection_maps_a_non_receiver_argument() {
     // to `b`) is written; `p` is untouched, proving the mapping is positional.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun grow(x: &mut i32): &mut i32 borrows x { x }
         fun pick(a: &mut i32, b: &mut i32): &mut i32 { grow(b) }
         fun main() {
@@ -1223,7 +1223,7 @@ fn multi_parameter_projection_unions_branch_positions() {
     // both aggregate) — a recognized wrapped view, not an escape.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct Box { x: i32 }
         fun pick(a: &mut Box, b: &mut Box, first: bool): Option<&mut i32> {
@@ -1250,7 +1250,7 @@ fn a_wrapped_view_return_projects_its_parameter() {
     // `Cell::slot` shape — the root-set now records it without changing codegen.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct Cell { value: i32 }
         impl Cell { fun slot(&mut self): Option<&mut i32> { Some(&mut self.value) } }
@@ -1271,7 +1271,7 @@ fn an_explicit_borrows_clause_agrees_with_inference() {
     // annotated form compiles and writes through identically to the inferred one.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Wrapper { value: i32 }
         impl Wrapper { fun slot(&mut self): &mut i32 borrows self { &mut self.value } }
         fun main() {
@@ -1309,7 +1309,7 @@ fn shared_write_view_rebinds_and_mutates_through_handles() {
     // stale tail (len 3 then 4 instead of 1 then 2).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         fun main() {
             let a: Shared<List<i32>> = Shared::new([1, 2, 3]);
@@ -1332,7 +1332,7 @@ fn own_parameter_is_a_mutable_copy() {
     // ("cannot assign to this expression"); it is now allowed.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(own x: i32): i32 { x += 1; x }
         fun grow(own xs: List<i32>): i32 { xs = [7, 8, 9, 10]; xs.len() }
         fun main() {
@@ -1357,7 +1357,7 @@ fn own_parameter_is_a_mutable_copy() {
 fn a_mut_parameter_rebinds_its_copy() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(mut x: i32): i32 { x = x + 1; x }
         fun main() { print(bump(1)); }
         "#,
@@ -1369,7 +1369,7 @@ fn a_mut_parameter_rebinds_its_copy() {
 fn a_mut_parameter_is_invisible_to_the_caller() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun grow(mut xs: List<i32>): i32 { xs.push(9); xs.len() }
         fun main() {
             mut list = [1, 2];
@@ -1398,7 +1398,7 @@ fn a_plain_parameter_beside_a_mut_one_still_rejects_writes() {
 fn a_mut_parameter_takes_field_writes() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32 }
         fun place(mut p: Point): i32 { p.x = 42; p.x }
         fun main() { print(place(Point { x = 0 })); }
@@ -1414,7 +1414,7 @@ fn a_closure_mut_parameter_works_unannotated() {
     // parameter type lands from `set_with`'s declared signature.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::Signal;
         fun main() {
             mut seed = [1, 2];
@@ -1434,7 +1434,7 @@ fn a_closure_mut_parameter_works_unannotated() {
 fn a_closure_mut_parameter_types_from_a_declared_closure_argument() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun apply(xs: List<i32>, grow: |List<i32>| i32): i32 { grow(xs) }
         fun main() {
             mut list = [1, 2];
@@ -1453,7 +1453,7 @@ fn a_closure_mut_parameter_types_from_a_declared_closure_argument() {
 fn a_closure_mut_parameter_works_annotated() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let bump = |mut v: i32| { v = v + 1; v };
             print(bump(1));
@@ -1467,7 +1467,7 @@ fn a_closure_mut_parameter_works_annotated() {
 fn mut_self_is_the_builder_idiom() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32 }
         impl Point {
             fun with_x(mut self, value: i32): Point { self.x = value; self }
@@ -1489,7 +1489,7 @@ fn a_mut_parameter_roots_a_writable_view() {
     // the view writes land in the copy, still invisible to the caller.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun poke(mut x: i32): i32 { let v = &mut x; v = 5; x }
         fun main() { print(poke(1)); }
         "#,
@@ -1503,7 +1503,7 @@ fn a_mut_parameter_feeds_a_ref_mut_argument() {
     // writable-view parameter passes check_mutable_arguments.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun bump(c: &mut i32) { c += 1; }
         fun outer(mut x: i32): i32 { bump(&mut x); x }
         fun main() { print(outer(1)); }
@@ -1576,7 +1576,7 @@ fn a_mut_parameter_never_takes_a_resource() {
 fn a_mut_destructure_capture_does_not_alias_its_source() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = ([1, 2], 3);
             mut (xs, n) = pair;
@@ -1596,7 +1596,7 @@ fn an_immutable_capture_is_isolated_from_source_mutation() {
     // `mut` binding, so the share elision does not apply).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = ([1, 2], 3);
             let (xs, n) = pair;
@@ -1612,7 +1612,7 @@ fn an_immutable_capture_is_isolated_from_source_mutation() {
 fn a_mut_match_capture_does_not_alias_the_subject() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = ([1, 2], 3);
             match pair {
@@ -1637,7 +1637,7 @@ fn a_returned_capture_does_not_leak_an_alias() {
     // rests on).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let held: Option<List<i32>> = Some([1, 2]);
@@ -1660,7 +1660,7 @@ fn a_nested_variant_capture_does_not_alias() {
     // tuple) — collection recurses the whole tree, not just top level.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut wrapped = (Some([1, 2]), 3);
@@ -1689,7 +1689,7 @@ fn an_is_capture_does_not_alias_the_subject() {
     // to copy — so this printed 3, the source's growth showing through.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = ([1, 2], 3);
             if pair is (let xs, let n) {
@@ -1708,7 +1708,7 @@ fn a_mut_is_capture_does_not_write_back_to_the_subject() {
     // payload, so growing it grew what the option still holds (3/3).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut held: Option<List<i32>> = Some([1, 2]);
@@ -1734,7 +1734,7 @@ fn a_guarded_match_capture_does_not_alias_the_subject() {
     // 3/3 with `if n > 0` added.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = ([1, 2], 3);
             match pair {
@@ -1759,7 +1759,7 @@ fn a_rejecting_guard_leaves_the_subject_untouched() {
     // as it was — and that leg's own capture is still a copy (3/3 before).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = ([1, 2], 3);
             match pair {
@@ -1788,7 +1788,7 @@ fn a_braced_leg_capture_does_not_leak_an_alias() {
     // now looks through the forms that forward a value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun take_it(held: Option<List<i32>>, fallback: List<i32>): List<i32> {
             match held {
@@ -1818,7 +1818,7 @@ fn a_conditionally_returned_capture_does_not_leak_an_alias() {
     // the caller's tuple (3/3).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun pick(pair: (List<i32>, List<i32>), first: bool): List<i32> {
             let (a, b) = pair;
             if first { a } else { b }
@@ -1845,7 +1845,7 @@ fn a_shared_capture_is_not_an_elidable_move_source() {
     // this printed 3. Only an OWNER may donate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = ([1, 2], 3);
             let (xs, n) = pair;
@@ -1866,7 +1866,7 @@ fn a_mut_capture_from_an_immutable_subject_copies() {
     // never shareable, because it can write.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let pair = ([1, 2], 3);
             mut (xs, n) = pair;
@@ -1896,7 +1896,7 @@ fn an_own_parameter_capture_shares_when_nothing_writes_it() {
     // monomorphized body in `vilan/test/closure-param-inference.js` is the
     // same elision seen in bytes — it regained its pre-B60 form here.)
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun peek(own pair: (List<i32>, i32)): i32 {
             let (first, second) = pair;
             first.len()
@@ -1922,7 +1922,7 @@ fn an_own_parameter_capture_copies_when_a_method_writes_it() {
     // the receiver's root joins the write set and the capture copies — 1, not 2.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun observe(own pair: (List<i32>, i32)): i32 {
             let (first, second) = pair;
             pair.0.push(7);
@@ -1941,7 +1941,7 @@ fn an_own_parameter_capture_copies_when_an_assignment_writes_it() {
     // The capture must not see `[ 9, 9 ]` — 1, not 2.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { xs: List<i32> }
         fun observe(own pair: (Holder, i32)): i32 {
             let (first, second) = pair;
@@ -1970,7 +1970,7 @@ fn a_generic_capture_moves_a_resource_instantiation() {
     // `drop a n=7` that proves the caller holds THE resource, not a twin.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Res {
             n: i32,
@@ -1999,7 +1999,7 @@ fn a_moved_resource_instantiation_destroys_one_value() {
     // not owned at scope end and the value is destroyed exactly once.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::{ Drop, drop };
         resource struct Res {
@@ -2040,7 +2040,7 @@ fn a_generic_aggregate_capture_moves_a_resource_instantiation() {
     // single mutated resource; a copy would add a second at `n=1`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Res {
             n: i32,
@@ -2075,7 +2075,7 @@ fn a_generic_aggregate_capture_copies_a_data_instantiation() {
     // resources only — it is not a licence to alias.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Wrap<T> {
             value: T,
         }
@@ -2104,7 +2104,7 @@ fn a_mut_array_binder_in_a_match_stamps_its_elements() {
     // meanings.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let arr: [List<i32>; 2] = [[1, 2], [3]];
             match arr {
@@ -2126,7 +2126,7 @@ fn a_mut_array_binder_in_an_is_test_stamps_its_elements() {
     // The `is` half of the same grammar arm.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let arr: [List<i32>; 2] = [[1, 2], [3]];
             if arr is mut [a, b] {
@@ -2150,7 +2150,7 @@ fn a_guard_that_needs_a_temporary_emits_it() {
     // the guard, so the guard's `pop` takes from the copy, not the subject.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut pair = ([1, 2], 3);
@@ -2187,7 +2187,7 @@ fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
     // steps over ["a","b","c"].
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         enum Feed {
             Ready(List<str>, i32),
@@ -2222,7 +2222,7 @@ fn an_is_capture_from_a_mut_parameter_subject_is_unchanged() {
     // B53 shipped.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         enum Feed {
             Ready(List<str>, i32),
@@ -2253,7 +2253,7 @@ fn an_is_capture_from_a_mut_view_parameter_reads_the_prematch_value() {
     // receiver position. Printed "b\nc".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2287,7 +2287,7 @@ fn an_is_capture_from_a_dereferenced_view_local_copies_and_reads_early() {
     // fixes; before, "b".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2315,7 +2315,7 @@ fn a_destructure_of_a_dereferenced_view_copies_its_captures() {
     // Printed 3.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = ([1, 2], 3);
             let view = &mut pair;
@@ -2339,7 +2339,7 @@ fn a_guarded_leg_capture_from_a_viewed_subject_reads_the_prematch_value() {
     // "b\nc".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2374,7 +2374,7 @@ fn an_unguarded_match_leg_on_a_viewed_subject_was_already_right() {
     // than the view.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2413,7 +2413,7 @@ fn both_capture_shapes_survive_an_in_place_write_through_the_view() {
     // materialization, 4 without the copy.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun grow(pair: &mut (List<str>, i32)): i32 {
             if pair is (let items, let at) {
                 pair.0.push("d");
@@ -2440,7 +2440,7 @@ fn a_nested_capture_from_a_viewed_subject_reads_the_prematch_value() {
     // 2 + 3 + 4; post-write it was 4 + 7 + 5.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Pair {
             Two((List<i32>, i32), i32),
             Neither,
@@ -2472,7 +2472,7 @@ fn a_viewed_capture_read_before_and_after_the_write_agrees() {
     // so 3 + 3 — not 3 + 13.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2508,7 +2508,7 @@ fn a_resource_capture_from_a_viewed_subject_loans_the_prematch_payload() {
     // already does, and matching it is the whole rule. 1 + 0, not 9 + 5.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Conn {
             id: i32,
         }
@@ -2544,7 +2544,7 @@ fn a_resource_capture_from_a_place_subject_loans_the_prematch_payload() {
     // place path" a checked claim rather than a stated one.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Conn {
             id: i32,
         }
@@ -2574,7 +2574,7 @@ fn a_readonly_view_subject_keeps_its_shared_accessors() {
     // taken that back for `&self` methods.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2614,7 +2614,7 @@ fn a_shortening_write_through_a_list_view_truncates() {
     // and still held `2` and `3`. Nothing in the source says "merge".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun replace(v: &mut List<i32>) {
             v = [9];
         }
@@ -2638,7 +2638,7 @@ fn a_shortening_reassign_of_a_viewed_enum_leaves_no_stale_payload() {
     // owner can reach. The emitted shape is the pin: the truncating write, and
     // the helper that truncates.
     let source = r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2671,7 +2671,7 @@ fn a_widening_reassign_of_a_viewed_enum_fills_every_slot() {
     // read back after the widening write proves no slot was left a hole.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Feed {
             Ready(List<str>, i32),
             Done,
@@ -2701,7 +2701,7 @@ fn an_equal_width_write_through_a_struct_view_is_unchanged() {
     // merge happened to be right there and the replace must agree with it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Point { x: i32, y: i32 }
         fun move_to(p: &mut Point) {
             p = Point { x = 7, y = 8 };
@@ -2723,7 +2723,7 @@ fn a_shortening_write_through_a_view_truncates_under_const_eval() {
     // replace natively — a merge there would fold a stale slot into a literal.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun replace(v: &mut List<i32>): i32 {
             v = [9];
             v.len()
@@ -2754,7 +2754,7 @@ fn a_view_write_drops_the_overwritten_variants_resource() {
     // doctrine B81/B88 applied to captures.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop {
@@ -2799,7 +2799,7 @@ fn a_view_write_of_the_same_variant_width_drops_the_old_payload() {
     let program = |write: &str| {
         format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
@@ -2833,7 +2833,7 @@ fn a_view_write_that_grows_the_variant_drops_the_old_payload() {
     // ownership reason, not the layout one.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -2859,7 +2859,7 @@ fn a_view_write_to_a_struct_pointee_drops_the_old_value() {
     // `overwrite_drops_the_old_value_then_the_new_at_scope_end`, one loan over.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -2883,7 +2883,7 @@ fn a_view_write_drops_before_the_truncating_replace_clobbers_the_payload() {
     // a drop emitted after it would destroy nothing. The resource here sits in
     // slot 2, BEHIND a `List` payload, so the truncation to one slot takes both.
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -2921,7 +2921,7 @@ fn a_view_write_drops_the_payload_in_the_owned_paths_order() {
     let program = |write: &str| {
         format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
@@ -2952,7 +2952,7 @@ fn a_view_write_through_a_mut_parameter_drops_the_old_value() {
     // special case, it is one of three names for a writable view.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -2976,7 +2976,7 @@ fn a_view_write_through_a_mut_local_drops_the_old_value() {
     // spelled `v = ..` and `view_binding_mutability` is what recognizes it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -3000,7 +3000,7 @@ fn a_view_write_through_a_nested_reborrow_drops_the_old_value() {
     // nothing — but a rule keyed on "the receiver is `self`" would miss this.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -3026,7 +3026,7 @@ fn repeated_view_writes_drop_each_outgoing_value_exactly_once() {
     // never a remembered value. "first" and "second" appear once each.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -3058,7 +3058,7 @@ fn a_view_write_after_the_owner_moved_out_is_rejected() {
     // second drop (`a_moved_out_binding_is_not_overwrite_dropped`).
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -3085,7 +3085,7 @@ fn a_moved_out_binding_is_not_overwrite_dropped() {
     // that owns nothing and must NOT drop. "dropped held" appears once.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
@@ -3122,7 +3122,7 @@ fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
     let program = |declaration: &str, borrow: &str| {
         format!(
             r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
@@ -3162,7 +3162,7 @@ fn a_view_write_to_a_data_pointee_emits_no_drop() {
     // resource-free corpus program byte-identical.
     assert_emits_containing(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { n: i32 }
         impl Holder { fun clear(&mut self) { self = Holder { n = 0 }; } }
         fun main() {
@@ -3191,7 +3191,7 @@ fn a_view_write_to_a_data_pointee_emits_no_drop() {
 fn b99_program(body: &str) -> String {
     format!(
         r#"
-        import std::print;
+        import std::io::print;
         import std::drop::Drop;
         resource struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
@@ -3465,7 +3465,7 @@ fn a_resource_free_component_write_plans_no_drop_pass_at_all() {
     // arm collects nothing and no `try`/`finally` appears.
     let js = match compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Slot { held: i32 }
         fun main() {
             mut slot = Slot { held = 1 };
@@ -3502,7 +3502,7 @@ fn an_is_capture_from_a_component_written_place_reads_the_prematch_value() {
     // array, so the deferred read returned the write. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut t = (7, 3);
             if t is (let a, let b) {
@@ -3523,7 +3523,7 @@ fn a_place_capture_read_before_and_after_a_component_write_agrees() {
     // binding is one value, so 6, not 102.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut t = (7, 3);
             if t is (let a, let b) {
@@ -3545,7 +3545,7 @@ fn a_component_write_through_a_field_path_does_not_reach_a_capture() {
     // into the very array that place names. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32), tag: i32 }
         fun main() {
             mut h = Holder { pair = (7, 3), tag = 0 };
@@ -3570,7 +3570,7 @@ fn a_disjoint_field_write_leaves_a_sibling_subject_correct() {
     // soundly. Pinned because the answer must not change either way.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32), tag: i32 }
         fun main() {
             mut h = Holder { pair = (7, 3), tag = 5 };
@@ -3591,7 +3591,7 @@ fn an_index_write_does_not_reach_a_fixed_array_capture() {
     // subject temp aliases. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut marr: [i32; 2] = [7, 3];
             if marr is let [g, k] {
@@ -3611,7 +3611,7 @@ fn an_index_write_does_not_reach_a_capture_of_an_indexed_subject() {
     // subscript, so both sides root at `rows`. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut rows = [(7, 3)];
             if rows[0] is (let a, let b) {
@@ -3631,7 +3631,7 @@ fn a_nested_component_write_does_not_reach_a_nested_capture() {
     // Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut n = ((7, 3), 5);
             if n is ((let i, let j), let k) {
@@ -3653,7 +3653,7 @@ fn a_mut_self_method_call_does_not_reach_a_capture_of_its_receiver() {
     // Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Counter { pair: (i32, i32) }
         impl Counter {
             fun bump(&mut self) { self.pair.1 = 99 }
@@ -3679,7 +3679,7 @@ fn a_write_through_a_mut_view_of_the_subject_does_not_reach_its_captures() {
     // `vt`, which is what makes the root question sound. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut vt = (7, 3);
             let vv = &mut vt;
@@ -3702,7 +3702,7 @@ fn a_guarded_leg_capture_from_a_component_written_place_reads_the_prematch_value
     // a binding that has not been declared. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut gl = (7, 3);
             match gl {
@@ -3726,7 +3726,7 @@ fn an_unguarded_match_leg_on_a_component_written_place_was_already_right() {
     // late and never had the bug. Pinned so the fix cannot move it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut ml = (7, 3);
             match ml {
@@ -3748,7 +3748,7 @@ fn a_destructure_from_a_component_written_place_was_already_right() {
     // reach back into.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut d = (7, 3);
             let (d1, d2) = d;
@@ -3773,7 +3773,7 @@ fn both_capture_shapes_survive_a_component_write_to_the_place() {
     // without the copy.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut pair = (["a", "b", "c"], 0);
             if pair is (let items, let at) {
@@ -3797,7 +3797,7 @@ fn a_resource_capture_from_a_component_written_place_loans_the_prematch_payload(
     // minting a second owner to destroy twice. Exactly what the viewed twin
     // does, and what the whole-assignment place twin already did. 1, not 6.
     let source = r#"
-        import std::print;
+        import std::io::print;
         resource struct Conn { id: i32 }
         fun main() {
             mut slot = (Conn { id = 1 }, 0);
@@ -3828,7 +3828,7 @@ fn a_whole_assignment_to_the_subject_still_leaves_its_captures_aliasing() {
     // moves six corpus goldens and takes back B53's share elision on the alias
     // path.
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut t = (7, 3);
             if t is (let first, let kept) {
@@ -3866,7 +3866,7 @@ fn a_borrows_call_subject_reads_the_prematch_value() {
     // `*view`, one spelling over.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
@@ -3891,7 +3891,7 @@ fn a_borrows_call_subject_copies_its_captures() {
     // growing the source through the receiver grew the capture. Printed 3.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { cells: (List<i32>, i32) }
         impl Holder {
             fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
@@ -3917,7 +3917,7 @@ fn a_resource_capture_from_a_borrows_call_subject_loans_the_prematch_payload() {
     // fixes WHICH value is loaned without minting a second owner to destroy
     // twice. Both halves asserted: the value (1, not 6) and the absent copy.
     let source = r#"
-        import std::print;
+        import std::io::print;
         resource struct Conn { id: i32 }
         struct Holder { slot: (Conn, i32) }
         impl Holder {
@@ -3951,7 +3951,7 @@ fn both_capture_shapes_survive_a_write_through_a_borrows_call_subject() {
     // without the materialization, 4 without the copy.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (List<str>, i32) }
         impl Holder {
             fun view(&mut self): &mut (List<str>, i32) borrows self { &mut self.pair }
@@ -3981,7 +3981,7 @@ fn a_readonly_borrows_call_subject_materializes_when_a_write_reaches_the_receive
     // Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun peek(&self): &(i32, i32) borrows self { &self.pair }
@@ -4006,7 +4006,7 @@ fn a_free_function_borrows_call_subject_reads_the_prematch_value() {
     // miss this. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun slot(h: &mut Holder): &mut (i32, i32) borrows h { &mut h.pair }
         fun main() {
@@ -4028,7 +4028,7 @@ fn a_guarded_leg_over_a_borrows_call_subject_reads_the_prematch_value() {
     // pre-write value. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
@@ -4056,7 +4056,7 @@ fn an_unguarded_match_over_a_borrows_call_subject_copies_its_aggregate_capture()
     // share. Printed 3.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { cells: (List<i32>, i32) }
         impl Holder {
             fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
@@ -4083,7 +4083,7 @@ fn a_let_destructure_of_a_borrows_call_copies_its_aggregate_capture() {
     // the capture. Printed 3.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { cells: (List<i32>, i32) }
         impl Holder {
             fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
@@ -4109,7 +4109,7 @@ fn a_chained_borrows_projection_subject_reads_the_prematch_value() {
     // construction, whatever it was projected from. Printed 99 without it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { pair: (i32, i32) }
         struct Outer { inner: Inner }
         impl Outer {
@@ -4141,7 +4141,7 @@ fn a_readonly_projection_of_a_writable_one_reads_the_prematch_value() {
     // without the recursion into the projected receiver.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { pair: (i32, i32) }
         struct Outer { inner: Inner }
         impl Outer {
@@ -4173,7 +4173,7 @@ fn a_wrapped_view_capture_over_a_borrows_call_is_not_copied() {
     // (`option-view.vl`, 77 -> 1, a semantic break rather than a cost).
     // A view aliases on purpose: it never copies.
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
@@ -4207,7 +4207,7 @@ fn an_owned_call_subject_still_binds_without_copying() {
     // copying" stands. `call_returns_view` is what separates the two, not
     // "the subject is a call".
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun make(): (List<i32>, i32) { ([1, 2], 3) }
         fun main() {
             if make() is (let xs, let n) {
@@ -4232,7 +4232,7 @@ fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
     // the only thing owed and the answer never depended on the timing.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { cells: (List<i32>, i32) }
         impl Holder {
             fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
@@ -4273,7 +4273,7 @@ fn a_returned_field_place_copies_out_of_its_receiver() {
     // it. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun make(&self): (i32, i32) { self.pair }
@@ -4296,7 +4296,7 @@ fn a_returned_field_place_copies_out_of_a_mut_receiver() {
     // call either way.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun make(&mut self): (i32, i32) { self.pair }
@@ -4317,7 +4317,7 @@ fn a_returned_field_of_a_view_parameter_copies() {
     // The free-function spelling: nothing about this is special to a receiver.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun make(h: &Holder): (i32, i32) { h.pair }
         fun main() {
@@ -4340,7 +4340,7 @@ fn a_view_receiver_forwarded_whole_into_a_by_value_return_copies() {
     // exemption reads the signature.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun copy(&self): Holder { self }
@@ -4361,7 +4361,7 @@ fn a_returned_nested_field_of_a_receiver_copies() {
     // The copy lands at the LEAF, so the depth of the projection is irrelevant.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { pair: (i32, i32) }
         struct Holder { inner: Inner }
         impl Holder {
@@ -4384,7 +4384,7 @@ fn a_returned_list_field_of_a_receiver_copies() {
     // so growing the result grew the receiver.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { items: List<i32> }
         impl Holder {
             fun items_of(&self): List<i32> { self.items }
@@ -4406,7 +4406,7 @@ fn a_returned_field_copies_in_the_tail_arm_that_owes_it() {
     // that hand back the receiver's storage — the constructed arm stays free.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun pick(&self, first: bool): (i32, i32) {
@@ -4430,7 +4430,7 @@ fn an_early_ret_of_a_receivers_field_copies() {
     // `return_sites`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun make(&self, early: bool): (i32, i32) {
@@ -4457,7 +4457,7 @@ fn a_borrows_projection_still_returns_the_alias() {
     // receiver.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
@@ -4478,7 +4478,7 @@ fn a_readonly_borrows_projection_still_returns_the_alias() {
     // projection, and its result must keep naming the receiver's storage.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun peek(&self): &(i32, i32) borrows self { &self.pair }
@@ -4504,7 +4504,7 @@ fn a_view_parameter_forwarded_into_a_view_return_still_aliases() {
     // reaches the seam.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun same(v: &mut Holder): &mut Holder borrows v { v }
         fun main() {
@@ -4524,7 +4524,7 @@ fn a_receiver_forwarded_into_a_view_return_still_aliases() {
     // Holder { self }` with one word changed in the return type.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun me(&mut self): &mut Holder borrows self { self }
@@ -4547,7 +4547,7 @@ fn a_bare_self_receivers_field_return_was_already_right() {
     // stay one rule.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun make(self): (i32, i32) { self.pair }
@@ -4569,7 +4569,7 @@ fn a_returned_own_parameter_still_moves_out_of_a_view_receivers_neighbour() {
     // fluent-builder shape stays free. Proven by the ABSENT `__clone`, since
     // behaviour cannot see the difference.
     let source = r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun through(own h: Holder): Holder { h }
         fun main() {
@@ -4593,7 +4593,7 @@ fn a_returned_scalar_field_of_a_receiver_needs_no_copy() {
     // The type filter is unchanged: a scalar read IS the copy, so no `__clone`
     // is owed and none is emitted.
     let source = r#"
-        import std::print;
+        import std::io::print;
         struct Holder { n: i32 }
         impl Holder {
             fun get(&self): i32 { self.n }
@@ -4618,7 +4618,7 @@ fn a_closure_returning_its_own_view_parameters_field_copies() {
     // parameter is bare) and pinned so the seam's two spellings stay one rule.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun apply(h: &Holder, f: |&Holder| (i32, i32)): (i32, i32) { f(h) }
         fun main() {
@@ -4650,7 +4650,7 @@ fn a_by_value_forwarders_result_binds_mut() {
     // (B100's copy is what makes the first half true).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun copy(&self): Holder { self }
@@ -4673,7 +4673,7 @@ fn a_free_by_value_forwarders_result_binds_mut() {
     // the caller's own value is untouched by the write to the copy.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun copy_of(h: &Holder): Holder { h }
         fun main() {
@@ -4697,7 +4697,7 @@ fn a_by_value_forwarder_still_passes_the_escape_check() {
     // 3's own: the return hands back a value, so no view escapes.
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun copy(&self): Holder { self }
@@ -4716,7 +4716,7 @@ fn a_view_returning_forwarders_result_is_still_a_view() {
     // return is a projection, its result is a view, and a view cannot be `mut`.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun me(&mut self): &mut Holder borrows self { self }
@@ -4738,7 +4738,7 @@ fn a_view_of_a_local_still_cannot_escape_a_by_value_return() {
     // copy converts this one and the view still dangles.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         impl Holder {
             fun bad(&self): (i32, i32) { let v = &self.pair; v }
@@ -4760,7 +4760,7 @@ fn a_scalar_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
     // as CLONEABLE-AGGREGATE-only rather than by-value-only.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun same(v: &mut i32): i32 { v }
         fun main() {
             mut n = 5;
@@ -4781,7 +4781,7 @@ fn a_generic_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
     // the view classification does too.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun same<T>(v: &T): T { v }
         fun main() {
@@ -4802,7 +4802,7 @@ fn a_borrows_call_chain_into_a_by_value_return_keeps_its_borrow() {
     // call site honest about that.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
         fun get(h: &Holder): (i32, i32) { peek(h) }
@@ -4823,7 +4823,7 @@ fn a_wrapped_view_return_is_still_a_borrow() {
     // `returns_view`, which reads the TOP-LEVEL type node.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
@@ -4850,7 +4850,7 @@ fn a_resource_forwarded_out_of_a_loan_is_still_refused() {
     // consulted. Pinned so the guard's unreachability is a fact, not a hope.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard {
             fun drop(own self) { print("drop " + self.tag); }
@@ -4891,7 +4891,7 @@ fn a_scalar_view_forwarded_into_a_by_value_return_hands_back_the_value() {
     // and `__clone` cannot collapse a pair; the crossing emits the read.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun same(v: &mut i32): i32 { v }
         fun main() {
             mut n = 5;
@@ -4913,7 +4913,7 @@ fn a_generic_view_forwarded_into_a_by_value_return_reads_at_a_scalar() {
     // the pair rather than collapsing it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun same<T>(v: &T): T { v }
         fun main() {
             mut n = 5;
@@ -4933,7 +4933,7 @@ fn a_scalar_reference_leaf_in_a_by_value_return_reads_the_place() {
     // the later write showed through it too.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { n: i32 }
         impl Holder {
             fun grab(&self): i32 { &self.n }
@@ -4955,7 +4955,7 @@ fn a_scalar_borrows_call_leaf_in_a_by_value_return_reads_the_place() {
     // over. Same pair, same live alias, same read.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { n: i32 }
         fun peek(h: &Holder): &i32 borrows h { &h.n }
         fun get(h: &Holder): i32 { peek(h) }
@@ -4977,7 +4977,7 @@ fn a_reference_leaf_in_a_by_value_return_copies() {
     // receiver's field. Printed 99.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5006,7 +5006,7 @@ fn a_borrows_call_leaf_in_a_by_value_return_copies() {
     // what makes it merely conservative rather than wrong.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
         fun get(h: &Holder): (i32, i32) { peek(h) }
@@ -5028,7 +5028,7 @@ fn a_mut_reference_leaf_in_a_by_value_return_copies() {
     // the leaf's own view-ness.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5051,7 +5051,7 @@ fn a_free_parameters_reference_leaf_in_a_by_value_return_copies() {
     // loan, and `place_root` walks to it the same way.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         fun grab_of(h: &Holder): Inner { &h.inner }
@@ -5072,7 +5072,7 @@ fn a_nested_reference_leaf_in_a_by_value_return_copies() {
     // roots at `self` like `&self.inner` does.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Mid { inner: Inner }
         struct Holder { mid: Mid }
@@ -5096,7 +5096,7 @@ fn a_tail_if_arms_reference_leaf_in_a_by_value_return_copies() {
     // reason B100 pinned its own conditional shape.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner, other: Inner }
         impl Holder {
@@ -5121,7 +5121,7 @@ fn a_borrows_method_leaf_in_a_by_value_return_copies() {
     // receiver, at position 0 of the call.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5146,7 +5146,7 @@ fn a_borrows_call_chain_leaf_in_a_by_value_return_copies() {
     // reaches a place at all. Without the recursion this hands back the alias.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Mid { inner: Inner }
         struct Outer { mid: Mid }
@@ -5174,7 +5174,7 @@ fn a_borrows_call_on_a_local_in_a_by_value_return_copies_nothing() {
     // a dead owner at the return, so a projection of a LOCAL donates its
     // storage. Reading through the call reaches `h`, a local, and stops.
     let source = r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         fun peek(h: &Holder): &Inner borrows h { &h.inner }
@@ -5197,7 +5197,7 @@ fn an_owned_call_leaf_in_a_by_value_return_copies_nothing() {
     // clause projects nothing, so reading through it names no place and the
     // seam has nothing to copy.
     let source = r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         fun fresh(): Inner { Inner { n = 3 } }
@@ -5223,7 +5223,7 @@ fn a_reference_leaf_in_a_view_return_still_aliases() {
     // so nothing crosses and `&mut self.inner` stays the alias it is for.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5248,7 +5248,7 @@ fn a_reference_leaf_handing_back_a_resource_is_refused() {
     // uncopied AND undestroyed.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5271,7 +5271,7 @@ fn a_borrows_call_leaf_handing_back_a_resource_is_refused() {
     // forwarder `fun take(&self): Guard { self }` already gets.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5294,7 +5294,7 @@ fn a_reference_leaf_loaning_a_resource_out_of_a_view_return_is_still_allowed() {
     // scope-end teardown is `destruction.md`'s subject, not this seam's.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5331,7 +5331,7 @@ fn b116_the_ret_spelling_of_a_reference_leaf_agrees_with_the_tail() {
     // the tail compiled and copied. Both now emit the copy, and the same one.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5373,7 +5373,7 @@ fn b116_the_ret_spelling_of_a_scalar_view_reads_the_place() {
     // runtime pair.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         fun same(v: &mut i32, flag: bool): i32 {
             if flag { ret v; }
             v
@@ -5403,7 +5403,7 @@ fn b116_the_ret_spelling_of_a_borrows_call_leaf_copies() {
     // read from the callee's `borrows` clause. Same answer at the `ret`.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
         fun get(h: &Holder, flag: bool): (i32, i32) {
@@ -5442,7 +5442,7 @@ fn b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused() {
     // exactly the bug B109 shipped to close.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5467,7 +5467,7 @@ fn b116_the_ret_spelling_of_a_resource_borrows_call_is_refused() {
     // loaned parameter itself — R3's diagnostic, at the `ret` as at the tail.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5493,7 +5493,7 @@ fn b116_the_ret_spelling_of_a_view_of_a_local_still_cannot_escape() {
     // too: this is refused in both spellings, as the tail always was.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun grab(flag: bool): Inner {
             let local = Inner { n = 3 };
@@ -5515,7 +5515,7 @@ fn b116_the_ret_spelling_of_a_borrows_projection_is_sanctioned() {
     // copy, in both.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         fun view_of(h: &Holder, flag: bool): &Inner borrows h {
@@ -5547,7 +5547,7 @@ fn b116_a_ret_only_resource_crossing_is_named_by_the_move_scan() {
     // move scan answers with the bare twin's diagnostic.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5580,7 +5580,7 @@ fn b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail() {
     // measurement §11.3 candidate (d) deferred.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5618,7 +5618,7 @@ fn b122_a_conditional_tail_arm_may_not_escape_a_view_of_a_local() {
     // return LEAF (`collect_tail_leaves`), so this arm is examined on its own.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun grab(flag: bool): Inner {
             let local = Inner { n = 3 };
@@ -5638,7 +5638,7 @@ fn b122_a_conditional_tail_arm_order_does_not_matter() {
     // every leaf gets asked.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun grab(flag: bool): Inner {
             let local = Inner { n = 3 };
@@ -5658,7 +5658,7 @@ fn b122_a_nested_conditional_arm_may_not_escape_a_view_of_a_local() {
     // outermost `if`.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun grab(flag: bool, other: bool): Inner {
             let local = Inner { n = 3 };
@@ -5682,7 +5682,7 @@ fn b122_a_match_leg_may_not_escape_a_view_of_a_local() {
     // would suggest is representative.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         enum Choice { A, B }
         struct Inner { n: i32 }
         fun grab(choice: Choice): Inner {
@@ -5706,7 +5706,7 @@ fn b122_a_mixed_leaf_return_refuses_only_the_local_view_leaf() {
     // separately and answered separately — exactly one diagnostic, and its
     // span is the local arm, not the parameter arm and not the whole `if`.
     let source = r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         fun grab(h: &Holder, flag: bool): Inner {
@@ -5730,7 +5730,7 @@ fn a_closures_ret_still_cannot_hand_back_a_view() {
     // view at all (`compute_return_clone_sites` relies on exactly that).
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         fun main() {
@@ -5760,7 +5760,7 @@ fn b134_the_unannotated_ret_spelling_of_a_reference_leaf_copies() {
     // twin has always emitted.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5804,7 +5804,7 @@ fn b134_an_unannotated_tail_of_a_loaned_place_copies() {
     // printed 99 where its annotated twin printed 3.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         impl Holder {
@@ -5838,7 +5838,7 @@ fn b134_the_unannotated_ret_spelling_of_a_scalar_view_reads_the_place() {
     // (`v[0][v[1]]`), at the `ret` as at the tail.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         fun same(v: &mut i32, flag: bool) {
             if flag { ret v; }
             v
@@ -5870,7 +5870,7 @@ fn b134_the_unannotated_ret_spelling_of_a_borrows_call_leaf_copies() {
     // at both of the caller's return positions.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { pair: (i32, i32) }
         fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
         fun get(h: &Holder, flag: bool) {
@@ -5908,7 +5908,7 @@ fn b134_the_unannotated_ret_spelling_of_a_resource_reference_leaf_is_refused() {
     // (the crossing scan never saw it).
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5934,7 +5934,7 @@ fn b134_an_unannotated_ret_only_resource_crossing_is_named_by_the_move_scan() {
     // walking the tail alone says nothing about it.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         resource struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
@@ -5960,7 +5960,7 @@ fn b134_the_unannotated_ret_spelling_of_a_view_of_a_local_still_cannot_escape() 
     // as the raw scan did.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun grab(flag: bool) {
             let local = Inner { n = 3 };
@@ -5991,7 +5991,7 @@ fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local(
     // (`b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closure_local`).
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun main() {
             let grab = |flag: bool| {
@@ -6016,7 +6016,7 @@ fn b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closur
     // Both refuse now.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun main() {
             let via_ret = |flag: bool| {
@@ -6031,7 +6031,7 @@ fn b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closur
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun main() {
             let via_tail = |flag: bool| {
@@ -6057,7 +6057,7 @@ fn b123_a_closure_ret_and_conditional_tail_arm_agree_accepting_an_owned_leaf() {
     // widens what gets ASKED, not what gets REFUSED.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun main() {
             let via_ret = |flag: bool| {
@@ -6082,7 +6082,7 @@ fn b123_a_closure_conditional_tail_arm_order_does_not_matter() {
     // walks both arms of an `if`/`else` regardless of order.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun main() {
             let grab = |flag: bool| {
@@ -6103,7 +6103,7 @@ fn b123_a_nested_closure_conditional_arm_may_not_escape_a_view_of_a_closure_loca
     // levels deep is still a leaf the walk finds.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         fun main() {
             let grab = |flag: bool, other: bool| {
@@ -6128,7 +6128,7 @@ fn b123_a_closure_match_leg_may_not_escape_a_view_of_a_closure_local() {
     // still examined on its own.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         enum Choice { A, B }
         struct Inner { n: i32 }
         fun main() {
@@ -6157,7 +6157,7 @@ fn b123_a_mixed_leaf_closure_return_refuses_each_forbidden_view_leaf_separately(
     // must refuse BOTH, separately, each naming its own span rather than
     // collapsing into one diagnostic or naming the enclosing `if`.
     let source = r#"
-        import std::print;
+        import std::io::print;
         struct Inner { n: i32 }
         struct Holder { inner: Inner }
         fun main() {
@@ -6193,7 +6193,7 @@ fn a_list_literal_element_copies_its_source_place() {
     // result's element grew `xs`. Printed 3.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [1, 2];
             mut ys = [xs];
@@ -6211,7 +6211,7 @@ fn a_tuple_literal_element_copies_its_source_place() {
     // The same seam through a tuple, whose elements store flat.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [1, 2];
             mut pair = (xs, 1);
@@ -6229,7 +6229,7 @@ fn a_struct_literal_field_copies_its_source_place() {
     // Rule 1 names "field initialization" outright; it was not enforced.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { items: List<i32> }
         fun main() {
             mut xs = [1, 2];
@@ -6249,7 +6249,7 @@ fn a_variant_payload_copies_its_source_place() {
     // arm never saw it: `Some(xs)` captured `xs`'s storage as the payload.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut xs = [1, 2];
@@ -6272,7 +6272,7 @@ fn a_construction_does_not_see_later_writes_to_its_source() {
     // already-built list must not.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [1, 2];
             let held = [xs];
@@ -6291,7 +6291,7 @@ fn a_nested_construction_copies_at_every_level() {
     // field, not just the outer element.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Row { cells: List<i32> }
         fun main() {
             mut cells = [1, 2];
@@ -6312,7 +6312,7 @@ fn a_pushed_place_copies_into_the_receiver() {
     // storage into `acc`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [1, 2];
             mut acc: List<List<i32>> = List::new();
@@ -6331,7 +6331,7 @@ fn filter_does_not_share_elements_with_its_receiver() {
     // A20: `filter` pushes the loop element straight through.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<List<i32>> = List::new();
             xs.push([1, 2]);
@@ -6352,7 +6352,7 @@ fn reverse_does_not_share_elements_with_its_receiver() {
     // only, and `self[index]` hands the element over uncopied.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<List<i32>> = List::new();
             xs.push([1, 2]);
@@ -6373,7 +6373,7 @@ fn sort_by_does_not_share_elements_with_its_receiver() {
     // same elements.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::Ordering;
         struct Cell { n: i32 }
         fun main() {
@@ -6397,7 +6397,7 @@ fn map_does_not_share_elements_with_its_receiver() {
     // borrowed — so the copy lands at the closure's RETURN.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<List<i32>> = List::new();
             xs.push([1, 2]);
@@ -6416,7 +6416,7 @@ fn a_list_method_chain_does_not_share_elements() {
     // The composed case: every hop of `map(...).filter(...)` has to hold.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs: List<List<i32>> = List::new();
             xs.push([1, 2]);
@@ -6439,7 +6439,7 @@ fn a_returned_parameter_place_does_not_alias_the_caller() {
     // caller's own storage.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun identity(c: List<i32>): List<i32> { c }
         fun main() {
             mut xs = [1, 2];
@@ -6458,7 +6458,7 @@ fn a_returned_field_of_a_parameter_does_not_alias_the_caller() {
     // The projecting getter — the shape that makes `map`'s closure leak.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { items: List<i32> }
         fun items_of(holder: Holder): List<i32> { holder.items }
         fun main() {
@@ -6481,7 +6481,7 @@ fn a_returned_local_still_moves() {
     // pin the absence of `__clone` in bytes — so this only guards the output.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun build(): List<List<i32>> {
             mut result: List<List<i32>> = List::new();
             result.push([1, 2]);
@@ -6513,7 +6513,7 @@ fn a_closure_returning_a_captured_local_does_not_alias_it() {
     // parameter half of this rule, spelled inline.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut xs = [ 1, 2 ];
             let get = || xs;
@@ -6536,7 +6536,7 @@ fn a_closure_returning_a_captured_own_parameter_does_not_alias_it() {
     // lists. The bare-parameter twin already worked and is the control.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun make_bare(items: List<i32>): || List<i32> { || items }
         fun make_own(own items: List<i32>): || List<i32> { || items }
         fun main() {
@@ -6561,7 +6561,7 @@ fn a_closure_returning_its_own_local_still_moves() {
     // the difference — a copy would be correct too — so the proof is the
     // emitted bytes, and the program below has no other `__clone` site.
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let build = || {
                 mut result = [ 1, 2 ];
@@ -6590,7 +6590,7 @@ fn a_closure_returning_a_captured_field_does_not_alias_it() {
     // copies on the same rule — the `map`-closure shape, one frame in.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { items: List<i32> }
         fun main() {
             mut holder = Holder { items = [ 1, 2 ] };
@@ -6614,7 +6614,7 @@ fn a_closures_own_is_capture_is_not_a_resource_capture() {
     // `match` twin was always fine — only the `is` arm was missing.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         resource struct Db { handle: i32 }
         fun main() {
@@ -6634,7 +6634,7 @@ fn a_guard_that_lifts_emits_its_temporary() {
     // container's variant, all of which the else-if chain used to drop.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let held: Option<List<i32>> = Some([1, 2, 3]);
@@ -6654,7 +6654,7 @@ fn a_guard_that_matches_emits_its_temporary() {
     // temp and an if-chain — three statements with nowhere to go.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             let held: Option<List<i32>> = Some([1, 2, 3]);
@@ -6678,7 +6678,7 @@ fn a_later_guarded_leg_gets_its_own_slot() {
     // even asked.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun main() {
             mut held: Option<List<i32>> = Some([1, 2, 3]);
@@ -6703,7 +6703,7 @@ fn a_guard_that_reads_a_copied_capture_reads_the_copy() {
     // value seam), so it copies; the guard's `len` is the copy's.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun keep(held: Option<List<i32>>): List<i32> {
             match held {
@@ -6732,7 +6732,7 @@ fn trait_conformance_ignores_parameter_mut() {
     // satisfied by an impl with it (and the receiver likewise).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         trait Doubler { fun doubled(self, x: i32): i32; }
         struct Twice {}
         impl Twice with Doubler {
@@ -6770,7 +6770,7 @@ fn a_capture_sees_a_later_write_to_the_captured_binding() {
     // c01 — mutation flows IN. Under a by-value capture this would print 1.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut count = 1;
             let read = || count;
@@ -6787,7 +6787,7 @@ fn a_write_inside_a_closure_reaches_the_captured_binding() {
     // c02 — writes flow OUT, the same aliasing read from the other side.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut total = 0;
             let bump = || { total = total + 5; };
@@ -6806,7 +6806,7 @@ fn a_captured_aggregates_field_write_is_visible_through_the_capture() {
     // because it holds the binding rather than a copy of what it held.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Box { n: i32 }
         fun main() {
             mut box = Box { n = 1 };
@@ -6827,7 +6827,7 @@ fn a_rebinding_after_the_capture_is_visible_through_it() {
     // binding is the same binding.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut label = "before";
             let show = || label;
@@ -6846,7 +6846,7 @@ fn a_captured_shared_cell_aliases_through_the_capture() {
     // so it survives any capture rule the language might have picked.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         fun main() {
             let cell = Shared::new(1);
@@ -6874,7 +6874,7 @@ fn a_returned_closure_may_not_capture_a_view_of_a_dead_local() {
     // q05, red-first: this compiled and printed 7 on 0.38.0.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun make_reader(): || i32 {
             mut n = 7;
             let view = &mut n;
@@ -6894,7 +6894,7 @@ fn a_closure_may_not_capture_a_view_even_when_it_does_not_escape() {
     // does not enter a closure body at all.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut n = 1;
             let view = &mut n;
@@ -6911,7 +6911,7 @@ fn a_closure_may_not_capture_a_for_each_view() {
     // A `for e in &mut list` binding is a view with no `&` in sight.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut rows = [ 1, 2 ];
             for row in &mut rows {
@@ -6930,7 +6930,7 @@ fn a_closure_may_not_capture_a_borrows_call_result() {
     // (`Shared::write`), which has no local root at all.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         fun main() {
             let cell = Shared::new(1);
@@ -6949,7 +6949,7 @@ fn a_view_declared_inside_a_closure_is_not_a_capture() {
     // place, so the view is an ordinary short-lived local.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let f = || {
                 mut n = 4;
@@ -6971,7 +6971,7 @@ fn a_closure_may_still_capture_a_view_parameter_of_its_enclosing_function() {
     // refuses (`a_returned_closure_over_a_view_parameter_is_refused`, below).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { items: List<i32> }
         impl Bag {
             fun fill(&mut self) {
@@ -6995,7 +6995,7 @@ fn a_returned_closure_over_a_view_parameter_is_refused() {
     // capture is legal, the ESCAPE is not.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         fun make(v: &mut i32): || i32 { || *v }
         fun main() { mut n = 3; print(make(&mut n)()); }
         "#,
@@ -7009,7 +7009,7 @@ fn reading_the_value_out_before_the_closure_is_the_fix_the_message_names() {
     // take the view as a closure PARAMETER (a per-call loan, never a capture).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             mut n = 1;
             let view = &mut n;
@@ -7036,7 +7036,7 @@ fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
     // for the call), and never learns that this one is stored.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Holder { f: || i32 }
         fun keep(g: || i32): Holder { Holder { f = g } }
         fun make(v: &mut i32): Holder { keep(|| *v) }

@@ -90,7 +90,7 @@ fn a_dropped_database_closes_and_the_file_reopens() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::db::Database;
 import std::drop::drop;
 import std::option::Option::{ self, Some, None };
@@ -160,7 +160,7 @@ main();
 fn migrations_apply_once_and_a_re_run_applies_nothing() {
     let dir = migration_project(
         "migrate_idempotent",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::db::{ Database, Migration };
 import std::display::Display;
 
@@ -227,7 +227,7 @@ main();
 fn an_extended_migration_list_applies_only_the_tail() {
     let dir = migration_project(
         "migrate_tail",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::db::{ Database, Migration };
 import std::display::Display;
 import std::option::Option::{ self, Some, None };
@@ -267,7 +267,7 @@ main();
 fn a_failing_migration_stops_the_boot_naming_it_and_records_nothing() {
     let dir = migration_project(
         "migrate_failure",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::db::{ Database, Migration };
 import std::display::Display;
 import std::option::Option::{ self, Some, None };
@@ -335,7 +335,7 @@ main();
 fn a_database_ahead_of_the_migration_list_is_refused() {
     let dir = migration_project(
         "migrate_drift_ahead",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::db::{ Database, Migration };
 import std::display::Display;
 import std::option::Option::{ self, Some, None };
@@ -386,7 +386,7 @@ main();
 fn a_migration_inserted_before_the_applied_history_is_refused() {
     let dir = migration_project(
         "migrate_drift_inserted",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::db::{ Database, Migration };
 import std::display::Display;
 import std::option::Option::{ self, Some, None };

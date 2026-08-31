@@ -67,7 +67,6 @@ The `B = Self` parameter types the right-hand side; mixed-operand impls
 are how std's `Instant + Duration` works:
 
 ```vilan
-import std::print;
 import std::operators::Add;
 
 struct Celsius {
@@ -116,7 +115,6 @@ supplies — `map<U>(self, |T| U)` for the plain case, and
 container's **first type argument**.
 
 ```vilan
-import std::print;
 import std::operators::Lift;
 
 struct Tagged<T> {

@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::operators::Rem;
 
 // `%` is truncated remainder (the dividend's sign) at every numeric type —

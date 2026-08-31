@@ -4,7 +4,7 @@
 // compare the enveloped sizes against the bare values. Sizes are real UTF-8
 // byte counts, not code units.
 
-import std::print;
+import std::io::print;
 import std::option::Option::{ self, Some, None };
 import std::bytes::encode_utf8;
 import std::json::{ Json, json_codec };

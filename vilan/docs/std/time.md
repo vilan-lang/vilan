@@ -50,7 +50,6 @@ impl Duration with PartialOrd { … }
 The `"{age} ago"` UI idiom:
 
 ```vilan
-import std::print;
 import std::time::{ now, Instant, Duration };
 
 fun main() {
@@ -99,7 +98,6 @@ settled, one arriving long after), and asking a settled timer is immediate.
 already fired, does nothing.
 
 ```vilan
-import std::print;
 import std::time::Timer;
 
 fun main() {

@@ -481,7 +481,7 @@ fn every_tracked_fixture_is_already_in_canonical_order() {
 /// canonicalized: `todos.vl`'s shell and button, `views.vl`'s shell, and the
 /// project templates' card.
 const ORDER_SENSITIVE: &str = concat!(
-    "import std::print;\n",
+    "import std::io::print;\n",
     "import std::style::{ AlignItems, Color, Cursor, Display, FlexDirection, Length, space, style };\n",
     "\n",
     "fun main() {\n",
@@ -592,7 +592,7 @@ fn an_order_sensitive_fixture_resolves_the_same_slots() {
 /// the property is a token, so `padding:` really does rank — which is what makes
 /// the entangled-pair cases below load-bearing here in a way they are not there.
 const CSS_ORDER_SENSITIVE: &str = concat!(
-    "import std::print;\n",
+    "import std::io::print;\n",
     "import std::style::{ Color, Length, space, style };\n",
     "\n",
     "fun main() {\n",

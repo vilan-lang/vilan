@@ -47,17 +47,22 @@ error; `i64`/`u64` were renamed to `i53`/`u53`). Unsuffixed: integer
 
 Std declarations the language itself depends on:
 
-| Item | Module | Language use |
-|---|---|---|
-| primitives (`bool`, `str`, numerics, `BigInt`) | `std::boolean`/`string`/`number` | literal types |
-| `List<T>` | `std::list` | list literals, `for` |
-| `Option<T>` | `std::option` | `?.` results, view-returning lookups |
-| `Try`, `Verdict`, `Lift` | `std::operators` | `!`, `?.` (§5.10) |
-| `Add Sub Mul Div Rem Shl Shr BitAnd BitOr BitXor` | `std::operators` | operators (§5.7) |
-| `PartialEq`, `PartialOrd` | `std::compare` | `==`/ordering (§5.7) |
-| `Iterator`/`Iterable` | `std::iterator` | `for … in` |
-| `Task<T>` | `std::task` | `async`/`await` (§7.3) |
-| `Promise<T>` | `std::promise` | host-interop promises (§7.3) |
-| `Context<T>` | `std::context` | contexts (§8) |
-| `panic`, `assert` | `std::io` | divergence, `vilan test` |
+The **prelude** column says whether the default (base) prelude makes the
+name ambient too — `Option` is both a lang item and a prelude member, and
+that is where the two ideas meet (§4.7). `built-in` means the language
+has it with no prelude at all.
+
+| Item | Module | Language use | Prelude |
+|---|---|---|---|
+| primitives (`bool`, `str`, numerics, `BigInt`) | `std::boolean`/`string`/`number` | literal types | built-in |
+| `List<T>` | `std::list` | list literals, `for` | built-in |
+| `Option<T>` | `std::option` | `?.` results, view-returning lookups | base (with `Some`/`None`) |
+| `Try`, `Verdict`, `Lift` | `std::operators` | `!`, `?.` (§5.10) | — (but `Result`/`Ok`/`Err` are base) |
+| `Add Sub Mul Div Rem Shl Shr BitAnd BitOr BitXor` | `std::operators` | operators (§5.7) | — |
+| `PartialEq`, `PartialOrd` | `std::compare` | `==`/ordering (§5.7) | — |
+| `Iterator`/`Iterable` | `std::iterator` | `for … in` | — |
+| `Task<T>` | `std::task` | `async`/`await` (§7.3) | — |
+| `Promise<T>` | `std::promise` | host-interop promises (§7.3) | — |
+| `Context<T>` | `std::context` | contexts (§8) | — |
+| `panic`, `assert` | `std::io` | divergence, `vilan test` | — |
 

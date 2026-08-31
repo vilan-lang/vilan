@@ -23,7 +23,6 @@ it, so you rarely call it directly. Reach for it when you want a whole block
 to exist only during development.
 
 ```vilan,browser
-import std::print;
 import std::dev;
 
 fun main() {
@@ -68,7 +67,6 @@ Module-level bindings carry across a swap automatically (see
 value minted inside a function that you want to survive one edit.
 
 ```vilan,browser
-import std::print;
 import std::dev;
 import std::option::Option::{ self, Some, None };
 

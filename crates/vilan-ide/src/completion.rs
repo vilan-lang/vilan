@@ -512,7 +512,7 @@ impl ImportRoots {
     /// own order, together with the package SURFACE (`lib.vl`) that origin
     /// publishes. `None` when `origin` names no origin.
     ///
-    /// A library has a surface — `import std::print` names a leaf of std's
+    /// A library has a surface — `import std::io::print` names a leaf of std's
     /// `lib.vl`, which declares nothing and re-exports everything. The entry
     /// package does not: a `[package]` has a `main.vl`, and its modules are
     /// addressed by path. This mirrors the loader exactly, which searches the
@@ -1475,7 +1475,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     ///   `import`, and offering them is what the head position did before.
     /// - **one** (`import std::|`) — that origin's modules, enumerated from its
     ///   source roots, plus the package's own `lib.vl` surface where it has one
-    ///   (`import std::print`).
+    ///   (`import std::io::print`).
     /// - **two or more** (`import std::json::|`) — the named module's importable
     ///   names, LOADED ON DEMAND. The point of an import is to reach a module
     ///   the program has not loaded, so the analyzed `Program` cannot answer;

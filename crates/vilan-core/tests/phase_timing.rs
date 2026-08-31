@@ -32,7 +32,7 @@ fn phase_timing_survives_a_warm_second_analysis() {
     unsafe { std::env::set_var("VILAN_PHASE_TIMING", "1") };
 
     let source = r#"
-        import std::print;
+        import std::io::print;
         fun main() { print("warm"); }
         main();
         "#;

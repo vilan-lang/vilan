@@ -8,8 +8,6 @@
 has that value:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let n = 7;
 	let label = if n % 2 == 0 { "even" } else { "odd" };
@@ -26,7 +24,6 @@ the compiler checks for completeness. Arms are `pattern => expression`.
 Payloads bind with `let`, and `_` catches everything else:
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 
 fun describe(slot: Option<i32>): str {
@@ -114,7 +111,6 @@ let value = match slot {
 `for` covers every loop. It has three forms:
 
 ```vilan
-import std::print;
 import std::range::Range;
 
 fun main() {
@@ -171,7 +167,6 @@ Two operators make the common patterns short.
 value, and if there isn't one, return the failure from this function":
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 
@@ -207,7 +202,6 @@ a `Result`'s error, and `.ok_or(err)` turns an `Option`'s `None` into an
 `Err` you supply.
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
 
@@ -237,7 +231,6 @@ from JS, and on `Option` it plays the same role, with the compiler
 checking it:
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 
 struct Book {
@@ -267,7 +260,6 @@ chain, a `?` on its own lifts the rest of the surrounding expression,
 operators included:
 
 ```vilan
-import std::print;
 import std::option::Option::{ self, Some, None };
 
 fun main() {

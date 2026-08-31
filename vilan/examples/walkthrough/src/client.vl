@@ -4,7 +4,6 @@
 // closes when it unmounts, instead of living as long as the tab.
 
 import std::json::json_codec;
-import std::print;
 import std::reactive::Signal;
 import std::result::Result::{ Err, Ok, self };
 import std::router::current_path;

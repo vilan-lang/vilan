@@ -160,7 +160,7 @@ impl Install {
         .expect("write vilan.toml");
         fs::write(
             project.join("src/main.vl"),
-            "import std::print;\nimport std::process::args;\n\nfun main() {\n\tfor arg in args() {\n\t\tprint(arg);\n\t}\n}\n",
+            "import std::io::print;\nimport std::process::args;\n\nfun main() {\n\tfor arg in args() {\n\t\tprint(arg);\n\t}\n}\n",
         )
         .expect("write main.vl");
         project

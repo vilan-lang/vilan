@@ -6,7 +6,7 @@
 import std::debug::Debug;
 import std::json::Json;
 import std::operators::Div;
-import std::print;
+import std::io::print;
 
 [derive(Json)]
 struct Packet {

@@ -1954,20 +1954,13 @@ impl<'src> Transformer<'src> {
         options: &BuildOptions,
         names: Rc<NameSeed>,
     ) -> Self {
-        let print_fn_id = {
-            let std_module_id = *program
-                .module_id_by_name
-                .get("std")
-                .expect("missing std module");
-            let std_module = program.modules.get(&std_module_id).unwrap();
-            let std_module_scope_id = std_module.body.1;
-            let std_module_scope = program.scopes.get(&std_module_scope_id).unwrap();
-            let print_fn_id = *std_module_scope
-                .name_to_id_map
-                .get("print")
-                .expect("missing print function in the std module");
-            print_fn_id
-        };
+        // `std::io::print`, captured by the analyzer beside `panic`. It used to
+        // be looked up in std's package-root scope, which only ever worked
+        // because `lib.vl` re-exported it there under the short name — an
+        // alias deleted by prelude.md §10.2.
+        let print_fn_id = program
+            .print_fn_id
+            .expect("missing print function in std::io");
 
         Self {
             formatter: Formatter::from_options(options.indent, options.spaces),

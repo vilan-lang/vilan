@@ -2529,6 +2529,24 @@ pub struct Analyzer<'src> {
     // `module_id_by_name`, whose `pkg` namespace is then the entry's alone.
     packages: Vec<LoadedPackage>,
     package_of_source: HashMap<SourceId, usize>,
+    // The prelude (prelude.md §9.2, implementation option 1). `prelude_exports`
+    // is every loaded module's importable names by module scope — what a
+    // prelude module would publish, read syntactically at load. `prelude_seeds`
+    // is the work list: one entry per scope that takes an ambient set, with the
+    // manifest path to draw it from and the source whose package resolves that
+    // path's root.
+    //
+    // The bindings are copied into the target scope with `or_insert`, so items
+    // (declared during the walk) and imports (resolved just before) both win
+    // silently — the prelude is the weakest scope by ORDERING, never by a
+    // synthesized import that would clobber a file's own declarations.
+    prelude_exports: HashMap<Id, Vec<&'src str>>,
+    prelude_seeds: Vec<(Id, String, SourceId)>,
+    /// What the ENTRY file's prelude bound, for `Program::prelude_bindings`.
+    prelude_entry_bindings: Vec<Id>,
+    /// The scope the entry file resolves in, so `seed_preludes` knows which of
+    /// its seeds is the one Organize Imports acts on.
+    prelude_entry_scope: Option<Id>,
     modules: IndexMap<Id, Module<'src>>,
     parameters: IndexMap<Id, Parameter<'src>>,
     // The built-in `std` structs that back scalar primitives, keyed by name
@@ -2635,6 +2653,17 @@ pub struct Analyzer<'src> {
     // cache, then reused.
     std_module_files: Vec<(String, PathBuf)>,
     std_export_index: Option<HashMap<String, String>>,
+    /// The names `std::web` makes ambient, read lazily off disk on the first
+    /// failed resolution (`prelude.md` §11.4). A package on the base prelude
+    /// reaching for `Signal`, `view`, `View`, `style` or `ui` is the one new
+    /// class of confusion the two-set design creates, and the fix is one
+    /// manifest line rather than an import — so this steer must fire BEFORE
+    /// the ordinary import steer would send the user the wrong way.
+    web_prelude_index: Option<HashSet<String>>,
+    /// The path this analysis's ENTRY package resolves under, so the steer can
+    /// tell "you are not on the web set" from "you are, and this name is
+    /// genuinely missing". `None` is `prelude = false`.
+    entry_prelude_path: Option<String>,
     // The sibling index for the METHOD steer (std-surface.md §5): which
     // unloaded std module carries a method of this name on a subject with this
     // head, and what to import to reach it. `(subject head, method name) ->
@@ -2856,6 +2885,7 @@ pub struct Analyzer<'src> {
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
+    print_fn_id: Option<Id>,
     // `std::asset`'s const-only channel, in the order a diagnostic names its
     // members. One list rather than one field per verb: the channel grows
     // (four verbs in 2026-08, eight after kolt.local 035), and the const
@@ -2977,6 +3007,49 @@ pub enum ImportableKind {
 /// whose source is not the module's own). `export import` is the opposite case:
 /// the module is publishing the name on purpose, and std's `lib.vl` — which
 /// declares nothing at all — is entirely made of them.
+/// The curated steer for a name std's package root used to re-export
+/// (`prelude.md` §10.2). Thirteen aliases lived in `std/src/lib.vl` for one
+/// reason — to let a caller write `std::print` instead of `std::io::print` —
+/// and the prelude serves that better, so they were deleted.
+///
+/// `std::print` will be typed from muscle memory for a long time, and the
+/// generic "cannot find 'print' in the imported path" names neither the
+/// removal nor either way forward. This names both.
+fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String> {
+    if root != "std" || !at_std_root {
+        return None;
+    }
+    // The base prelude carries `print`, so the shortest fix is to write
+    // nothing at all; the others have only their real path.
+    let in_base_prelude = name == "print";
+    let home = match name {
+        "print" | "panic" | "assert" => "io",
+        "Default" => "default",
+        "str" => "string",
+        "BigInt" | "f32" | "f64" | "i8" | "i16" | "i32" | "i53" | "u8" | "u16" | "u32" | "u53" => {
+            "number"
+        }
+        _ => return None,
+    };
+    // The primitives are ambient with no prelude at all (spec §4.7), so
+    // pointing at an import would be pointing at something never needed.
+    if home == "number" || name == "str" {
+        return Some(format!(
+            "`std::{name}` was removed: `{name}` is a primitive and is always \
+             in scope — delete the import (its module path, if you need it, \
+             is `std::{home}::{name}`)"
+        ));
+    }
+    Some(if in_base_prelude {
+        format!(
+            "`std::{name}` was removed: `{name}` is in the default prelude \
+             (no import needed), and its module path is `std::{home}::{name}`"
+        )
+    } else {
+        format!("`std::{name}` was removed: its module path is `std::{home}::{name}`")
+    })
+}
+
 fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'src>>) {
     for item in items {
         if let Node::Export(inner) = &item.0 {
@@ -3348,6 +3421,10 @@ impl<'src> Analyzer<'src> {
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
             package_of_source: HashMap::default(),
+            prelude_exports: HashMap::default(),
+            prelude_seeds: Vec::new(),
+            prelude_entry_bindings: Vec::new(),
+            prelude_entry_scope: None,
             modules: IndexMap::new(),
             parameters: IndexMap::new(),
             primitive_struct_ids: HashMap::default(),
@@ -3374,6 +3451,8 @@ impl<'src> Analyzer<'src> {
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
             std_export_index: None,
+            web_prelude_index: None,
+            entry_prelude_path: None,
             std_trait_method_index: None,
             derived_origins: Vec::new(),
             closure_parameter_fill_sites: HashMap::default(),
@@ -3425,6 +3504,7 @@ impl<'src> Analyzer<'src> {
             trait_body_scopes: HashSet::default(),
             trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
+            print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
             walk_depth: 0,
@@ -25337,6 +25417,85 @@ impl<'src> Analyzer<'src> {
     /// (its `pkg::` self-references stay within it); the entry and `std` fall
     /// through to the global module map, so a dependency-free program resolves
     /// exactly as before.
+    /// The scope holding a prelude module's bindings, from a manifest path like
+    /// `std::prelude` (`prelude.md` §6.2). Walks the path exactly as
+    /// [`Analyzer::resolve_import`] does — the same root resolution, the same
+    /// namespace descent — with one deliberate omission: **no
+    /// `record_reference`**. Prelude bindings must stay invisible to the
+    /// reference index `Document::import_leaf_is_used` reads, or Organize
+    /// Imports would prune real imports on the grounds that "the prelude
+    /// already references them" (§13 determination 14).
+    ///
+    /// `None` when the path names no such module; the caller reports.
+    fn prelude_module_scope(&mut self, path: &str, source: SourceId) -> Option<Id> {
+        let mut segments = path.split("::");
+        let root = segments.next()?;
+        let mut target_id = self.resolve_import_root(root, source)?;
+        let mut namespace_scope_id = self.modules.get(&target_id)?.body.1;
+        for part in segments {
+            target_id = self.member_in_namespace(part, namespace_scope_id)?;
+            let Some(Expr::Module(sub_module_id)) = self.expr_id_to_expr_map.get(&target_id) else {
+                return None;
+            };
+            namespace_scope_id = self.modules.get(sub_module_id)?.body.1;
+        }
+        Some(namespace_scope_id)
+    }
+
+    /// Copies each queued prelude's names into the scope that asked for it.
+    ///
+    /// Called from `resolve_world` AFTER the import fixpoint, which is the one
+    /// window where both halves are true: the prelude module's own
+    /// `export import` lines have resolved (so its scope holds real ids), and
+    /// the target scope has everything that must beat the prelude — its walked
+    /// items and its own imports. `or_insert` then yields to both, which is
+    /// §9.1's rule implemented as ordering rather than as a precedence table.
+    ///
+    /// The ambient set is the prelude module's IMPORTABLES, not its whole
+    /// scope: a module's plain `import`s land in its scope too, and publishing
+    /// those would make a prelude's contents an accident of how it is written.
+    fn seed_preludes(&mut self) {
+        for (scope_id, path, source) in std::mem::take(&mut self.prelude_seeds) {
+            let Some(prelude_scope_id) = self.prelude_module_scope(&path, source) else {
+                continue;
+            };
+            // A prelude module resolving to the scope it would seed is the
+            // custom prelude's own file (§7): it gets no prelude, which also
+            // makes this non-recursive.
+            if prelude_scope_id == scope_id {
+                continue;
+            }
+            let Some(names) = self.prelude_exports.get(&prelude_scope_id).cloned() else {
+                continue;
+            };
+            let bindings: Vec<(&'src str, Id)> = {
+                let prelude_scope = match self.scopes.get(&prelude_scope_id) {
+                    Some(scope) => scope,
+                    None => continue,
+                };
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        prelude_scope
+                            .name_to_id_map
+                            .get_key_value(name)
+                            .map(|(key, id)| (*key, *id))
+                    })
+                    .collect()
+            };
+            let entry_bindings: Vec<Id> = bindings.iter().map(|(_, id)| *id).collect();
+            let scope = self.mut_scope_for_scope_id(scope_id);
+            for (name, id) in bindings {
+                scope.name_to_id_map.entry(name).or_insert(id);
+            }
+            // Organize Imports needs the ENTRY file's ambient set — the file
+            // the editor is acting on — so record only that seed.
+            if self.prelude_entry_scope == Some(scope_id) {
+                self.prelude_entry_bindings.extend(entry_bindings);
+            }
+        }
+    }
+
     fn resolve_import_root(&self, root: &str, source: SourceId) -> Option<Id> {
         if let Some(&package_index) = self.package_of_source.get(&source) {
             let package = &self.packages[package_index];
@@ -25402,6 +25561,9 @@ impl<'src> Analyzer<'src> {
         self.record_reference(source_id, root_span, module_id);
         let mut target_id = module_id;
         let mut namespace_scope_id = self.modules.get(&module_id).unwrap().body.1;
+        // Which scope is `std`'s own root, so the removed-alias steer fires on
+        // `std::print` and not on `std::io::print`'s deeper segments.
+        let root_scope_id = namespace_scope_id;
         for (part, part_span) in segments {
             match self.member_in_namespace(part, namespace_scope_id) {
                 Some(id) => {
@@ -25426,11 +25588,16 @@ impl<'src> Analyzer<'src> {
                 }
                 None => {
                     if report {
+                        let msg =
+                            removed_std_alias(root, part, namespace_scope_id == root_scope_id)
+                                .unwrap_or_else(|| {
+                                    format!("cannot find '{}' in the imported path", part)
+                                });
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: None,
                             span: part_span,
-                            msg: format!("cannot find '{}' in the imported path", part),
+                            msg,
                         });
                     }
                     return false;
@@ -28630,8 +28797,75 @@ impl<'src> Analyzer<'src> {
     /// the SAME name (a layered std twin) keep the steer, genuinely
     /// different modules make it ambiguous and it stays silent.
     fn import_steer(&mut self, name: &str) -> Option<String> {
+        if let Some(steer) = self.web_prelude_steer(name) {
+            return Some(steer);
+        }
         self.build_std_indexes_if_needed();
         self.import_steer_inner(name)
+    }
+
+    /// The web-set arm of the unresolved-name diagnostic (`prelude.md` §11.4
+    /// determination 1). Fires when the name is one `std::web` would have made
+    /// ambient and this package is not on it — the misdirection the two-set
+    /// design creates, whose fix is a manifest line, not an import.
+    ///
+    /// Keeps the existing `; …` suffix shape so `vilan-lsp`'s `unresolved_name`
+    /// string parser is unaffected (it keys on the `; import it first` prefix,
+    /// which this arm deliberately does not use — a quickfix that inserted an
+    /// import here would be the wrong repair).
+    fn web_prelude_steer(&mut self, name: &str) -> Option<String> {
+        if self.entry_prelude_path.as_deref() == Some(crate::manifest::WEB_PRELUDE) {
+            return None;
+        }
+        self.build_web_prelude_index_if_needed();
+        if !self.web_prelude_index.as_ref()?.contains(name) {
+            return None;
+        }
+        Some(format!(
+            "; `{name}` is in the prelude of the web set — set \
+             `prelude = \"{}\"` in vilan.toml",
+            crate::manifest::WEB_PRELUDE
+        ))
+    }
+
+    /// Reads `std::web`'s importable names off disk, once, on the first failed
+    /// resolution. A cold path by construction, and the same shape
+    /// [`Analyzer::build_std_indexes_if_needed`] uses — deliberately reading
+    /// the MODULE rather than carrying a second copy of the web set in Rust,
+    /// so the steer can never drift from what `std/src/web.vl` actually
+    /// exports. Answers empty when the file is unreadable: a steer degrades,
+    /// it never fails.
+    fn build_web_prelude_index_if_needed(&mut self) {
+        if self.web_prelude_index.is_some() {
+            return;
+        }
+        let module = crate::manifest::WEB_PRELUDE
+            .rsplit("::")
+            .next()
+            .unwrap_or_default();
+        let path = self
+            .std_module_files
+            .iter()
+            .find(|(name, _)| name == module)
+            .map(|(_, path)| path.clone());
+        let mut names = HashSet::default();
+        if let Some(path) = path {
+            if let Some(loaded) = load_package_module(&path) {
+                let mut importables = Vec::new();
+                collect_importables(&loaded.ast.0, &mut importables);
+                names.extend(
+                    importables
+                        .into_iter()
+                        .map(|importable| importable.name.to_string()),
+                );
+            }
+        }
+        // The base seven are in both sets, so a program missing `print` must
+        // get the ordinary import steer, not "switch to the web set".
+        for shared in ["print", "Option", "Some", "None", "Result", "Ok", "Err"] {
+            names.remove(shared);
+        }
+        self.web_prelude_index = Some(names);
     }
 
     /// The lazy std-wide scan behind both B4 steers: every std module file,
@@ -30610,6 +30844,12 @@ impl<'src> Analyzer<'src> {
             self.resolve_import(&path, name, scope_id, span, true, leaf_span, source_id);
             self.attribute_new_diagnostics(diagnostics_before, source_id);
         }
+        // The prelude binds HERE — after every import has resolved (so a
+        // prelude module's own re-exports point at real definitions, and so an
+        // explicit import of a prelude name is already in the scope that
+        // `or_insert` must yield to) and before any name resolves against a
+        // scope (so nothing has memoized a lookup the prelude would change).
+        self.seed_preludes();
 
         // --- Resolve `use` statements ---
         // `use Namespace::{ a, b }` binds items out of a namespace — a module
@@ -33777,6 +34017,14 @@ pub struct Program<'src> {
     pub list_push_fn_id: Option<Id>,
     // The `std` `panic` intrinsic (if loaded); its calls lower to a `throw`.
     pub panic_fn_id: Option<Id>,
+    // `std::io::print`, captured beside `panic` for the same reason: the
+    // transformer lowers `print` specially and must name the definition rather
+    // than a spelling. It used to be read out of std's package-root scope,
+    // which worked only because `lib.vl` re-exported it as `std::io::print` — an
+    // alias whose whole job was import brevity, deleted by prelude.md §10.2.
+    // A lang-adjacent function says where it lives; it does not ride on a
+    // convenience re-export.
+    pub print_fn_id: Option<Id>,
     // The std `drop<T>(own value)` sink (if loaded): a call to it is rewritten at
     // the site by the argument's concrete type — a resource lowers to its `__drop`
     // helper, data is a no-op consume (destruction.md §6).
@@ -33946,6 +34194,13 @@ pub struct Program<'src> {
     // label)`. Type names aren't entities, so this drives go-to-definition and
     // hover on them (e.g. `Option`, `i32`, a trait bound).
     pub type_references: Vec<(SourceId, Span, Option<Id>, String)>,
+    // The definitions this package's PRELUDE binds ambiently (`prelude.md`
+    // §11.1). Organize Imports reads it to strip an import the prelude already
+    // covers: an import whose leaf resolves to one of these definitions binds
+    // a name that is in scope anyway, so removing it changes nothing about
+    // what the file means. Matching on the DEFINITION and not just the name is
+    // what keeps `import my_lib::print;` alive beside an ambient `std::io::print`.
+    pub prelude_bindings: Vec<Id>,
     // A human-readable type label for every typed expression (e.g. `struct
     // Point`, `type i32`, `enum Option<i32>`), pre-rendered during analysis for
     // language-server hover. Keyed by expr id; `expr_id_to_type_id_map` wins
@@ -36086,7 +36341,7 @@ struct ModuleResolution {
 /// are equivalent to an importer. Returns the existing path (the flat form wins
 /// when both somehow exist), and a flag set when *both* exist (an ambiguity the
 /// caller reports). `None` when neither exists — the name isn't a module here
-/// (e.g. the `print` in `std::print`), which the caller simply skips.
+/// (e.g. the `print` in `std::io::print`), which the caller simply skips.
 ///
 /// "Exists" means on disk OR in the open-document overlay. Asking only the disk
 /// made an editor-only module invisible: the buffer was registered, but this
@@ -36359,6 +36614,11 @@ pub struct PackageSpec {
     /// directory inside the project stays external. Git dependencies and
     /// packages outside any workspace are `false`, as is `std`'s own spec.
     pub member: bool,
+    /// This package's ambient scope, from its OWN manifest (`prelude.md` §7).
+    /// Never the consumer's: a dependency's files resolve under the prelude its
+    /// author declared, which is what keeps two packages that disagree about
+    /// what `Signal` means both compiling in one build.
+    pub prelude: crate::manifest::PreludeSpec,
 }
 
 impl PackageSpec {
@@ -36474,6 +36734,10 @@ pub struct Workspace {
     /// The entry manifest's `[macro]` budgets (fuel per expansion, fixpoint
     /// depth) — defaults when absent.
     pub macro_limits: crate::macros::MacroLimits,
+    /// The ENTRY package's ambient scope (`prelude.md` §6). It lives here
+    /// rather than on a `PackageSpec` because the entry package has no spec in
+    /// `packages` — that slice is its dependencies.
+    pub entry_prelude: crate::manifest::PreludeSpec,
 }
 
 /// A package loaded during analysis: its source root, the namespace its modules
@@ -36537,6 +36801,16 @@ struct BaseCacheKey {
     /// The expansion budgets. Module-file expansions run inside the world, so
     /// two budgets can resolve two different worlds from identical sources.
     macro_limits: (u64, u32),
+    /// The ENTRY package's prelude (`prelude.md` §6). A stored world holds its
+    /// modules' scopes already seeded with their ambient set, and the entry
+    /// package's own modules take the entry prelude — so two preludes resolve
+    /// two different worlds from identical sources, exactly as two macro
+    /// budgets do. Omitting this served a `std::web` world to a base-prelude
+    /// program, which is how it was found.
+    ///
+    /// The dependency packages' preludes ride in `workspace` below, since
+    /// `workspace_fingerprint` renders one row per package spec.
+    entry_prelude: Option<String>,
 }
 
 /// The base cache (S3c, analysis-reuse.md §6.10): resolved pre-entry worlds
@@ -36604,10 +36878,14 @@ fn workspace_fingerprint(
             .map(|(name, dependency_index)| format!("{name}->{dependency_index}"))
             .collect();
         rows.push(format!(
-            "package {index} root={} surface={} member={} layers=[{}] deps=[{}]",
+            "package {index} root={} surface={} member={} prelude={} layers=[{}] deps=[{}]",
             spec.base_root.display(),
             spec.surface,
             spec.member,
+            // A dependency's own ambient set is part of what its modules
+            // RESOLVE TO in a stored world (prelude.md §7), so it belongs to
+            // the key beside its roots.
+            spec.prelude.module_path().unwrap_or("false"),
             layers.join(","),
             dependencies.join(","),
         ));
@@ -37031,6 +37309,10 @@ fn analyze_inner<'src>(
         std_seeds: entry_seed_names,
         workspace: workspace_fingerprint(workspace, &entry_dependency_seeds),
         macro_limits: (workspace.macro_limits.fuel, workspace.macro_limits.depth),
+        entry_prelude: workspace
+            .entry_prelude
+            .module_path()
+            .map(|path| path.to_string()),
     };
     let base_cacheable = allow_cache
         && !entry_is_inside_std
@@ -37113,6 +37395,13 @@ fn analyze_inner<'src>(
         }
     }
     analyzer.std_module_files.sort();
+    // What the ENTRY package resolves under, for the web-set steer arm
+    // (prelude.md §11.4): a package already on `std::web` must not be told to
+    // switch to it.
+    analyzer.entry_prelude_path = workspace
+        .entry_prelude
+        .module_path()
+        .map(|path| path.to_string());
     let global_scope = analyzer.create_scope(None);
     let global_scope_id = analyzer.push_scope(global_scope);
     // Every primitive is now migrated to source and captured after its module
@@ -37149,7 +37438,7 @@ fn analyze_inner<'src>(
     analyzer.module_id_by_name.insert("pkg", pkg_module_id);
 
     // `std` is the package root, integrated from `lib.vl`. Its re-exports bind
-    // into this scope; childing it to the global scope lets `std::i32`,
+    // into this scope; childing it to the global scope lets `std::number::i32`,
     // `std::List`, ... reach the builtins.
     let std_scope = analyzer.create_scope(Some(global_scope_id));
     let std_scope_id = analyzer.push_scope(std_scope);
@@ -37260,7 +37549,7 @@ fn analyze_inner<'src>(
         .collect();
     // The entry program addresses std submodules by path (`std::option::..`), so
     // its imports also seed the reachable set. Names that aren't modules (e.g. the
-    // `print` in `std::print`) simply find no file and are skipped. A cross-target
+    // `print` in `std::io::print`) simply find no file and are skipped. A cross-target
     // std import (e.g. `std::http` in a browser build) is reported here — once, at
     // its import — but still loaded, so the rest of the file types cleanly (P3).
     // (Skipped when compiling std itself, whose internal imports aren't user code.)
@@ -37293,6 +37582,12 @@ fn analyze_inner<'src>(
     // loaded before the registry builds, derives or not.
     for core in [
         "boolean", "list", "null", "promise", "compare", "default", "debug", "json", "hash",
+        // `number` and `string` host the numeric and `str` primitives. They
+        // used to load only as a side effect of `std/src/lib.vl` re-exporting
+        // their members for the `std::number::i32` / `std::string::str` short names; the alias
+        // sweep (prelude.md §10.2) deleted those, so the lang items say so
+        // themselves instead of riding on an alias.
+        "number", "string",
     ] {
         to_load.push((Origin::Std, core));
     }
@@ -37534,6 +37829,32 @@ fn analyze_inner<'src>(
     // the loop's entry arm skip it; the entry-as-module arm is unaffected.
     if base_cacheable {
         expanded_sources.insert(SourceId(0));
+    }
+    // A prelude module is reached by NO import — that is the whole point — so
+    // nothing in the discovery graph would ever load it. Seed it explicitly,
+    // once per package that declares one (prelude.md §6.2). A path rooted at a
+    // dependency is left to that dependency's own `lib.vl` surface, which is
+    // the only way its modules become reachable at all.
+    let mut seed_prelude_module = |origin: Origin, prelude: &crate::manifest::PreludeSpec| {
+        let Some(path) = prelude.module_path() else {
+            return;
+        };
+        let mut segments = path.split("::");
+        let (Some(root), Some(module), None) = (segments.next(), segments.next(), segments.next())
+        else {
+            return;
+        };
+        let module = interned_display_name(module.to_string());
+        match root {
+            "std" => to_load.push((Origin::Std, module)),
+            "pkg" => to_load.push((origin, module)),
+            _ => {}
+        }
+    };
+    seed_prelude_module(entry_pkg_origin, &workspace.entry_prelude);
+    seed_prelude_module(Origin::Std, &std.prelude);
+    for (index, package) in workspace.packages.iter().enumerate() {
+        seed_prelude_module(Origin::Dep(index), &package.prelude);
     }
     // Splice sites are stamped with a per-analysis counter (gensym hygiene, §7).
     let mut macro_site_counter: u32 = 0;
@@ -37989,6 +38310,56 @@ fn analyze_inner<'src>(
         }
     }
 
+    // Every loaded module's importable names, read syntactically before any
+    // walk. A prelude module publishes exactly these (prelude.md §8), and
+    // reading them here is what lets `seed_preludes` answer "what does
+    // `std::web` make ambient" without re-parsing anything.
+    for (_name, ast, _text, module_scope_id, _source_id, _origin) in &loaded {
+        let mut importables = Vec::new();
+        collect_importables(&ast.0, &mut importables);
+        analyzer.prelude_exports.insert(
+            *module_scope_id,
+            importables
+                .into_iter()
+                .map(|importable| importable.name)
+                .collect(),
+        );
+    }
+    // A dependency's `lib.vl` walks into the dependency's NAMESPACE scope, not
+    // into a module scope in `loaded` — so its ambient set is queued here, from
+    // the same package's own prelude. (std's `lib.vl` is the twin case and
+    // needs nothing: std declares `prelude = false`.)
+    for (source_id, namespace_scope_id, lib_ast, package_index, _lib_text) in &dependency_lib_walks
+    {
+        let mut importables = Vec::new();
+        collect_importables(&lib_ast.0, &mut importables);
+        analyzer.prelude_exports.insert(
+            *namespace_scope_id,
+            importables
+                .into_iter()
+                .map(|importable| importable.name)
+                .collect(),
+        );
+        if let Some(path) = workspace.packages[*package_index].prelude.module_path() {
+            analyzer
+                .prelude_seeds
+                .push((*namespace_scope_id, path.to_string(), *source_id));
+        }
+    }
+    // Queue each module's ambient set, from the prelude ITS OWN package
+    // declares (prelude.md §7 — never the consumer's, never inherited).
+    for (_name, _ast, _text, module_scope_id, source_id, origin) in &loaded {
+        let prelude = match origin {
+            Origin::Std => &std.prelude,
+            Origin::Pkg => &workspace.entry_prelude,
+            Origin::Dep(index) => &workspace.packages[*index].prelude,
+        };
+        if let Some(path) = prelude.module_path() {
+            analyzer
+                .prelude_seeds
+                .push((*module_scope_id, path.to_string(), *source_id));
+        }
+    }
     for (_name, ast, _text, module_scope_id, source_id, _origin) in &loaded {
         analyzer.set_current_source(*source_id);
         analyzer.module_scope_ids.insert(*module_scope_id);
@@ -38041,6 +38412,10 @@ fn analyze_inner<'src>(
             .scopes
             .get(io_scope_id)
             .and_then(|scope| scope.name_to_id_map.get("panic").copied());
+        analyzer.print_fn_id = analyzer
+            .scopes
+            .get(io_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("print").copied());
     }
     // Remember `std::asset`'s const-only compile-time channel — lines out (in
     // both spellings), text in, whole files out (in both spellings), a
@@ -38417,6 +38792,19 @@ fn analyze_over_world<'src>(
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);
+        // The entry file's ambient set. The entry walks in the GLOBAL scope, so
+        // its prelude is seeded here rather than in the load loop — and seeded
+        // *after* the pre-entry `resolve_world`, which is what keeps it out of
+        // the modules' reach: they resolved already, and global is their
+        // parent. (An entry that IS a module took its seed in the loop, which
+        // is why this sits under the same guard as the walk.)
+        if let Some(path) = workspace.entry_prelude.module_path() {
+            analyzer.prelude_entry_scope = Some(global_scope_id);
+            analyzer
+                .prelude_seeds
+                .push((global_scope_id, path.to_string(), SourceId(0)));
+            analyzer.seed_preludes();
+        }
         let entry_walk_start = analyzer.entity_id;
         analyzer.walk_expr_nodes(&nodes.0, global_scope_id);
         analyzer.source_ranges.push(SourceRange {
@@ -39160,6 +39548,7 @@ fn analyze_over_world<'src>(
         list_new_fn_id,
         list_push_fn_id,
         panic_fn_id: analyzer.panic_fn_id,
+        print_fn_id: analyzer.print_fn_id,
         drop_fn_id: analyzer.drop_fn_id,
         asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),
@@ -39202,6 +39591,7 @@ fn analyze_over_world<'src>(
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         type_references,
+        prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
         declaration_labels,
         expr_type_ids,

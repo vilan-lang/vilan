@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 import std::range::Range;
 
 // Inferred `const` (proposal/const-eval.md §9): every binding below is an

@@ -188,7 +188,6 @@ one, and the `Server` handed to `on_start` carries the port it actually
 bound, so `port()` and `url()` are right in either case:
 
 ```vilan,norun
-import std::print;
 import std::http::{ Response, Server };
 
 fun main() {
@@ -598,7 +597,6 @@ something absent reports `Created` when it appears. You consume a watch by
 
 ```vilan,norun
 import std::fs::{ Change, ChangeKind, Watcher };
-import std::print;
 
 fun describe(change: Change): str {
 	match change.kind {

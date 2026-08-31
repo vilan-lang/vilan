@@ -134,7 +134,7 @@ fn a_revalidating_client_gets_304_and_every_other_form_gets_the_bytes() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        r#"import std::io::print;
 import std::bytes::encode_utf8;
 import std::http::{ Server, etag_of, etag_response };
 

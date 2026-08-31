@@ -144,7 +144,6 @@ paired with `Bytes::to_hex` for the hex those are written as:
 ```vilan
 import std::crypto::sha256;
 import std::bytes::encode_utf8;
-import std::print;
 
 async fun main() {
 	let hex = sha256(encode_utf8("body { color: red }")).to_hex();

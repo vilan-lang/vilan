@@ -53,7 +53,7 @@ fn a_satisfied_fence_compiles_on_every_build_target() {
 fn a_neutral_fence_spanning_families_holds_for_base_code() {
     assert_compiles(
         r#"
-        import std::print;
+        import std::io::print;
 
         [platform("@process", "browser")]
         fun shared_label(): str {
@@ -701,7 +701,7 @@ fn a_base_only_function_is_colorless() {
     assert_eq!(
         requirement_line_of(
             r#"
-        import std::print;
+        import std::io::print;
 
         fun greet() {
             print("hi");
@@ -887,7 +887,7 @@ fn an_unreferenced_colored_global_is_elided_not_rejected() {
 fn a_neutral_global_is_colorless_everywhere() {
     assert_compiles_browser(
         r#"
-        import std::print;
+        import std::io::print;
 
         let greeting = "hello";
 
@@ -905,7 +905,7 @@ fn a_const_bindings_initializer_is_compile_time_data() {
     // seeds nothing and carries no requirement line.
     assert_compiles_browser(
         r#"
-        import std::print;
+        import std::io::print;
 
         let width = const 2 + 2;
 
@@ -917,7 +917,7 @@ fn a_const_bindings_initializer_is_compile_time_data() {
     assert_eq!(
         requirement_line_of(
             r#"
-        import std::print;
+        import std::io::print;
 
         let width = const 2 + 2;
 
@@ -965,7 +965,7 @@ fn an_index_expressions_subject_reference_colors() {
     // that side).
     assert_fails_browser_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::fs::read_file_to_str;
 
         let cache = [read_file_to_str("cache.txt")];
@@ -1052,7 +1052,7 @@ fn a_dropped_bindings_initializer_leaves_no_residue_in_the_bundle() {
     // the fs module's last synchronous entry was deleted (kolt.local 031 Q3).
     let node = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::process::env;
 
         let cache = env("cache.txt");
@@ -1153,7 +1153,7 @@ fn a_closure_grounded_generic_dispatches_through_its_bound() {
     // empty abstract method (undefined ~ falsy) cannot pass.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
 
         struct Wrap<V> {
@@ -1198,7 +1198,7 @@ fn a_closure_grounded_generic_still_fails_an_unmet_bound() {
     // bound check must reject it — deferral must not soften the gate.
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
 
         struct Wrap<V> {
@@ -1239,7 +1239,7 @@ fn chained_maps_ground_each_link() {
     // deferred call result, so the retries must converge inside-out.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
 
         struct Wrap<V> {
@@ -1281,7 +1281,7 @@ fn a_closure_grounded_generic_meets_a_method_bound() {
     // rather than a free function.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
 
         struct Wrap<V> {
@@ -1333,7 +1333,7 @@ fn a_named_function_passes_as_a_method_closure_argument() {
     // declared return.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Wrap<V> {
             value: V,
@@ -1363,7 +1363,7 @@ fn a_named_function_passes_as_a_method_closure_argument() {
 fn a_named_function_passes_as_a_free_closure_argument() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun apply(seed: i32, transform: |i32| i32): i32 {
             transform(seed)
@@ -1388,7 +1388,7 @@ fn a_named_function_binds_to_an_annotated_let_and_field() {
     // closure-typed struct field (the Kolt server-hook shape).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Holder {
             hook: |str| i32,
@@ -1415,7 +1415,7 @@ fn a_named_function_binds_to_an_annotated_let_and_field() {
 fn a_named_function_returns_as_a_closure() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun double(n: i32): i32 {
             n * 2
@@ -1441,7 +1441,7 @@ fn a_void_function_without_annotation_coerces() {
     // handler shape; the return type comes from the body's inferred type.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun run_twice(action: || void) {
             action();
@@ -1467,7 +1467,7 @@ fn a_stored_function_value_survives_shared_storage() {
     // indirectly (the pilot's hook pattern, without the eta-expansion).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
 
         fun measure(text: str): i32 {
@@ -1617,7 +1617,7 @@ fn a_fn_typed_binding_calls() {
     // The filed shape, end to end.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun helper(i: i32): i32 {
             i + 1
@@ -1639,7 +1639,7 @@ fn a_nested_fn_typed_binding_calls() {
     // was found) is the same value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             fun helper(i: i32): i32 {
@@ -1661,7 +1661,7 @@ fn a_fn_typed_binding_calls_at_every_arity() {
     // void-returning one has no declared return to read.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun nothing(): i32 {
             7
@@ -1695,7 +1695,7 @@ fn a_rebound_fn_typed_binding_still_calls() {
     // `Type::Function(id)`, so the last one resolves the same declaration.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun helper(i: i32): i32 {
             i + 10
@@ -1720,7 +1720,7 @@ fn a_fn_typed_binding_composes_with_the_b20_coercion() {
     // coercion converts it). One value, both uses, in one program.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun double(i: i32): i32 {
             i * 2
@@ -1749,7 +1749,7 @@ fn a_closure_typed_parameter_rebinds_and_calls() {
     // disturb it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun double(i: i32): i32 {
             i * 2
@@ -2169,7 +2169,7 @@ fn the_clock_is_not_const_evaluable() {
     // the program.
     let source = r#"
         import std::time::now;
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let moment = const now();
@@ -2298,7 +2298,7 @@ fn timer_after_starts_the_host_timer_at_construction() {
     // lazily at `wait` it would need 60ms and lose to the 30ms sleeper.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::task::nursery;
         import std::time::{ sleep, Timer };
@@ -2333,7 +2333,7 @@ fn timer_after_for_mirrors_sleep_for() {
     // `sleep_for`): armed at construction, fires, verdict `true`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep, Duration, Timer };
 
         fun main() {
@@ -2353,7 +2353,7 @@ fn timer_wait_gives_concurrent_waiters_one_verdict() {
     // verdict when it fires.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
         import std::task::nursery;
         import std::time::Timer;
@@ -2385,7 +2385,7 @@ fn timer_wait_after_settlement_returns_the_memoized_verdict() {
     // timer answers immediately, as often as you ask, on both verdicts.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep, Timer };
 
         fun main() {
@@ -2409,7 +2409,7 @@ fn timer_cancel_before_settlement_resolves_waiters_false() {
     // does everyone who asks afterwards.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::nursery;
         import std::time::{ sleep, Timer };
 
@@ -2440,7 +2440,7 @@ fn timer_cancel_clears_the_host_timer() {
     // race.
     let js = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::Timer;
 
         fun main() {
@@ -2464,7 +2464,7 @@ fn timer_cancel_after_firing_is_a_no_op() {
     // `true` verdict into a `false` one.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep, Timer };
 
         fun main() {
@@ -2485,7 +2485,7 @@ fn timer_cancel_is_idempotent() {
     // timer settled and does nothing.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::Timer;
 
         fun main() {
@@ -2511,7 +2511,7 @@ fn a_cancelling_nursery_tears_down_the_waiter_but_not_the_timer() {
     // still cancellable to `false` by the holder of the value.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::task::nursery;
         import std::time::{ sleep, Timer };
 
@@ -2545,7 +2545,7 @@ fn a_timer_that_fires_with_no_waiters_memoizes_true() {
     // is waiting when someone finally asks.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep, Timer };
 
         fun main() {
@@ -2567,7 +2567,7 @@ fn a_pending_timer_keeps_the_process_alive() {
     // prints only because the host timer does.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::Timer;
 
         fun main() {
@@ -2590,7 +2590,7 @@ fn copying_a_timer_shares_the_underlying_host_timer() {
     // a cancel through any copy settles every copy.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::Timer;
 
         fun call_off(timer: Timer) {
@@ -2651,7 +2651,7 @@ fn a_bounded_caller_constructs_an_unbounded_struct_via_a_generic_static_new() {
     // struct binder.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
 
         struct Cell<T> {
@@ -2690,7 +2690,7 @@ fn two_bounded_generics_construct_two_unbounded_fields() {
     // its own binding — before the fix BOTH `A` and `B` were rejected.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
 
         struct Cell<T> {
@@ -2732,7 +2732,7 @@ fn a_nested_generic_argument_still_binds_through_the_expectation() {
     // (`Cell::new([initial])` binds the callee's `T` to `List<T_caller>`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialEq;
 
         struct Cell<T> {
@@ -2772,7 +2772,7 @@ fn return_type_only_inference_still_binds_a_static_generic() {
     // callee's own return-type generic must still be inferred.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Cell<T> {
             value: List<T>,
@@ -2808,7 +2808,7 @@ fn draft_push_is_local_first_and_settles_synced() {
     // is still on the wire; the settle lands afterwards.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -2841,7 +2841,7 @@ fn draft_adopt_echo_is_a_no_op() {
     // nothing — state stays Synced, `local` untouched.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::time::{ sleep_for, Duration };
@@ -2867,7 +2867,7 @@ fn draft_adopt_echo_is_a_no_op() {
 fn draft_adopt_takes_remote_when_local_is_clean() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
 
@@ -2893,7 +2893,7 @@ fn draft_failure_keeps_the_local_value() {
     // commit, and the state carries the reason.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::time::{ sleep_for, Duration };
@@ -2922,7 +2922,7 @@ fn draft_dirty_local_survives_adoption() {
     // eventual push knowingly overwrites.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::time::{ sleep_for, Duration };
@@ -2951,7 +2951,7 @@ fn draft_generation_guard_discards_superseded_pushes() {
     // discarded.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::time::{ sleep_for, Duration };
@@ -2990,7 +2990,7 @@ fn draft_push_publishes_one_coherent_wave() {
     // is unobservable either way.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState, combine };
         import std::option::Option::{ self, Some, None };
         import std::time::{ sleep_for, Duration };
@@ -3030,7 +3030,7 @@ fn draft_adoption_publishes_one_coherent_wave() {
     // branch writes `local` and `state`, and must publish them together.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState, combine };
         import std::option::Option::{ self, Some, None };
 
@@ -3075,7 +3075,7 @@ fn draft_repush_resends_edits_the_remote_never_accepted() {
     // then settles the draft, so a second reconnect sends nothing.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3120,7 +3120,7 @@ fn draft_repush_on_a_clean_draft_sends_nothing() {
     // of untouched drafts costs zero frames on reconnect.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3163,7 +3163,7 @@ fn draft_repush_is_at_least_once() {
     // an appending commit closure would not.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3204,7 +3204,7 @@ fn draft_repush_rides_the_reconnect_hook_shape() {
     // channel) so a hook that awaits does. One reconnect, one re-push.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3254,7 +3254,7 @@ fn draft_debounce_coalesces_a_burst_into_one_commit() {
     // LAST value. Without the window they produce three.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3289,7 +3289,7 @@ fn draft_debounce_keeps_the_local_half_synchronous() {
     // Dirty state are set before `push` returns, exactly as undebounced.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3326,7 +3326,7 @@ fn draft_commit_cancels_a_pending_debounce() {
     // commit rather than passing unobserved.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3361,7 +3361,7 @@ fn draft_repush_cancels_a_pending_debounce() {
     // shows up as the window's second commit.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ draft, Draft, DraftState };
         import std::option::Option::{ self, Some, None };
         import std::shared::Shared;
@@ -3421,7 +3421,7 @@ fn an_effect_closures_unannotated_parameter_grounds_from_the_signal() {
     // of binding pattern captures against the enum's raw declaration.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, run_with_owner };
         import std::option::Option::{ self, Some, None };
 
@@ -3453,7 +3453,7 @@ fn an_annotated_effect_parameter_destructures_the_signals_payload() {
     // annotating the parameter grounds everything downstream.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::reactive::{ Signal, Owner, run_with_owner };
         import std::option::Option::{ self, Some, None };
 
@@ -3682,7 +3682,7 @@ fn e82_a_derive_refusal_anchors_at_the_attribute_not_the_generated_text() {
     // (standard A2, `a_diagnostic_in_generated_code_anchors_at_the_attribute`).
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
 
         [derive(PartialEq)]
         struct Widget { item: Opaque }
@@ -3892,7 +3892,7 @@ fn a_derived_impl_stays_module_visible_and_explicit_imports_coexist() {
     // explicit import of the same name a derive uses internally is fine.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::json::JsonValue;
         [derive(PartialEq, Json)]
         struct Point { x: i32 }
@@ -3938,7 +3938,7 @@ fn a_conflicting_later_call_names_the_first_call_inference() {
 fn consistent_later_calls_stay_clean() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let show = |x| print(x);
             show(1);
@@ -4003,7 +4003,7 @@ fn an_annotated_map_checks_its_inserts() {
     );
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         fun main() {
             mut table: Map<str, i32> = Map::new();
@@ -4021,7 +4021,7 @@ fn a_generic_functions_own_bindings_stay_legal() {
     // enclosing generic function's own parameter) is not a leak.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun pick<T>(a: T): T {
             let x = a;
             x
@@ -4111,7 +4111,7 @@ fn bool_conditions_of_every_shape_still_compile_and_run() {
     // test, `&&`-composition, a bool-returning call — in `if` and `for`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
         fun ready(n: i32): bool { n > 1 }
         fun main() {
@@ -4135,7 +4135,7 @@ fn an_any_condition_stays_lenient() {
     // type `any` keeps that leniency — documented, pinned.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun main() {
             let flags: List<any> = [true];
             if flags[0] {
@@ -4247,7 +4247,7 @@ fn ordering_dispatches_through_a_partial_ord_impl() {
     // re-dispatched to the concrete receiver like any inherited method.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ now, Duration };
 
         fun main() {
@@ -4268,7 +4268,7 @@ fn all_four_orderings_dispatch_on_a_user_type() {
     // `partial_compare` — both truth values exercised.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::{ PartialEq, PartialOrd, Ordering };
         import std::option::Option::{ self, Some };
 
@@ -4305,7 +4305,7 @@ fn a_declared_lt_override_wins_over_the_default() {
     // path) — reversed ordering proves the OVERRIDE ran, not the default.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::{ PartialEq, PartialOrd, Ordering };
         import std::option::Option::{ self, Some };
 
@@ -4342,7 +4342,7 @@ fn a_partial_ord_bound_dispatches_orderings_generically() {
     // monomorphization; exercised with std's `Duration` impl.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::PartialOrd;
         import std::time::Duration;
 
@@ -4384,7 +4384,7 @@ fn ordering_a_struct_is_rejected_not_js_compared() {
 fn same_type_native_comparisons_still_compile_and_run() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let a: u32 = 5;
@@ -4410,7 +4410,7 @@ fn same_type_native_comparisons_still_compile_and_run() {
 fn an_async_call_in_a_module_initializer_is_rejected() {
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep_for, Duration };
 
         async fun ready(tag: str): i32 {
@@ -4482,7 +4482,7 @@ fn creating_an_async_closure_in_an_initializer_stays_legal() {
 
 /// `ready` + a module-level spawn, the shared preamble for the rows below.
 const AWAIT_SHAPED_PREAMBLE: &str = r#"
-        import std::print;
+        import std::io::print;
         import std::task::Task;
         import std::time::{ sleep_for, Duration };
 
@@ -4618,7 +4618,7 @@ fn awaiting_a_non_task_in_an_initializer_is_rejected() {
     // — and the steer stays true (it never claims the operand is a spawn).
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
 
         let plain: i32 = 7;
         let value: i32 = await plain;
@@ -4690,7 +4690,7 @@ fn an_explicit_await_on_an_async_call_keeps_the_call_message() {
     // `warm` takes an argument so the call site's snippet (`warm(1)`) is
     // distinct from its declaration — the span must land on the call.
     let source = r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep_for, Duration };
 
         fun warm(seed: i32): i32 {
@@ -4733,7 +4733,7 @@ fn an_explicit_await_on_an_async_call_keeps_the_call_message() {
 fn a_rejecting_async_main_exits_nonzero_with_the_error_surfaced() {
     let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        import std::{ print, panic };
+        import std::{ io::print, io::panic };
         import std::time::{ sleep_for, Duration };
 
         async fun main() {
@@ -4769,7 +4769,7 @@ fn a_rejecting_async_main_exits_nonzero_with_the_error_surfaced() {
 fn a_resolving_async_main_exits_zero() {
     let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep_for, Duration };
 
         async fun main() {
@@ -4787,7 +4787,7 @@ fn a_panicking_sync_main_is_unchanged() {
     // The contract async `main` was brought level WITH; it must not move.
     let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        import std::{ print, panic };
+        import std::{ io::print, io::panic };
 
         fun main() {
             print("before");
@@ -4809,7 +4809,7 @@ fn an_async_main_that_keeps_working_is_not_cut_short() {
     // IIFE (or exited on settle), this would truncate.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep_for, Duration };
 
         async fun main() {
@@ -4831,7 +4831,7 @@ fn the_browser_leg_gets_no_exit_handler() {
     // `process` does not exist to reference.
     let emitted = compile_browser(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::{ sleep_for, Duration };
 
         async fun main() {
@@ -4913,7 +4913,7 @@ fn the_old_u64_suffix_errors_with_a_rename_hint() {
 fn i53_suffixed_literals_compile_and_run() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let wide = 9007199254740992i53;
@@ -4965,7 +4965,7 @@ fn an_imported_module_alias_qualifies_statics() {
     // The supported spelling: import the module, qualify through its name.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::math;
 
         fun main() {
@@ -4988,7 +4988,7 @@ fn a_method_call_result_is_directly_callable() {
     // The service-hook shape that carried the bind-first workaround.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
 
         struct Holder {
@@ -5008,7 +5008,7 @@ fn a_method_call_result_is_directly_callable() {
 fn an_index_result_is_directly_callable() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let handlers: List<|i32| i32> = [|n: i32| n * 2, |n: i32| n + 1];
@@ -5025,7 +5025,7 @@ fn a_direct_call_chains_into_further_postfixes() {
     // The direct call's result re-enters the chain (here: indexed).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::shared::Shared;
 
         struct Factory {
@@ -5048,7 +5048,7 @@ fn tuple_member_access_grounds() {
     // the multi-element form; `.0` is the point access.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let pair: (i32, i32) = (41, 1);
@@ -5063,7 +5063,7 @@ fn tuple_member_access_grounds() {
 fn tuple_member_access_infers_without_an_annotation() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let pair = (40, 2);
@@ -5079,7 +5079,7 @@ fn tuple_elements_carry_their_own_types() {
     // `.1` on `(i32, str)` is a str — methods dispatch on the element type.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let entry = (7, "vilan");
@@ -5094,7 +5094,7 @@ fn tuple_elements_carry_their_own_types() {
 fn nested_tuple_access_chains() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let nested = ((1, 2), 3);
@@ -5111,7 +5111,7 @@ fn a_tuple_typed_element_reads_as_a_value() {
     // result behaves as a full tuple value (destructure, re-access).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let nested = ((1, 2), 3);
@@ -5128,7 +5128,7 @@ fn a_tuple_typed_element_reads_as_a_value() {
 fn a_tuple_typed_element_assignment_writes_its_region() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             mut nested = ((1, 2), 3);
@@ -5146,7 +5146,7 @@ fn a_nested_tuple_write_hits_the_storage_not_a_copy() {
     // write through a nested path mutates the tuple — never a resliced copy.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             mut deep = ((1, 2), 3);
@@ -5190,7 +5190,7 @@ fn a_named_member_on_a_tuple_is_rejected() {
 fn a_tuple_element_assigns_through_a_mut_binding() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             mut pair: (i32, i32) = (41, 1);
@@ -5227,7 +5227,7 @@ fn a_tuple_element_assignment_needs_a_mut_binding() {
 fn a_ret_leg_no_longer_poisons_the_match_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         fun first_or_bail(items: List<i32>): i32 {
@@ -5254,7 +5254,7 @@ fn a_panic_leg_no_longer_absorbs_the_match_type() {
     // The binding is UNANNOTATED — the value leg's type wins.
     assert_compiles_and_runs(
         r#"
-        import std::{ print, panic };
+        import std::{ io::print, io::panic };
         import std::option::Option::{ self, Some, None };
 
         fun unwrap_or_panic(slot: Option<str>): str {
@@ -5277,7 +5277,7 @@ fn a_panic_leg_no_longer_absorbs_the_match_type() {
 fn a_panicking_if_branch_yields_to_the_other() {
     assert_compiles_and_runs(
         r#"
-        import std::{ print, panic };
+        import std::{ io::print, io::panic };
 
         fun main() {
             let flag = true;
@@ -5293,7 +5293,7 @@ fn a_panicking_if_branch_yields_to_the_other() {
 fn a_jump_leg_diverges_inside_a_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             mut total = 0;
@@ -5316,7 +5316,7 @@ fn all_diverging_legs_still_satisfy_an_annotation() {
     // Never fits any expected type; nothing runs past the match.
     assert_compiles(
         r#"
-        import std::panic;
+        import std::io::panic;
 
         fun choose(flag: bool): i32 {
             let value: i32 = match flag {
@@ -5337,7 +5337,7 @@ fn all_diverging_legs_still_satisfy_an_annotation() {
 fn a_direct_call_types_several_unannotated_parameters() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let add = |a, b| a + b;
@@ -5353,7 +5353,7 @@ fn a_direct_call_respects_annotated_parameters() {
     // Mixed: the annotation stays authoritative; only the Unknown fills.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             let scale = |a: i32, b| a * b;

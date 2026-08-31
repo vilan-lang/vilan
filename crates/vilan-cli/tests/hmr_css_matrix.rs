@@ -63,8 +63,8 @@ fn wait_for_file(path: &Path, deadline: Duration) -> bool {
 const LINKED_CELLS: usize = 27;
 const LINKLESS_CELLS: usize = 19;
 
-const CLIENT: &str = "import std::print;\n\nfun main() {\n\tprint(\"client up\");\n}\n";
-const SERVER: &str = "import std::print;\n\nfun main() {\n\tprint(\"server up\");\n}\n";
+const CLIENT: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"client up\");\n}\n";
+const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"server up\");\n}\n";
 
 /// The DOM/host stub every column shares. `nextSibling` is real (the shim
 /// inserts a shadow `<style>` immediately after the `<link>` it supersedes, to

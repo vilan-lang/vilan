@@ -1,4 +1,4 @@
-import std::print;
+import std::io::print;
 
 // A trait generic parameter with a default (`B = Self`). In `mix`'s default
 // body the parameter `b: B` is treated as a `Self` value, so both

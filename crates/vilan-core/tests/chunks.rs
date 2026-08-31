@@ -242,7 +242,7 @@ fun main() {
 #[test]
 fn a_node_program_plans_nothing() {
     let plan = plan_for(
-        "import std::print;\nfun main() { print(1); }\n",
+        "import std::io::print;\nfun main() { print(1); }\n",
         Platform::default(),
     );
     assert_eq!(plan.sites, 0);

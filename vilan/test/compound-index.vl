@@ -5,7 +5,7 @@
 //
 // The byte diff between the two halves below IS the rule: an effectful
 // subscript gets a temp, a pure one is left exactly as it was.
-import std::print;
+import std::io::print;
 
 struct Cell { n: i32 }
 

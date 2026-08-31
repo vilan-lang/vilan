@@ -71,7 +71,7 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// changes the bundle (a swap round).
 fn client_source(code_marker: &str, css_marker: &str) -> String {
     format!(
-        "import std::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{css_marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{code_marker}\");\n}}\n"
+        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"css\", \".{css_marker}{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"{code_marker}\");\n}}\n"
     )
 }
 
@@ -412,7 +412,7 @@ fn the_dev_channel_drives_the_watch_round() {
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
     );
 
     // `--hmr-port 0` asks for an ephemeral port; the CLI announces the bound one.
@@ -555,7 +555,7 @@ fn the_dev_channel_drives_the_watch_round() {
 /// excluded from adopt), but `value: i32` is `TransferForm::Value`, so it IS
 /// wrapped in the `__hmr_adopt` thunk — which is built `is_async: false`.
 fn awaiting_initializer_source() -> String {
-    "import std::print;\nimport std::task::Task;\nimport std::time::sleep;\n\n     fun ready(): i32 {\n\tsleep(0);\n\t7\n}\n\n     let pending: Task<i32> = async ready();\nlet value: i32 = await pending;\n\n     fun main() {\n\tprint(value);\n}\n"
+    "import std::io::print;\nimport std::task::Task;\nimport std::time::sleep;\n\n     fun ready(): i32 {\n\tsleep(0);\n\t7\n}\n\n     let pending: Task<i32> = async ready();\nlet value: i32 = await pending;\n\n     fun main() {\n\tprint(value);\n}\n"
         .to_string()
 }
 
@@ -584,7 +584,7 @@ fn an_awaiting_initializer_cannot_reach_the_hmr_adopt_thunk() {
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
     );
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
@@ -660,7 +660,7 @@ fn common_source(banner: &str) -> String {
 /// leaves it untouched — the "no css either" half of the quiet assertion).
 fn shared_client_source(css_marker: &str) -> String {
     format!(
-        "import std::print;\nimport std::asset::emit;\nimport pkg::common::banner;\n\n\
+        "import std::io::print;\nimport std::asset::emit;\nimport pkg::common::banner;\n\n\
          fun styles(): i32 {{\n\temit(\"css\", \".{css_marker}{{color:red}}\");\n\t1\n}}\n\n\
          let _s = const styles();\n\nfun main() {{\n\tprint(banner());\n}}\n"
     )
@@ -671,7 +671,7 @@ fn shared_client_source(css_marker: &str) -> String {
 /// the marker; a shared edit bumps the banner.
 fn shared_server_source(server_marker: &str) -> String {
     format!(
-        "import std::print;\nimport pkg::common::banner;\n\n\
+        "import std::io::print;\nimport pkg::common::banner;\n\n\
          fun main() {{\n\tprint(\"server-up {server_marker} banner=\" + banner());\n}}\n"
     )
 }
@@ -780,7 +780,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"server-booted\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server-booted\");\n}\n",
     );
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
@@ -942,7 +942,7 @@ fn a_broken_build_still_renders_the_terminal_diagnostic() {
 /// A node leg whose `main` prints a distinguishing marker — so the watcher's
 /// captured stdout witnesses which Node leg actually ran.
 fn node_marker(marker: &str) -> String {
-    format!("import std::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\n")
+    format!("import std::io::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\n")
 }
 
 /// Accumulates the watcher's stdout into a shared buffer (rather than a consuming
@@ -1117,7 +1117,7 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"server-booted\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server-booted\");\n}\n",
     );
 
     // One-shot build (a fresh process, cold cache) → capture the server bundle.
@@ -1323,7 +1323,7 @@ fn the_overlay_traces_a_cross_module_requirement_chain_in_each_hops_file() {
 /// fall into — proving the fix needs a server that behaves exactly like the
 /// real-world idiom it's fixing, not a stand-in.
 fn boot_time_css_server_source() -> String {
-    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::print;\nimport std::process;\n\n\
+    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::io::print;\nimport std::process;\n\n\
      fun main() {\n\
      \tlet client_css = fs::read_file_to_str(\"dist/client.css\");\n\
      \tServer::builder()\n\
@@ -1639,7 +1639,7 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
 /// first-ever stylesheet of the session.
 fn presence_client_source(asset_kind: &str) -> String {
     format!(
-        "import std::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"{asset_kind}\", \".added{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"a\");\n}}\n"
+        "import std::io::print;\nimport std::asset::emit;\n\nfun styles(): i32 {{\n\temit(\"{asset_kind}\", \".added{{color:red}}\");\n\t1\n}}\n\nlet _s = const styles();\n\nfun main() {{\n\tprint(\"a\");\n}}\n"
     )
 }
 
@@ -1658,7 +1658,7 @@ fn presence_client_source(asset_kind: &str) -> String {
 /// rather than stubbed: the document genuinely lacks the `<link>`, because the
 /// process that rendered it predates the stylesheet.
 fn boot_rendered_page_server_source() -> String {
-    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::print;\nimport std::process;\n\n\
+    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::io::print;\nimport std::process;\n\n\
      fun main() {\n\
      \tlet sidecar = if fs::stat(\"dist/client.css\").is_some() { \"<link rel=\\\"stylesheet\\\" href=\\\"/client.css\\\">\" } else { \"\" };\n\
      \tlet page = i\"<!doctype html><head><link rel=\\\"stylesheet\\\" href=\\\"/theme.css\\\">{sidecar}</head><body><script src=\\\"/client.js\\\"></script></body>\";\n\
@@ -2015,7 +2015,7 @@ fn a_removed_stylesheet_leaves_no_sidecar_and_declares_none() {
     write(
         &dir,
         "src/server.vl",
-        "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
     );
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
@@ -2090,7 +2090,7 @@ fn a_removed_stylesheet_leaves_no_sidecar_and_declares_none() {
 /// point is to answer a trigger request after round 1 — so it needs its own
 /// death, exactly the css e2e's mimic-server shape).
 fn force_refresh_server_source() -> String {
-    "import std::watch;\nimport std::http::{ Response, Server };\nimport std::print;\nimport std::process;\n\n\
+    "import std::watch;\nimport std::http::{ Response, Server };\nimport std::io::print;\nimport std::process;\n\n\
      fun main() {\n\
      \tServer::builder()\n\
      \t\t.port(0)\n\
@@ -2254,7 +2254,7 @@ fn force_refresh_is_a_no_op_outside_a_watch_session() {
     write(
         &dir,
         "src/main.vl",
-        "import std::watch;\nimport std::print;\n\nfun main() {\n\twatch::force_refresh();\n\tprint(\"done\");\n}\n",
+        "import std::watch;\nimport std::io::print;\n\nfun main() {\n\twatch::force_refresh();\n\tprint(\"done\");\n}\n",
     );
 
     let liveness = support::run_liveness();

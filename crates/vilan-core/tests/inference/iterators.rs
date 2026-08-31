@@ -22,7 +22,7 @@ fn i5_a_stateful_iterator_conforms_to_the_repaired_trait() {
     // "`Counting`'s `next` receives `&mut self`, but `Iterator` declares `self`".
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
         import std::option::Option::{ self, Some, None };
 
@@ -82,7 +82,7 @@ fn i5_range_implements_the_iterator_trait() {
     // that a bound `I: Iterator<i32>` accepts a `Range`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
         import std::option::Option::{ self };
         import std::range::Range;
@@ -113,7 +113,7 @@ fn i5_iterator_from_fn_follows_the_repaired_receiver() {
     // now be `mut` — which is the honest reading: pulling advances it.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
         import std::option::Option::{ self, Some, None };
 
@@ -143,7 +143,7 @@ fn i5_iterator_from_fn_follows_the_repaired_receiver() {
 fn list_iter_walks_the_elements_in_order() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             mut cursor = [1, 2, 3].iter();
@@ -160,7 +160,7 @@ fn list_iter_walks_the_elements_in_order() {
 fn list_iter_over_an_empty_list_is_immediately_exhausted() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self };
 
         fun main() {
@@ -184,7 +184,7 @@ fn list_iter_stays_exhausted_past_the_last_element() {
     // running off the array (the index guard, not a panic from `[]`).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self };
 
         fun main() {
@@ -206,7 +206,7 @@ fn list_iter_holds_a_snapshot_so_a_later_push_is_not_walked() {
     // keeps rule 4 out of it, since the cursor shares no storage with `live`.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             mut live = [1, 2];
@@ -230,7 +230,7 @@ fn list_iter_satisfies_an_iterator_bound() {
     // asked for by BOUND rather than by method name.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
 
         fun count_of<I: Iterator<i32>>(mut source: I): i32 {
@@ -294,7 +294,7 @@ fn list_iter_satisfies_an_iterator_bound() {
 #[test]
 fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         impl List<type T> {
             fun second_len(self): i32 {
@@ -331,7 +331,7 @@ fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
 #[test]
 fn a_generic_residual_is_legal_in_every_file_that_declares_its_parameter() {
     let source = r#"
-        import std::print;
+        import std::io::print;
 
         impl List<type T> {
             fun doubled(self): List<T> {
@@ -403,7 +403,7 @@ fn a_leaked_generic_still_reports_on_the_cold_path() {
 fn adapter_program(body: &str) -> String {
     format!(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
         import std::option::Option::{{ self, Some, None }};
         import std::range::Range;
@@ -893,7 +893,7 @@ fn an_adapter_chain_leaves_its_source_list_alone() {
 fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         fun main() {
@@ -917,7 +917,7 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
 fn a_protocol_loop_over_a_user_iterator_keeps_its_tuple_element() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Cursor<T> {
@@ -960,7 +960,7 @@ fn a_protocol_loop_over_a_user_iterator_keeps_its_tuple_element() {
 fn a_protocol_loop_keeps_every_element_form_through_a_generic() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Point { x: i32, y: i32 }
@@ -993,7 +993,7 @@ fn a_protocol_loop_keeps_every_element_form_through_a_generic() {
 fn a_protocol_loop_element_matches_its_enum_variants() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Shade { Light, Dark(i32) }
 
@@ -1015,7 +1015,7 @@ fn a_protocol_loop_element_matches_its_enum_variants() {
 fn a_protocol_loop_keeps_an_enum_subjects_element_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         enum Feed<T> { Ready(List<T>, i32), Done }
@@ -1057,7 +1057,7 @@ fn a_protocol_loop_keeps_an_enum_subjects_element_type() {
 fn a_mut_view_loop_keeps_its_element_type_through_a_generic() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Bag<T> { items: List<T>, cursor: i32 }
@@ -1092,7 +1092,7 @@ fn a_mut_view_loop_keeps_its_element_type_through_a_generic() {
 fn a_protocol_loop_keeps_a_tuple_element_through_an_adapter_chain() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             for pair in [(1, "a"), (2, "b"), (3, "c")].iter().filter(|p| p.0 > 1) {
@@ -1114,7 +1114,7 @@ fn a_protocol_loop_keeps_a_tuple_element_through_an_adapter_chain() {
 fn a_structurally_named_tuple_element_still_projects() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             for pair in ["a", "b"].iter().enumerate() {
@@ -1160,7 +1160,7 @@ fn a_structurally_named_tuple_element_still_projects() {
 fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Cursor { items: List<i32>, index: i32 }
 
@@ -1184,7 +1184,7 @@ fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
 fn a_for_loop_over_an_enum_without_next_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Color { Red, Green, Blue }
 
@@ -1199,7 +1199,7 @@ fn a_for_loop_over_an_enum_without_next_is_diagnosed() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Shape { Circle(i32), Square(i32) }
 
@@ -1221,7 +1221,7 @@ fn a_for_loop_over_an_enum_without_next_is_diagnosed() {
 fn a_field_named_next_does_not_satisfy_the_for_protocol() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Link { next: i32, value: i32 }
 
@@ -1246,7 +1246,7 @@ fn a_field_named_next_does_not_satisfy_the_for_protocol() {
 fn a_for_loop_over_a_field_less_struct_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Marker {}
 
@@ -1269,7 +1269,7 @@ fn a_for_loop_over_a_field_less_struct_is_diagnosed() {
 fn a_next_that_does_not_return_option_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Odd { count: i32 }
 
@@ -1299,7 +1299,7 @@ fn a_next_that_does_not_return_option_is_diagnosed() {
 fn a_mut_for_loop_over_a_subject_without_next_mut_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Cursor { items: List<i32>, index: i32 }
 
@@ -1314,7 +1314,7 @@ fn a_mut_for_loop_over_a_subject_without_next_mut_is_diagnosed() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         struct Down { left: i32 }
@@ -1344,7 +1344,7 @@ fn a_mut_for_loop_over_a_subject_without_next_mut_is_diagnosed() {
 fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
 
         fun main() {
@@ -1369,7 +1369,7 @@ fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
 fn the_deliberate_native_iteration_forms_still_iterate() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
         import std::bytes::{ Bytes, encode_utf8 };
 
@@ -1400,7 +1400,7 @@ fn the_deliberate_native_iteration_forms_still_iterate() {
 fn a_subject_that_declares_next_still_drives_the_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::range::Range;
         import std::iterator::Iterator;
         import std::option::{Option, Some, None};
@@ -1455,7 +1455,7 @@ fn a_subject_that_declares_next_still_drives_the_loop() {
 fn a_next_inherited_from_a_trait_default_drives_the_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Fixed<T> { fun next(&mut self): Option<T> { None } }
@@ -1482,7 +1482,7 @@ fn a_next_inherited_from_a_trait_default_drives_the_loop() {
 fn an_inherited_default_that_yields_drives_the_loop_to_its_end() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Countdown<T> {
@@ -1516,7 +1516,7 @@ fn an_inherited_default_that_yields_drives_the_loop_to_its_end() {
 fn an_inherited_default_on_a_generic_subject_keeps_its_element_type() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Feed<T> {
@@ -1554,7 +1554,7 @@ fn an_inherited_default_on_a_generic_subject_keeps_its_element_type() {
 fn a_next_mut_inherited_from_a_trait_default_drives_a_mut_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Walk<T> {
@@ -1595,7 +1595,7 @@ fn a_next_mut_inherited_from_a_trait_default_drives_a_mut_loop() {
 fn an_inherent_next_beats_an_inherited_default_at_the_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Fixed<T> { fun next(&mut self): Option<T> { None } }
@@ -1627,7 +1627,7 @@ fn an_inherent_next_beats_an_inherited_default_at_the_loop() {
 fn two_inherited_default_nexts_are_ambiguous_at_the_loop() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Early<T> { fun next(&mut self): Option<T> { None } }
@@ -1660,7 +1660,7 @@ fn two_inherited_default_nexts_are_ambiguous_at_the_loop() {
 #[test]
 fn two_declared_nexts_are_ambiguous_at_the_loop() {
     let two_declared = r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Early<T> { fun next(&mut self): Option<T>; }
@@ -1696,7 +1696,7 @@ fn two_declared_nexts_are_ambiguous_at_the_loop() {
 #[test]
 fn both_ambiguous_for_each_tiers_share_one_diagnostic_shape() {
     let declared = r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Early<T> { fun next(&mut self): Option<T>; }
@@ -1712,7 +1712,7 @@ fn both_ambiguous_for_each_tiers_share_one_diagnostic_shape() {
         }
         "#;
     let inherited = r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Early<T> { fun next(&mut self): Option<T> { None } }
@@ -1748,7 +1748,7 @@ fn both_ambiguous_for_each_tiers_share_one_diagnostic_shape() {
 fn an_inherent_next_beats_two_declared_trait_nexts_at_the_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Early<T> { fun next(&mut self): Option<T>; }
@@ -1780,7 +1780,7 @@ fn an_inherent_next_beats_two_declared_trait_nexts_at_the_loop() {
 fn one_declared_next_beside_an_unrelated_trait_still_drives_the_loop() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Only<T> { fun next(&mut self): Option<T>; }
@@ -1811,7 +1811,7 @@ fn one_declared_next_beside_an_unrelated_trait_still_drives_the_loop() {
 fn two_declared_next_muts_are_ambiguous_at_the_mut_loop() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait WalkA<T> { fun next_mut(&mut self): Option<&mut T>; }
@@ -1842,7 +1842,7 @@ fn two_declared_next_muts_are_ambiguous_at_the_mut_loop() {
 fn an_inherited_default_next_keeps_the_tiers_own_boundaries() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Bad { fun next(&mut self): i32 { 0 } }
 
@@ -1858,7 +1858,7 @@ fn an_inherited_default_next_keeps_the_tiers_own_boundaries() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Hidden<T> { [trait_only] fun next(&mut self): Option<T> { None } }
@@ -1882,7 +1882,7 @@ fn an_inherited_default_next_keeps_the_tiers_own_boundaries() {
 fn a_supertraits_default_next_drives_the_loop_too() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         trait Base<T> { fun next(&mut self): Option<T> { None } }
@@ -1917,7 +1917,7 @@ fn a_supertraits_default_next_drives_the_loop_too() {
 fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Odd { count: i32 }
 
@@ -1946,7 +1946,7 @@ fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
 fn an_unannotated_next_that_yields_an_option_stays_legal() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
         import std::option::Option::{ self, Some, None };
 
@@ -1966,7 +1966,7 @@ fn an_unannotated_next_that_yields_an_option_stays_legal() {
     // an `Option` drives the loop exactly as an annotated one does.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Two { at: i32 }
@@ -1994,7 +1994,7 @@ fn an_unannotated_next_that_yields_an_option_stays_legal() {
 fn an_unannotated_next_that_yields_a_non_option_is_diagnosed_too() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Num { at: i32 }
         impl Num {
@@ -2017,7 +2017,7 @@ fn an_unannotated_next_that_yields_a_non_option_is_diagnosed_too() {
 fn an_unannotated_inherited_default_next_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         trait Blank { fun next(&mut self) { } }
 
@@ -2040,7 +2040,7 @@ fn an_unannotated_inherited_default_next_is_diagnosed() {
 fn an_annotated_non_option_next_keeps_its_own_diagnostic() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Num2 { at: i32 }
         impl Num2 {
@@ -2079,7 +2079,7 @@ fn an_annotated_non_option_next_keeps_its_own_diagnostic() {
 fn an_enum_pattern_on_a_functions_own_type_parameter_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Shape { Circle(i32), Square(i32) }
 
@@ -2099,7 +2099,7 @@ fn an_enum_pattern_on_a_functions_own_type_parameter_is_diagnosed() {
 fn an_enum_match_arm_on_a_functions_own_type_parameter_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
 
@@ -2126,7 +2126,7 @@ fn an_enum_match_arm_on_a_functions_own_type_parameter_is_diagnosed() {
 fn an_enum_pattern_on_a_traits_own_parameter_in_a_default_is_diagnosed() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Colour { Red, Green }
         enum Fruit { Apple(i32), Pear(i32) }
@@ -2161,7 +2161,7 @@ fn an_enum_pattern_on_a_traits_own_parameter_in_a_default_is_diagnosed() {
 fn a_bound_does_not_make_a_type_parameter_matchable() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         trait Tag { fun tag(self): i32; }
@@ -2185,7 +2185,7 @@ fn a_bound_does_not_make_a_type_parameter_matchable() {
 fn a_concrete_mismatched_subject_keeps_its_own_pattern_diagnostics() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Colour { Red, Green }
         enum Fruit { Apple, Pear }
@@ -2199,7 +2199,7 @@ fn a_concrete_mismatched_subject_keeps_its_own_pattern_diagnostics() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Colour { Red, Green }
 
@@ -2224,7 +2224,7 @@ fn a_concrete_mismatched_subject_keeps_its_own_pattern_diagnostics() {
 fn matching_through_a_type_parameter_still_works_where_it_is_sound() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::{Option, Some, None};
 
         enum Route { Home, Away(i32) }
@@ -2270,7 +2270,7 @@ fn matching_through_a_type_parameter_still_works_where_it_is_sound() {
 fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
 
@@ -2287,7 +2287,7 @@ fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         enum Other { First, Second(i32) }
@@ -2341,7 +2341,7 @@ fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
 fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         enum Other { First, Second(i32) }
@@ -2364,7 +2364,7 @@ fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
     // method. A diagnostic that also rejects this would be no fix at all.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
 
@@ -2393,7 +2393,7 @@ fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
 fn a_closure_parameter_typed_by_a_methods_generic_reaches_its_methods() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         impl Route {
@@ -2423,7 +2423,7 @@ fn a_closure_parameter_typed_by_a_methods_generic_reaches_its_methods() {
 fn a_closure_argument_is_substituted_before_the_argument_that_fixes_the_generic() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         impl Route {
@@ -2450,7 +2450,7 @@ fn a_closure_argument_is_substituted_before_the_argument_that_fixes_the_generic(
     // And the wrong enum is still caught with the arguments in that order.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         enum Other { First, Second(i32) }
@@ -2477,7 +2477,7 @@ fn a_closure_argument_is_substituted_before_the_argument_that_fixes_the_generic(
 fn every_callee_shape_substitutes_its_closure_arguments_parameter() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         impl Route {
@@ -2517,7 +2517,7 @@ fn every_callee_shape_substitutes_its_closure_arguments_parameter() {
 fn a_closure_nested_in_a_closure_argument_is_substituted_too() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         impl Route {
@@ -2548,7 +2548,7 @@ fn a_closure_nested_in_a_closure_argument_is_substituted_too() {
 fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         impl Route {
@@ -2570,7 +2570,7 @@ fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         enum Other { First, Second(i32) }
@@ -2593,7 +2593,7 @@ fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
     );
     assert_fails_spanning(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Route { Home, Away(i32) }
         enum Other { First, Second(i32) }
@@ -2807,7 +2807,7 @@ fn rev_is_a_barrier_that_still_composes_with_adapters_on_both_sides() {
 fn to_set_collapses_duplicates_at_the_end_of_a_chain() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::set::Set;
 
         fun main() {
@@ -2828,7 +2828,7 @@ fn to_set_collapses_duplicates_at_the_end_of_a_chain() {
 fn to_map_builds_a_map_out_of_pairs_and_the_last_key_wins() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::map::Map;
         import std::option::Option::{ self, Some, None };
 
@@ -2968,7 +2968,7 @@ fn a_dispatched_call_is_not_colored_by_a_same_named_async_static() {
     // static is not reachable from it and must not color the caller.
     assert_compiles_without_async(
         r#"
-        import std::print;
+        import std::io::print;
         import std::option::Option::{ self, Some, None };
 
         struct Gate {}
@@ -3020,7 +3020,7 @@ fn iterator_all_does_not_color_its_caller_async_through_promise_all() {
     // program with nothing async in it.
     assert_compiles_without_async(
         r#"
-        import std::print;
+        import std::io::print;
 
         fun main() {
             print([1, 2, 3].iter().all(|n| n > 0));
@@ -3040,7 +3040,7 @@ fn a_genuinely_async_dispatched_member_still_colors_its_caller() {
     // deletion.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::time::sleep;
         import std::option::Option::{ self, Some, None };
 
@@ -3177,7 +3177,7 @@ fn b79_the_bounds_themselves_are_legal() {
     // asymmetry.)
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Edge { Min = -9007199254740991, Max = 9007199254740991 }
         fun main() {
             print(match Edge::Min { Edge::Min => "min", Edge::Max => "max" });
@@ -3209,7 +3209,7 @@ fn b79_a_hex_discriminant_is_read_as_hex() {
     // silent `0` is the bug; reading it is the fix, not a feature.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         enum Mask { Low = 0x0F, High = 0xF0 }
         fun main() {
             print(match Mask::High { Mask::Low => "low", Mask::High => "high" });
@@ -3257,7 +3257,7 @@ fn b79_the_still_legal_discriminant_forms_all_compile() {
     // discriminants at all, and a plain enum with none.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         enum Signed { A = -3, B = -1, C = 5, D }
         enum Gapped { X = 10, Y = 20, Z = 30 }
@@ -3306,7 +3306,7 @@ fn b79_std_ordering_still_lowers_to_its_bare_discriminant() {
     // to the bare integer rather than the `[index]` array.
     let javascript = compile(
         r#"
-        import std::print;
+        import std::io::print;
         import std::compare::Ordering;
         fun main() {
             print(Ordering::Greater);
@@ -3370,7 +3370,7 @@ fn b84_a_static_and_a_method_of_one_name_in_one_block_collide() {
     // two.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
         struct Bag { n: i32 }
         impl Bag {
             fun tag(): str { "static" }
@@ -3492,7 +3492,7 @@ fn b84_one_name_per_block_across_two_blocks_still_compiles() {
     // declared once per block, in three blocks, two of them trait impls.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Bag { n: i32 }
         trait Marker { fun mark(self): str; }
@@ -3553,7 +3553,7 @@ fn b83_an_inherent_static_outranks_a_trait_provided_one() {
     // The registration order that used to decide it: the trait impl FIRST.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::default::Default;
 
         struct Bag { n: i32 }
@@ -3573,7 +3573,7 @@ fn b83_the_inherent_static_wins_from_either_declaration_order() {
     // makes the rule a rule rather than a coincidence.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::default::Default;
 
         struct Bag { n: i32 }
@@ -3597,7 +3597,7 @@ fn b83_two_traits_providing_one_static_are_ambiguous() {
     // that does not resolve.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Bag { n: i32 }
         trait Alpha { fun spawn(): Bag; }
@@ -3620,7 +3620,7 @@ fn b83_an_inherent_static_resolves_the_two_trait_ambiguity() {
     // impossible steer is worse than no steer (the B65 lesson).
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Bag { n: i32 }
         trait Alpha { fun spawn(): Bag; }
@@ -3645,7 +3645,7 @@ fn b83_a_lone_trait_provided_static_still_resolves() {
     // make every trait-provided static uncallable.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::default::Default;
 
         struct Bag { n: i32 }
@@ -3665,7 +3665,7 @@ fn b83_a_static_on_a_trait_subject_impl_still_resolves() {
     // set, so a trait-subject impl must keep resolving.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::iterator::Iterator;
         import std::option::Option::{ self, Some, None };
 
@@ -3687,7 +3687,7 @@ fn b83_two_impls_of_one_trait_do_not_make_a_static_ambiguous() {
     // never reach.
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         import std::default::Default;
 
         struct Bag { n: i32 }
@@ -3715,7 +3715,7 @@ fn b83_a_trait_declared_static_is_not_reachable_through_the_trait() {
     // the fix rather than a qualified path.
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Bag { n: i32 }
         trait Alpha { fun spawn(): Bag; }
@@ -3727,7 +3727,7 @@ fn b83_a_trait_declared_static_is_not_reachable_through_the_trait() {
     );
     assert_fails_with(
         r#"
-        import std::print;
+        import std::io::print;
 
         struct Bag { n: i32 }
         trait Alpha { fun spawn(): Bag { Bag { n = 3 } } }
@@ -3837,7 +3837,7 @@ fn the_constraint_fixpoint_stops_when_it_settles() {
 fn b95_program(annotation: &str, first: &str, second: &str) -> String {
     format!(
         r#"
-        import std::print;
+        import std::io::print;
         fun through<T>(value: T): T {{
             print(4242);
             value
@@ -3920,7 +3920,7 @@ fn b95_a_two_generic_instantiation_shares_an_instance() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun pair<T, U>(left: T, right: U): T {
                 print(4242);
                 left
@@ -3947,7 +3947,7 @@ fn b95_two_spellings_of_a_method_receiver_share_an_instance() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             struct Holder<T> { value: T }
             impl Holder<type T> {
                 fun show(self): T {
@@ -3976,7 +3976,7 @@ fn b95_different_nominal_arguments_still_split_the_instance() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun through<T>(value: T): T {
                 print(4242);
                 value
@@ -4001,7 +4001,7 @@ fn b95_arrays_of_different_lengths_still_split_the_instance() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun through<T>(value: T): T {
                 print(4242);
                 value
@@ -4027,7 +4027,7 @@ fn b95_nested_arguments_that_differ_deep_still_split_the_instance() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun through<T>(value: T): T {
                 print(4242);
                 value
@@ -4067,7 +4067,7 @@ fn b102_a_callers_generic_does_not_split_the_callees_instance() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun through<T>(value: T): T {
                 print(4242);
                 value
@@ -4095,7 +4095,7 @@ fn b102_a_different_instantiation_through_a_forwarder_still_splits() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             fun through<T>(value: T): T {
                 print(4242);
                 value
@@ -4155,7 +4155,7 @@ fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             import std::map::Map;
             import std::reactive::Signal;
             fun main() {
@@ -4180,7 +4180,7 @@ fn b102_a_static_on_a_trait_monomorphizes_through_its_binder() {
     assert_eq!(
         emitted_occurrences(
             r#"
-            import std::print;
+            import std::io::print;
             trait Iterator<T> {
                 fun next(self): T;
             }
@@ -4220,7 +4220,7 @@ fn b102_a_static_on_a_trait_monomorphizes_through_its_binder() {
 fn b102_the_unconditional_hoist_keeps_both_argument_orders_running() {
     assert_compiles_and_runs(
         r#"
-        import std::print;
+        import std::io::print;
         fun apply<T>(render: |T| i32, value: T): i32 {
             render(value)
         }

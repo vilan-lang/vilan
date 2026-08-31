@@ -1,5 +1,5 @@
 import std::option::Option::{ self, Some, None };
-import std::print;
+import std::io::print;
 
 // Gap B: an impl subject with `type` binders nested anywhere in its type
 // pattern (here a tuple) binds them as the impl's generics and flows them into

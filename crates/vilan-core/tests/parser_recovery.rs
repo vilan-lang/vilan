@@ -691,7 +691,7 @@ fn a_missing_semicolon_on_an_import_keeps_the_import() {
     // The same, for the two non-expression statements that take a terminator.
     // P3's file used to lose its `import` — so every use of `print` below
     // reported "cannot find 'print' in this scope" as well.
-    let source = "import std::print
+    let source = "import std::io::print
 
 fun main() {\n\tprint(1);\n}\n";
     let reported = diagnostics(source);
@@ -895,7 +895,7 @@ fn a_file_scope_missing_semicolon_reports_at_the_gap() {
     // P3: an `import` with no `;`. Before S2 this read `found 'import' expected an
     // expression` ON the `import` keyword — §4.1 calls it incomprehensible, and
     // §4.2 records the fallback it came from as untested anywhere in the repo.
-    let source = "import std::print\n\nfun main() {\n\tprint(1);\n}\n";
+    let source = "import std::io::print\n\nfun main() {\n\tprint(1);\n}\n";
     let reported = diagnostics(source);
     assert_eq!(reported.len(), 1, "{reported:#?}");
     assert_eq!(

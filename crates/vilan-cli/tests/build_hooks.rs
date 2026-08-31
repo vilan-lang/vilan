@@ -96,7 +96,7 @@ fn runs(dir: &Path, file: &str) -> usize {
 }
 
 /// The smallest program that compiles and runs.
-const MAIN: &str = "import std::print;\nfun main() { print(\"ok\") }\nmain();\n";
+const MAIN: &str = "import std::io::print;\nfun main() { print(\"ok\") }\nmain();\n";
 
 /// A `[package]` with one declared hook: it appends to `ran.txt` and writes
 /// `generated.txt`, declaring `input.txt` in and `generated.txt` out.
@@ -560,7 +560,7 @@ fn a_hook_generates_a_module_the_same_build_compiles_and_then_stops_paying_for_i
     write(
         &dir,
         "src/main.vl",
-        "import std::print;\nimport pkg::generated::generated;\n\
+        "import std::io::print;\nimport pkg::generated::generated;\n\
          fun main() { print(generated() + 1) }\nmain();\n",
     );
     write(&dir, "icons.lock", "v1\n");
@@ -1259,7 +1259,7 @@ fn generated_root_project(tag: &str, generated: Option<&str>) -> PathBuf {
     write(
         &dir,
         "src/main.vl",
-        "import std::print;\nimport pkg::icons::generated;\n\
+        "import std::io::print;\nimport pkg::icons::generated;\n\
          fun main() { print(generated() + 1) }\nmain();\n",
     );
     write(&dir, "icons.lock", "v1\n");

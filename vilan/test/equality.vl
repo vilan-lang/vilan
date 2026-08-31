@@ -1,4 +1,4 @@
-import std::{ print, option::Option::{ self, Some, None }, result::Result::{ self, Ok, Err } };
+import std::{ io::print, option::Option::{ self, Some, None }, result::Result::{ self, Ok, Err } };
 import std::compare::PartialEq;
 
 struct Point { x: i32, y: i32 }

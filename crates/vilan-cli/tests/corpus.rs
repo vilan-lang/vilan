@@ -381,7 +381,7 @@ fn emitted_js_is_independent_of_import_order() {
                 \tprint(format(42));\n\
                 \tprint(PI + E + EPSILON + QUARTER_TURN);\n\
                 \tprint(INFINITY.is_infinite() && NAN.is_nan());\n}\n";
-    let print_import = "import std::print;\n";
+    let print_import = "import std::io::print;\n";
     let bytes_import = "import std::bytes::{ encode_utf8 };\n";
     let base64_import = "import std::base64::{ encode_url };\n";
     let display_import = "import std::display::{ format };\n";

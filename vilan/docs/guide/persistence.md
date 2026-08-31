@@ -13,7 +13,6 @@ underneath). There is no ORM and no query builder. You write SQL, with
 `?` placeholders for values:
 
 ```vilan,norun
-import std::print;
 import std::db::{ Database, Statement, Row };
 import std::option::Option::{ self, Some, None };
 
@@ -81,7 +80,6 @@ database has not seen and records them in a `vilan_migrations` table it
 owns. Call it at boot, unconditionally, before the first query:
 
 ```vilan,norun
-import std::print;
 import std::db::{ Database, Migration };
 
 fun main() {
@@ -177,7 +175,6 @@ Every server in vilan is a `Server::builder()` chain — a port, a handler,
 and `start()`:
 
 ```vilan,norun
-import std::print;
 import std::http::{ Server, Request, Response };
 
 fun main() {
@@ -394,7 +391,6 @@ whole tree under it. You pull changes out one at a time:
 
 ```vilan,norun
 import std::fs::{ Change, ChangeKind, Watcher };
-import std::print;
 
 fun main() {
 	let watcher = Watcher::watch_all("content");

@@ -6,7 +6,7 @@
 import std::iterator::Iterator;
 import std::map::Map;
 import std::option::Option::{ None, Some, self };
-import std::print;
+import std::io::print;
 import std::range::Range;
 import std::set::Set;
 

@@ -23,6 +23,60 @@ work offline and a moved tag cannot change what you already built.
 Nothing else fetches: the editor uses the cache when it's there and
 never reaches the network.
 
+## The prelude key
+
+`prelude` names the module whose exports are in scope in every one of
+this package's files with no `import`. It sits on `[package]` and on
+`[library]` alike:
+
+```toml
+[package]
+name = "app"
+prelude = "std::web"
+```
+
+| Value | Meaning |
+|---|---|
+| *omitted* | std's base set: `print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err` |
+| `"std::web"` | the base set plus `Signal`, `view`, `View`, and the modules `style` and `ui` |
+| `"pkg::my_prelude"` | your own module — its exports are the ambient names |
+| `"some_dep::their_prelude"` | a dependency's module |
+| `false` | no prelude at all |
+
+A custom prelude is an ordinary module of re-exports, and it **replaces**
+std's rather than extending it — extension is spelled by re-exporting
+what you want to keep:
+
+```vilan,fragment
+export import std::io::print;
+export import std::option::Option::{ self, Some, None };
+export import std::reactive::Signal;
+export import std::style;                 // a whole MODULE, as `style::…`
+```
+
+Three rules make the key safe to use:
+
+- **Per package, never inherited.** A dependency resolves under the
+  prelude *its* manifest declares. You cannot change what a dependency's
+  source means, and it cannot inject names into yours — not even through
+  a `[project]` workspace root, which has no `prelude` key at all. Each
+  member states its own.
+- **The weakest scope.** A local declaration or an explicit import of a
+  prelude name wins, silently. Adding a prelude cannot break code that
+  compiles today.
+- **`"std"` is not a value.** It names the package root, not a prelude
+  module; the manifest refuses it and points at `"std::prelude"` (the
+  default) or `"std::web"`.
+
+A prelude that re-exports a platform-layered name makes your package's
+ambient scope platform-dependent. Nothing special happens — platform
+coloring still reports at the point the code becomes reachable — but
+"my prelude broke my server build" is a confusing way to learn it.
+
+The standard library declares `prelude = false`: 264 names across 59
+files, where "which module is this from" has to be answerable by reading
+the file.
+
 ## Reserved names
 
 Four names are refused wherever a manifest names a package: `std`,

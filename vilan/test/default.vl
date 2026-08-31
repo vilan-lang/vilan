@@ -1,4 +1,4 @@
-import std::{ print, u32 };
+import std::{ io::print, number::u32 };
 
 trait Default {
 	fun default(): Self;

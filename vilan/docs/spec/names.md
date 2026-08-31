@@ -45,7 +45,7 @@ directory is spelled `foo`.
 is idempotent and cycle-tolerant) and binds the imported items in the
 importing module's scope:
 
-- `import std::print;` binds the item `print`.
+- `import std::io::print;` binds the item `print`.
 - `import std::reactive::{ Signal, combine };` binds each set member.
 - `import std::option::Option::{ self, Some, None };` is a path into a
   TYPE: `self` binds the type itself; variant names bind the variants for
@@ -68,8 +68,6 @@ outward from the use site to the innermost binding. A `let`/`mut` binding
 declaration onward, including imports and items:
 
 ```vilan
-import std::print;
-
 fun main() {
 	let print_count = 2;
 	mut label = "a";
@@ -86,6 +84,17 @@ Items within one module share the module scope and are visible
 **throughout** the module regardless of declaration order (a function may
 call one declared later). Local `let` bindings are visible only after
 their declaration.
+
+The full ladder, weakest first: the **prelude** (§4.7) → module items and
+explicit **imports** → enclosing scopes → the innermost local binding.
+Two rungs deserve stating outright, because both are silent:
+
+- An **explicit import beats a same-file declaration.** `import
+  std::io::print;` in a file that also declares `fun print` binds the
+  import; the file's own function is unreachable by that name.
+- **Everything beats the prelude.** It is the weakest rung by
+  construction, so shadowing one of its names — by declaring it or by
+  importing it — is never a diagnostic.
 
 A `let` may also redeclare a name **within the same scope**: the later
 binding shadows the earlier one from its own declaration point onward,
@@ -145,8 +154,6 @@ too, by the coherence rule of §5.4: rule 2 above says "the method a trait
 provides", and a trait provides one.
 
 ```vilan
-import std::print;
-
 struct Bag { x: i32 }
 trait Iter { fun pick(self): str; }
 
@@ -176,8 +183,54 @@ or nothing.
 
 ## 4.7 The prelude
 
-A small set of names is in scope without imports: the primitive types
-(`i32`, `str`, `bool`, …), `List`, `void`, and the boolean/`null`
-literals' types. Everything else (including `Option`, `Result`, `print`)
-must be imported. (The exact prelude is the lang-item table, appendix
-§A.4.)
+Two sets of names are in scope without imports.
+
+**The built-in set**, always: the primitive types (`i32`, `str`, `bool`,
+…), `List`, `void`, and the boolean/`null` literals' types. (The exact
+set is the lang-item table, appendix §A.4.)
+
+**The package's prelude**, chosen by its manifest. A prelude is a
+**module**, and the names it makes ambient are exactly that module's
+exports. `[package] prelude` (and `[library] prelude`) names it:
+
+| Value | Ambient names |
+|---|---|
+| *omitted* — the default | std's base set: `print`, `Option`, `Some`, `None`, `Result`, `Ok`, `Err` |
+| `"std::web"` | the base set, plus `Signal`, `view`, `View`, and the **modules** `style` and `ui` |
+| any module path (`pkg::…`, `std::…`, a dependency) | that module's exports |
+| `false` | none — only the built-in set above |
+
+```vilan
+fun main() {
+	// `Option`, `Some`, `None` and `print` with no import: the language
+	// manufactures the `Option` here, so it can also name it.
+	match [10, 20, 30].get(1) {
+		Some(let n) => print("found one"),
+		None => print("empty"),
+	}
+}
+```
+
+A prelude entry may name a **module** as well as a member. An ambient
+module contributes exactly one name to the bare namespace — its own — and
+its members are reached through it, so `style::Display` needs no import
+while bare `Display` still means `std::display::Display`.
+
+**The prelude is the weakest binding in the language.** A local
+declaration or an explicit import of a prelude name wins, silently, with
+no diagnostic (§4.4). A file that declares its own `fun print` gets its
+own; a file that imports `std::io::print` gets that import, and the
+import is simply redundant rather than an error.
+
+**A prelude is per package and never inherited.** A dependency's files
+resolve under the prelude *its* manifest declares — not its consumer's,
+not a workspace root's, and not per platform layer. Two packages that
+disagree about what `Signal` means both keep compiling in one build.
+
+A shadowed prelude name has no qualified spelling at the use site:
+`std::io::print(x)` written inline is refused (§4.6). Recover by importing
+the module and qualifying through it — `import std::io;` then
+`io::print(…)`.
+
+The standard library itself declares `prelude = false`, so its own
+resolution stays greppable.

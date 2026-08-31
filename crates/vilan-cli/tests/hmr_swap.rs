@@ -274,7 +274,7 @@ fun main() {
 }
 "#;
 
-const SERVER: &str = "import std::print;\n\nfun main() {\n\tprint(\"server up\");\n}\n";
+const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"server up\");\n}\n";
 
 /// The DOM/host stub plus the swap-matrix assertions, run under node against the
 /// two instrumented bundles. `window === globalThis` (as in a browser) so the

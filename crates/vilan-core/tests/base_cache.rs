@@ -69,13 +69,14 @@ fn stats() -> (u64, u64) {
     vilan_core::analyzer::base_cache_stats()
 }
 
-const PROGRAM_A: &str = "import std::print;\nfun main() { print(1); }\n";
-const PROGRAM_B: &str = "import std::print;\nfun main() { print(2 + 3); }\n";
+const PROGRAM_A: &str = "import std::io::print;\nfun main() { print(1); }\n";
+const PROGRAM_B: &str = "import std::io::print;\nfun main() { print(2 + 3); }\n";
 /// A DISTINCT import set from A/B — and deliberately one that reaches no
 /// macro-defining std module, so this fixture's hit deltas belong to the
 /// outer analysis alone (`std::time`, the previous choice, drags two macro
 /// worlds along and each of those now consults the cache itself).
-const PROGRAM_C: &str = "import std::print;\nimport std::math::PI;\nfun main() { print(PI); }\n";
+const PROGRAM_C: &str =
+    "import std::io::print;\nimport std::math::PI;\nfun main() { print(PI); }\n";
 
 /// Same import set: the second program hits, and its observations are
 /// byte-identical to a fresh (cache-cleared) build of the same program.
@@ -132,7 +133,7 @@ fn world_entangling_entries_and_overlays_bypass() {
     // Macro-DEFINING entries stay bypassed (E23's world key is
     // entry-entangled); derive USERS cache since the hoist (§6.13).
     let _ = observe(
-        "import std::print;\nmacro fun m(s: Source): Source { s }\nfun main() { print(1); }\n",
+        "import std::io::print;\nmacro fun m(s: Source): Source { s }\nfun main() { print(1); }\n",
     );
     let (hits_mid, misses_mid) = stats();
     assert_eq!(
@@ -317,8 +318,8 @@ fn derive_entries_cache_and_derived_impls_survive_the_hit() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     vilan_core::analyzer::base_cache_clear();
-    const WITH_DERIVE: &str = "import std::print;\n[derive(PartialEq)]\nstruct P { x: i32 }\nfun main() { print(P { x = 1 } == P { x = 1 }); }\n";
-    const WITHOUT_DERIVE: &str = "import std::print;\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
+    const WITH_DERIVE: &str = "import std::io::print;\n[derive(PartialEq)]\nstruct P { x: i32 }\nfun main() { print(P { x = 1 } == P { x = 1 }); }\n";
+    const WITHOUT_DERIVE: &str = "import std::io::print;\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
 
     let first = observe(WITH_DERIVE);
     let (hits_before, _) = stats();
@@ -360,13 +361,13 @@ fn macro_worlds_share_one_base_world_and_observe_identically() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Two defining files: `PartialEq` lives in compare.vl, `Debug` in
     // debug.vl — so this entry compiles two macro worlds, not one.
-    const TWO_WORLDS: &str = "import std::print;\n[derive(PartialEq, Debug)]\nstruct P { x: i32 }\nfun main() { print((P { x = 1 } == P { x = 1 }).debug()); }\n";
+    const TWO_WORLDS: &str = "import std::io::print;\n[derive(PartialEq, Debug)]\nstruct P { x: i32 }\nfun main() { print((P { x = 1 } == P { x = 1 }).debug()); }\n";
 
     vilan_core::analyzer::base_cache_clear();
     vilan_core::macro_world_cache_clear();
     // Prime the ordinary (dependency-free) base so the OUTER analysis below
     // is a hit and every remaining delta belongs to the macro worlds.
-    // `import std::print` dispatches no macro of its own.
+    // `import std::io::print` dispatches no macro of its own.
     let _ = observe(PROGRAM_A);
     let (hits_before, misses_before) = stats();
     let two_worlds = observe(TWO_WORLDS);
@@ -420,8 +421,8 @@ fn a_warm_macro_world_observes_what_a_cold_one_observes() {
     let _guard = CACHE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    const DERIVE_DEBUG: &str = "import std::print;\n[derive(Debug)]\nstruct P { x: i32 }\nfun main() { print(P { x = 1 }.debug()); }\n";
-    const DERIVE_PARTIAL_EQ: &str = "import std::print;\n[derive(PartialEq)]\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
+    const DERIVE_DEBUG: &str = "import std::io::print;\n[derive(Debug)]\nstruct P { x: i32 }\nfun main() { print(P { x = 1 }.debug()); }\n";
+    const DERIVE_PARTIAL_EQ: &str = "import std::io::print;\n[derive(PartialEq)]\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
 
     // Cold leg: the outer world is stored, no macro-world base is.
     vilan_core::analyzer::base_cache_clear();
@@ -474,9 +475,9 @@ fn a_missing_derive_errors_identically_through_a_warm_macro_world() {
     // The entry derives Debug (compiling debug.vl's world) and then asks for
     // an `==` its struct never derived: the error must be identical whichever
     // way the world beneath the derive was analyzed.
-    const MISSING_DERIVE: &str = "import std::print;\n[derive(Debug)]\nstruct P { x: i32 }\nfun main() { print((P { x = 1 } == P { x = 1 }).debug()); }\n";
+    const MISSING_DERIVE: &str = "import std::io::print;\n[derive(Debug)]\nstruct P { x: i32 }\nfun main() { print((P { x = 1 } == P { x = 1 }).debug()); }\n";
 
-    const DERIVE_PARTIAL_EQ: &str = "import std::print;\n[derive(PartialEq)]\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
+    const DERIVE_PARTIAL_EQ: &str = "import std::io::print;\n[derive(PartialEq)]\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
 
     // Cold: nothing is stored under a macro_std workspace, so debug.vl's
     // world builds its own base.
@@ -523,7 +524,7 @@ fn an_entry_declared_impl_resolves_through_a_cache_hit() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     vilan_core::analyzer::base_cache_clear();
-    const ENTRY_IMPL: &str = "import std::print;\nstruct Widget { n: i32 }\nimpl Widget { fun doubled(self): i32 { self.n * 2 } }\nfun main() { print(Widget { n = 21 }.doubled()); }\n";
+    const ENTRY_IMPL: &str = "import std::io::print;\nstruct Widget { n: i32 }\nimpl Widget { fun doubled(self): i32 { self.n * 2 } }\nfun main() { print(Widget { n = 21 }.doubled()); }\n";
 
     // A first analysis of the same import set stores the base world.
     let _ = observe(PROGRAM_A);
@@ -605,7 +606,7 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
     let entry_path = app_dir.join("main.vl");
     std::fs::write(
         &entry_path,
-        "import std::print;\nimport common::greeting;\n\nfun main() {\n\tprint(greeting());\n}\n",
+        "import std::io::print;\nimport common::greeting;\n\nfun main() {\n\tprint(greeting());\n}\n",
     )
     .expect("write main.vl");
     let dep_root = root.join("common");
@@ -619,9 +620,11 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
             dependencies: Vec::new(),
             surface: true,
             member: false,
+            prelude: Default::default(),
         }],
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
+        entry_prelude: Default::default(),
     };
     let source: &'static str = Box::leak(
         std::fs::read_to_string(&entry_path)

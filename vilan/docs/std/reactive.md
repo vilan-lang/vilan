@@ -63,7 +63,6 @@ impl Signal<Signal<type U>> {
   signal is unsupported.
 
 ```vilan
-import std::print;
 import std::reactive::{ Signal, Owner, batch };
 
 fun main() {
@@ -105,7 +104,6 @@ A signal of the tuple of the sources' current values, firing when any source
 changes. Variadic over tuples of signals of mixed element types:
 
 ```vilan
-import std::print;
 import std::reactive::{ Signal, combine };
 
 fun main() {

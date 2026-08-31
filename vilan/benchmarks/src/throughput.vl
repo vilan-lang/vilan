@@ -8,7 +8,7 @@ import std::http::{ Response, Server };
 import std::io::panic;
 import std::json::{ Json, json_codec };
 import std::option::Option::{ None, Some };
-import std::print;
+import std::io::print;
 import std::result::Result::{ Err, Ok, self };
 import std::rpc::{
 	Dispatcher,
