@@ -329,14 +329,14 @@ fn build_once(
     platform: Option<String>,
     debug: bool,
     rerun_hooks: bool,
-) -> ExitCode {
+) -> RoundOutcome {
     // Before the hooks, which are the first thing that records: every round of
     // `--watch` explains itself, and a round must not inherit the previous
     // one's outputs.
     explain::begin();
     with_project(file, |project| {
-        if let Err(code) = run_build_hooks(&project, rerun_hooks) {
-            return code;
+        if let Err(outcome) = run_build_hooks(&project, rerun_hooks) {
+            return outcome;
         }
         match project {
             Project::Single {
@@ -364,7 +364,7 @@ fn build_once(
 /// not it is fresh. It is the escape hatch `build-hooks.md` §3.2 names for the
 /// staleness predicate's one accepted unsoundness — a hook that reads a file it
 /// did not declare.
-fn run_build_hooks(project: &Project, rerun: bool) -> Result<(), ExitCode> {
+fn run_build_hooks(project: &Project, rerun: bool) -> Result<(), RoundOutcome> {
     let Some(hooks) = project.hooks() else {
         return Ok(());
     };
@@ -373,7 +373,7 @@ fn run_build_hooks(project: &Project, rerun: bool) -> Result<(), ExitCode> {
     note_refused_dependency_hooks(project);
     hooks.run(rerun).map_err(|message| {
         eprintln!("{} {message}", paint::error_prefix());
-        ExitCode::FAILURE
+        RoundOutcome::Failed
     })
 }
 
@@ -450,7 +450,7 @@ fn note_refused_dependency_hooks(project: &Project) {
 
 /// Type-checks the project once. A standalone `[library]` has no fixed platform, so
 /// it verifies the platform contract (§4.2) instead of a single-platform build.
-fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> ExitCode {
+fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> RoundOutcome {
     with_project(file, |project| match project {
         Project::Single {
             unit,
@@ -475,8 +475,8 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
         // `--rerun-hooks` is a `vilan build` flag: `run` is the dev loop, where
         // the whole point of the staleness gate is that an expensive hook stops
         // costing anything per round.
-        if let Err(code) = run_build_hooks(&project, false) {
-            return code;
+        if let Err(outcome) = run_build_hooks(&project, false) {
+            return outcome.into();
         }
         match project {
             Project::Single { unit, platform, .. } => {
@@ -498,7 +498,7 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
                 default_entry,
                 ..
             } => run_workspace(&root, &members, args, entry, &default_entry),
-            Project::Library { name, .. } => not_buildable_library(&name),
+            Project::Library { name, .. } => not_buildable_library(&name).into(),
         }
     })
 }
@@ -628,14 +628,61 @@ fn collect_input_tree(root: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
     }
 }
 
+/// Whether one command run — one `--watch` round — succeeded.
+///
+/// [`ExitCode`] is write-only: it is built from a verdict and handed to the
+/// process, and nothing can read the verdict back out of it. A caller that only
+/// forwards a code is well served by that; [`watch_loop`] is not, because it has
+/// to *act* on a failed round — it restores the round's snapshot difference and
+/// retries once (G14). So the three commands a watch session drives (`build`,
+/// `check`, `test`) report a verdict that can be read, and [`run_or_watch`]
+/// flattens it into an `ExitCode` at the one place that needs one.
+///
+/// Nothing is lost by the conversion. Every fallible step under those three
+/// answers with `Err(ExitCode::FAILURE)` — the only failure code the CLI has —
+/// so an arm below that reads such an `Err` as `Failed` and drops the code drops
+/// nothing the `Err` had not already said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoundOutcome {
+    Succeeded,
+    Failed,
+}
+
+impl From<RoundOutcome> for ExitCode {
+    fn from(outcome: RoundOutcome) -> ExitCode {
+        match outcome {
+            RoundOutcome::Succeeded => ExitCode::SUCCESS,
+            RoundOutcome::Failed => ExitCode::FAILURE,
+        }
+    }
+}
+
+/// The failure value of a command's result currency, so one reporter serves
+/// both: [`ExitCode`] for a command that answers straight to the process (a
+/// `run` propagates the *program's* own code, any value, not just 0/1), and
+/// [`RoundOutcome`] for one a `--watch` session drives and has to read back.
+trait CommandFailure {
+    fn failed() -> Self;
+}
+
+impl CommandFailure for ExitCode {
+    fn failed() -> ExitCode {
+        ExitCode::FAILURE
+    }
+}
+
+impl CommandFailure for RoundOutcome {
+    fn failed() -> RoundOutcome {
+        RoundOutcome::Failed
+    }
+}
+
 /// Runs `action` once and returns its exit code (no `--watch`, `roots` is `None`),
 /// or — under `--watch` — re-runs it on every change to a `.vl` file under `roots`.
-fn run_or_watch(roots: Option<Vec<PathBuf>>, mut action: impl FnMut() -> ExitCode) -> ExitCode {
+fn run_or_watch(roots: Option<Vec<PathBuf>>, mut action: impl FnMut() -> RoundOutcome) -> ExitCode {
     match roots {
-        None => action(),
-        Some(roots) => watch_loop(&roots, move || {
-            let _ = action();
-        }),
+        None => action().into(),
+        Some(roots) => watch_loop(&roots, action),
     }
 }
 
@@ -707,7 +754,38 @@ fn install_watch_interrupt_hook() {
 /// otherwise loops until `Ctrl-C` — which stops any `run --watch` child (via the
 /// shared terminal process group on unix, via the child's Job object on Windows)
 /// and runs [`install_watch_interrupt_hook`]'s cleanup.
-fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
+///
+/// **A failed round keeps its change** (G14, ruled 2026-08-29). The difference
+/// that woke a round is *consumed* only when the round succeeds: a round whose
+/// action fails leaves the old snapshot in place, so the next poll still sees
+/// that difference and re-fires the round — once. A second consecutive failure
+/// consumes the difference and the session goes back to waiting for the next
+/// change, which is the posture this loop has always had. Before, that posture
+/// was the *only* one — `snapshot = next` ran before the action — so a round lost
+/// to a transient failure (a `cmd` hiccup on a loaded runner, a hook racing
+/// something outside the tree) was lost for good, and the session sat healthy and
+/// silent until some unrelated file happened to move.
+///
+/// **Why the guard is once.** The other failure a round has is a *compile error*,
+/// and for it "wait for the next change" is the right design: the fix is the next
+/// edit, and a tree that cannot compile would retry forever. Retried once, a
+/// broken tree compiles-fails a second time and then rests — one extra compile
+/// per broken save, bounded, and the price of giving the transient case its round
+/// back. Nothing here can tell the two apart (a failed command is a failed
+/// command), which is exactly why the budget is one and not a policy.
+///
+/// **No hot loop.** A retry is an ordinary round: it rides
+/// [`WATCH_POLL_INTERVAL`] like every other one, and the second failure consumes
+/// the difference, so no sequence of failures produces a third automatic attempt.
+/// A change landing *during* a pending retry is folded into that retry rather
+/// than refreshing the budget — the conservative direction, and the one that
+/// keeps "at most two runs per difference" true however edits are timed.
+///
+/// The retry is only as good as the verdict its caller hands back, and one
+/// caller has none to give: see [`run_watch`], whose rounds report
+/// [`RoundOutcome::Succeeded`] because their failures are already handled inside
+/// the round.
+fn watch_loop(roots: &[PathBuf], mut action: impl FnMut() -> RoundOutcome) -> ExitCode {
     if roots.iter().all(|root| !root.exists()) {
         eprintln!("{} nothing to watch (no such path)", paint::error_prefix());
         return ExitCode::FAILURE;
@@ -747,7 +825,9 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
     // the initial build causes one extra round — which is the correct behavior.
     let started = SystemTime::now();
     let mut snapshot = watch_snapshot(roots);
-    action();
+    // The first round has no difference to keep — the baseline below is built
+    // after it either way — so its verdict is nothing this loop can act on.
+    let _ = action();
     // The first build just revealed which `asset::read` inputs exist — paths
     // the baseline could not contain. Seed them in with E20's rule intact: an
     // input whose mtime predates the build joins the baseline (no spurious
@@ -758,16 +838,61 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
             snapshot.insert(path, modified);
         }
     }
+    // Whether the round about to run is the ONE retry of a round that just
+    // failed. This flag is the spin guard: the difference is kept for exactly
+    // one re-fire, and the failure that ends a retry consumes it.
+    let mut retrying = false;
     loop {
         std::thread::sleep(WATCH_POLL_INTERVAL);
         let next = watch_snapshot(roots);
-        if next != snapshot {
-            snapshot = next;
-            eprintln!(
-                "\n{}",
-                paint::err(paint::Style::CYAN, "[watch] change detected, re-running")
-            );
-            action();
+        if next == snapshot {
+            continue;
+        }
+        eprintln!(
+            "\n{}",
+            paint::err(
+                paint::Style::CYAN,
+                if retrying {
+                    "[watch] retrying the failed round"
+                } else {
+                    "[watch] change detected, re-running"
+                }
+            )
+        );
+        match action() {
+            // Consumed by a round that dealt with it. `next` was read BEFORE the
+            // action, so an edit landing while the round ran is still a
+            // difference at the next poll — E20's rule, unchanged.
+            RoundOutcome::Succeeded => {
+                snapshot = next;
+                retrying = false;
+            }
+            // NOT consumed: the same difference is still there at the next poll,
+            // which is how the retry fires without a timer of its own.
+            RoundOutcome::Failed if !retrying => {
+                retrying = true;
+                eprintln!(
+                    "{}",
+                    paint::err(
+                        paint::Style::CYAN,
+                        "[watch] the round failed; retrying it once on the next poll"
+                    )
+                );
+            }
+            // The retry failed too. Consume the difference and wait for the next
+            // change: twice in a row is a broken tree rather than a hiccup, and
+            // the fix for a broken tree is the next edit.
+            RoundOutcome::Failed => {
+                snapshot = next;
+                retrying = false;
+                eprintln!(
+                    "{}",
+                    paint::err(
+                        paint::Style::CYAN,
+                        "[watch] the retry failed too; waiting for the next change"
+                    )
+                );
+            }
         }
     }
 }
@@ -797,30 +922,57 @@ fn run_watch(
         activate_hmr(&file, hmr_port)
     };
     let mut state = WatchState::default();
-    let code = watch_loop(&roots, move || match &channel {
-        Some(channel) => {
-            child = hmr_round(
-                channel,
-                file.clone(),
-                &args,
-                &mut state,
-                child.take(),
-                entry.as_deref(),
-            );
-        }
-        None => {
-            // The plain restart loop recompiles and respawns wholesale, so the
-            // per-leg skip doesn't drop in naturally here (there are no retained
-            // per-leg artifacts to reuse) (backlog E12).
-            if let Some(mut previous) = child.take() {
-                let _ = previous.kill();
-                let _ = previous.wait();
-                // The child is reaped, so nothing holds the round's temp script
-                // any more and it can be removed before the next one writes it.
-                remove_watch_script();
+    let code = watch_loop(&roots, move || {
+        match &channel {
+            Some(channel) => {
+                child = hmr_round(
+                    channel,
+                    file.clone(),
+                    &args,
+                    &mut state,
+                    child.take(),
+                    entry.as_deref(),
+                );
             }
-            child = build_and_spawn_run(file.clone(), &args, entry.as_deref());
+            None => {
+                // The plain restart loop recompiles and respawns wholesale, so
+                // the per-leg skip doesn't drop in naturally here (there are no
+                // retained per-leg artifacts to reuse) (backlog E12).
+                if let Some(mut previous) = child.take() {
+                    let _ = previous.kill();
+                    let _ = previous.wait();
+                    // The child is reaped, so nothing holds the round's temp
+                    // script any more and it can be removed before the next one
+                    // writes it.
+                    remove_watch_script();
+                }
+                child = build_and_spawn_run(file.clone(), &args, entry.as_deref());
+            }
         }
+        // **This path has no failure verdict to give**, so it reports none, and
+        // [`watch_loop`]'s retry does not reach it (G14's determination, made
+        // here at the code):
+        //
+        // * Neither round *returns* one. `hmr_round` and `build_and_spawn_run`
+        //   both answer with an `Option<ManagedChild>`, and `None` there means
+        //   "no Node child to hold" — which a browser-only workspace produces on
+        //   a perfectly good round — while a failed HMR round returns the
+        //   PREVIOUS child, alive. The value cannot separate the two, and
+        //   reading a failure out of it would be inventing one.
+        // * The failure is already handled where it happens: a failed round
+        //   reports to the terminal, pushes `error` to the browser overlay, and
+        //   keeps the last good build running. `WatchState::failed` records that
+        //   for the classifier's benefit — recompile every leg next round — and
+        //   is not a verdict about the round.
+        // * The failure it would carry is the one the ruling deliberately does
+        //   not retry. On the dev loop the overwhelming failure is a compile
+        //   error, whose fix is the next edit; retrying it here would cost a
+        //   second full recompile of every leg and a second error overlay per
+        //   broken save.
+        //
+        // The transient case G14 is about — a hook hiccup — is legible on the
+        // `build` / `check` / `test` rounds, which is where the retry lives.
+        RoundOutcome::Succeeded
     });
     // Reached ONLY when there was nothing to watch — i.e. before any script was
     // written. The other two cleanup paths are the per-round delete above (which
@@ -1440,38 +1592,40 @@ fn build_and_spawn_run(
     }
 }
 
-/// Prints an `error: <message>` line and returns the failure code.
-fn report_error(message: &str) -> ExitCode {
+/// Prints an `error: <message>` line and answers with the caller's own failure
+/// value: an [`ExitCode`] for a command that reports straight to the process, a
+/// [`RoundOutcome`] for one a `--watch` session drives and must read.
+fn report_error<T: CommandFailure>(message: &str) -> T {
     eprintln!("{} {message}", paint::error_prefix());
-    ExitCode::FAILURE
+    T::failed()
 }
 
 /// Reports that a `none`-platform package can't be built (it's a pure library).
-fn no_host_platform() -> ExitCode {
+fn no_host_platform() -> RoundOutcome {
     eprintln!(
         "{} the platform is `none` (a pure library); pick a host to build for with \
          `--platform node` or `--platform browser`",
         paint::error_prefix()
     );
-    ExitCode::FAILURE
+    RoundOutcome::Failed
 }
 
 /// Reports that a `[library]` can't be built or run on its own — it's compiled only
 /// as a dependency of an app.
-fn not_buildable_library(name: &str) -> ExitCode {
+fn not_buildable_library(name: &str) -> RoundOutcome {
     eprintln!(
         "{} `{name}` is a `[library]`, built only as a dependency of an app, not on its own. \
          Verify its platform contract with `vilan check`, or build an app that depends on it.",
         paint::error_prefix()
     );
-    ExitCode::FAILURE
+    RoundOutcome::Failed
 }
 
 /// Checks a standalone `[library]`: it has no fixed build platform, so instead of a
 /// single-platform compile it verifies the **platform contract** (§4.2) — every
 /// module's `pkg::` imports must resolve for every platform that module's layer
 /// serves. Reports any violation; clean ⇒ success.
-fn check_library(dir: &Path, name: &str) -> ExitCode {
+fn check_library(dir: &Path, name: &str) -> RoundOutcome {
     let spec = vilan_core::manifest::resolve_library(dir);
     let violations = check_library_contract(&spec);
     if violations.is_empty() {
@@ -1479,12 +1633,12 @@ fn check_library(dir: &Path, name: &str) -> ExitCode {
             "{name}: {}",
             paint::out(paint::Style::GREEN, "platform contract OK")
         );
-        ExitCode::SUCCESS
+        RoundOutcome::Succeeded
     } else {
         for violation in &violations {
             eprintln!("{} {}", paint::error_prefix(), violation.msg);
         }
-        ExitCode::FAILURE
+        RoundOutcome::Failed
     }
 }
 
@@ -2500,13 +2654,10 @@ impl Project {
 /// Resolves the project from an optional path, then runs `action`. An explicit
 /// file is a single entry; a directory (or no path, via the working directory)
 /// is read from its `vilan.toml`.
-fn with_project(path: Option<PathBuf>, action: impl FnOnce(Project) -> ExitCode) -> ExitCode {
+fn with_project<T: CommandFailure>(path: Option<PathBuf>, action: impl FnOnce(Project) -> T) -> T {
     match resolve_project(path) {
         Ok(project) => action(project),
-        Err(message) => {
-            eprintln!("{} {message}", paint::error_prefix());
-            ExitCode::FAILURE
-        }
+        Err(message) => report_error(&message),
     }
 }
 
@@ -2974,7 +3125,7 @@ fn compile_unit(
 
 /// Builds a lone package / bare file, writing `<entry>.mjs` on a process leg
 /// and `<entry>.js` on the browser (or printing to stdout).
-fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool) -> ExitCode {
+fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool) -> RoundOutcome {
     let mut chunks = Vec::new();
     // A lone package writes `<entry>.<ext>` beside its source, so the entry file's
     // own stem is what its chunks are named after.
@@ -2993,7 +3144,9 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         Some((leg.as_str(), &mut chunks)),
     ) {
         Ok(compiled) => compiled,
-        Err(code) => return code,
+        // The `Err` is the whole verdict: every fallible step here answers with
+        // `ExitCode::FAILURE`, so the discarded code says nothing more.
+        Err(_) => return RoundOutcome::Failed,
     };
     if stdout {
         // `--stdout` is one stream, so it carries the eager bundle. A split
@@ -3001,7 +3154,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         // Bundled resources are files by construction too, so `--stdout`
         // carries none of them either — it prints a bundle, not a build.
         print!("{}", compiled.javascript);
-        return ExitCode::SUCCESS;
+        return RoundOutcome::Succeeded;
     }
     // Before the writers, which record the files this leg's facts explain.
     explain::leg_facts(&leg, compiled.explain);
@@ -3016,16 +3169,18 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         &mut BTreeMap::new(),
     ) {
         Ok(assets) => assets,
-        Err(code) => return code,
+        Err(_) => return RoundOutcome::Failed,
     };
-    if let Err(code) = write_chunks(
+    if write_chunks(
         &output_path,
         &chunks,
         styles.as_deref(),
         &assets,
         matches!(platform, Platform::Browser),
-    ) {
-        return code;
+    )
+    .is_err()
+    {
+        return RoundOutcome::Failed;
     }
     match fs::write(&output_path, compiled.javascript) {
         Ok(()) => {
@@ -3041,7 +3196,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
             // failed has not written the tree it would be explaining, and its
             // diagnostics are the account it owes.
             explain::print();
-            ExitCode::SUCCESS
+            RoundOutcome::Succeeded
         }
         Err(error) => {
             eprintln!(
@@ -3049,13 +3204,13 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
                 paint::error_prefix(),
                 output_path.display()
             );
-            ExitCode::FAILURE
+            RoundOutcome::Failed
         }
     }
 }
 
 /// Type-checks a lone package / bare file, writing no output.
-fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
+fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> RoundOutcome {
     match compile_unit(
         unit,
         platform,
@@ -3071,9 +3226,9 @@ fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
                 unit.entry.display(),
                 paint::out(paint::Style::GREEN, "no errors")
             );
-            ExitCode::SUCCESS
+            RoundOutcome::Succeeded
         }
-        Err(code) => code,
+        Err(_) => RoundOutcome::Failed,
     }
 }
 
@@ -3115,15 +3270,15 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
 /// — a `none` member is a pure library, compiled only as a dependency of a host.
 /// Members build in declaration order (the client before the server, so the
 /// server's `dist/client.js` exists). `--platform`/`--stdout` don't apply.
-fn build_workspace(root: &Path, members: &[(Unit, Platform)], debug: bool) -> ExitCode {
+fn build_workspace(root: &Path, members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
     match build_workspace_artifacts(root, members, debug, Emission::AsDeclared) {
         Ok(()) => {
             // Every leg is written, so the report is complete — see
             // `build_single` for why only a successful build prints one.
             explain::print();
-            ExitCode::SUCCESS
+            RoundOutcome::Succeeded
         }
-        Err(code) => code,
+        Err(_) => RoundOutcome::Failed,
     }
 }
 
@@ -3247,7 +3402,7 @@ fn build_workspace_artifacts(
 
 /// Type-checks every member of a workspace (each for its own platform; a `none`
 /// library against the base layer).
-fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> ExitCode {
+fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
     let mut ok = true;
     for (unit, platform) in members {
         ok &= compile_unit(
@@ -3262,9 +3417,9 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> ExitCode {
         .is_ok();
     }
     if ok {
-        ExitCode::SUCCESS
+        RoundOutcome::Succeeded
     } else {
-        ExitCode::FAILURE
+        RoundOutcome::Failed
     }
 }
 
@@ -3396,12 +3551,12 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
 /// Runs the package's `*_test.vl` tests: each is compiled and executed, passing if
 /// it exits 0 (a failed `assert` panics -> non-zero). Reports a pass/fail summary
 /// and exits non-zero if any test fails.
-fn test(path: Option<PathBuf>) -> ExitCode {
+fn test(path: Option<PathBuf>) -> RoundOutcome {
     let tests = match discover_tests(path) {
         Ok(tests) => tests,
         Err(message) => {
             eprintln!("{} {message}", paint::error_prefix());
-            return ExitCode::FAILURE;
+            return RoundOutcome::Failed;
         }
     };
     if tests.is_empty() {
@@ -3409,7 +3564,7 @@ fn test(path: Option<PathBuf>) -> ExitCode {
             "{}",
             paint::out(paint::Style::DIM, "no `*_test.vl` tests found")
         );
-        return ExitCode::SUCCESS;
+        return RoundOutcome::Succeeded;
     }
     println!(
         "running {} test(s)",
@@ -3452,9 +3607,9 @@ fn test(path: Option<PathBuf>) -> ExitCode {
         paint::out(failed_style, &format!("{failed} failed"))
     );
     if failed == 0 {
-        ExitCode::SUCCESS
+        RoundOutcome::Succeeded
     } else {
-        ExitCode::FAILURE
+        RoundOutcome::Failed
     }
 }
 

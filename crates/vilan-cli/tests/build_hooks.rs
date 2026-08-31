@@ -839,6 +839,49 @@ fn watch_manifest(inputs: &str) -> String {
     )
 }
 
+/// [`watch_manifest`] over `input.txt`, plus one more `[build] run` command —
+/// the one whose failure the retry pins are about (G14).
+///
+/// Its position in the round is the whole fixture: it runs AFTER the round
+/// counter, so a round is counted whether or not it goes on to fail, and BEFORE
+/// the declared hook, which a failed round therefore never reaches. That makes
+/// `ran.txt` the observable for "the round completed" and `rounds.txt` the one
+/// for "a round started".
+fn watch_manifest_failing(command: &str) -> String {
+    format!(
+        "[package]\nname = \"app\"\n\n[build]\nrun = [{}, {}]\n\n[[build.hook]]\nname = \"gen\"\n\
+         run = [{}, {}]\ninputs = \"input.txt\"\noutputs = \"generated.txt\"\n",
+        toml_string(&append("rounds.txt")),
+        toml_string(command),
+        toml_string(&append("ran.txt")),
+        toml_string(&write_line("generated.txt", "generated"))
+    )
+}
+
+/// A hook command that fails ONCE and then succeeds: while `marker` exists it
+/// removes it and exits non-zero, so the very next invocation passes. The
+/// transient failure G14 is about, made deterministic — no sleeps, no load
+/// dependence, and armed by the test at the moment it chooses.
+fn fail_once(marker: &str) -> String {
+    if cfg!(windows) {
+        format!("if exist {marker} (del {marker} & exit 1)")
+    } else {
+        format!("if [ -f {marker} ]; then rm {marker}; exit 1; fi")
+    }
+}
+
+/// A hook command that fails EVERY time `marker` exists, counting each
+/// invocation in `attempts` first. Counting inside the failing command is what
+/// makes "exactly twice per change" observable: the round and its one retry
+/// both reach it, and nothing else does.
+fn fail_while(marker: &str, attempts: &str) -> String {
+    if cfg!(windows) {
+        format!("if exist {marker} (echo ran>> {attempts} & exit 1)")
+    } else {
+        format!("if [ -f {marker} ]; then printf 'ran\\n' >> {attempts}; exit 1; fi")
+    }
+}
+
 /// Starts `vilan build --watch` over `dir`. `build`, not `run`: the pins are
 /// about the wake-up set, and a build round spawns no program, binds no port
 /// and leaves no `node` grandchild to reap. The loop's narration (banner,
@@ -871,14 +914,23 @@ fn wait_for_in(dir: &Path, label: &str, condition: impl Fn() -> bool) -> Duratio
     wait_nudged(dir, label, || {}, condition)
 }
 
-/// [`wait_for_in`], re-invoking `nudge` every ~20 s while it waits. The watch
-/// loop consumes a snapshot difference BEFORE it re-runs the action, so a
-/// round lost to a transient action failure is lost for good — a one-shot
-/// trigger then hangs the full bound on a healthy watcher (the flake-shaped
-/// Windows red, hypothesis H-A). Re-touching the trigger makes the positive
-/// pins immune to a single lost round without weakening them: if the wake-up
-/// set is wrong, no amount of re-touching wakes it. Never used by the
-/// negative pin, whose whole claim is that nothing fires.
+/// [`wait_for_in`], re-invoking `nudge` every ~20 s while it waits. A one-shot
+/// trigger that goes unheard for any reason hangs the full bound on an
+/// otherwise healthy watcher (the flake-shaped Windows red, hypothesis H-A).
+/// Re-touching the trigger makes the positive pins immune to a single lost
+/// round without weakening them: if the wake-up set is wrong, no amount of
+/// re-touching wakes it.
+///
+/// The specific loss that motivated it — a round eaten by a transient action
+/// failure, the difference consumed before the action ran — is now the loop's
+/// own business (G14: a failed round keeps its change and re-fires once), so
+/// this is belt-and-braces against the shapes that remain (a filesystem whose
+/// mtime granularity swallows a rewrite, a snapshot read racing a write).
+///
+/// Two callers never use it, each for its own reason: the negative pin, whose
+/// whole claim is that nothing fires, and the retry pins, whose claim is that
+/// the RETRY landed the change — a re-touch there would start a fresh round
+/// and prove nothing.
 fn wait_nudged(
     dir: &Path,
     label: &str,
@@ -1000,6 +1052,124 @@ fn a_file_added_under_a_declared_directory_input_starts_a_watch_round() {
         || runs(&dir, "rounds.txt") >= 2,
     );
     wait_for_in(&dir, "the hook the new icon re-runs", || {
+        runs(&dir, "ran.txt") >= 2
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── A failed round keeps its change, and is retried exactly once (G14) ──
+//
+// The defect these close: the loop consumed a snapshot difference BEFORE it ran
+// the action (`snapshot = next; action()`), so a round whose action failed for
+// any transient reason — a `cmd` hiccup on a loaded runner, a hook racing
+// something outside the tree — could never re-fire. The difference was spent and
+// the session sat healthy and silent until some unrelated file moved.
+//
+// The ruling (2026-08-29) is a restored difference and ONE retry, so the two
+// pins are the two halves of that sentence: the transient failure loses no
+// round, and the persistent one costs exactly two runs and then rests.
+
+#[test]
+fn a_transiently_failing_round_keeps_its_change_and_retries() {
+    // Arm a `[build] run` command to fail exactly once, edit a declared input,
+    // and the hook still runs for that edit: the round the failure ate is given
+    // back by the retry.
+    //
+    // The pin's claim rests on NOT re-touching the trigger — `wait_for_in`
+    // never nudges (unlike `wait_nudged`, which the positive G10 pins above
+    // use), so the only thing that can produce the second hook run is the loop
+    // re-firing a difference it kept. On the unfixed tree this waits out its
+    // whole bound.
+    let dir = temp_project("watch_transient_failure");
+    write(
+        &dir,
+        "vilan.toml",
+        &watch_manifest_failing(&fail_once("fail-once.txt")),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+    let _watcher = spawn_watch(&dir);
+
+    // The hook, not the round counter: `ran.txt` is written after the failing
+    // command, so seeing it proves round 1 got past the command before the test
+    // arms it.
+    wait_for_in(&dir, "the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
+
+    // Arm the failure, then make the ONE edit whose round it eats. The marker is
+    // neither a `.vl` file nor a declared input, so arming starts no round of
+    // its own — which is exactly what the negative pin above proves.
+    write(&dir, "fail-once.txt", "fail the next round\n");
+    write(&dir, "input.txt", "two\n");
+
+    wait_for_in(&dir, "the hook the retried round re-runs", || {
+        runs(&dir, "ran.txt") >= 2
+    });
+    // The failure really happened — otherwise the pin would be green on a tree
+    // where nothing was ever retried, and the marker is how that is visible: the
+    // command deletes it on the invocation it fails.
+    assert!(
+        !dir.join("fail-once.txt").exists(),
+        "the armed command must have run and failed once"
+    );
+    // Two rounds' worth of the counter for one edit: the round that failed and
+    // the retry that succeeded (plus round 1).
+    assert!(
+        runs(&dir, "rounds.txt") >= 3,
+        "the failed round and its retry are two rounds: {}",
+        runs(&dir, "rounds.txt")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_persistently_failing_round_runs_twice_and_then_waits() {
+    // The guard, without which the pin above would describe a spin: a command
+    // that fails every time runs the round and ONE retry per change, and then
+    // the session goes quiet until the next change — it does not hammer the
+    // failing tree once per poll.
+    let dir = temp_project("watch_persistent_failure");
+    write(
+        &dir,
+        "vilan.toml",
+        &watch_manifest_failing(&fail_while("armed.txt", "attempts.txt")),
+    );
+    write(&dir, "src/main.vl", MAIN);
+    write(&dir, "input.txt", "one\n");
+    let _watcher = spawn_watch(&dir);
+
+    let first_round = wait_for_in(&dir, "the first round", || runs(&dir, "rounds.txt") >= 1);
+    wait_for_in(&dir, "the first round's hook", || {
+        runs(&dir, "ran.txt") >= 1
+    });
+
+    write(&dir, "armed.txt", "fail every round\n");
+    write(&dir, "input.txt", "two\n");
+    wait_for_in(&dir, "the failed round and its one retry", || {
+        runs(&dir, "attempts.txt") >= 2
+    });
+
+    // Exactly two, held across a window scaled to this machine's own round
+    // (E32's rule): a third attempt would mean the difference was never
+    // consumed, which is the hot loop the once-only guard exists to prevent.
+    let quiet = Instant::now();
+    let window = support::round_budget(first_round);
+    while quiet.elapsed() < window {
+        assert_eq!(
+            runs(&dir, "attempts.txt"),
+            2,
+            "a failing round is retried once, never spun"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // And the session is alive rather than wedged on the failure — otherwise the
+    // window above is vacuous. Disarm, edit, and the next change rounds normally.
+    std::fs::remove_file(dir.join("armed.txt")).expect("disarm the failing command");
+    write(&dir, "input.txt", "three\n");
+    wait_for_in(&dir, "the round a later change still starts", || {
         runs(&dir, "ran.txt") >= 2
     });
     let _ = std::fs::remove_dir_all(&dir);

@@ -52,6 +52,7 @@ appendix/gotchas.md h2 services--the-wire
 appendix/gotchas.md h2 process--testing
 guide/dev-loop.md h1 the-dev-loop
 guide/dev-loop.md h2 what-each-edit-does
+guide/dev-loop.md h2 when-a-round-fails
 guide/dev-loop.md h2 what-carries-across-a-swap-and-what-resets
 guide/dev-loop.md h2 escape-hatches
 guide/dev-loop.md h2 running-something-alongside-the-build
