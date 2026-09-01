@@ -513,12 +513,24 @@ backed enums, native though they are for `==` and `<`, have no `Add` at
 all — a backing value is a lowering detail, not a number to compute
 with.
 
+An **unbounded generic parameter** is one of the things "anything else"
+covers. A declaration is checked once for all its instantiations, so a
+parameter admits only what its bounds promise, and an unbounded one
+promises nothing: it is neither a string form nor the left operand's
+type. Bound it — `Display` and an explicit `to_string()` to concatenate,
+the operator's own trait to add — or take a concrete type.
+
 ```vilan,fragment
 "n=" + count                 // str + i32 — concatenation
 "p=" + point                 // error: `Point` has no string form
 "p=" + point.to_string()     // the fix the error names
 count + "n="                 // error: only a `str` LEFT operand concatenates
 1.5 + count                  // error: f64 and i32; no implicit conversions
+```
+
+```vilan,fragment
+fun show<T>(value: T): str { "v=" + value }              // error: `T` is unbounded
+fun show<T: Display>(value: T): str { "v=" + value.to_string() }   // the fix
 ```
 
 `is` (§3.7 level 10) tests a value against a match pattern and yields

@@ -4821,18 +4821,16 @@ fn a_closure_or_function_reference_concatenated_into_a_string_is_rejected() {
 }
 
 #[test]
-#[ignore = "B148 residual: an unbounded generic right operand still escapes the check"]
 fn an_unbounded_generic_concatenated_into_a_string_is_rejected() {
-    // KNOWN BUG. The rule only rejects a GROUNDED right operand, the same
-    // leniency B24 gave the comparisons, so a bare `T` passes and every
-    // instantiation of `show` prints the runtime shape — `show(Point { … })`
-    // still emits `"v=" + value` and prints `v=1,2`.
+    // B169 (was b148's recorded residual). The rule only rejected a GROUNDED
+    // right operand, the same leniency B24 gave the comparisons, so a bare
+    // `T` passed and every instantiation of `show` printed the runtime shape
+    // — `show(Point { … })` emitted `"v=" + value` and printed `v=1,2`.
     //
     // The declaration is checked once for all instantiations (§5.7's note on
-    // generic parameters), so the honest fix is a refusal HERE with a
-    // `T: Display` steer, not a per-monomorphization check — but which of
-    // those the language wants is a design call, and the operand rule this
-    // pin belongs to does not settle it.
+    // generic parameters), so the fix is the refusal HERE that pin asked for,
+    // not a per-monomorphization check: an unbounded parameter promises
+    // nothing, and nothing is not a string form.
     assert_fails_with(
         r#"
         fun show<T>(value: T): str {
@@ -4844,6 +4842,98 @@ fn an_unbounded_generic_concatenated_into_a_string_is_rejected() {
         }
         "#,
         "has no string form",
+    );
+}
+
+#[test]
+fn an_unbounded_generic_added_to_a_number_is_rejected() {
+    // The other half of the admitted set: `T + T` needs the operands to BE
+    // the same type, and an unbounded parameter is not known to be `i32`.
+    // `total + value` emitted the host's `+` and `add(Point { … })` returned
+    // the string `"1,2"` typed as `i32`.
+    assert_fails_spanning(
+        r#"
+        fun add<T>(value: T, total: i32): i32 {
+            total + value
+        }
+
+        fun main() {
+            let _n = add(5, 1);
+        }
+        "#,
+        "total + value",
+        "the operands are `i32` and `T`",
+    );
+}
+
+#[test]
+fn an_unbounded_generic_in_an_i_string_hole_is_rejected() {
+    // The hole is this same concatenation, so it is refused at the same
+    // place — and this is the spelling that actually turns up in a generic
+    // `Display`-ish helper.
+    assert_fails_with(
+        r#"
+        fun show<T>(value: T): str {
+            i"v={value}"
+        }
+
+        fun main() {
+            let _text = show(5);
+        }
+        "#,
+        "has no string form",
+    );
+}
+
+#[test]
+fn a_generic_right_operand_bounded_to_its_peer_still_adds() {
+    // The refusal must not reach a parameter that IS known to be the left
+    // operand's type: a bound the operator dispatches through carries the
+    // promise, and the `T + T` form keeps working.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        fun total<T: Add>(a: T, b: T): T {
+            a + b
+        }
+
+        fun main() {
+            print(total(1, 2));
+            print(total("a", "b"));
+        }
+        "#,
+        "3\nab\n",
+    );
+}
+
+#[test]
+fn the_to_string_steer_for_a_generic_operand_compiles_and_renders() {
+    // The refusal names `Display` + `.to_string()`; that has to be a working
+    // spelling, or the rule would leave a generic helper with no way to
+    // render its own parameter.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun show<T: Display>(value: T): str {
+            "v=" + value.to_string()
+        }
+
+        fun main() {
+            print(show(Point { x = 1, y = 2 }));
+            print(show(5));
+        }
+        "#,
+        "v=(1, 2)\nv=5\n",
     );
 }
 

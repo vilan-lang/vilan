@@ -32675,15 +32675,56 @@ impl<'src> Analyzer<'src> {
                         continue;
                     }
                     let rhs_type = self.infer_type(rhs_id, &lhs_type, &HashMap::default());
-                    let admitted = if concatenating {
-                        self.renders_into_a_string(&rhs_type)
-                    } else {
-                        self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
-                    };
-                    if grounded(&rhs_type) && !admitted {
+                    // B169 (b148's recorded residual): an UNBOUNDED parameter
+                    // was not grounded, so the leniency B24 gave the
+                    // comparisons carried it past the gate — and `compare_type`
+                    // then ADMITTED it, since a parameter compares equal to
+                    // whatever is asked of it. Nothing downstream would type it
+                    // either: the declaration is checked once for all
+                    // instantiations (§5.7). So `fun show<T>(value: T): str
+                    // { "v=" + value }` compiled and `show(Point { … })`
+                    // printed `v=1,2`, and `total + value` against an `i32`
+                    // emitted the host's `+` over whatever was passed.
+                    //
+                    // A BOUND is a promise and keeps its leniency: `T: Add` on
+                    // the right of `a + b` is `B = Self` through the dispatch,
+                    // and a parameter bound to the left operand's own type is
+                    // exactly what the admitted set wants. Only the unbounded
+                    // case promises nothing — and nothing is neither a string
+                    // form nor the left operand's type.
+                    let unbounded_generic = matches!(
+                        &rhs_type,
+                        Type::Generic(constraint_id)
+                            if self.generic_bound_trait_ids(*constraint_id).is_empty()
+                    );
+                    let admitted = !unbounded_generic
+                        && if concatenating {
+                            self.renders_into_a_string(&rhs_type)
+                        } else {
+                            self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
+                        };
+                    if (grounded(&rhs_type) || unbounded_generic) && !admitted {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
-                        let msg = if concatenating {
+                        let msg = if unbounded_generic && concatenating {
+                            format!(
+                                "`+` on `str` concatenates, and `{rhs_label}` has no string form: \
+                                 a parameter promises only what its bounds promise, and this one \
+                                 is unbounded, so every instantiation would concatenate the \
+                                 value's runtime shape — a struct as a tuple, an enum as a tagged \
+                                 array. Bound it with `Display` and concatenate \
+                                 `value.to_string()`; an i-string hole is this same \
+                                 concatenation, so it needs the same pair"
+                            )
+                        } else if unbounded_generic {
+                            format!(
+                                "`+` adds two values of the same type, but the operands are \
+                                 `{lhs_label}` and `{rhs_label}`: a parameter promises only what \
+                                 its bounds promise, and this one is unbounded — nothing says it \
+                                 is `{lhs_label}`. Bound it (`<{rhs_label}: Add>`), or take a \
+                                 concrete type"
+                            )
+                        } else if concatenating {
                             // Not "or interpolate it": an i-string hole lexes to
                             // this very concatenation and is refused here too,
                             // so steering to one would steer into the same
