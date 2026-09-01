@@ -28903,10 +28903,19 @@ impl<'src> Analyzer<'src> {
     /// ambient and this package is not on it — the misdirection the two-set
     /// design creates, whose fix is a manifest line, not an import.
     ///
-    /// Keeps the existing `; …` suffix shape so `vilan-lsp`'s `unresolved_name`
-    /// string parser is unaffected (it keys on the `; import it first` prefix,
-    /// which this arm deliberately does not use — a quickfix that inserted an
-    /// import here would be the wrong repair).
+    /// Keeps the existing `; …` suffix shape, which leaves `vilan-lsp`'s
+    /// `unresolved_name` parser reading the name exactly as it does for any
+    /// other miss: that parser keys on the `cannot find '` PREFIX, not on the
+    /// suffix, so the add-import quickfix IS offered beside this steer. That is
+    /// wanted, not tolerated — the module-carried entries left the steer's set
+    /// with the F2 fix below, so every name that still reaches here has a real
+    /// declaring module and the import compiles. Two repairs, both correct: the
+    /// manifest line the message argues for (this program is web-shaped and
+    /// will want the rest of the set) and the one-name import the editor can
+    /// apply. Pinned on the LSP side by
+    /// `document.rs::quickfix_offers_the_add_import_beside_the_web_set_steer`,
+    /// because this paragraph previously claimed the opposite and nothing
+    /// caught it (E110, audit run 6's F22).
     fn web_prelude_steer(&mut self, name: &str) -> Option<String> {
         if self.entry_prelude_path.as_deref() == Some(crate::manifest::WEB_PRELUDE) {
             return None;

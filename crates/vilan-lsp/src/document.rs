@@ -3654,6 +3654,72 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E110 (audit run 6, F22): a name the WEB set would have made ambient
+    // carries the manifest steer analyzer-side (`prelude = "std::web"`), and
+    // the add-import quickfix is offered beside it. `web_prelude_steer`'s
+    // comment used to claim the opposite — that the arm's different suffix
+    // steered the LSP's `unresolved_name` parser off — which was never true:
+    // that parser keys on the `cannot find '` PREFIX, and every name still in
+    // the steer's set has a real declaring module (the module-carried entries
+    // left it with F2). Two repairs, both of which compile; the pin is what
+    // keeps the comment from drifting back.
+    #[test]
+    fn quickfix_offers_the_add_import_beside_the_web_set_steer() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tlet _s = Signal;\n}\n")]);
+        let steered = document
+            .diagnostics
+            .iter()
+            .find(|error| error.msg.contains("cannot find 'Signal'"))
+            .expect("the unresolved name is reported");
+        assert!(
+            steered.msg.contains("prelude of the web set"),
+            "the analyzer's own steer is the premise of this pin: {}",
+            steered.msg
+        );
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let signal_fixes: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title.contains("`Signal`"))
+            .collect();
+        assert_eq!(
+            signal_fixes.len(),
+            1,
+            "expected exactly one unambiguous `Signal` fix: {:?}",
+            fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            signal_fixes[0].replacement, "import std::reactive::Signal;\n",
+            "{}",
+            signal_fixes[0].title
+        );
+        // Applied and re-analyzed: the import is a repair, not a detour — which
+        // is the whole reason the quickfix is wanted here rather than silenced.
+        let mut applied = text.to_string();
+        applied.replace_range(
+            signal_fixes[0].span.into_range(),
+            &signal_fixes[0].replacement,
+        );
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed
+                .diagnostics
+                .iter()
+                .all(|error| !error.msg.contains("cannot find 'Signal'")),
+            "applying the fix should resolve the name: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // An AMBIGUOUS name — two sibling modules each declare it — offers one
     // quickfix PER CANDIDATE, never a guess.
     #[test]
