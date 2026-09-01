@@ -5263,10 +5263,9 @@ fn a_display_bound_reached_through_a_supertrait_still_renders() {
 }
 
 #[test]
-#[ignore = "B176's numeric sibling, found by the b176 lane and awaiting an \
-            item of its own: a BOUNDED generic right operand of a NATIVE \
-            numeric `+` is still admitted unchecked, and no bound can promise \
-            what that position needs"]
+#[ignore = "B179: a BOUNDED generic right operand of a NATIVE numeric `+` is \
+            still admitted unchecked, and no bound can promise what that \
+            position needs — the refuse-or-admit ruling is B179's"]
 fn a_bounded_generic_added_to_a_number_is_rejected() {
     // KNOWN BUG. B169 closed the unbounded case here and B176 closed the
     // concatenating case for a bound; this is the square neither covers.
