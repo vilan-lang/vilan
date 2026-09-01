@@ -6991,3 +6991,210 @@ fn a32_a_custom_signal_impl_drives_the_process_bind_value() {
         "<input value=\"SHOUT\">\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B157 — std's `MaybeSignal`: one parameter, static value or reactive one
+// ---------------------------------------------------------------------------
+
+/// The pattern, whole and from std: one bound, two call forms, no ceremony.
+/// The static arm fires once; the reactive arm subscribes and keeps firing.
+#[test]
+fn b157_std_maybe_signal_takes_a_static_value_and_a_source() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ MaybeSignal, Signal, SignalCell, comp };
+
+        fun badge<V: MaybeSignal<str>>(label: V) {
+            label.bind(|text| print(i"[{text}]"));
+        }
+
+        fun main() {
+            let (_value, _owner) = comp(|| {
+                badge("draft");
+                let live = Signal::new("saved");
+                badge(live);
+                live.set("synced");
+                0
+            });
+        }
+        main();
+        "#,
+        "[draft]\n[saved]\n[synced]\n",
+    );
+}
+
+/// A user's own `Source` reaches the reactive arm too — the bounded blanket is
+/// written over the TRAIT, so it admits every source and not only the cell.
+#[test]
+fn b157_a_user_source_reaches_the_reactive_arm() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::reactive::{{ MaybeSignal, Signal, SignalCell, Source, Subscription, comp }};
+        {A_USER_SOURCE}
+        fun badge<V: MaybeSignal<str>>(label: V) {{
+            label.bind(|text| print(i"[{{text}}]"));
+        }}
+
+        fun main() {{
+            let (_value, _owner) = comp(|| {{
+                let stored: Stored<str> = Stored::new("kept");
+                badge(stored);
+                stored.set("moved");
+                0
+            }});
+        }}
+        main();
+        "#
+        ),
+        "[kept]\n[moved]\n",
+    );
+}
+
+/// The bound decides which INSTANTIATION is wanted before specificity is
+/// consulted: the same `SignalCell<str>` under `MaybeSignal<SignalCell<str>>`
+/// is a static value of that type, through the blanket, and its handler
+/// receives the cell itself.
+#[test]
+fn b157_a_nested_bound_reads_a_cell_as_a_static_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::reactive::{ MaybeSignal, Signal, SignalCell, Source, comp };
+
+        fun holder<V: MaybeSignal<SignalCell<i32>>>(slot: V) {
+            slot.bind(|inner| print(i"holder {inner.get()}"));
+        }
+
+        fun main() {
+            let (_value, _owner) = comp(|| {
+                let live = Signal::new(7);
+                holder(live);
+                0
+            });
+        }
+        main();
+        "#,
+        "holder 7\n",
+    );
+}
+
+/// A user's own impl outranks std's blanket where both match — the specificity
+/// order applies to std's arms like any others, so a type may take over its own
+/// `bind`.
+#[test]
+fn b157_a_users_own_impl_outranks_stds_blanket() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ MaybeSignal, comp };
+
+        struct Tag { text: str }
+
+        impl Tag with MaybeSignal<str> {
+            fun bind(self, react: |str| void) { react(i"<{self.text}>"); }
+        }
+
+        fun badge<V: MaybeSignal<str>>(label: V) {
+            label.bind(|text| print(i"[{text}]"));
+        }
+
+        fun main() {
+            let (_value, _owner) = comp(|| {
+                badge("plain");
+                badge(Tag { text = "own" });
+                0
+            });
+        }
+        main();
+        "#,
+        "[plain]\n[<own>]\n",
+    );
+}
+
+/// The reactive arm registers with the ambient owner, so a REACTIVE value
+/// outside every boundary is refused — the requirement is static and flows
+/// through the bound to the call that supplied the source.
+#[test]
+fn b157_a_reactive_value_outside_a_boundary_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ MaybeSignal, Signal, SignalCell };
+
+        fun badge<V: MaybeSignal<str>>(label: V) {
+            label.bind(|text| print(text));
+        }
+
+        fun main() {
+            badge(Signal::new("no boundary"));
+        }
+        main();
+        "#,
+        "owner_scope",
+    );
+}
+
+/// …and a STATIC value needs none: the coverage refinement follows the
+/// instantiation the call selects, and the static arm registers nothing. A
+/// component that happens to be handed a plain string is not asked for a
+/// boundary it has no use for.
+#[test]
+fn b157_a_static_value_needs_no_boundary() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ MaybeSignal, Signal, SignalCell };
+
+        fun badge<V: MaybeSignal<str>>(label: V) {
+            label.bind(|text| print(text));
+        }
+
+        fun main() {
+            badge("no boundary");
+        }
+        main();
+        "#,
+        "no boundary
+",
+    );
+}
+
+/// The miscompile this shape opened, pinned: two BLANKETS separated only by
+/// their instantiation. Under `MaybeSignal<SignalCell<i32>>` only the static
+/// blanket provides what the bound asked for, but the bounded one's binder was
+/// never grounded from the receiver's own `Source` impl, so tier 2 could not
+/// tell them apart and tier 3 gave it to the stronger binder bound. The
+/// reactive body then ran against a value that was never a cell and the program
+/// printed `undefined`.
+#[test]
+fn b157_a_bounded_blanket_is_filtered_by_the_instantiation_the_bound_asked_for() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        trait Src<T> { fun read(self): T; }
+        trait Maybe<T> { fun show(self, react: |T| void); }
+
+        struct Cell { value: i32 }
+        impl Cell with Src<i32> { fun read(self): i32 { self.value } }
+
+        impl type T with Maybe<T> {
+            fun show(self, react: |T| void) { react(self); }
+        }
+        impl type S: Src<type T> with Maybe<T> {
+            fun show(self, react: |T| void) { react(self.read()); }
+        }
+
+        fun plain<V: Maybe<i32>>(v: V) { v.show(|n| print(i"plain {n}")); }
+        fun holder<V: Maybe<Cell>>(v: V) { v.show(|inner| print(i"holder {inner.read()}")); }
+
+        fun main() {
+            let cell = Cell { value = 7 };
+            plain(cell);
+            holder(cell);
+        }
+        main();
+        "#,
+        "plain 7
+holder 7
+",
+    );
+}
