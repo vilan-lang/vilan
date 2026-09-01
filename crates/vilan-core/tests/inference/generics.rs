@@ -4467,6 +4467,8 @@ fn a_blanket_impl_bound_resolves_from_a_generic_body() {
         main();
         "#,
         "<3>\n",
+    );
+}
 
 // --- M16: a T-independent generic body is emitted ONCE ----------------------
 
