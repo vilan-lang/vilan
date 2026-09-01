@@ -294,6 +294,190 @@ fn every_corpus_golden_is_byte_identical() {
     );
 }
 
+/// The directive a corpus program uses to name the bytes that carry a claim.
+const WITNESS_DIRECTIVE: &str = "// witness:";
+
+/// The negative form: bytes a claim says are ABSENT.
+const WITNESS_ABSENT_DIRECTIVE: &str = "// witness-absent:";
+
+/// The shortest a normalized POSITIVE witness may be. A one- or two-character
+/// witness (`(`, `;`) is in every golden and therefore pins nothing; the floor
+/// stops a directive from being written down as a no-op.
+///
+/// It applies to the positive form only, because the strength argument inverts
+/// for the negative one: a SHORT absent-witness is the harder claim (more
+/// goldens contain `finally` than contain `} finally { $a(r); }`), so the
+/// short-is-vacuous reasoning does not carry over, and `resource_exit.vl`'s
+/// seven-character `finally` is the strongest form of its own sentence.
+const SHORTEST_WITNESS: usize = 8;
+
+/// Collapses every run of ASCII whitespace to one space and trims, so a witness
+/// may be written on one comment line and still match bytes that the emitter
+/// spread over several indented lines.
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every `// witness:` / `// witness-absent:` line in `source`, normalized, as
+/// `(line number, present, witness)`.
+fn witnesses(source: &str) -> Vec<(usize, bool, String)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim_start();
+            // The two prefixes diverge before either colon (`witness:` against
+            // `witness-`), so neither is a prefix of the other and this order is
+            // a readability choice rather than a correctness one.
+            let (present, rest) = if let Some(rest) = trimmed.strip_prefix(WITNESS_ABSENT_DIRECTIVE)
+            {
+                (false, rest)
+            } else {
+                (true, trimmed.strip_prefix(WITNESS_DIRECTIVE)?)
+            };
+            Some((index + 1, present, normalize_whitespace(rest)))
+        })
+        .collect()
+}
+
+/// Audit run 7's F7/F8 rule, mechanized: a corpus program's prose claim is
+/// checked against the bytes it claims.
+///
+/// The finding that minted this: `resource.vl` said "Two locals drop in reverse
+/// declaration order at the scope end" and, since c8609287 moved disposal from
+/// the scope end to the LAST USE, neither local was read — so both dropped at
+/// their declaration, in declaration order, and the golden beside the sentence
+/// proved the opposite of it. The inference twins were adjusted in that commit;
+/// the corpus twins were not. Nothing was red, because a golden gate checks that
+/// the bytes are the bytes the compiler emits, never that they are the bytes the
+/// comment above them describes.
+///
+/// A `// witness:` line closes that gap by making the load-bearing bytes
+/// nameable. It is deliberately NOT a second copy of the golden: a witness names
+/// the FRAGMENT a claim rests on — the `finally` that has to close after the
+/// last statement, the drop that has to precede the write — so a regeneration
+/// that moves that fragment fails here with the claim's own words beside it,
+/// where the byte gate would only have said "regenerate". The negative form
+/// (`// witness-absent:`) carries the claims that are about an emission NOT
+/// happening, which `resource_exit.vl`'s "no `finally` in the emitted bytes at
+/// all" is one of and which no positive substring can express.
+///
+/// Matching is whitespace-normalized on both sides, so a witness fits on one
+/// comment line and still spans the emitter's indented multi-line shapes. It is
+/// substring containment rather than a regex: a witness should be readable as
+/// the JS it names.
+///
+/// The rejected weaker design, recorded because it looks adequate: "every corpus
+/// program's leading comment mentions a token the emitted JS contains". It is
+/// vacuous against the very finding it would answer — `resource.vl`'s stale
+/// header mentioned "drop", the golden contains `drop`, and the check stays
+/// green through the whole regression. A claim is only checkable when the
+/// program says WHICH bytes are the claim.
+///
+/// The floors below keep the mechanism from rotting to nothing while it is still
+/// being adopted file by file; they rise as programs are annotated.
+#[test]
+fn every_declared_witness_is_in_its_golden() {
+    const FEWEST_ANNOTATED_PROGRAMS: usize = 2;
+    const FEWEST_WITNESSES: usize = 12;
+
+    let corpus = corpus_dir();
+    let mut annotated = 0usize;
+    let mut total = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&corpus)
+        .expect("corpus directory")
+        .map(|entry| entry.expect("corpus entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("vl") {
+            continue;
+        }
+        let golden_path = path.with_extension(GOLDEN_EXTENSION);
+        let Ok(golden) = std::fs::read_to_string(&golden_path) else {
+            continue;
+        };
+        let source = std::fs::read_to_string(&path).expect("read a corpus program");
+        let declared = witnesses(&source);
+        if declared.is_empty() {
+            continue;
+        }
+        annotated += 1;
+        total += declared.len();
+        let normalized_golden = normalize_whitespace(&golden);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        for (line, present, witness) in declared {
+            if present && witness.len() < SHORTEST_WITNESS {
+                failures.push(format!(
+                    "{name}:{line}: witness {witness:?} is shorter than {SHORTEST_WITNESS} \
+                     characters, so it pins nothing"
+                ));
+                continue;
+            }
+            if witness.is_empty() {
+                failures.push(format!("{name}:{line}: the witness is empty"));
+                continue;
+            }
+            if normalized_golden.contains(&witness) != present {
+                let complaint = if present {
+                    "is not in"
+                } else {
+                    "is in (and the claim above says it is absent from)"
+                };
+                failures.push(format!(
+                    "{name}:{line}: the declared witness {witness:?} {complaint} \
+                     {} — the claim above it is unwitnessed. Fix the program until \
+                     the claim holds, or correct the claim; do NOT relax the \
+                     witness to whatever the golden happens to say.",
+                    golden_path.display()
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} corpus witness(es) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert!(
+        annotated >= FEWEST_ANNOTATED_PROGRAMS && total >= FEWEST_WITNESSES,
+        "the witness mechanism has rotted: {annotated} annotated program(s) \
+         (floor {FEWEST_ANNOTATED_PROGRAMS}) carrying {total} witness(es) \
+         (floor {FEWEST_WITNESSES})"
+    );
+}
+
+/// The witness gate's own parsing, pinned: the two directives are told apart,
+/// whitespace normalization spans lines, and a bare `//` comment is not a
+/// witness.
+#[test]
+fn witness_directives_parse() {
+    let source = "// a claim\n\
+                  // witness: } finally {\t$a(a);\n\
+                  \t// witness-absent: finally\n\
+                  // witnessing something is not a directive\n";
+    let parsed = witnesses(source);
+    assert_eq!(
+        parsed,
+        vec![
+            (2, true, "} finally { $a(a);".to_string()),
+            (3, false, "finally".to_string()),
+        ],
+        "witness parsing changed"
+    );
+    assert_eq!(
+        normalize_whitespace("\ttry {\n\t\t$a(r);\n"),
+        "try { $a(r);",
+        "whitespace normalization must let a one-line witness span emitted lines"
+    );
+}
+
 /// The equivalence-gate rationale for HMR (A13, `hmr.md` §5): the `build` path
 /// never sets `BuildOptions.hmr`, so no corpus golden may carry the watch-only
 /// instrumentation (`__hmr_adopt*` / `__hmr_expose`). The runtime *guard*

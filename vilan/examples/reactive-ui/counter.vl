@@ -11,10 +11,9 @@
 // which is why the chain below writes `style::Display::Flex` and imports nothing
 // for it. The prelude carries the module, not its members, so you
 // qualify; importing the member `style` would SHADOW the module and take
-// `style::Display` with it, so the builder is qualified too.
-//
-// error in every TYPE position, so `counter_card`'s return cannot be written
-
+// `style::Display` with it, so the builder is qualified too. B172 made a
+// module-qualified path legal in TYPE position too, so `counter_card`'s return
+// is written `style::Style` and this file imports nothing at all.
 
 // Typed atomic styles (proposal/ui-styling.md): built inside `const`, so the
 // rules land in app.css at build time; `.styled(..)` just sets the classes.
