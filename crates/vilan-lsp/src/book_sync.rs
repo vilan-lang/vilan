@@ -368,7 +368,13 @@ const PINNED_MDBOOK: &str = "mdbook v0.5.4";
 /// `cargo test` does not, and this harness has to be honest under both.
 fn pinned_mdbook_or_refusal(program: &std::ffi::OsStr) -> Result<String, String> {
     let named = program.to_string_lossy().into_owned();
-    let install = "install it with `cargo install mdbook --version 0.5.4 --locked`";
+    // Read off the pin rather than spelled again: an install line naming a
+    // different version than the one being refused for is the same fork this
+    // whole function exists to prevent, one file further in.
+    let version = PINNED_MDBOOK
+        .rsplit_once(" v")
+        .map_or(PINNED_MDBOOK, |(_, version)| version);
+    let install = format!("install it with `cargo install mdbook --version {version} --locked`");
     let reported = match Command::new(program).arg("--version").output() {
         Err(error) => {
             return Err(format!(
