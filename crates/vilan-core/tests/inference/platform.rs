@@ -5052,7 +5052,9 @@ fn a_function_reference_left_operand_of_addition_is_rejected() {
 }
 
 #[test]
-#[ignore = "B170 residual: an unbounded generic LEFT operand still escapes the check"]
+#[ignore = "B174: an unbounded generic LEFT operand still escapes the check — \
+            refusing it is a bound requirement on every trait default written \
+            over the trait's own parameter, the deferred breaking step"]
 fn an_unbounded_generic_left_operand_of_addition_is_rejected() {
     // KNOWN BUG, and the one left-operand shape the fix deliberately did not
     // take. The declaration is checked once for all instantiations and an
