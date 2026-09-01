@@ -112,10 +112,20 @@ it is written into the literal, not read off the end of a line.
 
 ### Interpolated strings
 
+```text
+ISTRING          = 'i' , '"' , { istring_part } , '"' ;
+istring_part     = hole | istring_char ;
+hole             = '{' , expression , '}' ;
+istring_char     = "\" any_char_except_line_terminator
+                 | any_char_except_brace_quote_backslash_or_line_terminator ;
+```
+
 `i"…"` is an interpolated string: `{expr}` holes embed expressions; `\{`
-and `\}` are literal braces. The construct is defined by desugaring. An
-interpolated string is exactly equivalent to a parenthesized
-concatenation:
+and `\}` are literal braces. Every other escape is carried through as the
+plain twin carries it — `\` and the character it precedes, interpreted at
+code generation — and an unescaped `}` outside a hole is an error. The
+construct is defined by desugaring. An interpolated string is exactly
+equivalent to a parenthesized concatenation:
 
 ```text
 i"Hello, {name}!"   ≡   ("" + "Hello, " + (name) + "!")
