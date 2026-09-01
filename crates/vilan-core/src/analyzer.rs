@@ -24549,6 +24549,47 @@ impl<'src> Analyzer<'src> {
                                 );
                             }
                         }
+                        // B175: the same specialization for an ASSOCIATED
+                        // function reached through a BOUND — the impl-path form
+                        // of B162's `Trait::func`. `T::default()` under
+                        // `T: Default` resolves to the trait's own
+                        // `fun default(): Self`, and an associated function has
+                        // no `self`, so the receiver-driven branch above cannot
+                        // fire: `self_trait` is read off the first parameter and
+                        // there is none. The call therefore typed as the BOUND
+                        // (`Default`) instead of as the binder (`T`) the path
+                        // named. std's `List::sum`/`product` are the exhibit —
+                        // `mut total = T::default()` made `total` trait-typed,
+                        // so `total += item` reached the operator check with a
+                        // `Type::Trait` left operand, which is the only reason
+                        // B170 had to put that shape on the check's skip list.
+                        //
+                        // The binder is what the path named, so the binder is
+                        // what `Self` stands for. The accessor recorded both
+                        // halves when it resolved through the bound — the
+                        // constraint (`generic_dispatch`) and the trait that
+                        // provided the member (`bound_dispatch_traits`) — and
+                        // the same structural substitution the receiver branch
+                        // performs maps `Self`, nested occurrences included,
+                        // onto `Type::Generic(constraint)`. A `Trait::func()`
+                        // path is untouched: its subject is the trait itself,
+                        // not a bound binder, so it records no constraint here
+                        // and keeps typing as the trait (B162's ruling).
+                        if self_trait.is_none()
+                            && let Some(GenericDispatch::OnConstraint(constraint_id, _)) =
+                                self.generic_dispatch.get(&subject_id).copied()
+                            && let Some((bound_trait, _)) =
+                                self.bound_dispatch_traits.get(&subject_id).cloned()
+                            && self.mentions_self_trait(&return_type, bound_trait, 0)
+                        {
+                            let binder = Type::Generic(constraint_id).get_type_id(self);
+                            return self.substitute_member_type(
+                                &return_type,
+                                bound_trait,
+                                binder,
+                                &SubstitutionContext::default(),
+                            );
+                        }
                         return_type
                     }
                     // Not callable. The user-facing "cannot call a non-function
@@ -26023,6 +26064,29 @@ impl<'src> Analyzer<'src> {
                             let r = r_item_id.get_type(self);
                             self.compare_type_rigid(&l, &r, substitution_context, rigid)
                         })
+            }
+            // B177: an array is STRUCTURAL here too, and it was the one
+            // composite shape with no arm of its own — so it fell through to
+            // the `a == b` fallback at the bottom, which compares
+            // `Type::Array`'s ELEMENT TYPE ID. Ids are minted fresh per
+            // spelling and deliberately not interned (`type_id_for_type` says
+            // why: inference resolves a type in place, so a mutated id must
+            // stay unshared), which made an array type unequal to ITSELF
+            // written twice. `impl [i32; 2] with Add<i32>` was refused with
+            // "`type`'s `add` returns `[i32; 2]`, but `Add` declares
+            // `[i32; 2]`" — the same spelling on both sides — and no array
+            // impl could be written at all, while a tuple impl of the same
+            // shape passed on the arm above. Every other comparator already
+            // resolved the ids before comparing (`reconcile_type`'s array arm,
+            // `same_impl_type`'s, `impl_subject_matches`'s); this one now does
+            // too. The LENGTH is part of the type — `[i32; 3]` is not
+            // `[i32; 4]` — so it is compared first, by value.
+            (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
+                l_length == r_length && {
+                    let l = l_element.get_type(self);
+                    let r = r_element.get_type(self);
+                    self.compare_type_rigid(&l, &r, substitution_context, rigid)
+                }
             }
             // Same nominal type: compatible when the arguments are (a side with
             // no arguments is an erased/abstract `List`/`Option`, compatible with
@@ -33007,14 +33071,26 @@ impl<'src> Analyzer<'src> {
                         .map(move |(name, _)| (*name, declaring_trait_id))
                 })
                 .collect();
-            let subject_name = match check.subject_type_id.get_type(self) {
+            // B177: a conformance diagnostic that cannot say WHOSE member it
+            // means is barely a diagnostic (B170's rule, on the impl side). A
+            // non-struct subject used to fall back to the literal word "type",
+            // so an array impl's return mismatch read "`type`'s `add` returns
+            // …" — and every non-nominal subject reported as the same anonymous
+            // "type". A nominal subject is named by its declaration; everything
+            // else has a spelling, which is what `pretty_print_type` produces:
+            // `[i32; 2]`, `(i32, i32)`, `|i32| i32`.
+            let subject_type = check.subject_type_id.get_type(self);
+            let subject_name = match &subject_type {
                 Type::Struct(struct_id, _) => self
                     .structs
-                    .get(&struct_id)
-                    .map(|s| s.name)
-                    .unwrap_or("type"),
-                _ => "type",
-            };
+                    .get(struct_id)
+                    .map(|struct_| struct_.name.to_string()),
+                Type::Enum(enum_id, _) => {
+                    self.enums.get(enum_id).map(|enum_| enum_.name.to_string())
+                }
+                _ => None,
+            }
+            .unwrap_or_else(|| self.pretty_print_type(&subject_type, &HashMap::default()));
             let check_subject_type = check.subject_type_id.get_type(self);
             // Record a signature-conformance check for EVERY trait/supertrait
             // member the impl provides by name — required members AND overrides
@@ -33630,8 +33706,52 @@ impl<'src> Analyzer<'src> {
             if let Some(rhs_id) = rhs_id {
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let bool_type = self.bool_type();
-                    for (operand_id, side) in [(lhs_id, "left"), (rhs_id, "right")] {
+                    for (operand_id, side, is_right) in
+                        [(lhs_id, "left", false), (rhs_id, "right", true)]
+                    {
                         let operand = self.infer_type(operand_id, &bool_type, &HashMap::default());
+                        // B181, and the same membership principle B179 settled
+                        // for the native family: `grounded` excludes every
+                        // `Type::Generic`, so a parameter reached neither this
+                        // check nor a refusal, and `compare_type` would have
+                        // admitted it anyway (a parameter compares equal to
+                        // whatever is asked of it). `fun both<T>(flag: bool,
+                        // value: T): bool { flag && value }` compiled and
+                        // `both(true, Point { x = 1, y = 2 })` printed the
+                        // struct's runtime tuple — the VALUE, typed `bool`.
+                        //
+                        // A bound cannot rescue it. `&&` admits `bool` and
+                        // nothing else, no trait names that set (the logical
+                        // operators model no operator trait at all — there is
+                        // not even an impl to consult), and a bound promises a
+                        // trait's METHODS, never that the parameter IS `bool`.
+                        // So every generic right operand refuses, whatever it
+                        // is bounded to.
+                        //
+                        // The LEFT half waits with B174: refusing a parameter
+                        // there is the deferred breaking generics change, not
+                        // this miscompile fix.
+                        if is_right && matches!(operand, Type::Generic(_)) {
+                            let label = self.pretty_print_type(&operand, &HashMap::default());
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "`{symbol}` takes `bool` operands, and `{label}` is a type \
+                                         parameter: `bool`'s set is `bool` itself, no trait names \
+                                         it, and `{symbol}` models no operator trait to consult, so \
+                                         no bound on `{label}` can prove membership — a bound \
+                                         promises a trait's methods, never that the parameter IS \
+                                         `bool`. Test the value and combine the `bool`s, or declare \
+                                         this operand `bool`"
+                                    ),
+                                },
+                                binary_id,
+                            );
+                            continue;
+                        }
                         if grounded(&operand)
                             && !self.compare_type(&bool_type, &operand, &HashMap::default())
                         {
@@ -34066,13 +34186,30 @@ impl<'src> Analyzer<'src> {
             // `Mapped` is still symbolic, and a `Module` is not a value —
             // naming one as an operand is already someone else's diagnostic.
             //
-            // `Trait` skips for a reason of its own, and a census found it:
-            // std's `List<T: Add + Default>::sum` writes `mut total =
-            // T::default()`, and the multi-bound `T::default()` infers as the
-            // BOUND (`Default`) rather than as `T`, so `total += item` arrives
-            // here with a trait-typed left operand. Judging it would refuse
-            // std's own `sum`/`product` over an inference wart in a different
-            // subsystem, so the shape is left as it was and filed instead.
+            // B175 REMOVED `Trait` from that list. It skipped for a reason of
+            // its own — std's `List<T: Add + Default>::sum` wrote `mut total =
+            // T::default()`, and the bound-path `T::default()` inferred as the
+            // BOUND (`Default`) rather than as `T`, so `total += item` reached
+            // here with a trait-typed left operand and judging it would have
+            // refused std's own `sum`/`product` over an inference wart in a
+            // different subsystem. The wart is fixed (the `Self` return of an
+            // associated function reached through a bound now specializes to
+            // the binder), so the shape is judged like every other: a value
+            // typed as a BARE trait has no concrete type to dispatch to, and
+            // an operator on it is refused by the no-impl branch below.
+            //
+            // ONE trait-typed shape still skips, and it is the one with no
+            // actionable verdict to give: `self` inside a trait DEFAULT body is
+            // also `Type::Trait` (the same distinction `is_in_trait_default`
+            // draws for the method path). `self + self` in a default over a
+            // supertrait `Add` miscompiles today — it emits the host's `+` over
+            // two lowered structs — but refusing it would be advice nobody can
+            // act on: the explicit spelling `self.add(self)` does not resolve
+            // there either, and the binary emitter has no `OnType(None)` case
+            // to dispatch a default body's operand on the type being
+            // specialized. Both halves are one deeper defect (filed), and
+            // B170's own rule applies until it closes: a refusal a reader
+            // cannot act on is barely a refusal.
             if matches!(
                 lhs_type,
                 Type::Any
@@ -34081,8 +34218,8 @@ impl<'src> Analyzer<'src> {
                     | Type::Unresolved
                     | Type::Module(_)
                     | Type::Mapped(_, _, _)
-                    | Type::Trait(_, _)
-            ) {
+            ) || (matches!(lhs_type, Type::Trait(_, _)) && self.is_in_trait_default(binary_id))
+            {
                 continue;
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {
@@ -34220,6 +34357,21 @@ impl<'src> Analyzer<'src> {
                                  rendered this one with `.to_string()`"
                             )
                         }
+                        // B175: the shape B170 had to skip. A bare trait is the
+                        // one operand whose refusal must NOT name an impl: an
+                        // `impl Maker with Add` is not a thing that can be
+                        // written, so the standard advice would send the reader
+                        // after a declaration the language has no syntax for.
+                        // The rule is B4's — a trait is a bound, not a type —
+                        // and the register is B72's: name the rule, then the
+                        // declaration that works.
+                        (Type::Trait(_, _), _) => format!(
+                            "`{symbol}` models `{trait_name}`, and this operand is the bare trait \
+                             `{type_name}`: a trait is a bound, not a value type (vilan has no \
+                             trait objects), so there is no concrete type here for `{required}` to \
+                             dispatch to. Hold the value in a generic bounded by the trait \
+                             (`<T: {type_name}>`) and the operator resolves at each instantiation"
+                        ),
                         (Type::Void, _) => format!(
                             "`{symbol}` needs a value on the left, and this operand is `void`: the \
                              expression it comes from produces no value — a function that returns \

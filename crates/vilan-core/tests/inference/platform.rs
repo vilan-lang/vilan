@@ -7764,3 +7764,255 @@ fn a_closure_payload_capture_in_an_else_if_chain_calls_the_right_arm() {
         "second\n",
     );
 }
+
+// --- B175: `Type::Trait` comes OFF the operator check's skip list ------------
+//
+// B170 routed every left-operand SHAPE through the check and then had to carve
+// one back out: `Type::Trait`. std's `List<T: Add + Default>::sum` wrote `mut
+// total = T::default()`, the bound-path `T::default()` inferred as the BOUND,
+// and judging a trait-typed left operand would have refused std's own
+// `sum`/`product` over an inference wart in a different subsystem. B175 fixed
+// the wart (`traits::b175_*`), so the carve-out goes, and with it the hole:
+// a value typed as a bare trait now gets a verdict like every other shape.
+
+#[test]
+fn b175_a_bare_trait_left_operand_of_addition_is_rejected() {
+    // The hole B170 left open, entered the only way a bare trait value can be
+    // built now that all six DECLARATION positions refuse one (B4 §12.2): the
+    // return of a trait's own associated function, whose `Self` legitimately
+    // stays abstract on the `Trait::func` path (B162). Pre-fix this compiled —
+    // the check `continue`d before ever looking for an impl — and emitted the
+    // host's `+`.
+    assert_fails_spanning(
+        r#"
+        import std::io::panic;
+
+        trait Maker {
+            fun make(): Self { panic("no default") }
+        }
+
+        fun main() {
+            let m = Maker::make();
+            let _sum = m + 1;
+        }
+        "#,
+        "m + 1",
+        "this operand is the bare trait `Maker`",
+    );
+}
+
+#[test]
+fn b175_a_bare_trait_left_operand_is_refused_without_impl_advice() {
+    // The B170 rule about WHICH refusal, applied to the shape B170 skipped: a
+    // tuple and an array can act on "add `impl (i32, i32) with PartialEq`"
+    // because such an impl resolves; `impl Maker with PartialEq` is not a
+    // declaration the language has, so a bare trait must get the reason
+    // instead — a trait is a bound, not a type — and the steer that does work.
+    let source = r#"
+        import std::io::panic;
+
+        trait Maker {
+            fun make(): Self { panic("no default") }
+        }
+
+        fun main() {
+            let _same = Maker::make() == Maker::make();
+        }
+        "#;
+    assert_fails_with(source, "a trait is a bound, not a value type");
+    assert_fails_with(source, "(`<T: Maker>`)");
+    assert_fails_without(source, "add `impl Maker with PartialEq`");
+}
+
+#[test]
+fn b175_the_sibling_operators_refuse_a_bare_trait_too() {
+    // The carve-out gated the whole loop, not one operator, so every operator
+    // modelling a trait skipped its refusal for this shape.
+    for (operator, trait_name) in [("<", "PartialOrd"), ("-", "Sub"), ("*", "Mul")] {
+        assert_fails_with(
+            &format!(
+                r#"
+                import std::io::panic;
+
+                trait Maker {{
+                    fun make(): Self {{ panic("no default") }}
+                }}
+
+                fun main() {{
+                    let _result = Maker::make() {operator} Maker::make();
+                }}
+                "#
+            ),
+            &format!("models `{trait_name}`, and this operand is the bare trait `Maker`"),
+        );
+    }
+}
+
+#[test]
+#[ignore = "B175's residual: `self` inside a trait DEFAULT body is `Type::Trait` \
+            too, and `self + self` over a supertrait `Add` still emits the host's \
+            `+`. Refusing it needs a spelling that works first — `self.add(self)` \
+            does not resolve there either, and the binary emitter has no \
+            `OnType(None)` case to dispatch a default body's operand on the type \
+            being specialized."]
+fn a_trait_defaults_self_operand_dispatches_to_the_specialized_type() {
+    // KNOWN BUG. `Money { cents = 21 }.twice()` prints `2`: the emission is the
+    // host's `+` over two lowered structs, so `[21] + [21]` is the string
+    // "2121" and slot 0 of it is "2" — a plausible wrong answer, not a visible
+    // NaN. It is the one trait-typed shape B175 deliberately left skipping,
+    // because both halves of closing it (a working spelling, and a dispatch for
+    // it) are the same deeper defect.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        struct Money { cents: i32 }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+        }
+
+        impl Money with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+// --- B181: `&&`/`||` accepted a generic RIGHT operand and emitted the value --
+//
+// The same membership principle B179 settled for the native family, on the two
+// operators that model no trait at all. `grounded` excludes every
+// `Type::Generic`, so a parameter reached neither the `bool` check nor a
+// refusal, and `compare_type` would have admitted it anyway — a parameter
+// compares equal to whatever is asked of it. `fun both<T>(flag: bool, value: T):
+// bool { flag && value }` compiled, and `both(true, Point { x = 1, y = 2 })`
+// printed `[ 1, 2 ]`: JS's `&&` yields the RIGHT operand when the left is
+// truthy, so the struct itself came back, typed `bool`.
+//
+// No bound rescues it. `&&` admits `bool` and nothing else, no trait names that
+// set, and — unlike `+`, where a `str` left operand's admitted set IS
+// trait-characterizable (B176's render bound) — there is not even an operator
+// trait to consult. So every generic right operand refuses, whatever its bound.
+//
+// The LEFT half is B174's deferral shape and waits with it.
+
+#[test]
+fn b181_an_unbounded_generic_right_operand_of_and_is_rejected() {
+    // The pin B181 was filed as. Pre-fix this program compiled and PRINTED the
+    // struct.
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun both<T>(flag: bool, value: T): bool {
+            flag && value
+        }
+
+        fun main() {
+            print(both(true, Point { x = 1, y = 2 }));
+        }
+        "#,
+        "flag && value",
+        "`&&` takes `bool` operands, and `T` is a type parameter",
+    );
+}
+
+#[test]
+fn b181_a_bounded_generic_right_operand_of_or_is_rejected_too() {
+    // The bound is IRRELEVANT here, which is the ruling and therefore the pin:
+    // the refusal must not steer the author to add one, because no bound can
+    // make a parameter BE `bool`. `||` shares the arm, so it shares the rule.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        fun either<T: Add>(flag: bool, value: T): bool {
+            flag || value
+        }
+
+        fun main() {
+            print(either(false, 1));
+        }
+        "#,
+        "flag || value",
+        "no bound on `T` can prove membership",
+    );
+}
+
+#[test]
+fn b181_the_generic_right_operand_refusal_names_the_spelling_that_works() {
+    // A refusal is worth what the reader can do with it: the value has to
+    // become a `bool` before the operator sees it.
+    assert_fails_with(
+        r#"
+        fun both<T>(flag: bool, value: T): bool {
+            flag && value
+        }
+
+        fun main() {
+            print(both(true, 1));
+        }
+        "#,
+        "Test the value and combine the `bool`s, or declare this operand `bool`",
+    );
+}
+
+#[test]
+fn b181_a_bool_right_operand_still_short_circuits() {
+    // The escape hatch the refusal steers to has to work, or the rule would
+    // have no legal spelling — and the short circuit itself must survive: the
+    // right operand is not evaluated when the left already decides.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun loud(): bool {
+            print("evaluated");
+            true
+        }
+
+        fun both<T>(flag: bool, value: T, ready: bool): bool {
+            flag && ready
+        }
+
+        fun main() {
+            print(both(true, 7, true));
+            print(false && loud());
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+#[ignore = "B174's half: an unbounded generic LEFT operand of `&&` still \
+            escapes the check — refusing it is the deferred breaking generics \
+            change, the same one that keeps `value + 1` open on the left."]
+fn an_unbounded_generic_left_operand_of_and_is_rejected() {
+    // KNOWN BUG. `both(Point { x = 1, y = 2 }, true)` prints `true`: the host's
+    // `&&` finds the struct truthy and yields the right operand. The left half
+    // is deliberately untouched by B181, exactly as B179 left `+`'s to B174.
+    assert_fails_with(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun both<T>(value: T, flag: bool): bool {
+            value && flag
+        }
+
+        fun main() {
+            print(both(Point { x = 1, y = 2 }, true));
+        }
+        "#,
+        "takes `bool` operands",
+    );
+}

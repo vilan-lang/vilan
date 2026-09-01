@@ -1041,3 +1041,137 @@ fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
         "#,
     );
 }
+
+// --- B175: an associated function reached through a BOUND types as the -------
+// --- BINDER, not as the bound ------------------------------------------------
+//
+// The impl-path form of B162's `Trait::func`. `T::default()` under `T: Default`
+// resolves to the trait's own `fun default(): Self`, and the `Self`-return
+// specialization that makes a trait member's return concrete is driven by the
+// RECEIVER — read off the member's first parameter. An associated function has
+// no `self`, so nothing fired and the call typed as `Default` itself.
+//
+// std's `List<T: Add + Default>::sum`/`product` are the exhibit: `mut total =
+// T::default()` made `total` trait-typed, so `total += item` reached the binary
+// operator check with a `Type::Trait` left operand — the single reason B170 had
+// to put that shape on the check's skip list, and (because a skipped operator
+// keeps the anything-goes native emission) a live miscompile of `sum` over any
+// nominal element type.
+//
+// The fix specializes `Self` against the BINDER the path named, structurally,
+// exactly as the receiver branch does for a `self` method.
+
+const WALLET: &str = r#"
+    import std::io::print;
+    import std::default::Default;
+    import std::operators::Add;
+    struct Money { cents: i32 }
+    impl Money with Add {
+        fun add(self, other: Money): Money { Money { cents = self.cents + other.cents } }
+    }
+    impl Money with Default {
+        fun default(): Money { Money { cents = 0 } }
+    }
+"#;
+
+#[test]
+fn b175_a_bound_associated_call_types_as_the_type_parameter() {
+    // The inference claim itself, asked the only way a parameter can be asked:
+    // a `Type::Generic` compares equal to whatever is expected of it, so an
+    // annotation cannot tell the two apart — a MEMBER lookup can, because it
+    // reports the type it searched. Pre-fix: "Default has no method".
+    let source = r#"
+        import std::default::Default;
+        import std::operators::Add;
+        impl List<type T: Add + Default> {
+            fun probe(self): T {
+                let total = T::default();
+                total.no_such_member()
+            }
+        }
+        fun main() { print(1); }
+        "#;
+    assert_fails_with(source, "T has no method 'no_such_member'");
+    // And the misleading half is GONE, not merely joined by a better one.
+    assert_fails_without(source, "Default has no method");
+}
+
+#[test]
+fn b175_a_single_bound_associated_call_types_as_the_type_parameter_too() {
+    // The item filed the MULTI-bound (`Add + Default`) shape, but the cause is
+    // not the multiplicity — the receiver-driven specialization cannot fire for
+    // an associated function whatever the bound list looks like. One bound
+    // behaved identically before the fix, and must behave identically after.
+    assert_fails_with(
+        r#"
+        import std::default::Default;
+        impl List<type T: Default> {
+            fun probe(self): T {
+                let total = T::default();
+                total.no_such_member()
+            }
+        }
+        fun main() { print(1); }
+        "#,
+        "T has no method 'no_such_member'",
+    );
+}
+
+#[test]
+fn b175_a_nominal_elements_sum_dispatches_its_add() {
+    // THE MISCOMPILE, run. `total` arrived at `+=` typed as `Default`, the
+    // operator check skipped that shape, and no `Add` dispatch was recorded —
+    // so the emission stayed the host's `+` over two lowered structs and
+    // `[40] + [2]` came back as the string "402", whose slot 0 is "4".
+    // Pre-fix this printed "4\n0\n".
+    assert_compiles_and_runs(
+        &format!(
+            r#"{WALLET}
+            fun main() {{
+                mut wallet = List::new();
+                wallet.push(Money {{ cents = 40 }});
+                wallet.push(Money {{ cents = 2 }});
+                print(wallet.sum().cents);
+            }}
+            "#
+        ),
+        "42\n",
+    );
+}
+
+#[test]
+fn b175_an_empty_nominal_list_sums_to_the_elements_default() {
+    // The other half of `sum`'s body, and the one that reads `T::default()`'s
+    // value rather than its type: with no element to seed from, the fallback IS
+    // the answer. It must be `Money`'s own default, not a trait-typed nothing.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{WALLET}
+            fun main() {{
+                let empty: List<Money> = List::new();
+                print(empty.sum().cents);
+            }}
+            "#
+        ),
+        "0\n",
+    );
+}
+
+#[test]
+fn b175_the_trait_path_still_types_as_the_trait() {
+    // B162's boundary, unmoved: `Trait::func()` names the TRAIT, not a bound
+    // binder, so its `Self` return has no binder to specialize to and stays
+    // abstract. The fix keys on the accessor's recorded constraint, which only
+    // the bound path has — this pin is what keeps it from widening into one
+    // that re-points every `Self` return at whatever is convenient.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{MAKER}
+            fun main() {{
+                print(Maker::make());
+            }}
+            "#
+        ),
+        "trait default\n",
+    );
+}
