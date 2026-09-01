@@ -1,5 +1,8 @@
 // `vilan test .` runs every `*_test.vl` file in the package. A test is a
 // program: it passes by exiting 0, and a failed `assert` panics.
+//
+// `assert` is imported: it sits beside `print` in `std::io`, but the prelude
+// carries `print` and not `assert` — the prelude is a floor, not the module.
 
 import std::io::assert;
 import pkg::greeting::greeting;
