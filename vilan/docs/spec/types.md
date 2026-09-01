@@ -498,6 +498,12 @@ right operand (default `Self`); the result type is the impl's (for the
 arithmetic traits, `Self`). Compound assignment `x op= e` is exactly
 `x = x op e` with `x`'s place evaluated once.
 
+The left operand's *shape* does not enter into it. A tuple or an array
+is an impl subject like any other (`impl (i32, i32) with PartialEq`),
+and one without the impl is the same error a struct without it is — the
+operators are never the host's. `void` is refused outright: an
+expression that produces no value has no operand to be.
+
 The primitives do not dispatch — native machine operators *are* their
 semantics — so their admitted operand pairs are stated rather than read
 off an impl. For `+` those pairs are exactly two:
@@ -518,12 +524,24 @@ backed enums, native though they are for `==` and `<`, have no `Add` at
 all — a backing value is a lowering detail, not a number to compute
 with.
 
+An **unbounded generic parameter** is one of the things "anything else"
+covers. A declaration is checked once for all its instantiations, so a
+parameter admits only what its bounds promise, and an unbounded one
+promises nothing: it is neither a string form nor the left operand's
+type. Bound it — `Display` and an explicit `to_string()` to concatenate,
+the operator's own trait to add — or take a concrete type.
+
 ```vilan,fragment
 "n=" + count                 // str + i32 — concatenation
 "p=" + point                 // error: `Point` has no string form
 "p=" + point.to_string()     // the fix the error names
 count + "n="                 // error: only a `str` LEFT operand concatenates
 1.5 + count                  // error: f64 and i32; no implicit conversions
+```
+
+```vilan,fragment
+fun show<T>(value: T): str { "v=" + value }              // error: `T` is unbounded
+fun show<T: Display>(value: T): str { "v=" + value.to_string() }   // the fix
 ```
 
 `is` (§3.7 level 10) tests a value against a match pattern and yields
