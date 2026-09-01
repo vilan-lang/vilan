@@ -541,7 +541,7 @@ enum Postfix<'src> {
 /// mutable — one spelling of one keyword meaning two things.
 fn apply_binding_mutability(pattern: Pattern<'_>, mutable: bool) -> Pattern<'_> {
     match pattern {
-        Pattern::Binding(name, _) => Pattern::Binding(name, mutable),
+        Pattern::Binding(name, _, name_span) => Pattern::Binding(name, mutable, name_span),
         Pattern::Tuple(patterns) => Pattern::Tuple(
             patterns
                 .into_iter()
@@ -3649,7 +3649,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             None
         };
         let node = match pattern {
-            Pattern::Binding(name, _) => Node::Let((name, pattern_span), type_, value, mutable),
+            Pattern::Binding(name, _, _) => Node::Let((name, pattern_span), type_, value, mutable),
             pattern => Node::LetDestructure((pattern, pattern_span), type_, value, mutable),
         };
         Some((node, self.span_from(start)))
@@ -3791,7 +3791,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             });
         }
         let name = self.eat_ident()?;
-        Some((Pattern::Binding(name, false), self.span_from(start)))
+        // A binder's own span IS the bare name, so the name span and the pattern
+        // span coincide here. They part company one level up, where the match/`is`
+        // grammar's `let`/`mut` arm widens the pattern span over the keyword.
+        let name_span = self.span_from(start);
+        Some((Pattern::Binding(name, false, name_span), name_span))
     }
 
     /// A match/`is` pattern: `_`, `let x` / `mut x` (a binder), a literal (`"quit"`,

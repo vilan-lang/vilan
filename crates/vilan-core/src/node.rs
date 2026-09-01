@@ -1069,8 +1069,15 @@ pub type StructInitializerField<'src> = (&'src str, Option<Spanned<Node<'src>>>)
 pub enum Pattern<'src> {
     // `_` — matches anything without binding it.
     Wildcard,
-    // `let x` / `mut x` — matches anything, capturing the value.
-    Binding(&'src str, bool),
+    // `let x` / `mut x` — matches anything, capturing the value. The third field
+    // is the span of the NAME alone. It is carried rather than derived because a
+    // binding's enclosing `Spanned` span is not uniform: a `match`/`is` capture's
+    // span covers the `let `/`mut ` keyword too, while the same `Pattern::Binding`
+    // reached as an element of a binder tuple/array (`Some(let (a, b))`) carries
+    // the bare identifier. Consumers that paint or anchor the name — semantic
+    // tokens, inlay hints — must read this field; reconstructing the name span by
+    // arithmetic on the enclosing span cannot tell those two cases apart (E111).
+    Binding(&'src str, bool, Span),
     // A path to an enum variant with optional payload patterns: a bare `Name`
     // (`["Name"]`) or a qualified `Enum::Variant` (`["Enum", "Variant"]`).
     Variant(Vec<&'src str>, Option<Vec<Spanned<Pattern<'src>>>>),

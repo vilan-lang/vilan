@@ -1526,6 +1526,17 @@ impl<'a, 'src> Analysis<'a, 'src> {
             if let Some(return_type_id) = function.return_type_id {
                 return Some(return_type_id);
             }
+            // An UNANNOTATED return is not an unknown one (E107): vilan infers it,
+            // and the analyzer memoizes the answer per function. Reading only the
+            // declaration made member completion go silent for every call in a
+            // builder chain written the way the language invites — `fun on_drag(own
+            // self, …) { …; self }` — which is one `.` away from the whole chain
+            // offering nothing. The record is keyed by function alone and written
+            // only for an exact answer under an empty substitution, so it is the
+            // function's own return type, never a caller's specialization.
+            if let Some(return_type_id) = program.inferred_return_types.get(&callee_id) {
+                return Some(*return_type_id);
+            }
         }
         if let Some(external) = program.external_functions.get(&callee_id) {
             return Some(external.return_type_id);
