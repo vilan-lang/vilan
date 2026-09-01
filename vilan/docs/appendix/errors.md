@@ -28,14 +28,13 @@ shadowing local.
 → [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md)
 
 **"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
-The name (`Signal`, `view`, `View`) is one std's **web**
+The name (`Signal`, `SignalCell`, `view`, `View`) is one std's **web**
 prelude makes ambient, and this package is on the base one. Either set
 `prelude = "std::web"` in `vilan.toml`, or import the name explicitly —
-both work — the steer fires only for names the web set carries as bare
-members, never for its module-carried names (`style`, `ui`), where
-switching preludes would leave a value-position miss unfixed — and it
-only means the manifest line is usually what
-you wanted.
+both work; the steer only means the manifest line is usually what you
+wanted. It fires only for names the web set carries as bare members,
+never for its module-carried names (`style`, `ui`): switching preludes
+would leave a `style::Display` miss exactly where it was.
 → [Projects](../tour/projects.md), [spec §4.7](../spec/names.md)
 
 **"`std` is a namespace, not a value; import the module first …"**
