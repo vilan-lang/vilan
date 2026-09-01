@@ -263,6 +263,12 @@ none. **An interpolated string is this same concatenation** (`i"a{x}b"`
 identical fix; the same goes for a `css` block value that mixes text
 with holes. A backed enum is included in the refusal on purpose: its
 backing is a lowering detail, not a rendering the program chose.
+A **generic parameter** gets the same error worded for its bounds — an
+unbounded one promises nothing, and one bounded to something other than
+a string form (`T: Add`) promises the wrong thing. Bound it with
+`Display` and the bare operand concatenates: the implementation is
+called at each instantiation, so `"v=" + value` and `i"v={value}"` both
+render the value rather than its runtime shape.
 → [Values and types](../tour/values-and-types.md), [Strings](../std/strings.md)
 
 **"`+` on `…` adds, and `str` is not a number: only a `str` LEFT operand

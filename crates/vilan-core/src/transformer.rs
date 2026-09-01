@@ -1,6 +1,6 @@
 use crate::analyzer::{
     BackingValue, CopyDecision, DropExtent, Expr, ExprIfBranch, ExprPattern, Function,
-    GenericDispatch, Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
+    GenericDispatch, Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::Error;
@@ -1773,6 +1773,13 @@ struct Transformer<'src> {
     // nothing. Collected here and turned into a hard compile error at assembly,
     // so the class cannot recur silently.
     unresolved_drop_sinks: Vec<Id>,
+    // Never-silent guard (B176): `str + value` sites the analyzer admitted on a
+    // generic parameter's render bound, whose `to_string` could not be resolved
+    // at this monomorphization. Falling through emits the raw host `+` — the
+    // exact miscompile the routing exists to remove, and a clean compile that
+    // prints the value's runtime shape. Collected here and turned into a hard
+    // compile error at assembly, so the class cannot recur silently.
+    unrendered_concatenations: Vec<Id>,
     // C11 (`temporary-drop.md`): the resource temporaries lifted out of the
     // statement currently being emitted, innermost last. Each records where its
     // `const` landed in the statement list, so the emitter can close a
@@ -1998,6 +2005,7 @@ impl<'src> Transformer<'src> {
             bodyless_emissions: Vec::new(),
             bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
+            unrendered_concatenations: Vec::new(),
             pending_temporaries: Vec::new(),
             chunk_members: HashMap::default(),
             chunk_count: 0,
@@ -2371,6 +2379,32 @@ impl<'src> Transformer<'src> {
                       resolved, so the sink cannot tell a resource from data and \
                       would tear nothing down; please report this program"
                     .to_string(),
+            });
+        }
+
+        // Never-silent (B176): refuse to ship a program whose admitted `str +
+        // value` could not reach the render bound's `to_string`. The
+        // concatenation was admitted BECAUSE the bound promises a string form;
+        // emitting the raw `+` instead prints the value's runtime shape from a
+        // compile that reported nothing — the miscompile itself, and the one
+        // this routing exists to remove.
+        if let Some(&binary_id) = self.unrendered_concatenations.first() {
+            return Err(Error {
+                trace: Vec::new(),
+                note: None,
+                span: self
+                    .program
+                    .span_map
+                    .get(&binary_id)
+                    .map(|span| **span)
+                    .unwrap_or_default(),
+                msg: format!(
+                    "internal: this concatenation was admitted on a generic \
+                     parameter's `{RENDER_MEMBER}` bound, but no implementation \
+                     could be resolved for it here — concatenating the operand \
+                     directly would print the value's runtime shape; please \
+                     report this program"
+                ),
             });
         }
 
@@ -4175,7 +4209,42 @@ impl<'src> Transformer<'src> {
             }
             Expr::Binary(op, lhs, rhs) => {
                 let lhs = self.walk_entity(*lhs, block).unwrap_or(js::Node::Void);
-                let rhs = self.walk_entity(*rhs, block).unwrap_or(js::Node::Void);
+                let mut rhs = self.walk_entity(*rhs, block).unwrap_or(js::Node::Void);
+                // B176: `"v=" + value` where `value: T` is bounded to a trait
+                // that provides `to_string`. The analyzer ADMITS this — the
+                // bound is exactly the string form the concatenation asks for
+                // — so the emission has to keep the promise: route the operand
+                // through the impl `T` is bound to at this monomorphization,
+                // the same channel `value.to_string()` uses. Without it the
+                // admitted concatenation was a raw host `+` over the value's
+                // runtime shape, and `show(Point { x = 1, y = 2 })` printed
+                // `v=1,2` with the `Display` impl never called. The `+` itself
+                // is untouched; only the operand changes, which is why the
+                // i-string hole (`("" + "v=" + value)`) and every non-tail
+                // position are covered by the one rewrite.
+                if let Some(&(constraint_id, trait_id)) =
+                    self.program.concat_render_dispatch.get(&id)
+                {
+                    match self
+                        .current_substitution
+                        .get(&constraint_id)
+                        .copied()
+                        .and_then(|concrete| {
+                            self.resolve_dispatch_with(
+                                concrete,
+                                RENDER_MEMBER,
+                                &[],
+                                Some((trait_id, Vec::new())),
+                            )
+                        }) {
+                        Some(dispatch) => rhs = self.emit_dispatch(dispatch, vec![rhs], None),
+                        // Never-silent (B55's pattern): falling through here
+                        // emits the very `+` this fix exists to remove, so the
+                        // program would compile and print the wrong string
+                        // again. Collect it and refuse at assembly instead.
+                        None => self.unrendered_concatenations.push(id),
+                    }
+                }
                 // `x op y` where `x: T` is a trait-bounded generic: dispatch to T's
                 // concrete operator impl at this monomorphization, re-resolved like
                 // the instance-method generic dispatch. (`!=` negates `eq`, as below.)
