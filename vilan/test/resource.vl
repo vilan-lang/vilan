@@ -1,9 +1,18 @@
-// Deterministic destruction (destruction.md §5/§7, C4 S2 chunk b): resource
-// locals drop at their scope's end, and every drop body prints so the ORDER is
-// visible. Exercises locals-reverse, early `ret`, R2 overwrite, a `Drop` body
-// before its fields (reverse field order), and a containment-only resource
+// Deterministic destruction (destruction.md §5/§7, C4 S2 chunk b): a resource
+// local drops after the statement holding its LAST READ (lifetimes.md §6's
+// last-use disposal), and every drop body prints so the ORDER is visible. Where
+// a claim below is about the scope END, the program earns it — the function's
+// final statement reads the binding, so the teardown lands there rather than at
+// the declaration. Exercises locals-reverse, early `ret`, R2 overwrite, a `Drop`
+// body before its fields (reverse field order), and a containment-only resource
 // (no `Drop` impl) still freeing its fields. Synchronous + host-free, so the
 // interpreter equivalence gate checks it against `node` too.
+//
+// Each claim below carries a `// witness:` line naming the emitted bytes it
+// rests on; `corpus.rs`'s `every_declared_witness_is_in_its_golden` checks them
+// against `resource.mjs`. That gate exists because of THIS file: audit run 7
+// (F7/F8) found two claims here asserting the opposite of the golden beside
+// them, and a byte gate cannot notice a sentence going stale.
 import std::io::print;
 import std::drop::Drop;
 
@@ -15,6 +24,7 @@ impl Res with Drop {
 
 // A resource that OWNS resources and has its own `Drop`: the body runs first,
 // then the fields drop in reverse declaration order.
+// witness: drop2($d); $a($d[1]); $a($d[0]);
 resource struct Pair { first: Res, second: Res }
 impl Pair with Drop {
 	fun drop(&mut self) { print("pair-body"); }
@@ -23,30 +33,40 @@ impl Pair with Drop {
 // A resource by containment only (no `Drop` impl) still drops its field.
 resource struct Bag { item: Res }
 
-// Two locals drop in reverse declaration order at the scope end.
+// Two locals still owned at the scope end drop THERE, in reverse declaration
+// order: `b` before `a`. The trailing read is what holds them that long — with
+// no read at all each would drop at its own declaration, in declaration order,
+// and the reverse-order claim would have no witness left.
+// witness: console.log(a[0] + b[0]); } finally { $a(b); } } finally { $a(a); }
 fun locals() {
 	let a = Res { tag = "a" };
 	let b = Res { tag = "b" };
 	print("locals-body");
+	print(a.tag + b.tag);
 }
 
 // A resource owned at an early `ret` drops on the way out — and also on the
-// fall-through path.
+// fall-through path. The fall-through read is `r`'s last use, so the teardown
+// is a `finally` spanning the `if`, and the taken and not-taken paths both
+// release through that one region.
+// witness: try { if (stop) { console.log("stopping"); return; } console.log("continuing " + r[0]); } finally { $a(r); }
 fun early(stop: bool) {
 	let r = Res { tag = "early" };
 	if stop {
 		print("stopping");
 		ret;
 	}
-	print("continuing");
+	print(i"continuing {r.tag}");
 }
 
 // R2: assigning onto a still-owning binding drops the OLD value first; the new
-// value drops at the scope end.
+// value drops at the scope end, which the trailing read of `r` is what holds
+// it to.
+// witness: $a(r); r = [ "new" ]; console.log("overwrite-body " + r[0]); } finally { $a(r); }
 fun overwrite() {
 	mut r = Res { tag = "old" };
 	r = Res { tag = "new" };
-	print("overwrite-body");
+	print(i"overwrite-body {r.tag}");
 }
 
 // The `Drop` body runs before the fields, which drop in reverse order.
@@ -56,6 +76,7 @@ fun nested() {
 }
 
 // Containment-only: no `Drop` impl, but the field still drops.
+// witness: const bag = [ [ "bagged" ] ]; $e(bag);
 fun containment() {
 	let bag = Bag { item = Res { tag = "bagged" } };
 	print("containment-body");
@@ -69,10 +90,12 @@ resource struct Slot { held: Res }
 
 impl Slot {
 	// The `&mut self` spelling.
+	// witness: $g(self); __replace(self, [ [ "refilled" ] ]);
 	fun refill(&mut self) { self = Slot { held = Res { tag = "refilled" } }; }
 }
 
 // The `&mut x` parameter spelling of the same write.
+// witness: $g(slot); __replace(slot, [ [ "replaced" ] ]);
 fun view_overwrite(slot: &mut Slot) {
 	slot = Slot { held = Res { tag = "replaced" } };
 }
@@ -86,6 +109,7 @@ fun view_writes() {
 
 // A loan owns nothing, so a view LOCAL of a resource takes no teardown of its
 // own: only `s` is wrapped, and "loaned" prints once.
+// witness: const s = [ [ "loaned" ] ]; try { } finally { $g(s); } console.log("loaned-body");
 fun loaned() {
 	let s = Slot { held = Res { tag = "loaned" } };
 	let v = &s;
@@ -98,6 +122,8 @@ fun loaned() {
 // are the SAME function twice, differing only in whether the root is the place
 // or a `&mut` of it, so the byte diff between them IS the claim that the two
 // spellings are indistinguishable.
+// witness: $a(slot[0]); slot[0] = [ "component-new" ];
+// witness: $a(slot[0]); slot[0] = [ "through-view" ];
 fun component_owned() {
 	mut slot = Slot { held = Res { tag = "component-old" } };
 	slot.held = Res { tag = "component-new" };
@@ -116,12 +142,15 @@ fun component_view(slot: &mut Slot) {
 // aggregate here with NO `resource` modifier, so its `try`/`finally` and the
 // trailing "counted" are the byte-level witness that a PLAIN struct holding a
 // resource field is a resource by containment and runs the scope-end teardown.
+// The final statement reads `counted`, which is what puts that teardown at the
+// scope end rather than at the declaration.
+// witness: counted[1] = 2; console.log("component-data-body " + counted[0][0]); } finally { $i(counted); }
 struct Counted { held: Res, count: i32 }
 
 fun component_data() {
 	mut counted = Counted { held = Res { tag = "counted" }, count = 1 };
 	counted.count = 2;
-	print("component-data-body");
+	print(i"component-data-body {counted.held.tag}");
 }
 
 fun component_writes() {

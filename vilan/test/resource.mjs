@@ -10,29 +10,39 @@ function drop2(self) {
 }
 function locals() {
 	const a = [ "a" ];
-	$a(a);
-	const b = [ "b" ];
-	$a(b);
-	console.log("locals-body");
+	try {
+		const b = [ "b" ];
+		try {
+			console.log("locals-body");
+			console.log(a[0] + b[0]);
+		} finally {
+			$a(b);
+		}
+	} finally {
+		$a(a);
+	}
 }
 function early(stop) {
 	const r = [ "early" ];
-	$a(r);
-	if (stop) {
-		console.log("stopping");
-		return;
+	try {
+		if (stop) {
+			console.log("stopping");
+			return;
+		}
+		console.log("continuing " + r[0]);
+	} finally {
+		$a(r);
 	}
-	console.log("continuing");
 }
 function overwrite() {
 	let r = [ "old" ];
 	try {
 		$a(r);
 		r = [ "new" ];
+		console.log("overwrite-body " + r[0]);
 	} finally {
 		$a(r);
 	}
-	console.log("overwrite-body");
 }
 function nested() {
 	const pair = [ [ "first" ], [ "second" ] ];
@@ -89,10 +99,10 @@ function component_data() {
 	let counted = [ [ "counted" ], 1 ];
 	try {
 		counted[1] = 2;
+		console.log("component-data-body " + counted[0][0]);
 	} finally {
 		$i(counted);
 	}
-	console.log("component-data-body");
 }
 function component_writes() {
 	component_owned();
