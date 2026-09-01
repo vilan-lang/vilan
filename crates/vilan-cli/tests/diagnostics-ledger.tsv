@@ -369,3 +369,4 @@ row	flagship	key
 343	-	std::db migrate: the database has migration '{recorded_name}' applied, but it is not among the {count} migrations given — this database was migrated by a newer build
 344	-	std::db migrate: migration '{pending}' is not applied, but '{applied}' after it in the list is — a migration was inserted before the applied history
 345	flagship	`{symbol}` takes two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: `{rhs_label}` is wider than what `{lhs_label}` admits
+346	flagship	`{subject_label}`'s `{method_name}` accepts `{declared_label}`, but the right operand is `{rhs_label}`

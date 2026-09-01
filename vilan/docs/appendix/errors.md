@@ -357,6 +357,25 @@ so `T: Add` promises `T + T` and says nothing about `i32`. Convert where
 the type is known and declare the operand `i32`.
 → [Values and types](../tour/values-and-types.md)
 
+**"`…`'s `add` accepts `…`, but the right operand is `…`"**
+The same membership rule where the left operand **dispatches**: your impl
+says what its operator accepts, and this operand is not it. Three shapes
+reach the message. A `Self` operator (`impl Counter with Add`) accepts
+the subject and nothing else — a foreign struct there used to be read
+through the declared type's fields, so `Counter { n = 1 } + Point { x =
+1, y = 2 }` computed off the `Point`'s first slot. A **declared** `B`
+(`impl Meters with Add<Feet>`) accepts *that* type, which means it does
+not accept `Meters`. And an impl over its own parameter
+(`impl Bag<type T> with Add<T>`) accepts whatever the left operand bound
+`T` to. The routes out: convert the operand, give the left type a second
+impl whose `B` is this operand's type, or — for a **generic** operand,
+where no bound can prove membership — write the left operand's type over
+that same parameter, so its `B` *is* the parameter. Every dispatched
+operator reads this way, `eq` for `==`/`!=` and `lt`/`le`/`gt`/`ge` for
+the orderings included.
+→ [Data and traits](../tour/data-and-traits.md),
+[Values and types](../tour/values-and-types.md)
+
 **"`+` adds numbers and concatenates `str`, and `…` is neither: it has no
 `Add` …"**
 `bool` and backed enums are native for `==` and `<` without being
