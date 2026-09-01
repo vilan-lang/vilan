@@ -19,3 +19,16 @@ sha2 = "0.10"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Console"] }
+
+# Test-only, and only for the clock: the const-pass scaling gate
+# (`tests/perf_baseline.rs`) asserts a ratio of THREAD CPU TIME so that ten
+# sibling test suites cannot red it (backlog M15), and neither platform exposes
+# a thread clock through `std`. Both packages are already in the lockfile — and
+# so already covered by `THIRD-PARTY-NOTICES.txt` — because the tree depends on
+# them elsewhere; these edges add no third-party surface to the shipped binary,
+# which is why they are dev-dependencies and not dependencies.
+[target."cfg(unix)".dev-dependencies]
+libc = "0.2"
+
+[target."cfg(windows)".dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }

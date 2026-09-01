@@ -37,8 +37,11 @@
 //! One thing in this file is not a measurement but a *pin*, and runs in the
 //! normal gate: `the_const_pass_scales_with_its_const_sites_and_not_with_their_square`
 //! (backlog M4, `const-eval.md` §10.4). It asserts a ratio between two
-//! measurements taken in one process, never a number of seconds — see its own
-//! comment, and `perf-baseline.md` §1.4 for why that is admissible where a
+//! measurements taken in one process, never a number of seconds — and since
+//! backlog M15 those two measurements are **thread CPU time**, not wall clock,
+//! so the one pin that runs beside every other test in the suite is immune to
+//! what the rest of the machine is doing. See its own comment, and
+//! `perf-baseline.md` §1.4 for why a ratio is admissible where a
 //! relative-regression check is not.
 //!
 //! `--release` because a debug measurement is a fact about `-O0` — every row
@@ -219,10 +222,98 @@ struct PhaseSample {
     parse: Duration,
     analyze: Duration,
     post: Duration,
+    /// The post-analysis passes' **thread CPU time** — the same span as
+    /// [`PhaseSample::post`], measured on the clock that counts only the
+    /// cycles this thread was actually given (backlog M15). `None` where the
+    /// host exposes no such clock; see [`thread_cpu_now`].
+    ///
+    /// Not summarized into any [`Row`]: the recorded baseline reports the
+    /// LATENCY a caller waits for, and that is wall clock by definition. This
+    /// field exists for the one consumer that wants a load-immune number
+    /// instead of a latency — the const-pass scaling gate, which asserts a
+    /// ratio and no latency at all.
+    post_cpu: Option<Duration>,
     transform: Duration,
     total: Duration,
     diagnostics: usize,
     emitted_bytes: usize,
+}
+
+/// The calling thread's CPU time since it started — the time it was actually
+/// ON a core, not the time that passed — or `None` where the host exposes no
+/// such clock.
+///
+/// Backlog M15. A wall-clock ratio is a claim about the compiler only on an
+/// idle machine: under contention the scheduler stretches the two measurements
+/// by *different* factors, and the gate reds with no regression anywhere (twice
+/// in two orders — `perf-baseline.md` §6.3, and again at loadavg 82 in Order
+/// 22). Thread CPU time is the ratio's actual intent: preemption does not
+/// accrue to it, so ten sibling test suites cost the measured thread nothing
+/// but cache pressure, which lands on both subjects alike and cancels in the
+/// ratio.
+///
+/// Both implementations read a *thread* clock rather than a process one: the
+/// measurement runs on its own spawned thread (`const_pass_walls`' caller), and
+/// the compiler is single-threaded within a call, so the thread clock is
+/// exactly the work under measurement and nothing else.
+#[cfg(unix)]
+fn thread_cpu_now() -> Option<Duration> {
+    let mut timespec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes the `timespec` we hand it and reads
+    // nothing else; the pointer is to a live local.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timespec) };
+    (result == 0).then(|| {
+        Duration::new(
+            timespec.tv_sec.max(0) as u64,
+            timespec.tv_nsec.clamp(0, 999_999_999) as u32,
+        )
+    })
+}
+
+/// The Windows half: kernel + user time for the current (pseudo-handle) thread.
+/// `FILETIME` is a count of 100-nanosecond intervals, and the pair is what
+/// `CLOCK_THREAD_CPUTIME_ID` returns as one number. Its resolution is the
+/// scheduler tick (~15.6 ms), which is coarse next to the POSIX clock but small
+/// against the ~100 ms and ~350 ms spans the gate compares.
+#[cfg(windows)]
+fn thread_cpu_now() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: `GetThreadTimes` writes the four `FILETIME`s we hand it and reads
+    // nothing else; `GetCurrentThread` returns a pseudo-handle that needs no
+    // close. The pointers are to live locals.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let hundred_nanoseconds =
+        |time: FILETIME| ((time.dwHighDateTime as u64) << 32) | (time.dwLowDateTime as u64);
+    let ticks = hundred_nanoseconds(kernel) + hundred_nanoseconds(user);
+    Some(Duration::from_nanos(ticks.saturating_mul(100)))
+}
+
+/// Every other host: no thread CPU clock, so the one caller that wants one
+/// falls back to wall clock and says so in its own output.
+#[cfg(not(any(unix, windows)))]
+fn thread_cpu_now() -> Option<Duration> {
+    None
 }
 
 /// Compiles `subject` once through the four library entry points, timing each.
@@ -286,9 +377,15 @@ fn measure_phases(
     );
     let analyze_time = analyze_started.elapsed();
 
+    let post_cpu_started = thread_cpu_now();
     let post_started = Instant::now();
     post_analysis_passes(&mut program, platform, &options);
     let post = post_started.elapsed();
+    // Both clocks span exactly the same call; the CPU one is `None` together
+    // at both ends or not at all (backlog M15).
+    let post_cpu = post_cpu_started
+        .zip(thread_cpu_now())
+        .map(|(started, ended)| ended.saturating_sub(started));
 
     let transform_started = Instant::now();
     let emitted = transform(&program, &options);
@@ -298,6 +395,7 @@ fn measure_phases(
         parse,
         analyze: analyze_time,
         post,
+        post_cpu,
         transform: transform_time,
         total: started.elapsed(),
         diagnostics: program.diagnostics.len(),
@@ -754,26 +852,84 @@ fn style_heavy_source(sites: usize) -> String {
     source
 }
 
-/// The `post_analysis_passes` walls for TWO style-heavy entries, measured
-/// warm, ALTERNATELY — small, large, small, large… — and each taken as the
-/// MINIMUM of its rounds, the least-contended sample.
+/// Which clock [`const_pass_costs`] managed to use. Printed and quoted in the
+/// failure, because the two are not the same claim: `ThreadCpu` is a claim
+/// about the compiler, `Wall` is a claim about the compiler AND the machine's
+/// other tenants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScaleClock {
+    /// [`thread_cpu_now`] answered: the cost is CPU time, load-immune.
+    ThreadCpu,
+    /// The host has no thread CPU clock, so the cost is wall clock — today's
+    /// measurement, and the one M15 exists to stop relying on. Unreachable on
+    /// unix and windows; kept so the gate degrades rather than disappears.
+    Wall,
+}
+
+impl ScaleClock {
+    fn name(self) -> &'static str {
+        match self {
+            ScaleClock::ThreadCpu => "thread-cpu",
+            ScaleClock::Wall => "wall",
+        }
+    }
+}
+
+/// The `post_analysis_passes` COST of TWO style-heavy entries, measured warm,
+/// ALTERNATELY — small, large, small, large… — and each taken as the MINIMUM
+/// of its rounds, the least-contended sample.
 ///
-/// The alternation is the point, and it is a 2026-08-19 repair (found by
-/// D17's lane): measured as two sequential blocks, the two mins were drawn
-/// from two *disjoint time windows*, and contention that differs between the
-/// windows — a sibling suite's compile storm landing on one block and not the
-/// other — inflates the ratio instead of cancelling in it. Under a load-25
-/// contended full-suite run the pin read **6.63×** against its 6× bound, and
-/// passed alone. Interleaving draws both mins from rounds that span the
-/// same period, which is §8.4's run-the-binaries-alternately discipline
-/// applied inside one process. (Both subjects import the same std names, so
-/// they share one base-cache world and stay warm across the alternation.)
-fn const_pass_walls(
+/// **The cost is thread CPU time** (backlog M15), falling back to wall clock
+/// only on a host with no thread clock — which is why the caller prints and
+/// asserts with the [`ScaleClock`] it actually got. Wall clock was the
+/// measurement through Order 22 and it made the pin a load detector as much as
+/// a scaling detector: at loadavg 82 it read **8.83×** against a 6× bound with
+/// no regression anywhere, and 2.84 s solo on the same tree. What the
+/// scheduler does to a 350 ms window is not what it does to a 100 ms one, so
+/// the stretch does not cancel in the ratio; CPU time never accrues the
+/// stretch in the first place.
+///
+/// The alternation predates that and still earns its place (a 2026-08-19
+/// repair, found by D17's lane): measured as two sequential blocks the two
+/// mins came from two *disjoint time windows*, so even a load-immune clock
+/// would have the two subjects seeing different cache-pressure regimes.
+/// Interleaving draws both mins from rounds that span the same period, which
+/// is §8.4's run-the-binaries-alternately discipline applied inside one
+/// process. (Both subjects import the same std names, so they share one
+/// base-cache world and stay warm across the alternation.)
+///
+/// Both clocks are kept, and the caller prints both: the wall pair beside the
+/// CPU pair is what makes the load-immunity claim CHECKABLE from an ordinary
+/// suite log rather than asserted in a comment — under lane load the two
+/// ratios visibly part company, and on a quiet machine they agree.
+struct ConstPassCost {
+    small: Duration,
+    large: Duration,
+    small_wall: Duration,
+    large_wall: Duration,
+    clock: ScaleClock,
+}
+
+impl ConstPassCost {
+    /// The gated ratio: the large subject's cost over the small one's, on
+    /// whichever clock [`const_pass_costs`] got.
+    fn ratio(&self) -> f64 {
+        self.large.as_secs_f64() / self.small.as_secs_f64()
+    }
+
+    /// The same ratio on wall clock — the pre-M15 measurement, printed for
+    /// contrast and asserted on nowhere.
+    fn wall_ratio(&self) -> f64 {
+        self.large_wall.as_secs_f64() / self.small_wall.as_secs_f64()
+    }
+}
+
+fn const_pass_costs(
     small_sites: usize,
     large_sites: usize,
     std: &PackageSpec,
     platform: Platform,
-) -> (Duration, Duration) {
+) -> ConstPassCost {
     const ROUNDS: usize = 3;
     let small = PhaseSubject::synthetic(
         &format!("style_{small_sites}"),
@@ -787,13 +943,32 @@ fn const_pass_walls(
     // exactly as `phase_section` primes its subjects.
     let _ = measure_phases(&small, std, platform, false);
     let _ = measure_phases(&large, std, platform, false);
-    let mut small_wall = Duration::MAX;
-    let mut large_wall = Duration::MAX;
+    // Decided once, from the priming sample, so both subjects are costed on
+    // the same clock however the rounds go.
+    let clock = match thread_cpu_now() {
+        Some(_) => ScaleClock::ThreadCpu,
+        None => ScaleClock::Wall,
+    };
+    let cost = |sample: &PhaseSample| match clock {
+        ScaleClock::ThreadCpu => sample.post_cpu.unwrap_or(sample.post),
+        ScaleClock::Wall => sample.post,
+    };
+    let mut measured = ConstPassCost {
+        small: Duration::MAX,
+        large: Duration::MAX,
+        small_wall: Duration::MAX,
+        large_wall: Duration::MAX,
+        clock,
+    };
     for _ in 0..ROUNDS {
-        small_wall = small_wall.min(measure_phases(&small, std, platform, false).post);
-        large_wall = large_wall.min(measure_phases(&large, std, platform, false).post);
+        let small_sample = measure_phases(&small, std, platform, false);
+        measured.small = measured.small.min(cost(&small_sample));
+        measured.small_wall = measured.small_wall.min(small_sample.post);
+        let large_sample = measure_phases(&large, std, platform, false);
+        measured.large = measured.large.min(cost(&large_sample));
+        measured.large_wall = measured.large_wall.min(large_sample.post);
     }
-    (small_wall, large_wall)
+    measured
 }
 
 /// The pass must stay LINEAR in its const sites.
@@ -807,7 +982,7 @@ fn const_pass_walls(
 /// were hoisted (`const-eval.md` §10).
 ///
 /// Relative by construction, never a fixed number of seconds: the assertion is
-/// four times the sites against a bound of six times the time, measured in the
+/// four times the sites against a bound of six times the COST, measured in the
 /// same process, in the same session, on the same source shape — the
 /// measured-reference discipline `tests/support/mod.rs` established for the
 /// suite's liveness bounds, and for the same reason (`suite-speed.md` §5–§7:
@@ -822,15 +997,29 @@ fn const_pass_walls(
 /// two mins were then drawn from two sequential, disjoint time windows, so a
 /// wall-clock ratio was load-sensitive by construction — contention landing
 /// unevenly across the windows inflates the ratio instead of cancelling in
-/// it. The rounds now interleave (see [`const_pass_walls`]); re-measured
-/// under a *worse* load (~40) the interleaved pin reads 3.13–3.59× against
-/// the quiet machine's 3.44×, so the construction, not the bound, was the
-/// flake. Widening instead was tried and measured VACUOUS: a genuinely
-/// quadratic plant — one whole-world rebuild plus a re-walk of every other
-/// site, per site — reads **7.63–8.01×** at this size, so an 8× bound waves
-/// a real quadratic through while 6× catches it. (The heavier historical
-/// plant, a whole-program mini-build per other site, read 13.89×.) 6×
-/// therefore stands, now with plant measurements on BOTH sides of it.
+/// it. The rounds were made to interleave (see [`const_pass_costs`]);
+/// re-measured under a *worse* load (~40) the interleaved pin read 3.13–3.59×
+/// against the quiet machine's 3.44×. Widening instead was tried and measured
+/// VACUOUS: a genuinely quadratic plant — one whole-world rebuild plus a
+/// re-walk of every other site, per site — reads **7.63–8.01×** at this size,
+/// so an 8× bound waves a real quadratic through while 6× catches it. (The
+/// heavier historical plant, a whole-program mini-build per other site, read
+/// 13.89×.) 6× therefore stands, with plant measurements on BOTH sides of it.
+///
+/// **Interleaving was not enough, and backlog M15 is the second half of that
+/// repair.** In Order 22 the interleaved wall-clock pin read **8.83×** at
+/// loadavg 82 — a lane's verdict, not a regression; the same tree read 2.84 s
+/// solo. Interleaving equalizes *when* the two subjects are measured, but the
+/// large subject's window is four times longer, so it cannot get as lucky as
+/// the small one under contention and the min-of-rounds is biased upward for
+/// it alone. The cost is therefore **thread CPU time** now, not wall clock:
+/// the ratio's stated intent all along, and the one measurement a scheduler
+/// with ten other tenants cannot move. Widening the bound remains refused for
+/// the reason it always was — a bound wide enough for loadavg 82 catches
+/// nothing — and `#[ignore]`ing it (M15's option (a)) was the fallback if no
+/// honest CPU clock existed; `CLOCK_THREAD_CPUTIME_ID` and `GetThreadTimes`
+/// are that clock, so the pin stays in the gate where a scaling regression is
+/// caught the day it lands rather than at the next deliberate run.
 ///
 /// Honest about what it does and does not catch, because a pin that is believed
 /// to catch more than it does is worse than none. At the site counts a gate can
@@ -853,36 +1042,51 @@ fn the_const_pass_scales_with_its_const_sites_and_not_with_their_square() {
     // so 8 would be vacuous (see the doc comment).
     const BOUND: f64 = 6.0;
 
-    let (small, large) = std::thread::Builder::new()
+    let measured = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(|| {
             let std = std_spec();
             let platform = Platform::default();
-            const_pass_walls(SITES, SITES * FACTOR, &std, platform)
+            const_pass_costs(SITES, SITES * FACTOR, &std, platform)
         })
         .expect("spawn the const-scaling measurement thread")
         .join()
         .expect("the const-scaling measurement thread panicked");
 
-    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    let ratio = measured.ratio();
+    // The loadavg and the wall-clock ratio ride along (backlog M13's
+    // provenance rule, backlog M15's claim): the gated number is load-immune
+    // now, and a row that shows it holding at 2.9× while the wall ratio it
+    // replaced reads 5-9× at the same loadavg is how that stays checkable from
+    // an ordinary suite log instead of asserted in a comment.
     println!(
-        "PERF-SCALE const_pass {SITES} sites = {:.2} ms, {} sites = {:.2} ms, ratio {ratio:.2}×",
-        milliseconds(small),
+        "PERF-SCALE const_pass clock={} load={} {SITES} sites = {:.2} ms, {} sites = {:.2} ms, \
+         ratio {ratio:.2}× (wall {:.2} ms → {:.2} ms, ratio {:.2}×)",
+        measured.clock.name(),
+        loadavg_1m(),
+        milliseconds(measured.small),
         SITES * FACTOR,
-        milliseconds(large),
+        milliseconds(measured.large),
+        milliseconds(measured.small_wall),
+        milliseconds(measured.large_wall),
+        measured.wall_ratio(),
     );
     assert!(
-        small > Duration::ZERO,
+        measured.small > Duration::ZERO,
         "the {SITES}-site measurement read zero, so the ratio means nothing",
     );
     assert!(
         ratio <= BOUND,
         "{}× the const sites cost {ratio:.2}× the post-analysis passes \
-         ({:.2} ms → {:.2} ms), over the {BOUND}× bound: the const pass has \
-         gone super-linear in its sites (const-eval.md §10)",
+         ({:.2} ms → {:.2} ms of {} time, loadavg {}, wall ratio {:.2}×), over \
+         the {BOUND}× bound: the const pass has gone super-linear in its sites \
+         (const-eval.md §10)",
         FACTOR,
-        milliseconds(small),
-        milliseconds(large),
+        milliseconds(measured.small),
+        milliseconds(measured.large),
+        measured.clock.name(),
+        loadavg_1m(),
+        measured.wall_ratio(),
     );
 }
 
