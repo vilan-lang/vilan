@@ -1709,6 +1709,101 @@ fun main() {}
     );
 }
 
+// --- E109: the `pub` rule refuses ONCE, in the word that was written --------
+//
+// Audit run 6, F10 and F21. The rule replaced the missing-`;` message but not
+// the STATEMENT the recovery kept beside it — a bare `pub`, which the analyzer
+// then reported as `cannot find 'pub' in this scope`, the useless message
+// first and the curated one second. And the text was a fixed string naming
+// `pub`, so a program that wrote `public` was refused in a word its author
+// never typed.
+
+#[test]
+fn a_visibility_marker_draws_exactly_one_diagnostic() {
+    // The count IS the claim (the `let mut` sibling has always been clean):
+    // one mistake, one refusal, and no unresolved-name cascade off the
+    // identifier the recovery used to keep.
+    let diagnostics = failure_diagnostics(
+        r#"
+pub fun helper(): i32 { 1 }
+
+fun main() {}
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one mistake, one diagnostic: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].0.contains("is not a vilan keyword"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_visibility_marker_no_longer_cascades_into_an_unresolved_name() {
+    // The half that matters, stated the way the `;` half already is: the
+    // follow-on is GONE, not merely ordered behind the curated rule.
+    assert_fails_without(
+        r#"
+pub struct Point { x: i32 }
+
+fun main() {}
+        "#,
+        "cannot find 'pub' in this scope",
+    );
+}
+
+#[test]
+fn the_visibility_rule_quotes_the_marker_that_was_written() {
+    // F21: `public` is the same reflex one synonym over, and the refusal is
+    // about the word on the screen — quoting `pub` at an author who wrote
+    // `public` is the papercut the curated rule exists to remove.
+    assert_fails_with(
+        r#"
+public fun helper(): i32 { 1 }
+
+fun main() {}
+        "#,
+        "`public` is not a vilan keyword",
+    );
+}
+
+#[test]
+fn the_visibility_rule_still_quotes_pub_when_pub_was_written() {
+    assert_fails_with(
+        r#"
+pub fun helper(): i32 { 1 }
+
+fun main() {}
+        "#,
+        "`pub` is not a vilan keyword",
+    );
+}
+
+#[test]
+fn a_visibility_marker_inside_a_block_draws_one_diagnostic_too() {
+    // The other statement loop: a block's body recovers through the same two
+    // steps, so the drop has to hold there as well.
+    let diagnostics = failure_diagnostics(
+        r#"
+fun main() {
+    public fun helper(): i32 { 1 }
+}
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one mistake, one diagnostic: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].0.contains("`public` is not a vilan keyword"),
+        "{diagnostics:#?}"
+    );
+}
+
 #[test]
 fn a_bare_pub_identifier_is_still_an_ordinary_name() {
     // The negative: `pub` is an identifier, and the steer fires only where one
