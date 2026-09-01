@@ -5262,6 +5262,50 @@ fn a_display_bound_reached_through_a_supertrait_still_renders() {
     );
 }
 
+#[test]
+#[ignore = "B176's numeric sibling, found by the b176 lane and awaiting an \
+            item of its own: a BOUNDED generic right operand of a NATIVE \
+            numeric `+` is still admitted unchecked, and no bound can promise \
+            what that position needs"]
+fn a_bounded_generic_added_to_a_number_is_rejected() {
+    // KNOWN BUG. B169 closed the unbounded case here and B176 closed the
+    // concatenating case for a bound; this is the square neither covers.
+    // `bump(1, Point { x = 1, y = 2 })` prints `11,2` — a string, typed as an
+    // `i32` — exactly the unbounded sibling's garbage, from a declaration that
+    // carries a bound.
+    //
+    // The concatenation could be fixed by ROUTING because a bound can promise
+    // a string form. This position cannot: a native left operand never
+    // dispatches, so the only admissible right operand is one known to BE
+    // `i32`, and `T: Add` does not say that — `Add`'s `B` defaults to `Self`,
+    // which is `T`, not the left operand's type. So the answer is a refusal,
+    // and refusing here is a ruling about what a bound on the right of a
+    // native operator may mean, not a codegen fix.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Add {
+            fun add(self, other: Point): Point {
+                Point { x = self.x + other.x, y = self.y + other.y }
+            }
+        }
+
+        fun bump<T: Add>(total: i32, value: T): i32 {
+            total + value
+        }
+
+        fun main() {
+            print(bump(1, Point { x = 1, y = 2 }));
+        }
+        "#,
+        "total + value",
+        "the operands are `i32` and `T`",
+    );
+}
+
 // --- B170: `+` skipped its check when the LEFT operand was non-nominal -------
 //
 // B148 closed the hole for a NATIVE left operand and the dispatch loop's own
