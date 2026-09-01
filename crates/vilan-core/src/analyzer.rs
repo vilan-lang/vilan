@@ -31391,12 +31391,18 @@ impl<'src> Analyzer<'src> {
                     };
                     if let Some(trait_id) = bare_trait_id {
                         let (message, note) = self.bare_trait_in_value_position(trait_id, scope_id);
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note,
-                            span,
-                            msg: message,
-                        });
+                        // Attributed to the walk that wrote the annotation, for
+                        // the reason the unresolved arm below is (E108) — this
+                        // is the same drain, and it had the same defect.
+                        self.push_in_source(
+                            Error {
+                                trace: Vec::new(),
+                                note,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                        );
                     }
                     // A refused annotation resolves to `Unknown`, so the one
                     // report at the annotation stands alone instead of cascading
@@ -31424,12 +31430,23 @@ impl<'src> Analyzer<'src> {
                         let steer = self.import_steer(name).unwrap_or_default();
                         format!("cannot find type '{}'{}", name, steer)
                     };
-                    self.diagnostics.push(Error {
-                        trace: Vec::new(),
-                        note: None,
-                        span,
-                        msg: message,
-                    });
+                    // Attributed to the file the annotation was WALKED from, the
+                    // same as the value-position twin (E108). This queue drains
+                    // in `build()`, after every per-file walk has finished, so
+                    // an unattributed push keeps whatever `current_source_id`
+                    // the last walk left — std's `lib.vl` — and the span then
+                    // indexes a file the author never opened. `source_id` is
+                    // the walk's own record, captured when the annotation was
+                    // prepped.
+                    self.push_in_source(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: message,
+                        },
+                        source_id,
+                    );
                     self.write_type_slot(type_id, Type::Unknown);
                 }
             }
