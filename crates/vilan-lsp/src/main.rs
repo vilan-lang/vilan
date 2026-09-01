@@ -9,6 +9,7 @@ mod line_index;
 mod manifest_completion;
 mod publish;
 mod references;
+mod session_trace;
 mod uri;
 
 use std::collections::HashMap;
@@ -1494,11 +1495,17 @@ impl Backend {
     /// are poison-tolerant so a caught panic cannot convert into a
     /// panic-on-every-later-request loop).
     fn fenced<R>(&self, request: &'static str, fallback: R, work: impl FnOnce() -> R) -> R {
+        let started = std::time::Instant::now();
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
             panic_fence_tests::maybe_inject(request);
             work()
         }));
+        // E106: the fence is the ONE synchronous seam every request already
+        // passes through, which makes it the place to time them all without
+        // touching a handler. A panicked request is timed too — the time it
+        // burned before unwinding is time the user waited.
+        self.trace_request(request, started.elapsed().as_millis());
         match caught {
             Ok(answer) => answer,
             Err(payload) => {
@@ -1514,6 +1521,43 @@ impl Backend {
                 fallback
             }
         }
+    }
+
+    /// E106: fold one request's duration into the session tally, and put the
+    /// trace's own verdict on the client's output channel.
+    ///
+    /// Nothing is logged for an ordinary request, so a healthy session is
+    /// silent; a slow one is named with its duration, and every
+    /// [`session_trace::SUMMARY_EVERY_REQUESTS`] requests the whole profile goes
+    /// out together with the server's retained-state cardinalities. Those counts
+    /// are the growth evidence: one that climbs while `documents` does not is a
+    /// leak with a name, which is what the item asks for before any reclaim is
+    /// designed.
+    ///
+    /// The send is spawned like the panic fence's, and guarded on a runtime
+    /// actually being present — the tally itself is pure and must stay usable
+    /// from a plain synchronous caller.
+    fn trace_request(&self, request: &'static str, elapsed_ms: u128) {
+        let text = match session_trace::record(request, elapsed_ms) {
+            session_trace::TraceEvent::Quiet => return,
+            session_trace::TraceEvent::Slow(line) => line,
+            session_trace::TraceEvent::Summarize => {
+                session_trace::summary(session_trace::StateSizes {
+                    documents: self.documents.len(),
+                    semantic_token_cache: self.semantic_token_cache.len(),
+                    manifests: self.manifests.len(),
+                    pending: self.pending.len(),
+                    line_indices: self.line_indices.len(),
+                })
+            }
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            client.log_message(MessageType::INFO, text).await;
+        });
     }
 
     /// Schedule a debounced re-analysis. A burst of edits collapses to a single
@@ -4408,5 +4452,159 @@ mod incremental_sync_tests {
                 .all(|hint| hint.position.line != hint_line + 1),
             "the stale window no longer over-answers the moved hint"
         );
+    }
+}
+
+/// E106: the scripted session — an open/edit/close loop driven straight through
+/// the server's own handlers, asserting that every retained map comes back to
+/// where it started.
+///
+/// The item asks to MEASURE before designing a reclaim, and the owner's decisive
+/// datapoint (a language-server restart that did not help, a VS Code restart
+/// that did) put the prime suspicion on the editor side. That does not exonerate
+/// the server: it only says a leak here would have been cleared by the restart.
+/// This is how the server half is held to it — the session's memory is its maps,
+/// so a map that does not return to baseline over a loop of open/edit/close is a
+/// leak with a name and a count, which the `session_trace` summary then reports
+/// to a live session in the same terms.
+///
+/// `line_indices` is deliberately EXEMPT from the baseline: it is a by-path
+/// cache of files that are NOT open (std, and workspace files reached by
+/// cross-file navigation), documented as never invalidated, so it is bounded by
+/// the project's file count rather than by the session's length. It is still
+/// counted in the trace summary, because "bounded by the project" is a claim a
+/// climbing number in a real session would refute.
+#[cfg(test)]
+mod session_leak_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    const PROGRAM: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
+
+    fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
+        DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "vilan".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        }
+    }
+
+    fn whole_file_change(uri: &Url, version: i32, text: &str) -> DidChangeTextDocumentParams {
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// Every retained map's cardinality, as one comparable tuple.
+    fn sizes(backend: &Backend) -> session_trace::StateSizes {
+        session_trace::StateSizes {
+            documents: backend.documents.len(),
+            semantic_token_cache: backend.semantic_token_cache.len(),
+            manifests: backend.manifests.len(),
+            pending: backend.pending.len(),
+            line_indices: backend.line_indices.len(),
+        }
+    }
+
+    /// The scripted session: several files, each opened, edited a few times
+    /// (with the semantic-token and inlay-hint requests an editor really sends
+    /// after an edit), then closed — the whole loop repeated, so a per-round
+    /// residue shows up as a multiple rather than as one ambiguous entry.
+    #[tokio::test]
+    async fn an_open_edit_close_loop_returns_every_retained_map_to_baseline() {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-session-leak-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+
+        let baseline = sizes(backend);
+        assert_eq!(
+            baseline.documents, 0,
+            "the session starts holding nothing: {baseline:?}",
+        );
+
+        const ROUNDS: usize = 3;
+        const FILES: usize = 4;
+        for round in 0..ROUNDS {
+            let mut open = Vec::new();
+            for file in 0..FILES {
+                let path = directory.join(format!("session_{file}.vl"));
+                std::fs::write(&path, PROGRAM).expect("a source file");
+                let uri = Url::from_file_path(&path).expect("a file url");
+                backend.did_open(open_params(&uri, PROGRAM)).await;
+                open.push(uri);
+            }
+            assert_eq!(
+                backend.documents.len(),
+                FILES,
+                "round {round}: every opened file is held",
+            );
+
+            // The requests an editor sends while typing, so the caches an edit
+            // fills are actually filled before the close has to reclaim them.
+            for (keystroke, uri) in open.iter().enumerate() {
+                let edited = format!("{PROGRAM}// edit {keystroke}\n");
+                backend
+                    .did_change(whole_file_change(uri, 2 + keystroke as i32, &edited))
+                    .await;
+                let _ = backend
+                    .semantic_tokens_full(SemanticTokensParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                    })
+                    .await;
+                let _ = backend
+                    .inlay_hint(InlayHintParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        range: Range::new(Position::new(0, 0), Position::new(20, 0)),
+                        work_done_progress_params: Default::default(),
+                    })
+                    .await;
+            }
+
+            for uri in &open {
+                backend
+                    .did_close(DidCloseTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    })
+                    .await;
+            }
+
+            let after = sizes(backend);
+            assert_eq!(
+                (
+                    after.documents,
+                    after.semantic_token_cache,
+                    after.manifests,
+                    after.pending,
+                ),
+                (
+                    baseline.documents,
+                    baseline.semantic_token_cache,
+                    baseline.manifests,
+                    baseline.pending,
+                ),
+                "round {round}: closing every document must give the session's \
+                 memory back (baseline {baseline:?}, after {after:?})",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
