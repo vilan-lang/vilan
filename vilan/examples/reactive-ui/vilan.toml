@@ -2,8 +2,18 @@
 # it mounts the `counter` and `todos` components. As a `browser`-target package,
 # a plain `vilan build .` emits `app.js` (and the `const` styles' `app.css`) next
 # to it — no `--target` needed. Sources sit at the package root, so `root` is `.`.
+#
+# `prelude` names the ambient scope every file here resolves under — the names in
+# scope with no import (`proposal/prelude.md` §5). `std::web` is the set for
+# applications: the base seven (`print`, `Option`/`Some`/`None`,
+# `Result`/`Ok`/`Err`) plus `Signal`, `SignalCell`, `view` and `View`, plus the
+# MODULES `style` and `ui` — which is why the sources beside this file write
+# `style::Display` and `ui::mount_root` with no import. The prelude carries those
+# two as modules and not as members, so you qualify: one ambient name buys a
+# whole namespace. Omit the key for the base set; `false` turns it off.
 [package]
 name = "reactive_ui"
 root = "."
 entry = "app.vl"
 target = "browser"
+prelude = "std::web"

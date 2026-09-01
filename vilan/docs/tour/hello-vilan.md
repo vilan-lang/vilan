@@ -183,9 +183,10 @@ prelude = "std::web"    # omit the key for the default set
 ```
 
 The default set is `print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`.
-The **web** set adds `Signal`, `view`, `View`, and the modules `style`
-and `ui` — so a UI file writes `view("div")` and `style::Display::Flex`
-with no import at all. `prelude = false` turns it off entirely.
+The **web** set adds `Signal`, `SignalCell`, `view`, `View`, and the
+modules `style` and `ui` — so a UI file writes `view("div")` and
+`style::Display::Flex` with no import at all. `prelude = false` turns it
+off entirely.
 
 Two rules worth knowing:
 

@@ -5,21 +5,30 @@
 // not discovered by running it. Bindings take a `Source`, not a tracking
 // closure, so there is nothing to re-discover and an `await` can never hide a
 // dependency.
+//
+// `Signal`, `view` and `View` are ambient: `prelude = "std::web"` in vilan.toml
+// puts them in scope with no import, along with the MODULES `style` and `ui` —
+// which is why the chain below writes `style::Display::Flex` and imports nothing
+// for it. The prelude carries the module, not its members, so you
+// qualify; importing the member `style` would SHADOW the module and take
+// `style::Display` with it, so the builder is qualified too.
+//
+// The one import left is the B172 workaround: a module-qualified path is a parse
+// error in every TYPE position, so `counter_card`'s return cannot be written
+// `style::Style`. It comes out when B172 closes.
 
-import std::reactive::Signal;
-import std::style::{ Color, Display, FlexDirection, Style, space, style };
-import std::ui::{ View, view };
+import std::style::Style;
 
 // Typed atomic styles (proposal/ui-styling.md): built inside `const`, so the
 // rules land in app.css at build time; `.styled(..)` just sets the classes.
 fun counter_card(): Style {
-	style()
-		.display(Display::Flex)
-		.flex_direction(FlexDirection::Column)
-		.gap(space(2))
-		.padding(space(4))
-		.background(Color::gray(50))
-		.radius(space(2))
+	style::style()
+		.display(style::Display::Flex)
+		.flex_direction(style::FlexDirection::Column)
+		.gap(style::space(2))
+		.padding(style::space(4))
+		.background(style::Color::gray(50))
+		.radius(style::space(2))
 }
 
 // A component is just a function returning the `View` subtree it owns.

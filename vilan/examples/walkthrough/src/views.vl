@@ -1,63 +1,64 @@
 // The UI: a sign-in gate, then the routed app — the note list at "/",
 // one note's editor at "/note/{id}". Lists render live off the mirror;
 // the editor commits per keystroke through drafts.
+//
+// The import block below is what the `std::web` prelude (vilan.toml) leaves:
+// `Option`/`Some`/`None`, `Result`/`Ok`/`Err`, `Signal`, `SignalCell`, `view` and
+// `View` are ambient members, and the whole nine-name `std::style` block is gone
+// because `style` is an ambient MODULE — one ambient name for the namespace, so
+// every spelling below is `style::…`. Note what would break it: importing the
+// member `style` to write the builder bare would SHADOW that module, and
+// `style::Color` in the same file would stop resolving.
 
-import std::option::Option::{ None, Some, self };
-import std::reactive::{ Draft, DraftState, Signal, SignalCell, draft };
-import std::result::Result::{ Err, Ok, self };
+import std::reactive::{ Draft, DraftState, draft };
 import std::router::{ link, navigate };
 import std::rpc::{ ConnectionState, RpcError, SocketTransport };
 import std::storage;
-import std::style::{
-	AlignItems,
-	Color,
-	Cursor,
-	Display,
-	FlexDirection,
-	Length,
-	Style,
-	space,
-	style,
-};
-import std::ui::{ View, view };
 import pkg::notes::{ AuthOutcome, Note };
 import pkg::routes::{ Route, href };
 import pkg::store::NotesClient;
 
 // --- styles (compiled at build time; see the styling guide) ---
 
-let shell = const style()
-	.display(Display::Flex)
-	.flex_direction(FlexDirection::Column)
-	.gap(space(3))
-	.padding(space(6))
-	.margin_x(Length::auto())
-	.max_width(Length::rem(30))
+let shell = const style::style()
+	.display(style::Display::Flex)
+	.flex_direction(style::FlexDirection::Column)
+	.gap(style::space(3))
+	.padding(style::space(6))
+	.margin_x(style::Length::auto())
+	.max_width(style::Length::rem(30))
 	.font_family("system-ui, sans-serif");
 
-let row = const style().display(Display::Flex).gap(space(2)).align_items(AlignItems::Center);
+let row = const style::style()
+	.display(style::Display::Flex)
+	.gap(style::space(2))
+	.align_items(style::AlignItems::Center);
 
-let field = const style()
-	.padding(space(2))
-	.radius(space(1))
-	.border(Length::px(1), Color::gray(300));
+let field = const style::style()
+	.padding(style::space(2))
+	.radius(style::space(1))
+	.border(style::Length::px(1), style::Color::gray(300));
 
-let button = const style()
-	.padding_x(space(3))
-	.padding_y(space(2))
-	.color(Color::white())
-	.background(Color::blue(600))
-	.radius(space(1))
+let button = const style::style()
+	.padding_x(style::space(3))
+	.padding_y(style::space(2))
+	.color(style::Color::white())
+	.background(style::Color::blue(600))
+	.radius(style::space(1))
 	.border_none()
-	.cursor(Cursor::Pointer);
+	.cursor(style::Cursor::Pointer);
 
-let muted = const style().color(Color::gray(500));
+let muted = const style::style().color(style::Color::gray(500));
 
 // --- the screen ---
 
 // The app shell: a connection banner, the sign-in gate, and the routed
 // app. The gate and the app toggle on whether a token exists.
-fun screen(client: NotesClient<SocketTransport>, token: SignalCell<str>, route: SignalCell<Route>): View {
+fun screen(
+	client: NotesClient<SocketTransport>,
+	token: SignalCell<str>,
+	route: SignalCell<Route>,
+): View {
 	// The mirror, as a plain signal: `[]` until the first sync lands. Counted
 	// and released when this view is unmounted — the channel is open while,
 	// and only while, the screen is showing. The empty `[]` takes its element

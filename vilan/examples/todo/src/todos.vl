@@ -8,13 +8,18 @@
 // Mutations go through the typed `TodoClient` stub. Note what's ABSENT: no
 // local list edit, no refetch — the change comes back over the wire and lands
 // in `items` like anyone else's would.
+//
+// `Signal`, `SignalCell`, `view`, `View` and `Result`/`Ok`/`Err` are ambient
+// under `prelude = "std::web"` (vilan.toml), and the style chains below reach
+// `std::style` through the ambient MODULE — one ambient name for the whole
+// namespace, which is why every spelling is `style::…` and nothing imports it.
+// Importing the member `style` would shadow that module and take `style::Color`
+// down with it, so even the builder stays qualified. `format`, `combine` and
+// `std::rpc` are outside the set and are imported by name.
 
 import std::display::format;
-import std::reactive::{ Signal, SignalCell, combine };
-import std::result::Result::{ Err, Ok, self };
+import std::reactive::combine;
 import std::rpc::{ RpcError, SocketTransport };
-import std::style::{ AlignItems, Color, Cursor, Display, Length, Style, space, style };
-import std::ui::{ View, view };
 import pkg::store::TodoClient;
 import pkg::todo::Todo;
 
@@ -24,39 +29,39 @@ import pkg::todo::Todo;
 // `raw(..)` is the escape hatch for what the typed surface still lacks —
 // `list-style` here, and nothing else since the value types landed.
 
-let shell = const style()
-	.padding_x(space(4))
-	.padding_y(space(8))
-	.margin_x(Length::auto())
-	.max_width(Length::rem(32))
+let shell = const style::style()
+	.padding_x(style::space(4))
+	.padding_y(style::space(8))
+	.margin_x(style::Length::auto())
+	.max_width(style::Length::rem(32))
 	.font_family("system-ui, sans-serif")
-	.font_size(Length::px(16))
+	.font_size(style::Length::px(16))
 	.line_height(1.5);
 
-let row = const style().display(Display::Flex).gap(space(2));
+let row = const style::style().display(style::Display::Flex).gap(style::space(2));
 
-let list = const style().padding(space(0)).raw("list-style", "none");
+let list = const style::style().padding(style::space(0)).raw("list-style", "none");
 
-let item = const style()
-	.display(Display::Flex)
-	.gap(space(2))
-	.align_items(AlignItems::Center)
-	.padding_y(space(1));
+let item = const style::style()
+	.display(style::Display::Flex)
+	.gap(style::space(2))
+	.align_items(style::AlignItems::Center)
+	.padding_y(style::space(1));
 
-let done_label = const style().text_decoration("line-through").opacity(0.5);
+let done_label = const style::style().text_decoration("line-through").opacity(0.5);
 
-let button = const style()
-	.padding_x(space(2))
-	.padding_y(space(1))
-	.background(Color::gray(50))
-	.radius(space(1))
-	.border(Length::px(1), Color::gray(300))
-	.cursor(Cursor::Pointer)
-	.hover(style().background(Color::gray(100)));
+let button = const style::style()
+	.padding_x(style::space(2))
+	.padding_y(style::space(1))
+	.background(style::Color::gray(50))
+	.radius(style::space(1))
+	.border(style::Length::px(1), style::Color::gray(300))
+	.cursor(style::Cursor::Pointer)
+	.hover(style::style().background(style::Color::gray(100)));
 
-let remove_button = const button + style().margin_left(Length::auto());
+let remove_button = const button + style::style().margin_left(style::Length::auto());
 
-let empty_note = const style().opacity(0.6);
+let empty_note = const style::style().opacity(0.6);
 
 fun todos(client: TodoClient<SocketTransport>): View {
 	let items = client.todos.or([]);
@@ -121,7 +126,9 @@ fun todos(client: TodoClient<SocketTransport>): View {
 // two const styles, selected at runtime: `bind_class` over their class lists
 // is the recorded composition for signal-driven style switching.
 fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
-	let active = const button + style().font_weight(700).border(Length::px(1), Color::gray(700));
+	let active = const button + style::style()
+		.font_weight(700)
+		.border(style::Length::px(1), style::Color::gray(700));
 	let base_classes = button.class_list();
 	let active_classes = active.class_list();
 	view("button")

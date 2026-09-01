@@ -3,10 +3,13 @@
 // `[rpc]` bodies that use them. The browser entry imports `NotesClient` from
 // here and takes only the generated stub and the contract hash — the bodies
 // below are server-colored, and only the server entry reaches them.
+//
+// The package's `prelude = "std::web"` reaches this server-colored module too:
+// `SignalCell` types the `[expose]`d field and `Option`/`Some`/`None` carry every
+// lookup below, with no import for either. `std::db` is one-layer — refused from
+// both preludes by rule — so it is named.
 
 import std::db::{ Database, Row, Statement };
-import std::option::Option::{ None, Some, self };
-import std::reactive::{ Signal, SignalCell };
 import pkg::notes::{ AuthOutcome, Note };
 
 // --- node:crypto bindings for password hashing (sync, fits the dispatch

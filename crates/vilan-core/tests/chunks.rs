@@ -4,12 +4,31 @@
 
 use std::path::{Path, PathBuf};
 
+use vilan_core::manifest::{PreludeSpec, WEB_PRELUDE};
 use vilan_core::{Platform, Workspace, analyze_source};
 
+/// Plans `source` under the BASE prelude — the ambient scope a package with no
+/// `prelude` key resolves under, and the right one for the self-contained
+/// fixtures below, which name every import they use.
 fn plan_for(source: &'static str, platform: Platform) -> vilan_core::chunks::ChunkPlan {
+    plan_under(source, platform, PreludeSpec::default())
+}
+
+/// Plans `source` under a declared ambient scope (`prelude.md` §6.2). A fixture
+/// read off disk has to be analyzed under the prelude ITS manifest declares, or
+/// the probe means something the build never does.
+fn plan_under(
+    source: &'static str,
+    platform: Platform,
+    prelude: PreludeSpec,
+) -> vilan_core::chunks::ChunkPlan {
     let spec = vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
     );
+    let workspace = Workspace {
+        entry_prelude: prelude,
+        ..Workspace::default()
+    };
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
@@ -19,7 +38,7 @@ fn plan_for(source: &'static str, platform: Platform) -> vilan_core::chunks::Chu
                 Path::new("."),
                 Path::new("chunk_probe.vl"),
                 Some(platform),
-                &Workspace::default(),
+                &workspace,
             );
             assert!(errors.is_empty(), "{errors:?}");
             vilan_core::chunks::plan(&program.expect("program"))
@@ -40,7 +59,16 @@ fn router_example() -> &'static str {
 
 #[test]
 fn the_router_example_splits_into_its_three_routes() {
-    let plan = plan_for(router_example(), Platform::Browser);
+    // `vilan/examples/router/vilan.toml` declares `prelude = "std::web"`, so
+    // `view`, `View`, `SignalCell` and the `ui` module are ambient there and the
+    // file imports none of them. Analyzing it under the base prelude instead
+    // would fail to resolve them — the probe has to read the example the way its
+    // own manifest does.
+    let plan = plan_under(
+        router_example(),
+        Platform::Browser,
+        PreludeSpec::Module(WEB_PRELUDE.to_string()),
+    );
     eprintln!("{}", vilan_core::chunks::render(&plan, "app.vl"));
     assert_eq!(plan.sites, 1, "one splittable match (the nested one is v2)");
     let arms: Vec<&str> = plan.chunks.iter().map(|chunk| chunk.arm.as_str()).collect();

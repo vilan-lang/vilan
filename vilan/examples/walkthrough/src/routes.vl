@@ -1,7 +1,9 @@
 // The route model: one enum, and parse/href as an inverse pair.
 // "/" is the note list; "/note/7" edits note 7.
+//
+// `Option`/`Some`/`None` are ambient (the package's `prelude = "std::web"`
+// restates the base seven), so `parse`'s match on `parse_i32` imports nothing.
 
-import std::option::Option::{ None, Some, self };
 import std::router::{ Routable, segments };
 
 [derive(PartialEq)]
