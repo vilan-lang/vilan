@@ -5,8 +5,10 @@ import {
     workspace,
     window,
     commands,
+    CancellationToken,
     CodeAction,
     CodeActionKind,
+    FileSystemWatcher,
     LogOutputChannel,
     ExtensionContext,
     Range,
@@ -17,12 +19,134 @@ import {
     DidChangeConfigurationNotification,
     LanguageClient,
     LanguageClientOptions,
+    MessageSignature,
     ServerOptions,
     TransportKind,
 } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
 let outputChannel: LogOutputChannel | undefined;
+
+// --- E106: session instrumentation ---------------------------------------
+//
+// The owner reports the language server "slowing down quite a bit" over a
+// working session, and the decisive datapoint is that `Vilan: Restart Language
+// Server` does NOT fix it while restarting VS Code does. That datapoint only
+// means something once the restart command is known to really replace the
+// server, so that was checked first: `startClient` stops the old client and
+// constructs a NEW `LanguageClient`, and `vscode-languageclient`'s node layer
+// spawns a fresh process for it (and SIGTERMs the old one two seconds later if
+// it has not exited). So a restart genuinely resets everything living inside the
+// server process — which is what moves the suspicion to state that OUTLIVES the
+// client, here in the extension host.
+//
+// One such leak is fixed below (see `sharedFileWatcher`). The counters here are
+// how the next one gets attributed rather than guessed at: every request is
+// timed at the client edge, so "slow" can be read as a number per method, and
+// the per-restart bookkeeping is logged instead of being silently swallowed.
+//
+// Everything is logged to the extension's own output channel (Vilan Language
+// Server), and `Vilan: Show Language Server Status` dumps the tally on demand.
+
+/// A single request round trip is called slow past this, and says so in the
+/// output channel with its method and duration. Chosen well above an ordinary
+/// completion or hover on a large file, so a quiet session logs nothing.
+const SLOW_REQUEST_MS = 400;
+
+/// Round-trip timings for one method, as measured at the client edge — so it
+/// includes transport and the extension host's own scheduling, which is what
+/// the user actually waits for.
+interface RequestStat {
+    count: number;
+    totalMilliseconds: number;
+    maxMilliseconds: number;
+}
+
+const requestStats = new Map<string, RequestStat>();
+
+/// How many times a server process has been started this session. A session
+/// with more than one has exercised the restart path, which is the path that
+/// used to leak a file watcher every time.
+let serverStarts = 0;
+
+/// When this extension host activated — the span every count below covers.
+const sessionStarted = Date.now();
+
+/// The ONE `**/*.vl` watcher this session owns.
+///
+/// This used to be `workspace.createFileSystemWatcher('**/*.vl')` written inline
+/// in the client options, evaluated afresh on every `startClient` call. The
+/// client does not own a watcher handed to it that way: `FileSystemWatcherFeature`
+/// hooks `onDidCreate`/`onDidChange`/`onDidDelete` listeners and, on stop,
+/// disposes THE LISTENERS — the `FileSystemWatcher` itself is the caller's to
+/// dispose, and nothing disposed it. So every restart (and every `vilan.server.path`
+/// or `vilan.stdPath` change) left one more workspace-recursive watcher running
+/// in the extension host, for the lifetime of the window.
+///
+/// That is exactly the shape of the owner's datapoint: restarting the server
+/// could not clear it — restarting the server was what CREATED it — and only
+/// reloading the window did. Created once and registered with the extension's
+/// subscriptions, it is now reused by every client: the stop disposes the old
+/// client's listeners and the new client hooks its own.
+let fileWatcher: FileSystemWatcher | undefined;
+
+function sharedFileWatcher(context: ExtensionContext): FileSystemWatcher {
+    if (fileWatcher === undefined) {
+        fileWatcher = workspace.createFileSystemWatcher('**/*.vl');
+        context.subscriptions.push(fileWatcher);
+    }
+    return fileWatcher;
+}
+
+/// The method name of a request, whichever spelling the client used.
+function methodOf(type: string | MessageSignature): string {
+    return typeof type === 'string' ? type : type.method;
+}
+
+/// Fold one round trip into the tally, and name it in the output channel when it
+/// crosses `SLOW_REQUEST_MS`.
+function recordRequest(method: string, milliseconds: number): void {
+    const stat = requestStats.get(method) ?? {
+        count: 0,
+        totalMilliseconds: 0,
+        maxMilliseconds: 0,
+    };
+    stat.count += 1;
+    stat.totalMilliseconds += milliseconds;
+    stat.maxMilliseconds = Math.max(stat.maxMilliseconds, milliseconds);
+    requestStats.set(method, stat);
+    if (milliseconds >= SLOW_REQUEST_MS) {
+        outputChannel?.warn(
+            `slow request: ${method} took ${milliseconds} ms ` +
+                `(request ${stat.count} of this method; slowest so far ${stat.maxMilliseconds} ms)`,
+        );
+    }
+}
+
+/// The session tally, as lines. Ordered by total time spent, which is the order
+/// that answers "what is the session actually waiting on".
+function sessionStatusLines(context: ExtensionContext): string[] {
+    const minutes = ((Date.now() - sessionStarted) / 60000).toFixed(1);
+    const lines = [
+        `session age: ${minutes} min`,
+        `server starts this session: ${serverStarts}`,
+        `client attached: ${client !== undefined}`,
+        `file watchers created: ${fileWatcher === undefined ? 0 : 1} (one per session, never per restart)`,
+        `extension subscriptions: ${context.subscriptions.length}`,
+        'requests (count / mean ms / max ms), slowest total first:',
+    ];
+    const ordered = [...requestStats.entries()].sort(
+        (left, right) => right[1].totalMilliseconds - left[1].totalMilliseconds,
+    );
+    if (ordered.length === 0) {
+        lines.push('  (none yet)');
+    }
+    for (const [method, stat] of ordered) {
+        const mean = (stat.totalMilliseconds / stat.count).toFixed(1);
+        lines.push(`  ${method}: ${stat.count} / ${mean} / ${stat.maxMilliseconds}`);
+    }
+    return lines;
+}
 
 /// Windows executables carry a `.exe` suffix and nothing else does, so every use
 /// below collapses to exactly the pre-Windows expression on Linux and macOS
@@ -113,7 +237,23 @@ function reportMissingServer(command: string): void {
 /// window. Replaces any running client; reuses one output channel.
 async function startClient(context: ExtensionContext): Promise<void> {
     if (client) {
-        await client.stop().catch(() => undefined);
+        // E106: the outcome of the stop used to be swallowed whole
+        // (`.catch(() => undefined)`), so a server that refused to shut down —
+        // `stop()` rejects after its two-second grace, and the old process is
+        // only SIGTERMed two seconds after that — looked exactly like a clean
+        // restart. Naming it is the difference between "the restart didn't
+        // help" and "the restart didn't happen".
+        const stopping = Date.now();
+        try {
+            await client.stop();
+            outputChannel?.info(`previous server stopped in ${Date.now() - stopping} ms`);
+        } catch (error) {
+            outputChannel?.warn(
+                `previous server did not stop cleanly after ${Date.now() - stopping} ms ` +
+                    `(${error instanceof Error ? error.message : String(error)}); ` +
+                    'the client library terminates the orphan shortly after',
+            );
+        }
         client = undefined;
     }
 
@@ -149,14 +289,39 @@ async function startClient(context: ExtensionContext): Promise<void> {
             { scheme: 'file', pattern: '**/vilan.toml' },
         ],
         synchronize: {
-            fileEvents: workspace.createFileSystemWatcher('**/*.vl'),
+            // One watcher for the whole session, not one per client (E106).
+            fileEvents: sharedFileWatcher(context),
         },
         // Seed the server's feature settings; later changes go via
         // `workspace/didChangeConfiguration` (see `activate`).
         initializationOptions: readFeatureConfig(),
         outputChannel,
+        // E106: time every round trip at the client edge. One general hook
+        // covers every request type, so a method added later is measured
+        // without being remembered here.
+        middleware: {
+            sendRequest: async <P, R>(
+                type: string | MessageSignature,
+                param: P | undefined,
+                token: CancellationToken | undefined,
+                next: (
+                    type: string | MessageSignature,
+                    param?: P,
+                    token?: CancellationToken,
+                ) => Promise<R>,
+            ): Promise<R> => {
+                const started = Date.now();
+                try {
+                    return await next(type, param, token);
+                } finally {
+                    recordRequest(methodOf(type), Date.now() - started);
+                }
+            },
+        },
     };
 
+    serverStarts += 1;
+    outputChannel?.info(`starting language server #${serverStarts} from ${command}`);
     client = new LanguageClient('vilan', 'Vilan Language Server', serverOptions, clientOptions);
     try {
         await client.start();
@@ -197,10 +362,26 @@ export function activate(context: ExtensionContext): void {
 
     context.subscriptions.push(
         commands.registerCommand('vilan.restartServer', async () => {
+            // E106: the profile as it stood BEFORE the restart is the evidence a
+            // "restarting didn't help" report needs — after the restart it is
+            // gone. Logged here rather than remembered by the user.
+            outputChannel?.info(
+                ['session status before restart:', ...sessionStatusLines(context)].join('\n  '),
+            );
             await startClient(context);
             if (client) {
                 window.showInformationMessage('Vilan: language server restarted.');
             }
+        }),
+    );
+
+    // E106: the tally on demand, for the moment the session starts feeling slow.
+    context.subscriptions.push(
+        commands.registerCommand('vilan.showServerStatus', () => {
+            outputChannel?.show(true);
+            outputChannel?.info(
+                ['language server session status:', ...sessionStatusLines(context)].join('\n  '),
+            );
         }),
     );
 

@@ -227,6 +227,7 @@ const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: 15..16, head: [Attribute
 fn the_is_tier_and_condition_heads_are_pinned() {
     snapshot("a is None && b", SNAP_IS_AND);
     snapshot("x is Some(let y)", SNAP_IS_BIND);
+    snapshot("x is Some(let (y, z))", SNAP_IS_BIND_TUPLE);
     // §H.1 struct-literal-free condition heads.
     snapshot_condition("flag & mask == 0", SNAP_COND_BIT_EQ);
     snapshot_condition("a << 2 > b", SNAP_COND_SHL_GT);
@@ -269,7 +270,17 @@ const SNAP_MEMBER_TRY: &str = "(Lift((MemberAccessor((Accessor(\"a\"), 14..15), 
 const SNAP_LIFT_ADD: &str = "(LiftGroup((Binary(Add, (Lifted((Accessor(\"a\"), 15..16)), 15..17), (Lifted((Accessor(\"b\"), 20..21)), 20..22)), 15..22)), 14..23)";
 const SNAP_LIFT_MEMBER: &str = "(Binary(Add, (Lift((Accessor(\"x\"), 15..16), (MemberAccessor((LiftBinder, 18..19), (Accessor(\"y\"), 18..19)), 18..19)), 15..19), (Accessor(\"z\"), 22..23)), 15..23)";
 const SNAP_IS_AND: &str = "(Binary(And, (Is((Accessor(\"a\"), 14..15), (Variant([\"None\"], None), 19..23)), 14..23), (Accessor(\"b\"), 27..28)), 14..28)";
-const SNAP_IS_BIND: &str = "(Is((Accessor(\"x\"), 14..15), (Variant([\"Some\"], Some([(Binding(\"y\", false), 24..29)])), 19..30)), 14..30)";
+// E111: `Binding`'s third field is the NAME's own span, recorded by the parser
+// where it is unambiguous. Read it against the pattern span beside it: the
+// pattern is `let y` at 24..29 and the name is `y` at 28..29, so the four
+// characters of the keyword are accounted for HERE and not by arithmetic in a
+// consumer. The tuple fixture below is the case that arithmetic got wrong.
+const SNAP_IS_BIND: &str = "(Is((Accessor(\"x\"), 14..15), (Variant([\"Some\"], Some([(Binding(\"y\", false, 28..29), 24..29)])), 19..30)), 14..30)";
+// A BINDER tuple payload: the tuple pattern spans `let (y, z)` (24..34, keyword
+// included) while each element carries its bare identifier — `y` at 29..30, `z`
+// at 32..33. Adding the keyword's four characters to an element start, which is
+// what the analyzer used to do, lands `y` on `, z` and `z` past the parens (E111).
+const SNAP_IS_BIND_TUPLE: &str = "(Is((Accessor(\"x\"), 14..15), (Variant([\"Some\"], Some([(Tuple([(Binding(\"y\", false, 29..30), 29..30), (Binding(\"z\", false, 32..33), 32..33)]), 24..34)])), 19..35)), 14..35)";
 const SNAP_COND_BIT_EQ: &str = "(Binary(Eq, (Binary(BitAnd, (Accessor(\"flag\"), 3..7), (Accessor(\"mask\"), 10..14)), 3..14), (Number(\"0\", None, None), 18..19)), 3..19)";
 const SNAP_COND_SHL_GT: &str = "(Binary(Gt, (Binary(Shl, (Accessor(\"a\"), 3..4), (Number(\"2\", None, None), 8..9)), 3..9), (Accessor(\"b\"), 12..13)), 3..13)";
 const SNAP_COND_IS_OR: &str = "(Binary(Or, (Is((Accessor(\"a\"), 3..4), (Variant([\"None\"], None), 8..12)), 3..12), (Is((Accessor(\"b\"), 16..17), (Variant([\"None\"], None), 21..25)), 16..25)), 3..25)";

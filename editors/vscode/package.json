@@ -72,6 +72,11 @@
         "command": "vilan.restartServer",
         "title": "Restart Language Server",
         "category": "Vilan"
+      },
+      {
+        "command": "vilan.showServerStatus",
+        "title": "Show Language Server Status",
+        "category": "Vilan"
       }
     ],
     "tomlValidation": [

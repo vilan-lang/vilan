@@ -11948,7 +11948,7 @@ impl<'src> Analyzer<'src> {
         let mut members = Vec::new();
         for parameter in &function.parameters.0 {
             let parameter_name = match &parameter.pattern {
-                Pattern::Binding(name, _) => name,
+                Pattern::Binding(name, _, _) => name,
                 _ => "_",
             };
             if parameter_name == "self" {
@@ -19525,7 +19525,7 @@ impl<'src> Analyzer<'src> {
             Node::Is(subject, pattern) => {
                 let subject_id = self.walk_expr_node(subject, scope_id);
                 let walk_pattern =
-                    self.walk_pattern(&pattern.0, &pattern.1, scope_id, true, pattern.1.end);
+                    self.walk_pattern(&pattern.0, &pattern.1, scope_id, pattern.1.end);
                 self.constraints.push(Constraint::Is(PreppedIs {
                     id,
                     subject_id,
@@ -19565,7 +19565,7 @@ impl<'src> Analyzer<'src> {
                         signature.push_str(", ");
                     }
                     match &parameter.pattern {
-                        Pattern::Binding(name, _) => signature.push_str(name),
+                        Pattern::Binding(name, _, _) => signature.push_str(name),
                         _ => signature.push('_'),
                     }
                     if let Some(type_) = parameter.declared_type.as_deref() {
@@ -20365,8 +20365,7 @@ impl<'src> Analyzer<'src> {
                     .map(|value| self.walk_expr_node(value, scope_id));
                 // Binders become visible after the whole statement, like a
                 // plain `let` — the initializer never sees them.
-                let walk_pattern =
-                    self.walk_pattern(&pattern.0, &pattern.1, scope_id, false, node.1.end);
+                let walk_pattern = self.walk_pattern(&pattern.0, &pattern.1, scope_id, node.1.end);
                 if *mutable {
                     self.set_pattern_bindings_mutable(&walk_pattern);
                 }
@@ -20618,13 +20617,7 @@ impl<'src> Analyzer<'src> {
                     let walked_patterns = patterns
                         .iter()
                         .map(|pattern| {
-                            self.walk_pattern(
-                                &pattern.0,
-                                &pattern.1,
-                                leg_scope_id,
-                                true,
-                                pattern.1.end,
-                            )
+                            self.walk_pattern(&pattern.0, &pattern.1, leg_scope_id, pattern.1.end)
                         })
                         .collect();
                     let guard_id = guard
@@ -21186,7 +21179,7 @@ impl<'src> Analyzer<'src> {
             (_, Some(type_node)) => self.walk_type_node(type_node, type_scope_id),
             // A bare `self` (incl. `&self` / `&mut self`) takes the enclosing
             // `Self` type.
-            (Pattern::Binding(name, _), None) if *name == "self" => self
+            (Pattern::Binding(name, _, _), None) if *name == "self" => self
                 .try_get_expr_id_by_name("Self", type_scope_id)
                 .and_then(|self_id| self.expr_id_to_type_id_map.get(&self_id).copied())
                 .unwrap_or_else(|| Type::Unknown.get_type_id(self)),
@@ -21194,7 +21187,7 @@ impl<'src> Analyzer<'src> {
         };
         // A tuple binder is not referenceable by name; `_` keeps it positional.
         let name = match pattern {
-            Pattern::Binding(name, _) => *name,
+            Pattern::Binding(name, _, _) => *name,
             _ => "_",
         };
         // `_` eats the argument: it stays positional but is never referenceable.
@@ -21225,7 +21218,7 @@ impl<'src> Analyzer<'src> {
         // *reference* to the parameter (an `Expr::Local`), since the parameter
         // entity itself is a declaration that emits no value.
         if !matches!(pattern, Pattern::Binding(..)) {
-            let walked = self.walk_pattern(pattern, span, body_scope_id, false, span.end);
+            let walked = self.walk_pattern(pattern, span, body_scope_id, span.end);
             let reference_id = self.new_entity_id();
             self.expr_id_to_expr_map
                 .insert(reference_id, Expr::Local(parameter_id));
@@ -21255,9 +21248,6 @@ impl<'src> Analyzer<'src> {
         pattern: &'src Pattern<'src>,
         span: &'src Span,
         scope_id: Id,
-        // `match` bindings spell `let`/`mut` before each capture; binder elements
-        // (a `let`/parameter tuple) don't. Drives the name-span keyword strip.
-        keyword_prefixed: bool,
         // Where the captures become visible (proposal/local-shadowing.md §2):
         // the end of the declaring construct — the whole statement for a
         // destructuring `let` (so its initializer never sees its own binders),
@@ -21266,17 +21256,19 @@ impl<'src> Analyzer<'src> {
     ) -> WalkPattern<'src> {
         match pattern {
             Pattern::Wildcard => WalkPattern::Wildcard,
-            Pattern::Binding(name, mutable) => {
+            Pattern::Binding(name, mutable, name_span) => {
                 let name = *name;
                 let capture_id = self.new_entity_id();
                 let unknown_type_id = Type::Unknown.get_type_id(self);
-                // In a `match` binding the span covers the `let `/`mut ` keyword
-                // before the capture, so strip it; a binder element (a `let`/parameter
-                // tuple) carries the bare identifier span and needs no adjustment.
-                let header = span.into_range();
-                let prefix = if keyword_prefixed { "let ".len() } else { 0 };
-                let name_span: Span =
-                    (header.start + prefix..header.start + prefix + name.len()).into();
+                // The parser records the name's own span (E111). It used to be
+                // reconstructed here as `span.start + "let ".len()` under a flag
+                // threaded down from the caller — right for a `match`/`is` capture
+                // (`Some(let x)`, whose span covers the keyword) and wrong by exactly
+                // four characters for every binding reached through a BINDER tuple or
+                // array (`Some(let (a, b))`, `Some(let [a, b])`), whose elements carry
+                // bare identifier spans. Both are the same `Pattern::Tuple` in the
+                // tree, so no flag threaded from above could have told them apart.
+                let name_span = *name_span;
                 self.variables.insert(
                     capture_id,
                     Variable {
@@ -21312,7 +21304,6 @@ impl<'src> Analyzer<'src> {
                                 &sub_pattern.0,
                                 &sub_pattern.1,
                                 scope_id,
-                                keyword_prefixed,
                                 visible_from,
                             )
                         })
@@ -21324,13 +21315,7 @@ impl<'src> Analyzer<'src> {
                 patterns
                     .iter()
                     .map(|sub_pattern| {
-                        self.walk_pattern(
-                            &sub_pattern.0,
-                            &sub_pattern.1,
-                            scope_id,
-                            keyword_prefixed,
-                            visible_from,
-                        )
+                        self.walk_pattern(&sub_pattern.0, &sub_pattern.1, scope_id, visible_from)
                     })
                     .collect(),
             ),
@@ -21339,13 +21324,7 @@ impl<'src> Analyzer<'src> {
                 patterns
                     .iter()
                     .map(|sub_pattern| {
-                        self.walk_pattern(
-                            &sub_pattern.0,
-                            &sub_pattern.1,
-                            scope_id,
-                            keyword_prefixed,
-                            visible_from,
-                        )
+                        self.walk_pattern(&sub_pattern.0, &sub_pattern.1, scope_id, visible_from)
                     })
                     .collect(),
             ),
@@ -34772,6 +34751,19 @@ pub struct Program<'src> {
     // layout — which elements are themselves tuples (and so are spread, not nested)
     // — resolving any generic element through the active monomorphization.
     pub expr_type_ids: HashMap<Id, TypeId>,
+    /// Every UNANNOTATED function's inferred return type, as
+    /// `infer_function_returns` recorded it — its memo, keyed by function alone
+    /// and written only for an exact answer under an empty substitution, so the
+    /// entry is the function's own return type and not a caller's specialization.
+    ///
+    /// Carried out of the analyzer for the IDE (E107). A call expression stores
+    /// no type on its own id, so member completion resolves a call receiver by
+    /// reading the callee's DECLARED return type — and a builder written the way
+    /// vilan lets you write it (`fun on_drag(own self, …) { …; self }`, no
+    /// annotation) has none, which silently emptied completion for the whole
+    /// chain. The inferred answer was already computed; only the analyzer could
+    /// see it.
+    pub inferred_return_types: HashMap<Id, TypeId>,
     /// B70 (variadic-generics.md §T.8): the type of every ELEMENT of a tuple
     /// construction, as the tuple's type rule computed it — the coverage
     /// `expr_type_ids` cannot give, because it holds a type only where one is
@@ -36072,7 +36064,7 @@ pub(crate) fn service_impl_source(
             let mut parameters = Vec::new();
             for parameter in &function.parameters.0 {
                 let parameter_name = match &parameter.pattern {
-                    Pattern::Binding(name, _) => *name,
+                    Pattern::Binding(name, _, _) => *name,
                     _ => "_",
                 };
                 if parameter_name == "self" {
@@ -40166,6 +40158,7 @@ fn analyze_over_world<'src>(
         expr_types,
         declaration_labels,
         expr_type_ids,
+        inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         next_entity_id: analyzer.entity_id,

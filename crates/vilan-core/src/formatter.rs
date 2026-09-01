@@ -4649,7 +4649,7 @@ impl<'src> Printer<'src> {
     /// where a binding reads `let x` / `mut x`.
     fn print_binder(&mut self, binder: &Pattern<'src>) {
         match binder {
-            Pattern::Binding(name, _) => self.out.push_str(name),
+            Pattern::Binding(name, _, _) => self.out.push_str(name),
             Pattern::Tuple(elements) => {
                 self.out.push('(');
                 for (index, (element, _)) in elements.iter().enumerate() {
@@ -4708,7 +4708,7 @@ impl<'src> Printer<'src> {
     fn print_pattern(&mut self, pattern: &Pattern<'src>) {
         match pattern {
             Pattern::Wildcard => self.out.push('_'),
-            Pattern::Binding(name, mutable) => {
+            Pattern::Binding(name, mutable, _) => {
                 self.out.push_str(if *mutable { "mut " } else { "let " });
                 self.out.push_str(name);
             }

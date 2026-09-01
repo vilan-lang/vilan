@@ -1993,7 +1993,7 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
         .iter()
         .map(|parameter| {
             let parameter_name = match &parameter.pattern {
-                Pattern::Binding(name, _) => (*name).to_string(),
+                Pattern::Binding(name, _, _) => (*name).to_string(),
                 _ => slice(text, parameter.span).to_string(),
             };
             array(vec![

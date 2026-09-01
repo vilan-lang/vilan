@@ -12175,3 +12175,399 @@ mod perf_baseline {
         assert_eq!(percentile(&sorted[..1], 0.99), 1.0);
     }
 }
+
+/// E111: a capture's name span inside an `is`/`match` pattern — the one span
+/// semantic tokens and inlay hints BOTH read (`Variable::name_span`), so a
+/// wrong one paints the highlighting and slides the hint together.
+///
+/// The owner's live site was kolt `interact.vl:129`,
+/// `if handler.on_double_click is Some(let (delay, on_double_click))`: every
+/// token from the tuple onward sat four characters late. The analyzer used to
+/// rebuild the name span as `pattern.start + "let ".len()` under a flag threaded
+/// down from the caller. That is right for `Some(let x)`, whose pattern span
+/// really does cover the keyword — and wrong by exactly four for a binding
+/// reached through a BINDER tuple or array, whose elements carry bare identifier
+/// spans. Both shapes are the same `Pattern::Tuple` in the tree, which is why the
+/// fix had to move the name span into the AST rather than sharpen the flag.
+///
+/// These assert ABSOLUTE offsets against the fixture text, so an off-by-any drift
+/// fails loudly rather than shifting an expectation along with the bug.
+#[cfg(test)]
+mod pattern_capture_name_spans {
+    use super::tests::std_root;
+    use super::*;
+    use std::path::Path;
+
+    fn analyze(text: &str) -> Document {
+        Document::analyze(text, &std_root(), Path::new("test.vl"))
+    }
+
+    /// Every DECLARATION token (a capture's own name), as the text it covers.
+    fn declaration_tokens(document: &Document, text: &str) -> Vec<(usize, usize, String)> {
+        document
+            .semantic_tokens()
+            .iter()
+            .filter(|(_, kind, modifiers)| {
+                matches!(kind, TokenKind::Variable) && modifiers & MODIFIER_DECLARATION != 0
+            })
+            .map(|(span, _, _)| {
+                let range = span.into_range();
+                (
+                    range.start,
+                    range.end,
+                    text.get(range.start..range.end)
+                        .unwrap_or("<out of bounds>")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The span the fixture text says a capture occupies — the pin's own oracle,
+    /// independent of anything the compiler computed.
+    fn expected(text: &str, name: &str, after: &str) -> (usize, usize, String) {
+        let anchor = text.find(after).expect("the fixture anchor");
+        let start = text[anchor..].find(name).expect("the capture name") + anchor;
+        (start, start + name.len(), name.to_string())
+    }
+
+    /// The bug's exact shape: an `is` pattern whose payload is a TUPLE binder.
+    /// Both captures used to land four characters late (`"y, ot"`, `"r)) {"`).
+    #[test]
+    fn a_tuple_payload_paints_its_captures_on_their_own_names() {
+        let text = "fun main() {\n\tlet a: Option<(i32, i32)> = Some((1, 2));\n\tif a is Some(let (delay, other)) {\n\t\tprint(delay);\n\t}\n}\n";
+        let document = analyze(text);
+        assert_eq!(
+            declaration_tokens(&document, text),
+            vec![
+                expected(text, "a", "let a: Option"),
+                expected(text, "delay", "Some(let ("),
+                expected(text, "other", "Some(let ("),
+            ],
+        );
+    }
+
+    /// The `mut` spelling of the same binder — `"mut "` is four characters too,
+    /// so the old arithmetic drifted here identically rather than differently.
+    #[test]
+    fn a_mut_tuple_payload_paints_its_captures_on_their_own_names() {
+        let text = "fun main() {\n\tlet a: Option<(i32, i32)> = Some((1, 2));\n\tif a is Some(mut (delay, other)) {\n\t\tprint(delay);\n\t}\n}\n";
+        let document = analyze(text);
+        assert_eq!(
+            declaration_tokens(&document, text),
+            vec![
+                expected(text, "a", "let a: Option"),
+                expected(text, "delay", "Some(mut ("),
+                expected(text, "other", "Some(mut ("),
+            ],
+        );
+    }
+
+    /// The ARRAY binder, the shape neither the report nor B166/B167 covered: the
+    /// analyzer recursed into `Pattern::Array` with the same flag, so it drifted
+    /// too. Pinned per case, not by family.
+    #[test]
+    fn an_array_payload_paints_its_captures_on_their_own_names() {
+        let text = "fun main() {\n\tlet a: Option<[i32; 2]> = Some([1, 2]);\n\tif a is Some(let [delay, other]) {\n\t\tprint(delay);\n\t}\n}\n";
+        let document = analyze(text);
+        assert_eq!(
+            declaration_tokens(&document, text),
+            vec![
+                expected(text, "a", "let a: Option"),
+                expected(text, "delay", "Some(let ["),
+                expected(text, "other", "Some(let ["),
+            ],
+        );
+    }
+
+    /// A `match` leg reaches `walk_pattern` by a different caller than `is` does,
+    /// and drifted the same way — so the leg gets its own pin.
+    #[test]
+    fn a_match_legs_tuple_payload_paints_its_captures_on_their_own_names() {
+        let text = "fun main() {\n\tlet a: Option<(i32, i32)> = Some((1, 2));\n\tmatch a {\n\t\tSome(let (delay, other)) => print(delay),\n\t\tNone => {}\n\t}\n}\n";
+        let document = analyze(text);
+        assert_eq!(
+            declaration_tokens(&document, text),
+            vec![
+                expected(text, "a", "let a: Option"),
+                expected(text, "delay", "Some(let ("),
+                expected(text, "other", "Some(let ("),
+            ],
+        );
+    }
+
+    /// The three shapes that were already RIGHT, so the fix is pinned as a
+    /// narrowing and not as a swap of one drift for another: a bare payload
+    /// (whose pattern span really does cover `let `), a pattern tuple whose
+    /// elements each spell their own `let`, and a destructuring `let`.
+    #[test]
+    fn the_shapes_that_already_painted_correctly_are_unmoved() {
+        let bare = "fun main() {\n\tlet a: Option<i32> = Some(3);\n\tif a is Some(let value) {\n\t\tprint(value);\n\t}\n}\n";
+        assert_eq!(
+            declaration_tokens(&analyze(bare), bare),
+            vec![
+                expected(bare, "a", "let a: Option"),
+                expected(bare, "value", "Some(let "),
+            ],
+        );
+
+        let nested = "fun main() {\n\tlet a: Option<Option<i32>> = Some(Some(3));\n\tif a is Some(Some(let value)) {\n\t\tprint(value);\n\t}\n}\n";
+        assert_eq!(
+            declaration_tokens(&analyze(nested), nested),
+            vec![
+                expected(nested, "a", "let a: Option"),
+                expected(nested, "value", "Some(Some(let "),
+            ],
+        );
+
+        // Each element spells its own `let`, so each element's span DOES cover a
+        // keyword — the case the deleted flag existed to serve.
+        let legs = "fun main() {\n\tlet a = (1, 2);\n\tmatch a {\n\t\t(let first, let second) => print(first + second),\n\t}\n}\n";
+        assert_eq!(
+            declaration_tokens(&analyze(legs), legs),
+            vec![
+                expected(legs, "a", "let a = "),
+                expected(legs, "first", "\t\t(let "),
+                expected(legs, "second", ", let "),
+            ],
+        );
+
+        let destructure =
+            "fun main() {\n\tlet (first, second) = (1, 2);\n\tprint(first + second);\n}\n";
+        assert_eq!(
+            declaration_tokens(&analyze(destructure), destructure),
+            vec![
+                expected(destructure, "first", "let ("),
+                expected(destructure, "second", "let ("),
+            ],
+        );
+    }
+
+    /// The hints ride the SAME `name_span`, and a hint is the worse half of the
+    /// bug: a slid anchor lands mid-identifier, and the handler's viewport filter
+    /// can drop it entirely. Anchored at each capture name's END.
+    #[test]
+    fn inlay_hints_anchor_at_the_end_of_a_tuple_payloads_capture_names() {
+        let text = "fun main() {\n\tlet a: Option<(i32, i32)> = Some((1, 2));\n\tif a is Some(let (delay, other)) {\n\t\tprint(delay);\n\t}\n}\n";
+        let document = analyze(text);
+        let anchor = |name: &str| {
+            let (_, end, _) = expected(text, name, "Some(let (");
+            (end, ": i32".to_string())
+        };
+        let hints = document.inlay_hints();
+        assert!(
+            hints.contains(&anchor("delay")) && hints.contains(&anchor("other")),
+            "hints must sit just past each capture name, not four characters on: \
+             {hints:?}",
+        );
+    }
+}
+
+/// E107: member completion inside a BUILDER chain — the owner's kolt
+/// `interact.vl` shape, reported as "a `.` on its own line between two existing
+/// `.calls` offers nothing".
+///
+/// The line break was a red herring. The classifier reads member position in
+/// token space and has since kolt.local 001, so every trivia shape resolves; the
+/// receiver's TYPE was what went missing. `call_result_type_id` resolved a call
+/// receiver by reading the callee's DECLARED return type, and kolt's builders —
+/// like the language invites — declare none:
+///
+/// ```text
+/// fun on_drag(own self, handler: || DragHandler) { self.on_drag = Some(handler); self }
+/// ```
+///
+/// So `Handler::new().` was already silent, and so was every link after it, on
+/// one line or ten. The analyzer had inferred the answer all along and memoized
+/// it; it simply never left the analyzer, which is why the fix is one exported
+/// field (`Program::inferred_return_types`) rather than a second inference in
+/// the IDE.
+///
+/// Both spellings are pinned side by side in every shape, so a regression that
+/// re-narrows this to declared returns fails on the unannotated row alone.
+#[cfg(test)]
+mod builder_chain_member_completion {
+    use super::tests::std_root;
+    use super::*;
+    use std::path::Path;
+
+    /// kolt's spelling: `own self` builders that return `self` with no return
+    /// annotation, plus a field, so a silent answer is distinguishable from a
+    /// merely incomplete one.
+    const UNANNOTATED: &str = "struct Handler { count: i32 }\n\
+         impl Handler {\n\
+         \tfun new() { Handler { count = 0 } }\n\
+         \tfun on_drag(own self, handler: || void) { self.count = 1; self }\n\
+         \tfun on_double_click(own self, handler: || void) { self.count = 2; self }\n\
+         }\n";
+
+    /// The same builders with the return type written out — the control that
+    /// keeps the pin honest about WHICH half broke.
+    const ANNOTATED: &str = "struct Handler { count: i32 }\n\
+         impl Handler {\n\
+         \tfun new(): Handler { Handler { count = 0 } }\n\
+         \tfun on_drag(own self, handler: || void): Handler { self.count = 1; self }\n\
+         \tfun on_double_click(own self, handler: || void): Handler { self.count = 2; self }\n\
+         }\n";
+
+    /// The labels offered at the `~` cursor in `prelude` + `body`.
+    fn labels(prelude: &str, body: &str) -> Vec<String> {
+        let source = format!("{prelude}fun main() {{\n{body}}}\n");
+        let offset = source.find('~').expect("the pin source needs a `~` cursor");
+        let text = source.replace('~', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect()
+    }
+
+    /// Asserts the chain's members are offered, for BOTH spellings of the
+    /// builder's return type.
+    fn assert_offers_the_builders_members(shape: &str, body: &str) {
+        for (spelling, prelude) in [("unannotated", UNANNOTATED), ("annotated", ANNOTATED)] {
+            let found = labels(prelude, body);
+            for member in ["count", "on_drag", "on_double_click"] {
+                assert!(
+                    found.contains(&member.to_string()),
+                    "{shape} ({spelling} builder) must offer `{member}`: {found:?}",
+                );
+            }
+        }
+    }
+
+    /// The reported shape: a `.` alone on a continuation line, with the chain
+    /// continuing on the line BELOW it.
+    #[test]
+    fn a_dot_on_its_own_line_mid_chain_offers_the_receivers_members() {
+        assert_offers_the_builders_members(
+            "a mid-chain dot on its own line",
+            "\tlet h = Handler::new()\n\t\t.on_drag(|| {})\n\t\t.~\n\t\t.on_double_click(|| {});\n",
+        );
+    }
+
+    /// The same, parenthesized — the way the owner's site wraps the chain.
+    #[test]
+    fn a_parenthesized_chains_own_line_dot_offers_the_receivers_members() {
+        assert_offers_the_builders_members(
+            "a parenthesized mid-chain dot",
+            "\tlet h = (Handler::new()\n\t\t.on_drag(|| {})\n\t\t.~\n\t\t.on_double_click(|| {}));\n",
+        );
+    }
+
+    /// The trailing dot, and the dot immediately before the closing paren — the
+    /// other two shapes the item names.
+    #[test]
+    fn a_trailing_dot_and_a_dot_before_the_close_paren_offer_the_receivers_members() {
+        assert_offers_the_builders_members(
+            "a trailing dot",
+            "\tlet h = Handler::new()\n\t\t.on_drag(|| {})\n\t\t.~;\n",
+        );
+        assert_offers_the_builders_members(
+            "a dot before the closing paren",
+            "\tlet h = (Handler::new()\n\t\t.on_drag(|| {})\n\t\t.~\n\t);\n",
+        );
+    }
+
+    /// The same-line control: the report is about a line break, so the pin has
+    /// to show the SAME answer with no line break at all — which is how the
+    /// investigation learned the break was not the variable.
+    #[test]
+    fn the_same_line_control_offers_the_same_members() {
+        assert_offers_the_builders_members(
+            "a same-line chain",
+            "\tlet h = Handler::new().on_drag(|| {}).~;\n",
+        );
+        assert_offers_the_builders_members(
+            "a bare constructor call receiver",
+            "\tlet h = Handler::new().~;\n",
+        );
+    }
+
+    /// The owner's literal site: the chain is an ARGUMENT inside an element's
+    /// opening tag, one closure deep. The element head is its own cursor-context
+    /// world, so a chain nested in a head argument gets its own row.
+    #[test]
+    fn a_builder_chain_inside_an_element_head_argument_offers_the_receivers_members() {
+        for (spelling, prelude) in [("unannotated", UNANNOTATED), ("annotated", ANNOTATED)] {
+            let source = format!(
+                "import std::ui::view;\n{prelude}fun main() {{\n\
+                 \t<div\n\
+                 \t\t.on(Handler::new()\n\
+                 \t\t\t.on_drag(|| {{}})\n\
+                 \t\t\t.~\n\
+                 \t\t\t.on_double_click(|| {{}}))\n\
+                 \t></div>\n\
+                 }}\n"
+            );
+            let offset = source.find('~').expect("cursor");
+            let text = source.replace('~', "");
+            let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+            let found: Vec<String> = document
+                .completion(offset)
+                .into_iter()
+                .map(|completion| completion.label)
+                .collect();
+            for member in ["count", "on_drag", "on_double_click"] {
+                assert!(
+                    found.contains(&member.to_string()),
+                    "an element-head argument's chain ({spelling}) must offer \
+                     `{member}`: {found:?}",
+                );
+            }
+        }
+    }
+
+    /// A nested chain inside a closure ARGUMENT of the outer chain — kolt's
+    /// `DragHandler::new().on_drag_move(…)` inside `on_drag(|| { … })`. The inner
+    /// receiver is a different unannotated builder reached through a closure body.
+    #[test]
+    fn a_chain_nested_in_a_closure_argument_offers_the_inner_receivers_members() {
+        let prelude = "struct Inner { m: i32 }\n\
+             impl Inner {\n\
+             \tfun new() { Inner { m = 0 } }\n\
+             \tfun on_move(own self, handler: || void) { self.m = 1; self }\n\
+             \tfun on_end(own self, handler: || void) { self.m = 2; self }\n\
+             }\n\
+             struct Handler { count: i32 }\n\
+             impl Handler {\n\
+             \tfun new() { Handler { count = 0 } }\n\
+             \tfun on_drag(own self, handler: || Inner) { self.count = 1; self }\n\
+             }\n";
+        let found = labels(
+            prelude,
+            "\tlet h = Handler::new()\n\t\t.on_drag(|| {\n\t\t\tInner::new()\n\t\t\t\t.on_move(|| {})\n\t\t\t\t.~\n\t\t\t\t.on_end(|| {})\n\t\t});\n",
+        );
+        for member in ["m", "on_move", "on_end"] {
+            assert!(
+                found.contains(&member.to_string()),
+                "the INNER builder's `{member}`: {found:?}",
+            );
+        }
+        assert!(
+            !found.contains(&"on_drag".to_string()),
+            "…and not the outer chain's: {found:?}",
+        );
+    }
+
+    /// The inferred return type must be the FUNCTION's, never a caller's
+    /// specialization: the exported record is keyed by function alone, so a
+    /// generic builder is the case that would expose a leak between call sites.
+    #[test]
+    fn an_unannotated_generic_returns_its_own_type_not_a_callers() {
+        let prelude = "struct Wrapper<T> { value: T }\n\
+             struct Point { x: i32 }\n\
+             impl Point { fun twin(self): Point { self } }\n\
+             fun wrap<T>(value: T) { Wrapper { value = value } }\n";
+        let found = labels(prelude, "\tlet w = wrap(Point { x = 1 });\n\twrap(1).~;\n");
+        assert!(
+            found.contains(&"value".to_string()),
+            "the wrapper's own field: {found:?}",
+        );
+        assert!(
+            !found.contains(&"twin".to_string()) && !found.contains(&"x".to_string()),
+            "nothing from the OTHER call site's specialization: {found:?}",
+        );
+    }
+}
