@@ -13539,6 +13539,168 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// The type a member declares for its SECOND parameter — the `b`/`other`
+    /// that an operator trait's `B` names, the receiver being parameter 0.
+    /// `None` when there is no such parameter (a malformed impl, which
+    /// conformance refuses on its own).
+    fn second_parameter_type_id(&self, member_id: Id) -> Option<TypeId> {
+        let parameter_id = match self.get_entity_by_id(member_id) {
+            Expr::Function(function_id) => self
+                .functions
+                .get(function_id)
+                .and_then(|function| function.parameters.get(1).copied()),
+            Expr::ExternalFunction(external_function_id) => self
+                .external_functions
+                .get(external_function_id)
+                .and_then(|external| external.parameters.get(1).copied()),
+            _ => None,
+        }?;
+        self.parameters
+            .get(&parameter_id)
+            .map(|parameter| parameter.type_id)
+    }
+
+    /// B180: the right operand of a DISPATCHED operator, against the `B` the
+    /// left operand's impl actually declares. Pushes the refusal and answers
+    /// `true` when the operand does not belong there.
+    ///
+    /// B179 ruled the operand roles for the NATIVE left operand: the operator
+    /// belongs to the LEFT one, so the right has to be a MEMBER of what that
+    /// operand's `add` accepts. The dispatch path is where an impl gets to SAY
+    /// what that set is — and it was never read. `impl Counter with Add { fun
+    /// add(self, other: Counter): Counter }` resolved for `Counter { n = 1 } +
+    /// Point { x = 1, y = 2 }`, passed the `Point` straight into a body typed
+    /// for a `Counter`, and printed `2` off the struct's slot 0. Every operator
+    /// the dispatch serves had it: `-` and `*` computed off slot 0 the same
+    /// way, `==` compared it, and `<` reached it through `PartialOrd`'s
+    /// inherited default.
+    ///
+    /// The `B` to check is the impl's, not the trait's, and it is three
+    /// different things depending on how the impl was written:
+    ///
+    ///   * a type the impl wrote itself (`impl Meters with Add<Feet>` declaring
+    ///     `other: Feet`) — that type, as written;
+    ///   * the impl's OWN parameter (`impl Vec<type T> with Add<T>`, or
+    ///     `Add<Vec<T>>`) — substituted through the binders the subject bound,
+    ///     so `Vec<i32> + x` wants an `i32` and `Vec<T> + x` wants that same
+    ///     `T`. A binder the subject did NOT decide is a hole the operand
+    ///     fills: it BINDS, which is acceptance, and the bound it carries is
+    ///     what the operand is then checked against;
+    ///   * `Self`, whether spelled or arrived at through `Add<B = Self>`'s
+    ///     default — the subject.
+    ///
+    /// A GENERIC right operand refuses for B179's reason, one level along: a
+    /// bound promises a trait's methods, never that the parameter IS the
+    /// declared `B`, and the declaration is checked once for all of its
+    /// instantiations. `compare_type` would admit it (a parameter compares
+    /// equal to whatever is asked), which is why the comparison here is the
+    /// RIGID one — the same instrument conformance uses to say that a member
+    /// promising any `T` is not implemented by one fixing the position to
+    /// `str`. Rigid over both sides' parameters, minus the impl's own free
+    /// binders, is exactly "same parameter, or a member of a concrete set".
+    fn refuse_operator_right_operand(
+        &mut self,
+        op: BinaryOp,
+        symbol: &str,
+        binary_id: Id,
+        rhs_id: Option<Id>,
+        member_id: Id,
+        lhs_type: &Type,
+        bindings: &SubstitutionContext,
+    ) -> bool {
+        let (Some(rhs_id), Some((trait_name, method_name))) = (rhs_id, operator_trait_method(op))
+        else {
+            return false;
+        };
+        let Some(declared_id) = self.second_parameter_type_id(member_id) else {
+            return false;
+        };
+        let raw_declared = declared_id.get_type(self);
+        let mut free_binders: Vec<TypeId> = Vec::new();
+        self.collect_generics(&raw_declared, 0, &mut free_binders);
+        free_binders.retain(|constraint_id| !bindings.contains_key(constraint_id));
+        let declared = match bindings.get(&declared_id).copied() {
+            // The TRAIT's own `B`, bound by the argument the impl's `with`
+            // clause wrote (`impl Meters with PartialOrd<Feet>`). A defaulted
+            // parameter interns as its default rather than as a fresh generic,
+            // so this position is a plain type id and `substitute_type` — which
+            // rewrites `Type::Generic` and nothing else — would walk past it.
+            Some(argument_id) => argument_id.get_type(self),
+            None => match self.substitute_type(&raw_declared, bindings) {
+                Type::Trait(trait_id, arguments) => {
+                    // `B = Self` with no argument supplied: `Add<B = Self>`
+                    // interns `B` as `Type::Trait(Add, [])`, which is also what
+                    // a `Self`-spelled parameter resolves to. Either way the
+                    // position means the subject. Any OTHER trait in the
+                    // position is a genuinely trait-typed operand, and this
+                    // check has no verdict to give about one.
+                    if arguments.is_empty()
+                        && self.traits.get(&trait_id).map(|trait_| trait_.name) == Some(trait_name)
+                    {
+                        lhs_type.clone()
+                    } else {
+                        return false;
+                    }
+                }
+                substituted => substituted,
+            },
+        };
+        // Inferred against the DECLARED operand type, so an unsuffixed literal
+        // adapts to it exactly as it would at the method call this dispatches
+        // to (`Bag<i53> + 3`).
+        let rhs_type = self.infer_type(rhs_id, &declared, &HashMap::default());
+        if matches!(declared, Type::Unknown | Type::Unresolved)
+            || matches!(rhs_type, Type::Unknown | Type::Unresolved)
+        {
+            return false;
+        }
+        let mut rigid: Vec<TypeId> = Vec::new();
+        self.collect_generics(&declared, 0, &mut rigid);
+        self.collect_generics(&rhs_type, 0, &mut rigid);
+        rigid.retain(|constraint_id| !free_binders.contains(constraint_id));
+        if self.compare_type_rigid(&declared, &rhs_type, &HashMap::default(), &rigid) {
+            return false;
+        }
+        let subject_label = self.pretty_print_type(lhs_type, &HashMap::default());
+        let declared_label = self.pretty_print_type(&declared, &HashMap::default());
+        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+        let subject_name = match lhs_type {
+            Type::Struct(id, _) => self.structs.get(id).map(|struct_| struct_.name.to_string()),
+            Type::Enum(id, _) => self.enums.get(id).map(|enum_| enum_.name.to_string()),
+            _ => None,
+        }
+        .unwrap_or_else(|| subject_label.clone());
+        let steer = if matches!(rhs_type, Type::Generic(_)) {
+            format!(
+                "a parameter promises a trait's METHODS, never that it IS \
+                 `{declared_label}`, so no bound on `{rhs_label}` can prove membership. \
+                 Declare the operand `{declared_label}`, or put a left operand there whose \
+                 `{trait_name}` declares its `B` AS `{rhs_label}` — one impl written over \
+                 that same parameter (`impl {subject_name}<type {rhs_label}> with \
+                 {trait_name}<{rhs_label}>`)"
+            )
+        } else {
+            format!(
+                "`{symbol}` dispatches to that impl, which reads the value as \
+                 `{declared_label}`. Convert the operand, or give `{subject_name}` an impl \
+                 of `{trait_name}` whose `B` is `{rhs_label}`"
+            )
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "`{subject_label}`'s `{method_name}` accepts `{declared_label}`, but the \
+                     right operand is `{rhs_label}`: {steer}"
+                ),
+            },
+            binary_id,
+        );
+        true
+    }
+
     /// Resolves a method `member_name` declared by `trait_id` — a default method
     /// or a signature-only requirement — callable on a `Self`-typed receiver.
     /// Used for abstract receivers: `Self` in a trait default method, a
@@ -33496,7 +33658,6 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {
-                self.binary_op_dispatch.insert(binary_id, method_id);
                 // Record the operand's type-arg bindings whenever there are any
                 // (`Option<Point> ==` binds the impl's `Option<T>` to `T = Point`)
                 // — the same rule `resolve_method_call` applies to an explicit
@@ -33508,14 +33669,22 @@ impl<'src> Analyzer<'src> {
                 // the call falls through to the requirement's empty body and trips
                 // the emitter's never-silent check.
                 let impl_subject = impl_subject_id.get_type(self);
-                if let Some((_, bindings)) =
-                    self.reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
-                    && !bindings.is_empty()
-                {
-                    self.method_call_substitution
-                        .insert(binary_id, bindings.into_iter().collect());
+                let bindings: SubstitutionContext = self
+                    .reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
+                    .map(|(_, bindings)| bindings.into_iter().collect())
+                    .unwrap_or_default();
+                // B180: and the RIGHT operand has to belong to what that impl
+                // declares, which nothing asked before this line existed.
+                if self.refuse_operator_right_operand(
+                    op, symbol, binary_id, rhs_id, method_id, &lhs_type, &bindings,
+                ) {
+                    continue;
                 }
-            } else if let Some((_member_id, impl_subject_id, trait_id, trait_arguments)) =
+                self.binary_op_dispatch.insert(binary_id, method_id);
+                if !bindings.is_empty() {
+                    self.method_call_substitution.insert(binary_id, bindings);
+                }
+            } else if let Some((member_id, impl_subject_id, trait_id, trait_arguments)) =
                 // Natives never dispatch — native JS IS their operator
                 // semantics (std's numeric impls carry default bodies written
                 // WITH the operators; dispatching a native back into one
@@ -33535,25 +33704,34 @@ impl<'src> Analyzer<'src> {
                 // providing impl's generics from the receiver — the same
                 // Gap-E path an ordinary method call takes.
                 let (_, method_name) = operator_trait_method(op).expect("checked above");
+                // The same substitution `receiver.member()` and `for x in
+                // receiver` build for an inherited default — the impl's own
+                // generics from the receiver, then the TRAIT's parameters from
+                // the arguments the `with` clause wrote. It was spelled out
+                // twice; B180 needs it before the dispatch is recorded (the
+                // trait's `B` is bound in its second half), so it reads the
+                // factored helper both places instead.
+                let bindings = self.inherited_default_bindings(
+                    &lhs_type,
+                    impl_subject_id,
+                    trait_id,
+                    &trait_arguments,
+                );
+                // B180, the other half of the dispatch path: `PartialOrd`'s
+                // `lt`/`le`/`gt`/`ge` reach their operand through the TRAIT's
+                // default, so the `B` to check is the trait's own parameter —
+                // resolved by the bindings above, or `Self` where the `with`
+                // clause supplied no argument.
+                if self.refuse_operator_right_operand(
+                    op, symbol, binary_id, rhs_id, member_id, &lhs_type, &bindings,
+                ) {
+                    continue;
+                }
                 let receiver_type_id = lhs_type.clone().get_type_id(self);
                 self.generic_dispatch.insert(
                     binary_id,
                     GenericDispatch::OnType(Some(receiver_type_id), method_name),
                 );
-                let impl_subject = impl_subject_id.get_type(self);
-                let mut bindings: SubstitutionContext = self
-                    .reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
-                    .map(|(_, bindings)| bindings.into_iter().collect())
-                    .unwrap_or_default();
-                let trait_parameter_ids = self
-                    .traits
-                    .get(&trait_id)
-                    .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-                    .unwrap_or_default();
-                for (parameter_id, argument_id) in trait_parameter_ids.iter().zip(trait_arguments) {
-                    let resolved = self.substitute_type(&argument_id.get_type(self), &bindings);
-                    bindings.insert(*parameter_id, resolved.get_type_id(self));
-                }
                 if !bindings.is_empty() {
                     self.method_call_substitution.insert(binary_id, bindings);
                 }

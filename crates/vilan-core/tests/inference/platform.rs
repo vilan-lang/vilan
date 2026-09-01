@@ -5564,6 +5564,568 @@ fn the_conversion_steer_for_a_generic_numeric_operand_compiles_and_runs() {
     );
 }
 
+// --- B180: the DISPATCH path never read the impl's declared `B` -------------
+//
+// B179 ruled the operand roles for a NATIVE left operand; a NOMINAL one is
+// where an impl gets to SAY what its operator accepts, and nothing read it.
+// `impl Counter with Add { fun add(self, other: Counter): Counter }` resolved
+// for `Counter { n = 1 } + Point { x = 1, y = 2 }`, handed the `Point` to a
+// body typed for a `Counter`, and printed `2` — the struct's slot 0, read as
+// `other.n`. Every operator the dispatch serves had it, all measured before the
+// fix: `-` gave `7` and `*` gave `30` off the same slot, `==` answered `true`,
+// `<` answered `true` through `PartialOrd`'s inherited default, `/ % << >> & ^
+// |` all computed, and `c += Point { .. }` rode the desugar's second
+// registration site into the same body. `impl Meters with Add<Feet>` accepted a
+// `Meters` (6, reading `other.f` off `m`), and `impl Bag<type T> with Add<T>`
+// at `Bag<i32>` accepted a `str`.
+//
+// The `B` to check is the IMPL's, and it is three things: a type the impl wrote
+// (`Add<Feet>`), the impl's own parameter substituted through what the subject
+// bound (`Add<T>` at `Vec2<i32>` wants an `i32`), or `Self` — spelled, or
+// arrived at through `Add<B = Self>`'s default. A generic right operand refuses
+// for B179's reason one level along: a bound promises a trait's METHODS, never
+// that the parameter IS the declared `B`. The comparison is the RIGID one
+// conformance uses, because the ordinary one treats a parameter as a hole and
+// answers `true` to whatever is asked.
+
+#[test]
+fn a_foreign_struct_on_the_right_of_a_dispatched_add_is_rejected() {
+    // The pin B180 was filed as: GROUNDED both sides, no generics anywhere, and
+    // it printed `2`.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Counter): Counter {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            let counter = Counter { n = 1 };
+            let point = Point { x = 1, y = 2 };
+            print((counter + point).n);
+        }
+        "#,
+        "counter + point",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn a_self_spelled_operand_is_the_subject_like_the_b_equals_self_default() {
+    // Two spellings of the same `B`. `Add<B = Self>`'s default interns `B` as
+    // the trait type itself rather than as a fresh parameter, and a `Self`
+    // written in the impl lands on that same type — so the position has to be
+    // read as "the subject" in both, or the check would have no `B` at all for
+    // the overwhelmingly common impl.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Self): Self {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            let counter = Counter { n = 1 };
+            let point = Point { x = 7, y = 9 };
+            print((counter + point).n);
+        }
+        "#,
+        "counter + point",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn the_self_spelled_operand_still_dispatches_for_the_subject() {
+    // The other half: the `Self` spelling must still ACCEPT a `Counter`, or the
+    // arm above would be refusing the position rather than checking it.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Self): Self {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            print((Counter { n = 1 } + Counter { n = 4 }).n);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn every_dispatched_operator_checks_its_right_operand() {
+    // One check at the dispatch site, not one per trait — so the whole family
+    // is the pin. Each of these computed off `Point`'s slot 0 before the fix.
+    for (operator, trait_name, method) in [
+        ("-", "Sub", "sub"),
+        ("*", "Mul", "mul"),
+        ("/", "Div", "div"),
+        ("%", "Rem", "rem"),
+        ("<<", "Shl", "shl"),
+        (">>", "Shr", "shr"),
+        ("&", "BitAnd", "bit_and"),
+        ("^", "BitXor", "bit_xor"),
+        ("|", "BitOr", "bit_or"),
+    ] {
+        assert_fails_spanning(
+            &format!(
+                r#"
+        import std::operators::{trait_name};
+
+        struct Counter {{ n: i32 }}
+        struct Point {{ x: i32, y: i32 }}
+
+        impl Counter with {trait_name} {{
+            fun {method}(self, other: Counter): Counter {{
+                Counter {{ n = self.n + other.n }}
+            }}
+        }}
+
+        fun main() {{
+            let counter = Counter {{ n = 12 }};
+            let point = Point {{ x = 3, y = 4 }};
+            print((counter {operator} point).n);
+        }}
+        "#
+            ),
+            &format!("counter {operator} point"),
+            &format!("`Counter`'s `{method}` accepts `Counter`, but the right operand is `Point`"),
+        );
+    }
+}
+
+#[test]
+fn a_dispatched_equality_checks_its_other_operand() {
+    // `PartialEq`'s parameter is the same `B`, and `Counter { n = 1 } == Point
+    // { x = 1, y = 2 }` answered a plausible `true` off slot 0. `!=` shares the
+    // dispatch (the transformer negates `eq`), so it shares the refusal.
+    for operator in ["==", "!="] {
+        assert_fails_spanning(
+            &format!(
+                r#"
+        import std::compare::PartialEq;
+
+        struct Counter {{ n: i32 }}
+        struct Point {{ x: i32, y: i32 }}
+
+        impl Counter with PartialEq {{
+            fun eq(self, other: Counter): bool {{
+                self.n == other.n
+            }}
+        }}
+
+        fun main() {{
+            let counter = Counter {{ n = 1 }};
+            let point = Point {{ x = 1, y = 2 }};
+            print(counter {operator} point);
+        }}
+        "#
+            ),
+            &format!("counter {operator} point"),
+            "`Counter`'s `eq` accepts `Counter`, but the right operand is `Point`",
+        );
+    }
+}
+
+#[test]
+fn a_dispatched_ordering_checks_the_operand_of_its_inherited_default() {
+    // The SECOND dispatch branch: an impl declares `partial_compare`, and the
+    // operator reaches its operand through `PartialOrd`'s inherited `lt`/`le`/
+    // `gt`/`ge` default, whose parameter is the TRAIT's `B`. `Counter { n = 1 }
+    // < Point { x = 5, y = 2 }` answered `true` off slot 0.
+    for (operator, method) in [("<", "lt"), (">", "gt"), ("<=", "le"), (">=", "ge")] {
+        assert_fails_spanning(
+            &format!(
+                r#"
+        import std::compare::{{ PartialOrd, PartialEq, Ordering }};
+        import std::option::Option::{{ Some }};
+
+        struct Counter {{ n: i32 }}
+        struct Point {{ x: i32, y: i32 }}
+
+        impl Counter with PartialEq {{
+            fun eq(self, other: Counter): bool {{
+                self.n == other.n
+            }}
+        }}
+
+        impl Counter with PartialOrd {{
+            fun partial_compare(self, other: Counter): Option<Ordering> {{
+                if self.n < other.n {{ Some(Ordering::Less) }} else {{ Some(Ordering::Greater) }}
+            }}
+        }}
+
+        fun main() {{
+            let counter = Counter {{ n = 1 }};
+            let point = Point {{ x = 5, y = 2 }};
+            print(counter {operator} point);
+        }}
+        "#
+            ),
+            &format!("counter {operator} point"),
+            &format!("`Counter`'s `{method}` accepts `Counter`, but the right operand is `Point`"),
+        );
+    }
+}
+
+#[test]
+fn a_compound_assignment_rides_the_dispatch_check() {
+    // `c += p` desugars to `c = c + p` and registers its own binary from the
+    // second site — the same route B179's `total += value` takes.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Counter): Counter {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        fun main() {
+            mut counter = Counter { n = 1 };
+            counter += Point { x = 7, y = 9 };
+            print(counter.n);
+        }
+        "#,
+        "counter += Point { x = 7, y = 9 }",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn a_concrete_non_self_b_accepts_it_and_refuses_the_subject() {
+    // `impl Meters with Add<Feet>` is the whole reason this is a reconciliation
+    // against the DECLARED `B` and not an equality against the subject: `Meters
+    // + Feet` is the impl's entire point and must run, while `Meters + Meters`
+    // — the shape a `B = Self` reader would assume is the safe one — is the
+    // miscompile, and printed `6` by reading `other.f` off the `m` slot.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+
+        impl Meters with Add<Feet> {
+            fun add(self, other: Feet): Meters {
+                Meters { m = self.m + other.f }
+            }
+        }
+
+        fun main() {
+            print((Meters { m = 1 } + Feet { f = 2 }).m);
+        }
+        "#,
+        "3\n",
+    );
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Meters { m: i32 }
+        struct Feet { f: i32 }
+
+        impl Meters with Add<Feet> {
+            fun add(self, other: Feet): Meters {
+                Meters { m = self.m + other.f }
+            }
+        }
+
+        fun main() {
+            let near = Meters { m = 1 };
+            let far = Meters { m = 5 };
+            print((near + far).m);
+        }
+        "#,
+        "near + far",
+        "`Meters`'s `add` accepts `Feet`, but the right operand is `Meters`",
+    );
+}
+
+#[test]
+fn the_impls_own_parameter_as_b_binds_from_the_subject_and_accepts() {
+    // `impl Vec2<type T> with Add<T>` declares its `B` as its OWN parameter,
+    // which the subject binds: at `Vec2<i32>` the operand must be an `i32`, at
+    // `Vec2<str>` a `str`. Both run, from ONE impl — the acceptance the check
+    // has to preserve, and the reason a bare "must equal the subject" guard
+    // would have been wrong.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+
+        impl Vec2<type T> with Add<T> {
+            fun add(self, other: T): Vec2<T> {
+                Vec2 { a = other }
+            }
+        }
+
+        fun main() {
+            print((Vec2 { a = 1 } + 5).a);
+            print((Vec2 { a = "x" } + "y").a);
+        }
+        "#,
+        "5\ny\n",
+    );
+}
+
+#[test]
+fn the_impls_own_parameter_as_b_refuses_a_mis_binding() {
+    // The same impl, mis-bound: `Vec2<i32>`'s `B` is `i32`, and a `str` there
+    // was stored and printed as `oops` before the fix. The refusal names what
+    // the subject bound, not the impl's abstract `T`.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+
+        impl Vec2<type T> with Add<T> {
+            fun add(self, other: T): Vec2<T> {
+                Vec2 { a = other }
+            }
+        }
+
+        fun main() {
+            let pair = Vec2 { a = 1 };
+            print((pair + "oops").a);
+        }
+        "#,
+        r#"pair + "oops""#,
+        "`Vec2<i32>`'s `add` accepts `i32`, but the right operand is `str`",
+    );
+}
+
+#[test]
+fn a_nested_impl_parameter_as_b_substitutes_through_its_nominal() {
+    // `Add<Vec2<T>>` — the binder inside a nominal argument, not at the top of
+    // the position. Same impl, both verdicts: `Vec2<i32> + Vec2<i32>` runs, and
+    // a `Point` there printed `3` off slot 0 before the fix.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+
+        impl Vec2<type T> with Add<Vec2<T>> {
+            fun add(self, other: Vec2<T>): Vec2<T> {
+                other
+            }
+        }
+
+        fun main() {
+            print((Vec2 { a = 1 } + Vec2 { a = 9 }).a);
+        }
+        "#,
+        "9\n",
+    );
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Vec2<T> { a: T }
+        struct Point { x: i32, y: i32 }
+
+        impl Vec2<type T> with Add<Vec2<T>> {
+            fun add(self, other: Vec2<T>): Vec2<T> {
+                other
+            }
+        }
+
+        fun main() {
+            let pair = Vec2 { a = 1 };
+            let point = Point { x = 3, y = 4 };
+            print((pair + point).a);
+        }
+        "#,
+        "pair + point",
+        "`Vec2<i32>`'s `add` accepts `Vec2<i32>`, but the right operand is `Point`",
+    );
+}
+
+#[test]
+fn a_bounded_generic_right_operand_of_a_dispatched_operator_is_rejected() {
+    // B179's shape with a NOMINAL left operand. `Point` implements `Add`, so
+    // the bound is satisfied and the call type-checked — and `bump(Counter { n
+    // = 1 }, Point { x = 7, y = 9 })` printed `8`: `1 + 7`, the `Point`'s slot
+    // 0 read as `other.n`. The declaration is checked once for all of its
+    // instantiations, and `T: Add` promises `Add`'s methods, never that `T` IS
+    // `Counter`.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Counter { n: i32 }
+        struct Point { x: i32, y: i32 }
+
+        impl Counter with Add {
+            fun add(self, other: Counter): Counter {
+                Counter { n = self.n + other.n }
+            }
+        }
+
+        impl Point with Add {
+            fun add(self, other: Point): Point {
+                Point { x = self.x + other.x, y = self.y + other.y }
+            }
+        }
+
+        fun bump<T: Add>(counter: Counter, value: T): Counter {
+            counter + value
+        }
+
+        fun main() {
+            print(bump(Counter { n = 1 }, Point { x = 7, y = 9 }).n);
+        }
+        "#,
+        "counter + value",
+        "`Counter`'s `add` accepts `Counter`, but the right operand is `T`",
+    );
+}
+
+#[test]
+fn a_concrete_b_does_not_admit_a_parameter_either() {
+    // The same rule where the impl declares a non-`Self` `B`: `Add<i32>` does
+    // not admit `T`, whatever `T` is bounded to. This is the reading B179's
+    // second steer does NOT mean — see the pin below for the one it does.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Bag { total: i32 }
+
+        impl Bag with Add<i32> {
+            fun add(self, other: i32): Bag {
+                Bag { total = self.total + other }
+            }
+        }
+
+        fun bump<T: Add>(bag: Bag, value: T): Bag {
+            bag + value
+        }
+
+        fun main() {
+            print(bump(Bag { total = 1 }, 4).total);
+        }
+        "#,
+        "bag + value",
+        "`Bag`'s `add` accepts `i32`, but the right operand is `T`",
+    );
+}
+
+#[test]
+fn two_different_parameters_in_the_two_positions_are_rejected() {
+    // `Bag<A>`'s `B` is `A`; a `B` from the caller's own list is a DIFFERENT
+    // parameter, and nothing relates them. Rigid comparison is what says so —
+    // the ordinary one treats each as a hole and answers `true`, which is how
+    // `mix(Bag { first = 1 }, "x")` printed `x` before the fix.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Bag<T> { first: T }
+
+        impl Bag<type T> with Add<T> {
+            fun add(self, other: T): Bag<T> {
+                Bag { first = other }
+            }
+        }
+
+        fun mix<A, B>(bag: Bag<A>, value: B): Bag<A> {
+            bag + value
+        }
+
+        fun main() {
+            print(mix(Bag { first = 1 }, "x").first);
+        }
+        "#,
+        "bag + value",
+        "`Bag<A>`'s `add` accepts `A`, but the right operand is `B`",
+    );
+}
+
+#[test]
+fn b179s_second_steer_now_names_a_spelling_that_works() {
+    // B179's refusal steers to "put a left operand there whose `Add` declares a
+    // `B` that admits `T`", and until B180 closed that sentence steered into a
+    // broken route: EVERY nominal left operand accepted the parameter, so the
+    // steer named a program that miscompiled instead of one that worked. This
+    // is the spelling it means — the left operand's own type carries the
+    // parameter, so its `Add` declares `B = T` and the operand IS a member.
+    // Same generic function, two instantiations, both running through the impl.
+    assert_compiles_and_runs(
+        r#"
+        import std::operators::Add;
+
+        struct Bag<T> { first: T }
+
+        impl Bag<type T> with Add<T> {
+            fun add(self, other: T): Bag<T> {
+                Bag { first = other }
+            }
+        }
+
+        fun bump<T: Add>(bag: Bag<T>, value: T): Bag<T> {
+            bag + value
+        }
+
+        fun main() {
+            print(bump(Bag { first = 1 }, 4).first);
+            print(bump(Bag { first = "a" }, "b").first);
+        }
+        "#,
+        "4\nb\n",
+    );
+}
+
+#[test]
+fn a_generic_receiver_and_operand_of_one_parameter_still_compare() {
+    // The control the rigid comparison must not break, and std's own shape:
+    // `impl List<type T: PartialEq> with PartialEq { fun eq(self, b: List<T>) }`
+    // reached from a generic body, where BOTH sides are the caller's `T`. The
+    // parameters are rigid but IDENTICAL, which is exactly the case rigidity
+    // admits.
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+
+        fun same<T: PartialEq>(left: List<T>, right: List<T>): bool {
+            left == right
+        }
+
+        fun main() {
+            print(same([1, 2], [1, 2]));
+            print(same(["a"], ["b"]));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
 // --- B170: `+` skipped its check when the LEFT operand was non-nominal -------
 //
 // B148 closed the hole for a NATIVE left operand and the dispatch loop's own

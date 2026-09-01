@@ -653,6 +653,32 @@ fun bump<T: Add>(total: i32, value: T): bool { total < value } // error: same, f
 fun sum<T: Add>(first: T, second: T): T { first + second }     // the parameter is on the LEFT
 ```
 
+Where the left operand *does* dispatch, the same membership question is
+answered by the impl instead of by this section: the right operand must
+be admitted by the `B` **that impl declares**, checked against the
+signature the dispatch will actually run. That `B` is whatever the impl
+wrote — a type of its own (`impl Meters with Add<Feet>` admits a `Feet`
+and nothing else, `Meters` included), one of the impl's own parameters
+(`impl Bag<type T> with Add<T>`, whose admitted operand is whatever the
+subject bound `T` to), or `Self`, spelled or reached through the
+trait's `B = Self` default. A generic right operand refuses here for the
+reason it refuses over a number, one level along: a bound promises a
+trait's methods, never that the parameter *is* the declared `B`. The
+spelling that works is the one where the impl's `B` **is** that same
+parameter, which is what a generic subject's own impl gives.
+
+```vilan,fragment
+counter + point                  // error: `Counter`'s `add` accepts `Counter`
+metres + feet                    // ok:    `impl Meters with Add<Feet>`
+metres + metres                  // error: that impl's `B` is `Feet`
+bag_of_i32 + "x"                 // error: `Bag<i32>`'s `add` accepts `i32`
+
+fun bump<T: Add>(counter: Counter, value: T): Counter { counter + value }
+// error: `Counter`'s `add` accepts `Counter`, and a bound cannot prove `T` is one
+fun bump<T: Add>(bag: Bag<T>, value: T): Bag<T> { bag + value }
+// ok: `impl Bag<type T> with Add<T>` declares the very parameter as its `B`
+```
+
 `is` (§3.7 level 10) tests a value against a match pattern and yields
 `bool`; bindings inside an `is` pattern are scoped to nothing (use
 `match` to bind).
