@@ -18147,6 +18147,62 @@ impl<'src> Analyzer<'src> {
     /// result (`let s = …`, `let _ = …`, or passing it as an argument like
     /// `owner.take(…)`) consumes it and is fine: those are not bare block
     /// statements. Non-fatal — pushed to `warnings`, not `diagnostics`.
+    /// B178: the entry `main` takes NO parameters.
+    ///
+    /// A parameter declares what values a function accepts, and the entry
+    /// accepts none: the shell owns what is passed to a program, so nothing in
+    /// the language can call `main` with arguments. The transformer inlines
+    /// `main`'s body as the program's top-level statements, which is why a
+    /// parameter was not merely useless but broken — `fun main(condition: bool)`
+    /// compiled and the emitted program read a free `condition`, dying with
+    /// `ReferenceError: condition is not defined` at the first statement.
+    ///
+    /// The way forward is a real argument door rather than a parameter list:
+    /// `std::process::args()` hands back the argv tail as a `List<str>`, a value
+    /// whose type is always right where a hand-written parameter list is a
+    /// guess at what the shell will send.
+    ///
+    /// Keyed on the GLOBAL scope's `main`, which is the same lookup the
+    /// transformer's entry discovery makes — a module's own `main`, or a method
+    /// named `main`, lives in its own scope and is nobody's entry.
+    fn check_entry_main_parameters(&mut self, global_scope_id: Id) {
+        let Some(main_id) = self
+            .scopes
+            .get(&global_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("main"))
+            .copied()
+        else {
+            return;
+        };
+        let Some(main) = self.functions.get(&main_id) else {
+            return;
+        };
+        let parameters = main.parameters.clone();
+        let (Some(first), Some(last)) = (parameters.first(), parameters.last()) else {
+            return;
+        };
+        // The whole parameter LIST is what has to go, so the squiggle covers it
+        // rather than one name — and it is the exact text a fix deletes.
+        let start = self.span_map.get(first).map(|span| span.start);
+        let end = self.span_map.get(last).map(|span| span.end);
+        let (Some(start), Some(end)) = (start, end) else {
+            return;
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: Span::new((), start..end),
+                msg: "`main` takes no parameters: the shell owns what is passed to a \
+                      program, so nothing can call the entry with arguments — read them \
+                      with `std::process::args()`, which hands back the argument tail as \
+                      a `List<str>`"
+                    .to_string(),
+            },
+            main_id,
+        );
+    }
+
     fn check_must_use(&mut self) {
         // Value-discarded statements: every non-tail entry of a function body
         // (`body.0`; the tail `body.1` is the return value) and of every inner
@@ -40311,6 +40367,10 @@ fn analyze_over_world<'src>(
     // Record `Some(let v)` captures over wrapped-scalar-view calls before the
     // checks + view classification consult them.
     analyzer.wrapped_view_captures = analyzer.compute_wrapped_view_captures();
+    // B178: the entry takes no parameters — a whole-program shape check, so it
+    // rides here with the rest rather than at the declaration's walk (where
+    // "which `main` is the entry" is not yet a question the walk can answer).
+    analyzer.check_entry_main_parameters(global_scope_id);
     analyzer.check_readonly_mutation();
     analyzer.check_mutable_arguments();
     analyzer.check_mutable_references();

@@ -96,6 +96,17 @@ byte (§4.2), so this would fail to build on a case-sensitive
 filesystem. Rename the file or the import so the two agree.
 → [Names, modules, and packages](../spec/names.md)
 
+**"`main` takes no parameters: the shell owns what is passed to a program …"**
+A parameter list declares what values a function accepts, and the entry
+accepts none — nothing in the language can call `main`, so a parameter
+there is a guess about what the shell will send rather than a promise
+about it. Delete the list and read the arguments with
+`process::args()`, a `List<str>` of everything after the script path,
+whose type is always right. (This shape used to compile: the entry's
+body becomes the program's top-level statements, so the parameter was a
+free name and the program died at its first use.)
+→ [Process modules](../std/process.md)
+
 ## Types and generics
 
 **"Expected …, but got … instead."**
