@@ -585,3 +585,57 @@ fn bare() {}
         "the doc comment's `#[ignore]` is prose, not an attribute"
     );
 }
+
+// ── N27's other half: the close-time cross-check ──────────────────────────────
+
+/// The script the orchestrator runs at close, cross-checking each named item
+/// against the tracker's INDEX.
+///
+/// CI holds the FORMAT (`every_ignored_pin_names_a_tracker_item_or_is_a_declared_non_bug`)
+/// and cannot hold more: the tracker is a different repository and is not in a
+/// CI checkout, so "the id names an item that is still OPEN" has to be asked
+/// where both repositories are. This pin is the small thing CI can still say
+/// about it — that the script the process depends on is committed, runnable,
+/// and still offers the interface the process invokes it through. Its own
+/// readers are proven by its `--self-test`, which the weekly workflow runs.
+const CROSS_CHECK_SCRIPT: &str = "scripts/ignored-pins.py";
+
+#[test]
+fn the_close_time_cross_check_is_committed_and_keeps_its_interface() {
+    let path = repository_root().join(CROSS_CHECK_SCRIPT);
+    let script = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!("{CROSS_CHECK_SCRIPT} is the close-time half of N27 and must be committed: {error}")
+    });
+    for flag in ["--tracker", "--self-test", "--list"] {
+        assert!(
+            script.contains(flag),
+            "{CROSS_CHECK_SCRIPT} no longer offers `{flag}` — the close-time run \
+             invokes it, and the workflow's self-test step does"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("the script's metadata")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "{CROSS_CHECK_SCRIPT} is run as a command and is not executable ({mode:o})"
+        );
+    }
+}
+
+// And the weekly leg runs the script's self-test, which is the only place
+// anything proves its readers: CI cannot run the check itself, so a script that
+// silently stopped reading `#[ignore]` attributes would report a clean tree
+// forever.
+#[test]
+fn the_leg_self_tests_the_cross_check() {
+    let workflow = workflow_code();
+    assert!(
+        workflow.contains("scripts/ignored-pins.py --self-test"),
+        "the weekly leg must self-test the close-time cross-check: {workflow}"
+    );
+}
