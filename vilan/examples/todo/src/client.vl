@@ -6,10 +6,13 @@
 // inside the view, so the subscription opens at mount and closes at unmount.
 // The UI never writes the list itself — the server owns the data, and every
 // change (this tab's included) arrives over the wire.
+//
+// `Result`/`Ok`/`Err` and `print` are ambient under the package's
+// `prelude = "std::web"`, and `mount_root` is reached through the ambient MODULE
+// `ui` — so what is left below is the codec and this package's own modules,
+// none of which any prelude carries.
 
 import std::json::json_codec;
-import std::result::Result::{ Err, Ok };
-import std::ui::mount_root;
 import pkg::store::TodoClient;
 import pkg::todos::todos;
 
@@ -18,7 +21,7 @@ async fun main() {
 	// browsers); node clients pass an absolute ws:// URL.
 	match TodoClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			let root = mount_root("app", || todos(client));
+			let root = ui::mount_root("app", || todos(client));
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}

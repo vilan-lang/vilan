@@ -3,8 +3,13 @@
 //
 // Both components build and run: the counter, and the todo list (`todos.vl`) now
 // that `combine` (variadic generics), `bind_each`, and `show` are implemented.
+//
+// `ui` is a module the `std::web` prelude puts in scope (vilan.toml), so
+// `ui::mount_root` needs no import. The prelude carries the module and not the
+// member on purpose: `mount_root` exists only on the browser layer, and
+// qualifying it keeps a node build's error at the call rather than at an import
+// you never wrote.
 
-import std::ui::mount_root;
 import pkg::counter::counter;
 import pkg::todos::todos;
 
@@ -13,6 +18,6 @@ fun main() {
 	// registers into it ambiently (proposal/ambient-owner.md §4). The
 	// returned root owners would tear the components down; an app lets
 	// them live.
-	let counter_root = mount_root("counter", || counter());
-	let todos_root = mount_root("todos", || todos());
+	let counter_root = ui::mount_root("counter", || counter());
+	let todos_root = ui::mount_root("todos", || todos());
 }

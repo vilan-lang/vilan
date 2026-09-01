@@ -6,11 +6,15 @@
 // `std::fs` directly even though it sits in the same source tree as the client,
 // and the whole boot/persist lifecycle is the store's own business instead of
 // wiring injected from `main`.
+//
+// The package's `prelude = "std::web"` reaches this server-colored module too —
+// `SignalCell` for the `[expose]`d field's type, and `Result`/`Ok`/`Err` for
+// `load`'s decode — which is the case for the web set restating the base seven
+// rather than replacing them. `std::fs` and `std::shared` are one-layer or
+// out-of-set names and stay imported.
 
 import std::fs;
 import std::json::json_codec;
-import std::reactive::{ Signal, SignalCell };
-import std::result::Result::{ Err, Ok, self };
 import std::shared::Shared;
 import std::wire::{ Frame, decode, encode };
 import pkg::todo::Todo;

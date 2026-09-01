@@ -32,6 +32,7 @@ follows keystroke by keystroke.
 ```toml
 [package]
 name = "notes"
+prelude = "std::web"
 
 [entry.client]
 target = "browser"
@@ -53,9 +54,16 @@ walkthrough/
 ```
 
 One package, two entries ([Platforms](../tour/platforms.md) introduced
-this layout). There is no client/server directory split and no shared
-`common` package. Every file is visible to both entries, and the
-compiler sorts out what may run where by what each entry reaches.
+this layout). `prelude = "std::web"` is the other line worth reading: it
+puts `Signal`, `SignalCell`, `view`, `View` and the modules `style` and
+`ui` in scope in every file below with no `import`, which is why the
+snippets that follow have such short import blocks (see [the prelude
+key](../tour/projects.md#the-prelude-key)). It is a *package* key, so
+both entries share it — every name in the set exists on node too, so the
+server leg loses nothing by it. There is no client/server directory
+split and no shared `common` package. Every file is visible to both
+entries, and the compiler sorts out what may run where by what each
+entry reaches.
 `store.vl` uses SQLite freely because only the server entry calls into
 it; if client code ever reached that far, the build would fail with the
 call chain.

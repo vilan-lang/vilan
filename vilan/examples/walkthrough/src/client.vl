@@ -2,13 +2,15 @@
 // and mount the screen. The mirror is read INSIDE the screen
 // (`client.notes.or([])`): the subscription opens when the view mounts and
 // closes when it unmounts, instead of living as long as the tab.
+//
+// `Signal`, `Result`/`Ok`/`Err` and `print` are ambient under the package's
+// `prelude = "std::web"`, and `mount_root` is reached through the ambient MODULE
+// `ui` — browser-only inside a module both layers declare, so the qualifier is
+// what keeps a platform error at the call.
 
 import std::json::json_codec;
-import std::reactive::Signal;
-import std::result::Result::{ Err, Ok, self };
 import std::router::current_path;
 import std::storage;
-import std::ui::mount_root;
 import pkg::routes::{ Route, parse };
 import pkg::store::NotesClient;
 import pkg::views::screen;
@@ -19,7 +21,7 @@ async fun main() {
 
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {
-			let _root = mount_root("app", || screen(client, token, route));
+			let _root = ui::mount_root("app", || screen(client, token, route));
 		},
 		Err(let error) => print(i"connect failed: {error.debug()}"),
 	}

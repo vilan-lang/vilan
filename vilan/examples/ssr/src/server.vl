@@ -7,6 +7,10 @@
 // arrives fully painted; `/client.js` carries the bundle that boots and
 // replaces it, and `serve_build` is what puts it there — the bundle's name comes
 // from the build, not from this file.
+//
+// This file shares the package's `prelude = "std::web"` — that is what gives
+// `print` below with no import. The rest of what a server reaches is one-layer
+// and in no prelude by rule, so the process modules are imported by name.
 
 import std::build::require_build;
 import std::document::require_shell;

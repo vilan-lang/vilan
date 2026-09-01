@@ -12,11 +12,14 @@
 // writes coalesced per wire turn (reactive batching: `batch` around inbound handling).
 //
 //     vilan run vilan/examples/rpc
+//
+// `print`, `Option`/`Some`/`None` and `Result`/`Ok`/`Err` are ambient here:
+// `prelude = "std::prelude"` in vilan.toml is the base set, and this file leans
+// on all seven. Everything outside it — `Signal` and the reactive combinators
+// included, since those belong to the WEB set — is imported by name.
 
 import std::json::json_codec;
-import std::option::Option::{ None, Some, self };
 import std::reactive::{ Signal, SignalCell, Source, batch };
-import std::result::Result::{ Err, Ok, self };
 import std::rpc::{
 	Dispatcher,
 	LocalTransport,

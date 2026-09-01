@@ -13,8 +13,20 @@
 #
 #   vilan build .   compiles both entries into `dist/` (`client.js` / `server.js`)
 #   vilan run .     builds both and starts the Node server → http://localhost:8791
+#
+# `prelude` names the ambient scope every file in the package resolves under —
+# the names in scope with no import (`proposal/prelude.md` §5). It is a PACKAGE
+# key, so both entries share it, and this example is where that stops being an
+# economy and starts being the point: `src/app.vl` is compiled by BOTH legs, so
+# its ambient scope has to mean the same thing on node and in the browser.
+# `std::web` is built to: the base seven (`print`, `Option`/`Some`/`None`,
+# `Result`/`Ok`/`Err`), `Signal`, `SignalCell`, `view` and `View`, plus the
+# MODULES `style` and `ui` — every one of them base-layer or declared by both
+# platform layers, which is exactly the admission test a one-layer name like
+# `Server` or `fs` fails. `src/app.vl` ends up importing nothing at all.
 [package]
 name = "ssr"
+prelude = "std::web"
 
 [entry.client]
 target = "browser"

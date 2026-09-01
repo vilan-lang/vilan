@@ -4,5 +4,11 @@
 # the browser client. A platform-specific module would live in a
 # `[library.target.<t>]` overlay and only be available to a dependent building
 # for that target.
+#
+# `prelude` is a `[library]` key too, with the same meaning and the same rules
+# (`proposal/prelude.md` §6.2). It is the library's OWN ambient scope: `src/lib.vl`
+# resolves under the base set below whichever member imports it, so a consumer
+# cannot change what this file means by changing its own key.
 [library]
 name = "common"
+prelude = "std::prelude"

@@ -3,10 +3,14 @@
 // built live UI: render, then replace (proposal/ssr.md §1 step 3). No adoption,
 // no addressing, no reconciliation; the same component code produced both trees,
 // so when the data matches the swap is imperceptible.
+//
+// `ui` is a module the `std::web` prelude puts in scope, so `ui::mount_root`
+// needs no import. It stays qualified on purpose: `mount_root` is browser-only
+// inside a module both layers declare, and a qualified call keeps a node build's
+// platform error at the call rather than at an import.
 
-import std::ui::mount_root;
 import pkg::app::app;
 
 fun main() {
-	let _root = mount_root("app", || app());
+	let _root = ui::mount_root("app", || app());
 }

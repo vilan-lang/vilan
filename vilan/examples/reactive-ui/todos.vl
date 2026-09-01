@@ -1,10 +1,15 @@
 // todos.vl — the fuller picture on the explicit-dependency core: derived signals
 // (`derive`), a two-input dependency (`combine`), a reactive keyed list, and
 // conditional rendering. The dependency graph is literally the combinator tree.
+//
+// `Signal`, `SignalCell`, `view` and `View` are ambient (`prelude = "std::web"`),
+// so nothing below imports them — `SignalCell` travels with `Signal` precisely
+// for the annotations and parameter types this file is full of. `format` and
+// `combine` are NOT in the set and are imported by name: the prelude is a floor,
+// not the module.
 
 import std::display::format;
-import std::reactive::{ Signal, SignalCell, combine };
-import std::ui::{ View, view };
+import std::reactive::combine;
 
 // `bind_each` reconciles by key and re-renders only CHANGED rows — `Todo`
 // derives `PartialEq` so the reconciler can tell.
