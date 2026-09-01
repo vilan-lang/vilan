@@ -314,6 +314,29 @@ jobs:
             '$0 ~ heading {inside=1; next} /^## / && inside {exit} inside' \
             CHANGELOG.md > notes.md
           test -s notes.md
+          # GitHub caps a release body at 125,000 characters, and a large
+          # release's section can exceed it (v0.40.0 did, at 74 entries).
+          # Over the cap, keep whole entries up to a safe margin and point
+          # at the changelog for the rest — never a mid-entry cut.
+          python3 - "$VERSION" <<'PY'
+          import sys
+          version = sys.argv[1]
+          text = open("notes.md").read()
+          CAP = 110_000
+          if len(text) > CAP:
+              entries = text.split("\n<!-- family:")
+              kept, size = [entries[0]], len(entries[0])
+              for entry in entries[1:]:
+                  size += len(entry) + len("\n<!-- family:")
+                  if size > CAP:
+                      break
+                  kept.append(entry)
+              dropped = len(entries) - len(kept)
+              tail = (f"\n\n---\n\n*These notes hit GitHub's release-body cap: "
+                      f"{dropped} more entries are in [CHANGELOG.md's v{version} section]"
+                      f"(https://github.com/vilan-lang/vilan/blob/v{version}/CHANGELOG.md).*\n")
+              open("notes.md", "w").write("\n<!-- family:".join(kept) + tail)
+          PY
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
