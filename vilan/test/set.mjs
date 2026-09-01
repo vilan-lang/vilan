@@ -38,15 +38,8 @@ function $e(self, value2) {
 function $f(self) {
 	return $c(self) === 0;
 }
-function $g() {
-	const table = new Map();
-	return [ table ];
-}
 function $h(self, value2) {
 	self[0].set(hash(value2), value2);
-}
-function $i(self) {
-	return self[0].size;
 }
 function $j(self, value2) {
 	return self[0].has(hash(value2));
@@ -100,11 +93,11 @@ let copy = __clone(numbers);
 $b(copy, 100);
 console.log($d(numbers, 100));
 console.log($d(copy, 100));
-let words = $g();
+let words = $a();
 $h(words, "hi");
 $h(words, "hi");
 $h(words, "bye");
-console.log($i(words));
+console.log($c(words));
 console.log($j(words, "hi"));
 let empty = $a();
 console.log($f(empty));

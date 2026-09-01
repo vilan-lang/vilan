@@ -13,15 +13,6 @@ function $d(self, value) {
 function $b(self, transform) {
 	$d(self, transform($c(self)));
 }
-function $e(value) {
-	return [ __shared_new(value) ];
-}
-function $f(self, value) {
-	self[0].v = value;
-}
-function $g(self) {
-	return self[0].v;
-}
 const counter = $a(0);
 $b(counter, (n) => {
 	return n + 1;
@@ -30,6 +21,6 @@ $b(counter, (n) => {
 	return n * 10;
 });
 console.log($c(counter));
-const label = $e("a");
-$f(label, "hello");
-console.log($g(label));
+const label = $a("a");
+$d(label, "hello");
+console.log($c(label));

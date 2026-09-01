@@ -3839,6 +3839,18 @@ fn the_constraint_fixpoint_stops_when_it_settles() {
 // --- `assert_compiles_and_runs` cannot see it. Each shape of nested type id
 // --- gets its own pin, and each merging pin is twinned with a splitting one —
 // --- the key must be COARSER, never wrong.
+// ---
+// --- The count is of INSTANCE KEYS (`instances_minted`), not of emitted
+// --- copies, and that is a backlog M16 repair. These pins used to count how
+// --- many times a distinctive body appeared in the output, which was a
+// --- faithful proxy for "how many keys" only while one key meant one emitted
+// --- copy. Since M16 a body that renders the same at every `T` is emitted
+// --- ONCE however many keys reach it — and every fixture below uses exactly
+// --- such a body, deliberately, so that nothing but the key can split it. The
+// --- old instrument would therefore have read 1 everywhere and every
+// --- splitting pin would have gone quietly vacuous. Asking the memo directly
+// --- is the same move the const pass's name-seed and call-graph pins make:
+// --- where the output cannot distinguish two mechanisms, count the mechanism.
 
 /// The B95 probe body: a distinctive expression the instance emits once.
 fn b95_program(annotation: &str, first: &str, second: &str) -> String {
@@ -3863,9 +3875,9 @@ fn b95_program(annotation: &str, first: &str, second: &str) -> String {
 #[test]
 fn b95_two_spellings_of_one_nominal_type_share_an_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             &b95_program("List<i32>", "List::new()", "List::new()"),
-            "console.log(4242)",
+            "through",
         ),
         1,
     );
@@ -3876,9 +3888,9 @@ fn b95_two_spellings_of_one_nominal_type_share_an_instance() {
 #[test]
 fn b95_a_nested_nominal_argument_shares_an_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             &b95_program("List<List<i32>>", "List::new()", "List::new()"),
-            "console.log(4242)",
+            "through",
         ),
         1,
     );
@@ -3888,9 +3900,9 @@ fn b95_a_nested_nominal_argument_shares_an_instance() {
 #[test]
 fn b95_two_spellings_of_one_tuple_type_share_an_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             &b95_program("(i32, str)", r#"(1, "x")"#, r#"(2, "y")"#),
-            "console.log(4242)",
+            "through",
         ),
         1,
     );
@@ -3901,9 +3913,9 @@ fn b95_two_spellings_of_one_tuple_type_share_an_instance() {
 #[test]
 fn b95_two_spellings_of_one_array_type_share_an_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             &b95_program("[i32; 3]", "[1, 2, 3]", "[4, 5, 6]"),
-            "console.log(4242)",
+            "through",
         ),
         1,
     );
@@ -3913,9 +3925,9 @@ fn b95_two_spellings_of_one_array_type_share_an_instance() {
 #[test]
 fn b95_two_spellings_of_one_closure_type_share_an_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             &b95_program("|i32| i32", "|n| n + 1", "|n| n + 2"),
-            "console.log(4242)",
+            "through",
         ),
         1,
     );
@@ -3925,7 +3937,7 @@ fn b95_two_spellings_of_one_closure_type_share_an_instance() {
 #[test]
 fn b95_a_two_generic_instantiation_shares_an_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             fun pair<T, U>(left: T, right: U): T {
@@ -3941,7 +3953,7 @@ fn b95_a_two_generic_instantiation_shares_an_instance() {
                 pair(c, d);
             }
             "#,
-            "console.log(4242)",
+            "pair",
         ),
         1,
     );
@@ -3952,7 +3964,7 @@ fn b95_a_two_generic_instantiation_shares_an_instance() {
 #[test]
 fn b95_two_spellings_of_a_method_receiver_share_an_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             struct Holder<T> { value: T }
@@ -3969,7 +3981,7 @@ fn b95_two_spellings_of_a_method_receiver_share_an_instance() {
                 b.show();
             }
             "#,
-            "console.log(4242)",
+            "show",
         ),
         1,
     );
@@ -3981,7 +3993,7 @@ fn b95_two_spellings_of_a_method_receiver_share_an_instance() {
 #[test]
 fn b95_different_nominal_arguments_still_split_the_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             fun through<T>(value: T): T {
@@ -3995,7 +4007,7 @@ fn b95_different_nominal_arguments_still_split_the_instance() {
                 through(b);
             }
             "#,
-            "console.log(4242)",
+            "through",
         ),
         2,
     );
@@ -4006,7 +4018,7 @@ fn b95_different_nominal_arguments_still_split_the_instance() {
 #[test]
 fn b95_arrays_of_different_lengths_still_split_the_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             fun through<T>(value: T): T {
@@ -4020,7 +4032,7 @@ fn b95_arrays_of_different_lengths_still_split_the_instance() {
                 through(b);
             }
             "#,
-            "console.log(4242)",
+            "through",
         ),
         2,
     );
@@ -4032,7 +4044,7 @@ fn b95_arrays_of_different_lengths_still_split_the_instance() {
 #[test]
 fn b95_nested_arguments_that_differ_deep_still_split_the_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             fun through<T>(value: T): T {
@@ -4046,7 +4058,7 @@ fn b95_nested_arguments_that_differ_deep_still_split_the_instance() {
                 through(b);
             }
             "#,
-            "console.log(4242)",
+            "through",
         ),
         2,
     );
@@ -4072,7 +4084,7 @@ fn b95_nested_arguments_that_differ_deep_still_split_the_instance() {
 #[test]
 fn b102_a_callers_generic_does_not_split_the_callees_instance() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             fun through<T>(value: T): T {
@@ -4087,7 +4099,7 @@ fn b102_a_callers_generic_does_not_split_the_callees_instance() {
                 print(forward(2));
             }
             "#,
-            "console.log(4242)",
+            "through",
         ),
         1,
     );
@@ -4100,7 +4112,7 @@ fn b102_a_callers_generic_does_not_split_the_callees_instance() {
 #[test]
 fn b102_a_different_instantiation_through_a_forwarder_still_splits() {
     assert_eq!(
-        emitted_occurrences(
+        instances_minted(
             r#"
             import std::io::print;
             fun through<T>(value: T): T {
@@ -4115,7 +4127,7 @@ fn b102_a_different_instantiation_through_a_forwarder_still_splits() {
                 print(forward("x"));
             }
             "#,
-            "console.log(4242)",
+            "through",
         ),
         2,
     );

@@ -725,19 +725,67 @@ static FAILURES: OnceLock<Mutex<HashMap<u64, Arc<Vec<Error>>>>> = OnceLock::new(
 /// Sibling of `analyzer::base_cache_clear` — and to be used WITH it: a stored
 /// base world carries a macro registry whose `MacroDef`s memoize their own
 /// compiled world, so clearing this map alone leaves those reachable.
+/// The bytes a cached failure retains (backlog M11): its messages, notes and
+/// trace labels. A pure function of the errors, so an eviction can compute
+/// exactly what the store recorded without the map carrying the figure.
+fn failure_text_bytes(errors: &[Error]) -> usize {
+    fn note_bytes(note: &crate::error::Note) -> usize {
+        note.msg.len()
+    }
+    errors
+        .iter()
+        .map(|error| {
+            error.msg.len()
+                + error.note.as_ref().map(note_bytes).unwrap_or(0)
+                + error
+                    .trace
+                    .iter()
+                    .map(|hop| note_bytes(&hop.note))
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Records a failure's retained text at its tally site, giving back whatever
+/// it displaced (backlog M11).
+fn record_cached_failure(errors: &[Error], displaced: Option<Arc<Vec<Error>>>) {
+    if let Some(displaced) = displaced {
+        crate::leak_tally::release(
+            crate::leak_tally::LeakSite::MacroFailureText,
+            failure_text_bytes(&displaced),
+        );
+    }
+    crate::leak_tally::record(
+        crate::leak_tally::LeakSite::MacroFailureText,
+        failure_text_bytes(errors),
+    );
+}
+
 #[doc(hidden)]
 pub fn macro_world_cache_clear() {
     if let Some(worlds) = WORLDS.get() {
+        // No tally release: what a compiled world retains is genuinely
+        // `Box::leak`ed (`MacroWorldText`/`MacroWorldProgram`/`MacroWorldAst`),
+        // so dropping the `Arc` gives back none of it (backlog M11).
         worlds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
     if let Some(failures) = FAILURES.get() {
-        failures
+        let mut failures = failures
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The failure text, by contrast, IS given back — the map owns it
+        // (M11). Cross-thread like every other release here; `outstanding` is
+        // signed for exactly that.
+        for errors in failures.values() {
+            crate::leak_tally::release(
+                crate::leak_tally::LeakSite::MacroFailureText,
+                failure_text_bytes(errors),
+            );
+        }
+        failures.clear();
     }
 }
 
@@ -829,10 +877,11 @@ fn compile_world(
                 .collect(),
         );
         // Recovering (E97): the `Arc` is complete before the lock is taken.
-        failures
+        let displaced = failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(failure_key, errors.clone());
+        record_cached_failure(&errors, displaced);
         return Err((*errors).clone());
     }
     let Some(program) = program else {
@@ -843,10 +892,11 @@ fn compile_world(
             msg: "the macro world failed to compile".to_string(),
         }]);
         // Recovering (E97): the `Arc` is complete before the lock is taken.
-        failures
+        let displaced = failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(failure_key, errors.clone());
+        record_cached_failure(&errors, displaced);
         return Err((*errors).clone());
     };
     // The world outlives this analysis (it's cached process-globally), so the

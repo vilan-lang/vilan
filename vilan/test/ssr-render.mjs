@@ -147,14 +147,6 @@ function $a(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function $b(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
-function $c(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
 function $e(self) {
 	return self[0].v;
 }
@@ -163,14 +155,11 @@ function $d(self, source) {
 	self[2].v = [  ];
 	return __clone(self);
 }
-function $h(self) {
-	return self[0].v;
-}
 function $j(owner, body) {
 	return body(owner);
 }
 function $g(self, source, key, build) {
-	const items = $h(source);
+	const items = $e(source);
 	for (const item of items) {
 		const owner = new2();
 		self[2].v.push([ 0, $j(owner, ($i) => {
@@ -183,11 +172,8 @@ function $n(self, name2, value) {
 	apply(value, self, name2);
 	return __clone(self);
 }
-function $p(self) {
-	return self[0].v;
-}
 function $o(self, source, build) {
-	const value = $p(source);
+	const value = $e(source);
 	const owner = new2();
 	self[2].v.push([ 0, $j(owner, ($q) => {
 		return build(value, $q);
@@ -215,8 +201,8 @@ function $z(self, content) {
 	return __clone(self);
 }
 const title = $a("Tasks <live>");
-const todos = $b([ "alpha", "beta & gamma" ]);
-const page = $c([ 1 ]);
+const todos = $a([ "alpha", "beta & gamma" ]);
+const page = $a([ 1 ]);
 console.log(render(app(title, todos, page)));
 console.log(render(text(view("p"), "<script>alert(\"&\")</script>")));
 console.log(render($n($n(view("img"), "src", "/logo.png"), "alt", "a & b")));

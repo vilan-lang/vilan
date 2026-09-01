@@ -38,7 +38,7 @@ function from_json_value2(value) {
 	return $f;
 }
 function to_json(self) {
-	return "{\"name\":" + JSON.stringify(self[0]) + "," + "\"members\":" + $M(self[1]) + "," + "\"captain\":" + $N(self[2]) + "}";
+	return "{\"name\":" + JSON.stringify(self[0]) + "," + "\"members\":" + $i(self[1]) + "," + "\"captain\":" + $N(self[2]) + "}";
 }
 function from_json(text) {
 	const $x = $u(__try_parse_json(text), "not valid JSON");
@@ -191,18 +191,6 @@ function $H(value) {
 	}
 	return $I;
 }
-function $M(self) {
-	let result = "[";
-	let first = true;
-	for (const element of self) {
-		if (!(first)) {
-			result = result + ",";
-		}
-		result = result + JSON.stringify(element);
-		first = false;
-	}
-	return result + "]";
-}
 function $N(self) {
 	const $O = self;
 	let $P = null;
@@ -264,7 +252,7 @@ const $t = none;
 console.log($t[0] === 0 && $q($t[1]) === "null");
 const json = "{\"name\":\"Reds\",\"members\":[\"Ada\",\"Bob\"],\"captain\":\"Ada\"}";
 const $L = from_json(json);
-console.log($L[0] === 0 && to_json($L[1]) === json && $M($L[1][1]) === "[\"Ada\",\"Bob\"]");
+console.log($L[0] === 0 && to_json($L[1]) === json && $i($L[1][1]) === "[\"Ada\",\"Bob\"]");
 const teams = $Q("[" + json + "]");
 const $W = teams;
 console.log($W[0] === 0 && $X($W[1]) === "[" + json + "]");

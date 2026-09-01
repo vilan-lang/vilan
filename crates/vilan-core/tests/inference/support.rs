@@ -962,6 +962,49 @@ pub fn emitted_occurrences(source: &str, needle: &str) -> usize {
     }
 }
 
+/// How many monomorphization INSTANCES one clean compile of `source` minted
+/// for the generic function named `function_name` — the instance memo's own
+/// count, read inside the compiling thread (the log is thread-local).
+///
+/// The instrument the B95/B102 pins ask their question with since backlog M16.
+/// Counting emitted copies of a distinctive body answered it only while one
+/// instance key meant one emitted body; a `T`-independent body is now emitted
+/// once however many keys reach it, so the emission can no longer say whether
+/// the key discriminated — only the memo can.
+#[track_caller]
+pub fn instances_minted(source: &str, function_name: &str) -> usize {
+    let source = source.to_string();
+    let function_name = function_name.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean compile, got: {messages:#?}"
+            );
+            let program = program.expect("a clean analysis produces a program");
+            vilan_core::transformer::reset_instance_log();
+            transform(&program, &BuildOptions::default()).expect("a clean transform");
+            vilan_core::transformer::instance_log()
+                .iter()
+                .filter(|minted| *minted == &function_name)
+                .count()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the instance-log worker panicked")
+}
+
 /// The R11 "not move-clean" diagnostics for `source`, each as
 /// `(message, primary range, note)`.
 pub fn r11_rejections(

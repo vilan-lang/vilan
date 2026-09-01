@@ -1054,6 +1054,7 @@ dependencies = [
  "ariadne",
  "clap",
  "ctrlc",
+ "libc",
  "sha2",
  "vilan-core",
  "vilan-embedded-std",

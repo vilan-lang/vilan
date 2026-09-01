@@ -13,9 +13,6 @@ function $a(items) {
 function $b(items) {
 	return 1;
 }
-function $c(items) {
-	return 1;
-}
 function $e(xs) {
 	return 1;
 }
@@ -41,5 +38,5 @@ const none = $a([  ]);
 console.log([ ...none, 7 ][0]);
 console.log([ ...make(), 6 ][2]);
 console.log($b([ ...__clone(pair) ]));
-console.log($c([ ...pair, 7 ]));
+console.log($b([ ...pair, 7 ]));
 console.log($d([ 1, 2, 3 ]));

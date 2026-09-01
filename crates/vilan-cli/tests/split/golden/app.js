@@ -344,12 +344,12 @@ function chunk_failure() {
 	return chunk_error_signal;
 }
 function set_chunk_pending(busy, $bx) {
-	if ($an(chunk_pending_signal) !== busy) {
+	if ($x(chunk_pending_signal) !== busy) {
 		$by(chunk_pending_signal, busy, $bx);
 	}
 }
 function clear_chunk_error($bo) {
-	const $bp = $aB(chunk_error_signal);
+	const $bp = $x(chunk_error_signal);
 	let $bq = null;
 	if ($bp[0] === 0) {
 		const _reason = $bp[1];
@@ -380,7 +380,7 @@ function mount(id, view2) {
 	element.appendChild(view2[0]);
 }
 function mount_root(id, body) {
-	const $bS = $bR([ 1 ], ($bP) => {
+	const $bS = $q([ 1 ], ($bP) => {
 		return $bQ(body);
 	});
 	const built = $bS[0];
@@ -454,7 +454,7 @@ function app(route2, $S, $T) {
 			$al = "";
 		}
 		return $al;
-	}, $S, [ 0, $T ]), $S, $T), $S, $T), $ap(class2(view("p"), "failed"), $aA(chunk_error(), (reason) => {
+	}, $S, [ 0, $T ]), $S, $T), $S, $T), $ap(class2(view("p"), "failed"), $am(chunk_error(), (reason) => {
 		const $ax = reason;
 		let $ay = null;
 		if ($ax[0] === 0) {
@@ -504,14 +504,6 @@ function $a(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function $b(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
-function $c(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
 function $l(self) {
 	return self.length === 0;
 }
@@ -553,10 +545,6 @@ function $q(policy, body) {
 }
 function $x(self) {
 	return self[0].v;
-}
-function $y(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $A(self, $i) {
 	const $B = $i;
@@ -601,7 +589,7 @@ function $K(self, item, $L) {
 	return __clone(item);
 }
 function $u(self, transform, $v, $w) {
-	const derived = $y(transform($x(self)));
+	const derived = $a(transform($x(self)));
 	register_with_owner($F(self, (value) => {
 		$z(derived, transform(value), $v);
 		return;
@@ -626,21 +614,9 @@ function $ai(self, content, $aj, $ak) {
 	place(content, self, $aj, $ak);
 	return __clone(self);
 }
-function $an(self) {
-	return self[0].v;
-}
-function $ao(signal, observer) {
-	const id = fresh_id();
-	const cell = signal[0];
-	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
-}
 function $am(self, transform, $v, $w) {
-	const derived = $a(transform($an(self)));
-	register_with_owner($ao(self, (value) => {
+	const derived = $a(transform($x(self)));
+	register_with_owner($F(self, (value) => {
 		$f(derived, transform(value), $v);
 		return;
 	}), $v, $w);
@@ -662,54 +638,14 @@ function $ap(self, source, $aq, $ar) {
 	}, $aq, $ar);
 	return __clone(self);
 }
-function $aB(self) {
-	return self[0].v;
-}
-function $aC(signal, observer) {
-	const id = fresh_id();
-	const cell = signal[0];
-	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
-}
-function $aA(self, transform, $v, $w) {
-	const derived = $a(transform($aB(self)));
-	register_with_owner($aC(self, (value) => {
-		$f(derived, transform(value), $v);
-		return;
-	}), $v, $w);
-	return derived;
-}
-function $aR(self) {
-	return self[0].v;
-}
 function $aQ(source) {
-	__chunk_preload(__chunk_arm($aR(source)));
+	__chunk_preload(__chunk_arm($x(source)));
 }
 function $bj(owner, body) {
 	return body(owner);
 }
-function $bm(signal, observer) {
-	const id = fresh_id();
-	const cell = signal[0];
-	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
-}
-function $bn(self) {
-	return self[0].v;
-}
-function $bl(self, observer) {
-	const subscription = $bm(self, observer);
-	observer($bn(self));
-	return subscription;
-}
 function $bk(self, observer, $at, $au) {
-	$K(get_owner($au), $bl(self, observer), $at);
+	$K(get_owner($au), $aw(self, observer), $at);
 }
 function $aV(self, source, render, $aW, $aX) {
 	const element = __clone(self[0]);
@@ -846,25 +782,8 @@ function $bG(self, value, $g) {
 	self[0].v = value;
 	$bH(self, $g);
 }
-function $bO(signal, observer) {
-	const id = fresh_id();
-	const cell = signal[0];
-	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
-}
-function $bN(self, observer) {
-	const subscription = $bO(self, observer);
-	observer($aR(self));
-	return subscription;
-}
-function $bM(self, observer, $at, $au) {
-	$K(get_owner($au), $bN(self, observer), $at);
-}
 function $aS(self, source, render, $aT, $aU) {
-	const gated = $y($aR(source));
+	const gated = $a($x(source));
 	const wired2 = __shared_new(false);
 	const generation = __shared_new(0);
 	const advance = (value) => {
@@ -875,7 +794,7 @@ function $aS(self, source, render, $aT, $aU) {
 		}
 		return;
 	};
-	$bM(source, (value) => {
+	$bk(source, (value) => {
 		const mine = generation.v + 1;
 		generation.v = mine;
 		clear_chunk_error($aT);
@@ -912,19 +831,12 @@ function $bQ(body) {
 	const result = body(scope);
 	return [ result, scope ];
 }
-function $bR(policy, body) {
-	const fresh = new2();
-	const result = body(fresh);
-	drain(fresh);
-	fresh[2].v = true;
-	return result;
-}
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 const path_signal = $a("");
 const wired = __shared_new(false);
-const chunk_pending_signal = $b(false);
-const chunk_error_signal = $c([ 1 ]);
+const chunk_pending_signal = $a(false);
+const chunk_error_signal = $a([ 1 ]);
 const BASE = announce("BASE", 2);
 const SCALED = announce("SCALED", BASE * 3);
 const LABEL = "scale " + SCALED;

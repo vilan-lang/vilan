@@ -40,6 +40,20 @@
 //! reads every thread's counters inside that thread (the leak soak does) sums
 //! to the exact net.
 //!
+//! **Not every retention is a leak, and the tally covers both** (backlog M11).
+//! A `Box::leak` is the obvious way to hold memory for the life of a process;
+//! a process-global cache with per-key overwrite as its only eviction is the
+//! other, and it is the bigger one. `BASE_CACHE` retains a whole resolved
+//! `World` per `BaseCacheKey` and `macros`' `FAILURES` retains rendered error
+//! text per failing definition set — neither is a `Box::leak`, so neither
+//! violated this module's literal contract, and that was exactly the finding:
+//! `[vilan leak] total` omitted the largest per-process retention, and the
+//! soak's strongest assertion (`total == counts().named()`) is blind to an
+//! unrecorded site by construction. Both now [`record`] on insert and
+//! [`release`] on eviction, so [`outstanding`] at those sites is the LIVE
+//! retention rather than a running total — the one shape difference from the
+//! leak sites, where gross and net differ only where a handle was reclaimed.
+//!
 //! Text-site counts are exact byte lengths. AST-site counts differ by what
 //! their assertions need: the entry AST — the one site *allowed* to grow per
 //! analysis — records a tree-proportional estimate (node count × node size),
@@ -111,10 +125,34 @@ pub enum LeakSite {
     /// The wasm front-end's entry source text (content-interned: one per
     /// distinct compiled source, however many Runs repeat it).
     WasmEntryText,
+    /// A resolved pre-entry `World` retained by `analyzer`'s `BASE_CACHE`, one
+    /// per distinct `BaseCacheKey` (backlog M11). Not a `Box::leak` — the
+    /// world is an ordinary value in a process-global map — but a RETENTION of
+    /// exactly the kind this tally exists to make countable, and until M11 the
+    /// largest one in the process was the one `[vilan leak] total` could not
+    /// see. Recorded SOURCE-PROPORTIONALLY: the total bytes of the module
+    /// texts the world was built from, which is what the derived analyzer
+    /// state it retains scales with. Like the AST sites this is a proportional
+    /// figure and not a heap audit — the real retention is a multiple of it,
+    /// and the texts themselves belong to `ParseCleanCache*`, which is shared
+    /// across worlds and already counted there. Released on eviction: a
+    /// per-key overwrite, a stale-hit removal, and `base_cache_clear` each
+    /// give the world's bytes back, so [`outstanding`] is the live retention
+    /// and its growth is the growth of the key set.
+    BaseCacheWorld,
+    /// The rendered error text `macros`' `FAILURES` cache retains, one entry
+    /// per distinct (definition set, layout) whose world failed to compile
+    /// (backlog M11). Recorded as the bytes of the messages, notes and trace
+    /// labels it holds; released when an entry is displaced or
+    /// `macro_world_cache_clear` drops the map. Its sibling `WORLDS` needs no
+    /// release: what that cache holds is genuinely `Box::leak`ed
+    /// (`MacroWorldText`/`MacroWorldProgram`/`MacroWorldAst`) and clearing the
+    /// map does not give one byte of it back.
+    MacroFailureText,
 }
 
 /// The number of [`LeakSite`] variants — keep in step with the enum.
-const SITE_COUNT: usize = 19;
+const SITE_COUNT: usize = 21;
 
 /// Every site in declaration order — keep in step with the enum; [`report`]
 /// iterates it.
@@ -138,6 +176,8 @@ const ALL_SITES: [LeakSite; SITE_COUNT] = [
     LeakSite::MacroParseText,
     LeakSite::MacroParseAst,
     LeakSite::WasmEntryText,
+    LeakSite::BaseCacheWorld,
+    LeakSite::MacroFailureText,
 ];
 
 thread_local! {

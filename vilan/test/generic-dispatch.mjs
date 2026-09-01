@@ -1,9 +1,6 @@
 function $a(value) {
 	return JSON.stringify(value);
 }
-function $b(value) {
-	return JSON.stringify(value);
-}
 function $c(self) {
 	let result = "[";
 	let first = true;
@@ -28,7 +25,7 @@ function $d(self) {
 	return $f;
 }
 console.log($a(42));
-console.log($b("hi"));
+console.log($a("hi"));
 const nums = [ 1, 2, 3 ];
 console.log($c(nums));
 const maybe = [ 0, 7 ];

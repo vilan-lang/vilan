@@ -723,3 +723,268 @@ fn a_world_that_loaded_an_overlaid_source_is_not_stored_until_the_buffer_closes(
     vilan_core::analyzer::base_cache_clear();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// The retention tally (backlog M11)
+// ---------------------------------------------------------------------------
+
+/// Runs `body` on the big-stack worker the analyses need, and reads the leak
+/// tally FROM INSIDE it.
+///
+/// The thread is not a convenience here, it is the instrument: `leak_tally`'s
+/// counters are thread-local by design (the E12 pointer-identity lesson —
+/// a process-global counter's before/after deltas are famously flaky under a
+/// parallel test runner), so a store that happens on an analysis thread is
+/// invisible to the runner's thread. Every record, every release and every
+/// read this pin makes therefore happens on one thread, which is also the
+/// shape the leak soak reads its numbers in.
+fn on_one_thread<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(body)
+        .expect("spawn the retention-tally worker")
+        .join()
+        .expect("the retention-tally worker panicked")
+}
+
+fn analyze_on_this_thread(spec: &PackageSpec, source: &'static str) {
+    let (program, _errors) = analyze_source(
+        source,
+        spec,
+        Path::new("."),
+        Path::new("retention_probe.vl"),
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    drop(program);
+}
+
+/// M11: the base cache's worlds are the compiler's largest per-process
+/// retention, and `[vilan leak] total` could not see one of them.
+///
+/// Nothing here is a `Box::leak`, which is exactly why the site was missing:
+/// the tally's literal contract was never violated, and the soak's strongest
+/// assertion (`total == counts().named()`) is blind to an unrecorded site by
+/// construction. The finding is that the omission was the BIGGEST number in
+/// the process. What the site buys is in the three assertions below — the
+/// retention is counted, it is proportional to the world rather than a flat
+/// per-entry constant, and it comes BACK, so `outstanding` is the live
+/// retention and its growth is the growth of the key set (per-key overwrite
+/// being the only eviction this cache has).
+#[test]
+fn the_base_cache_records_and_releases_what_its_worlds_retain() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let (retained, gross, outstanding, after_clear, gross_after_clear) = on_one_thread(move || {
+        use vilan_core::leak_tally::{self, LeakSite};
+
+        // Clear FIRST, then zero the counters: a world stored by an earlier
+        // test would otherwise be released against a fresh tally and read
+        // negative here.
+        vilan_core::analyzer::base_cache_clear();
+        leak_tally::reset();
+
+        // Three distinct import sets, which is three distinct
+        // `BaseCacheKey`s and therefore three retained worlds — the shape an
+        // editing session mints one of per import set it ever sees.
+        analyze_on_this_thread(&spec, PROGRAM_A);
+        analyze_on_this_thread(&spec, PROGRAM_C);
+        analyze_on_this_thread(
+            &spec,
+            "import std::io::print;\nimport std::list::List;\nfun main() { print(1); }\n",
+        );
+
+        let retained = vilan_core::analyzer::base_cache_retained();
+        let gross = leak_tally::bytes(LeakSite::BaseCacheWorld);
+        let outstanding = leak_tally::outstanding(LeakSite::BaseCacheWorld);
+
+        vilan_core::analyzer::base_cache_clear();
+        (
+            retained,
+            gross,
+            outstanding,
+            leak_tally::outstanding(LeakSite::BaseCacheWorld),
+            leak_tally::bytes(LeakSite::BaseCacheWorld),
+        )
+    });
+
+    // The magnitude the item called unmeasurable, printed rather than only
+    // asserted: `cargo test … -- --nocapture` reads it off, and a future
+    // change to what a world costs shows up here as a number instead of as a
+    // silence.
+    println!(
+        "M11-RETENTION base_cache retained={retained} worlds, recorded {gross} B \
+         ({} B/world)",
+        gross / retained.max(1),
+    );
+    assert!(
+        retained >= 3,
+        "three distinct import sets must retain at least three worlds, not {retained}"
+    );
+    // Proportional, not a flat per-entry constant: std alone is hundreds of
+    // kilobytes of module text, so a site recording the shallow struct would
+    // land three orders of magnitude below this and a site recording nothing
+    // would read zero.
+    assert!(
+        gross > 100_000,
+        "a retained world must be recorded proportionally to the world; \
+         {gross} B for {retained} worlds is not that"
+    );
+    assert_eq!(
+        outstanding, gross as isize,
+        "nothing was evicted, so every recorded byte is still outstanding"
+    );
+    assert_eq!(
+        after_clear, 0,
+        "clearing the cache must give every retained byte back, or `outstanding` \
+         is a running total rather than the live retention"
+    );
+    assert_eq!(
+        gross_after_clear, gross,
+        "the GROSS record stands through a release, exactly as it does at the \
+         leak sites"
+    );
+}
+
+/// M11's sibling: `macros`' `FAILURES` cache retains rendered error text per
+/// failing definition set, with the same per-key overwrite and the same
+/// absence from the tally. It is bounded — one entry per (definition set,
+/// layout) — which is the argument for recording it and not for leaving it
+/// out: a bound nobody can read is not a bound anybody can check.
+#[test]
+fn a_cached_macro_failure_is_recorded_once_and_given_back() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    // A macro whose WORLD fails to compile: the body calls a name that exists
+    // in no macro world, so the hermetic compile errors and the failure —
+    // not a world — is what gets cached.
+    const BROKEN_MACRO: &str = r#"
+        import std::io::print;
+
+        macro fun broken_world(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source };
+            source(no_such_macro_helper(item))
+        }
+
+        [broken_world]
+        struct Point { x: i32 }
+
+        fun main() { print(1); }
+        "#;
+
+    let (first, second, after_clear) = on_one_thread(move || {
+        use vilan_core::leak_tally::{self, LeakSite};
+
+        vilan_core::analyzer::base_cache_clear();
+        vilan_core::macro_world_cache_clear();
+        leak_tally::reset();
+
+        analyze_on_this_thread(&spec, BROKEN_MACRO);
+        let first = leak_tally::outstanding(LeakSite::MacroFailureText);
+        // The second analysis is served from `FAILURES` and must retain
+        // nothing new — the cache is what stops the failing world (and its
+        // leaked text) being rebuilt per analysis, backlog E23.
+        analyze_on_this_thread(&spec, BROKEN_MACRO);
+        let second = leak_tally::outstanding(LeakSite::MacroFailureText);
+
+        vilan_core::macro_world_cache_clear();
+        (
+            first,
+            second,
+            leak_tally::outstanding(LeakSite::MacroFailureText),
+        )
+    });
+
+    println!("M11-RETENTION macro_failures recorded {first} B for one failing world");
+    assert!(
+        first > 0,
+        "a failing macro world caches its rendered error text, and the tally \
+         must see it"
+    );
+    assert_eq!(
+        second, first,
+        "the second analysis is a FAILURES hit: it retains nothing new"
+    );
+    assert_eq!(
+        after_clear, 0,
+        "clearing the macro caches must give the failure text back"
+    );
+}
+
+/// M11's open question, measured rather than feared: how fast does the base
+/// cache's key set actually grow?
+///
+/// The item's worry was that "an LSP session mints a retained world for every
+/// distinct import set it ever sees, intermediate states included" — with
+/// per-key overwrite the only eviction, that would be unbounded growth per
+/// keystroke. It is not. Typing `import std::io::print;` one character at a
+/// time is 22 analyses and retains THREE worlds: an intermediate prefix
+/// either does not parse (nothing is stored) or seeds the same `std::`
+/// reference set as its neighbours, and the key is the reference set, not the
+/// text. Growth is bounded by the number of DISTINCT import sets a session
+/// visits, which is a property of the project, not of the typing — and
+/// revisiting a set hits rather than re-storing.
+///
+/// That is why M11's answer is a tally site and not an eviction policy: what
+/// the cache retains is bounded and is now countable, and a bound nobody can
+/// read is not a bound anybody can check. If this pin ever reads keystroke
+/// growth, the eviction policy is the fix and this is what will say so.
+#[test]
+fn the_base_cache_grows_with_distinct_import_sets_not_with_keystrokes() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let (typed, typed_states, revisited) = on_one_thread(move || {
+        vilan_core::analyzer::base_cache_clear();
+        // Every prefix of one import line, analyzed as the language server
+        // analyzes a buffer edit.
+        let full = "import std::io::print;";
+        for length in 1..=full.len() {
+            let source: &'static str =
+                Box::leak(format!("{}\nfun main() {{ }}\n", &full[..length]).into_boxed_str());
+            analyze_on_this_thread(&spec, source);
+        }
+        let typed = vilan_core::analyzer::base_cache_retained();
+
+        // And the session shape: three import sets, revisited five times each
+        // with different bodies, as a session moves between files.
+        vilan_core::analyzer::base_cache_clear();
+        for round in 0..5 {
+            for module in ["io::print", "math::PI", "list::List"] {
+                let source: &'static str = Box::leak(
+                    format!("import std::{module};\nfun main() {{ }}\n// {round}\n")
+                        .into_boxed_str(),
+                );
+                analyze_on_this_thread(&spec, source);
+            }
+        }
+        let revisited = vilan_core::analyzer::base_cache_retained();
+        vilan_core::analyzer::base_cache_clear();
+        (typed, full.len(), revisited)
+    });
+
+    println!(
+        "M11-RETENTION growth: {typed_states} keystroke states -> {typed} worlds; \
+         3 import sets x 5 rounds -> {revisited} worlds"
+    );
+    assert!(
+        typed <= 5,
+        "{typed_states} intermediate typing states retained {typed} worlds: the key \
+         set is tracking the TEXT rather than the import set, which is the \
+         unbounded growth M11 asked about"
+    );
+    assert_eq!(
+        revisited, 3,
+        "three import sets revisited must retain three worlds — a revisit has to \
+         HIT, not store a fourth"
+    );
+}

@@ -121,12 +121,6 @@ function $f(self) {
 	}
 	return result;
 }
-function $s(self, fn) {
-	return [ self, fn ];
-}
-function $t(self, count) {
-	return [ self, count ];
-}
 function $w(self) {
 	const $x = next2(self[0]);
 	if ($x[0] === 0) {
@@ -167,9 +161,6 @@ function $A(self, predicate) {
 		}
 	}
 	return false;
-}
-function $D(self) {
-	return [ __clone(self), 0 ];
 }
 function $E(self, other) {
 	return [ self, __clone(other) ];
@@ -329,9 +320,6 @@ function $aq(self) {
 function $at(self) {
 	return self[0].size;
 }
-function $au(self, fn) {
-	return [ self, fn ];
-}
 function $aw(self) {
 	const $ax = $I(self[0]);
 	if ($ax[0] === 0) {
@@ -406,13 +394,13 @@ console.log($f($e($d($c($b($a([ 1, 2, 3, 4, 5, 6 ]), (n) => {
 }), (n) => {
 	return n * 10;
 }), 1), 2)));
-console.log($u($t($s([ 0 ], (n) => {
+console.log($u($e($c([ 0 ], (n) => {
 	return n * n;
 }), 4)));
 console.log($A([ 0 ], (n) => {
 	return n === 3;
 }));
-let zipped = $E(new2(0, 9), $D([ "a", "b" ]));
+let zipped = $E(new2(0, 9), $a([ "a", "b" ]));
 const $M = zipped;
 while (true) {
 	const $N = $F($M);
@@ -423,7 +411,7 @@ while (true) {
 	console.log("" + pair[0] + pair[1]);
 }
 console.log($P($O($a([ 1, 2 ]), $a([ 3 ]))));
-let numbered = $U($D([ "x", "y" ]));
+let numbered = $U($a([ "x", "y" ]));
 const $X = numbered;
 while (true) {
 	const $Y = $V($X);
@@ -446,7 +434,7 @@ $ak($a([ 1, 2 ]), (n) => {
 console.log($at($aq($an($b($a([ 1, 2, 2, 3 ]), (n) => {
 	return n > 1;
 })))));
-const lengths = $aA($av($au($D([ "alpha", "hi" ]), (word) => {
+const lengths = $aA($av($c($a([ "alpha", "hi" ]), (word) => {
 	return [ word, word.length ];
 })));
 console.log($aG($aD(lengths, "hi"), -(1)));

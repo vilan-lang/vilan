@@ -73,29 +73,15 @@ function outer(items) {
 function $a(items) {
 	return 1;
 }
-function $b(items) {
-	return 1;
-}
 function $c(head, rest) {
 	return head;
-}
-function $d(items) {
-	return 1;
 }
 function $e(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function $f(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
 function $i(self) {
 	return self[0].v;
-}
-function $j(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $q(self) {
 	return self.length === 0;
@@ -149,7 +135,7 @@ function $g(sources, $h) {
 			return $i(source);
 		});
 	};
-	const derived = $j(snapshot());
+	const derived = $e(snapshot());
 	sources.map((source) => {
 		return $u(source, (_) => {
 			$k(derived, snapshot(), $h);
@@ -157,9 +143,6 @@ function $g(sources, $h) {
 		});
 	});
 	return derived;
-}
-function $w(self) {
-	return self[0].v;
 }
 function $y(self, $n) {
 	const $z = $n;
@@ -191,16 +174,16 @@ const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 console.log(middle([ 4, 5, 6 ]));
 console.log($a([  ]));
-console.log($b([ 1 ]));
+console.log($a([ 1 ]));
 console.log($c(2, [ 3, 4 ]));
 console.log(swap_pack([ 1, 2 ]));
 console.log(outer([ 3, 4 ]));
 const inner = [ 10, 11 ];
-console.log($d([ ...inner, 12 ]));
+console.log($a([ ...inner, 12 ]));
 const count = $e(20);
-const name = $f("hi");
+const name = $e("hi");
 const both = $g([ __clone(count), name ], [ 1 ]);
-console.log($w(both)[0]);
+console.log($i(both)[0]);
 $x(count, 21, [ 1 ]);
-console.log($w(both)[0]);
-console.log($w(both)[1]);
+console.log($i(both)[0]);
+console.log($i(both)[1]);

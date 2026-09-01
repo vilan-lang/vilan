@@ -65,10 +65,6 @@ function $K(self, fn) {
 	const inner = fn(self[0]);
 	return [ __clone(inner[0]), self[1] + "+" + inner[1] ];
 }
-function $N(self, fn) {
-	const inner = fn(self[0]);
-	return [ __clone(inner[0]), self[1] + "+" + inner[1] ];
-}
 const count = [ 0, 2 ];
 let $a = null;
 const $b = count;
@@ -203,7 +199,7 @@ const paired = $K(left, ($L) => {
 });
 console.log("" + $J(paired[0]) + " [" + paired[1] + "]");
 const boxes = [ [ [ 7, "inner" ] ], "outer" ];
-const picked = $N(boxes, ($O) => {
+const picked = $K(boxes, ($O) => {
 	return __at($O, 0);
 });
 console.log("" + $J(picked[0]) + " [" + picked[1] + "]");
