@@ -2958,6 +2958,21 @@ pub struct Analyzer<'src> {
     // The constraints those annotations recorded, checked after `build()` —
     // where the binding's own type has settled (B161).
     binding_trait_constraints: Vec<BindingTraitConstraint>,
+    // B182: the annotation slots a REFUSED bare trait resolved to `Unknown`,
+    // each with the site its one report was filed at. B161 resolves a refused
+    // annotation to `Unknown` "so the one report stands alone instead of
+    // cascading" — and that promise is only kept if the checks downstream can
+    // tell THIS `Unknown` (a type a diagnostic already accounted for) from an
+    // ordinary one (a type nobody has been told about). The slot is the
+    // provenance: a field access reads the field's declared type id, so a
+    // receiver typed from a refused field IS this id, and so is the argument a
+    // `[service]`/`[expose]` expansion passes on.
+    refused_annotation_slots: HashMap<TypeId, (SourceId, Span)>,
+    // The refusals above that actually SILENCED a follow-on. Ordering asks only
+    // about these (`normalize_diagnostic_order`): a refusal that caused
+    // stand-downs is the ROOT of everything still printed around it, and a root
+    // reads first.
+    stood_down_refusals: HashSet<(SourceId, Span)>,
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
@@ -3600,6 +3615,8 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
             binding_trait_constraints: Vec::new(),
+            refused_annotation_slots: HashMap::default(),
+            stood_down_refusals: HashSet::default(),
             panic_fn_id: None,
             source_trait_id: None,
             print_fn_id: None,
@@ -4105,6 +4122,25 @@ impl<'src> Analyzer<'src> {
             let Some((_, own_generics)) = self.method_signature(member_id) else {
                 continue;
             };
+            // B182: the never-silent invariant's own subject is "no binding was
+            // recorded". When one of this call's VALUES has no type because its
+            // annotation was refused — and refused with a report — that is the
+            // whole answer, and every generic of the call is equally
+            // unanswerable, so the question is asked of the CALL rather than of
+            // each generic (E104's per-offending-thing rule, at the grain this
+            // offense actually has). It is not a blanket: a call whose values
+            // all have types still reports, and the bound violations above,
+            // which name a real type, are untouched.
+            //
+            // This is where B161's promise reaches MACRO-GENERATED code. A
+            // `[service]` expansion's `expose(self.field)` is a call the author
+            // never wrote, over a field they did, and "cannot infer 'S' for
+            // this call" re-anchored at the attribute was the cascade's loudest
+            // and least actionable voice — it read as a compiler fault where
+            // the refusal two pages down was the fix.
+            if self.call_stands_down_on_refused_annotation(call_id) {
+                continue;
+            }
             for constraint_id in own_generics {
                 let bound_traits = self.generic_bound_traits(constraint_id);
                 if bound_traits.is_empty() {
@@ -14234,6 +14270,87 @@ impl<'src> Analyzer<'src> {
             .get(&expr_id)
             .or_else(|| self.resolved_types.get(&expr_id))
             .copied()
+    }
+
+    /// The refusal an expression's `Unknown` traces to, if any (B182): the site
+    /// of the ONE report already filed about the annotation whose slot this
+    /// expression reads.
+    ///
+    /// B161's promise — "a refused annotation resolves to `Unknown`, so the one
+    /// report stands alone instead of cascading" — is kept by the checks that
+    /// consult this, and only by them. The slot is the whole mechanism: a field
+    /// access records the FIELD's declared type id as the expression's type
+    /// (`resolve_member_accessor`), and a `[service]`/`[expose]` expansion
+    /// passes that same access on as an argument, so one lookup answers for the
+    /// receiver in the author's own body and for the generated call alike.
+    ///
+    /// The three fallbacks below are the same slot reached without an interned
+    /// expression type — a binding or parameter naming the annotation directly,
+    /// and a field whose access resolved before the drain ran.
+    fn refused_annotation_behind(&self, expr_id: Id) -> Option<(SourceId, Span)> {
+        if self.refused_annotation_slots.is_empty() {
+            return None;
+        }
+        let mut slots: Vec<TypeId> = Vec::new();
+        slots.extend(self.type_id_of_expr(expr_id));
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Local(binding_id)) => {
+                slots.extend(
+                    self.variables
+                        .get(binding_id)
+                        .map(|variable| variable.type_id),
+                );
+                slots.extend(
+                    self.parameters
+                        .get(binding_id)
+                        .map(|parameter| parameter.type_id),
+                );
+            }
+            Some(Expr::Field(_, struct_id, field_index)) => {
+                slots.extend(
+                    self.structs
+                        .get(struct_id)
+                        .and_then(|struct_| struct_.fields.get(*field_index))
+                        .map(|field| field.type_id),
+                );
+            }
+            _ => {}
+        }
+        slots
+            .into_iter()
+            .find_map(|slot| self.refused_annotation_slots.get(&slot).copied())
+    }
+
+    /// [`Self::refused_annotation_behind`], recording the refusal as one that
+    /// SILENCED a follow-on — which is what makes it a root for ordering
+    /// (`Program::normalize_diagnostic_order`). Every stand-down site calls
+    /// this, so "caused a stand-down" is never asserted, only observed.
+    fn stand_down_on_refused_annotation(&mut self, expr_id: Id) -> bool {
+        match self.refused_annotation_behind(expr_id) {
+            Some(site) => {
+                self.stood_down_refusals.insert(site);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Self::stand_down_on_refused_annotation`] asked of a CALL: was it
+    /// handed a value whose type a refused annotation resolved to `Unknown`?
+    ///
+    /// The receiver rides in `argument_ids` on the paths that record one, so
+    /// one sweep answers for both halves of a method call.
+    fn call_stands_down_on_refused_annotation(&mut self, call_id: Id) -> bool {
+        let Some(argument_ids) = self
+            .function_calls
+            .get(&call_id)
+            .map(|call| call.argument_ids.clone())
+        else {
+            return false;
+        };
+        argument_ids
+            .into_iter()
+            .any(|argument_id| self.stand_down_on_refused_annotation(argument_id))
     }
 
     /// `place_value_type`'s interned half.
@@ -28211,6 +28328,16 @@ impl<'src> Analyzer<'src> {
             }
             MethodLookup::Defer => Resolution::Deferred,
             MethodLookup::NotCallable => {
+                // B182: a receiver that is `Unknown` because its annotation was
+                // REFUSED has no methods for the reason a diagnostic has
+                // already given. "cannot call method 'set_with' on unknown" is
+                // that refusal restated at every use — which is exactly the
+                // cascade B161 resolved to `Unknown` to prevent. Failed either
+                // way: the call still has no answer, it just no longer has a
+                // second report.
+                if self.stand_down_on_refused_annotation(subject_id) {
+                    return Resolution::Failed;
+                }
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -31211,6 +31338,12 @@ impl<'src> Analyzer<'src> {
                 if self.is_unknown_closure_parameter(subject_id) {
                     return Resolution::Deferred;
                 }
+                // B182, the method call's twin: a subject whose annotation was
+                // refused has no fields for a reason already reported.
+                if self.stand_down_on_refused_annotation(subject_id) {
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
                 let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -31796,6 +31929,15 @@ impl<'src> Analyzer<'src> {
                                     },
                                     source_id,
                                 );
+                                // B182: the slot this report accounts for.
+                                // Everything downstream reads `Unknown` here —
+                                // a method call on the field, a bound the
+                                // `[service]` expansion cannot check — and the
+                                // provenance is what lets those stand down
+                                // instead of restating the refusal in the
+                                // vocabulary of code the author never wrote.
+                                self.refused_annotation_slots
+                                    .insert(type_id, (source_id, span));
                             }
                         }
                     }
@@ -35050,6 +35192,13 @@ pub struct Program<'src> {
     /// The source file each diagnostic (by index) belongs to — `SourceId(0)` is
     /// the entry; imported modules publish to their own files (backlog E1).
     pub diagnostic_sources: Vec<SourceId>,
+    /// B182: the refusals that SILENCED a follow-on — the sites
+    /// [`Analyzer::stand_down_on_refused_annotation`] recorded, as
+    /// `(file, span)`. Read by [`Program::normalize_diagnostic_order`] alone,
+    /// which is the whole reason they are carried: a refusal other diagnostics
+    /// were dropped in favour of is the ROOT of everything still printed around
+    /// it, and a root reads first.
+    pub stood_down_refusals: HashSet<(SourceId, Span)>,
     /// Non-fatal diagnostics (unused `[must_use]` results) — rendered as warnings.
     pub warnings: Vec<Error>,
     /// The source file each warning (by index) belongs to — read through
@@ -35753,23 +35902,94 @@ impl<'src> Program<'src> {
                 error.trace.iter().map(|hop| locate(&hop.note)).collect(),
             )
         }
-        fn sort_in_step(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>) {
+        /// **The root rule (B182).** Where a diagnostic sits in the file's
+        /// order, as `(position, rank)`, before the content tail decides
+        /// anything: `(span.start, 1)` for every diagnostic, EXCEPT a refusal
+        /// that caused a stand-down, which takes `(the outermost enclosing
+        /// diagnostic's start, 0)`.
+        ///
+        /// One sentence: **a refusal other reports were dropped in favour of
+        /// prints ahead of every diagnostic whose span encloses it, and ahead
+        /// of anything sharing its span.** That is the reader's order — the
+        /// specific before the general — and it is what the exhibit needed. A
+        /// `[service]` struct's generated-code diagnostics re-anchor at the
+        /// WHOLE declaration (standard A2), whose span opens before the field
+        /// annotation inside it, so plain positional order printed the
+        /// consequence first and buried the cause: kolt's owner read "cannot
+        /// infer 'S'" and never reached the refused field two pages down.
+        ///
+        /// Only refusals move, only past diagnostics that CONTAIN them, and
+        /// everything else keeps `span.start` — so no unrelated pair is
+        /// reordered, and the result is still one total, deterministic order.
+        /// The scan costs one pass over the list per ROOT, and the roots are
+        /// the handful of refusals that silenced something — a diagnostic list
+        /// with none of them pays nothing.
+        fn placement(
+            error: &Error,
+            source: SourceId,
+            entries: &[Error],
+            sources: &[SourceId],
+            roots: &HashSet<(SourceId, Span)>,
+        ) -> (usize, u8) {
+            if !roots.contains(&(source, error.span)) {
+                return (error.span.start, 1);
+            }
+            let enclosing = entries
+                .iter()
+                .zip(sources.iter())
+                .filter(|(other, other_source)| {
+                    **other_source == source
+                        && other.span.start <= error.span.start
+                        && other.span.end >= error.span.end
+                        && other.span != error.span
+                })
+                .map(|(other, _)| other.span.start)
+                .min();
+            (enclosing.unwrap_or(error.span.start), 0)
+        }
+        fn sort_in_step(
+            entries: &mut Vec<Error>,
+            sources: &mut Vec<SourceId>,
+            roots: &HashSet<(SourceId, Span)>,
+        ) {
             // `push_diagnostic` pads lazily, so the attribution vector can be
             // SHORTER than the list it describes. Materialize the implicit
             // entry-file tail before permuting, or that tail loses its file.
             sources.resize(entries.len(), SourceId(0));
-            let mut paired: Vec<(Error, SourceId)> =
-                entries.drain(..).zip(sources.drain(..)).collect();
-            paired.sort_by(|(left, left_source), (right, right_source)| {
-                key(left, *left_source).cmp(&key(right, *right_source))
-            });
-            for (entry, source) in paired {
+            let placements: Vec<(usize, u8)> = entries
+                .iter()
+                .zip(sources.iter())
+                .map(|(error, source)| placement(error, *source, entries, sources, roots))
+                .collect();
+            let mut paired: Vec<(Error, SourceId, (usize, u8))> = entries
+                .drain(..)
+                .zip(sources.drain(..))
+                .zip(placements)
+                .map(|((entry, source), placement)| (entry, source, placement))
+                .collect();
+            paired.sort_by(
+                |(left, left_source, left_place), (right, right_source, right_place)| {
+                    (left_source.0, *left_place)
+                        .cmp(&(right_source.0, *right_place))
+                        .then_with(|| key(left, *left_source).cmp(&key(right, *right_source)))
+                },
+            );
+            for (entry, source, _) in paired {
                 entries.push(entry);
                 sources.push(source);
             }
         }
-        sort_in_step(&mut self.diagnostics, &mut self.diagnostic_sources);
-        sort_in_step(&mut self.warnings, &mut self.warning_sources);
+        let roots = std::mem::take(&mut self.stood_down_refusals);
+        sort_in_step(&mut self.diagnostics, &mut self.diagnostic_sources, &roots);
+        // Warnings are not refusals and nothing stands down in favour of one,
+        // so the root rule has nothing to say about them: they keep the
+        // positional order they have always had.
+        sort_in_step(
+            &mut self.warnings,
+            &mut self.warning_sources,
+            &HashSet::default(),
+        );
+        self.stood_down_refusals = roots;
     }
 
     /// The program's call graph: ONE build per analysis, shared by everything
@@ -40793,6 +41013,7 @@ fn analyze_over_world<'src>(
         platform,
         closures: analyzer.closures,
         diagnostics: analyzer.diagnostics,
+        stood_down_refusals: std::mem::take(&mut analyzer.stood_down_refusals),
         warnings: analyzer.warnings,
         warning_sources: analyzer.warning_sources,
         enums: analyzer.enums,

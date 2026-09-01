@@ -1010,3 +1010,144 @@ fn e90_a_workspace_member_read_reports_at_itself() {
         "the user-side hop still renders in main.vl: {stderr}"
     );
 }
+
+// --- B182: one round, one report per distinct error --------------------------
+//
+// A multi-entry package's `check` is one analysis PER ENTRY over one source
+// tree, so a module every leg reaches produced its diagnostics once per leg:
+// kolt's two refused fields were six of its 53 errors, the one report each is
+// owed arriving once per entry. The loader already refuses to report a module's
+// parse errors once per importing seam (E102); an entry is that seam one level
+// up, and the ledger keys the same three things — file, position, reason.
+
+/// The rendered diagnostics of a failing `vilan check .`, as one string. The
+/// dedup is a CHECK property: `build` stops at the first failing leg, so it
+/// never reaches a second entry to repeat anything.
+fn check_stderr(dir: &Path) -> (Output, String) {
+    let output = vilan(dir, &["check", "."], true);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output, stderr)
+}
+
+/// One line per rendered diagnostic — ariadne opens each report with its
+/// message on an `Error:` line.
+fn error_headers(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("Error:"))
+        .collect()
+}
+
+/// A package with three entries, all reaching one module — kolt's own layout.
+const THREE_ENTRY_MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\
+                                    \n[entry.client]\ntarget = \"browser\"\n\
+                                    \n[entry.server]\n\n[entry.probe]\n";
+
+/// The three entries, each importing the shared module and doing nothing else.
+fn three_entries() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "src/client.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\nfun main() {\n\tprint(\"client\");\n}\n",
+        ),
+        (
+            "src/server.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+        ),
+        (
+            "src/probe.vl",
+            "import std::io::print;\nimport pkg::store::Store;\n\nfun main() {\n\tprint(\"probe\");\n}\n",
+        ),
+    ]
+}
+
+#[test]
+fn a_shared_modules_error_reports_once_per_check_not_once_per_entry() {
+    // A plain type error, nothing to do with the refusal family: the dedup is
+    // the round's, not one family's.
+    let mut files = vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        (
+            "src/store.vl",
+            "struct Store {\n\tname: str,\n}\n\nfun oops(): i32 {\n\t\"not an int\"\n}\n",
+        ),
+    ];
+    files.extend(three_entries());
+    let dir = temp_files("per_entry_dedup", &files);
+    let (output, stderr) = check_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the broken check must fail");
+    let headers = error_headers(&stderr);
+    assert_eq!(
+        headers.len(),
+        1,
+        "one mistake in a module all three entries reach is one report: {stderr}"
+    );
+    assert!(
+        headers[0].contains("Expected i32, but got str"),
+        "and it is the mistake itself: {stderr}"
+    );
+}
+
+#[test]
+fn the_service_exhibits_refused_fields_report_only_their_roots() {
+    // kolt's shape and kolt's mistake (B182): two `[expose]` fields annotated
+    // with the reactive TRAIT rather than the cell, in a module all three
+    // entries reach. That produced 53 diagnostics — six curated roots, fifteen
+    // setter calls on a receiver with no type, twelve generated-code inference
+    // failures, and field-access noise — with the cascade printed FIRST.
+    let mut files = vec![
+        ("vilan.toml", THREE_ENTRY_MANIFEST),
+        (
+            "src/store.vl",
+            "import std::reactive::Signal;\n\
+             \n\
+             [service(StoreClient)]\n\
+             struct Store {\n\
+             \t[expose] tasks: Signal<List<i32>>,\n\
+             \t[expose] names: Signal<List<str>>,\n\
+             }\n\
+             \n\
+             impl Store {\n\
+             \t[rpc]\n\
+             \tfun add(self, id: i32): i32 {\n\
+             \t\tself.tasks.set_with(|list| {\n\
+             \t\t\tmut updated = list;\n\
+             \t\t\tupdated.push(id);\n\
+             \t\t\tupdated\n\
+             \t\t});\n\
+             \t\tid\n\
+             \t}\n\
+             }\n",
+        ),
+    ];
+    files.extend(three_entries());
+    let dir = temp_files("service_roots", &files);
+    let (output, stderr) = check_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "the broken check must fail");
+    let headers = error_headers(&stderr);
+    assert_eq!(
+        headers.len(),
+        2,
+        "two refused annotations are two reports — one each, not one per entry: {stderr}"
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|header| header.contains("'Signal' is a trait, not a type")),
+        "and both are the refusal itself, not a consequence of it: {stderr}"
+    );
+    for cascade in [
+        "on unknown",
+        "cannot infer",
+        "in code generated by this attribute",
+    ] {
+        assert!(
+            !stderr.contains(cascade),
+            "no follow-on may survive the refusal ({cascade:?}): {stderr}"
+        );
+    }
+}
