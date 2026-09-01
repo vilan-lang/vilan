@@ -6007,3 +6007,201 @@ fn the_literal_door_control_refuses_the_same_value_it_always_did() {
         "Expected i32, but got str instead.",
     );
 }
+
+// --- B167: an `is`-capture that is CALLED reads the same alias a read does ---
+//
+// `if stored is Some(let f) { f() }` compiled to `f()` against an `f` nothing
+// ever declared — `ReferenceError` at run time from accepted vilan. An `is`
+// capture has no declaration of its own: it is ALIASED to the subject's
+// payload slot (`$a[1]`) and substituted at each use. The value-read arm
+// consulted that alias table; the call arm's named-callee fast path, written
+// for functions, did not, and swallowed every other kind of local. So the
+// defect bit exactly the payloads whose uses are calls — closure-typed ones —
+// which is why an `i32` payload had always worked and why `match`, whose legs
+// DECLARE their captures, worked too. Every pin here RUNS the bundle: the
+// program compiled before, so only execution can tell the difference.
+
+#[test]
+fn a_closure_payload_capture_is_callable_in_the_arm() {
+    // The minimal repro. Direct use, no shadowing, no nesting — the name is
+    // irrelevant, which is what falsified the first (alpha-rename) reading.
+    assert_compiles_and_runs(
+        r#"
+        fun main() {
+            let stored: Option<|| void> = Some(|| print("inner"));
+            if stored is Some(let handler) {
+                handler();
+            }
+        }
+        "#,
+        "inner\n",
+    );
+}
+
+#[test]
+fn a_closure_payload_capture_is_callable_from_a_closure_in_the_arm() {
+    // The owner's shape: the call is CAPTURED by a closure created in the
+    // arm and handed off. The alias has to survive into the closure body.
+    assert_compiles_and_runs(
+        r#"
+        fun run(callback: || void) {
+            callback();
+        }
+
+        fun main() {
+            let stored: Option<|| void> = Some(|| print("inner"));
+            if stored is Some(let handler) {
+                run(|| {
+                    handler();
+                });
+            }
+        }
+        "#,
+        "inner\n",
+    );
+}
+
+#[test]
+fn a_closure_payload_capture_is_callable_two_closures_deep() {
+    // Two nested closure boundaries between the capture and its call.
+    assert_compiles_and_runs(
+        r#"
+        fun run(callback: || void) {
+            callback();
+        }
+
+        fun main() {
+            let stored: Option<|| void> = Some(|| print("inner"));
+            if stored is Some(let handler) {
+                run(|| {
+                    run(|| {
+                        handler();
+                    });
+                });
+            }
+        }
+        "#,
+        "inner\n",
+    );
+}
+
+#[test]
+fn a_closure_payload_capture_takes_arguments_and_returns() {
+    // Not just a bare `f()`: arguments pass and the result is used, so the
+    // alias has to hold in operand position too.
+    assert_compiles_and_runs(
+        r#"
+        fun main() {
+            let stored: Option<|i32| i32> = Some(|n| n * 2);
+            if stored is Some(let double) {
+                print(double(20) + 1);
+            }
+        }
+        "#,
+        "41\n",
+    );
+}
+
+#[test]
+fn a_closure_payload_capture_shadowing_an_outer_binding_calls_the_captured_one() {
+    // The program as first reported, whose shadowing was a red herring: it
+    // fails and is fixed for the same reason the unshadowed one is, and the
+    // capture — not the outer binding — is what runs.
+    assert_compiles_and_runs(
+        r#"
+        fun run(callback: || void) {
+            callback();
+        }
+
+        fun main() {
+            let handler = || print("outer");
+            let stored: Option<|| void> = Some(|| print("inner"));
+            if stored is Some(let handler) {
+                run(|| {
+                    handler();
+                });
+            }
+        }
+        "#,
+        "inner\n",
+    );
+}
+
+#[test]
+fn an_i32_payload_capture_control_still_reads_through_the_alias() {
+    // The control that always worked: a payload whose uses are READS took the
+    // value arm, which consulted the alias table all along.
+    assert_compiles_and_runs(
+        r#"
+        fun main() {
+            let stored: Option<i32> = Some(41);
+            if stored is Some(let n) {
+                print(n + 1);
+            }
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn the_match_control_still_calls_its_closure_payload() {
+    // The other control that always worked, and by a different mechanism:
+    // a `match` leg DECLARES its captures as `const`s, so the callee had a
+    // declaration to refer to. Untouched by the fix, and pinned so it stays
+    // that way.
+    assert_compiles_and_runs(
+        r#"
+        fun main() {
+            let stored: Option<|| void> = Some(|| print("inner"));
+            match stored {
+                Some(let f) => f(),
+                None => print("none"),
+            }
+        }
+        "#,
+        "inner\n",
+    );
+}
+
+#[test]
+fn a_struct_payload_capture_control_still_reads_its_fields() {
+    // The shape kolt's servers run in production: a struct payload, read
+    // through its fields rather than called. It must not move.
+    assert_compiles_and_runs(
+        r#"
+        struct User { name: str, age: i32 }
+
+        fun main() {
+            let stored: Option<User> = Some(User { name = "ada", age = 36 });
+            if stored is Some(let user) {
+                print(user.name);
+                print(user.age);
+            }
+        }
+        "#,
+        "ada\n36\n",
+    );
+}
+
+#[test]
+fn a_closure_payload_capture_in_an_else_if_chain_calls_the_right_arm() {
+    // Two `is` tests in one chain: each arm's capture must alias ITS own
+    // subject's slot, not the previous test's.
+    assert_compiles_and_runs(
+        r#"
+        fun main() {
+            let first: Option<|| void> = None;
+            let second: Option<|| void> = Some(|| print("second"));
+            if first is Some(let a) {
+                a();
+            } else if second is Some(let b) {
+                b();
+            } else {
+                print("neither");
+            }
+        }
+        "#,
+        "second\n",
+    );
+}

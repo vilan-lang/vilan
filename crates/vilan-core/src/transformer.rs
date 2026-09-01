@@ -3582,7 +3582,22 @@ impl<'src> Transformer<'src> {
                     .get(&function_call.subject_id)
                     .unwrap();
                 match subject {
-                    Expr::Local(target_id) => {
+                    // B167: an `is`-test capture is a VALUE aliased to the
+                    // subject's payload slot — it has no declaration of its
+                    // own — so it is not a named callee and must fall to the
+                    // value-call arm below, which walks the subject and picks
+                    // the alias up from `is_bindings` exactly as READING the
+                    // capture does. Without the guard this arm emitted the
+                    // binding's source name for a callee nothing ever
+                    // declared: `if stored is Some(let f) { f() }` compiled to
+                    // `f()` against no `f`, a `ReferenceError` from accepted
+                    // vilan. It bit precisely the payloads whose uses ARE
+                    // calls — closure-typed ones — which is why an `i32`
+                    // payload (read as a value) had always worked, and why
+                    // `match`, whose legs DECLARE their captures, worked too.
+                    // One alias table, and now every place a local becomes JS
+                    // consults it.
+                    Expr::Local(target_id) if !self.is_bindings.contains_key(target_id) => {
                         let target_id = *target_id;
                         // Calling a named binding REFERENCES it, exactly as
                         // reading it does (the `Expr::Local` value arm above):
