@@ -318,7 +318,7 @@ not visible:
 ```vilan,fragment
 .show(open)                             // any Source<bool>
 .when(present, || task_editor(…))       // any Source<bool> + (sync || View)
-.swap(route, |current| match current {  // Signal<T> + (sync |T| View)
+.swap(route, |current| match current {  // any Source<T> + (sync |T| View)
 	Route::Home => home_page(),
 	Route::NotFound => not_found(),
 })

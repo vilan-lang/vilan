@@ -276,3 +276,64 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
         "`bind_each` must reconcile the removed row away; got:\n{updated}"
     );
 }
+
+// ── B168: `swap` joins them, and it is live too ──────────────────────────────
+//
+// A33 held `View::swap` back for an inference gap, not for a write — B168 closed
+// the gap and the three that waited (`swap`, `swap_split`, `chunk_preload`)
+// widened. The compile facts are pinned in `vilan-core`'s bounds suite; what
+// only a running program shows is the same thing it showed for the other eight:
+// that a widened `swap` still SUBSCRIBES. A `swap` that read its source once
+// would mount the right subtree and then never move again, and it would type,
+// build and pass every compile pin.
+
+/// The route swap, driven by a user `Source`, dumped at the mount and again
+/// after the route moves. `swap` also DISPOSES the previous subtree, so the
+/// second dump asserts the old section is gone as well as the new one present —
+/// a read-once binding fails on both halves.
+#[test]
+fn a_user_source_drives_swap_and_keeps_driving_it() {
+    let app = format!(
+        r#"import std::reactive::{{ Signal, Source, Subscription }};
+import std::ui::{{ View, mount_root, view }};
+{STORED}
+/// The harness serializes the mounted tree under this tag.
+[extern("__dump")]
+external fun dump(tag: str): void;
+
+fun main() {{
+	let route: Stored<str> = Stored::new("home");
+
+	let _root = mount_root("app", || view("main")
+		.swap(route, |current| view("section").text(i"page {{current}}")));
+	dump("mounted");
+
+	route.set("docs");
+	dump("updated");
+}}
+"#
+    );
+    let stdout = build_and_run("swap", &app);
+    let line = |tag: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(tag))
+            .unwrap_or_else(|| panic!("no {tag} dump in:\n{stdout}"))
+            .to_string()
+    };
+    let mounted = line("mounted");
+    let updated = line("updated");
+
+    assert!(
+        mounted.contains("<section>page home</section>"),
+        "the mount must render the user source's current value; got:\n{mounted}"
+    );
+    assert!(
+        updated.contains("<section>page docs</section>"),
+        "a write through the user source must swap the subtree; got:\n{updated}"
+    );
+    assert!(
+        !updated.contains("page home"),
+        "`swap` must remove the previous subtree; got:\n{updated}"
+    );
+}

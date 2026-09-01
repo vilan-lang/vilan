@@ -420,21 +420,17 @@ impl View {
 	/// enclosing boundary goes is disposed with it. Routing is the first
 	/// customer (`std::router`): `swap(route, |current| match current { .. })`.
 	///
-	/// CONCRETE `Signal`, and NOT because it writes (A33's sweep classifies it
-	/// read-only, exactly like `when`). It is BLOCKED: a `Source<T>` bound whose
-	/// argument is a BARE generic parameter loses its link to the caller's own
-	/// `T` when the argument's type is `Signal<T>` inside a generic body — the
-	/// callee's `T: PartialEq` is then checked against the impl's unbound
-	/// parameter and refused. `swap_split` below calls `self.swap(gated, render)`
-	/// from exactly such a body, so widening this signature makes std itself
-	/// uncompilable. (`Source<List<T>>` — `bind_each`'s bound, a CONSTRUCTED
-	/// argument — resolves fine; the gap is the bare parameter alone. Pinned
-	/// `#[ignore]`d in `tests/inference/generics.rs`; un-ignore it and this
-	/// signature, `swap_split`'s and `chunk_preload`'s widen together, in that
-	/// generic-parameter order — the split gate rebinds them by position.)
-	fun swap<T: PartialEq>(
+	/// A `Source<T>` bound like every other read-only binding (A33). This one
+	/// was the sweep's single holdout — a bound whose argument is a BARE
+	/// generic parameter lost its link to the caller's `T` inside a generic
+	/// body, and `swap_split` below calls `self.swap(gated, render)` from
+	/// exactly such a body — until B168 fixed the receiver/subject
+	/// reconciliation that leaked the impl's own parameter there. `swap`,
+	/// `swap_split` and `chunk_preload` declare the same generics in the same
+	/// ORDER, because the split gate rebinds their type arguments by position.
+	fun swap<T: PartialEq, S: Source<T>>(
 		self,
-		source: Signal<T>,
+		source: S,
 		render: (sync |T| View) context owner_scope,
 	): View {
 		let element = self.element;
@@ -502,9 +498,9 @@ impl View {
 	/// In a build with no chunk map — every single-file build, which is every
 	/// build that did not ask to split — `chunk_ready` is true for every arm
 	/// and this is `swap`, one derived signal deeper.
-	fun swap_split<T: PartialEq>(
+	fun swap_split<T: PartialEq, S: Source<T>>(
 		self,
-		source: Signal<T>,
+		source: S,
 		render: (sync |T| View) context owner_scope,
 	): View {
 		let gated: Signal<T> = Signal::new(source.get());
@@ -622,9 +618,10 @@ external fun chunk_preload_arm(arm: i32): void;
 /// the swap is the last call in its view chain, so without it the whole shell
 /// subtree is built before the boot route's chunk is even asked for. Declares
 /// the same generics as `swap_split`, in the same order, because the emitter
-/// rebinds the gate call's type argument onto it by position. `swap_split` then
-/// joins the in-flight fetch this started rather than opening a second one.
-fun chunk_preload<T: PartialEq>(source: Signal<T>) {
+/// rebinds the gate call's type arguments onto it by position. `swap_split`
+/// then joins the in-flight fetch this started rather than opening a second
+/// one.
+fun chunk_preload<T: PartialEq, S: Source<T>>(source: S) {
 	chunk_preload_arm(chunk_arm(source.get()));
 }
 
