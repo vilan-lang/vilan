@@ -26,7 +26,7 @@ import pkg::promise::Promise;
 import pkg::reactive::{
 	Disposable,
 	FlushPolicy,
-	Signal,
+	SignalCell,
 	Source,
 	Subscription,
 	at_settle,
@@ -445,7 +445,7 @@ struct SocketDuplex {
 	// RPC calls (e.g. an `attach(connection)` method), like `SplitDuplex`.
 	// A cell: every reconnect lands a fresh id.
 	connection: Shared<i32>,
-	state: Signal<ConnectionState>,
+	state: SignalCell<ConnectionState>,
 	inbound: Shared<Option<|Frame| void>>,
 	// Frames that arrived before `on_frame` was set — queued, then flushed.
 	early: Shared<List<Frame>>,
@@ -568,7 +568,7 @@ impl SocketTransport with Transport {
 impl SocketTransport {
 	/// The duplex's lifecycle, for the UI — bind it ("reconnecting…") or gate
 	/// optimistic writes on it.
-	fun connection_state(self): Signal<ConnectionState> {
+	fun connection_state(self): SignalCell<ConnectionState> {
 		self.duplex.state
 	}
 
@@ -799,7 +799,7 @@ fun connect_socket(url: str): Result<SocketDuplex, str> {
 				socket = Shared::new(socket),
 				url,
 				connection = Shared::new(connection),
-				state = Signal::new(ConnectionState::Connected),
+				state = SignalCell::new(ConnectionState::Connected),
 				inbound,
 				early,
 				pending,
@@ -1284,11 +1284,11 @@ impl ReactiveClient {
 		client
 	}
 
-	/// A remote handle for a channel: a typed local mirror (`Signal<Option<T>>`,
+	/// A remote handle for a channel: a typed local mirror (`SignalCell<Option<T>>`,
 	/// `None` until the first update lands) kept in sync by inbound `Update`
 	/// frames, wrapped as a `RemoteSource<T>` whose `sub` also opens the channel.
 	fun source<T: Wire>(self, channel: i32): RemoteSource<T> {
-		let cache: Signal<Option<T>> = Signal::new(None);
+		let cache: SignalCell<Option<T>> = SignalCell::new(None);
 		let codec = self.codec;
 		// Deliver one routed `Update`: re-open the frame (the envelope was only
 		// routed, not consumed) and rebuild the payload at this channel's type.
@@ -1415,7 +1415,7 @@ struct RemoteSource<T> {
 	// against the channel the mirror holds THEN (a rebind may have moved it).
 	codec: Codec,
 	transport: DuplexEnd,
-	cache: Signal<Option<T>>,
+	cache: SignalCell<Option<T>>,
 }
 
 impl RemoteSource<type T> {
@@ -1426,7 +1426,7 @@ impl RemoteSource<type T> {
 		self.cache.get()
 	}
 
-	/// Observe the mirror through `transform`, as a plain `Signal<U>` — the
+	/// Observe the mirror through `transform`, as a plain `SignalCell<U>` — the
 	/// one seam into the ordinary reactive world (`bind_each`, `bind_text`,
 	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
 	/// it opens the channel if nothing else has, and the lease is released
@@ -1437,8 +1437,8 @@ impl RemoteSource<type T> {
 	/// `None` until the first frame lands — the one place the `Option` is
 	/// confronted, and where a fallback of a DIFFERENT type than `T` belongs
 	/// (`"Loading…"` from a `RemoteSource<i32>`).
-	fun map<U>(self, transform: sync |Option<T>| U): Signal<U> {
-		let derived = Signal::new(transform(self.get()));
+	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U> {
+		let derived = SignalCell::new(transform(self.get()));
 		get_owner().take(self.lease(|value| {
 			derived.set(transform(value));
 		}));
@@ -1448,16 +1448,16 @@ impl RemoteSource<type T> {
 	/// `map` for the same-type case: `initial` until the first frame, the
 	/// mirrored value after. Counted and owner-released exactly like `map`,
 	/// because it IS `map` — `client.notes.or([])` inside a view replaces the
-	/// hand-built `Signal::new([])` + never-disposed `sub` pair, and the
+	/// hand-built `SignalCell::new([])` + never-disposed `sub` pair, and the
 	/// subscription now dies with the view instead of with the tab.
-	fun or(self, initial: T): Signal<T> {
+	fun or(self, initial: T): SignalCell<T> {
 		self.map(|value| match value {
 			Some(let present) => present,
 			None => initial,
 		})
 	}
 
-	/// What is locally KNOWN about this mirror, as a `Signal<Status>`.
+	/// What is locally KNOWN about this mirror, as a `SignalCell<Status>`.
 	/// Passive: opens no channel, takes no lease, needs no owner — derived
 	/// from the cache alone, so it is callable at the top of `main` where
 	/// `map` is not. The honest sentence: a `status` observer ALONE never
@@ -1466,7 +1466,7 @@ impl RemoteSource<type T> {
 	/// correct — the channel was never opened. Any path that renders the value
 	/// when it arrives (`sub`, `map`, `or`) subscribes; the count is what
 	/// makes that harmless.
-	fun status(self): Signal<Status> {
+	fun status(self): SignalCell<Status> {
 		self.cache.map(|value| match value {
 			Some(let _present) => Status::Ready,
 			None => Status::Waiting,
@@ -1779,14 +1779,16 @@ macro fun service(item: Item): Source {
 		Some(let found) => found,
 		None => ServiceItem { name = "?", client_name = "?", fields = [], methods = [] },
 	};
-	// The [expose]d fields: each `Signal<Element>` surfaces its element (a
-	// malformed field renders `_`, erroring clearly at the generated site).
+	// The [expose]d fields: each source's SOLE type argument is its element —
+	// `SignalCell<Note>`, `StorageSignal<str>`. Whether the field is exposable is
+	// the compiler's `std::Source` reconciliation; a field whose element is not
+	// its one type argument renders `_`, erroring clearly at the generated site.
 	mut exposed_names: List<str> = [];
 	mut exposed_elements: List<str> = [];
 	for field in target.fields {
 		if field.exposed {
 			exposed_names.push(field.name);
-			if field.type_.name == "Signal" && field.type_.arguments.len() == 1 {
+			if field.type_.arguments.len() == 1 {
 				match field.type_.arguments.get(0) {
 					Some(let element) => exposed_elements.push(element.render()),
 					None => exposed_elements.push("_"),

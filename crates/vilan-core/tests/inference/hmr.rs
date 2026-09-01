@@ -63,12 +63,12 @@ fn hmr_mut_binding_is_let_and_immutable_binding_is_const() {
 
 #[test]
 fn hmr_signal_binding_uses_payload_form() {
-    // A `Signal<T>` adopts through the payload form, and its getter reads the value
+    // A `SignalCell<T>` adopts through the payload form, and its getter reads the value
     // cell (`[0].v`) so only the value crosses — old subscribers die.
     let js = compile_hmr(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         let ticker = Signal::new(0);
         fun main() { print(ticker.get()); }
         "#,
@@ -277,7 +277,7 @@ fn hmr_disabled_is_byte_identical_and_has_no_instrumentation() {
     // output is untouched.
     let source = r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         mut count = 0;
         let ticker = Signal::new(0);
         fun main() { count = count + 1; print(count); print(ticker.get()); }

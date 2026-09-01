@@ -4164,9 +4164,9 @@ fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
             r#"
             import std::io::print;
             import std::map::Map;
-            import std::reactive::Signal;
+            import std::reactive::{ Signal, SignalCell };
             fun main() {
-                let scores: Signal<Map<str, i32>> = Signal::new(Map::new());
+                let scores: SignalCell<Map<str, i32>> = Signal::new(Map::new());
                 print(scores.get().len());
             }
             "#,

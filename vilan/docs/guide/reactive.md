@@ -17,7 +17,7 @@ The UI layer, the rpc mirrors, and the router are all built on these, so
 this chapter pays for itself quickly.
 
 ```vilan
-import std::reactive::{ Signal, Owner, run_with_owner };
+import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
 
 fun main() {
 	let count = Signal::new(0);
@@ -32,15 +32,35 @@ fun main() {
 
 ## Signals
 
-A `Signal<T>` is a mutable cell whose readers can subscribe to changes.
+A `SignalCell<T>` is a mutable cell whose readers can subscribe to changes.
 
 ```vilan,fragment
-Signal::new(value: T): Signal<T>       // a fresh signal
+Signal::new(value: T): SignalCell<T>       // a fresh signal
 signal.get(): T                        // current value
 signal.set(value: T)                   // write + notify subscribers
 signal.set_with(transform: sync |T| T) // read-modify-write in one step
 signal.update(mutate: sync |&mut T| void) // mutate in place + notify once
 ```
+
+Two names, one idea. **`Signal<T>` is a trait** — the writable half of the
+reactive contract, `set` and `notify` over `Source`'s `get` and `sub` — and
+**`SignalCell<T>` is the canonical type that implements it**, the cell
+`Signal::new` hands back. Day to day you write `Signal::new(0)` and never
+think about it. The split matters in two places: when a *component* wants to
+accept any signal (bound it on `Signal<T>`, and a caller may pass a cell of
+their own that clamps or persists — see
+[Writing a Signal](../std/reactive.md#writing-a-signal)), and when you need to
+*name the type* in a struct field or a return type, where a trait may not go
+and `SignalCell<T>` is the word.
+
+```vilan,fragment
+struct Store { todos: SignalCell<List<str>> }   // a field names the cell
+let count: Signal<i32> = SignalCell::new(1);    // an annotation may name the trait
+```
+
+An annotation naming a trait is a **checked constraint**, not the binding's
+type: `count` is still a `SignalCell<i32>` and still has `update`, which lives
+on the cell alone.
 
 Signals hold **values**. Vilan copies, so `get` hands you a copy, and the
 only way to change what subscribers see is a write through the signal
@@ -48,10 +68,10 @@ itself. For a collection, `update` is the one you want: the closure gets a
 **writable view of the stored value**, so you mutate it directly.
 
 ```vilan
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun main() {
-	let items: Signal<List<str>> = Signal::new([]);
+	let items: SignalCell<List<str>> = Signal::new([]);
 	items.update(|&mut list| {
 		list.push("first");
 	});
@@ -72,7 +92,7 @@ any other write. `update` works for any `T` a closure can mutate: `Map`,
 better when you're computing a new value rather than editing one:
 
 ```vilan
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun main() {
 	let count = Signal::new(1);
@@ -92,7 +112,7 @@ Build state as a graph and let it recompute itself:
 - `signal.map(transform)` gives a signal of the transformed value:
 
   ```vilan
-  import std::reactive::Signal;
+  import std::reactive::{ Signal, SignalCell };
   fun main() {
   	let count = Signal::new(2);
   	let doubled = count.map(|n: i32| n * 2);
@@ -103,11 +123,11 @@ Build state as a graph and let it recompute itself:
   ```
 - `combine((a, b, …))` gives a signal of the tuple of several
   signals' values. It fires when any of them changes. Takes two or more.
-- `nested.flatten()` on a `Signal<Signal<U>>` follows whichever inner
+- `nested.flatten()` on a `SignalCell<SignalCell<U>>` follows whichever inner
   signal is current, and detaches from a replaced one.
 
 ```vilan
-import std::reactive::{ Signal, combine };
+import std::reactive::{ Signal, SignalCell, combine };
 
 fun main() {
 	let first = Signal::new("Ada");
@@ -161,7 +181,7 @@ For tests, or when you're building your own machinery:
   with `owner.defer(…)`.
 
 ```vilan
-import std::reactive::{ Signal, Owner, run_with_owner };
+import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
 
 fun main() {
 	let source = Signal::new(0);
@@ -265,8 +285,8 @@ can safely commit through an rpc:
 
 ```vilan,fragment
 struct Draft<T> {
-	local: Signal<T>,          // bind inputs to this
-	state: Signal<DraftState>, // Synced | Dirty | Failed(str)
+	local: SignalCell<T>,          // bind inputs to this
+	state: SignalCell<DraftState>, // Synced | Dirty | Failed(str)
 	…
 }
 draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T>
@@ -395,7 +415,7 @@ write is in flight, and a banner that should say why it failed.
 changes — and adds a `state` signal to bind:
 
 ```vilan
-import std::reactive::{ Signal, Optimistic, WriteState };
+import std::reactive::{ Signal, SignalCell, Optimistic, WriteState };
 import std::result::Result::{ self, Ok, Err };
 
 fun main() {

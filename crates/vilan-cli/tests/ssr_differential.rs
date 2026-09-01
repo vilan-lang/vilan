@@ -56,13 +56,13 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 
 /// The shared component — identical bytes in both legs (written to each package).
 /// It exercises every read-once binding form: static `class`/`attr`, `bind_text`,
-/// `bind_class`, `bind_attr`, `bind_styled` (a `Signal<Style>` over compiled
+/// `bind_class`, `bind_attr`, `bind_styled` (a `SignalCell<Style>` over compiled
 /// atomic classes), `bind_each` (keyed, over a list), `when` (taken),
 /// `show` (hidden), `swap` (a value branch), `bind_value`, a discarded `on`
 /// handler, and nested composition — with `&`/`<`/`>`/`"` in the data to drive
 /// escaping on both sides.
 const COMPONENT: &str = r#"import std::ui::{ view, View };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::style::{ style, space, Style };
 
 [derive(PartialEq)]
@@ -81,7 +81,7 @@ fun app(): View {
 	let title = Signal::new("Dashboard & <you>");
 	let cls = Signal::new("live");
 	let href = Signal::new("/home");
-	let rows: Signal<List<Row>> = Signal::new([
+	let rows: SignalCell<List<Row>> = Signal::new([
 		Row { id = 1, label = "first \"one\"" },
 		Row { id = 2, label = "second & third" },
 	]);
@@ -91,7 +91,7 @@ fun app(): View {
 	let query = Signal::new("hello");
 	let compact = const style().padding(space(2));
 	let roomy = const style().padding(space(6));
-	let theme: Signal<Style> = Signal::new(compact);
+	let theme: SignalCell<Style> = Signal::new(compact);
 	let width = Signal::new("40px");
 	view("main")
 		.class("app")

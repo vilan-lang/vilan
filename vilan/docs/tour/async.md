@@ -149,7 +149,7 @@ never touches a parameter marked **`sync`**:
 ```vilan,fragment
 // The callback completes inside the reactive graph's synchronous
 // protocol — an async closure here is refused, not adapted:
-fun map<U>(self, transform: sync |T| U): Signal<U>
+fun map<U>(self, transform: sync |T| U): SignalCell<U>
 ```
 
 `Signal::map`, `turn`, `batch`, and the UI render callbacks are `sync`

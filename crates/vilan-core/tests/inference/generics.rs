@@ -1751,7 +1751,7 @@ fn generic_source_element_serialized_in_a_sub_closure() {
         r#"
         import std::io::print;
         import std::json::Json;
-        import std::reactive::{ Source, Signal, Subscription };
+        import std::reactive::{ Source, Signal, SignalCell, Subscription };
         fun forward<T: Json, S: Source<T>>(source: S, out: |str| void): Subscription {
             source.sub(|value| out(value.to_json()))
         }
@@ -1804,7 +1804,7 @@ fn generic_bound_derivation_through_a_method_call() {
         r#"
         import std::io::print;
         import std::json::Json;
-        import std::reactive::{ Source, Signal, Subscription };
+        import std::reactive::{ Source, Signal, SignalCell, Subscription };
         struct Sink {}
         impl Sink {
             fun forward<T: Json, S: Source<T>>(self, source: S, out: |str| void): Subscription {
@@ -1837,7 +1837,7 @@ fn owner_take_disposes_a_mapped_and_a_root_subscription() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner };
+        import std::reactive::{ Signal, SignalCell, Owner };
         fun main() {
             let owner = Owner::new();
             let count = Signal::new(0);
@@ -1862,7 +1862,7 @@ fn lone_set_notifies_synchronously() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal };
+        import std::reactive::{ Signal, SignalCell };
         fun main() {
             let a = Signal::new(0);
             let _ = a.sub(|v| print(i"a={v}"));   // immediate: a=0
@@ -1883,7 +1883,7 @@ fn batch_commits_value_immediately_but_defers_notification() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
         fun main() {
             let s = Signal::new(0);
             let doubled = s.map(|n| n * 2);
@@ -1906,7 +1906,7 @@ fn batch_coalesces_a_multi_input_observer() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
         fun main() {
             let a = Signal::new(1);
             let b = Signal::new(10);
@@ -1932,7 +1932,7 @@ fn without_a_batch_a_multi_input_observer_glitches() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal };
+        import std::reactive::{ Signal, SignalCell };
         fun main() {
             let a = Signal::new(1);
             let b = Signal::new(10);
@@ -1956,7 +1956,7 @@ fn batch_cascade_settles_in_one_flush() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
         fun main() {
             let a = Signal::new(1);
             let b = a.map(|n| n + 1);      // b = a + 1
@@ -1976,7 +1976,7 @@ fn nested_batches_flush_at_the_outer_boundary() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
         fun main() {
             let a = Signal::new(0);
             let _ = a.sub(|v| print(i"a={v}"));   // immediate: a=0
@@ -2002,7 +2002,7 @@ fn dispose_in_a_batch_scrubs_the_pending_notify() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
         fun main() {
             let counter = Signal::new(0);
             let sub = counter.sub(|n| print(i"tick {n}"));   // immediate: tick 0
@@ -2029,7 +2029,7 @@ fn update_mutates_a_list_in_place_and_a_later_get_sees_it() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun main() {
             let todos = Signal::new([1, 2]);
             todos.update(|&mut list| { list.push(5); });
@@ -2049,14 +2049,14 @@ fn update_generalizes_over_every_collection() {
         import std::io::print;
         import std::map::Map;
         import std::set::Set;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         struct Counter { hits: i32 }
         fun main() {
-            let scores: Signal<Map<str, i32>> = Signal::new(Map::new());
+            let scores: SignalCell<Map<str, i32>> = Signal::new(Map::new());
             scores.update(|&mut m| { m.insert("a", 1); m.insert("b", 2); });
             print(scores.get().len());
 
-            let tags: Signal<Set<i32>> = Signal::new(Set::new());
+            let tags: SignalCell<Set<i32>> = Signal::new(Set::new());
             tags.update(|&mut s| { s.insert(7); });
             print(tags.get().len());
 
@@ -2077,7 +2077,7 @@ fn update_over_a_scalar_signal_writes_through_the_view() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun main() {
             let count = Signal::new(1);
             count.update(|&mut n| { n = *n + 10; });
@@ -2095,7 +2095,7 @@ fn update_notifies_exactly_once_per_call() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner };
+        import std::reactive::{ Signal, SignalCell, Owner };
         fun main() {
             let owner = Owner::new();
             let xs = Signal::new([0]);
@@ -2115,7 +2115,7 @@ fn update_notifies_even_when_the_closure_writes_nothing() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner };
+        import std::reactive::{ Signal, SignalCell, Owner };
         fun main() {
             let owner = Owner::new();
             let xs = Signal::new([0]);
@@ -2135,7 +2135,7 @@ fn update_coalesces_under_batch() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, batch };
+        import std::reactive::{ Signal, SignalCell, Owner, batch };
         fun main() {
             let owner = Owner::new();
             let xs = Signal::new([0]);
@@ -2159,7 +2159,7 @@ fn a_reentrant_get_inside_update_sees_the_in_progress_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun main() {
             let xs = Signal::new([1, 2]);
             xs.update(|&mut list| {
@@ -2183,7 +2183,7 @@ fn update_refuses_a_view_escaping_its_closure() {
     // storing it in a struct field is the ordinary escape error.
     assert_fails_with(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         struct Hold { slot: &mut List<i32> }
         fun main() {
             let xs = Signal::new([1]);
@@ -2201,7 +2201,7 @@ fn set_with_still_copies_and_transforms() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun main() {
             mut seed = [1, 2];
             let numbers = Signal::new(seed);
@@ -2401,10 +2401,10 @@ fn signal_update_refuses_an_awaiting_closure() {
     // that did not bite until B61. It bites now.
     assert_fails_with(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::time::sleep;
         fun main() {
-            let items: Signal<List<i32>> = Signal::new([1]);
+            let items: SignalCell<List<i32>> = Signal::new([1]);
             items.update(|&mut list| { sleep(1); list.push(2); });
         }
         "#,
@@ -2581,12 +2581,12 @@ fn expose_accepts_a_signal_of_wire() {
     // `[derive(Wire)]` struct both qualify.
     assert_compiles(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         [derive(Wire)]
         struct Pt { x: i32 }
         struct Session {
-            [expose] status: Signal<str>,
-            [expose] cursor: Signal<Pt>,
+            [expose] status: SignalCell<str>,
+            [expose] cursor: SignalCell<Pt>,
             hidden: i32,
         }
         fun main() {}
@@ -2595,12 +2595,39 @@ fn expose_accepts_a_signal_of_wire() {
 }
 
 #[test]
-fn expose_rejects_a_non_signal_field() {
-    // Exposure is observation: a plain value has nothing to subscribe to.
-    assert_fails(
+fn expose_rejects_a_field_that_is_not_a_source() {
+    // Exposure is observation: a plain value has nothing to subscribe to. The
+    // test is now `std::Source` reconciliation, not the field's spelling (A32),
+    // and the refusal names the trait. Supersedes
+    // `expose_rejects_a_non_signal_field`.
+    assert_fails_with(
         r#"
         struct Session {
             [expose] name: str,
+        }
+        fun main() {}
+        "#,
+        "does not implement `std::Source`",
+    );
+}
+
+#[test]
+fn expose_accepts_a_users_own_source_impl() {
+    // The ceiling A32 removes: a custom `Source` — a storage-backed cell, a
+    // remote mirror — is exposable, because "observable" is what the trait
+    // means and not what the canonical cell is called. The element comes off
+    // the `Source` impl, so it is Wire-checked exactly as the cell's is.
+    assert_compiles(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        struct Stored<T> { inner: SignalCell<T> }
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
+        struct Session {
+            [expose] status: Stored<str>,
         }
         fun main() {}
         "#,
@@ -2608,17 +2635,41 @@ fn expose_rejects_a_non_signal_field() {
 }
 
 #[test]
-fn expose_rejects_a_signal_of_non_wire() {
-    // The observed values cross the wire, so the element must be Wire.
-    assert_fails(
+fn expose_rejects_a_users_source_over_a_non_wire_element() {
+    // …and the Wire rule rides the impl's element, so widening what may be
+    // exposed did not widen what may cross the wire.
+    assert_fails_with(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
         struct Password { hash: str }
+        struct Stored<T> { inner: SignalCell<T> }
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |T| void): Subscription { self.inner.sub(observer) }
+        }
         struct Session {
-            [expose] secret: Signal<Password>,
+            [expose] secret: Stored<Password>,
         }
         fun main() {}
         "#,
+        "is not Wire",
+    );
+}
+
+#[test]
+fn expose_rejects_a_signal_of_non_wire() {
+    // The observed values cross the wire, so the element must be Wire.
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        struct Password { hash: str }
+        struct Session {
+            [expose] secret: SignalCell<Password>,
+        }
+        fun main() {}
+        "#,
+        "is not Wire",
     );
 }
 
@@ -2763,7 +2814,7 @@ fn service_generates_dispatcher_client_and_mirror() {
         r#"
         import std::io::print;
         import std::shared::Shared;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, FromJson };
         import std::json::json_codec;
@@ -2771,7 +2822,7 @@ fn service_generates_dispatcher_client_and_mirror() {
 
         [service(Client)]
         struct Session {
-            [expose] status: Signal<str>,
+            [expose] status: SignalCell<str>,
             count: Shared<i32>,
         }
 
@@ -3002,7 +3053,7 @@ fn an_async_rpc_methods_writes_settle_as_one_wave_with_its_reply() {
         r#"
         import std::io::print;
         import std::shared::Shared;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, FromJson };
         import std::json::json_codec;
@@ -3011,7 +3062,7 @@ fn an_async_rpc_methods_writes_settle_as_one_wave_with_its_reply() {
 
         [service(JobClient)]
         struct Job {
-            [expose] status: Signal<str>,
+            [expose] status: SignalCell<str>,
         }
 
         impl Job {
@@ -3055,7 +3106,7 @@ fn a_no_arg_rpc_methods_writes_coalesce_in_the_wire_turn() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, FromJson };
         import std::json::json_codec;
@@ -3063,7 +3114,7 @@ fn a_no_arg_rpc_methods_writes_coalesce_in_the_wire_turn() {
 
         [service(FlipClient)]
         struct Flip {
-            [expose] state: Signal<str>,
+            [expose] state: SignalCell<str>,
         }
 
         impl Flip {
@@ -4065,7 +4116,7 @@ import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
         import std::json::{ Json, FromJson, json_codec };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::shared::Shared;
         import std::rpc_server::Service;
         import std::http::{ Response, Server };
@@ -4074,8 +4125,8 @@ import std::io::print;
         // a Service on the server's builder, Client::connect on the client.
         [service(Client)]
         struct Board {
-        	[expose] count: Signal<i32>,
-        	[expose] label: Signal<str>,
+        	[expose] count: SignalCell<i32>,
+        	[expose] label: SignalCell<str>,
         	total: Shared<i32>,
         }
         
@@ -4160,7 +4211,7 @@ import std::io::print;
 
 // --- B168: a trait bound over a BARE parameter, resolved in a generic body ---
 //
-// A33 widened `std::ui`'s read-only bindings from `Signal<T>` to a `Source<T>`
+// A33 widened `std::ui`'s read-only bindings from `SignalCell<T>` to a `Source<T>`
 // bound, and `View::swap` — read-only like every other, no write anywhere in
 // it — was the one site that could NOT come along. The gap the widening walked
 // into was narrow and exact:
@@ -4174,8 +4225,8 @@ import std::io::print;
 //     then checked against something that carries no bound and refused.
 //
 // `swap_split` calls `self.swap(gated, render)` from exactly such a body
-// (`gated: Signal<T>`, `T` its own parameter), so widening `swap` made std
-// itself uncompilable — with an explicit `self.swap<T, Signal<T>>(..)` too, the
+// (`gated: SignalCell<T>`, `T` its own parameter), so widening `swap` made std
+// itself uncompilable — with an explicit `self.swap<T, SignalCell<T>>(..)` too, the
 // bound check being downstream of the argument. The value FLOWED correctly:
 // dropping `T`'s bound entirely compiled and ran the same program, which placed
 // the defect in the bound CHECK rather than in inference.
@@ -4203,14 +4254,14 @@ fn a_bare_parameter_source_bound_resolves_inside_a_generic_body() {
     assert_compiles_and_runs(
         r#"
         import std::compare::PartialEq;
-        import std::reactive::{ Signal, Source };
+        import std::reactive::{ Signal, SignalCell, Source };
 
         fun consume<T: PartialEq, S: Source<T>>(source: S): T {
             source.get()
         }
 
         fun wrapper<T: PartialEq>(value: T): T {
-            let cell: Signal<T> = Signal::new(value);
+            let cell: SignalCell<T> = Signal::new(value);
             consume(cell)
         }
 
@@ -4229,14 +4280,14 @@ fn a_constructed_source_bound_resolves_inside_a_generic_body() {
     assert_compiles_and_runs(
         r#"
         import std::compare::PartialEq;
-        import std::reactive::{ Signal, Source };
+        import std::reactive::{ Signal, SignalCell, Source };
 
         fun consume<T: PartialEq, S: Source<List<T>>>(source: S): i32 {
             source.get().len()
         }
 
         fun wrapper<T: PartialEq>(value: List<T>): i32 {
-            let cell: Signal<List<T>> = Signal::new(value);
+            let cell: SignalCell<List<T>> = Signal::new(value);
             consume(cell)
         }
 
@@ -4257,14 +4308,14 @@ fn a_bare_parameter_source_bound_still_refuses_an_unbounded_caller() {
     assert_fails_with(
         r#"
         import std::compare::PartialEq;
-        import std::reactive::{ Signal, Source };
+        import std::reactive::{ Signal, SignalCell, Source };
 
         fun consume<T: PartialEq, S: Source<T>>(source: S): T {
             source.get()
         }
 
         fun wrapper<T>(value: T): T {
-            let cell: Signal<T> = Signal::new(value);
+            let cell: SignalCell<T> = Signal::new(value);
             consume(cell)
         }
 
@@ -4284,7 +4335,7 @@ fn a_bare_parameter_source_bound_still_refuses_an_unbounded_caller() {
 fn a_bare_parameter_bound_carries_the_callers_member_into_the_callee() {
     assert_compiles_and_runs(
         r#"
-        import std::reactive::{ Signal, Source };
+        import std::reactive::{ Signal, SignalCell, Source };
 
         trait Show { fun show(self): str; }
         impl i32 with Show { fun show(self): str { i"[{self}]" } }
@@ -4294,7 +4345,7 @@ fn a_bare_parameter_bound_carries_the_callers_member_into_the_callee() {
         }
 
         fun wrapper<T: Show>(value: T): str {
-            let cell: Signal<T> = Signal::new(value);
+            let cell: SignalCell<T> = Signal::new(value);
             consume(cell)
         }
 
@@ -4356,19 +4407,19 @@ fn a_bare_parameter_bound_survives_two_generic_bodies() {
     assert_compiles_and_runs(
         r#"
         import std::compare::PartialEq;
-        import std::reactive::{ Signal, Source };
+        import std::reactive::{ Signal, SignalCell, Source };
 
         fun inner<T: PartialEq, S: Source<T>>(source: S): T {
             source.get()
         }
 
         fun middle<T: PartialEq, S: Source<T>>(source: S): T {
-            let cell: Signal<T> = Signal::new(source.get());
+            let cell: SignalCell<T> = Signal::new(source.get());
             inner(cell)
         }
 
         fun outer<T: PartialEq>(value: T): T {
-            let cell: Signal<T> = Signal::new(value);
+            let cell: SignalCell<T> = Signal::new(value);
             middle(cell)
         }
 

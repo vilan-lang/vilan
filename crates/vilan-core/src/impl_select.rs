@@ -26,8 +26,8 @@
 //!    wants — a bound-directed call always does — an applying impl is kept
 //!    only if the arguments it provides FOR THIS RECEIVER are those arguments.
 //!    A blanket `impl type T with MaybeSignal<T>` provides
-//!    `MaybeSignal<Signal<str>>` on a `Signal<str>` where
-//!    `impl Signal<type T> with MaybeSignal<T>` provides `MaybeSignal<str>`,
+//!    `MaybeSignal<SignalCell<str>>` on a `SignalCell<str>` where
+//!    `impl SignalCell<type T> with MaybeSignal<T>` provides `MaybeSignal<str>`,
 //!    so the bound alone separates them and each is reachable.
 //! 3. **Specificity.** Among the survivors, the impl whose subject the others
 //!    match and which matches none of theirs wins — any constructor-headed

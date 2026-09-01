@@ -154,7 +154,7 @@ fn wait_for_port(lines: &mpsc::Receiver<String>, deadline: Duration) -> Option<u
 /// `on_teardown` are exercised; a `tally.effect` under the mount root proves
 /// subscription disposal.
 const CLIENT_A: &str = r#"import std::ui::{ view, View, mount_root };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::dev;
 import std::option::Option::{ self, Some, None };
 
@@ -165,7 +165,7 @@ external fun mark(tag: str): void;
 external fun record(tag: str, value: i32): void;
 
 [extern("globalThis.__captureSignal")]
-external fun capture_signal(tag: str, signal: Signal<i32>): void;
+external fun capture_signal(tag: str, signal: SignalCell<i32>): void;
 
 struct Cfg { a: i32 }
 
@@ -187,7 +187,7 @@ fun fresh_strap(): Strap {
 }
 
 mut count = seed_count();
-let tally: Signal<i32> = Signal::new(0);
+let tally: SignalCell<i32> = Signal::new(0);
 let cfg: Cfg = seed_cfg();
 let strap: Strap = fresh_strap();
 
@@ -216,7 +216,7 @@ fun main() {
 /// it fresh-initializes (§4). Everything else is identical, so `count`/`tally`
 /// carry and `strap` re-inits as the excluded form.
 const CLIENT_B: &str = r#"import std::ui::{ view, View, mount_root };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::dev;
 import std::option::Option::{ self, Some, None };
 
@@ -227,7 +227,7 @@ external fun mark(tag: str): void;
 external fun record(tag: str, value: i32): void;
 
 [extern("globalThis.__captureSignal")]
-external fun capture_signal(tag: str, signal: Signal<i32>): void;
+external fun capture_signal(tag: str, signal: SignalCell<i32>): void;
 
 struct Cfg { a: i32, b: i32 }
 
@@ -249,7 +249,7 @@ fun fresh_strap(): Strap {
 }
 
 mut count = seed_count();
-let tally: Signal<i32> = Signal::new(0);
+let tally: SignalCell<i32> = Signal::new(0);
 let cfg: Cfg = seed_cfg();
 let strap: Strap = fresh_strap();
 

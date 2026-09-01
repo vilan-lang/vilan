@@ -95,7 +95,7 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
         return empty;
     }
     // v1 addresses a chunk by the route value's variant tag alone (that is all
-    // a `Signal<T>` carries at the gate), so two route matches over different
+    // a `SignalCell<T>` carries at the gate), so two route matches over different
     // enums would alias each other's chunks. Rather than emit a map the
     // runtime can misread, a second splittable match declines the whole split —
     // reported as such, and recorded as the v2 extension beside nested matches.

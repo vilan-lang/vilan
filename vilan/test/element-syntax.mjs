@@ -36,48 +36,42 @@ function place(self, parent) {
 function place2(self, parent) {
 	parent[2].v.push([ 1, self ]);
 }
-function place3(self, parent) {
-	parent[2].v.push([ 1, $c(self) ]);
-}
 function apply(self, parent, name2) {
 	set_attribute(parent[1], name2, self);
 }
-function apply2(self, parent, name2) {
-	set_attribute(parent[1], name2, $c(self));
-}
 function is_void_element(tag) {
-	const $h = tag;
-	let $i = null;
-	if ($h === "area") {
-		$i = true;
-	} else if ($h === "base") {
-		$i = true;
-	} else if ($h === "br") {
-		$i = true;
-	} else if ($h === "col") {
-		$i = true;
-	} else if ($h === "embed") {
-		$i = true;
-	} else if ($h === "hr") {
-		$i = true;
-	} else if ($h === "img") {
-		$i = true;
-	} else if ($h === "input") {
-		$i = true;
-	} else if ($h === "link") {
-		$i = true;
-	} else if ($h === "meta") {
-		$i = true;
-	} else if ($h === "source") {
-		$i = true;
-	} else if ($h === "track") {
-		$i = true;
-	} else if ($h === "wbr") {
-		$i = true;
+	const $k = tag;
+	let $l = null;
+	if ($k === "area") {
+		$l = true;
+	} else if ($k === "base") {
+		$l = true;
+	} else if ($k === "br") {
+		$l = true;
+	} else if ($k === "col") {
+		$l = true;
+	} else if ($k === "embed") {
+		$l = true;
+	} else if ($k === "hr") {
+		$l = true;
+	} else if ($k === "img") {
+		$l = true;
+	} else if ($k === "input") {
+		$l = true;
+	} else if ($k === "link") {
+		$l = true;
+	} else if ($k === "meta") {
+		$l = true;
+	} else if ($k === "source") {
+		$l = true;
+	} else if ($k === "track") {
+		$l = true;
+	} else if ($k === "wbr") {
+		$l = true;
 	} else {
-		$i = false;
+		$l = false;
 	}
-	return $i;
+	return $l;
 }
 function escape_text(value) {
 	return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -96,54 +90,63 @@ function render(view2) {
 	}
 	out = out + escape_text(view2[3].v);
 	for (const child of view2[2].v) {
-		const $j = child;
-		let $k = null;
-		if ($j[0] === 0) {
-			const element = $j[1];
+		const $m = child;
+		let $n = null;
+		if ($m[0] === 0) {
+			const element = $m[1];
 			out = out + render(element);
-			$k = undefined;
+			$n = undefined;
 		} else {
-			const content = $j[1];
+			const content = $m[1];
 			out = out + escape_text(content);
-			$k = undefined;
+			$n = undefined;
 		}
-		$k;
+		$n;
 	}
 	return out + "</" + view2[0] + ">";
 }
 function row(label) {
-	return $e($d(view("li"), "class", "item"), label);
+	return $g($f(view("li"), "class", "item"), label);
 }
-function $a(value) {
+function $b(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function $c(self) {
+function $a(value) {
+	return $b(value);
+}
+function $e(self) {
 	return self[0].v;
 }
-function $b(self, name2, value) {
-	apply2(value, self, name2);
+function $d(self, parent, name2) {
+	set_attribute(parent[1], name2, $e(self));
+}
+function $c(self, name2, value) {
+	$d(value, self, name2);
 	return __clone(self);
 }
-function $d(self, name2, value) {
+function $f(self, name2, value) {
 	apply(value, self, name2);
 	return __clone(self);
 }
-function $e(self, content) {
+function $g(self, content) {
 	place2(content, self);
 	return __clone(self);
 }
-function $f(self, content) {
+function $h(self, content) {
 	place(content, self);
 	return __clone(self);
 }
-function $g(self, content) {
-	place3(content, self);
+function $j(self, parent) {
+	parent[2].v.push([ 1, $e(self) ]);
+}
+function $i(self, content) {
+	$j(content, self);
 	return __clone(self);
 }
 const name = $a("world & <you>");
-console.log(render($g($e($f($e($d($b(view("p"), "data-live", name), "title", "hi"), "Take "), $e(view("code"), "vilan upgrade")), " & enjoy. "), name)));
-console.log(render($d($d($d(view("input"), "type", "checkbox"), "disabled", ""), "aria-label", "Done")));
-console.log(render($f($f(view("ul"), row("alpha")), row("beta"))));
-console.log(render($f($d(view("svg"), "viewBox", "0 0 24 24"), $d(view("path"), "d", "M5 12h14"))));
-console.log(render($f(view("div"), $e(view("span"), "chained"))));
+console.log(render($i($g($h($g($f($c(view("p"), "data-live", name), "title", "hi"), "Take "), $g(view("code"), "vilan upgrade")), " & enjoy. "), name)));
+console.log(render($f($f($f(view("input"), "type", "checkbox"), "disabled", ""), "aria-label", "Done")));
+console.log(render($h($h(view("ul"), row("alpha")), row("beta"))));
+console.log(render($h($f(view("svg"), "viewBox", "0 0 24 24"), $f(view("path"), "d", "M5 12h14"))));
+console.log(render($h(view("div"), $g(view("span"), "chained"))));

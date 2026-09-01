@@ -212,10 +212,11 @@ fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T {
 /// continuation segment. Inside a held turn (a `turn` with an awaiting
 /// body) the whole lifecycle holds — the transaction wins.
 ///
-/// Concrete `Signal` because it WRITES (A33's sweep: the write-back class, with
-/// `Optimistic::over`, `ui`'s `bind_value` and `bind_draft`). `Source` declares
-/// `get`/`sub` and no `set`, so the whole point of this function is outside it.
-fun optimistic<T, E>(signal: Signal<T>, value: T, commit: async || Result<T, E>): Result<T, E> {
+/// Bounded on `Signal<T>` because it WRITES (A32's write-back class, with
+/// `Optimistic::over` and `ui`'s `bind_value`). `Source` declares `get`/`sub`
+/// and no `set`, so the whole point of this function is outside it — and any
+/// impl of the writable trait serves, not only the canonical cell.
+fun optimistic<T, E, S: Signal<T>>(signal: S, value: T, commit: async || Result<T, E>): Result<T, E> {
 	let previous = signal.get();
 	signal.set(value);
 	let outcome = commit();
@@ -444,7 +445,7 @@ fun comp<T>(body: (sync || T) context owner_scope): (T, Owner) {
 }
 
 /// The read-only view of a reactive value: read the current value and subscribe to its
-/// changes. `Signal<T>` implements it (and adds `set`/`set_with`); a *remote* handle
+/// changes. `SignalCell<T>` implements it (and adds `set`/`set_with`); a *remote* handle
 /// implements it too (its `sub` flows over a transport), so code that only observes can't
 /// tell a local signal from a remote one — the split the reactive north star needs
 /// (`proposal/transport-rpc.md` §8).
@@ -463,15 +464,57 @@ trait Source<T> {
 	}
 }
 
+/// The WRITABLE half of the pair: `Source` reads, `Signal` writes. A component
+/// that only observes takes a `Source`; one that writes back takes a `Signal`,
+/// and any impl satisfies it — a cell that clamps its setter, one that
+/// persists to storage, one that debounces. `set` and `notify` are the
+/// requirements, because that is where custom write logic lives and no generic
+/// body can reach an arbitrary impl's storage or subscriber list.
+///
+/// `Signal::new(value)` is the everyday spelling and does NOT dispatch: with no
+/// receiver there is nothing to select an impl from, so it resolves statically
+/// to this default body and means the canonical cell in every file (B162). An
+/// impl may declare its own `new`, reached at its own name.
+///
+/// `update` is deliberately NOT here. Its value is in-place mutation with one
+/// notify, and a generic default can only read-copy-mutate-write-back — the
+/// copy A18 existed to avoid. Impls may want their own update logic or none at
+/// all, so it stays inherent on `SignalCell` and general consumers are locked
+/// out of it.
+///
+/// The trait promises NOTHING about notification frequency. `SignalCell`
+/// notifies unconditionally (`set` never compares); an impl that wants "don't
+/// publish an unchanged value" writes that in its own `set`.
+trait Signal<T> with Source<T> {
+	/// The canonical cell, concretely — deliberately not `Self`: a bare
+	/// `Signal::new(1)` has no receiver and no bound in scope to resolve a
+	/// `Self` against.
+	fun new(value: T): SignalCell<T> {
+		SignalCell::new(value)
+	}
+
+	fun set(self, value: T);
+
+	/// Publish the current value without changing it.
+	fun notify(self);
+
+	/// Read, transform, write. The default is exactly that line; an impl that
+	/// can do better overrides it.
+	fun set_with(self, transform: sync |T| T) {
+		self.set(transform(self.get()));
+	}
+}
+
 /// A reactive value: a current value plus the observers to notify when it changes.
-/// Both a root `Signal` and every derived value share this representation; the
-/// difference is only who may write it (a root, via `Signal::set`).
-struct Signal<T> {
+/// Both a root cell and every derived value share this representation; the
+/// difference is only who may write it (a root, via `set`). The canonical
+/// `Signal` impl — `Signal::new` hands one back.
+struct SignalCell<T> {
 	value: Shared<T>,
 	subscribers: Shared<List<Subscriber>>,
 }
 
-impl Signal<type T> with Source<T> {
+impl SignalCell<type T> with Source<T> {
 	fun get(self): T {
 		self.value.read()
 	}
@@ -501,7 +544,7 @@ impl Signal<type T> with Source<T> {
 /// `get`/`sub`, and the whole reason it exists is to attach without the
 /// immediate first call that `sub` makes. There is no `Source` spelling for
 /// that, so `map`, which is built on it, stays a `Signal` method too.
-fun observe<T>(signal: Signal<T>, observer: |T| void): Subscription {
+fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 	let id = fresh_id();
 	let cell = signal.value;
 	signal.subscribers.write().push(Subscriber {
@@ -513,10 +556,15 @@ fun observe<T>(signal: Signal<T>, observer: |T| void): Subscription {
 	Subscription { subscribers = signal.subscribers, id, release = Shared::new(None) }
 }
 
-impl Signal<type T> {
-	fun new(value: T): Signal<T> {
+/// The canonical write side. `set_with` is the trait's default, unchanged —
+/// the body std used to carry here is the body the trait carries now.
+impl SignalCell<type T> with Signal<T> {
+	/// Declared, not inherited: `Type::func` reads the type's OWN members, so
+	/// the trait's default body is reachable at `Signal::new` and this one is
+	/// reachable at `SignalCell::new`. They are the same cell either way.
+	fun new(value: T): SignalCell<T> {
 		mut subscribers: List<Subscriber> = [];
-		Signal { value = Shared::new(value), subscribers = Shared::new(subscribers) }
+		SignalCell { value = Shared::new(value), subscribers = Shared::new(subscribers) }
 	}
 
 	fun set(self, value: T) {
@@ -547,17 +595,20 @@ impl Signal<type T> {
 			},
 		}
 	}
+}
 
-	fun set_with(self, transform: sync |T| T) {
-		self.set(transform(self.get()));
-	}
-
+impl SignalCell<type T> {
 	/// Mutate the stored value IN PLACE, then notify once (backlog A18,
 	/// `proposal/signal-update.md`). `mutate` receives a writable view of the
 	/// storage, so a collection grows without the copy-transform-return dance
 	/// `set_with` requires:
 	///
 	///     todos.update(|&mut list| { list.push(todo); });
+	///
+	/// INHERENT, not a `Signal` member (A32's ruling): a generic default could
+	/// only read-copy-mutate-write-back, which is the copy this exists to
+	/// avoid, and an impl may want its own update logic or none at all. A
+	/// consumer that needs it asks for the cell.
 	///
 	/// The notification is UNCONDITIONAL — exactly like `set`, which never
 	/// compares either. A `mutate` that writes nothing still publishes; that
@@ -578,8 +629,8 @@ impl Signal<type T> {
 	/// outside every boundary (module level, the top of `main`) it lives as long
 	/// as its source, which is what a module-level `current_path().map(parse)`
 	/// wants.
-	fun map<U>(self, transform: sync |T| U): Signal<U> {
-		let derived = Signal::new(transform(self.get()));
+	fun map<U>(self, transform: sync |T| U): SignalCell<U> {
+		let derived = SignalCell::new(transform(self.get()));
 		let _owned = register_with_owner(observe(self, |value| {
 			derived.set(transform(value));
 		}));
@@ -587,10 +638,53 @@ impl Signal<type T> {
 	}
 }
 
+/// A component value that may be STATIC or REACTIVE, with no ceremony at the
+/// call site (B157). A component takes one parameter bounded on this trait and
+/// accepts both `badge("draft")` and `badge(Signal::new("draft"))`; the value's
+/// TYPE decides its life, exactly as `AttrValue` has always decided an
+/// attribute's.
+///
+/// `bind` is EFFECT-SHAPED rather than getter-shaped, which is what makes one
+/// signature serve both cases: the static impl fires the handler once and is
+/// done, the reactive one subscribes and keeps firing. There is no runtime
+/// discrimination anywhere — which impl runs is settled at the call, by the
+/// specificity order (spec §5.4).
+///
+/// The reactive arm registers with the AMBIENT OWNER (`effect`), so a
+/// component's subscription dies with the boundary that built it. That is also
+/// why `bind` may only be called under one: the requirement is static, and it
+/// flows through the bound.
+trait MaybeSignal<T> {
+	fun bind(self, react: |T| void);
+}
+
+/// The static case: the value is the value, so hand it over once.
+///
+/// A BLANKET (B158) — the least specific tier, so any impl below outranks it
+/// wherever both match.
+impl type T with MaybeSignal<T> {
+	fun bind(self, react: |T| void) {
+		react(self);
+	}
+}
+
+/// The reactive case, over the READ trait: a cell, a derivation, a
+/// `RemoteSource`, a mirror of one's own. Bounded on `Source` rather than on
+/// `Signal` because `bind` only reads — a component that wants to write back
+/// asks for `Signal<T>` directly.
+///
+/// The binder in the bound is the impl's own parameter (B165), which is what
+/// makes this one impl rather than one per element type.
+impl type S: Source<type T> with MaybeSignal<T> {
+	fun bind(self, react: |T| void) {
+		self.effect(react);
+	}
+}
+
 /// The product combinator: a signal of the tuple of its inputs' current values,
 /// recomputed whenever any input changes. Variadic over the inputs' (distinct)
-/// types via a mapped-tuple parameter — `combine((a, b, c))` of `Signal<A>`,
-/// `Signal<B>`, `Signal<C>` yields `Signal<(A, B, C)>`.
+/// types via a mapped-tuple parameter — `combine((a, b, c))` of `SignalCell<A>`,
+/// `SignalCell<B>`, `SignalCell<C>` yields `SignalCell<(A, B, C)>`.
 ///
 /// Detachable like `map` (A28): each per-input subscription is handed to the
 /// ambient owner, so the whole product dies with the boundary that built it.
@@ -602,9 +696,9 @@ impl Signal<type T> {
 /// has no trait objects, and a `<S: Source<U>>` parameter names ONE type where
 /// the tuple needs a different one per element. `combine` widens when the
 /// mapped-tuple grammar can bind a bound per element, not before.
-fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {
+fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {
 	let snapshot = || (source in sources => source.get());
-	let derived = Signal::new(snapshot());
+	let derived = SignalCell::new(snapshot());
 	// Subscribe each input (the comprehension's `.map` runs `sub` per element).
 	// The handles are the AMBIENT OWNER's from here on — the tuple itself is
 	// what is dropped, not the subscriptions.
@@ -622,9 +716,9 @@ fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {
 // the result — and BOTH halves are the ambient owner's (A28): the outer
 // subscription is registered, and the inner one that happens to be live at
 // disposal is deferred, so nothing survives the boundary.
-impl Signal<Signal<type U>> {
-	fun flatten(self): Signal<U> {
-		let derived = Signal::new(self.get().get());
+impl SignalCell<SignalCell<type U>> {
+	fun flatten(self): SignalCell<U> {
+		let derived = SignalCell::new(self.get().get());
 		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
 		// `sub` runs its observer immediately, so the first inner wires here too.
 		let _outer = register_with_owner(self.sub(|inner| {
@@ -737,8 +831,8 @@ enum DraftState {
 
 struct Draft<T> {
 	// Bind inputs to this; read it like any signal.
-	local: Signal<T>,
-	state: Signal<DraftState>,
+	local: SignalCell<T>,
+	state: SignalCell<DraftState>,
 	// The last value known to match the remote (pushed by us or adopted).
 	synced: Shared<T>,
 	// Discards stale completions when pushes overlap (fast typing over a
@@ -762,8 +856,8 @@ struct Draft<T> {
 /// just resolves).
 fun draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T> {
 	Draft {
-		local = Signal::new(initial),
-		state = Signal::new(DraftState::Synced),
+		local = SignalCell::new(initial),
+		state = SignalCell::new(DraftState::Synced),
 		synced = Shared::new(initial),
 		generation = Shared::new(0),
 		debounce_millis = Shared::new(0),
@@ -975,9 +1069,9 @@ enum WriteState {
 
 struct Optimistic<T> {
 	// The signal being written — the one handed to `over`. Bind it.
-	value: Signal<T>,
+	value: SignalCell<T>,
 	// The lifecycle, for the UI.
-	state: Signal<WriteState>,
+	state: SignalCell<WriteState>,
 	// The last value the server confirmed: the ROLLBACK TARGET, and the
 	// reason this cannot be a free function over a bare signal.
 	confirmed: Shared<T>,
@@ -993,12 +1087,15 @@ impl Optimistic<type T> {
 	/// value as the confirmed truth — the value the cell is handed is, by
 	/// definition, the last thing anyone confirmed.
 	///
-	/// Concrete `Signal`: the cell's whole job is to write this (A33's
-	/// write-back class).
-	fun over(signal: Signal<T>): Optimistic<T> {
+	/// Concrete `SignalCell`, not the trait: `Optimistic` STORES the signal in
+	/// a field, and a field must name a real type (B161 admits a trait at a
+	/// `let` annotation only). Widening it means making `Optimistic` generic
+	/// over the signal type, which changes its arity everywhere — recorded on
+	/// A32 rather than taken here.
+	fun over(signal: SignalCell<T>): Optimistic<T> {
 		Optimistic {
 			value = signal,
-			state = Signal::new(WriteState::Confirmed),
+			state = SignalCell::new(WriteState::Confirmed),
 			confirmed = Shared::new(signal.get()),
 			generation = Shared::new(0),
 			confirmed_generation = Shared::new(0),

@@ -1,5 +1,5 @@
 import std::io::print;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, render, view };
 
 // Server-side rendering (proposal/ssr.md, A7): on `@process`, `std::ui` builds
@@ -13,7 +13,7 @@ enum Page {
 	About,
 }
 
-fun app(title: Signal<str>, todos: Signal<List<str>>, page: Signal<Page>): View {
+fun app(title: SignalCell<str>, todos: SignalCell<List<str>>, page: SignalCell<Page>): View {
 	let heading = view("h1").bind_text(title);
 	let list = view("ul").bind_each(todos, |todo| todo, |todo| view("li").text(todo));
 	let nav = view("nav").swap(page, |current| match current {
@@ -25,7 +25,7 @@ fun app(title: Signal<str>, todos: Signal<List<str>>, page: Signal<Page>): View 
 
 fun main() {
 	let title = Signal::new("Tasks <live>");
-	let todos: Signal<List<str>> = Signal::new(["alpha", "beta & gamma"]);
+	let todos: SignalCell<List<str>> = Signal::new(["alpha", "beta & gamma"]);
 	let page = Signal::new(Page::About);
 	// The bindings read once — the value at render time is the value served.
 	print(render(app(title, todos, page)));
@@ -42,7 +42,7 @@ fun main() {
 
 	// Mixed content (element-syntax S1): text children — plain and
 	// signal-read-once — interleave with elements as real siblings, in written
-	// order, each text arm escaped. A `Signal<str>` attribute reads once too.
+	// order, each text arm escaped. A `SignalCell<str>` attribute reads once too.
 	let name = Signal::new("world & <you>");
 	let mixed = view("p")
 		.attr("data-live", Signal::new("a \"quoted\" & value"))

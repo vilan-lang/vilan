@@ -9,7 +9,7 @@ A **service** is that struct. Three attributes do the work:
 
 - `[service(ClientName)]` on the struct names the generated client type.
 - `[rpc]` on a method makes it callable from the client.
-- `[expose]` on a `Signal<T>` field **mirrors** it: every connected
+- `[expose]` on a `SignalCell<T>` field **mirrors** it: every connected
   client gets a live copy that updates when the server writes it.
 
 There are no REST endpoints, fetch calls, or JSON shapes to keep in
@@ -18,7 +18,7 @@ sync by hand. The compiler knows both sides.
 Here's a complete little server:
 
 ```vilan,norun
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::json::json_codec;
 import std::http::{ Response, Server };
 import std::rpc_server::Service;
@@ -32,7 +32,7 @@ struct Note {
 
 [service(NotesClient)]
 struct Notes {
-	[expose] entries: Signal<List<Note>>,
+	[expose] entries: SignalCell<List<Note>>,
 	next_id: Shared<i32>,
 }
 
@@ -70,7 +70,7 @@ fields are typed **mirrors** (`RemoteSource<T>`, one per `[expose]`) and
 whose rpc methods are ordinary calls that return `Result`:
 
 ```vilan,browser
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::json::json_codec;
 import std::result::Result::{ self, Ok, Err };
 import std::shared::Shared;
@@ -83,7 +83,7 @@ struct Note {
 
 [service(NotesClient)]
 struct Notes {
-	[expose] entries: Signal<List<Note>>,
+	[expose] entries: SignalCell<List<Note>>,
 	next_id: Shared<i32>,
 }
 
@@ -240,28 +240,28 @@ Three patterns follow from it:
 
 ### Reading a mirror
 
-A mirror is a `RemoteSource<T>`, not a `Signal<T>`, for one honest
+A mirror is a `RemoteSource<T>`, not a `SignalCell<T>`, for one honest
 reason: before the first update lands it has **no value**, and nothing
 about the type pretends otherwise. You read it one of four ways:
 
-- `mirror.or(initial): Signal<T>` — the common one, for a view. A plain
+- `mirror.or(initial): SignalCell<T>` — the common one, for a view. A plain
   signal you hand to `bind_each`, `bind_text`, or a `{…}` hole: `initial`
   until the first sync, the mirrored value after. Write it inside the
   view (not in `main`), because it is a **subscription**: it opens the
   channel, and it is released when the view that created it is unmounted.
-- `mirror.map(|value| …): Signal<U>` — the same, with the `Option<T>`
+- `mirror.map(|value| …): SignalCell<U>` — the same, with the `Option<T>`
   in your hands once, which is where a fallback of a *different* type
   belongs (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for
   the same-type case.
 - `mirror.sub(|value| …): Subscription` — the manual form: an observer
   of present values, and a handle you dispose yourself. For code with no
   view and no owner (a probe, a script).
-- `mirror.get(): Option<T>` and `mirror.status(): Signal<Status>`
+- `mirror.get(): Option<T>` and `mirror.status(): SignalCell<Status>`
   (`Waiting` / `Ready`) — passive reads. They open nothing.
 
 ```vilan,browser
 import std::json::json_codec;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::SocketTransport;
 import std::shared::Shared;
@@ -275,7 +275,7 @@ struct Note {
 
 [service(NotesClient)]
 struct Notes {
-	[expose] entries: Signal<List<Note>>,
+	[expose] entries: SignalCell<List<Note>>,
 	next_id: Shared<i32>,
 }
 

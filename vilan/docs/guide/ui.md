@@ -11,7 +11,7 @@ Available in browser builds (`target = "browser"` in `vilan.toml`, or
 
 ```vilan,browser
 import std::ui::{ view, View, mount_root };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun main() {
 	let count = Signal::new(0);
@@ -46,7 +46,7 @@ Every `bind_*` sets the property now and re-sets it whenever the source
 changes. There is no render loop to trigger.
 
 A read-only binding asks for a
-[`Source<T>`](../std/reactive.md#source), not the concrete `Signal<T>` — a
+[`Source<T>`](../std/reactive.md#source), not the concrete `SignalCell<T>` — a
 signal is one, and so is anything else you implement `get`/`sub` on. Only
 the bindings that write back (`bind_value`, `bind_draft`) need a real
 signal.
@@ -58,7 +58,7 @@ position works — the value's type decides what lands in the DOM:
 
 - a `View` appends as an element;
 - a `str` appends as a **text node**;
-- a `Signal<str>` appends as a text node kept in sync;
+- a `SignalCell<str>` appends as a text node kept in sync;
 - a `List<View>` appends every view, in order.
 
 Text nodes make mixed content direct: prose around an inline element is
@@ -79,14 +79,14 @@ fun main() {
 }
 ```
 
-`attr` is typed the same way: a `str` value sets once, a `Signal<str>`
+`attr` is typed the same way: a `str` value sets once, a `SignalCell<str>`
 re-sets whenever it changes — `attr("href", signal)` and
 `bind_attr("href", signal)` are the same binding, chosen by type or by
 name. (`text` is unchanged: it still replaces everything the element
 contains, text nodes included, like the DOM's `textContent`.)
 
 `attr` and `child` dispatch through traits rather than a bound, so their
-reactive arms are `Signal<str>` specifically — a custom `Source` goes
+reactive arms are `SignalCell<str>` specifically — a custom `Source` goes
 through the named binding (`bind_attr`, `bind_text`) for now.
 
 ## Element syntax
@@ -96,7 +96,7 @@ sugar that lowers, before analysis, to exactly the chain you would have
 written — the same methods, in the same order, emitting the same code:
 
 ```vilan,browser
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, mount_root, view };
 
 fun counter(): View {
@@ -144,10 +144,10 @@ An element is an ordinary expression: it nests in holes, sits in match
 arms, and takes postfix chains. The two forms mix freely —
 
 ```vilan,browser
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, mount_root, view };
 
-fun panel(items: Signal<List<str>>, flag: Signal<bool>): View {
+fun panel(items: SignalCell<List<str>>, flag: SignalCell<bool>): View {
 	<section class("panel")>
 		<input placeholder("What needs doing?") />
 		<ul .bind_each(items, |t| t, |t| <li>{t}</li>) />
@@ -177,9 +177,9 @@ props:
 
 ```vilan,browser
 import std::ui::{ view, View, mount_root };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
-fun labelled_input(label: str, value: Signal<str>): View {
+fun labelled_input(label: str, value: SignalCell<str>): View {
 	view("label")
 		.text(label)
 		.child(view("input").bind_value(value))
@@ -275,7 +275,7 @@ here:
 
 ```vilan,browser
 import std::ui::{ view, View, mount_root };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 [derive(PartialEq)]
 struct Todo {
@@ -284,7 +284,7 @@ struct Todo {
 }
 
 fun main() {
-	let todos: Signal<List<Todo>> = Signal::new([
+	let todos: SignalCell<List<Todo>> = Signal::new([
 		Todo { id = 1, title = "write docs" },
 	]);
 	let _root = mount_root("app", || {
@@ -369,9 +369,9 @@ shell. The [server-side rendering guide](ssr.md) walks the whole loop.
 
 ```vilan
 import std::ui::{ view, View, render };
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
-fun greeting(name: Signal<str>): View {
+fun greeting(name: SignalCell<str>): View {
 	view("p").class("greeting").bind_text(name)
 }
 

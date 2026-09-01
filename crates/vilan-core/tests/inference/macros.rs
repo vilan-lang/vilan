@@ -2070,7 +2070,7 @@ fn flatten_follows_the_current_inner_and_detaches_the_old() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         fun main() {
             let first = Signal::new(1);
@@ -2152,7 +2152,7 @@ fn effect_registers_into_the_ambient_owner_and_dies_with_it() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, Disposable, owner_scope };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
 
         fun main() {
             let count = Signal::new(1);
@@ -2179,7 +2179,7 @@ fn effect_outside_an_owner_scope_is_a_compile_error() {
     let diagnostics = failure_diagnostics(
         r#"
 import std::io::print;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun main() {
     let count = Signal::new(1);
@@ -2203,7 +2203,7 @@ main();
 fn e74_an_uncovered_effect_anchors_at_the_users_call() {
     let source = r#"
 import std::io::print;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun main() {
     let count = Signal::new(1);
@@ -2287,7 +2287,7 @@ fn e74_a_covered_call_beside_the_uncovered_one_is_not_blamed() {
     assert_fails_spanning(
         r#"
 import std::io::print;
-import std::reactive::{ Owner, Signal, owner_scope };
+import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
 
 fun main() {
     let early = Signal::new(1);
@@ -2585,9 +2585,9 @@ fun main() {
 fn e78_the_std_read_chain_labels_the_frames_above_the_entry() {
     let source = r#"
 import std::io::print;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
-fun watch(count: Signal<i32>) {
+fun watch(count: SignalCell<i32>) {
     count.effect(|value| print(value));
 }
 
@@ -2641,7 +2641,7 @@ main();
 fn e78_each_uncovered_entry_gets_its_own_diagnostic() {
     let source = r#"
 import std::io::print;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 fun main() {
     let first = Signal::new(1);
@@ -3418,7 +3418,7 @@ fn importing_reactive_without_the_ambient_layer_compiles() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Subscription, Disposable };
+        import std::reactive::{ Signal, SignalCell, Subscription, Disposable };
 
         fun main() {
             let count = Signal::new(5);
@@ -3439,7 +3439,7 @@ fn a_dead_ambient_reader_does_not_poison_covered_paths() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, Disposable, owner_scope, get_owner };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope, get_owner };
 
         // Never called: exempt, and it must not unbind `get_owner` for the
         // covered path below.
@@ -3504,8 +3504,8 @@ fn a_trait_default_body_reads_context_through_covered_dispatch() {
 }
 
 // FIXED with B14's slice: an inherited trait default called on a GENERIC
-// subject's concrete instance (`Signal<i32>` inheriting from
-// `impl Signal<type T> with Source<T>`) — `resolve_inherited_default`
+// subject's concrete instance (`SignalCell<i32>` inheriting from
+// `impl SignalCell<type T> with Source<T>`) — `resolve_inherited_default`
 // matched impl subjects by exact type equality, so generic subjects never
 // matched and the call silently bound to the trait's ABSTRACT member (the
 // B12 silent-miscompile shape). Now nominal, like `resolve_member_on_type`.
@@ -3967,7 +3967,7 @@ fn comp_returns_the_product_and_the_scope() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, Disposable, comp };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, comp };
 
         fun main() {
             let count = Signal::new(1);
@@ -4015,7 +4015,7 @@ fn a_clause_can_name_an_imported_context() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, Disposable, owner_scope, run_with_owner };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope, run_with_owner };
 
         fun boundary(body: (|| void) context owner_scope) {
             let owner = Owner::new();

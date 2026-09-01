@@ -1556,7 +1556,7 @@ fn ssr_bind_text_embeds_current_signal_value() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("h1").bind_text(Signal::new("world"))));
@@ -1571,7 +1571,7 @@ fn ssr_bind_class_and_bind_attr_read_once() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("a").bind_class(Signal::new("active")).bind_attr("href", Signal::new("/x")).text("go")));
@@ -1590,12 +1590,12 @@ fn ssr_bind_styled_reads_the_current_style_once() {
         r#"
         import std::ui::{ view, View, render };
         import std::style::{ style, space, Style };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             let compact = const style().padding(space(2));
             let roomy = const style().padding(space(6));
-            let theme: Signal<Style> = Signal::new(compact);
+            let theme: SignalCell<Style> = Signal::new(compact);
             print(render(view("div").bind_styled(theme)));
             theme.set(roomy);
             print(render(view("div").bind_styled(theme)));
@@ -1605,7 +1605,7 @@ fn ssr_bind_styled_reads_the_current_style_once() {
     );
 }
 
-/// The construct-in-const rule survives a signal in the middle: a `Signal<Style>`
+/// The construct-in-const rule survives a signal in the middle: a `SignalCell<Style>`
 /// can only ever carry styles some `const` expression already emitted, so
 /// building one at the binding site is still the static error it always was.
 #[test]
@@ -1614,10 +1614,10 @@ fn bind_styled_cannot_construct_its_style_at_runtime() {
         r#"
         import std::ui::{ view, View, render };
         import std::style::{ style, space, Style };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
-            let theme: Signal<Style> = Signal::new(style().padding(space(2)));
+            let theme: SignalCell<Style> = Signal::new(style().padding(space(2)));
             print(render(view("div").bind_styled(theme)));
         }
         main();
@@ -1631,10 +1631,10 @@ fn ssr_bind_each_renders_current_list() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
-            let items: Signal<List<str>> = Signal::new(["a", "b", "c"]);
+            let items: SignalCell<List<str>> = Signal::new(["a", "b", "c"]);
             print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
         }
         "#,
@@ -1647,10 +1647,10 @@ fn ssr_bind_each_over_empty_list_renders_no_rows() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
-            let items: Signal<List<str>> = Signal::new([]);
+            let items: SignalCell<List<str>> = Signal::new([]);
             print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
         }
         "#,
@@ -1664,7 +1664,7 @@ fn ssr_when_renders_the_taken_branch_only() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("div").when(Signal::new(true), || view("p").text("shown"))));
@@ -1680,7 +1680,7 @@ fn ssr_swap_renders_the_current_value_branch() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         [derive(PartialEq)]
         enum Tab { A, B }
@@ -1702,7 +1702,7 @@ fn ssr_show_toggles_the_hidden_attribute() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("span").show(Signal::new(true))));
@@ -1718,7 +1718,7 @@ fn ssr_style_var_folds_into_the_style_attribute() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("div").style_var("--w", Signal::new("40px")).style_var("--h", Signal::new("10px"))));
@@ -1733,7 +1733,7 @@ fn ssr_bind_value_renders_the_input_value() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("input").attr("type", "text").bind_value(Signal::new("hello"))));
@@ -1748,7 +1748,7 @@ fn ssr_bind_draft_renders_the_local_value() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::{ Signal, draft, Draft };
+        import std::reactive::{ Signal, SignalCell, draft, Draft };
         import std::option::Option::{ self, Some, None };
         import std::io::print;
         fun main() {
@@ -1913,12 +1913,12 @@ fn ssr_child_interleaves_text_and_element_children() {
 
 #[test]
 fn ssr_child_reads_a_signal_text_node_once() {
-    // The `Signal<str>` arm of `Slot`, read once — the value at render time is
+    // The `SignalCell<str>` arm of `Slot`, read once — the value at render time is
     // the value served, escaped as text.
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("p").child("now: ").child(Signal::new("a & b"))));
@@ -1946,12 +1946,12 @@ fn ssr_child_accepts_a_list_of_views() {
 
 #[test]
 fn ssr_attr_reads_a_signal_value_once() {
-    // The `Signal<str>` arm of `AttrValue` — `attr` with a signal is exactly
+    // The `SignalCell<str>` arm of `AttrValue` — `attr` with a signal is exactly
     // `bind_attr`: read once here, tracked on the browser twin.
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             print(render(view("a").attr("href", Signal::new("/x")).text("go")));
@@ -1979,12 +1979,12 @@ fn ssr_text_replaces_text_node_children_too() {
 
 #[test]
 fn browser_text_children_ride_create_text_node() {
-    // The browser twin's `str` and `Signal<str>` `Slot` arms append real text
+    // The browser twin's `str` and `SignalCell<str>` `Slot` arms append real text
     // nodes (`document.createTextNode`) — siblings of element children, never
     // wrapper spans. The signal arm re-sets the node's own text on change.
     let js = compile_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ mount_root, view };
         fun main() {
             mount_root("app", || {
@@ -2008,7 +2008,7 @@ fn element_lowering_is_the_chain_byte_for_byte() {
     // the very trees the chain parses to, so the emitted JS is byte-identical.
     let element = r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ View, render, view };
         fun main() {
             let name = Signal::new("world");
@@ -2022,7 +2022,7 @@ fn element_lowering_is_the_chain_byte_for_byte() {
         "#;
     let chain = r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ View, render, view };
         fun main() {
             let name = Signal::new("world");
@@ -2265,10 +2265,10 @@ fn bind_each_rows_dispatch_slot_children() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ View, render, view };
         fun main() {
-            let items: Signal<List<str>> = Signal::new(["alpha", "beta"]);
+            let items: SignalCell<List<str>> = Signal::new(["alpha", "beta"]);
             print(render(view("ul").bind_each(items, |t| t, |t| view("li").child(t))));
         }
         "#,
@@ -2418,11 +2418,11 @@ fn browser_static_child_outside_a_boundary_compiles() {
 
 #[test]
 fn a_signal_child_outside_a_boundary_stays_fenced() {
-    // The reactive arm subscribes — `C = Signal<str>` selects the impl whose
+    // The reactive arm subscribes — `C = SignalCell<str>` selects the impl whose
     // `place` reaches the strict owner read, so the fence must hold.
     let errors = compile_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ mount, view, View };
         fun main() {
             mount("app", view("p").child(Signal::new("live")));
@@ -2441,7 +2441,7 @@ fn a_signal_child_outside_a_boundary_stays_fenced() {
 fn a_signal_attr_outside_a_boundary_stays_fenced() {
     let errors = compile_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ mount, view, View };
         fun main() {
             mount("app", view("p").attr("data-live", Signal::new("v")));
@@ -2486,7 +2486,7 @@ fn a_signal_through_a_generic_forwarder_stays_fenced() {
     let errors = compile_browser(
         r#"
         import std::ui::{ Slot, mount, view, View };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
         }
@@ -2512,7 +2512,7 @@ fn mixed_forwarder_call_sites_fence_by_their_own_instantiation() {
     compile_browser(
         r#"
         import std::ui::{ Slot, mount, mount_root, view, View };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
         }
@@ -2553,7 +2553,7 @@ fn a_two_level_forwarder_keeps_the_fence_for_a_signal() {
     let errors = compile_browser(
         r#"
         import std::ui::{ Slot, mount, view, View };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             view("p").child(content)
         }
@@ -2602,7 +2602,7 @@ fn a_self_recursive_forwarder_keeps_the_fence_for_a_signal() {
     let errors = compile_browser(
         r#"
         import std::ui::{ Slot, mount, view, View };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T, depth: i32): View {
             if depth > 0 {
                 wrap(content, depth - 1)
@@ -2652,7 +2652,7 @@ fn an_inherited_static_default_on_a_concrete_receiver_compiles() {
     // — the site narrows to the members its head selects.
     compile_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         trait Quiet {
             fun verdict(self): str {
                 "quiet"
@@ -2684,7 +2684,7 @@ fn a_needy_inherited_default_on_its_own_receiver_stays_fenced() {
     // receiver actually inherits subscribes, and the call is uncovered.
     let errors = compile_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         trait Loud {
             fun verdict(self): str {
                 let s = Signal::new(1);
@@ -2713,7 +2713,7 @@ fn a_default_body_self_call_chain_stays_fenced() {
     // and a needy impl reached through it still fences.
     let errors = compile_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         trait Chain {
             fun outer(self): str {
                 self.inner()
@@ -2750,7 +2750,7 @@ fn a_signal_through_a_closure_owned_dispatch_site_stays_fenced() {
     let errors = compile_browser(
         r#"
         import std::ui::{ Slot, mount, view, View };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         fun wrap<T: Slot>(content: T): View {
             let holder = view("p");
             let attach = || content.place(holder);
@@ -2802,7 +2802,7 @@ fn a_top_level_entry_alongside_a_covered_caller_stays_fenced() {
     // (requirement-polymorphism.md §1c).
     let errors = compile_browser(
         r#"
-        import std::reactive::{ Signal, run_with_owner, Owner };
+        import std::reactive::{ Signal, SignalCell, run_with_owner, Owner };
         fun needy() {
             let s = Signal::new(1);
             s.effect(|v| {});
@@ -2830,7 +2830,7 @@ fn a_covered_caller_alone_keeps_compiling() {
     // top-level entry has only covered callers and compiles.
     compile_browser(
         r#"
-        import std::reactive::{ Signal, run_with_owner, Owner };
+        import std::reactive::{ Signal, SignalCell, run_with_owner, Owner };
         fun needy() {
             let s = Signal::new(1);
             s.effect(|v| {});
@@ -2947,10 +2947,10 @@ fn ssr_example_app_renders_the_served_markup() {
     assert_compiles_and_runs(
         r#"
         import std::ui::{ view, View, render };
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun app(): View {
-            let tasks: Signal<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
+            let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
             let show_note = Signal::new(true);
             let label = Signal::new("idle");
             view("main")

@@ -352,8 +352,10 @@ std/process.md h2 stdprocess
 std/process.md h2 stdwatch
 std/reactive.md h1 stdreactive-reference
 std/reactive.md h2 at-a-glance
-std/reactive.md h2 signal
+std/reactive.md h2 signal-and-signalcell
 std/reactive.md h2 source
+std/reactive.md h2 writing-a-signal
+std/reactive.md h2 maybesignal
 std/reactive.md h2 combine
 std/reactive.md h2 subscription-disposable
 std/reactive.md h2 owner

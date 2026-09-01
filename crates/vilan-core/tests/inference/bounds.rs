@@ -1884,7 +1884,7 @@ fn a_turn_flush_cannot_drain_another_turns_queue() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Turn, turn_scope, flush };
+        import std::reactive::{ Signal, SignalCell, Turn, turn_scope, flush };
 
         fun main() {
             let a = Signal::new(0);
@@ -1912,7 +1912,7 @@ fn a_batch_body_defers_even_at_the_top_level() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, batch };
+        import std::reactive::{ Signal, SignalCell, batch };
 
         fun main() {
             let count = Signal::new(0);
@@ -1934,7 +1934,7 @@ fn a_turn_follows_its_extents_continuation_across_await() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Turn, turn_scope, flush };
+        import std::reactive::{ Signal, SignalCell, Turn, turn_scope, flush };
 
         async fun tick() {
             let _beat = 1;
@@ -1968,7 +1968,7 @@ fn a_host_invoked_adapter_gives_each_dispatch_its_own_turn() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
+        import std::reactive::{ Signal, SignalCell, FlushPolicy, turn, turn_scope };
 
         fun simulate_events(handler: (|| void) context turn_scope) {
             // The DOM stores only this plain closure; each invocation is a
@@ -2002,7 +2002,7 @@ fn a_named_handler_binding_adopts_the_clause() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
+        import std::reactive::{ Signal, SignalCell, FlushPolicy, turn, turn_scope };
 
         fun dispatch(handler: (|| void) context turn_scope) {
             turn(FlushPolicy::AtEnd, || handler());
@@ -2096,7 +2096,7 @@ fn a_continuation_set_settles_without_a_manual_flush() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
+        import std::reactive::{ Signal, SignalCell, FlushPolicy, turn, turn_scope };
 
         async fun tick() {
             let _beat = 1;
@@ -2127,7 +2127,7 @@ fn at_suspension_flushes_before_each_await() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
+        import std::reactive::{ Signal, SignalCell, FlushPolicy, turn, turn_scope };
 
         async fun tick() {
             let _beat = 1;
@@ -2159,7 +2159,7 @@ fn at_end_holds_writes_across_the_await_inside_the_extent() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, FlushPolicy, turn, turn_scope };
+        import std::reactive::{ Signal, SignalCell, FlushPolicy, turn, turn_scope };
 
         async fun tick() {
             let _beat = 1;
@@ -2196,7 +2196,7 @@ fn an_awaiting_turn_body_holds_writes_until_it_completes() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, turn, FlushPolicy, turn_scope };
+        import std::reactive::{ Signal, SignalCell, turn, FlushPolicy, turn_scope };
 
         async fun tick() {
             let _beat = 1;
@@ -2250,7 +2250,7 @@ fn a_sync_turn_body_stays_atomic_and_keeps_its_emission() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, turn, FlushPolicy, turn_scope };
+        import std::reactive::{ Signal, SignalCell, turn, FlushPolicy, turn_scope };
 
         fun main() {
             let counter = Signal::new(0);
@@ -2297,7 +2297,7 @@ fn optimistic_paints_then_reconciles_to_the_confirmed_value() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, optimistic };
+        import std::reactive::{ Signal, SignalCell, optimistic };
         import std::result::Result::{ self, Ok, Err };
 
         async fun tick() {
@@ -2327,7 +2327,7 @@ fn optimistic_rolls_back_on_failure() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, optimistic };
+        import std::reactive::{ Signal, SignalCell, optimistic };
         import std::result::Result::{ self, Ok, Err };
 
         async fun tick() {
@@ -2381,7 +2381,7 @@ fn an_optimistic_cell_publishes_pending_then_the_confirmed_value() {
         &format!(
             r#"
         import std::io::print;
-        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::reactive::{{ Signal, SignalCell, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
         {OPTIMISTIC_LABEL}
@@ -2413,7 +2413,7 @@ fn an_optimistic_cell_rolls_back_and_publishes_the_rejection() {
         &format!(
             r#"
         import std::io::print;
-        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::reactive::{{ Signal, SignalCell, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
         {OPTIMISTIC_LABEL}
@@ -2446,7 +2446,7 @@ fn a_superseded_optimistic_outcome_does_not_paint_the_cell() {
         &format!(
             r#"
         import std::io::print;
-        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::reactive::{{ Signal, SignalCell, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
         {OPTIMISTIC_LABEL}
@@ -2485,7 +2485,7 @@ fn a_rollback_lands_on_the_last_confirmation_not_the_original_value() {
         &format!(
             r#"
         import std::io::print;
-        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::reactive::{{ Signal, SignalCell, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
         {OPTIMISTIC_LABEL}
@@ -2525,7 +2525,7 @@ fn an_out_of_order_confirmation_cannot_walk_the_confirmed_shadow_backwards() {
         &format!(
             r#"
         import std::io::print;
-        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::reactive::{{ Signal, SignalCell, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
         {OPTIMISTIC_LABEL}
@@ -2569,7 +2569,7 @@ fn an_optimistic_transition_publishes_one_coherent_wave() {
         &format!(
             r#"
         import std::io::print;
-        import std::reactive::{{ Signal, Optimistic, WriteState, combine }};
+        import std::reactive::{{ Signal, SignalCell, Optimistic, WriteState, combine }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::time::{{ sleep_for, Duration }};
         {OPTIMISTIC_LABEL}
@@ -2604,7 +2604,7 @@ fn a_held_turn_holds_the_whole_optimistic_lifecycle() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Optimistic, WriteState, turn, FlushPolicy, turn_scope };
+        import std::reactive::{ Signal, SignalCell, Optimistic, WriteState, turn, FlushPolicy, turn_scope };
         import std::result::Result::{ self, Ok, Err };
 
         async fun tick() {
@@ -2643,7 +2643,7 @@ fn an_optimistic_cell_reconciles_over_a_real_rpc_round_trip() {
             r#"
         import std::io::print;
         import std::shared::Shared;
-        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::reactive::{{ Signal, SignalCell, Optimistic, WriteState }};
         import std::result::Result::{{ self, Ok, Err }};
         import std::json::{{ Json, json_codec }};
         import std::rpc::{{ local_rpc }};
@@ -5688,14 +5688,14 @@ fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
 
 /// B157's probe program, verbatim — the exhibit B158 was filed from. One
 /// trait, one blanket static impl, one generic `Signal` impl, and a bounded
-/// generic taking both a `str` and a `Signal<str>` with no call-site ceremony.
+/// generic taking both a `str` and a `SignalCell<str>` with no call-site ceremony.
 /// The `Signal` leg must REACT (the second `badge` line comes from `set`),
 /// which is what makes the trait route answer B157's first problem.
 #[test]
 fn b158_the_maybe_signal_probe_dispatches_through_a_blanket_and_a_signal_impl() {
     assert_compiles_and_runs(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         trait MaybeSignal<T> {
             fun bind(self, react: |T| void);
@@ -5707,7 +5707,7 @@ fn b158_the_maybe_signal_probe_dispatches_through_a_blanket_and_a_signal_impl() 
             }
         }
 
-        impl Signal<type T> with MaybeSignal<T> {
+        impl SignalCell<type T> with MaybeSignal<T> {
             fun bind(self, react: |T| void) {
                 let _watching = self.sub(react);
             }
@@ -5791,8 +5791,8 @@ fn b158_a_constructor_headed_impl_outranks_a_blanket_through_a_bound() {
 }
 
 /// The case the owner's proposed `not Signal` bound would have DELETED
-/// (B158's follow-up analysis): under a `MaybeSignal<Signal<str>>` bound, a
-/// bare `Signal<str>` is a legitimate STATIC value, reached through the
+/// (B158's follow-up analysis): under a `MaybeSignal<SignalCell<str>>` bound, a
+/// bare `SignalCell<str>` is a legitimate STATIC value, reached through the
 /// blanket — while the same value under a `MaybeSignal<str>` bound is the
 /// reactive source, reached through the constructor impl. The bound decides
 /// which INSTANTIATION is wanted before specificity is consulted, so both
@@ -5801,7 +5801,7 @@ fn b158_a_constructor_headed_impl_outranks_a_blanket_through_a_bound() {
 fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matches() {
     assert_compiles_and_runs(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         trait MaybeSignal<T> {
             fun bind(self, react: |T| void);
@@ -5811,7 +5811,7 @@ fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matc
             fun bind(self, react: |T| void) { react(self); }
         }
 
-        impl Signal<type T> with MaybeSignal<T> {
+        impl SignalCell<type T> with MaybeSignal<T> {
             fun bind(self, react: |T| void) { let _watching = self.sub(react); }
         }
 
@@ -5819,7 +5819,7 @@ fn b158_a_nested_bound_reaches_the_blanket_for_a_value_the_signal_impl_also_matc
             label.bind(|text| print(i"badge {text}"));
         }
 
-        fun holder<V: MaybeSignal<Signal<str>>>(slot: V) {
+        fun holder<V: MaybeSignal<SignalCell<str>>>(slot: V) {
             slot.bind(|inner| print(i"holder {inner.get()}"));
         }
 
@@ -6230,7 +6230,7 @@ fn a_supertrait_member_under_a_sub_bound_resolves_and_runs() {
 
 /// The acceptance exhibit's type, shared by the pins in this block.
 const A_USER_SOURCE: &str = r#"
-        struct Stored<T> { inner: Signal<T> }
+        struct Stored<T> { inner: SignalCell<T> }
 
         impl Stored<type T> with Source<T> {
             fun get(self): T { self.inner.get() }
@@ -6250,7 +6250,7 @@ const A_USER_SOURCE: &str = r#"
 fn a_user_source_drives_every_read_only_browser_binding() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::style::{{ Color, Style, style }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
@@ -6282,7 +6282,7 @@ fn a_user_source_drives_the_process_twin_and_renders() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ View, render, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6308,16 +6308,18 @@ fn a_user_source_drives_the_process_twin_and_renders() {
     );
 }
 
-/// The HOLD, half one: `bind_value` WRITES back, so it keeps its concrete
-/// `Signal` until A32 rules on the write side. A `Source` has no `set`, so this
-/// is a refusal and not an oversight — and pinning it means a later blanket
-/// widening cannot take the write side by accident.
+/// A33's HOLD, half one, now RULED (A32): `bind_value` writes back, so it
+/// bounds on trait-`Signal` rather than on the concrete cell. A type that is
+/// only a `Source` is still refused, which is the whole point of the pair —
+/// reading does not license writing — and the refusal still names `Signal`.
+/// Supersedes `bind_value_still_demands_a_signal`; its positive twin is
+/// `a32_a_custom_signal_impl_drives_bind_value`.
 #[test]
-fn bind_value_still_demands_a_signal() {
+fn a_source_alone_still_cannot_drive_bind_value() {
     assert_fails_browser_with(
         &format!(
             r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6337,7 +6339,7 @@ fn bind_draft_still_demands_a_draft() {
     assert_fails_browser_with(
         &format!(
             r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6350,19 +6352,19 @@ fn bind_draft_still_demands_a_draft() {
     );
 }
 
-/// The B158 DEFERRAL, stated as a test rather than only as a comment.
-/// `attr`/`child` dispatch through the `AttrValue`/`Slot` TRAITS, whose tracked
-/// arms are `impl Signal<str> with …`. Widening a trait arm is a BLANKET impl
-/// (`impl S: Source<str> with AttrValue`), which is B158's machinery, not a
-/// bound on a generic parameter — so a user source is still refused here while
-/// it drives every `bind_*`. Un-ignore nothing when B158 lands: replace this
-/// pin with its positive twin.
+/// The B158 deferral's POSITIVE TWIN, which its own comment said to write once
+/// the blanket machinery landed. `attr`/`child` dispatch through the
+/// `AttrValue`/`Slot` traits, whose tracked arms are now
+/// `impl type S: Source<str> with …` (B158's specificity order + B165's binder
+/// inside the bound), so a user source fills an attribute and places a slot
+/// exactly as the canonical cell does. Supersedes
+/// `the_attr_and_slot_trait_arms_are_still_signal_only`.
 #[test]
-fn the_attr_and_slot_trait_arms_are_still_signal_only() {
+fn a_user_source_fills_an_attribute_and_places_a_slot() {
     let program = |value: &str| {
         format!(
             r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6372,8 +6374,26 @@ fn the_attr_and_slot_trait_arms_are_still_signal_only() {
         "#
         )
     };
-    assert_fails_browser_with(&program(r#"view("a").attr("href", label)"#), "AttrValue");
-    assert_fails_browser_with(&program(r#"view("p").child(label)"#), "Slot");
+    assert_compiles_browser(&program(r#"view("a").attr("href", label)"#));
+    assert_compiles_browser(&program(r#"view("p").child(label)"#));
+}
+
+/// …and the STATIC arm still outranks the blanket where both match: `str` has
+/// its own `AttrValue`/`Slot` impl, so a plain string keeps reaching it rather
+/// than being asked for a `get` it does not have. This is the specificity order
+/// doing its job on std's own trait arms.
+#[test]
+fn a_plain_string_still_takes_the_static_attr_and_slot_arms() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(view("a").attr("href", "/home").child("label")));
+        }
+        main();
+        "#,
+        "<a href=\"/home\">label</a>\n",
+    );
 }
 
 /// …and the concrete arms are untouched, which is the no-regression half: the
@@ -6384,7 +6404,7 @@ fn the_attr_and_slot_trait_arms_are_still_signal_only() {
 fn element_syntax_still_routes_attributes_through_attr_value() {
     assert_compiles_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ View, mount_root, view };
 
         fun main() {
@@ -6415,7 +6435,7 @@ fn element_syntax_still_routes_attributes_through_attr_value() {
 fn a_user_source_drives_the_browser_swap() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6429,13 +6449,13 @@ fn a_user_source_drives_the_browser_swap() {
 
 /// `View::swap_split` — the split build's gate — driven by the same user
 /// `Source`. It is the signature whose own BODY carries the B168 shape
-/// (`self.swap(gated, render)` with `gated: Signal<T>`), so this pin is the
+/// (`self.swap(gated, render)` with `gated: SignalCell<T>`), so this pin is the
 /// compiler fix read through std rather than through a minimized exhibit.
 #[test]
 fn a_user_source_drives_the_split_gate() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6455,7 +6475,7 @@ fn a_user_source_drives_the_split_gate() {
 fn a_user_source_drives_the_boot_preload() {
     assert_compiles_browser(&format!(
         r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ chunk_preload, View, mount_root, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6476,7 +6496,7 @@ fn a_user_source_drives_the_process_swap_and_renders() {
     assert_compiles_and_runs(
         &format!(
             r#"
-        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::ui::{{ View, render, view }};
         {A_USER_SOURCE}
         fun main() {{
@@ -6499,7 +6519,7 @@ fn a_user_source_drives_the_process_swap_and_renders() {
 fn a_concrete_signal_still_drives_the_swap_family() {
     assert_compiles_browser(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
         import std::ui::{ chunk_preload, View, mount_root, view };
 
         fun main() {
@@ -6636,7 +6656,7 @@ fn b165_an_undeclared_name_inside_a_bound_still_refuses() {
 fn b165_the_static_blanket_and_a_source_bounded_blanket_coexist() {
     assert_compiles_and_runs(
         r#"
-        import std::reactive::{ Signal, Source };
+        import std::reactive::{ Signal, SignalCell, Source };
 
         trait Maybe<T> { fun show(self, react: |T| void); }
 
@@ -6659,5 +6679,315 @@ fn b165_the_static_blanket_and_a_source_bounded_blanket_coexist() {
         main();
         "#,
         "[static]\n[first]\n[second]\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A32 — `Signal` is the WRITE trait, `SignalCell` the canonical cell
+// ---------------------------------------------------------------------------
+
+/// A custom `Signal` impl: the setter CLAMPS. This is the owner's motivating
+/// exhibit, verbatim in shape — a component bounded on `Signal<i32>` writes
+/// 1000, the impl stores 800, and the component, the owner and every observer
+/// all read 800 back. There is one value and the impl decided it; the transform
+/// is the store, not a view.
+const A_CLAMPING_SIGNAL: &str = r#"
+        struct Clamped { inner: SignalCell<i32>, max: i32 }
+
+        impl Clamped {
+            fun new(initial: i32, max: i32): Clamped {
+                Clamped { inner = SignalCell::new(initial), max }
+            }
+        }
+
+        impl Clamped with Source<i32> {
+            fun get(self): i32 { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |i32| void): Subscription { self.inner.sub(observer) }
+        }
+
+        impl Clamped with Signal<i32> {
+            fun set(self, value: i32) {
+                let capped = if value > self.max { self.max } else { value };
+                self.inner.set(capped);
+            }
+            fun notify(self) { self.inner.notify(); }
+        }
+"#;
+
+#[test]
+fn a32_a_clamping_setter_satisfies_a_signal_bound() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::display::Display;
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        {A_CLAMPING_SIGNAL}
+        fun width_control<S: Signal<i32>>(width: S) {{
+            width.set(1000);
+            let seen: i32 = width.get();
+            print(i"component read back: {{seen}}");
+        }}
+
+        fun main() {{
+            width_control(SignalCell::new(0));
+            let clamped = Clamped::new(0, 800);
+            width_control(clamped);
+            let owner_sees: i32 = clamped.get();
+            print(i"owner sees: {{owner_sees}}");
+        }}
+        main();
+        "#
+        ),
+        "component read back: 1000\ncomponent read back: 800\nowner sees: 800\n",
+    );
+}
+
+/// The observers see the STORED value, never the value that was written: a
+/// subscriber on the clamped impl reads `0` then `800`, and `1000` never
+/// existed anywhere.
+#[test]
+fn a32_an_observer_of_a_clamping_signal_never_sees_the_written_value() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::display::Display;
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        {A_CLAMPING_SIGNAL}
+        fun main() {{
+            let clamped = Clamped::new(0, 800);
+            let watching = clamped.sub(|value| print(i"observer: {{value}}"));
+            clamped.set(1000);
+            watching.dispose();
+        }}
+        main();
+        "#
+        ),
+        "observer: 0\nobserver: 800\n",
+    );
+}
+
+/// `set_with` is a trait DEFAULT — read, transform, write — and the write half
+/// goes through the IMPL's `set`, so an inherited default clamps too. 800 + 5
+/// is stored as 800.
+#[test]
+fn a32_the_inherited_set_with_routes_through_the_impls_own_set() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::display::Display;
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        {A_CLAMPING_SIGNAL}
+        fun main() {{
+            let clamped = Clamped::new(795, 800);
+            clamped.set_with(|n| n + 5);
+            let first: i32 = clamped.get();
+            print(i"{{first}}");
+            clamped.set_with(|n| n + 5);
+            let second: i32 = clamped.get();
+            print(i"{{second}}");
+        }}
+        main();
+        "#
+        ),
+        "800\n800\n",
+    );
+}
+
+/// `update` is LOCKED OUT of the trait, by ruling: it lives on `SignalCell` as
+/// an inherent method, so a consumer holding only a `Signal<T>` bound cannot
+/// reach it. An impl may want its own update logic or none at all, and a
+/// generic default could only read-copy-mutate-write-back — the copy A18
+/// exists to avoid.
+#[test]
+fn a32_update_is_not_reachable_through_a_signal_bound() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source };
+        fun bump<S: Signal<i32>>(cell: S) {
+            cell.update(|&mut n| { n = *n + 1; });
+        }
+        "#,
+        "update",
+    );
+}
+
+/// …and it is reachable on the cell itself, which is the other half of the
+/// ruling: locking general consumers out must not cost the cell its method.
+#[test]
+fn a32_update_is_still_reachable_on_the_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::reactive::{ Signal, SignalCell, Source };
+        fun main() {
+            let count = SignalCell::new(1);
+            count.update(|&mut n| { n = *n + 41; });
+            let seen: i32 = count.get();
+            print(i"{seen}");
+        }
+        main();
+        "#,
+        "42\n",
+    );
+}
+
+/// `Signal::new` keeps the everyday spelling and means the canonical cell: it
+/// is the TRAIT's own default body (B162), which resolves statically with no
+/// receiver to dispatch on, and its element binds from the call.
+#[test]
+fn a32_signal_new_binds_its_element_and_hands_back_the_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::reactive::{ Signal, SignalCell, Source };
+        fun main() {
+            let count = Signal::new(41);
+            count.update(|&mut n| { n = *n + 1; });
+            let seen: i32 = count.get();
+            print(i"{seen}");
+            let cell: SignalCell<i32> = Signal::new(7);
+            let other: i32 = cell.get();
+            print(i"{other}");
+        }
+        main();
+        "#,
+        "42\n7\n",
+    );
+}
+
+/// B161's exhibit against the shipped pair: the annotation is a CONSTRAINT, so
+/// `count` is a `SignalCell<i32>` and keeps `update`, which the trait does not
+/// declare. Checked wide, kept narrow.
+#[test]
+fn a32_a_signal_annotation_leaves_the_binding_a_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+        import std::reactive::{ Signal, SignalCell, Source };
+        fun main() {
+            let count: Signal<i32> = SignalCell::new(1);
+            count.set(5);
+            count.update(|&mut n| { n = *n * 2; });
+            let seen: i32 = count.get();
+            print(i"{seen}");
+        }
+        main();
+        "#,
+        "10\n",
+    );
+}
+
+/// …and a custom impl satisfies the same annotation, which is what makes it a
+/// constraint rather than a spelling of the cell.
+#[test]
+fn a32_a_signal_annotation_admits_a_custom_impl() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::display::Display;
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        {A_CLAMPING_SIGNAL}
+        fun main() {{
+            let width: Signal<i32> = Clamped::new(0, 800);
+            width.set(1000);
+            let seen: i32 = width.get();
+            print(i"{{seen}}");
+        }}
+        main();
+        "#
+        ),
+        "800\n",
+    );
+}
+
+/// A type that implements only `Source` fails the annotation, naming the trait
+/// it does not implement.
+#[test]
+fn a32_a_signal_annotation_refuses_a_read_only_source() {
+    assert_fails_with(
+        &format!(
+            r#"
+        import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let typed: Signal<str> = Stored::new("");
+        }}
+        "#
+        ),
+        "does not implement trait 'Signal<str>'",
+    );
+}
+
+/// The owner's motivating case END TO END: a custom `Signal` impl driving a std
+/// UI binding that takes a signal. `bind_value` reads through `Source` and
+/// writes through `Signal`, and the impl's `set` decides what is stored — here
+/// an upcased copy of whatever was typed.
+#[test]
+fn a32_a_custom_signal_impl_drives_bind_value() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::ui::{ View, mount_root, view };
+
+        struct Shouted { inner: SignalCell<str> }
+
+        impl Shouted {
+            fun new(initial: str): Shouted { Shouted { inner = SignalCell::new(initial) } }
+        }
+
+        impl Shouted with Source<str> {
+            fun get(self): str { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |str| void): Subscription { self.inner.sub(observer) }
+        }
+
+        impl Shouted with Signal<str> {
+            fun set(self, value: str) { self.inner.set(value.to_uppercase()); }
+            fun notify(self) { self.inner.notify(); }
+        }
+
+        fun main() {
+            let name = Shouted::new("");
+            let _root = mount_root("app", || view("input").bind_value(name));
+        }
+        "#,
+    );
+}
+
+/// The process twin takes it too — the two `ui` layers declare one surface, so
+/// a component written against the bound renders on both sides.
+#[test]
+fn a32_a_custom_signal_impl_drives_the_process_bind_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+        import std::ui::{ View, render, view };
+
+        struct Upper { inner: SignalCell<str> }
+
+        impl Upper {
+            fun new(initial: str): Upper { Upper { inner = SignalCell::new(initial) } }
+        }
+
+        impl Upper with Source<str> {
+            fun get(self): str { self.inner.get() }
+            [must_use]
+            fun sub(self, observer: |str| void): Subscription { self.inner.sub(observer) }
+        }
+
+        impl Upper with Signal<str> {
+            fun set(self, value: str) { self.inner.set(value.to_uppercase()); }
+            fun notify(self) { self.inner.notify(); }
+        }
+
+        fun main() {
+            let name = Upper::new("");
+            name.set("shout");
+            print(render(view("input").bind_value(name)));
+        }
+        main();
+        "#,
+        "<input value=\"SHOUT\">\n",
     );
 }

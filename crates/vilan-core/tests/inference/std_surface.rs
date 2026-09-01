@@ -4730,7 +4730,7 @@ fn b98_a_third_impl_is_reported_against_the_first() {
 fn b98_the_platform_twins_are_not_a_duplicate_on_either_leg() {
     // The carve-out the rule must not break, pinned in BOTH directions:
     // `browser/ui.vl` and `process/ui.vl` each write `impl View with Slot`,
-    // `impl str with Slot`, `impl Signal<str> with AttrValue` and three more —
+    // `impl str with Slot`, `impl SignalCell<str> with AttrValue` and three more —
     // the twin MECHANISM (`method-resolution.md` §9(6)). Module resolution is
     // layered, so exactly one `ui` loads per build and the pairs never meet;
     // nothing special-cases them, and this is the measurement that says so.

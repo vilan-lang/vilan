@@ -7,7 +7,7 @@ Import what you use:
 
 ```vilan,fragment
 import std::reactive::{
-	Signal, Source, Subscription, Disposable, combine,
+	Signal, SignalCell, Source, MaybeSignal, Subscription, Disposable, combine,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush, at_settle,
 	optimistic, Optimistic, WriteState,
@@ -20,8 +20,10 @@ import std::reactive::{
 
 | Item | Kind | One line |
 |---|---|---|
-| `Signal<T>` | struct | mutable cell with subscribers |
 | `Source<T>` | trait | anything readable + subscribable (`get`/`sub`/`effect`) |
+| `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
+| `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
+| `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
 | `Subscription` | struct | an explicit subscription; `Disposable` |
 | `combine` | fn | tuple-signal over 2+ signals |
 | `Owner` | struct | disposal bag; the lifetime unit |
@@ -32,26 +34,60 @@ import std::reactive::{
 | `draft`, `Draft<T>`, `DraftState` | fn/struct/enum | local-first editing cell |
 | `reconcile`, `ReconcilePlan`, `RowStep` | fn/structs | keyed list diffing engine |
 
-## Signal
+## Signal and SignalCell
+
+`Source` reads and `Signal` writes; `SignalCell` is the canonical cell that
+implements both. A component that only observes takes a `Source`, one that
+writes back takes a `Signal`, and one that needs the cell's own surface — a
+`map`, an in-place `update` — names `SignalCell`.
 
 ```vilan,fragment
-impl Signal<type T> {
-	fun new(value: T): Signal<T>
-	fun set(self, value: T)                 // write + notify
-	fun set_with(self, transform: sync |T| T)    // read-modify-write
-	fun update(self, mutate: sync |&mut T| void) // mutate in place, notify once
-	fun map<U>(self, transform: sync |T| U): Signal<U>
+trait Signal<T> with Source<T> {
+	fun new(value: T): SignalCell<T>             // default body: the canonical cell
+	fun set(self, value: T)                      // required
+	fun notify(self)                             // required
+	fun set_with(self, transform: sync |T| T)    // default: set(transform(get()))
 }
-impl Signal<type T> with Source<T> {
+```
+
+`Signal::new(v)` is the everyday spelling and does not dispatch: there is no
+receiver to select an implementation from, so it resolves statically to the
+trait's own default body and means the canonical cell in every file. The value
+it hands back is a `SignalCell<T>`.
+
+```vilan,fragment
+impl SignalCell<type T> with Signal<T> {
+	fun new(value: T): SignalCell<T>
+	fun set(self, value: T)                 // write + notify
+	fun notify(self)                        // publish without changing
+	// from the trait default:
+	fun set_with(self, transform: sync |T| T)    // read-modify-write
+}
+impl SignalCell<type T> {
+	fun update(self, mutate: sync |&mut T| void) // mutate in place, notify once
+	fun map<U>(self, transform: sync |T| U): SignalCell<U>
+}
+impl SignalCell<type T> with Source<T> {
 	fun get(self): T
 	fun sub(self, observer: |T| void): Subscription
 	// from the trait default:
 	fun effect(self, observer: |T| void)    // fires now + on change; owner-registered
 }
-impl Signal<Signal<type U>> {
-	fun flatten(self): Signal<U>            // follow the current inner signal
+impl SignalCell<SignalCell<type U>> {
+	fun flatten(self): SignalCell<U>            // follow the current inner signal
 }
 ```
+
+`update` is **inherent to the cell**, deliberately: its value is in-place
+mutation with one notification, and a generic default could only
+read-copy-mutate-write-back — the copy it exists to avoid. An implementation may
+want its own update logic or none at all, so a consumer that needs it asks for
+`SignalCell<T>` rather than for a bound.
+
+A trait may be written as a **`let` annotation**, where it is a checked
+constraint rather than the binding's type: `let count: Signal<i32> =
+SignalCell::new(1)` asserts that `SignalCell<i32>` implements `Signal<i32>` and
+leaves `count` a `SignalCell<i32>`, `update` and all. Checked wide, kept narrow.
 
 - `set` notifies through the ambient turn when one exists (writes coalesce);
   outside any turn it notifies immediately.
@@ -63,11 +99,11 @@ impl Signal<Signal<type U>> {
   signal is unsupported.
 
 ```vilan
-import std::reactive::{ Signal, Owner, batch };
+import std::reactive::{ Signal, SignalCell, Owner, batch };
 
 fun main() {
 	let owner = Owner::new();
-	let todos: Signal<List<str>> = Signal::new([]);
+	let todos: SignalCell<List<str>> = Signal::new([]);
 	owner.take(todos.sub(|list| print(list.len())));   // 0
 
 	todos.update(|&mut list| { list.push("write docs"); });   // 1
@@ -105,16 +141,16 @@ trait Source<T> {
 }
 ```
 
-The read-only half of a reactive value. `Signal<T>` implements it, and so does
+The read-only half of a reactive value. `SignalCell<T>` implements it, and so does
 any type of yours — a storage-backed cell, a mirror over a transport, a wrapper
 that logs. Implement `get` and `sub` and `effect` comes free.
 
 ```vilan
-import std::reactive::{ Owner, Signal, Source, Subscription };
+import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription };
 
 /// A signal with a place to hang persistence, and no `set` on the trait.
 struct Stored<T> {
-	inner: Signal<T>,
+	inner: SignalCell<T>,
 }
 
 impl Stored<type T> with Source<T> {
@@ -151,26 +187,117 @@ binding in [`std::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
 `bind_attr`, `bind_styled`, `style_var`, `bind_each`, `when`, `show`, `swap`
 and `swap_split` — is generic over `Source<T>`, so `Stored<str>` above drives
 them exactly like a signal does, on the browser layer and on the SSR twin
-alike. `ReactiveServer`'s `expose` is generic the same way. What still asks for
-a `Signal` is what **writes** it: `bind_value`, `bind_draft`, `optimistic` and
-`Optimistic::over` all need `set`, which `Source` does not declare.
+alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
+`Slot` and `AttrValue` arms element syntax dispatches through, so
+`<p>{stored}</p>` and `<a href(stored)>` work for any source. What asks for a
+`Signal` is what **writes**: `bind_value` and its SSR twin bound on
+`Signal<str>`, and `optimistic` on `Signal<T>`, so a custom implementation with
+its own `set` drives them. `Optimistic::over` still asks for the cell, because
+`Optimistic` STORES it in a field and a field must name a real type.
+
+## Writing a Signal
+
+Implement `Source`'s `get`/`sub` and `Signal`'s `set`/`notify`, and the type is
+usable anywhere a signal is wanted. The setter is where custom behaviour lives —
+a clamp, a persistence write, a debounce — and there is only one value, so
+whatever `set` stores is what every reader and every observer sees.
+
+```vilan
+import std::display::Display;
+import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+struct Clamped { inner: SignalCell<i32>, max: i32 }
+
+impl Clamped {
+	fun new(initial: i32, max: i32): Clamped {
+		Clamped { inner = SignalCell::new(initial), max }
+	}
+}
+
+impl Clamped with Source<i32> {
+	fun get(self): i32 { self.inner.get() }
+	[must_use]
+	fun sub(self, observer: |i32| void): Subscription { self.inner.sub(observer) }
+}
+
+impl Clamped with Signal<i32> {
+	fun set(self, value: i32) {
+		self.inner.set(if value > self.max { self.max } else { value });
+	}
+	fun notify(self) { self.inner.notify(); }
+}
+
+/// A component. It bounds on the writable trait and knows no implementation.
+fun width_control<S: Signal<i32>>(width: S) {
+	width.set(1000);
+	let seen: i32 = width.get();
+	print(i"stored: {seen}");
+}
+
+fun main() {
+	width_control(SignalCell::new(0));       // stored: 1000
+	width_control(Clamped::new(0, 800));     // stored: 800
+}
+```
+
+The trait promises **nothing** about notification frequency. `SignalCell`
+notifies unconditionally — `set` never compares — and an implementation that
+wants "don't publish an unchanged value" writes that in its own `set`.
+
+## MaybeSignal
+
+```vilan,fragment
+trait MaybeSignal<T> {
+	fun bind(self, react: |T| void);
+}
+```
+
+One parameter that takes a static value or a reactive one, with no ceremony at
+the call site. `bind` is effect-shaped rather than getter-shaped, which is what
+lets one signature serve both: the static implementation fires the handler once,
+the reactive one subscribes and keeps firing.
+
+```vilan
+import std::reactive::{ MaybeSignal, Owner, Signal, SignalCell, comp };
+
+fun badge<V: MaybeSignal<str>>(label: V) {
+	label.bind(|text| print(i"[{text}]"));
+}
+
+fun main() {
+	let (_value, _owner) = comp(|| {
+		badge("draft");                      // [draft]
+		let live = Signal::new("saved");
+		badge(live);                         // [saved]
+		live.set("synced");                  // [synced]
+		0
+	});
+}
+```
+
+std ships two implementations: a blanket `impl type T with MaybeSignal<T>` (the
+static case) and `impl type S: Source<type T> with MaybeSignal<T>` (the reactive
+one). Which runs is settled at the call by the specificity order, with no
+runtime discrimination anywhere. The reactive arm registers with the ambient
+owner, so a component's subscription dies with the boundary that built it — and
+that is why `bind` may only be called under one.
 
 ## combine
 
 ```vilan,fragment
-fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T>
+fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T>
 ```
 
 A signal of the tuple of the sources' current values, firing when any source
 changes. Variadic over tuples of signals of mixed element types:
 
 ```vilan
-import std::reactive::{ Signal, combine };
+import std::reactive::{ Signal, SignalCell, combine };
 
 fun main() {
 	let flag = Signal::new(true);
 	let count = Signal::new(2);
-	let both: Signal<(bool, i32)> = combine((flag, count));
+	let both: SignalCell<(bool, i32)> = combine((flag, count));
 	let (_on, current) = both.get();
 	print(current);
 }
@@ -252,7 +379,7 @@ an id that cannot collide with a subscriber's (`fresh_id()` mints one).
 ## optimistic
 
 ```vilan,fragment
-fun optimistic<T, E>(signal: Signal<T>, value: T, commit: async || Result<T, E>): Result<T, E>
+fun optimistic<T, E>(signal: SignalCell<T>, value: T, commit: async || Result<T, E>): Result<T, E>
 ```
 
 Paint `value` into `signal` now, await `commit`, then reconcile: the
@@ -276,13 +403,13 @@ enum WriteState {
 }
 
 struct Optimistic<T> {
-	value: Signal<T>,           // the signal you handed to `over`; bind it
-	state: Signal<WriteState>,  // bind a spinner, a disabled button, a banner
+	value: SignalCell<T>,           // the signal you handed to `over`; bind it
+	state: SignalCell<WriteState>,  // bind a spinner, a disabled button, a banner
 	…                           // internals: the confirmed shadow, two generations
 }
 
 impl Optimistic<type T> {
-	fun over(signal: Signal<T>): Optimistic<T>
+	fun over(signal: SignalCell<T>): Optimistic<T>
 	fun write(self, value: T, commit: async || Result<T, str>): Result<T, str>
 }
 ```
@@ -329,8 +456,8 @@ enum DraftState {
 }
 
 struct Draft<T> {
-	local: Signal<T>,           // bind inputs to this; read like any signal
-	state: Signal<DraftState>,  // bind a status label to this
+	local: SignalCell<T>,           // bind inputs to this; read like any signal
+	state: SignalCell<DraftState>,  // bind a status label to this
 	…                           // internals: synced value, generation, debounce window
 }
 

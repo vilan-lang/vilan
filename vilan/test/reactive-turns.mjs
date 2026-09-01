@@ -76,7 +76,7 @@ function drain(turn) {
 		turn[1].v = true;
 		draining_turns.v.push(__clone(turn));
 		let budget = 100000;
-		while (!($l(turn[0].v)) && budget > 0) {
+		while (!($m(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;
 			turn[0].v = [  ];
 			for (const subscriber of wave) {
@@ -88,25 +88,28 @@ function drain(turn) {
 		turn[1].v = false;
 	}
 }
-function flush($q) {
-	const $r = $q;
-	let $s = null;
-	if ($r[0] === 0) {
-		const turn = $r[1];
-		$s = drain(turn);
+function flush($r) {
+	const $s = $r;
+	let $t = null;
+	if ($s[0] === 0) {
+		const turn = $s[1];
+		$t = drain(turn);
 	} else {
-		$s = undefined;
+		$t = undefined;
 	}
-	return $s;
+	return $t;
 }
 async function tick() {
 
 }
-function $a(value) {
+function $b(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function $c(signal, observer) {
+function $a(value) {
+	return $b(value);
+}
+function $d(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
 	signal[1].v.push([ id, () => {
@@ -115,118 +118,118 @@ function $c(signal, observer) {
 	} ]);
 	return [ signal[1], id, __shared_new([ 1 ]) ];
 }
-function $d(self) {
+function $e(self) {
 	return self[0].v;
 }
-function $b(self, observer) {
-	const subscription = $c(self, observer);
-	observer($d(self));
+function $c(self, observer) {
+	const subscription = $d(self, observer);
+	observer($e(self));
 	return subscription;
 }
-function $l(self) {
+function $m(self) {
 	return self.length === 0;
 }
-function $m(self) {
+function $n(self) {
 	return __list_get(self, self.length - 1);
 }
-function $h(self, $i) {
-	const $j = $i;
-	let $k = null;
-	if ($j[0] === 0) {
-		const turn = $j[1];
-		$k = enqueue(turn, self[1].v);
+function $i(self, $j) {
+	const $k = $j;
+	let $l = null;
+	if ($k[0] === 0) {
+		const turn = $k[1];
+		$l = enqueue(turn, self[1].v);
 	} else {
-		const $n = $m(draining_turns.v);
-		let $o = null;
-		if ($n[0] === 0) {
-			const draining = $n[1];
-			$o = enqueue(draining, self[1].v);
+		const $o = $n(draining_turns.v);
+		let $p = null;
+		if ($o[0] === 0) {
+			const draining = $o[1];
+			$p = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$o = undefined;
+			$p = undefined;
 		}
-		$k = $o;
+		$l = $p;
 	}
-	return $k;
+	return $l;
 }
-function $f(self, value, $g) {
+function $g(self, value, $h) {
 	self[0].v = value;
-	$h(self, $g);
+	$i(self, $h);
 }
-function $v(policy, body) {
+function $w(policy, body) {
 	const fresh = new2();
 	const result = body(fresh);
 	drain(fresh);
 	fresh[2].v = true;
 	return result;
 }
-function $x(body, $y) {
-	const $z = $y;
-	let $A = null;
-	if ($z[0] === 0) {
-		const current = $z[1];
-		$A = body(current);
+function $y(body, $z) {
+	const $A = $z;
+	let $B = null;
+	if ($A[0] === 0) {
+		const current = $A[1];
+		$B = body(current);
 	} else {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[2].v = true;
-		$A = result;
+		$B = result;
 	}
-	return $A;
+	return $B;
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 const a = $a(0);
 const b = $a(0);
-$b(a, (value) => {
+$c(a, (value) => {
 	return console.log("a -> " + value);
 });
-$b(b, (value) => {
+$c(b, (value) => {
 	return console.log("b -> " + value);
 });
 const turn_a = new2();
 const turn_b = new2();
-(($e) => {
-	$f(a, 1, [ 0, $e ]);
+(($f) => {
+	$g(a, 1, [ 0, $f ]);
 	return;
 })(turn_a);
-(($p) => {
-	$f(b, 1, [ 0, $p ]);
-	flush([ 0, $p ]);
+(($q) => {
+	$g(b, 1, [ 0, $q ]);
+	flush([ 0, $q ]);
 	return;
 })(turn_b);
 console.log("mid");
-(($t) => {
-	return flush([ 0, $t ]);
+(($u) => {
+	return flush([ 0, $u ]);
 })(turn_a);
-$v([ 0 ], ($u) => {
-	$f(a, 2, [ 0, $u ]);
-	$f(b, 2, [ 0, $u ]);
+$w([ 0 ], ($v) => {
+	$g(a, 2, [ 0, $v ]);
+	$g(b, 2, [ 0, $v ]);
 	console.log("inside");
 	return;
 });
-$x(($w) => {
-	$f(a, 3, [ 0, $w ]);
+$y(($x) => {
+	$g(a, 3, [ 0, $x ]);
 	console.log("batched");
 	return;
 }, [ 1 ]);
-$v([ 0 ], ($B) => {
-	$x(($C) => {
-		$f(a, 4, [ 0, $C ]);
+$w([ 0 ], ($C) => {
+	$y(($D) => {
+		$g(a, 4, [ 0, $D ]);
 		return;
-	}, [ 0, $B ]);
+	}, [ 0, $C ]);
 	console.log("joined");
 	return;
 });
 const turn_c = new2();
-(($D) => {
+(($E) => {
 	__task(async () => {
 		await (await (tick()));
-		$f(a, 5, [ 0, $D ]);
-		flush([ 0, $D ]);
+		$g(a, 5, [ 0, $E ]);
+		flush([ 0, $E ]);
 		return;
 	}, "main");
 	return;

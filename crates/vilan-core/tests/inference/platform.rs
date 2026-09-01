@@ -2243,11 +2243,11 @@ fn i53_signatures_are_rpc_legal() {
     // and returns are legal.
     assert_compiles(
         r#"
-        import std::reactive::Signal;
+        import std::reactive::{ Signal, SignalCell };
 
         [service(TickClient)]
         struct Ticker {
-            [expose] latest: Signal<i53>,
+            [expose] latest: SignalCell<i53>,
         }
 
         impl Ticker {
@@ -3422,7 +3422,7 @@ fn an_effect_closures_unannotated_parameter_grounds_from_the_signal() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, run_with_owner };
+        import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
         import std::option::Option::{ self, Some, None };
 
         struct Task {
@@ -3430,7 +3430,7 @@ fn an_effect_closures_unannotated_parameter_grounds_from_the_signal() {
         }
 
         fun main() {
-            let entry: Signal<Option<Task>> = Signal::new(Some(Task { name = "a" }));
+            let entry: SignalCell<Option<Task>> = Signal::new(Some(Task { name = "a" }));
             let owner = Owner::new();
             run_with_owner(owner, || {
                 entry.effect(|current| {
@@ -3454,7 +3454,7 @@ fn an_annotated_effect_parameter_destructures_the_signals_payload() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, Owner, run_with_owner };
+        import std::reactive::{ Signal, SignalCell, Owner, run_with_owner };
         import std::option::Option::{ self, Some, None };
 
         struct Task {
@@ -3462,7 +3462,7 @@ fn an_annotated_effect_parameter_destructures_the_signals_payload() {
         }
 
         fun main() {
-            let entry: Signal<Option<Task>> = Signal::new(Some(Task { name = "a" }));
+            let entry: SignalCell<Option<Task>> = Signal::new(Some(Task { name = "a" }));
             let owner = Owner::new();
             run_with_owner(owner, || {
                 entry.effect(|current: Option<Task>| {

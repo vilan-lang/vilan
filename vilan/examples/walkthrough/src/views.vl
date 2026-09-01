@@ -3,7 +3,7 @@
 // the editor commits per keystroke through drafts.
 
 import std::option::Option::{ None, Some, self };
-import std::reactive::{ Draft, DraftState, Signal, draft };
+import std::reactive::{ Draft, DraftState, Signal, SignalCell, draft };
 import std::result::Result::{ Err, Ok, self };
 import std::router::{ link, navigate };
 import std::rpc::{ ConnectionState, RpcError, SocketTransport };
@@ -57,7 +57,7 @@ let muted = const style().color(Color::gray(500));
 
 // The app shell: a connection banner, the sign-in gate, and the routed
 // app. The gate and the app toggle on whether a token exists.
-fun screen(client: NotesClient<SocketTransport>, token: Signal<str>, route: Signal<Route>): View {
+fun screen(client: NotesClient<SocketTransport>, token: SignalCell<str>, route: SignalCell<Route>): View {
 	// The mirror, as a plain signal: `[]` until the first sync lands. Counted
 	// and released when this view is unmounted — the channel is open while,
 	// and only while, the screen is showing. The empty `[]` takes its element
@@ -82,7 +82,7 @@ fun connection_banner(client: NotesClient<SocketTransport>): View {
 
 // Username + password + one button. Register-or-login keeps the surface
 // to a single rpc.
-fun sign_in_panel(client: NotesClient<SocketTransport>, token: Signal<str>): View {
+fun sign_in_panel(client: NotesClient<SocketTransport>, token: SignalCell<str>): View {
 	let username = Signal::new("");
 	let password = Signal::new("");
 	let status = Signal::new("");
@@ -118,9 +118,9 @@ fun sign_in_panel(client: NotesClient<SocketTransport>, token: Signal<str>): Vie
 // The routed app, visible once signed in. Pages swap on the route.
 fun authed_panel(
 	client: NotesClient<SocketTransport>,
-	notes: Signal<List<Note>>,
-	token: Signal<str>,
-	route: Signal<Route>,
+	notes: SignalCell<List<Note>>,
+	token: SignalCell<str>,
+	route: SignalCell<Route>,
 ): View {
 	view("div")
 		.styled(shell)
@@ -135,8 +135,8 @@ fun authed_panel(
 // "/" — the live list plus an add form. Rows are keyed by note id.
 fun home_page(
 	client: NotesClient<SocketTransport>,
-	notes: Signal<List<Note>>,
-	token: Signal<str>,
+	notes: SignalCell<List<Note>>,
+	token: SignalCell<str>,
 ): View {
 	let composing = Signal::new("");
 	let add = || {
@@ -169,7 +169,7 @@ fun home_page(
 		.child(view("ul").bind_each(notes, |note| note.id, |note| note_row(client, note, token)))
 }
 
-fun note_row(client: NotesClient<SocketTransport>, note: Note, token: Signal<str>): View {
+fun note_row(client: NotesClient<SocketTransport>, note: Note, token: SignalCell<str>): View {
 	view("li")
 		.styled(row)
 		.child(link(note.title, Route::Note(note.id)))
@@ -184,8 +184,8 @@ fun note_row(client: NotesClient<SocketTransport>, note: Note, token: Signal<str
 fun note_page(
 	client: NotesClient<SocketTransport>,
 	note_id: i32,
-	notes: Signal<List<Note>>,
-	token: Signal<str>,
+	notes: SignalCell<List<Note>>,
+	token: SignalCell<str>,
 ): View {
 	let entry = notes.map(|list| {
 		mut found: Option<Note> = None;
@@ -211,8 +211,8 @@ fun note_page(
 fun note_editor(
 	client: NotesClient<SocketTransport>,
 	note_id: i32,
-	entry: Signal<Option<Note>>,
-	token: Signal<str>,
+	entry: SignalCell<Option<Note>>,
+	token: SignalCell<str>,
 ): View {
 	let (seed_title, seed_body) = match entry.get() {
 		Some(let note) => (note.title, note.body),

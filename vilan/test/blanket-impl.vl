@@ -1,4 +1,4 @@
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 
 // A BLANKET impl (`impl type T with Trait<T>`) implements a trait for every
 // type at once. It is the LEAST SPECIFIC tier of `spec/types.md` §5.4's
@@ -17,24 +17,24 @@ impl type T with MaybeSignal<T> {
 }
 
 // A signal is a reactive source: the handler subscribes and fires again on
-// every `set`. `Signal<T>` is constructor-headed, so it outranks the blanket
+// every `set`. `SignalCell<T>` is constructor-headed, so it outranks the blanket
 // wherever both match.
-impl Signal<type T> with MaybeSignal<T> {
+impl SignalCell<type T> with MaybeSignal<T> {
 	fun bind(self, react: |T| void) {
 		let _watching = self.sub(react);
 	}
 }
 
 // One parameter, no call-site ceremony: a `str` takes the blanket, a
-// `Signal<str>` takes the signal impl, and neither call site says which.
+// `SignalCell<str>` takes the signal impl, and neither call site says which.
 fun badge<V: MaybeSignal<str>>(label: V) {
 	label.bind(|text| print(i"[{text}]"));
 }
 
-// The SAME `Signal<str>` under a bound written at `Signal<str>` is a static
+// The SAME `SignalCell<str>` under a bound written at `SignalCell<str>` is a static
 // value of that type, through the blanket — the bound decides which
 // instantiation is wanted before specificity is consulted.
-fun holder<V: MaybeSignal<Signal<str>>>(slot: V) {
+fun holder<V: MaybeSignal<SignalCell<str>>>(slot: V) {
 	slot.bind(|inner| print(i"holder {inner.get()}"));
 }
 

@@ -1,6 +1,6 @@
 import std::io::print;
 import std::map::Map;
-import std::reactive::{ Signal, Owner, batch };
+import std::reactive::{ Signal, SignalCell, Owner, batch };
 
 // `Signal::update` (A18, proposal/signal-update.md) — the closure receives a
 // writable view of the STORED value and the runtime notifies ONCE,
@@ -16,7 +16,7 @@ fun main() {
 	print(todos.get().len()); // 3
 
 	// The same method serves a `Map` — no per-container twin.
-	let scores: Signal<Map<str, i32>> = Signal::new(Map::new());
+	let scores: SignalCell<Map<str, i32>> = Signal::new(Map::new());
 	scores.update(|&mut entries| {
 		entries.insert("a", 1);
 		entries.insert("b", 2);

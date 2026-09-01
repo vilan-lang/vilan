@@ -14,7 +14,7 @@
 // client business.
 //
 // The read-only binders take a `Source<T>` bound rather than a concrete
-// `Signal<T>` (A33), in LOCKSTEP with the browser twin — the same component
+// `SignalCell<T>` (A33), in LOCKSTEP with the browser twin — the same component
 // source compiles through both layers, so a widening on one side that the other
 // lacks would make a custom-source component client-only. `bind_value` and
 // `bind_draft` stay concrete on both sides for the same reason: their browser
@@ -30,7 +30,7 @@
 
 import pkg::compare::PartialEq;
 import pkg::option::Option::{ None, self };
-import pkg::reactive::{ Draft, Owner, Signal, Source, owner_scope, run_with_owner, turn_scope };
+import pkg::reactive::{ Draft, Owner, Signal, SignalCell, Source, owner_scope, run_with_owner, turn_scope };
 import pkg::shared::Shared;
 import pkg::style::Style;
 
@@ -141,7 +141,7 @@ impl View {
 	}
 
 	/// An attribute. The value's TYPE decides its life
-	/// (proposal/element-syntax.md §5): a `str` sets once; a `Signal<str>` is
+	/// (proposal/element-syntax.md §5): a `str` sets once; a `SignalCell<str>` is
 	/// read once, exactly `bind_attr`. Anything `AttrValue` fills the slot.
 	fun attr<V: AttrValue>(self, name: str, value: V): View {
 		value.apply(self, name);
@@ -168,7 +168,7 @@ impl View {
 
 	/// Append content. Anything `Slot` fills a child position
 	/// (proposal/element-syntax.md §5): a `View` appends as an element, a
-	/// `str` as a text node, a `Signal<str>` as a text node read once, a
+	/// `str` as a text node, a `SignalCell<str>` as a text node read once, a
 	/// `List<View>` appends each.
 	fun child<C: Slot>(self, content: C): View {
 		content.place(self);
@@ -212,8 +212,9 @@ impl View {
 
 	/// A two-way input bind, server side: the input renders with its current
 	/// value. The write-back listener is client business — accepted and dropped.
-	/// Concrete `Signal`, matching the browser twin's write-back half (A33).
-	fun bind_value(self, signal: Signal<str>): View {
+	/// Bounded on `Signal<str>`, matching the browser twin's write-back half
+	/// (A32): it writes on the client, so it asks for the writable trait.
+	fun bind_value<S: Signal<str>>(self, signal: S): View {
 		set_attribute(self.attributes, "value", signal.get());
 		self
 	}
@@ -288,7 +289,7 @@ impl View {
 /// the type-directed half of `child`: the value's type carries the
 /// static-vs-tracked distinction; on this twin every arm reads once.
 ///
-/// The tracked arm stays `Signal<str>` rather than `Source<str>` — DEFERRED
+/// The tracked arm stays `SignalCell<str>` rather than `Source<str>` — DEFERRED
 /// with the browser twin's (A33): widening a trait ARM means a blanket impl
 /// (`impl S: Source<str> with Slot`), which is B158's machinery, not a bound on
 /// an ordinary generic parameter.
@@ -312,7 +313,8 @@ impl str with Slot {
 }
 
 /// A text node, read once — the value at render time is the value served.
-impl Signal<str> with Slot {
+/// A BLANKET over the read trait (B158/B165), like the browser twin.
+impl type S: Source<str> with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Text(self.get()));
 	}
@@ -329,7 +331,7 @@ impl List<View> with Slot {
 
 /// Something that can fill an attribute value (proposal/element-syntax.md §5) —
 /// what `<div name(value)>` desugars through (`.attr`, never `.bind_attr`).
-/// Widening the tracked arm past `Signal<str>` is deferred to B158 (see `Slot`).
+/// The tracked arm is a BLANKET over `Source<str>` (B158/B165).
 /// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
 trait AttrValue {
 	fun apply(self, parent: View, name: str);
@@ -342,8 +344,8 @@ impl str with AttrValue {
 	}
 }
 
-/// Read once — exactly `bind_attr`.
-impl Signal<str> with AttrValue {
+/// Read once — exactly `bind_attr`, for every `Source<str>`.
+impl type S: Source<str> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		set_attribute(parent.attributes, name, self.get());
 	}
@@ -415,13 +417,13 @@ fun render(view: View): str {
 /// `std::router::pending`/`chunk_error` re-export them, and the two `ui` layers
 /// declare the same surface — a component that binds one renders on both sides.
 /// KEEP IN STEP with the browser twin (browser/ui.vl).
-let chunk_pending_signal: Signal<bool> = Signal::new(false);
-let chunk_error_signal: Signal<Option<str>> = Signal::new(None);
+let chunk_pending_signal: SignalCell<bool> = SignalCell::new(false);
+let chunk_error_signal: SignalCell<Option<str>> = SignalCell::new(None);
 
-fun chunk_pending(): Signal<bool> {
+fun chunk_pending(): SignalCell<bool> {
 	chunk_pending_signal
 }
 
-fun chunk_failure(): Signal<Option<str>> {
+fun chunk_failure(): SignalCell<Option<str>> {
 	chunk_error_signal
 }

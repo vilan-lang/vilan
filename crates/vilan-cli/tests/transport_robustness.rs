@@ -153,11 +153,11 @@ impl Drop for LineChild {
     }
 }
 
-const COMMON: &str = r#"import std::reactive::Signal;
+const COMMON: &str = r#"import std::reactive::{ Signal, SignalCell };
 
 [service(StatusClient)]
 struct StatusBoard {
-	[expose] status: Signal<i32>,
+	[expose] status: SignalCell<i32>,
 }
 
 impl StatusBoard {
@@ -190,7 +190,7 @@ impl StatusBoard {
 ///   re-check exists to catch.
 #[cfg(unix)]
 const SERVER: &str = r#"import std::io::print;
-import std::reactive::Signal;
+import std::reactive::{ Signal, SignalCell };
 import std::json::json_codec;
 import std::option::Option::{ self, Some, None };
 import std::process::args;
@@ -201,7 +201,7 @@ import common::StatusBoard;
 // A second service with a DIFFERENT contract surface — the redeployed server.
 [service(DriftClient)]
 struct DriftBoard {
-	[expose] tally: Signal<i32>,
+	[expose] tally: SignalCell<i32>,
 }
 
 impl DriftBoard {
