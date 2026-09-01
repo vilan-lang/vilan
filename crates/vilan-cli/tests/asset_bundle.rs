@@ -366,6 +366,104 @@ fn a_resource_that_is_already_in_place_is_not_copied_over_itself() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// G19's doctrine, made observable: **a symlink is a supported spelling of
+/// project layout**, not an escape. A static tree named through a link inside
+/// the package is read, bundled and tracked exactly as a real directory is —
+/// which is how a shared icon set or a vendored asset folder gets its name in a
+/// package — and the containment fence, which is on the path as WRITTEN, has
+/// nothing to say about it.
+///
+/// The refusal message used to claim otherwise ("paths resolve inside the
+/// package root"), naming a resolution the fence does not perform; both halves
+/// are pinned here, the spelling that is refused and the one that is not.
+///
+/// `cfg(unix)`: creating a symlink needs a privilege Windows does not grant by
+/// default (audit run 7 owns the Windows half of symlink behavior). Nothing in
+/// the FIX is platform-specific.
+#[cfg(unix)]
+#[test]
+fn the_const_channel_reads_and_bundles_through_a_symlinked_tree() {
+    let dir = temp_project("linked_assets");
+    write(&dir, "vilan.toml", "[package]\nname = \"linked\"\n");
+    write(&dir, "vendor/icons/check.svg", ICON);
+    write(&dir, "vendor/icons/note.txt", "read through the link\n");
+    std::fs::create_dir_all(dir.join("src")).expect("the package source root");
+    std::os::unix::fs::symlink("../vendor/icons", dir.join("src/icons"))
+        .expect("link the vendored tree into the package");
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::asset::{ bundle, read, read_dir };\n\
+         import std::io::print;\n\
+         \n\
+         let icon = const bundle(\"icons/check.svg\");\n\
+         let note = const read(\"icons/note.txt\");\n\
+         let names = const read_dir(\"icons\");\n\
+         \n\
+         fun main() {\n\
+         \tprint(icon);\n\
+         \tprint(note);\n\
+         \tprint(names.len());\n\
+         }\nmain();\n",
+    );
+    let output = vilan(&["build", "--stdout", dir.to_str().expect("utf-8 temp path")]);
+    let javascript = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{text}");
+    assert!(
+        javascript.contains("read through the link"),
+        "`asset::read` folded the file behind the link into the output:\n{text}"
+    );
+    assert!(
+        javascript.contains("/icons/check.svg"),
+        "`asset::bundle` registered the resource by the name it was given:\n{text}"
+    );
+    assert!(
+        javascript.contains("\"check.svg\"") && javascript.contains("\"note.txt\""),
+        "`asset::read_dir` listed the tree behind the link:\n{javascript}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("vendor/icons/check.svg"))
+            .ok()
+            .as_deref(),
+        Some(ICON),
+        "and the tree it points at is untouched"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The half that IS refused, and the wording that says why. The fence is on the
+/// SPELLING — `..` and an absolute path — so the message must not claim to have
+/// resolved anything, which is the correction G19 asked for.
+#[test]
+fn the_containment_refusal_speaks_about_the_path_as_written() {
+    let dir = temp_project("written_fence");
+    write(&dir, "vilan.toml", "[package]\nname = \"fenced\"\n");
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::asset::read;\n\
+         let _outside = const read(\"../outside.txt\");\n\
+         fun main() {}\nmain();\n",
+    );
+    let output = vilan(&["build", dir.to_str().expect("utf-8 temp path")]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("stay inside the package root as written"),
+        "the refusal names the rule it actually applies:\n{text}"
+    );
+    assert!(
+        !text.contains("resolve inside the package root"),
+        "and never claims a resolution it does not perform:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `run --watch` recopies a resource that changed — which is what makes
 /// `asset_body`'s watch-mode re-read see new bytes rather than the copy round 1
 /// left in `dist/`.

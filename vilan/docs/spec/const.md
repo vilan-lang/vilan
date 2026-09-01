@@ -58,6 +58,29 @@ deterministic *per build-input closure*: same sources and same project
 files, same output — `emit` same lines out, `read` same values in,
 `bundle` same files carried.
 
+That containment rule is a rule about the path you **write**. A
+**symlink is a supported spelling of project layout**, not an escape: a
+link is an ordinary way a tree gets its name inside a package — a
+shared icon set, a generator's output directory, a vendored asset
+folder — so the channel follows one, reads what it points at, and
+tracks that file as the build input it is. What the fence refuses is a
+path that *says* it is leaving (an absolute path, a `..`); it does not
+refuse a name that happens to resolve elsewhere, and it never claims to
+have resolved anything.
+
+The same doctrine governs the rest of the toolchain, so one project
+layout means one thing everywhere: paths resolve honestly, every fence
+and scope is applied to the **resolved** tree, and a walk that follows
+links guards against cycles. Concretely — a `[[build.hook]]`'s declared
+input is followed and hashed as what it points at, while links *inside*
+a declared tree hash as their target path rather than being followed
+(so the hash can neither leave the tree nor loop); a package's
+`generated` root is still that package's products when the directory is
+a link out of the package; and `vilan fmt` walks a directory link,
+recognizes a directory it has already walked under another name, and
+stops at a link whose target leaves the project — saying so, since that
+is where the command's scope ends and not a judgement about the link.
+
 A function that reaches any verb of the channel — `emit`, `emit_keyed`,
 `read`, `bundle`, `bundle_as`, `read_dir`, `read_dir_all`, `digest` — is
 **compile-time-only**,

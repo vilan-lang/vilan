@@ -4877,7 +4877,7 @@ fn an_absolute_read_path_is_refused() {
     //
     // The path is per-platform because `is_absolute` is (N26): a POSIX
     // `/etc/hostname` is NOT absolute to Windows, which wants a drive prefix,
-    // so hardcoding it tested the sibling `escapes it` arm there and asserted
+    // so hardcoding it tested the sibling `leaves it` arm there and asserted
     // this arm's wording against it. Both arms refuse on both platforms — the
     // POSIX spelling reaches Windows' escape check as a `RootDir` component —
     // so what was wrong was the pin, not the fence. This one names THIS arm on
@@ -4933,7 +4933,7 @@ fn a_read_path_escaping_the_package_root_is_refused() {
         }
         main();
         "#,
-        "`asset::read` paths resolve inside the package root; `../outside.md` escapes it",
+        "`asset::read` paths stay inside the package root as written; `../outside.md` leaves it",
     );
 }
 
@@ -4949,7 +4949,7 @@ fn a_read_path_escaping_the_package_root_is_refused() {
 // be a single path segment. Backlog E94.
 
 /// The wording the fix should use, mirroring the read fence's shape ("`…` paths
-/// resolve inside the package root; `…` escapes it") for the write direction.
+/// stay inside the package root as written; `…` leaves it") for the write direction.
 const EMIT_KIND_REFUSAL: &str = "`asset::emit` kinds name one file beside the build output";
 
 #[test]

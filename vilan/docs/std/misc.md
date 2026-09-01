@@ -255,7 +255,12 @@ text at build time, so its result can fold into the output —
 page into the bundle as plain data. The path is **relative to the
 package root** (the base imports resolve under, never the process
 working directory); an absolute path or one that escapes the root is
-refused. Every file read becomes a **tracked build input**: `--watch`
+refused. That rule is about the path you *write*: a **symlink is
+ordinary project layout**, so `asset::read("icons/check.svg")` reads
+what the name points at wherever the file actually lives, and tracks it
+as the input it is — what gets refused is a path spelled with `..` or a
+root, never a name that happens to resolve elsewhere.
+Every file read becomes a **tracked build input**: `--watch`
 re-runs when one changes (or when a previously missing one appears),
 and an unchanged-source round still recompiles a leg whose read inputs
 changed. A missing file is a compile error at the `const` expression.
