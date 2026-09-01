@@ -262,7 +262,6 @@ trap cleanup EXIT INT TERM
 write_client() { # dir
     mkdir -p "$1/src"
     cat > "$1/src/client.vl" <<'CLIENT'
-import std::print;
 import std::asset::emit;
 
 fun styles(): i32 {
@@ -285,7 +284,6 @@ CLIENT
 write_watch_server() { # dir round
     cat > "$1/src/server.vl" <<SERVER
 import std::http::{ Response, Server };
-import std::print;
 import std::process;
 import std::time::sleep;
 
@@ -346,7 +344,6 @@ import std::build::require_build;
 import std::document::Document;
 import std::http::{ Response, Server };
 import std::json::json_codec;
-import std::print;
 import std::process;
 import std::reactive::{ Signal, SignalCell };
 import std::rpc_server::Service;
