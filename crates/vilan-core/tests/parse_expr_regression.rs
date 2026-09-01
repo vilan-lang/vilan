@@ -218,11 +218,13 @@ fn the_postfix_chain_and_lift_grouping_are_pinned() {
 fn element_atoms_are_pinned() {
     // The element form's parse shape, span-inclusive (element-syntax S2): one
     // attribute head item, one string child. The desugar-critical structure —
-    // head item kinds, child list, tag span — is all visible here.
+    // head item kinds, child list, tag span — is all visible here, and so are
+    // the four angle-bracket spans the editor paints from (E115): `<` at
+    // 14..15, the head's `>` at 27..28, `</` at 32..34 and its `>` at 35..36.
     snapshot("<p class(\"x\")>\"hi\"</p>", SNAP_ELEMENT);
 }
 
-const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: 15..16, head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [Bare((String(\"hi\"), 28..32))], self_closing: false, close_tag: Some(34..35) }), 14..36)";
+const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: 15..16, head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [Bare((String(\"hi\"), 28..32))], self_closing: false, close_tag: Some(34..35), punctuation: [14..15, 27..28, 32..34, 35..36] }), 14..36)";
 
 #[test]
 fn the_is_tier_and_condition_heads_are_pinned() {

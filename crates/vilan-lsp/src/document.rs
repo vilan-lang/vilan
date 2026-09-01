@@ -745,12 +745,14 @@ pub struct PublishedHop {
 }
 
 /// The markup spans of a raw parse (element-syntax S5): tag names (open and
-/// close), attribute and event names, and the desugar-scaffolding spans whose
-/// analyzed tokens the markup replaces.
+/// close), the angle brackets around them, attribute and event names, and the
+/// desugar-scaffolding spans whose analyzed tokens the markup replaces.
 #[derive(Default)]
 struct MarkupSpans {
     scaffolding: Vec<Span>,
     tags: Vec<Span>,
+    /// The elements' angle brackets — `<`, `>`, `</`, `/>` (E115).
+    punctuation: Vec<Span>,
     attributes: Vec<Span>,
 }
 
@@ -762,6 +764,7 @@ fn collect_markup_spans(
     if let Node::Element(body) = &node.0 {
         out.scaffolding.push((node.1.start..body.tag.end).into());
         out.tags.push(body.tag);
+        out.punctuation.extend(body.punctuation.iter().copied());
         if let Some(close) = body.close_tag {
             out.tags.push(close);
         }
@@ -2173,6 +2176,18 @@ impl Document {
                 tokens.retain(|(span, _, _)| !scaffolding.contains(&(span.start, span.end)));
             }
             for span in markup.tags {
+                tokens.push((span, TokenKind::Tag, 0));
+            }
+            // E115: the angle brackets paint as the tag they belong to. Until
+            // now the analyzed stream said nothing about them and the TextMate
+            // grammar was the only thing coloring them — which is fine for a
+            // one-line head and wrong the moment attributes spread out, because
+            // a grammar rule is matched one line at a time and a `>` that lands
+            // on a line of its own has no `<tag` in front of it to be part of.
+            // It fell through to the operator list and read as a comparison.
+            // The parse knows exactly where these are whatever shape the head
+            // was written in, so the two sources agree by construction.
+            for span in markup.punctuation {
                 tokens.push((span, TokenKind::Tag, 0));
             }
             for span in markup.attributes {
@@ -5974,6 +5989,13 @@ pub(crate) mod tests {
         );
         // The `<div` scaffolding Function token is suppressed.
         assert_eq!(kind_of("<div", 0), None, "{tokens:?}");
+        // E115: the angle brackets themselves paint too, as the tag they
+        // belong to — the open `<`, the head's `>`, a `/>`, and the close
+        // tag's `</` and `>`.
+        assert_eq!(kind_of("<", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of(">", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("/>", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("</", 0), Some(TokenKind::Tag), "{tokens:?}");
         // The invariant the sweep guarantees, re-checked over markup.
         let mut last_end = 0usize;
         for (span, _, _) in &tokens {
@@ -5984,6 +6006,45 @@ pub(crate) mod tests {
             );
             last_end = range.end;
         }
+    }
+
+    // E115: the owner's report — a head whose attributes span lines, with the
+    // closing `>` on a line of its own, loses that bracket's highlight. The
+    // rule this pins is that the SHAPE of the head cannot change the tokens:
+    // the same head written one-line and multi-line paints the same things, in
+    // the same order, with the same kinds. That is a property only a
+    // parse-driven source can have — a TextMate rule is matched one line at a
+    // time, so the `>` is out of its reach the moment it leaves the tag's line.
+    #[test]
+    fn a_multi_line_element_head_paints_what_a_one_line_head_paints() {
+        let prelude = "import std::ui::{ view, View };\n\nfun page(): View {\n";
+        let one_line =
+            format!("{prelude}\t<div aria-label(\"x\") on:click(handle)>\"hi\"</div>\n}}\n");
+        let multi_line = format!(
+            "{prelude}\t<div\n\t\taria-label(\"x\")\n\t\ton:click(handle)\n\t>\"hi\"</div>\n}}\n"
+        );
+        // Each token as (the source text it covers, its kind) — the shape a
+        // reader sees painted, independent of where the bytes landed.
+        let painted = |text: &str| -> Vec<(String, TokenKind)> {
+            let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+            document
+                .semantic_tokens()
+                .into_iter()
+                .map(|(span, kind, _)| (text[span.into_range()].to_string(), kind))
+                .collect()
+        };
+        let flat = painted(&one_line);
+        assert_eq!(
+            flat,
+            painted(&multi_line),
+            "the head's shape must not change what is painted",
+        );
+        // …and the terminator is in there, painted as its tag rather than left
+        // to fall through to the operator list as a comparison.
+        assert!(
+            flat.contains(&(">".to_string(), TokenKind::Tag)),
+            "the head's closing `>` is painted: {flat:?}",
+        );
     }
 
     #[test]
