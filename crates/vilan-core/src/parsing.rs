@@ -102,6 +102,12 @@ pub enum ParseErrorReason {
     /// prohibition explains itself and names the sanctioned spelling). The
     /// misplaced-`resource` steer is the one case today.
     Rule(&'static str),
+    /// The visibility-marker rule ([`visibility_marker_rule`]) — the one curated
+    /// rule whose text quotes a word from the SOURCE, so it carries the marker
+    /// instead of a finished `&'static str`. Only the two spellings
+    /// [`Parser::visibility_marker_before`] recognizes ever reach here, which is
+    /// what keeps the payload `'static`.
+    VisibilityMarker { marker: &'static str },
     /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
     /// The span is the GAP — the last character of the token before the one that
     /// could not continue the statement — so the diagnostic sits where the `;`
@@ -128,6 +134,27 @@ pub enum Found {
     Token(String),
     Character(char),
     EndOfInput,
+}
+
+/// What [`Parser::recover_missing_terminator`] did with the statement it read —
+/// three outcomes where there used to be two, because "reported it" and "kept
+/// it" are not the same decision.
+enum TerminatorRecovery<'src> {
+    /// Not the missing-`;` shape at all: nothing was reported, the cursor has
+    /// not moved, and the caller's next recovery step applies.
+    Declined,
+    /// Reported and KEPT. The statement is real code the parser read perfectly
+    /// well, and dropping it would unbind names the rest of the file uses —
+    /// `recover_missing_terminator`'s whole argument.
+    Kept(Spanned<Node<'src>>),
+    /// Reported and DROPPED, because the statement IS the mistake. A
+    /// `pub`/`public` visibility marker reads as a bare identifier expression
+    /// that binds nothing, so keeping it handed the analyzer a name nothing
+    /// declares and the one curated refusal arrived beside `cannot find 'pub'
+    /// in this scope` — a cascade off a word already refused (E109's F10). The
+    /// cursor has still advanced past the marker, so the item below it parses
+    /// normally and the caller's loop cannot spin.
+    Dropped,
 }
 
 /// The expectation a statement terminator records ([`Parser::note_terminator`]),
@@ -180,10 +207,19 @@ pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` b
 /// item, and the located failure is a missing `;` three columns in — true, and
 /// useless. Vilan has no visibility marker to reach for: a module's items are
 /// importable as written (E101).
-const PUB_IS_NOT_A_KEYWORD: &str = "`pub` is not a vilan keyword: a module's items are importable as they stand — \
-     `import pkg::util::helper;` reaches `fun helper` with nothing marking it — so the \
-     fix is to delete the word. (`export` exists, but it RE-exports something this \
-     module imported: `export import pkg::io::panic;`.)";
+///
+/// The marker is quoted back from the source rather than fixed at `pub`:
+/// `public` is the same reflex one synonym over, and it was being refused in a
+/// word its author never wrote (E109's F21). That is the only reason this is a
+/// function where every other curated rule is a constant.
+fn visibility_marker_rule(marker: &str) -> String {
+    format!(
+        "`{marker}` is not a vilan keyword: a module's items are importable as they stand — \
+         `import pkg::util::helper;` reaches `fun helper` with nothing marking it — so the \
+         fix is to delete the word. (`export` exists, but it RE-exports something this \
+         module imported: `export import pkg::io::panic;`.)"
+    )
+}
 
 /// The rule `let mut x = …` breaks. Curated (diagnostics-standard.md B6): `let`
 /// and `mut` are the two BINDING FORMS, not a keyword and a modifier on it, so
@@ -277,6 +313,7 @@ pub fn render(error: &ParseError) -> String {
 
     let mut message = match &error.reason {
         ParseErrorReason::Rule(rule) => rule.to_string(),
+        ParseErrorReason::VisibilityMarker { marker } => visibility_marker_rule(marker),
         ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
         ParseErrorReason::Unclosed { delimiter } => format!(
             "unclosed `{delimiter}`: expected a matching `{}`",
@@ -1022,10 +1059,10 @@ impl<'a, 'src> Parser<'a, 'src> {
         // mistake. Recognized structurally — the identifier `pub`, immediately
         // before a token that starts a fresh statement or item — never by
         // matching the message.
-        if let Some(marker) = self.visibility_marker_before(position) {
+        if let Some((at, marker)) = self.visibility_marker_before(position) {
             self.errors.push(ParseError {
-                span: self.token_span(marker),
-                reason: ParseErrorReason::Rule(PUB_IS_NOT_A_KEYWORD),
+                span: self.token_span(at),
+                reason: ParseErrorReason::VisibilityMarker { marker },
                 context,
                 hint: None,
             });
@@ -1073,21 +1110,26 @@ impl<'a, 'src> Parser<'a, 'src> {
         });
     }
 
-    /// The index of a `pub`-style visibility marker standing immediately before
-    /// `position`, when `position` starts a fresh statement or item — the shape
+    /// The `pub`-style visibility marker standing immediately before `position`,
+    /// when `position` starts a fresh statement or item — the shape
     /// `pub fun helper()` takes once `pub` lexes as the ordinary identifier it
     /// is. `public` is included: it is the same reflex, one synonym over.
-    fn visibility_marker_before(&self, position: usize) -> Option<usize> {
+    ///
+    /// Answers the marker's token index AND its spelling, because the rule
+    /// quotes the word that was written (E109) — and the spelling is `'static`
+    /// because only these two literals ever match.
+    fn visibility_marker_before(&self, position: usize) -> Option<(usize, &'static str)> {
         let previous = position.checked_sub(1)?;
-        let marker = matches!(
-            self.tokens.get(previous),
-            Some((Token::Ident("pub" | "public"), _))
-        );
+        let marker: &'static str = match self.tokens.get(previous) {
+            Some((Token::Ident("pub"), _)) => "pub",
+            Some((Token::Ident("public"), _)) => "public",
+            _ => return None,
+        };
         let starts_fresh = self
             .tokens
             .get(position)
             .is_some_and(|(token, _)| starts_statement_or_item(token));
-        (marker && starts_fresh).then_some(previous)
+        starts_fresh.then_some((previous, marker))
     }
 
     /// Whether the failure at `position` lies inside an interpolation HOLE, in
@@ -1315,8 +1357,13 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// head (or `}`, or end of input) counts, never an identifier or a literal:
     /// `print 1);` would resume at `1`, which is not a statement anyone wrote, so
     /// it takes the skipping path and reports once (§5.2's accepted outcome).
-    fn recover_missing_terminator(&mut self) -> Option<Spanned<Node<'src>>> {
-        let statement = self.attempt(|parser| {
+    ///
+    /// The ONE statement that is dropped rather than kept is the one that IS the
+    /// mistake: a `pub`/`public` visibility marker, which reads as a bare
+    /// identifier expression binding nothing (E109 — see
+    /// [`TerminatorRecovery::Dropped`]).
+    fn recover_missing_terminator(&mut self) -> TerminatorRecovery<'src> {
+        let Some(statement) = self.attempt(|parser| {
             // The three forms that take a terminator — the same three
             // `note_terminator` records one for.
             let body = parser
@@ -1327,13 +1374,22 @@ impl<'a, 'src> Parser<'a, 'src> {
                 || parser.peek_is_ctrl('}')
                 || parser.peek().is_some_and(starts_statement_or_item);
             at_a_fresh_statement.then_some(body)
-        })?;
+        }) else {
+            return TerminatorRecovery::Declined;
+        };
+        // Asked BEFORE the report, of the same predicate `emit_failure` routes
+        // on, so "the visibility rule was emitted" and "the statement is the
+        // marker" can never disagree.
+        let marker = self.visibility_marker_before(self.position).is_some();
         self.emit_failure(
             self.position,
             vec![TERMINATOR_EXPECTED.to_string()],
             Vec::new(),
         );
-        Some(statement)
+        match marker {
+            true => TerminatorRecovery::Dropped,
+            false => TerminatorRecovery::Kept(statement),
+        }
     }
 
     /// The located diagnostic for a statement that declined at `start`: the
@@ -1627,8 +1683,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             match self.parse_statement() {
                 Some(statement) => statements.push(statement),
                 None => match self.recover_missing_terminator() {
-                    Some(statement) => statements.push(statement),
-                    None => {
+                    TerminatorRecovery::Kept(statement) => statements.push(statement),
+                    TerminatorRecovery::Dropped => {}
+                    TerminatorRecovery::Declined => {
                         if let Some(swallowed) = self.recover_statement(self.position, false) {
                             statements.push(swallowed);
                         }
@@ -3454,9 +3511,13 @@ impl<'a, 'src> Parser<'a, 'src> {
                 tail = Some(expression);
                 break;
             }
-            if let Some(statement) = self.recover_missing_terminator() {
-                statements.push(statement);
-                continue;
+            match self.recover_missing_terminator() {
+                TerminatorRecovery::Kept(statement) => {
+                    statements.push(statement);
+                    continue;
+                }
+                TerminatorRecovery::Dropped => continue,
+                TerminatorRecovery::Declined => {}
             }
             if let Some(swallowed) = self.recover_statement(self.position, true) {
                 statements.push(swallowed);

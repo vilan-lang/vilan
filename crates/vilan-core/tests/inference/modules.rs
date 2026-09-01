@@ -5516,6 +5516,98 @@ fn an_async_drop_in_a_module_is_attributed_to_the_module() {
     );
 }
 
+// --- E108: an unresolved TYPE name is attributed like its value twin --------
+//
+// The two positions are one mechanism with one difference: the value site
+// attributes its diagnostic to the file the name was walked from and the type
+// site did not. Both are raised out of a queue drained in `build()`, long after
+// the per-file walks, so an unattributed one keeps whatever `current_source_id`
+// the last walk left — std's `lib.vl` — and the span then indexes a comment in
+// a file the author has never opened. (The prelude lane's find, Order 22.)
+
+#[test]
+fn an_unresolved_type_in_a_module_is_attributed_to_the_module() {
+    const ALPHA: &str = "fun make(): Widget {\n\t1\n}\n";
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::alpha::make;\nfun main() { make(); }\n",
+            ),
+            ("alpha.vl", ALPHA),
+        ],
+        "main.vl",
+    );
+    let (message, span, file) = outcome
+        .diagnostics
+        .iter()
+        .find(|(message, _, _)| message.contains("cannot find type 'Widget'"))
+        .expect("the unresolved type is reported");
+    let start = ALPHA.find("Widget").unwrap();
+    assert_eq!(
+        (file.as_deref(), span.clone()),
+        (Some("alpha.vl"), start..start + "Widget".len()),
+        "the annotation belongs to the module that wrote it: {message}"
+    );
+}
+
+#[test]
+fn an_unresolved_value_in_a_module_is_attributed_to_the_module_too() {
+    // The control the type case is measured against — green before E108 and
+    // after it, which is what makes the pair a claim about ONE mechanism.
+    const ALPHA: &str = "fun make(): i32 {\n\twidget_value\n}\n";
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::alpha::make;\nfun main() { make(); }\n",
+            ),
+            ("alpha.vl", ALPHA),
+        ],
+        "main.vl",
+    );
+    let (message, span, file) = outcome
+        .diagnostics
+        .iter()
+        .find(|(message, _, _)| message.contains("cannot find 'widget_value'"))
+        .expect("the unresolved value is reported");
+    let start = ALPHA.find("widget_value").unwrap();
+    assert_eq!(
+        (file.as_deref(), span.clone()),
+        (Some("alpha.vl"), start..start + "widget_value".len()),
+        "the read belongs to the module that wrote it: {message}"
+    );
+}
+
+#[test]
+fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
+    // The other diagnostic the same drain raises, carrying the same defect: an
+    // annotation that RESOLVED, to a trait, in value position (§12.2).
+    const ALPHA: &str =
+        "trait Shape {\n\tfun area(&self): i32;\n}\n\nfun size(shape: Shape): i32 {\n\t0\n}\n";
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::alpha::size;\nfun main() { size(1); }\n",
+            ),
+            ("alpha.vl", ALPHA),
+        ],
+        "main.vl",
+    );
+    let (message, span, file) = outcome
+        .diagnostics
+        .iter()
+        .find(|(message, _, _)| message.contains("'Shape' is a trait, not a type"))
+        .expect("the bare trait in value position is refused");
+    let start = ALPHA.find("shape: Shape").unwrap() + "shape: ".len();
+    assert_eq!(
+        (file.as_deref(), span.clone()),
+        (Some("alpha.vl"), start..start + "Shape".len()),
+        "the refusal belongs to the module that wrote the annotation: {message}"
+    );
+}
+
 #[test]
 fn an_entry_global_does_not_resolve_through_a_std_module_path() {
     // B52: `path::name` addresses what the namespace DECLARES. The member
