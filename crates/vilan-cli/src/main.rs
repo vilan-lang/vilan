@@ -1992,9 +1992,36 @@ fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
     Some((metadata.dev(), metadata.ino()))
 }
 
+/// `fs::canonicalize` rather than [`vilan_core::util::canonical_path`], and the
+/// difference is the whole guard (audit run 7's F6). `canonical_path` NEVER
+/// fails: where the resolution fails it degrades to the lexical
+/// `normalize_components`, which is the right answer for a comparison KEY over a
+/// path that may not be on disk, and the wrong one for an IDENTITY. The two
+/// agree while the resolution succeeds — and while it does, an ordinary junction
+/// cycle is caught either way, because both spellings resolve to one directory.
+///
+/// It is the failure that mattered, and the old code could not express it. A
+/// cycle spells one directory `src/l1`, `src/l1/l1`, `src/l1/l1/l1`, …, so the
+/// moment resolution stops answering, the lexical fallback mints a DISTINCT key
+/// at every level: [`visited`](TreeWalk::visited) never collides, the `else` arm
+/// below never runs — it was unreachable, since `Some` was the only value this
+/// function could return — and the walk fans out with nothing behind it, because
+/// [`TreeWalk::walk`] has no depth cap and there is no ELOOP on this side to
+/// backstop it. `None` is the sentence "I cannot identify this directory", and
+/// to the consumer it means STOP: the same thing the unix arm above already says
+/// when `fs::metadata` fails, and the safe answer to every way resolution can
+/// fail (an ACL that lets `read_dir` list a directory `CreateFileW` cannot open,
+/// a volume going away mid-walk). Stopping at a directory it cannot identify
+/// beats re-walking a tree it cannot recognize.
+///
+/// The verbatim (`\\?\`) prefix `canonicalize` returns is kept. This value is
+/// only ever compared with another produced right here, so the one property it
+/// needs is that one directory yields one key however it was reached; stripping
+/// is [`vilan_core::util::canonical_path`]'s job, for the keys that have to meet
+/// join-built paths.
 #[cfg(not(unix))]
 fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
-    Some(vilan_core::util::canonical_path(path))
+    fs::canonicalize(path).ok()
 }
 
 /// One walk of a project tree, with the two guards a link-following walk needs

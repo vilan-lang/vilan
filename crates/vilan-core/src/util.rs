@@ -501,6 +501,67 @@ mod tests {
         assert_eq!(strip_verbatim_prefix(r"\\?\pipe\vilan"), r"\\?\pipe\vilan");
     }
 
+    /// [`strip_verbatim_prefix`]'s doc justifies stripping UNCONDITIONALLY on
+    /// the grounds that "the result is a comparison key, never a path we
+    /// reopen". Audit run 7 checked, and three callers reopen it:
+    /// `TreeWalk::rooted_at` stats the canonical root (`is_dir()`,
+    /// `main.rs` ~2039), `find_project_root` probes `vilan.toml` beside every
+    /// ancestor of one (`main.rs` ~4069), and `generated_root_in` reads that
+    /// file's bytes (`manifest.rs` ~807). So the caveat `dunce` exists to
+    /// respect — that an ordinary spelling cannot always address what a verbatim
+    /// one can — is live here rather than excluded by construction.
+    ///
+    /// It holds, and this pin is why it is allowed to: `std` re-applies the
+    /// verbatim form itself on the way back in (`maybe_verbatim`), so a path
+    /// past `MAX_PATH` survives the round trip through the stripped spelling.
+    /// That is a property of the standard library, not of this module, which is
+    /// exactly the kind of thing that changes underneath a comment. The pin
+    /// turns the caveat into a gate, on the longest path the callers can hand
+    /// back — `cfg(windows)` because `MAX_PATH` and the prefix are only there.
+    #[cfg(windows)]
+    #[test]
+    fn a_stripped_canonical_path_is_still_openable() {
+        let base = std::env::temp_dir().join(format!("vilan-longpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Comfortably past `MAX_PATH` (260): the verbatim prefix is the only
+        // thing that lets Win32 address a path this long, so removing it is
+        // precisely the risk under test.
+        let mut deep = base.clone();
+        for _ in 0..12 {
+            deep.push("directory_with_a_name_long_enough_to_pass_max_path");
+        }
+        assert!(
+            deep.as_os_str().len() > 260,
+            "the probe must actually be a long path: {}",
+            deep.display()
+        );
+        std::fs::create_dir_all(&deep).expect("create a path past MAX_PATH");
+        std::fs::write(deep.join("vilan.toml"), "[package]\nname = \"app\"\n").unwrap();
+
+        let key = canonical_path(&deep);
+        assert!(
+            !key.to_string_lossy().starts_with(r"\\?\"),
+            "the prefix is gone — that is the behavior whose caveat this pins: {}",
+            key.display()
+        );
+        // The three reopens, in the shapes their callers use.
+        assert!(
+            key.is_dir(),
+            "a canonical root is stat'd by the walk that starts there: {}",
+            key.display()
+        );
+        assert!(
+            key.join("vilan.toml").is_file(),
+            "and probed for a manifest at every level of the climb above it"
+        );
+        assert!(
+            std::fs::read_to_string(key.join("vilan.toml")).is_ok(),
+            "and that manifest is then READ, which is the reopen that decides \
+             whether a generated root is found at all"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn components_normalize_away_dot_and_parent() {
         assert_eq!(
