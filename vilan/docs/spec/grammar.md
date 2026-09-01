@@ -271,6 +271,7 @@ available as user macro-attribute names.
 let        = ("let" | "mut") binder [ ":" type ] [ "=" expression ] ;
 assignment = [ "*" ] place ( "=" | "+=" | "-=" | "*=" | "/=" | "%=" )
              expression ;
+place      = chain ;                 (* an assignable location, §3.6 *)
 ret        = "ret" [ expression ] ;
 jump       = "jump" IDENT ;          (* break | continue *)
 ```
@@ -287,20 +288,20 @@ innermost enclosing loop.
 
 ```text
 block      = "{" { statement } [ expression ] "}" ;
-if-expr    = "if" secondary-expr block [ "else" ( block | if-expr ) ] ;
-for-expr   = "for" IDENT "in" secondary-expr block   (* iteration *)
-           | "for" secondary-expr block              (* while *)
+if-expr    = "if" condition-expr block [ "else" ( block | if-expr ) ] ;
+for-expr   = "for" IDENT "in" condition-expr block   (* iteration *)
+           | "for" condition-expr block              (* while *)
            | "for" block ;                           (* infinite *)
-match-expr = "match" secondary-expr "{" { match-leg [ "," ] } "}" ;
+match-expr = "match" condition-expr "{" { match-leg [ "," ] } "}" ;
 match-leg  = pattern { "," pattern } [ "if" expression ] "=>" expression ;
 ```
 
 A block's value is its trailing expression, or `void` if none. Conditions
-and `match`/`for` subjects are **secondary expressions** (§3.8): struct
-initializers are excluded there, keeping `if Foo {` unambiguous. A
-match leg's comma-separated patterns form an or-pattern; the optional
-`if` guard applies to the whole leg; the trailing comma after a leg is
-optional.
+and `match`/`for` subjects are **condition expressions** (§3.8): struct
+initializers and `css` blocks are excluded there, keeping `if Foo {`
+unambiguous. A match leg's comma-separated patterns form an or-pattern;
+the optional `if` guard applies to the whole leg; the trailing comma
+after a leg is optional.
 
 ## 3.6 Chain expressions (postfix)
 
@@ -321,10 +322,11 @@ postfix = "." member
                                           (* direct call on the chain result *)
         | "?." member ;                  (* lift link, §5.10 *)
 
-atom    = literal | IDENT | IDENT generic-args
+atom    = literal | IDENT | IDENT generic-args | struct-init
         | "(" expression ")" | tuple | list
         | tuple-comprehension | macro-invocation | macro-block
         | element | css-block ;
+literal = NUMBER | STRING | "true" | "false" | "null" ;
 tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
 entry   = spread | expression ;
 spread  = ".." expression ;
@@ -451,6 +453,16 @@ init-field    = IDENT [ "=" expression ] ;   (* shorthand: name alone *)
 closure       = ( "||" | "|" [ closure-param { "," closure-param } [ "," ] ] "|" )
                 [ ":" type ] expression ;
 closure-param = parameter ;   (* the same rule as a function's, less "..." *)
+
+operator-expr  = unary-expr { binary-op unary-expr } [ "is" pattern ] ;
+                 (* SHAPE only: §3.7's table is normative for precedence and
+                    associativity, and for the one-`is`-per-operand rule *)
+unary-expr     = { "!" | "-" | "await" | "async" | "&" [ "mut" ] | "*" }
+                 ( chain | block ) ;   (* "async" also takes a block *)
+binary-op      = "*" | "/" | "%" | "+" | "-" | "<<" | ">>"
+               | "&" | "^" | "|"
+               | "==" | "!=" | "<" | "<=" | ">" | ">="
+               | "&&" | "||" ;
 ```
 
 Two consequences of the tier split are normative:

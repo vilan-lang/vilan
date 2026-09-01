@@ -7,6 +7,17 @@ parts that vary. Find yours with a page search.
 (Organized companion: the [gotchas checklist](gotchas.md) covers traps by
 topic rather than by message.)
 
+This index is a **curated subset**, not a catalogue: the compiler has some
+three hundred message forms and this page carries around a hundred. An
+entry is here when all three hold — a plausible program reaches the
+message; reading it alone does not settle what to do next; and no entry
+already covers its family (one entry per family, its arms behind the `…`).
+The full list, with a verdict and pins per message, is the diagnostics
+ledger, and `crates/vilan-cli/tests/diagnostics_ledger.rs` holds this page
+against it: every quoted message here must still be one the compiler
+prints, and every message the ledger marks as documented must still be
+quoted here.
+
 ## Names and imports
 
 **"cannot find '…' in this scope"** · **"cannot find type '…'"**
@@ -49,6 +60,24 @@ chain shows the path from the fence. Fences check on every compile.
 Narrowing the fence, or moving the colored call out from behind it, are
 the two fixes.
 → [Platforms](../tour/platforms.md)
+
+**"`std::…` was removed: …"**
+Sixteen aliases lived at the `std` root for one release — `std::print`,
+`std::panic`, `std::Default`, the primitives — and the prelude serves the
+same purpose better, so they were deleted. The message names the way
+forward for the one you wrote: a primitive (`str`, `i32`, …) is always in
+scope and needs no import at all, `print` is in the default prelude, and
+anything else has its real module path (`std::io::panic`,
+`std::default::Default`).
+→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md)
+
+**"`…` is a reserved package name: …"**
+`std`, `pkg`, `macro_std` and `vilan` each already mean something as an
+import root, so a `[package] name` or a dependency key cannot claim one —
+a dependency named `std` used to REPLACE the standard library silently.
+Rename the package; or, for a dependency, rename the key, which is only
+the name you import it by and is free to differ from the library's own.
+→ [Projects](../tour/projects.md)
 
 **"cannot find module '…' to import"**
 The path names a module file that doesn't exist. `pkg::routes` means
@@ -164,7 +193,7 @@ inherent method of its own to outrank them. Say which one you mean with
 your own receiver already substituted in.
 → [Names, modules, and packages](../spec/names.md)
 
-**"`next` is ambiguous on '…': both '…' and '…' provide it, and a `for` loop has no spelling that names one"**
+**"`next` is ambiguous on '…': both '…' and '…' provide it…, and a `for` loop has no spelling that names one"**
 The loop's counterpart to the message above, for the iterator protocol
 (`next`, or `next_mut` for `for x in &mut subject`). Two traits provide
 the member — declaring it, or supplying it as an inherited default — and
@@ -174,7 +203,7 @@ one the message names: declare `next` on the type itself, where it beats
 every trait-provided one.
 → [Collections](../std/collections.md)
 
-**"'…' is not an inherent member of '…': '…' provides it; call '…' instead"**
+**"'…' is not an inherent member of '…': … provide… it; call … instead"**
 `Type::method(receiver)` means the type's *own* method. This one comes
 from a trait, so name the trait at the path head instead:
 `Trait::method(receiver)`.
@@ -344,6 +373,24 @@ of another one, so fix the first error in the list. When it appears
 alone, an annotation at the binding usually grounds it.
 → [gotchas](gotchas.md)
 
+**"… have mismatched types: expected …, but got … instead."**
+Every leg of a `match`, and both arms of a value `if`, produce the one
+value the construct has, so they have to agree on a type. The refusal is
+anchored at the arm that disagrees rather than at the whole construct, and
+it names which construct it is ("match legs", "`if` arms"). An arm that
+always leaves — a `ret`, a panic — contributes nothing to the merge and is
+never the one blamed.
+→ [Control flow](../tour/control-flow.md)
+
+**"'…' is ambiguous on '…': both '…' and '…' provide it and neither impl subject is more specific than the other …"**
+Two `impl` blocks match this receiver and neither is narrower than the
+other, so no spelling at the call site picks one — both are the same trait
+at the same instantiation. Vilan resolves overlap by specificity (a
+constructor-headed impl outranks a blanket `impl type T`), so the fix is
+at the definitions: narrow one subject until it is the more specific of
+the two.
+→ [Data and traits](../tour/data-and-traits.md)
+
 ## Memory and mutation
 
 **"cannot mutate immutable '…'"**
@@ -365,7 +412,7 @@ view-returning call (`list.at(0)`, `arena.get(h)`), or a `Some(let v)`
 capture of one. The rule is the same for all three.
 → [The memory model](../tour/memory-model.md)
 
-**"cannot mutate '…' with '….(..)' while a view into it is live (rule 4 …)"**
+**"cannot mutate '…' with '.…(..)' while a view into it is live (rule 4 …)"**
 The call may advance the container's *geometry* (grow, shrink, reallocate,
 swap an aggregate field) while a view points into it. Only
 geometry-advancing callees trigger this: a method that writes fields or
@@ -373,7 +420,7 @@ elements through `&mut self` passes freely (the compiler infers which is
 which). Do the mutation before taking the view, or after its block ends.
 → [The memory model](../tour/memory-model.md)
 
-**"cannot hold a view across 'await': '…' is still live here. …"**
+**"cannot hold a view across …: '…' is still live here. …"**
 Your function suspends while a view is live, and whatever it points into
 could change during the pause. Re-derive the view after the suspension
 (`rows[i].field` again) instead of keeping it. The message names `await`,
@@ -504,7 +551,7 @@ would launder the discipline away. Debug-print the resource's fields
 instead.
 → [Resources](../tour/resources.md)
 
-**"`…` cannot hold the resource `…`: a native container's internals are host code …"**
+**"`…` cannot hold the resource `…`…: … a native container's internals are host code …"**
 `List`, `Map`, `Set`, and the external generics (`Shared`, `Task`,
 `Promise`, `Context`) can't hold a resource: the move checker
 can't see inside host storage. `Option` is the sanctioned resource
@@ -519,7 +566,7 @@ nested two structs deep and an enum variant's payload, not just a direct
 field.
 → [Resources](../tour/resources.md)
 
-**"`Wire` / `Json` cannot be derived for the resource struct / enum `…`: …"**
+**"`…` cannot be derived for the resource … `…`: …"**
 The same rule with the resource in the other position — the derived type
 *is* the resource. Serializing it copies a handle out of its owner, and the
 reading half is worse: `Wire`'s `rebuild` and `Json`'s `from_json` build a
@@ -820,6 +867,15 @@ parentheses, `if p == Point { … } { … }` leaves a bare `Point` as the
 condition's operand, which reports **"`Point` is a type, not a value"**.
 Parenthesize the literal: `if p == (Point { x = 1 }) { … }`.
 → [spec §3.8](../spec/grammar.md)
+
+**"`#` is not a vilan token …"** · **"`@` is not a vilan token …"**
+Both turn up almost only inside a `css` block. A colour is written as a
+hole that routes through the `Color` type — `color: {Color::hex("#333")};`
+— which is what lets the type carry its own `:root` line. And a `css`
+block has no at-rules of any kind: a media query is spelled as a
+breakpoint combinator (`.md { … }`), and a declaration block under a
+selector of your own is `std::style::declare`.
+→ [Styling](../guide/styling.md)
 
 **"`pub` is not a vilan keyword …"**
 `pub` (and `public`) is an ordinary identifier here, so `pub fun helper()`
