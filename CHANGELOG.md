@@ -22,6 +22,12 @@ than a band: ..."). Two entries tripped this in one cycle before it was
 written down.
 -->
 
+
+## Unreleased
+
+<!-- family: tooling -->
+**A release whose notes exceed GitHub's 125,000-character body cap publishes anyway: the notes keep whole entries to a safe margin and point at the changelog for the rest.** v0.40.0's section was 221,530 characters at 74 entries and the publish step's `gh release create` refused with HTTP 422 after every build job had succeeded; the section's family order (breaking, then miscompiles, first) means the entries that survive the cut are the ones a reader must see. Never a mid-entry cut.
+
 ## v0.40.0 — 2026-09-01
 
 <!-- family: breaking -->
