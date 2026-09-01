@@ -1,0 +1,370 @@
+# The diagnostics ledger's mechanical index (N36/N37, Order 23).
+#
+# One line per row of `projects/vilan/proposal/diagnostics-ledger.md` in the
+# vilan-lang/proposals repository, which carries the prose: the site, the
+# verdict, the pins, the batch history. THIS file is the half a machine can
+# read, and `crates/vilan-cli/tests/diagnostics_ledger.rs` is what reads it.
+# The two are one record: a row lands in both, in the change that ships the
+# message, or the suite is red.
+#
+# Columns, tab-separated:
+#   row       the ledger row number
+#   flagship  `flagship` when the errors appendix documents this message,
+#             `-` otherwise. The appendix is a CURATED SUBSET, by three
+#             criteria (stated in `vilan/docs/appendix/errors.md` itself):
+#             a plausible program reaches it; the message alone does not
+#             settle what to do; and no entry already covers its family.
+#             A new row is classified at rowing time. The seed here is a
+#             LOWER BOUND: it is the set the Order 23 mapping could resolve
+#             mechanically, not the whole appendix.
+#   key       the message head, `{...}` for a slot and `...` for an elision.
+#             Truncated keys (the batch-7 generation's 60-char cut) are kept
+#             as they are; the gate splits on the slots and searches the
+#             literal fragments.
+#
+# Two rows are deliberately keyless and absent here: 154 (a forwarding push
+# with no head of its own) and 229 (the nine `ParseErrorReason::Rule`
+# statements, which the parse-rule tests hold instead).
+row	flagship	key
+1	flagship	'{type}' does not implement trait '{trait}', required by a declared bound of '{owner}'
+2	flagship	{label} of `[derive(Wire)]` type `{type_name}` is `{rendered
+3	-	{label} of `[derive(Hashable)]` type `{type_name}` is `{rend
+4	-	{label} of `[rpc]` method `{method_name}` is `{rendered}`, 
+5	-	{label} of `[rpc]` method `{method_name}` must declare a Wir
+6	-	{label} is `[expose]`d, but its element `{rendered}` is not 
+7	-	{label} is `[expose]`d, but its type `{rendered}` is not a 
+8	flagship	a view cannot escape its scope: it may not be returned, stor
+9	-	an async function cannot take {form} parameters: the view wo
+10	flagship	cannot reassign '{name}' while a view into it is live (rule 
+11	-	an async closure cannot capture the view '{name}': the captu
+12	-	cannot reseat a view to '{name}', which goes out of scope be
+13	flagship	cannot mutate immutable '{name}'; {advice} to allow mutation
+14	flagship	cannot mutate immutable '{name}'; {advice} to allow mutation
+15	-	a view can't be read as a value here; write `*` to copy the 
+16	-	cannot take a writable view of immutable '{name}'; {advice} 
+17	-	view binding '{name}' cannot be `mut`: a view cannot be rebo
+18	-	'{name}' is annotated as a value but its initializer is a v
+19	-	a `{kind}` parameter takes a view; pass `{kind} <place>` (th
+20	-	an array length must be a non-negative integer literal 
+21	-	the `?` lifts this condition to an `Option`/`Result`, which 
+22	-	Vilan has no const declarations; write `let x = const ..`
+23	-	a triple-quoted string spans lines: the opening """ must be
+24	-	a tuple position is a bare number (`.0`, `.1`); drop the suffix
+25	-	expected a method name after `.`
+26	-	expected a field or method name after `.`
+27	-	a `[T; n]` array type isn't a value; write an array 
+28	-	a `macro fun` must be a top-level item
+29	-	the invocation `macro {name}(..)` was not expanded: splice 
+30	-	this `macro { .. }` block was not expanded: a block cannot 
+31	-	`export` is a module-level item and cannot appear inside a b
+32	-	an `external` function cannot have a body
+33	-	function '{}' must have a body or be declared `external`
+34	flagship	a bare `?` (expression lifting) is not supported in this pos
+35	flagship	`?` lifts nothing here: the region is the whole expression;
+36	flagship	`!` cannot run after a `?` inside a lifted expression: it wo
+37	flagship	`!` requires the nearest enclosing function to declare an `O
+38	-	a `context` clause is only supported on a closure type
+39	-	a destructuring `let` requires a value
+40	-	cannot assign through `*`: a view is written through directl
+41	-	a lifted chain (`?.`) is not an assignment target
+42	-	struct '{}' must declare a body or be declared `external`
+43	flagship	a closure type is not valid here (expected an expression)
+44	-	a `context`-typed closure type is not valid here (expected a
+45	-	a closure-type marker is not valid here (expected an express
+46	-	a mapped tuple type is not valid here (expected an expressio
+47	-	a `context` clause is only supported on a closure type
+48	flagship	cannot find '{}' in this scope
+49	-	'{}' is not an enum variant
+50	flagship	variant '{}' does not belong to the matched enum
+51	-	cannot match an enum variant against type {}
+52	-	variant '{}' carries {} {}, but the pattern has {}
+53	-	this pattern binds {} {}, but the array's length is {}
+54	-	cannot destructure {rendered} as a fixed array: 
+55	-	literal pattern of type {} cannot match type {}
+56	-	an `async` closure type is only supported on parameters, `let` annotations, struct fields, and function return types
+57	-	a `context` clause is only supported on a parameter's closur
+58	-	this array literal has {} element{}, but its type is `[_; {l
+59	flagship	Expected {expected} (this literal's element type), but got {
+60	flagship	Expected {expected} (this literal's element type), but got {
+61	-	`self` import has no enclosing namespace
+62	flagship	cannot find module '{}' to import
+63	-	cannot find '{}' in the imported path
+64	flagship	Expected {} {}, but got {} instead.
+65	flagship	Expected {}, but got {} instead.{}
+66	flagship	Expected {} {}, but got {} instead.
+67	flagship	Expected {}, but got {} instead.
+68	flagship	Expected {} {}, but got {} instead.
+69	flagship	Expected {}, but got {} instead.
+70	-	cannot call '{name}': it is a struct, not a function; const
+71	-	cannot call this as a function: it is {rendered}
+72	-	{} has no method '{}'
+73	-	`len` takes no arguments
+74	-	{} has no method '{}'{}
+75	flagship	cannot call method '{}' on {}
+76	flagship	cannot call '{member_name}' on a value of bare trait type 
+77	flagship	Expected {}, but got {} instead.
+78	flagship	Expected {} {}, but got {} instead.
+79	flagship	Expected {}, but got {} instead.
+80	-	a tuple comprehension's source must be a mapped tuple, got {
+81	flagship	Expected {}, but got {} instead.
+82	flagship	Expected {}, but got {} instead.
+83	flagship	Expected {}, but got {} instead.
+84	-	`?.` flattens into the chain's own `Result`, so the error ty
+85	-	{operator} lifts an `Option`, a `Result`, or a type opting in with `impl .. with Lift`; this is {rendered}
+86	flagship	every `?` in one lifted expression must split the same 
+87	flagship	`?` short-circuits a lifted expression with the first bad 
+88	flagship	this lifted expression flattens into its own `Result`, so th
+89	-	{operator} lifts an `Option`, a `Result`, or a type opting in with
+90	-	`?.` needs a container with an element type; this is {rendered}
+91	-	{operator} on {rendered} needs {a|an} `{member_name}` method: the Lift contract (`map<U>(self, |T| U)`, `and_then<U>(self, |T| Self-of-U)`)
+92	-	a bare `ret` exits a closure whose body yields {tail_rendere
+93	-	the closure's body ends without a value, but this `ret` retu
+94	-	this `ret` returns {value_rendered}, but the closure's body 
+95	-	`!` on an `Option` returns `None` early, so the enclosing fu
+96	-	`!` returns this `Result`'s error as-is, so the error types 
+97	-	`!` on a `Result` returns the error early, so the enclosing 
+98	-	`!` needs a value implementing `Try` (an `Option`, a `Result
+99	-	the `Try` impl is missing `verdict`/`from_bad`
+100	-	`!` on a `Try` type returns `from_bad(..)`, which rebuilds {
+101	flagship	match guard must be a bool, but got {}
+102	flagship	match is not exhaustive: missing {}
+103	flagship	match is not exhaustive: add a catch-all `_` leg
+104	flagship	{construct} have mismatched types: expected {expected}, but got {got} instead.
+105	-	unknown struct: {}
+106	-	cannot initialize a non-struct: {}
+107	flagship	Expected {} {}, but got {} instead.
+108	flagship	struct '{}' has no field '{}'
+109	flagship	Expected {}, but got {} instead.
+110	-	a tuple's members are its positions: `{tuple}` has no membe
+111	-	subject is not a struct: {}
+112	flagship	struct '{}' has no field '{}'
+113	-	cannot access field '{}' on type {}
+114	-	cannot index this List: its element type is never determined
+115	flagship	index {literal_index} is out of range for an array of length
+116	-	cannot index {} (only a `List` or `[T; n]` array is indexabl
+117	flagship	cannot find '{}' in this scope
+118	-	`use` requires a namespace (a module or an enum)
+119	-	cannot find '{}' in the `use` path
+120	flagship	`{name}` is a type, not a value; construct it (`{name} { .`
+121	flagship	cannot find '{}' in this scope
+122	flagship	cannot assign to this expression
+123	flagship	cannot find type '{name}'{steer}
+124	-	cannot find '{}' in module '{}'
+125	-	cannot resolve `{member_name}` here: {subject_str} is not a 
+126	-	cannot find '{}' in {}{}
+127	-	cannot find '{}' in module '{}'
+128	-	cannot access '{}' on an unconstrained type parameter
+129	-	no bound of this type parameter ({}) has a member '{}'
+130	-	cannot find trait '{}'
+131	-	'{}' is not a trait
+132	flagship	'{}' does not implement trait '{}': missing '{}'
+133	-	this {construct} is `{label}`, but a condition must be `bool
+134	flagship	`{symbol}` takes `bool` operands; the {side} operand is `{la
+135	flagship	`bool` has no ordering: `{symbol}` models `PartialOrd`, whic
+136	-	`{symbol}` compares two values of the same type, but the 
+137	flagship	type '{type_name}' does not implement the `{trait_name}` ope
+138	flagship	cannot find context `{name}` in this scope
+139	-	duplicate context `{name}` in this clause
+140	flagship	unknown numeric suffix `{suffix}`{hint}
+141	flagship	the literal `{whole}` is out of range for `{name}` ({range})
+142	flagship	type of struct initializer could not be resolved
+143	flagship	type of accessor subject could not be resolved
+144	flagship	type of variable '{}' could not be resolved
+145	flagship	type of function call arguments could not be resolved
+146	-	cannot index this List: its element type is never determined
+147	flagship	type of match expression could not be resolved (subject: {})
+148	-	the type of '{name}' is never fully determined: `{rendered}`
+149	-	parse error in `{path}`: {rendered}
+150	-	`{importer}` imports `pkg::{module}`, but `{module}` is not 
+151	-	library at `{}` has no `lib.vl`
+152	-	library `{library_name}`'s base `lib.vl` re-exports `{module
+153	-	module `{name}` is ambiguous: both `{name}.vl` and `{name}/l
+155	-	`{}` requires a synchronous closure (`sync`): its completion
+156	-	`{}` is a host (`external`) function: it cannot await a Vila
+157	-	a `macro { .. }` block cannot appear inside macro code: the 
+158	-	the `macro_std` package was not found beside `std`: macros n
+159	-	a macro named `{name}` is already defined in this module
+160	-	a macro body may import only from `macro_std`: the macro wor
+161	-	`[service]` expanded before std::rpc's `service` macro was 
+162	-	this `macro { .. }` block was not registered; see the file'
+163	-	the built-in derive generators produced invalid Vilan ({mess
+164	-	no macro named `{name}` is in scope
+165	-	`{name}` is a macro HELPER (its signature is not a macro sha
+166	-	macro `{name}` is invocation-shaped (it takes no `Item`); ca
+167	-	no macro named `{name}` is in scope
+168	-	`{name}` is a macro HELPER (its signature is not a macro sha
+169	-	macro `{name}` is attribute-shaped (it takes an `Item`); use
+170	-	macro expansion did not settle after {cap} rounds: the chai
+171	-	{label}'s definition did not compile
+172	-	{label} failed at expansion time: {message}
+173	-	{label} generated invalid Vilan ({message}); the 
+174	flagship	{label} must generate a single expression here (it is 
+175	-	{label} generated a `macro {{ .. }}` block: macros cannot 
+176	-	{label} generated invalid Vilan ({message}); the 
+177	-	{label} generated a `macro fun`: macros cannot define macros
+178	-	{label} generated a `macro {{ .. }}` block: macros cannot 
+179	-	unknown platform pattern `{pattern_text}` in `[platform(…)]`
+180	flagship	`{name}` requires {requirement} and cannot run on `{platfo`
+181	flagship	{label} of `[derive(Wire)]` type `{type_name}` is the resourc
+182	-	{label} of `[derive(Hashable)]` type `{type_name}` is the res
+183	-	{label} of `[derive(PartialEq)]` type `{type_name}` is the re
+184	flagship	`{rendered}` implements `Drop` but is not a resource: destru
+185	-	`{}`'s `{}` declares {} type parameter(s), but `{}` declares 
+186	-	`{}`'s `{}` takes {} parameter(s), but `{}` declares {}; matc
+187	-	`{}`'s `{}` takes no receiver, but `{}` decl
+188	-	`{}`'s `{}` receives `{}`, but `{}` decl
+189	flagship	parameter {position} of `{}`'s `{}` is `{actual_label}`, but 
+190	-	`{}`'s `{}` returns `{actual_label}`, but `{}` declares `{exp
+191	-	`{container_name}` cannot hold the resource `{rendered}`{reach
+192	flagship	the resource `{rendered}` cannot be used where `any` is expec
+193	-	`{rendered}` cannot cross a hot swap: …` / `{rendered}` is a generic type parameter here: …
+194	-	use of `{name}` after it was moved
+195	-	`{name}` is not move-clean when instantiated with a resource 
+196	-	`{name}` is not move-clean … pass a resource to `drop<T>`
+197	-	`{name}` is not move-clean when instantiated with a resource 
+198	-	a `sync` closure contract is only supported on parameters
+199	-	`drop` for `{subject}` is async: teardown must be synchronou
+200	-	`drop` for `{subject}` requires an ambient context: teardown
+201	-	this call passes an async closure that reaches `{parameter}`,
+202	-	this call passes an async closure that reaches the host (`ext
+203	flagship	an async closure cannot adapt a trait/generic-dispatched call
+204	flagship	found {found} expected {expected} in {context}; {hint}
+205	flagship	unclosed `{delimiter}` in {production}: expected a matching `{close}`
+206	-	`resource` is a type-declaration modifier: it may appear only before a `struct` or `enum` declaration
+207	-	found '{character}' expected a token
+208	-	if this was postfix `!` before a comparison, the space is required: `a! == b`
+209	flagship	{members} form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order
+210	flagship	a string cannot span lines unless it is triple-quoted: close it before the line break; multi-line text goes in `"""…"""` (`i"""…"""` when interpolating), and a single line break is written `\n`
+211	-	a literal `}` inside an interpolated string is written `\}`: an unescaped brace belongs to a `{expr}` hole
+212	-	{} has no method '{}'{trait_only}{field}{import}
+213	-	'{member}' is ambiguous on '{type}': {both }{homes} provide it, and '{Trait}::{member}' names only the trait, not which of its instantiations; annotate the type this call must produce to pick one
+214	flagship	'{member}' is ambiguous on '{type}': {both }{subjects} provide it and neither impl subject is more specific than the other; vilan picks the more specific of two overlapping impls, so narrow one subject until it is
+215	-	`{method}` must be called on a context bound to a name
+216	-	`run` must be called on a named context with a closure literal body
+217	-	`run` must be called on a named context with a closure literal body, or a closure value whose type is `context`-annotated with exactly this context
+218	-	this parameter's `context` clause names a value that is not a context
+219	-	a `context`-typed binding takes a closure literal, or a value with the same `context` clause
+220	-	a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)
+221	flagship	an injected (`context`-typed) closure can only be called, forwarded to a parameter with the same `context` clause, or passed to `run`
+222	flagship	context `{}` is read here, but this code can be reached without an enclosing `run`
+223	-	an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`
+224	flagship	`{}` reads context `{}`, so it can't be used as a value
+225	-	`get_safe` needs `std::option::Option` loaded
+226	-	'{member_name}' is ambiguous on '{subject_str}': {both }{providers} provide it as a static, and a static has no receiver for a `Trait::{member_name}` path to select through; declare '{subject_str}''s own '{member_name}', which outranks every trait-provided one
+227	flagship	expected `;` to end this statement
+228	flagship	unclosed `{delimiter}`: expected a matching `{close}`
+230	-	no build manifest at {path} — build the leg first (`vilan build .`), and run the server from the project root
+231	-	{path} is not a build manifest this toolchain wrote — rebuild the leg (`vilan build .`)
+232	-	the `{build.leg}` build names {file}, which is not on disk — rebuild the leg (`vilan build .`), and run the server from the project root
+233	-	the build emitted the stylesheet {file} and this document links no stylesheet — add `<link rel="stylesheet" href="/{file}" />` inside <head>
+234	-	this document links {href}, which this build did not emit — remove the link, or restore the styles it names (a leg with no `const style()` emits no stylesheet at all)
+235	-	this document loads {src}, which this build did not emit — remove the script tag, or restore the build that wrote it
+236	-	this build's bundle {file} is loaded by no script in this document — add `<script src="/{file}"></script>` before </body>
+237	-	no element in this document carries id="{id}", which is where the client mounts — add `<div id="{id}"></div>` inside <body>
+238	-	{file} is loaded as a module script and this leg SPLITS — chunk resolution reads `document.currentScript`, which is null in a module, so every nested route would fail to load its chunk; drop `type="module"` from its script tag
+239	-	{path} does not match the `{build.leg}` build:
+240	-	{source} has no </{name}> for this document's {name}() markup to splice before — add </{name}> to the shell, or write the markup into the shell itself
+241	-	the context requirement flows through this call
+242	-	the context requirement may flow through this call (dispatch may select a reader)
+243	-	… {n} more uncovered call{s} on this path
+244	-	this `ret` returns {value}, but the function's return type is inferred as {inferred} from {origin}; make every return agree, or declare the return type
+245	-	a bare `ret` returns nothing, but the function's return type is inferred as {inferred} from {origin}; return a value, or declare the return type
+246	-	`{name}` is deprecated; {steer}
+247	flagship	`{old-spelling}` is deprecated; use `{new-spelling}`
+248	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, `macro_std`, and `vilan` are all reserved); rename the {package|dependency}
+249	-	`{name}` is never given a type: this closure is never called and its parameter is unannotated; annotate it (e.g. `|{name}: List<i32>|`)
+250	-	cannot iterate `{rendered}`: no bound on it provides `{next_method}(&mut self): Option<T>`, and a generic is not natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) or iterate a concrete container
+251	-	cannot iterate `{rendered}`: it has no `{next_method}(&mut self): Option<T>`, and {kind} is not natively iterable — the loop would walk its representation. Implement the iterator protocol on it, or iterate a `List` / `Set` / `Range` (a `Map` iterates through `entries()`, `keys()` or `values()`)
+252	-	cannot iterate `{rendered}`: {source}, but the `for` protocol drives `{next_method}(&mut self): Option<T>` and stops at `None`. {steer}
+253	flagship	`{next_method}` is ambiguous on `{rendered}`: {both }{providers} {provision}, and a `for` loop has no spelling that names one. Declare `{next_method}` on `{rendered}` itself — an inherent member beats every trait-provided one
+254	-	`{enum_name}` is backed by strings, and a backing value is not an order: `{symbol}` would compare the strings lexicographically, not the variants; write an `impl {enum_name} with PartialOrd`, or back the enum with integers
+255	-	this resource would be created only on some paths: the right of `&&`/`||` is evaluated conditionally, so no statement owns it and nothing can destroy it. Bind it first (`let handle = ...`) and use the binding here
+256	-	variant '{variant_name}' continues the discriminant sequence past {I53_MAX}, the largest integer a JS number holds exactly; give it an explicit discriminant
+257	-	variant '{variant_name}' carries a payload, so it cannot have an explicit backing value
+258	flagship	{label} of `[derive(Json)]` type `{type_name}` is the resource `{rendered}`: a resource is not plain data and cannot be serialized (serializing it would copy it out of its owner); serialize a plain-data projection (an id, a key) instead
+259	flagship	'{trait_name}' is already implemented for '{subject_label}'{elsewhere}; remove or merge this impl
+260	flagship	'{member_name}' is already defined for '{subject_label}'{elsewhere}; remove or rename this one
+261	flagship	cannot move a resource field out of a live aggregate: a resource has one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make the field an `Option` and use `take`
+262	flagship	`{name}` is moved on one path through this branch but not another: a resource's end-of-scope ownership must be static; move it on every path, or restructure with `Option` + `take`
+263	flagship	`{name}` is declared outside this loop and moved inside it: the move would repeat on the next iteration; move a value declared inside the loop, or loan `{name}` with `&` / `&mut`
+264	-	cannot move the resource `{name}` out of this function: it is declared `{declared}`, a loan, and a loan changes no ownership; declare it `{owned}` to take ownership, or restructure with `Option` + `take`
+265	-	cannot move the resource `{name}` out of this pattern: it captures from {subject}, which is matched by loan — `is` and `match &` inspect without consuming, so {subject} still owns the payload and still drops at its scope end; match {subject} by value to move the payload into the capture, or restructure with `Option` + `take`
+266	flagship	a closure cannot capture the resource `{name}`; pass a loan into the call, give ownership to the struct that owns this closure's lifetime, or hoist the resource to module level (process lifetime)
+267	flagship	`{name}` is a module-level resource: it has process lifetime and cannot be moved; loan it with `&{name}` / `&mut {name}` or a method call (`drop({name})` moves it, so it is rejected too)
+268	-	`{name}` is a module-level resource: it has process lifetime and cannot be overwritten (the old value's drop has nowhere to run); its initializer is the one write, and everything after is a loan
+269	flagship	`{name}` is not move-clean when instantiated with a resource: {summary}, and a generic body cannot destroy a `T`; move it out on every path, or take a concrete type
+270	flagship	`{name}` is not move-clean when instantiated with a resource: {summary}; a generic used with a resource type argument must use each resource value at most once, and never copy or capture it
+271	flagship	cannot mutate immutable '{name}'; {advice}.
+272	flagship	cannot mutate immutable '{name}'; {advice}.
+273	-	cannot take a writable view of immutable '{name}'; {advice}.
+274	flagship	unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.
+275	-	a resource never copies, so `mut {name}` cannot take one; declare it `own {name}` to transfer it in
+276	flagship	this expression nests more than {} levels deep, which analysis refuses; lift inner expressions into `let` bindings to flatten it
+277	-	cannot match an enum variant against the generic parameter `{parameter}`: `{parameter}` is whatever each instantiation binds it to, so there is nothing here to check the pattern against — the tag test runs anyway and matches any value that happens to share the tag. Match a value of the enum's own type, or move the match to where `{parameter}` is concrete
+278	flagship	this expression cannot be used as a type; write a type here — a name, a generic application, a tuple, a closure type, a reference, or a fixed-length array
+279	-	inferring this function's return type needs a chain of more than {} calls, which analysis refuses; declare a return type on one of them to end the chain
+280	flagship	'{type_label}' does not implement '{trait_label}', so '{trait_label}::{member_name}' cannot be called on it
+281	flagship	'{member_name}' is ambiguous on '{type_str}': {}{} provide it; call {} to pick one
+282	-	a bare `?` needs a container with an element type; this is {rendered}
+283	flagship	'{member_name}' is not an inherent member of '{subject_str}': {} provide{} it; call {} instead
+284	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, and `macro_std` are all reserved); this workspace staged a dependency edge named `{name}` — the edge is ignored and `{name}::` keeps meaning the root it always names; rename the dependency
+285	flagship	module `{name}` resolved to `{on_disk}` on disk, but it is imported as `{requested}`: Vilan matches module files by exact case, so this builds only where the filesystem ignores case; rename one to match the other
+286	flagship	`const` expressions form a dependency cycle
+287	flagship	`{name}` is a runtime value; a `const` expression reads only compile-time-known bindings
+288	flagship	this `const` expression reaches `{name}`, whose value is not compile-time-known
+289	flagship	{name} is compile-time-only; evaluate this call inside a `const` expression
+290	flagship	{subject} is compile-time-only; call it directly inside a `const` expression — a compile-time-only function has no runtime value form
+291	-	{headline}{subject}: {}
+292	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
+293	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
+294	-	the `macro_std` package was not found beside `std`
+295	-	the macro `{}` did not compile to a callable function
+296	-	in this macro: {}
+297	-	the macro world failed to compile
+298	-	the `[server]`/`[client]` form was removed; declare a `[package]` with `[entry.server]` / `[entry.client]` sections instead (each takes an optional `path` and `target`)
+299	-	set exactly one of `[package]`, `[library]`, or `[project]`: an app, a library, and a workspace root are different manifests
+300	-	`vilan.toml` must declare a `[package]`, `[library]`, or `[project]`
+301	-	`[project] default-entry` must name a member package (got `{name}`)
+302	-	unknown build preset `{preset}` (expected `debug` or `release`)
+303	-	`[build] run` has an empty command: each entry is a command line for the platform shell (`npx tailwindcss -i src/app.css -o dist/app.css`)
+304	-	`[package]` is missing a `name`
+305	-	`[package] name` must be a valid identifier (got `{name}`)
+306	-	invalid `[package] target`: {error}
+307	-	`[package] default-entry = "{name}"` has nothing to choose between: it names one of several `[entry.<name>]` sections, and this package declares none (its single `entry` is already what `vilan run` runs)
+308	-	`[package] default-entry = "{name}"` names no `[entry.{name}]` section; declared entries: {}
+309	-	`[entry.<name>]` sections require a `[package]` (a library has no entries; a workspace's entries live in its member packages)
+310	-	`[package] entry`/`target`/`split` can't be combined with `[entry.<name>]` sections: with multiple entries, each declares its own `path`, `target` and `split`
+311	-	`[entry.{name}]`: an entry name must be a valid identifier (it names the `dist/{name}.js` output)
+312	-	invalid `[entry.{name}] target`: {error}
+313	-	`[entry.{name}] target` must be a host platform (`node`/`deno`/`bun`/`browser`), not `none`
+314	-	`[entry.{name}] path` must be relative to the package root and free of `..` (got `{}`)
+315	-	`[library]` is missing a `name`
+316	-	`[library] name` must be a valid identifier (got `{name}`)
+317	-	`[library.layer.{name}]` must declare the platforms it serves (e.g. `platform = ["@process"]`)
+318	-	`[library.layer.{name}]` has an unknown platform `{token}` (expected `node`/`node:24`/`deno`/`bun`/`browser`, or `@process`)
+319	-	`{table} {name}` sets `project = true`, but this IS the project's table: `project = true` is how a member package opts in to a dependency declared here, so give `{name}` a `path` or a `git` source
+320	-	registry dependency `{name}` is not yet supported (a dependency is a local `path` or a `git` repository today)
+321	-	dependency `{name}` {problem}
+322	-	`[[build.hook]]` #{ordinal} has a blank `name`: the name is what the build reports on and what its freshness stamp keys on, so give it one (`name = "lucide"`)
+323	-	`[[build.hook]]` #{ordinal} is missing a `name`: the name is what the build reports on and what its freshness stamp keys on, so give it one (`name = "lucide"`)
+324	-	two `[[build.hook]]` tables are both named `{name}`: the name keys the freshness stamp, so it has to pick out one hook
+325	-	`[[build.hook]]` `{name}` declares no `run`: a hook is a command line for the platform shell (`run = "sh scripts/lucide.sh"`)
+326	-	`[[build.hook]]` `{name}` has an empty command: each entry is a command line for the platform shell (`run = "sh scripts/lucide.sh"`)
+327	-	`[[build.hook]]` `{name}` declares an empty `{key}` entry: each one is a file or directory path relative to the manifest
+328	-	`[[build.hook]]` `{name}` declares `{key}` entry `{path}`, which contains `{metacharacter}`: freshness digests the paths you declare, and there is no glob matching — name the directory (`src/static`) or the files themselves
+329	-	Cannot execute program without a main function
+330	flagship	internal: a call resolved to {source}, which has no body — emitting it would produce an empty function and a runtime `TypeError`. The receiver's type could not be resolved to a concrete implementation at this call; please report this program
+331	flagship	internal: the type of this `drop` argument could not be resolved, so the sink cannot tell a resource from data and would tear nothing down; please report this program
+332	flagship	`std::{name}` was removed: `{name}` is a primitive and is always in scope — delete the import (its module path, if you need it, is `std::{home}::{name}`)
+333	flagship	`std::{name}` was removed: `{name}` is in the default prelude (no import needed), and its module path is `std::{home}::{name}`
+334	flagship	`std::{name}` was removed: its module path is `std::{home}::{name}`
+335	flagship	`#` is not a vilan token; in a `css` block a colour is a hole — `color: {Color::hex("#333")};` — which routes it through the `Color` type that carries its own `:root` line
+336	flagship	`@` is not a vilan token; a `css` block has no at-rules — a media query is a breakpoint combinator (`.md { … }`), and a declaration block under a selector of your own is `std::style::declare`
+337	-	std::db migrate: could not begin a transaction for migration '{step.name}': {message}
+338	-	std::db migrate: migration '{step.name}' failed and was not applied: {message}
+339	-	std::db migrate: migration '{step.name}' applied but could not be recorded: {message}
+340	-	std::db migrate: migration '{step.name}' could not be committed: {message}
+341	-	std::db migrate: the migration at index {index} has an empty name — a name is a migration's identity in the applied table
+342	-	std::db migrate: two migrations are named '{step.name}' — a migration's name must be unique within the list
+343	-	std::db migrate: the database has migration '{recorded_name}' applied, but it is not among the {count} migrations given — this database was migrated by a newer build
+344	-	std::db migrate: migration '{pending}' is not applied, but '{applied}' after it in the list is — a migration was inserted before the applied history
