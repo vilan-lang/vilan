@@ -271,7 +271,7 @@ row	flagship	key
 245	-	a bare `ret` returns nothing, but the function's return type is inferred as {inferred} from {origin}; return a value, or declare the return type
 246	-	`{name}` is deprecated; {steer}
 247	flagship	`{old-spelling}` is deprecated; use `{new-spelling}`
-248	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, `macro_std`, and `vilan` are all reserved); rename the {package|dependency}
+248	flagship	`{name}` is a reserved package name: {reason} ({reserved}); rename the {package|dependency}
 249	-	`{name}` is never given a type: this closure is never called and its parameter is unannotated; annotate it (e.g. `|{name}: List<i32>|`)
 250	-	cannot iterate `{rendered}`: no bound on it provides `{next_method}(&mut self): Option<T>`, and a generic is not natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) or iterate a concrete container
 251	-	cannot iterate `{rendered}`: it has no `{next_method}(&mut self): Option<T>`, and {kind} is not natively iterable — the loop would walk its representation. Implement the iterator protocol on it, or iterate a `List` / `Set` / `Range` (a `Map` iterates through `entries()`, `keys()` or `values()`)
@@ -307,7 +307,7 @@ row	flagship	key
 281	flagship	'{member_name}' is ambiguous on '{type_str}': {}{} provide it; call {} to pick one
 282	-	a bare `?` needs a container with an element type; this is {rendered}
 283	flagship	'{member_name}' is not an inherent member of '{subject_str}': {} provide{} it; call {} instead
-284	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, and `macro_std` are all reserved); this workspace staged a dependency edge named `{name}` — the edge is ignored and `{name}::` keeps meaning the root it always names; rename the dependency
+284	flagship	`{name}` is a reserved package name: {reason} ({reserved}); this workspace staged a dependency edge named `{name}` — the edge is ignored and `{name}::` keeps meaning the root it always names; rename the dependency
 285	flagship	module `{name}` resolved to `{on_disk}` on disk, but it is imported as `{requested}`: Vilan matches module files by exact case, so this builds only where the filesystem ignores case; rename one to match the other
 286	flagship	`const` expressions form a dependency cycle
 287	flagship	`{name}` is a runtime value; a `const` expression reads only compile-time-known bindings
