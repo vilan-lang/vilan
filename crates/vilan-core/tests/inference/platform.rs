@@ -7849,7 +7849,7 @@ fn b175_the_sibling_operators_refuse_a_bare_trait_too() {
 }
 
 #[test]
-#[ignore = "B175's residual: `self` inside a trait DEFAULT body is `Type::Trait` \
+#[ignore = "B193 (B175's residual)'s residual: `self` inside a trait DEFAULT body is `Type::Trait` \
             too, and `self + self` over a supertrait `Add` still emits the host's \
             `+`. Refusing it needs a spelling that works first — `self.add(self)` \
             does not resolve there either, and the binary emitter has no \
