@@ -3551,6 +3551,45 @@ impl<'src> Printer<'src> {
         self.print_css_body(&nested.body, false);
     }
 
+    /// A closure whose body is an ELEMENT that splits (E118): the element takes
+    /// a line of its own, one level in from the statement, and its children and
+    /// closing tag hang off THAT line. Returns whether this arm printed the
+    /// body — `false` leaves the caller to print it inline as before.
+    ///
+    /// The exhibit is `overlays.attach(submenu, || <div .styled(s)>` with its
+    /// children and `</div>` below. Left inline, the split element inherits the
+    /// STATEMENT's indent for its children and its close, while its opening tag
+    /// starts wherever `|| ` happened to end — three anchors that answer to
+    /// nothing in common, and the wider the head the further apart they drift.
+    /// Breaking after `|| ` collapses them to one: the open tag, the close tag
+    /// and the children are all measured from a single column, which is exactly
+    /// how a BLOCK body already reads (`print_block` puts its statements one
+    /// level past the line the `{` opened and its `}` back on it).
+    ///
+    /// Width decides, as everywhere else. The element is printed inline first,
+    /// and only a rendering that actually broke is rolled back and re-printed —
+    /// so `|t| <li>{t}</li>` keeps its line, and the pins that hold an
+    /// expression-bodied closure argument inline keep holding.
+    fn print_closure_element_body(&mut self, body: &Spanned<Node<'src>>) -> bool {
+        if !matches!(body.0, Node::Element(_)) {
+            return false;
+        }
+        let inline_start = self.out.len();
+        let comment_cursor = self.cursor;
+        self.out.push(' ');
+        self.print_expr(body);
+        if !self.out[inline_start..].contains('\n') {
+            return true;
+        }
+        self.out.truncate(inline_start);
+        self.cursor = comment_cursor;
+        self.indent += 1;
+        self.line();
+        self.print_expr(body);
+        self.indent -= 1;
+        true
+    }
+
     fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
         // A comment between the element's items forces the split — collapsed,
         // there is no line to keep it on — and the split loops below attach it
@@ -4558,8 +4597,10 @@ impl<'src> Printer<'src> {
                     self.out.push_str(": ");
                     self.print_type(&return_type.0);
                 }
-                self.out.push(' ');
-                self.print_expr(&closure.return_value);
+                if !self.print_closure_element_body(&closure.return_value) {
+                    self.out.push(' ');
+                    self.print_expr(&closure.return_value);
+                }
             }
             Node::Is(subject, pattern) => {
                 self.print_operand(subject, 3);
@@ -7911,6 +7952,61 @@ mod element_layout {
         assert_construct(
             "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
             "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
+        );
+    }
+
+    // --- E118: a closure-argument element that SPLITS ------------------------
+
+    /// The owner's exhibit, verbatim. Inline, the element's three anchors
+    /// disagree: the open tag starts after `|| `, the children indent from the
+    /// STATEMENT, and the close tag sits at the statement's column. Breaking
+    /// after `|| ` puts all three on one column — the block body's rule.
+    #[test]
+    fn a_closure_argument_element_breaks_after_the_bar() {
+        assert_construct(
+            "fun demo() {\n\toverlays.attach(submenu, || <div .styled(example_padded_style)>\n\
+             \t\t<button>\"Sub item\"</button>\n\t</div>);\n}\n",
+            "fun demo() {\n\toverlays.attach(submenu, ||\n\
+             \t\t<div .styled(example_padded_style)>\n\
+             \t\t\t<button>\"Sub item\"</button>\n\t\t</div>);\n}\n",
+        );
+    }
+
+    /// One child, and it is an element — the shape that forces a split without
+    /// any help from the line budget.
+    #[test]
+    fn a_one_child_closure_argument_element_breaks_after_the_bar() {
+        assert_construct(
+            "fun demo() {\n\tattach(|| <div><span>\"x\"</span></div>);\n}\n",
+            "fun demo() {\n\tattach(||\n\t\t<div>\n\t\t\t<span>\"x\"</span>\n\
+             \t\t</div>);\n}\n",
+        );
+    }
+
+    /// Nested elements under one closure argument: every level indents from the
+    /// level above it, and each closing tag lands on its own opening tag's
+    /// column — the property the inline form could not have, since only the
+    /// outermost close had a column of its own.
+    #[test]
+    fn nested_children_indent_from_their_own_open_tag() {
+        assert_construct(
+            "fun demo() {\n\tattach(|| <div .styled(s)><section><span>\"x\"</span>\
+             </section></div>);\n}\n",
+            "fun demo() {\n\tattach(||\n\t\t<div .styled(s)>\n\t\t\t<section>\n\
+             \t\t\t\t<span>\"x\"</span>\n\t\t\t</section>\n\t\t</div>);\n}\n",
+        );
+    }
+
+    /// A closure argument nested INSIDE an element head — the `bind_each` shape
+    /// the inline pin above uses, with a body that splits. The rule applies at
+    /// that depth too, measured from the head-item line the closure sits on.
+    #[test]
+    fn a_closure_argument_element_inside_an_element_head_breaks_too() {
+        assert_construct(
+            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| \
+             <li><b>{t}</b></li>) />\n}\n",
+            "fun demo(): View {\n\t<ul\n\t\t.bind_each(items, |t| t.id, |t|\n\
+             \t\t\t<li>\n\t\t\t\t<b>{t}</b>\n\t\t\t</li>)\n\t/>\n}\n",
         );
     }
 }
