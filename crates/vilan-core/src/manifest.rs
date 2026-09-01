@@ -4242,6 +4242,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The Windows hazard neither pin above can reach (audit run 7, Order 24):
+    /// NTFS FOLDS CASE, so `gen` and `GEN` are two paths on unix and one
+    /// directory here. Nothing in this predicate folds case itself — it compares
+    /// `Path` components, which are bytes — so the answer rests entirely on
+    /// `fs::canonicalize` handing back the spelling that is ON DISK whichever
+    /// spelling it was asked about. It does, and this is the pin that says so:
+    /// a product asked about in the wrong case is the same product.
+    ///
+    /// Green, and worth stating as the control for the `#[ignore]`d pin below —
+    /// which is the same question one step past the edge of this one, where
+    /// there is no on-disk path to canonicalize and the case survives.
+    #[cfg(windows)]
+    #[test]
+    fn a_generated_root_covers_its_products_through_a_case_folded_spelling() {
+        let base = std::env::temp_dir().join(format!("vilan-covering-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("gen")).unwrap();
+        // `temp_dir` can answer with an 8.3 SHORT name, which canonicalizes to
+        // its long form — a second difference that would leave this pin
+        // measuring two things at once and passing or failing for the wrong
+        // reason. Resolve the fixture root once, up front, so the only
+        // difference below is the one under test.
+        let root = crate::util::canonical_path(&base);
+        std::fs::write(
+            root.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("gen/lib.vl"), "").unwrap();
+        let expected = Some(crate::util::canonical_path(root.join("gen")));
+
+        assert_eq!(
+            generated_root_covering(&root.join("gen/lib.vl")),
+            expected,
+            "the on-disk spelling, as everywhere else"
+        );
+        assert_eq!(
+            generated_root_covering(&root.join("GEN/lib.vl")),
+            expected,
+            "and the folded one: `GEN\\lib.vl` opens the same file NTFS holds at \
+             `gen\\lib.vl`, so it is the same product — a formatter that decided \
+             otherwise would rewrite a product because an editor spelled a drive \
+             path the way the user typed it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fail-OPEN corner of the same hazard, and the one RED measurement in
+    /// audit run 7's Windows batch.
+    ///
+    /// A product that its generator HAS NOT WRITTEN YET is not on disk, so
+    /// `canonical_path` degrades to the lexical `normalize_components` and keeps
+    /// whatever case it was handed — while the declared root, which IS on disk,
+    /// canonicalizes to the spelling NTFS holds. `covering_from`'s containment
+    /// test (`resolved.starts_with(&root)`) compares components byte-for-byte,
+    /// so the two disagree, the file reads as UNCOVERED, and the formatter
+    /// rewrites a product: §12.1's fmt↔hook loop, reached by a spelling rather
+    /// than by a link.
+    ///
+    /// The first half is the control and is green — spelled as the directory is
+    /// on disk, a not-yet-written product is covered, which is the property
+    /// `outputs = "src/icons/lib.vl"` depends on before the first build. Only
+    /// the folded spelling fails, and only where a filesystem folds case, which
+    /// is why this is `cfg(windows)` and why no unix pin could have caught it.
+    ///
+    /// Neither direction is obviously right, which is why this is `#[ignore]`d
+    /// rather than fixed here: folding case inside `covering_from` would make
+    /// the predicate platform-dependent in a function whose whole point is that
+    /// two front ends answer alike, and the alternative — resolving the nearest
+    /// EXISTING ancestor and rebuilding the tail — changes what `canonical_path`
+    /// promises for every caller. B198 carries the ruling.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "B198: whether `covering_from` folds case is an open ruling. A product \
+                its generator has not written yet has no on-disk path to \
+                canonicalize, so a case-folded spelling keeps its case while the \
+                declared root canonicalizes to NTFS's — the containment test at \
+                `manifest.rs` ~854 answers None and the formatter rewrites a \
+                product. Asserts the DESIRED outcome; un-ignore when B198 rules."]
+    fn a_product_the_generator_has_not_written_yet_is_still_covered() {
+        let base =
+            std::env::temp_dir().join(format!("vilan-covering-unwritten-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("gen")).unwrap();
+        // The same 8.3 precaution as the pin above, for the same reason.
+        let root = crate::util::canonical_path(&base);
+        std::fs::write(
+            root.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        let expected = Some(crate::util::canonical_path(root.join("gen")));
+
+        let on_disk_spelling = generated_root_covering(&root.join("gen/not_written_yet.vl"));
+        let folded_spelling = generated_root_covering(&root.join("GEN/not_written_yet.vl"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            on_disk_spelling, expected,
+            "a product is a product before its generator has run — the lexical \
+             fallback and the canonicalized root still agree"
+        );
+        assert_eq!(
+            folded_spelling, expected,
+            "and the same file spelled the way NTFS also accepts it is the same \
+             product, on disk yet or not"
+        );
+    }
+
     #[test]
     fn nothing_is_covered_without_a_manifest_declaring_it() {
         // A tree the predicate cannot read is a tree the formatter formats. Both
