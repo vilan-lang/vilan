@@ -8016,3 +8016,410 @@ fn an_unbounded_generic_left_operand_of_and_is_rejected() {
         "takes `bool` operands",
     );
 }
+
+// --- B196: every native operator, not just `+`, when the LEFT operand is not
+//     a number ---------------------------------------------------------------
+//
+// Audit run 7's F1, and a RELEASED miscompile: shipped in v0.40.0. b148 gated
+// its native-operand check on `+` and argued the gate in a SCOPE note — "the
+// other operators emit arithmetic on numbers, where `+` emits a rendering".
+// That is a statement about a NUMERIC left operand. Three native types are not
+// numbers, and for those the argument inverts: the host operator returns a
+// number, a binary takes its static type from the LEFT operand, so the result
+// is a number wearing a type it is not. Fifty-five wrong-running squares of the
+// audit's 216-program operator matrix, one root.
+//
+// The pre-fix runs, recorded here because a green pin proves only that the
+// program is refused NOW:
+//
+//   let c: bool = true - 3         →  -2. `if c` took the TRUE branch and
+//                                     `c == true` printed false: a `bool`
+//                                     that is neither value.
+//   let c: bool = true & 3         →  1, printed as `1` by an i-string hole
+//                                     typed `bool`.
+//   let s: str = "12" - "3"        →  9, and `s.len()` was `undefined`.
+//   let s: str = "12" << 2         →  48.
+//   mut c: bool = true; c -= 3     →  -2, the compound form inheriting it
+//                                     through the desugar.
+//   mut s: str = "12"; s *= 3      →  36.
+//   Level::High - Level::Low       →  4 typed `Level`; the `match` on it
+//                                     panicked, "Level: 4 is not one of its
+//                                     values".
+//   Level::High ^ Level::Low       →  4 again, and SILENT: `== Level::Low`
+//                                     and `== Level::High` both printed
+//                                     false, a `Level` matching no variant.
+//
+// The carve-out is "the left operand is a number", never "the operator is not
+// `+`": `f64 * i32` computes a correct answer of the declared type, and
+// refusing it is the numeric-strictness change with an `as_f64()` migration
+// that b148's SCOPE note deferred. It stays deferred, and is pinned below as a
+// control so a later lane cannot take it by accident.
+//
+// The COMPARISONS need nothing: `bool` has no ordering (B24 refuses `<` on it),
+// a string backing is not an order (§3.6 refuses that), and `str` and an
+// integer backing both order correctly. Only the wrong-running squares close.
+
+#[test]
+fn b196_a_bool_left_operand_of_subtraction_is_rejected() {
+    // The exhibit the item was filed on. Pre-fix: `-2`, truthy, `== true`
+    // false.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let c: bool = true - 3;
+            print(c);
+        }
+        "#,
+        "true - 3",
+        "`-` on `bool` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_bool_left_operand_of_a_bitwise_operator_is_rejected() {
+    // The quietest of the family: `true & 3` is `1`, which prints as `1` and
+    // never looks like a `bool` going wrong until something compares it.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let c: bool = true & 3;
+            print(c);
+        }
+        "#,
+        "true & 3",
+        "`&` on `bool` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_str_left_operand_of_subtraction_is_rejected() {
+    // Pre-fix: `9`, typed `str`, with `.len()` undefined on it.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let s: str = "12" - "3";
+            print(s);
+        }
+        "#,
+        r#""12" - "3""#,
+        "`-` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_str_left_operand_of_a_shift_is_rejected() {
+    // Pre-fix: `48`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let s: str = "12" << 2;
+            print(s);
+        }
+        "#,
+        r#""12" << 2"#,
+        "`<<` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_backed_enum_left_operand_of_subtraction_is_rejected() {
+    // Pre-fix: a `Level` holding `4`, on which the `match` panicked — the one
+    // arm of the family a runtime guard happened to catch.
+    assert_fails_spanning(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let level: Level = Level::High - Level::Low;
+            print(level == Level::Low);
+        }
+        "#,
+        "Level::High - Level::Low",
+        "`-` on `Level` has no meaning",
+    );
+}
+
+#[test]
+fn b196_a_backed_enum_left_operand_of_a_bitwise_operator_is_rejected() {
+    // The same value with no guard in front of it: pre-fix both comparisons
+    // printed false, a `Level` that is no variant at all.
+    assert_fails_spanning(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let level: Level = Level::High ^ Level::Low;
+            print(level == Level::Low);
+        }
+        "#,
+        "Level::High ^ Level::Low",
+        "`^` on `Level` has no meaning",
+    );
+}
+
+#[test]
+fn b196_the_compound_forms_inherit_the_refusal() {
+    // `x -= y` desugars to `x = x - y` and reaches the same check, so the
+    // whole compound family closes with the binary one. Pre-fix `c -= 3` left
+    // `-2` in a `bool` and `s *= 3` left `36` in a `str`.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            mut c: bool = true;
+            c -= 3;
+            print(c);
+        }
+        "#,
+        "c -= 3",
+        "`-` on `bool` has no meaning",
+    );
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            mut s: str = "12";
+            s *= 3;
+            print(s);
+        }
+        "#,
+        "s *= 3",
+        "`*` on `str` has no meaning",
+    );
+}
+
+#[test]
+fn b196_every_arithmetic_and_bitwise_operator_closes_on_every_non_numeric_left() {
+    // Per case, not per example: the rule is the left operand's SHAPE against
+    // the whole nine-operator family, so all twenty-seven squares are held.
+    for operator in ["-", "*", "/", "%", "&", "|", "^", "<<", ">>"] {
+        assert_fails_with(
+            &format!(
+                r#"
+                fun main() {{
+                    let flag = true;
+                    print(flag {operator} 3);
+                }}
+                "#
+            ),
+            &format!("`{operator}` on `bool` has no meaning"),
+        );
+        assert_fails_with(
+            &format!(
+                r#"
+                fun main() {{
+                    let text = "12";
+                    print(text {operator} 3);
+                }}
+                "#
+            ),
+            &format!("`{operator}` on `str` has no meaning"),
+        );
+        assert_fails_with(
+            &format!(
+                r#"
+                enum Level {{ Low = 1, High = 5 }}
+
+                fun main() {{
+                    print(Level::High {operator} Level::Low);
+                }}
+                "#
+            ),
+            &format!("`{operator}` on `Level` has no meaning"),
+        );
+    }
+}
+
+#[test]
+fn b196_the_refusal_names_the_admitted_set_of_the_left_operand() {
+    // The operand-role wording (row 345/353's family): a refusal that only
+    // says "not this one" leaves the reader to guess which ones are, so each
+    // left type names its own admitted set — and a STRING backing names a
+    // narrower one, because §3.6 refuses its ordering too.
+    assert_fails_with(
+        r#"
+        fun main() {
+            print(true - 3);
+        }
+        "#,
+        "`bool`'s admitted operators are `== != && || !`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print("12" - 3);
+        }
+        "#,
+        "`str`'s admitted operators are `+ == != < <= > >=`",
+    );
+    assert_fails_with(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            print(Level::High - Level::Low);
+        }
+        "#,
+        "`Level`'s admitted operators are `== != < <= > >=`",
+    );
+    assert_fails_with(
+        r#"
+        enum Size { Small = "sm", Large = "lg" }
+
+        fun main() {
+            print(Size::Large - Size::Small);
+        }
+        "#,
+        "`Size`'s admitted operators are `== !=`",
+    );
+}
+
+#[test]
+fn b196_the_refusal_steers_to_the_spelling_that_works() {
+    // A refusal is worth what the reader can do with it, and the three shapes
+    // want three different things: a bitwise operator on a `bool` is nearly
+    // always the logical one mistyped, a `str` wants parsing (or `.repeat`),
+    // and a backing is not a number to compute with at all.
+    assert_fails_with(
+        r#"
+        fun main() {
+            print(true & false);
+        }
+        "#,
+        "`&&` is `bool`'s conjunction",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print(true ^ false);
+        }
+        "#,
+        "`!=` is `bool`'s exclusive or",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print("ab" * 3);
+        }
+        "#,
+        "A `str` repeats with `.repeat(n)`",
+    );
+    assert_fails_with(
+        r#"
+        fun main() {
+            print("12" - 3);
+        }
+        "#,
+        "Parse the text first (`.parse_i32()`, `.parse_f64()`)",
+    );
+    assert_fails_with(
+        r#"
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            print(Level::High / Level::Low);
+        }
+        "#,
+        "match on the variant, or hold the number you mean",
+    );
+}
+
+#[test]
+fn b196_the_steers_the_refusals_name_all_compile() {
+    // Each escape hatch has to work, or the rule would have no legal spelling.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Level { Low = 1, High = 5 }
+
+        fun main() {
+            let flag = true;
+            let as_number: i32 = if flag { 1 } else { 0 };
+            print(as_number - 3);
+            print(true && false);
+            print(true != false);
+            print("ab".repeat(3));
+            print("12".parse_i32().unwrap_or(0) - 3);
+            let rank: i32 = match Level::High { Level::Low => 1, Level::High => 5 };
+            print(rank - 1);
+        }
+        "#,
+        "-2\nfalse\ntrue\nababab\n9\n4\n",
+    );
+}
+
+#[test]
+fn b196_the_numeric_carve_out_is_untouched() {
+    // b148's SCOPE note deferred `f64 * i32` — two GROUNDED numbers computing
+    // a correct answer of the declared type — and B196 is not that change.
+    // The whole nine-operator family stays admitted on a numeric left operand,
+    // mixed widths included.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let scale: f64 = 2.5;
+            let count: i32 = 2;
+            print(scale * count);
+            print(scale - count);
+            print(7 % 4);
+            print(6 & 3);
+            print(1 << 3);
+        }
+        "#,
+        "5\n0.5\n3\n2\n8\n",
+    );
+}
+
+#[test]
+fn b196_the_admitted_operators_of_each_left_type_still_run() {
+    // The controls. Every operator each refusal NAMES as admitted has to keep
+    // working, or the rule would have eaten more than the bug.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Level { Low = 1, High = 5 }
+        enum Size { Small = "sm", Large = "lg" }
+
+        fun main() {
+            print("a" + "b");
+            print("a" == "a");
+            print("a" != "b");
+            print("a" < "b");
+            print(true == false);
+            print(true && false);
+            print(true || false);
+            print(!true);
+            print(Level::Low < Level::High);
+            print(Level::Low == Level::Low);
+            print(Size::Small == Size::Large);
+        }
+        "#,
+        "ab\ntrue\ntrue\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+#[ignore = "B196's residual: the UNARY `-` takes its operand's type with no check \
+            at all (`Expr::Unary(_, operand)` in `infer_type_inner`), so `-true`, \
+            `-\"12\"` and `-Level::High` are the same miscompile at a different \
+            site — a second refusal family with a census and a ledger row of its \
+            own, not this binary gate's."]
+fn b196_a_unary_minus_on_a_non_numeric_operand_is_rejected() {
+    // KNOWN BUG, found on B196's path and deliberately not taken. The binary
+    // loop this lane fixed reads `prepped_binary_ops`; a unary is typed
+    // somewhere else entirely and reaches no operand rule at all, so `-true`
+    // is `-1` typed `bool`, `-"12"` is `-12` typed `str`, and
+    // `-Level::High` is `-5` typed `Level` — matching no variant, exactly as
+    // `Level::High ^ Level::Low` did.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let flipped: bool = -true;
+            print(flipped);
+        }
+        "#,
+        "has no meaning",
+    );
+}
