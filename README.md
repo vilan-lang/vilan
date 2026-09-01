@@ -49,7 +49,7 @@ contract. Exposed signals mirror live to every connected client, and
 ```vilan,fragment
 [service(NotesClient)]
 struct NotesStore {
-	[expose] notes: Signal<List<Note>>,
+	[expose] notes: SignalCell<List<Note>>,
 	…
 }
 
@@ -60,7 +60,7 @@ impl NotesStore {
 
 // browser side, inside a view:
 let client = NotesClient::connect("/", json_codec())!;
-let notes: Signal<List<Note>> = client.notes.or([]);   // live-synced, typed; subscribed while shown
+let notes: SignalCell<List<Note>> = client.notes.or([]);   // live-synced, typed; subscribed while shown
 ```
 
 The [full-stack walkthrough](vilan/docs/guide/walkthrough.md) builds a

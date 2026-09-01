@@ -7198,3 +7198,30 @@ holder 7
 ",
     );
 }
+
+/// The coherence rule std's blanket brings with it, stated as a pin because it
+/// is what a user meets first: a SECOND blanket for one trait never reaches a
+/// call site, so re-declaring `impl type T with MaybeSignal<T>` is refused at
+/// the declaration, naming the module that already has it. Narrowing the
+/// subject is the fix, and a narrowed impl then outranks std's by specificity
+/// (`b157_a_users_own_impl_outranks_stds_blanket`).
+#[test]
+fn b157_a_second_blanket_for_maybe_signal_is_refused_at_its_declaration() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ MaybeSignal, comp };
+
+        impl type T with MaybeSignal<T> {
+            fun bind(self, react: |T| void) { react(self); }
+        }
+
+        fun badge<V: MaybeSignal<str>>(label: V) { label.bind(|text| print(text)); }
+
+        fun main() {
+            let (_value, _owner) = comp(|| { badge("x"); 0 });
+        }
+        main();
+        "#,
+        "'MaybeSignal' is already implemented for 'T' by module 'reactive'",
+    );
+}
