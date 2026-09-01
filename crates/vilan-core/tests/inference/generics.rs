@@ -4594,3 +4594,426 @@ fn a_shared_generic_body_runs_at_every_type_it_was_shared_across() {
         "3\na!!\n",
     );
 }
+
+// --- B185: a REBINDING of a closure parameter waits for it, like a mention --
+//
+// `mut next = values` inside `|values| ..` is a binding whose type is still
+// `Unknown` *because* the parameter's is. The variable resolver alone treated
+// that `Unknown` as an ANSWER and ground the binding on it — permanently,
+// since bidirectional inference fills the parameter's slot later. Two failures
+// followed: every later use refused ("cannot call method 'push' on unknown"),
+// and where nothing refused, the transformer read the untyped binding as a
+// scalar and dropped the `__clone` a `mut` rebinding of a List, a Map or a
+// struct owes — so the closure mutated its CALLER's value in place.
+
+#[test]
+fn b185_a_rebound_closure_parameter_keeps_its_container_type() {
+    // The general path, with no reactive machinery in sight: a closure passed
+    // to a generic function, its parameter rebound, the rebinding used.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply<T>(value: T, transform: |T| T): T { transform(value) }
+
+        fun main() {
+            let result = apply([1], |values| {
+                mut next = values;
+                next.push(2);
+                next
+            });
+            print(result.len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b185_a_rebound_closure_parameter_still_copies_a_list() {
+    // The MISCOMPILE half. `mut next = values` owes the caller a copy; with
+    // `next` untyped the emitter dropped the `__clone` and `grow` mutated
+    // `seed` through the alias — the annotated spelling printed `1 2` while
+    // this one printed `2 2`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply<T>(value: T, transform: |T| T): T { transform(value) }
+        fun grow(list: &mut List<i32>) { list.push(9); }
+
+        fun main() {
+            let seed = [1];
+            let out = apply(seed, |values| {
+                mut next = values;
+                grow(&mut next);
+                next
+            });
+            print(seed.len());
+            print(out.len());
+        }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b185_a_rebound_closure_parameter_still_copies_a_struct() {
+    // The same copy, on the other aggregate: a struct is `__clone`d by value
+    // too, and the untyped binding aliased the caller's `seed`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Point { x: i32 }
+
+        fun apply<T>(value: T, transform: |T| T): T { transform(value) }
+        fun bump(point: &mut Point) { point.x = point.x + 1; }
+
+        fun main() {
+            let seed = Point { x = 1 };
+            let out = apply(seed, |value| {
+                mut next = value;
+                bump(&mut next);
+                next
+            });
+            print(seed.x);
+            print(out.x);
+        }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b185_a_rebinding_of_a_rebinding_waits_too() {
+    // The chain: `first` is itself ungrounded while the parameter is, so
+    // `second` must wait on the parameter THROUGH it — the walk follows a
+    // binding's initializer, not just one `let`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply<T>(value: T, transform: |T| T): T { transform(value) }
+
+        fun main() {
+            let result = apply([1], |values| {
+                let first = values;
+                mut second = first;
+                second.push(2);
+                second
+            });
+            print(result.len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b185_a_plain_let_rebinding_waits_too() {
+    // Not a `mut` rule: an immutable `let` rebinding lost the type the same
+    // way, and only the reads gave it away.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply<T>(value: T, transform: |T| T): T { transform(value) }
+
+        fun main() {
+            let result = apply([1, 2], |values| {
+                let next = values;
+                print(next.len());
+                next
+            });
+            print(result.len());
+        }
+        main();
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn b185_set_with_rebinding_on_an_inferred_signal() {
+    // The reported shape: `set_with` is a `Signal<T>` trait DEFAULT, and the
+    // receiver's `T` arrives from `Signal::new`'s call-site inference rather
+    // than an annotation.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Signal;
+
+        fun main() {
+            let s = Signal::new([1]);
+            s.set_with(|values| {
+                mut next = values;
+                next.push(2);
+                next
+            });
+            print(s.get().len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b185_set_with_rebinding_through_signal_cell_new() {
+    // The same through the impl's own `new` rather than the trait default's,
+    // so the two doors onto the one cell are both pinned.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::SignalCell;
+
+        fun main() {
+            let s = SignalCell::new([1]);
+            s.set_with(|values| {
+                mut next = values;
+                next.push(2);
+                next
+            });
+            print(s.get().len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b185_set_with_rebinding_on_a_trait_annotated_signal() {
+    // The website's verbatim shape (`playground.vl`): a B161 trait-as-
+    // constraint annotation over an EMPTY literal, and the copy-update-return
+    // idiom `set_with` exists for, reads included.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Signal;
+
+        struct ConsoleRow { id: i32, text: str }
+
+        fun main() {
+            let console_cap = 3;
+            let console_lines: Signal<List<ConsoleRow>> = Signal::new([]);
+            console_lines.set_with(|lines| {
+                mut next = lines;
+                if next.len() < console_cap {
+                    next.push(ConsoleRow { id = 1, text = "hi" });
+                } else if next.len() == console_cap {
+                    next.push(ConsoleRow { id = 2, text = "[output truncated]" });
+                }
+                next
+            });
+            print(console_lines.get().len());
+        }
+        main();
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b185_set_with_rebinding_on_a_declared_field() {
+    // A DECLARED field's type is no protection either: what mattered was the
+    // rebinding, not where the receiver's type came from.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        struct Store { items: SignalCell<List<i32>> }
+
+        fun main() {
+            let store = Store { items = Signal::new([1]) };
+            store.items.set_with(|list| {
+                mut updated = list;
+                updated.push(2);
+                updated
+            });
+            print(store.items.get().len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b185_rebinding_a_nested_container_parameter() {
+    // A generic APPLICATION nested one level further down still lands whole —
+    // the element type comes with it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Signal;
+
+        fun main() {
+            let s = Signal::new([[1]]);
+            s.set_with(|rows| {
+                mut next = rows;
+                next.push([2, 3]);
+                next
+            });
+            print(s.get().len());
+            print(s.get()[1].len());
+        }
+        main();
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn b185_rebinding_a_map_parameter() {
+    // The other container, whose `__clone` the untyped binding also dropped.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::reactive::Signal;
+
+        fun main() {
+            mut seed: Map<str, i32> = Map::new();
+            seed.insert("a", 1);
+            let s = Signal::new(seed);
+            s.set_with(|entries| {
+                mut next = entries;
+                next.insert("b", 2);
+                next
+            });
+            print(s.get().len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b185_rebinding_inside_a_nested_closure() {
+    // The rebinding one closure deeper, over a CAPTURE of the outer
+    // parameter — the walk reaches the parameter through the capture.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Signal;
+
+        fun main() {
+            let s = Signal::new([1]);
+            s.set_with(|values| {
+                let build = || {
+                    mut next = values;
+                    next.push(2);
+                    next
+                };
+                build()
+            });
+            print(s.get().len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b185_rebinding_in_a_required_method_closure() {
+    // `sub` is a `Source<T>` REQUIREMENT, not a default body: the same
+    // rebinding must ground there too, so the fix is not about how a default
+    // body's `T` is substituted.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Signal;
+
+        fun main() {
+            let s = Signal::new([1]);
+            let handle = s.sub(|values| {
+                let seen = values;
+                print(seen.len());
+            });
+            s.set([1, 2]);
+            handle.dispose();
+        }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b185_rebinding_in_an_inherent_update_closure() {
+    // `update` is INHERENT on `SignalCell` and hands its closure a `&mut T`
+    // view; a rebinding of that view grounds through the same walk.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Signal;
+
+        fun main() {
+            let s = Signal::new([1]);
+            s.update(|&mut list| {
+                let view = list;
+                print(view.len());
+            });
+            print(s.get().len());
+        }
+        main();
+        "#,
+        "1\n1\n",
+    );
+}
+
+#[test]
+fn b185_a_never_called_closure_still_names_its_starved_parameter() {
+    // Waiting forever must not become silence. A closure that is genuinely
+    // never called leaves the rebinding deferred, and the post-fixpoint sweep
+    // reports against the PARAMETER — where the annotation goes — rather than
+    // emitting the near-information-free "type of variable could not be
+    // resolved" residual over the rebinding.
+    assert_fails_with(
+        r#"
+        fun main() {
+            let never_called = |values| {
+                mut next = values;
+                next.push(2);
+                next
+            };
+        }
+        main();
+        "#,
+        "`values` is never given a type",
+    );
+}
+
+#[test]
+fn b185_a_rebinding_walk_terminates_on_a_module_level_binding_cycle() {
+    // Following initializers put the walk on a graph that can CYCLE: module
+    // bindings resolve in any order, so `let a = b; let b = a;` is writable
+    // and spun the walk forever (the two `..does_not_overflow_the_analyzer`
+    // pins in `resources` hung on exactly this before the seen-set). The
+    // program is undetermined either way — the claim is that it still SAYS so.
+    assert_fails(
+        r#"
+        let a = b;
+        let b = a;
+
+        fun apply<T>(value: T, transform: |T| T): T { transform(value) }
+
+        fun main() {
+            let result = apply(a, |values| {
+                mut next = values;
+                next
+            });
+        }
+        main();
+        "#,
+    );
+}
