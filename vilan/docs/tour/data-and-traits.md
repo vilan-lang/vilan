@@ -284,9 +284,9 @@ runtime", use an enum.
 
 ## A trait on a binding is a constraint
 
-The one place a trait's name reads well in an annotation is a `let`, and
-there it means something narrower than it looks: a **constraint** on the
-value, not the value's type.
+Two annotations take a trait's name — a `let` and a parameter — and
+there it means something narrower than it looks. On a `let` it is a
+**constraint** on the value, not the value's type.
 
 ```vilan
 trait Greet {
@@ -313,6 +313,47 @@ keep working with its real type. Because the type stays concrete, two
 implement the trait — there is no widening for them to meet in. And a
 trait nested inside the annotation (`List<Greet>`) is an ordinary value
 position, so it is still refused: there are no heterogeneous containers.
+
+## A trait on a parameter is a generic
+
+On a **parameter** the same spelling means a generic parameter you did
+not have to write. `fun f(x: Greet)` is `fun f<T: Greet>(x: T)`, and the
+function is compiled once per type it is called at, exactly as if you had
+written the `<T: Greet>` out:
+
+```vilan
+trait Greet {
+	fun greet(self): str;
+}
+
+struct Robot { id: i32 }
+struct Parrot { name: str }
+impl Robot with Greet { fun greet(self): str { "beep" } }
+impl Parrot with Greet { fun greet(self): str { "hello" } }
+
+fun announce(unit: Greet): str {
+	// `unit` is whatever type this call was made at, held to `Greet`, so
+	// the trait's members are what the body may reach — `unit.id` is not
+	// available here the way it was on the `let` above.
+	unit.greet()
+}
+
+fun main() {
+	print(announce(Robot { id = 1 }));
+	print(announce(Parrot { name = "kea" }));
+}
+```
+
+Two things follow, and both are worth knowing before you reach for it.
+Each parameter gets its **own** type parameter, so `fun pair(a: Greet, b:
+Greet)` accepts a `Robot` and a `Parrot` together; when both arguments
+must be the *same* type, write the generic yourself and use it twice
+(`fun pair<T: Greet>(a: T, b: T)`). And the function is genuinely
+generic, so a reader cannot see its arity from the signature — which is
+the trade the shorter spelling buys.
+
+Written and implicit generics mix freely, and the implicit ones come last
+in the list, so `f<i32>(..)` still binds the parameter you wrote.
 
 ## Associated functions
 

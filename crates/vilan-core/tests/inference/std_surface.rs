@@ -3997,41 +3997,56 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
 // which is the arc closing rather than a regression, and the steer's own pins
 // now read at the declaration. What survives verbatim is the register: name the
 // rule, then name the declaration that works.
+//
+// SUPERSEDED IN PART BY B186. The PARAMETER position, which is the position
+// B72 was filed on, now takes the trait name and means `<T: A>` — the steer's
+// own recommendation, made the spelling. What B72 established survives whole
+// where it still applies: the rule is a DECLARATION-site one (it fires with no
+// call in sight), it is one rule rather than a per-position message, and the
+// steer has to name a program that compiles. The pins below carry that to the
+// positions that still refuse, and the parameter's own acceptance is pinned in
+// `traits.rs`'s B186 section.
 
 #[test]
-fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
-    // The filed shape. Now refused where it is written, not where it is called.
-    assert_fails_with(
+fn b186_a_bare_trait_parameter_is_the_generic_the_steer_asked_for() {
+    // SUPERSEDED BY B186 (was `b72_a_bare_trait_parameter_steers_to_a_bound_generic`).
+    // The filed shape, and now a running program: the declaration B72 refused
+    // and steered to is what the declaration MEANS.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
-        fun main() { let s = show(Bag { n = 1 }); }
+        fun show(v: A): str { v.name() }
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
         "#,
-        "'A' is a trait, not a type: a trait is not a value type",
+        "bag\n",
     );
 }
 
 #[test]
-fn b72_the_bare_trait_steer_names_the_generic_to_write() {
+fn b72_the_bare_trait_steer_names_the_position_that_works() {
     // The actionable half — without it the message diagnoses without directing.
+    // Read at a FIELD since B186: the steer now names the parameter form first,
+    // because that is where a reader who wrote a trait most often meant to.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
-        fun main() { let s = show(Bag { n = 1 }); }
+        struct Holder { v: A }
+        fun main() { }
         "#,
-        "`<T: A>` — and write 'T' here",
+        "write `fun f(x: A)` for a parameter, or a generic for a field/return",
     );
 }
 
 #[test]
 fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
     // B72 anchored at the call and needed a note to reach the parameter that
-    // had to change. The refusal anchors at that parameter, so the note points
+    // had to change. The refusal anchors at the annotation, so the note points
     // at the other thing the reader may not be able to see — the trait — and
     // carries its own source, so it renders when the trait lives in another
     // module (the B72 mechanism, pointed one hop further out).
@@ -4040,8 +4055,8 @@ fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(subject: A): str { "x" }
-        fun main() { let s = show(Bag { n = 1 }); }
+        struct Holder { subject: A }
+        fun main() { }
         "#,
         "'A' is a trait, not a type",
         "A",
@@ -4050,20 +4065,24 @@ fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
 }
 
 #[test]
-fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
+fn b186_a_bare_trait_parameter_on_a_static_is_the_generic_too() {
+    // SUPERSEDED BY B186 (was `b72_a_bare_trait_parameter_on_a_static_steers_too`).
     // The second surface B72 had to reach separately — an associated function
-    // called as `Type::member(..)` — needs no separate reach now: both are the
-    // same written parameter, refused once at the declaration.
-    assert_fails_with(
+    // called as `Type::member(..)` — needs no separate reach now, in the other
+    // direction: both are the same written parameter, and both are the implicit
+    // generic.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         struct Holder { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        impl Holder { fun make(v: A): i32 { 1 } }
-        fun main() { let n = Holder::make(Bag { n = 1 }); }
+        impl Holder { fun make(v: A): str { v.name() } }
+        fun main() { print(Holder::make(Bag { n = 1 })); }
+        main();
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 
@@ -4072,33 +4091,32 @@ fn b72_the_refusal_does_not_wait_for_an_argument() {
     // B72's steer was conditional on the argument implementing the trait: at a
     // call, a non-implementing value made the missing impl the likelier
     // mistake, so the plain mismatch stayed the better report. A definition-site
-    // rule has no such branch and needs none — `fun show(v: A)` is wrong on its
-    // own terms, before any argument exists, and reports identically whether
-    // the value passed implements `A` or not. That is what makes it one rule
-    // rather than a message.
+    // rule has no such branch and needs none — a trait in a value position is
+    // wrong on its own terms, before any value exists. That is what makes it
+    // one rule rather than a message.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         struct Other { m: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
-        fun main() { let s = show(Other { m = 1 }); }
+        fun show(): A { Other { m = 1 } }
+        fun main() { let s = show(); }
         "#,
         "'A' is a trait, not a type",
     );
 }
 
 #[test]
-fn b72_an_uncalled_bare_trait_parameter_is_still_refused() {
+fn b72_an_unused_bare_trait_declaration_is_still_refused() {
     // The half a use-site steer structurally could not reach: a declaration
-    // nobody calls. B72 was silent here; the rule is not.
+    // nobody uses. B72 was silent here; the rule is not.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        fun show(v: A): str { "x" }
+        struct Holder { v: A }
         fun main() { }
         "#,
         "'A' is a trait, not a type",
@@ -4202,20 +4220,24 @@ fn b161_a_trait_annotated_binding_dispatches_on_its_own_type() {
 }
 
 #[test]
-fn b72_a_bare_trait_method_parameter_is_refused() {
+fn b186_a_bare_trait_method_parameter_is_the_generic_too() {
+    // SUPERSEDED BY B186 (was `b72_a_bare_trait_method_parameter_is_refused`).
     // A METHOD's bare-trait parameter reconciled value-first, so it accepted
-    // where the free function refused. The asymmetry is gone: both are written
-    // parameters, and the rule is on the writing.
-    assert_fails_with(
+    // where the free function refused — an asymmetry B72 closed by refusing
+    // both. Both are written parameters and the rule is still on the writing;
+    // what the writing MEANS is now the implicit generic, on both.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         struct Holder { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
-        impl Holder { fun take(self, v: A): i32 { 1 } }
-        fun main() { let h = Holder { n = 0 }; let n = h.take(Bag { n = 1 }); }
+        impl Holder { fun take(self, v: A): str { v.name() } }
+        fun main() { let h = Holder { n = 0 }; print(h.take(Bag { n = 1 })); }
+        main();
         "#,
-        "'A' is a trait, not a type",
+        "bag\n",
     );
 }
 

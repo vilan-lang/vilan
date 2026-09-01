@@ -4472,30 +4472,6 @@ fn a_blanket_impl_bound_resolves_from_a_generic_body() {
 
 // --- M16: a T-independent generic body is emitted ONCE ----------------------
 
-/// Counts the top-level `function` declarations in `js` whose body — the lines
-/// up to the closing brace at column 0 — contains `needle`.
-fn emitted_bodies_containing(js: &str, needle: &str) -> usize {
-    let mut count = 0;
-    let mut lines = js.lines().peekable();
-    while let Some(line) = lines.next() {
-        if !(line.starts_with("function ") || line.starts_with("async function ")) {
-            continue;
-        }
-        let mut body = String::new();
-        for inner in lines.by_ref() {
-            if inner == "}" {
-                break;
-            }
-            body.push_str(inner);
-            body.push('\n');
-        }
-        if body.contains(needle) {
-            count += 1;
-        }
-    }
-    count
-}
-
 /// M16 (audit run 6's F18). A generic function whose EMITTED body does not
 /// depend on `T` is one function, however many types it is instantiated at —
 /// and it used to be one byte-identical JS copy per instantiation.

@@ -913,6 +913,33 @@ pub fn assert_emits_containing(source: &str, needle: &str) {
     }
 }
 
+/// Counts the top-level `function` declarations in `js` whose body — the lines
+/// up to the closing brace at column 0 — contains `needle`. The instrument for
+/// an emitted-COPY count: M16's body sharing means the number of instance keys
+/// the analyzer minted is no longer the number of bodies that landed, and a pin
+/// about monomorphization cost has to read the bodies.
+pub fn emitted_bodies_containing(js: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut lines = js.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !(line.starts_with("function ") || line.starts_with("async function ")) {
+            continue;
+        }
+        let mut body = String::new();
+        for inner in lines.by_ref() {
+            if inner == "}" {
+                break;
+            }
+            body.push_str(inner);
+            body.push('\n');
+        }
+        if body.contains(needle) {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// The `(kind, line)` view of what a program's const evaluation emitted — what
 /// a pin about an asset's CONTENT reads. [`collected_keyed_assets`] is the same
 /// run with each contribution's sort key kept (build-hooks.md §5.3), and

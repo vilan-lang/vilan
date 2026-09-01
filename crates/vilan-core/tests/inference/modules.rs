@@ -5582,14 +5582,16 @@ fn an_unresolved_value_in_a_module_is_attributed_to_the_module_too() {
 #[test]
 fn a_bare_trait_annotation_in_a_module_is_attributed_to_the_module() {
     // The other diagnostic the same drain raises, carrying the same defect: an
-    // annotation that RESOLVED, to a trait, in value position (§12.2).
-    const ALPHA: &str =
-        "trait Shape {\n\tfun area(&self): i32;\n}\n\nfun size(shape: Shape): i32 {\n\t0\n}\n";
+    // annotation that RESOLVED, to a trait, in value position (§12.2). A FIELD
+    // since B186 — the parameter this was written on became the implicit
+    // generic, and a field is the nearest position that still refuses.
+    const ALPHA: &str = "trait Shape {\n\tfun area(&self): i32;\n}\n\nstruct Holder {\n\tshape: \
+                         Shape,\n}\n\nfun size(): i32 {\n\t0\n}\n";
     let outcome = analyze_package(
         &[
             (
                 "main.vl",
-                "import pkg::alpha::size;\nfun main() { size(1); }\n",
+                "import pkg::alpha::size;\nfun main() { size(); }\n",
             ),
             ("alpha.vl", ALPHA),
         ],

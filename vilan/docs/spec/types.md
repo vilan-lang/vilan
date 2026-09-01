@@ -426,8 +426,8 @@ may carry defaults
 value ever has a trait as its type.
 
 That rule is enforced **at the annotation**, in every value position — a
-parameter, a return type, a field, a generic argument (`List<Display>`)
-— and reported where the trait's name is written, whether or not the
+return type, a field, a generic argument (`List<Display>`) — and reported
+where the trait's name is written, whether or not the
 declaration is ever used. A trait's name stays legal in the positions
 that name a bound or a namespace rather than a value's type: a generic
 parameter's bound (`<T: Display>`), a supertrait, an `impl` subject
@@ -439,18 +439,19 @@ unaffected.
 
 ### A trait annotation on a binding
 
-A `let` binding's annotation is the one exception, and it is not an
-exception to the rule above but an application of it: a trait written
-there is a **checked constraint**, not the binding's type.
+A `let` binding's annotation is one of two exceptions — the other is a
+parameter's, below — and neither is an exception to the rule above but an
+application of it: a trait written here is a **checked constraint**, not
+the binding's type.
 
 ```
-let count: SignalCell<i32> = SignalCell::new(1);
+let count: Signal<i32> = SignalCell::new(1);
 ```
 
 `count`'s type is `SignalCell<i32>` — the type its initializer infers,
 exactly as if nothing had been written. The annotation neither widens it
 nor boxes it; it asserts that whatever type the initializer produces
-implements `SignalCell<i32>`, and is a compile error when it does not. This
+implements `Signal<i32>`, and is a compile error when it does not. This
 is the bounded-generic rule (§5.6) in binding position: **checked wide,
 kept narrow**, one concrete type per binding. Reading `count`'s members
 therefore reaches `SignalCell`'s own — its fields included — and a
@@ -467,11 +468,47 @@ constraint meets the one type that unification produced:
 
 ```
 // legal — both arms are SignalCell<i32>
-let cell: SignalCell<i32> = if c { SignalCell::new(1) } else { SignalCell::new(2) };
+let cell: Signal<i32> = if c { SignalCell::new(1) } else { SignalCell::new(2) };
 // refused at the ARMS, as an ordinary mismatch: two concrete types,
-// each implementing SignalCell<i32>, still do not unify
-let cell: SignalCell<i32> = if c { SignalCell::new(1) } else { OtherSignal::new(2) };
+// each implementing Signal<i32>, still do not unify
+let cell: Signal<i32> = if c { SignalCell::new(1) } else { OtherSignal::new(2) };
 ```
+
+### A trait annotation on a parameter
+
+A parameter's annotation is the other position that takes a trait name,
+and it means something different from a binding's: an **implicit generic
+parameter**.
+
+```
+fun render(cell: Signal<i32>): str { ... }   // == fun render<T: Signal<i32>>(cell: T)
+```
+
+The two readings differ because their quantification does. A binding has
+one initializer and so one concrete type, which it keeps. A parameter has
+one type per call site, so the function is checked **once, against the
+bound**, and monomorphized per call like any generic — which means the
+body reaches the trait's members and not the argument's own. Everything
+else follows from the desugaring, and nothing about it is new:
+
+- Each annotation is its **own** generic. `fun f(a: Show, b: Show)` has
+  two type parameters and its two arguments may be different types; a
+  function that needs them equal writes one generic and uses it twice.
+- The trait's arguments are the bound's: `x: Signal<i32>` bounds the
+  parameter by `Signal<i32>`, not by `Signal<T>` for a free `T`.
+- The implicit parameter is **appended** after every generic the
+  declaration writes, so explicit generic arguments keep their meaning.
+- Written and implicit generics mix freely in one signature.
+- A **closure** parameter takes no trait: a closure has no generic
+  parameters, so the annotation is refused there like any other value
+  position.
+
+The reading is the binding's in one respect: it applies to the
+parameter's OWN annotation, never to a trait nested inside one
+(`List<Display>`), which stays refused. A `&` is not such a nesting — it
+is a call convention, erased before the annotation is read — so
+`&Display` is "a view of something implementing `Display`" at a parameter
+and at a binding alike.
 
 ### Associated functions
 
