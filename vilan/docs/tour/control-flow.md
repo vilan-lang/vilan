@@ -103,6 +103,15 @@ if slot is Some(let task) && task.ready { start(task); }   // both fine
 if slot is Some(let task) { … } else { start(task); }      // error: unbound
 ```
 
+Negating the test swaps the two branches: `!(slot is Some(let task))` is
+true where the pattern *didn't* match, so the capture is unbound in that
+branch and in scope in the `else` — the branch reached only by a match.
+
+```vilan,fragment
+if !(slot is Some(let task)) { start(task); }              // error: unbound
+if !(slot is Some(let task)) { … } else { start(task); }   // fine: it matched
+```
+
 One edge to know: a `match` can't sit directly inside a larger operator
 expression. Bind it to a local first.
 

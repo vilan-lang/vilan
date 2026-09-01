@@ -809,12 +809,31 @@ then-branch, since reaching it proves only that *some* arm was true.
 Outside its scope the name is simply unbound, and reading it is the
 ordinary "cannot find" error.
 
+A **negation swaps the two branches**, and nothing else: `!(x is P)` is
+true exactly where `P` failed, so the capture is *not* in that `if`'s
+then-branch — it is in the **`else`** branch (and on down an `else if`
+chain), which is reached precisely when the pattern matched. Two
+negations cancel. The `&&` rule is unchanged *inside* the negation —
+`!(x is P && …)` still binds the right operand, which the short-circuit
+reached by matching — but a negated capture does not cross an `&&` it
+sits to the left of, because `&&` carries only its left operand's true
+side. A capture under a `||` stays unbound in both branches. Binding the
+continuation after a diverging then-branch (`if !(x is P) { ret; }`) is
+not part of this rule; the name is unbound after the `if` as usual.
+
 ```vilan,fragment
 if slot is Some(let n) { use(n); }                // yes: the test passed
 if slot is Some(let n) && n > 0 { use(n); }       // yes: `&&` short-circuits
 if slot is Some(let n) { … } else { use(n); }     // error: unbound here
 if slot is Some(let n) || n > 0 { … }             // error: unbound here
 if slot is Some(let n) { … } use(n);              // error: the `if` ended
+
+if !(slot is Some(let n)) { use(n); }             // error: the test failed
+if !(slot is Some(let n)) { … } else { use(n); }  // yes: it matched
+if !(!(slot is Some(let n))) { use(n); }          // yes: the negations cancel
+if !(slot is Some(let n) && n > 0) { … }          // yes for `n > 0`, no for the branch
+if !(slot is Some(let n)) && n > 0 { … }          // error: unbound here
+if !(slot is Some(let n)) { ret; } use(n);        // error: the `if` ended
 ```
 
 A pattern is checked against the type of the value it matches, so an

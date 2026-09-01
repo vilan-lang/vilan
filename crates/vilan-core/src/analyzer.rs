@@ -2301,6 +2301,95 @@ fn min_operand_end(outer: Option<usize>, inner: usize) -> usize {
     }
 }
 
+/// Where a pattern capture bound at the current point of an `if` condition is
+/// visible, tracked as a PAIR of answers (B195): `same_*` is the answer for a
+/// capture at EVEN negation parity from here, `flip_*` the answer at ODD.
+///
+/// Carrying both is what makes `!` a plain swap — and therefore what makes
+/// `!(!(x is P))` cancel on its own rather than needing a depth counter — and
+/// what lets `&&` cut the half that its short-circuit does not carry while
+/// leaving the other half alone.
+///
+/// The reason a negation needs any of this: `if !(x is P)` runs its THEN branch
+/// exactly when `P` did NOT match, so the capture is unbound there; the branch
+/// that proves the match is the ELSE. B171's then-branch rule, mirrored.
+#[derive(Debug, Clone, Copy)]
+struct ConditionPolarity {
+    /// Visibility end (`LocalDeclaration::visible_until`) for an even-parity
+    /// capture — [`LocalDeclaration::FOREVER`] when it reaches the then-branch.
+    same_until: usize,
+    /// The same for an odd-parity capture.
+    flip_until: usize,
+    /// Whether an even-parity capture is bound in the `if`'s ELSE branch.
+    same_in_else: bool,
+    /// The same for an odd-parity capture.
+    flip_in_else: bool,
+}
+
+impl ConditionPolarity {
+    /// The whole condition, unnegated: an even-parity capture runs to the end
+    /// of its scope (the then-branch included) and is NOT in the else; an
+    /// odd-parity one stops at the end of the condition — so it never reaches
+    /// the then-branch — and IS in the else.
+    fn root(condition_end: usize) -> Self {
+        Self {
+            same_until: LocalDeclaration::FOREVER,
+            flip_until: condition_end,
+            same_in_else: false,
+            flip_in_else: true,
+        }
+    }
+
+    /// Under a `!`: the two halves trade places.
+    fn negated(self) -> Self {
+        Self {
+            same_until: self.flip_until,
+            flip_until: self.same_until,
+            same_in_else: self.flip_in_else,
+            flip_in_else: self.same_in_else,
+        }
+    }
+
+    /// Into an operand of `&&`, which carries only its operands' TRUE side:
+    /// an even-parity capture (bound on that side) passes through untouched,
+    /// an odd-parity one dies with the operand — it reaches neither the other
+    /// operand, nor the then-branch, nor the else.
+    fn into_and_operand(self, operand_end: usize) -> Self {
+        Self {
+            flip_until: self.flip_until.min(operand_end),
+            flip_in_else: false,
+            ..self
+        }
+    }
+
+    /// Into an operand of `||`. B171 already caps both halves at the operand's
+    /// own end through [`Analyzer::or_operand_end`], which is the whole of the
+    /// ruled `||` answer; all this adds is that neither half reaches the else
+    /// branch either — `!(x is P) || c` stays unbound in both branches until
+    /// someone rules otherwise.
+    fn into_or_operand(self) -> Self {
+        Self {
+            same_in_else: false,
+            flip_in_else: false,
+            ..self
+        }
+    }
+}
+
+/// Whether a node is part of an `if` condition's BOOLEAN SPINE — the operators
+/// whose truth the branches are selected by, and the `is` test itself (B195).
+///
+/// [`ConditionPolarity`] follows the spine and no further: a capture reached
+/// through anything else (a call argument, a nested `if`) is bound by an
+/// evaluation the condition's truth says nothing about, so the frame is dropped
+/// for that subtree and the capture keeps the plain B171 treatment.
+fn is_condition_spine(node: &Node<'_>) -> bool {
+    matches!(
+        node,
+        Node::Unary('!', _) | Node::Binary(BinaryOp::And | BinaryOp::Or, _, _) | Node::Is(..)
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct Scope<'src> {
     pub id: Id,
@@ -2561,6 +2650,15 @@ pub struct Analyzer<'src> {
     /// arm's test. `None` outside a `||`. Set to the INNERMOST operand's end
     /// (operand spans nest), and restored on the way out.
     or_operand_end: Option<usize>,
+    /// B195: while walking an `if` condition along its boolean spine, how a
+    /// capture bound HERE relates to the two branches. `None` everywhere else —
+    /// off the spine, and outside a condition entirely.
+    condition_polarity: Option<ConditionPolarity>,
+    /// B195: the captures the condition being walked binds in the `if`'s ELSE
+    /// branch — the ones under a negation — as `(name, entity, visible_until)`.
+    /// Drained by the `if` walk, which declares them into the else branch's own
+    /// scope (and into an `else if`'s, and on down the chain).
+    else_visible_captures: Vec<(&'src str, Id, usize)>,
     // Diagnostic source attribution (backlog E1): `(index, source)` marks — a
     // diagnostic at index `i` belongs to the source of the last mark with
     // `index <= i` (default: the entry, `SourceId(0)`). Marks are dropped at
@@ -3642,6 +3740,8 @@ impl<'src> Analyzer<'src> {
             struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
             or_operand_end: None,
+            condition_polarity: None,
+            else_visible_captures: Vec::new(),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: HashSet::default(),
@@ -20142,7 +20242,20 @@ impl<'src> Analyzer<'src> {
             self.expr_id_to_expr_map.insert(id, Expr::Error);
             return id;
         }
+        // B195: the branch bookkeeping travels the condition's boolean spine
+        // only. Stepping off it (into a call argument, a nested `if`) drops the
+        // frame for the subtree and restores it on the way out, so a capture
+        // down there is never credited to a branch its evaluation is not tied
+        // to.
+        let dropped_polarity = if is_condition_spine(&node.0) {
+            None
+        } else {
+            Some(self.condition_polarity.take())
+        };
         let id = self.walk_expr_node_inner(node, scope_id);
+        if let Some(polarity) = dropped_polarity {
+            self.condition_polarity = polarity;
+        }
         self.walk_depth -= 1;
         id
     }
@@ -20732,7 +20845,16 @@ impl<'src> Analyzer<'src> {
             }
             // Only `!` exists today and yields `bool`; full lowering deferred.
             Node::Unary(operator, operand) => {
+                // B195: `!` swaps which of the `if`'s branches a capture inside
+                // it is bound in — the then-branch of `!(x is P)` runs exactly
+                // when `P` did not match — and swapping twice is the identity,
+                // so a double negation needs no case of its own.
+                let outer_polarity = self.condition_polarity;
+                if *operator == '!' {
+                    self.condition_polarity = outer_polarity.map(ConditionPolarity::negated);
+                }
                 let operand_id = self.walk_expr_node(operand, scope_id);
+                self.condition_polarity = outer_polarity;
                 Some(Expr::Unary(*operator, operand_id))
             }
             // `&x` / `&mut x` — a view of a place. For aggregates a view is the
@@ -20749,16 +20871,56 @@ impl<'src> Analyzer<'src> {
             }
             Node::Jump(target) => Some(Expr::Jump(target)),
             Node::If(if_) => {
+                /// B195: the captures an earlier condition in this `if`/`else if`
+                /// chain bound under a NEGATION — bound, that is, exactly on the
+                /// path that reaches this branch. `(name, entity, visible_until)`.
+                type InheritedCaptures<'src> = Vec<(&'src str, Id, usize)>;
+
+                /// Declares them into a branch's own scope, from its very start:
+                /// the branch is a fresh scope, so a later `let` of the same name
+                /// inside it still shadows this (the last covering declaration
+                /// wins).
+                fn declare_inherited<'src>(
+                    s: &mut Analyzer<'src>,
+                    body_scope_id: Id,
+                    inherited: &InheritedCaptures<'src>,
+                ) {
+                    for &(name, capture_id, visible_until) in inherited {
+                        s.declare_scope_value_until(
+                            body_scope_id,
+                            name,
+                            capture_id,
+                            0,
+                            visible_until,
+                        );
+                    }
+                }
+
                 fn walk_branch<'src>(
                     s: &mut Analyzer<'src>,
                     branch: &'src NodeIfBranch,
                     scope_id: Id,
+                    inherited: &InheritedCaptures<'src>,
                 ) -> ExprIfBranch {
                     match branch {
                         NodeIfBranch::If(if_) => {
                             let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
+                            // An `else if`'s condition and body are reached only
+                            // on the previous condition's false path, which is
+                            // where a negated capture is bound.
+                            declare_inherited(s, body_scope_id, inherited);
                             s.reject_lift_region_condition(&if_.condition);
+                            // B195: walk the condition with a fresh polarity
+                            // frame and a fresh collector, so a nested `if` in
+                            // the condition cannot leak either into this one.
+                            let outer_polarity = s
+                                .condition_polarity
+                                .replace(ConditionPolarity::root(if_.condition.1.end));
+                            let outer_captures = std::mem::take(&mut s.else_visible_captures);
                             let condition_id = s.walk_expr_node(&if_.condition, body_scope_id);
+                            s.condition_polarity = outer_polarity;
+                            let negated_captures =
+                                std::mem::replace(&mut s.else_visible_captures, outer_captures);
                             // A lifted condition was already rejected above
                             // with its targeted message — no second report.
                             if !matches!(if_.condition.0, Node::LiftRegion(..)) {
@@ -20769,20 +20931,26 @@ impl<'src> Analyzer<'src> {
                             ExprIfBranch::If(
                                 condition_id,
                                 (then_ids, then_expr_id),
-                                if_.else_
-                                    .as_ref()
-                                    .map(|x| Box::new(walk_branch(s, &x.0, scope_id))),
+                                if_.else_.as_ref().map(|x| {
+                                    // Everything the enclosing chain proved on
+                                    // the way here, plus what this condition
+                                    // proves by being false.
+                                    let mut passed_on = inherited.clone();
+                                    passed_on.extend(negated_captures);
+                                    Box::new(walk_branch(s, &x.0, scope_id, &passed_on))
+                                }),
                             )
                         }
                         NodeIfBranch::Else(body) => {
                             let body_scope_id = s.create_owned_scope(Some(scope_id)).id;
+                            declare_inherited(s, body_scope_id, inherited);
                             let else_ids = s.walk_expr_nodes(&body.0.0, body_scope_id);
                             let else_expr_id = s.walk_expr_node(&body.0.1, body_scope_id);
                             ExprIfBranch::Else((else_ids, else_expr_id))
                         }
                     }
                 }
-                let branch = walk_branch(self, if_, scope_id);
+                let branch = walk_branch(self, if_, scope_id, &Vec::new());
                 // A value `if` — one with a final `else` — has its arms unified
                 // by the same rule a `match`'s legs go through (B163). Queued
                 // here rather than folded into the inference so the check runs
@@ -21253,19 +21421,43 @@ impl<'src> Analyzer<'src> {
                 // takes in the other arm and everything after the condition,
                 // the then-branch included, since reaching either of those
                 // proves nothing about this arm.
-                let (lhs_id, rhs_id) = if matches!(op, BinaryOp::Or) {
-                    let outer = self.or_operand_end;
-                    self.or_operand_end = Some(min_operand_end(outer, lhs.1.end));
-                    let lhs_id = self.walk_expr_node(lhs, scope_id);
-                    self.or_operand_end = Some(min_operand_end(outer, rhs.1.end));
-                    let rhs_id = self.walk_expr_node(rhs, scope_id);
-                    self.or_operand_end = outer;
-                    (lhs_id, rhs_id)
-                } else {
-                    let lhs_id = self.walk_expr_node(lhs, scope_id);
-                    let rhs_id = self.walk_expr_node(rhs, scope_id);
-                    (lhs_id, rhs_id)
+                let outer_polarity = self.condition_polarity;
+                let (lhs_id, rhs_id) = match op {
+                    BinaryOp::Or => {
+                        let outer = self.or_operand_end;
+                        // B195: on top of that cap, neither operand of a `||`
+                        // establishes the test for the ELSE branch either.
+                        self.condition_polarity =
+                            outer_polarity.map(ConditionPolarity::into_or_operand);
+                        self.or_operand_end = Some(min_operand_end(outer, lhs.1.end));
+                        let lhs_id = self.walk_expr_node(lhs, scope_id);
+                        self.or_operand_end = Some(min_operand_end(outer, rhs.1.end));
+                        let rhs_id = self.walk_expr_node(rhs, scope_id);
+                        self.or_operand_end = outer;
+                        (lhs_id, rhs_id)
+                    }
+                    // B195: `&&` carries its operands' TRUE side and nothing
+                    // else, so a capture bound on an operand's FALSE side — one
+                    // under a negation — dies with that operand: `!(a is X) &&
+                    // use(n)` does not bind `n` for the right operand, and
+                    // `!(a is X && b)` still binds it for `b`, which the `&&`
+                    // short-circuit did reach by matching.
+                    BinaryOp::And => {
+                        self.condition_polarity =
+                            outer_polarity.map(|polarity| polarity.into_and_operand(lhs.1.end));
+                        let lhs_id = self.walk_expr_node(lhs, scope_id);
+                        self.condition_polarity =
+                            outer_polarity.map(|polarity| polarity.into_and_operand(rhs.1.end));
+                        let rhs_id = self.walk_expr_node(rhs, scope_id);
+                        (lhs_id, rhs_id)
+                    }
+                    _ => {
+                        let lhs_id = self.walk_expr_node(lhs, scope_id);
+                        let rhs_id = self.walk_expr_node(rhs, scope_id);
+                        (lhs_id, rhs_id)
+                    }
                 };
+                self.condition_polarity = outer_polarity;
                 // Overloadable operators dispatch; orderings and `&&`/`||`
                 // aren't overloadable but their operands are checked (B24).
                 if is_overloadable_operator(*op)
@@ -22349,7 +22541,13 @@ impl<'src> Analyzer<'src> {
                     // which for an `is` capture is the `if`'s own scope — the
                     // condition and the then-branch, never the `else` (its own
                     // sibling scope) and never after the `if`.
-                    let visible_until = self.or_operand_end.unwrap_or(LocalDeclaration::FOREVER);
+                    let or_cap = self.or_operand_end.unwrap_or(LocalDeclaration::FOREVER);
+                    // B195: and a capture under a negation stops where the
+                    // negation stops carrying the match — before the
+                    // then-branch, which runs when the test FAILED.
+                    let polarity = self.condition_polarity;
+                    let visible_until =
+                        polarity.map_or(or_cap, |polarity| or_cap.min(polarity.same_until));
                     self.declare_scope_value_until(
                         scope_id,
                         name,
@@ -22357,6 +22555,12 @@ impl<'src> Analyzer<'src> {
                         visible_from,
                         visible_until,
                     );
+                    // The branch that DOES run on a match is the else, and that
+                    // is a sibling scope the capture was never declared in: hand
+                    // it to the `if` walk, which declares it there.
+                    if polarity.is_some_and(|polarity| polarity.same_in_else) {
+                        self.else_visible_captures.push((name, capture_id, or_cap));
+                    }
                 }
                 WalkPattern::Binding(capture_id)
             }
