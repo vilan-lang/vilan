@@ -10,6 +10,7 @@
 
 pub mod boot;
 pub mod ladder;
+pub mod port;
 
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
