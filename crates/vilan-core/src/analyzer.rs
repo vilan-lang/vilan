@@ -33081,8 +33081,52 @@ impl<'src> Analyzer<'src> {
             if let Some(rhs_id) = rhs_id {
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let bool_type = self.bool_type();
-                    for (operand_id, side) in [(lhs_id, "left"), (rhs_id, "right")] {
+                    for (operand_id, side, is_right) in
+                        [(lhs_id, "left", false), (rhs_id, "right", true)]
+                    {
                         let operand = self.infer_type(operand_id, &bool_type, &HashMap::default());
+                        // B181, and the same membership principle B179 settled
+                        // for the native family: `grounded` excludes every
+                        // `Type::Generic`, so a parameter reached neither this
+                        // check nor a refusal, and `compare_type` would have
+                        // admitted it anyway (a parameter compares equal to
+                        // whatever is asked of it). `fun both<T>(flag: bool,
+                        // value: T): bool { flag && value }` compiled and
+                        // `both(true, Point { x = 1, y = 2 })` printed the
+                        // struct's runtime tuple — the VALUE, typed `bool`.
+                        //
+                        // A bound cannot rescue it. `&&` admits `bool` and
+                        // nothing else, no trait names that set (the logical
+                        // operators model no operator trait at all — there is
+                        // not even an impl to consult), and a bound promises a
+                        // trait's METHODS, never that the parameter IS `bool`.
+                        // So every generic right operand refuses, whatever it
+                        // is bounded to.
+                        //
+                        // The LEFT half waits with B174: refusing a parameter
+                        // there is the deferred breaking generics change, not
+                        // this miscompile fix.
+                        if is_right && matches!(operand, Type::Generic(_)) {
+                            let label = self.pretty_print_type(&operand, &HashMap::default());
+                            self.push_anchored(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                    msg: format!(
+                                        "`{symbol}` takes `bool` operands, and `{label}` is a type \
+                                         parameter: `bool`'s set is `bool` itself, no trait names \
+                                         it, and `{symbol}` models no operator trait to consult, so \
+                                         no bound on `{label}` can prove membership — a bound \
+                                         promises a trait's methods, never that the parameter IS \
+                                         `bool`. Test the value and combine the `bool`s, or declare \
+                                         this operand `bool`"
+                                    ),
+                                },
+                                binary_id,
+                            );
+                            continue;
+                        }
                         if grounded(&operand)
                             && !self.compare_type(&bool_type, &operand, &HashMap::default())
                         {
