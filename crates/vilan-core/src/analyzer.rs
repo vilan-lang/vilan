@@ -24306,6 +24306,10 @@ impl<'src> Analyzer<'src> {
     /// (`Source<i32>` for `Readable` -> `[i32]`): match the type against the
     /// providing impl's subject to bind the impl's generics, then substitute the
     /// impl's recorded trait arguments through that binding.
+    ///
+    /// "To bind the impl's generics" is the load-bearing half, and
+    /// [`bindings_for_binders`] is what makes it true of a reconciliation that
+    /// is merely a unification (B168).
     fn trait_args_for(&mut self, concrete: &Type, trait_id: Id) -> Option<Vec<TypeId>> {
         let candidates: Vec<(TypeId, Vec<TypeId>)> = self
             .implementations
@@ -24323,7 +24327,9 @@ impl<'src> Analyzer<'src> {
             if let Some((_, bindings)) =
                 self.reconcile_type(concrete, &subject, &SubstitutionContext::default())
             {
-                let context: SubstitutionContext = bindings.into_iter().collect();
+                let mut binders = Vec::new();
+                self.collect_subject_binders(subject_id, &mut binders);
+                let context = self.bindings_for_binders(&binders, bindings);
                 let resolved = arguments
                     .iter()
                     .map(|argument| {
@@ -24336,6 +24342,57 @@ impl<'src> Analyzer<'src> {
             }
         }
         None
+    }
+
+    /// The half of a receiver/subject reconciliation that grounds an impl's
+    /// WRITTEN trait arguments: the impl's own binders, bound.
+    ///
+    /// `reconcile_type` unifies, and a unifier is not directed. When one side
+    /// is generic and the other is not the binding can only run one way, which
+    /// is why a CONSTRUCTED receiver argument (`Cell<List<T>>` against
+    /// `Cell<Z>`) has always resolved. When BOTH sides are generic — a BARE
+    /// parameter receiver argument (`Cell<T>` against `Cell<Z>`), which is
+    /// every call made from inside a generic body — it keeps the LEFT one's
+    /// binding, `caller T -> impl Z`. That maps the caller's parameter onto the
+    /// impl's and says nothing about `Z`, so the impl's `with Src<Z>` then
+    /// substituted to nothing and the impl's own unbound parameter leaked out
+    /// as the bound's argument. The callee's `T` was inferred to it, and its
+    /// declared bound was checked against a parameter carrying no bounds at
+    /// all and refused (B168).
+    ///
+    /// So each pair is oriented toward the binders: kept as written when its
+    /// KEY is one, INVERTED when its VALUE is one, and dropped when neither is
+    /// — an impl's trait arguments are written in its binders and in concrete
+    /// types, so a binding for anything else cannot ground them. The first
+    /// orientation for a binder wins, as the first matching impl does.
+    ///
+    /// [`satisfies_trait_bound`] answers the same directedness problem by
+    /// reconciling SUBJECT-first. That could not simply be copied here:
+    /// swapping the operands would also put a `Type::Trait` receiver on the
+    /// right of the struct-satisfies-a-trait arm, which has no mirror, so
+    /// candidates that match nothing today would start matching. Orienting the
+    /// pairs afterwards leaves the reconciliation — and therefore the impl
+    /// selection — exactly as it was.
+    fn bindings_for_binders(
+        &mut self,
+        binders: &[TypeId],
+        bindings: Vec<(TypeId, TypeId)>,
+    ) -> SubstitutionContext {
+        let mut context = SubstitutionContext::default();
+        for (constraint_id, bound_id) in bindings {
+            if binders.contains(&constraint_id) {
+                context.entry(constraint_id).or_insert(bound_id);
+                continue;
+            }
+            if let Type::Generic(binder_id) = bound_id.get_type(self)
+                && binders.contains(&binder_id)
+                && !context.contains_key(&binder_id)
+            {
+                let inverted = Type::Generic(constraint_id).get_type_id(self);
+                context.insert(binder_id, inverted);
+            }
+        }
+        context
     }
 
     /// Binds a generic that appears only in another generic's *parameterized bound*
