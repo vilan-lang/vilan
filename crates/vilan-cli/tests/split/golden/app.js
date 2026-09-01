@@ -380,11 +380,11 @@ function mount(id, view2) {
 	element.appendChild(view2[0]);
 }
 function mount_root(id, body) {
-	const $bT = $bS([ 1 ], ($bQ) => {
-		return $bR(body);
+	const $bS = $bR([ 1 ], ($bP) => {
+		return $bQ(body);
 	});
-	const built = $bT[0];
-	const root = $bT[1];
+	const built = $bS[0];
+	const root = $bS[1];
 	mount(id, built);
 	if (__hmr_active()) {
 		const element = document.getElementById(id);
@@ -855,12 +855,9 @@ function $bO(signal, observer) {
 	} ]);
 	return [ signal[1], id, __shared_new([ 1 ]) ];
 }
-function $bP(self) {
-	return self[0].v;
-}
 function $bN(self, observer) {
 	const subscription = $bO(self, observer);
-	observer($bP(self));
+	observer($aR(self));
 	return subscription;
 }
 function $bM(self, observer, $at, $au) {
@@ -910,12 +907,12 @@ function $aS(self, source, render, $aT, $aU) {
 	}, $aT, $aU);
 	return __clone(self);
 }
-function $bR(body) {
+function $bQ(body) {
 	const scope = new3();
 	const result = body(scope);
 	return [ result, scope ];
 }
-function $bS(policy, body) {
+function $bR(policy, body) {
 	const fresh = new2();
 	const result = body(fresh);
 	drain(fresh);

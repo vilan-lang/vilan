@@ -160,8 +160,8 @@ too.
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>` | keyed rows; each row is a disposal boundary |
 | `when` | `(condition: S, body: (sync \|\| View) context owner_scope): View`; `S: Source<bool>` | state-DROPPING conditional |
-| `swap` | `(source: Signal<T>, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq` | dispose + rebuild per changed value — concrete `Signal` for now (see below) |
-| `swap_split` | same signature as `swap`; `T: PartialEq` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
+| `swap` | `(source: S, render: (sync \|T\| View) context owner_scope): View`; `T: PartialEq, S: Source<T>` | dispose + rebuild per changed value |
+| `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
@@ -184,17 +184,15 @@ impl Stored<type T> with Source<T> {
 ```
 
 `Stored<str>` now feeds `bind_text`, `bind_class`, `bind_attr`,
-`bind_styled`, `style_var`, `bind_each`, `when` and `show` — on both the
-browser layer and the SSR twin.
+`bind_styled`, `style_var`, `bind_each`, `when`, `show`, `swap`,
+`swap_split` and `chunk_preload` — on both the browser layer and the SSR
+twin.
 
-Three things deliberately still ask for the concrete type:
+Two things deliberately still ask for the concrete type:
 
 - **`bind_value` and `bind_draft`**, because they WRITE BACK. `Source`
   declares `get` and `sub` and no `set`, so there is nothing to widen to
   yet — the write side is its own design question.
-- **`swap` and `swap_split`**, which read like `when` does and would widen
-  with it, but a `Source<T>` bound over a bare parameter does not yet
-  resolve inside a generic body, and `swap_split` calls `swap` from one.
 - **`attr` and `child`**, whose reactive arms are the `AttrValue` and
   `Slot` traits — so `<div href(source)>` and `<p>{source}</p>` still want
   a `Signal<str>`. Widening a trait ARM is a blanket impl rather than a

@@ -260,11 +260,12 @@ impl View {
 
 	/// The dynamic-subtree swap, server side: renders the branch for `source`'s
 	/// CURRENT value. Read once — there is no later change to follow.
-	/// Concrete `Signal`, in lockstep with the browser twin's `swap` — which is
-	/// blocked by the bare-parameter `Source<T>` bound gap, not by a write (A33).
-	fun swap<T: PartialEq>(
+	/// A `Source<T>` bound, in lockstep with the browser twin's `swap` — held
+	/// concrete by A33 for the bare-parameter bound gap, widened with it once
+	/// B168 closed that gap.
+	fun swap<T: PartialEq, S: Source<T>>(
 		self,
-		source: Signal<T>,
+		source: S,
 		build: (sync |T| View) context owner_scope,
 	): View {
 		let value = source.get();

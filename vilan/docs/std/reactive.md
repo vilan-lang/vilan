@@ -148,12 +148,12 @@ fun main() {
 
 **Anything that only reads takes a `Source`, not a `Signal`.** Every read-only
 binding in [`std::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
-`bind_attr`, `bind_styled`, `style_var`, `bind_each`, `when`, `show` — is
-generic over `Source<T>`, so `Stored<str>` above drives them exactly like a
-signal does, on the browser layer and on the SSR twin alike. `ReactiveServer`'s
-`expose` is generic the same way. What still asks for a `Signal` is what
-**writes** it: `bind_value`, `bind_draft`, `optimistic` and `Optimistic::over`
-all need `set`, which `Source` does not declare.
+`bind_attr`, `bind_styled`, `style_var`, `bind_each`, `when`, `show`, `swap`
+and `swap_split` — is generic over `Source<T>`, so `Stored<str>` above drives
+them exactly like a signal does, on the browser layer and on the SSR twin
+alike. `ReactiveServer`'s `expose` is generic the same way. What still asks for
+a `Signal` is what **writes** it: `bind_value`, `bind_draft`, `optimistic` and
+`Optimistic::over` all need `set`, which `Source` does not declare.
 
 ## combine
 

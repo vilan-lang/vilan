@@ -6394,3 +6394,121 @@ fn element_syntax_still_routes_attributes_through_attr_value() {
         "#,
     );
 }
+
+// ── B168: the three A33 held back, widened ───────────────────────────────────
+//
+// A33's sweep classified `View::swap` READ-ONLY like every other binding it
+// widened, and held it anyway: a `Source<T>` bound whose argument is a BARE
+// generic parameter lost its link to the caller's `T` inside a generic body,
+// and `swap_split` calls `self.swap(gated, render)` from exactly such a body.
+// B168 fixed that reconciliation (`tests/inference/generics.rs` carries the
+// minimized pin and its edge cases), so the three that waited — `View::swap`,
+// `View::swap_split` and `ui::chunk_preload` — widened together, in
+// generic-parameter ORDER, which is what the split gate rebinds by position.
+//
+// Each pin below drives its signature with `A_USER_SOURCE`: a type that is a
+// `Source` and is NOT a `Signal`. Against the held signatures every one of them
+// was a type error naming `Signal`.
+
+/// `View::swap` on the BROWSER twin, driven by a user `Source`.
+#[test]
+fn a_user_source_drives_the_browser_swap() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ View, mount_root, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let route: Stored<str> = Stored::new("home");
+            let _root = mount_root("app", || view("main")
+                .swap(route, |current| view("section").text(current)));
+        }}
+        "#
+    ));
+}
+
+/// `View::swap_split` — the split build's gate — driven by the same user
+/// `Source`. It is the signature whose own BODY carries the B168 shape
+/// (`self.swap(gated, render)` with `gated: Signal<T>`), so this pin is the
+/// compiler fix read through std rather than through a minimized exhibit.
+#[test]
+fn a_user_source_drives_the_split_gate() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ View, mount_root, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let route: Stored<str> = Stored::new("home");
+            let _root = mount_root("app", || view("main")
+                .swap_split(route, |current| view("section").text(current)));
+        }}
+        "#
+    ));
+}
+
+/// `ui::chunk_preload` — the boot preload the emitter plants in front of the
+/// gate call — driven by the same user `Source`. It declares the same generics
+/// as `swap_split` in the same order, and this pin is what keeps the pair
+/// spelled alike after the widening.
+#[test]
+fn a_user_source_drives_the_boot_preload() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ chunk_preload, View, mount_root, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let route: Stored<str> = Stored::new("home");
+            chunk_preload(route);
+            let _root = mount_root("app", || view("main").text("shell"));
+        }}
+        "#
+    ));
+}
+
+/// The PROCESS twin's `swap`, and it renders: the two `ui` halves widened in
+/// lockstep here as they did for A33's eight, so a custom-source route is not
+/// client-only. The markup is the claim — a widened signature that dropped the
+/// value would serve an empty section and pass a compile-only pin.
+#[test]
+fn a_user_source_drives_the_process_swap_and_renders() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::reactive::{{ Signal, Source, Subscription }};
+        import std::ui::{{ View, render, view }};
+        {A_USER_SOURCE}
+        fun main() {{
+            let route: Stored<str> = Stored::new("docs");
+            print(render(view("main")
+                .swap(route, |current| view("section").text(current))));
+        }}
+        main();
+        "#
+        ),
+        "<main><section>docs</section></main>\n",
+    );
+}
+
+/// The no-regression half: a concrete `Signal` still drives all three. `Signal`
+/// implements `Source`, so the widening must have kept every existing call site
+/// — `std::router`'s `swap(route, ..)` is one, and the split fixture's gate is
+/// another.
+#[test]
+fn a_concrete_signal_still_drives_the_swap_family() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::Signal;
+        import std::ui::{ chunk_preload, View, mount_root, view };
+
+        fun main() {
+            let route = Signal::new("home");
+            chunk_preload(route);
+            let _root = mount_root("app", || view("main")
+                .swap(route, |current| view("section").text(current))
+                .swap_split(route, |current| view("aside").text(current)));
+        }
+        "#,
+    );
+}

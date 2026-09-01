@@ -409,12 +409,23 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
    enclosing the call — the latter is fixed by the enclosing
    instantiation, and callee and caller can share one outright (a trait's
    parameter, in a call between two of its own members).
-3. After binding, every bound's satisfaction is checked; an unsatisfied
+3. A generic mentioned only in a SIBLING parameter's parameterized bound
+   (`fun f<T: PartialEq, S: Source<T>>(source: S)`) is bound once that
+   sibling is: the bound's arguments are recovered from the
+   implementation the sibling's type provides for the bound trait
+   (`Signal<i32>: Source<i32>` binds `T := i32`). The arguments are read
+   at that implementation's OWN binders, so an argument whose type is
+   caller-generic comes through as the caller's parameter — bounds
+   intact — exactly as a concrete one comes through as the concrete
+   type: under `impl Signal<type Z> with Source<Z>`, a `Signal<T>`
+   receiver binds `Z := T` and the bound's argument is the caller's `T`,
+   never the impl's `Z`.
+4. After binding, every bound's satisfaction is checked; an unsatisfied
    bound is an error naming the parameter and bound.
-4. A call whose generics cannot all be grounded (no argument or
+5. A call whose generics cannot all be grounded (no argument or
    expectation determines them) is an error at the call.
 
-Bounds cut both ways. At a call they are an **obligation** (3 above); at
+Bounds cut both ways. At a call they are an **obligation** (4 above); at
 a declaration they are an **assumption**: inside the body of whatever
 declares the parameter — a function, an impl, or a trait — the bound
 trait's members are in scope on that parameter's type, and a call to one

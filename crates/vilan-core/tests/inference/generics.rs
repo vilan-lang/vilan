@@ -4150,39 +4150,47 @@ import std::io::print;
     );
 }
 
-// --- A33: a trait bound over a BARE parameter, resolved in a generic body ----
+// --- B168: a trait bound over a BARE parameter, resolved in a generic body ---
 //
 // A33 widened `std::ui`'s read-only bindings from `Signal<T>` to a `Source<T>`
 // bound, and `View::swap` — read-only like every other, no write anywhere in
-// it — is the one site that could NOT come along. The gap the widening walked
-// into is narrow and exact:
+// it — was the one site that could NOT come along. The gap the widening walked
+// into was narrow and exact:
 //
 //   * `S: Source<List<T>>` — the bound's argument CONSTRUCTED over the caller's
-//     own `T` — resolves fine inside a generic body. That is `bind_each`, and
+//     own `T` — resolved fine inside a generic body. That is `bind_each`, and
 //     it shipped.
-//   * `S: Source<T>` — the bound's argument the BARE parameter — does not. The
-//     callee's `T` is inferred through the bound to the *impl's* own unbound
-//     parameter instead of to the caller's, so the callee's `T: PartialEq` is
+//   * `S: Source<T>` — the bound's argument the BARE parameter — did not. The
+//     callee's `T` was inferred through the bound to the *impl's* own unbound
+//     parameter instead of to the caller's, so the callee's `T: PartialEq` was
 //     then checked against something that carries no bound and refused.
 //
 // `swap_split` calls `self.swap(gated, render)` from exactly such a body
-// (`gated: Signal<T>`, `T` its own parameter), so widening `swap` makes std
+// (`gated: Signal<T>`, `T` its own parameter), so widening `swap` made std
 // itself uncompilable — with an explicit `self.swap<T, Signal<T>>(..)` too, the
-// bound check being downstream of the argument. The value FLOWS correctly: drop
-// `T`'s bound entirely and the same program compiles and runs, which places
-// this in the bound CHECK rather than in inference.
+// bound check being downstream of the argument. The value FLOWED correctly:
+// dropping `T`'s bound entirely compiled and ran the same program, which placed
+// the defect in the bound CHECK rather than in inference.
 //
-// When this passes, `View::swap`, `View::swap_split` and `ui::chunk_preload`
-// widen together, keeping their generic-parameter ORDER — the split gate rebinds
-// their type arguments by position (`transformer.rs::rebind_by_position`).
+// B168's cause: recovering a bound's arguments from the receiver's impl
+// (`analyzer.rs::trait_args_for`) reconciles the receiver against the impl's
+// SUBJECT, and `reconcile_type` is a unifier — undirected. One generic side and
+// one concrete side can only bind one way, which is why the constructed
+// argument always worked; two generic sides kept the LEFT one's binding
+// (`caller T -> impl Z`), which says nothing about the impl's `Z` and left its
+// `with Source<Z>` ungrounded. The bindings are now ORIENTED toward the impl's
+// own binders, so the bound's argument comes back as the caller's parameter —
+// constraints and all.
+//
+// With it fixed, `View::swap`, `View::swap_split` and `ui::chunk_preload`
+// widened together, keeping their generic-parameter ORDER — the split gate
+// rebinds their type arguments by position
+// (`transformer.rs::rebind_by_position`).
 
-/// The gap, minimized out of `swap_split`. Un-ignore with the fix.
+/// The gap, minimized out of `swap_split`. B168 closed it: the impl's binders
+/// are what a receiver/subject reconciliation has to bind, and a bare-parameter
+/// receiver argument used to bind the caller's parameter to them instead.
 #[test]
-#[ignore = "A33: a `Source<T>` bound whose argument is a BARE generic parameter \
-            resolves the callee's `T` to the impl's own unbound parameter inside \
-            a generic body, so the callee's `T: PartialEq` is refused. Blocks \
-            widening `std::ui::View::swap` (and `swap_split`/`chunk_preload`), \
-            the one read-only binding A33 had to hold."]
 fn a_bare_parameter_source_bound_resolves_inside_a_generic_body() {
     assert_compiles_and_runs(
         r#"
@@ -4205,9 +4213,9 @@ fn a_bare_parameter_source_bound_resolves_inside_a_generic_body() {
     );
 }
 
-/// The half that DOES work, kept beside it so the pair localizes the gap to the
-/// bare parameter rather than to `Source` bounds in general — this is
-/// `bind_each`'s shape and it must not regress while the pin above is red.
+/// The half that ALWAYS worked, kept beside it so the pair localizes the gap to
+/// the bare parameter rather than to `Source` bounds in general — this is
+/// `bind_each`'s shape, and the control the fix must not move.
 #[test]
 fn a_constructed_source_bound_resolves_inside_a_generic_body() {
     assert_compiles_and_runs(
@@ -4228,5 +4236,177 @@ fn a_constructed_source_bound_resolves_inside_a_generic_body() {
         main();
         "#,
         "3\n",
+    );
+}
+
+/// The NON-VACUITY pin, and the one that matters most: orienting the bindings
+/// must not turn the bound check off. The caller's own `T` carries NO bound
+/// here, so the callee's `T: PartialEq` is genuinely unsatisfied and the call
+/// is still refused — naming the caller's parameter, which is now the parameter
+/// the check actually reaches.
+#[test]
+fn a_bare_parameter_source_bound_still_refuses_an_unbounded_caller() {
+    assert_fails_with(
+        r#"
+        import std::compare::PartialEq;
+        import std::reactive::{ Signal, Source };
+
+        fun consume<T: PartialEq, S: Source<T>>(source: S): T {
+            source.get()
+        }
+
+        fun wrapper<T>(value: T): T {
+            let cell: Signal<T> = Signal::new(value);
+            consume(cell)
+        }
+
+        fun main() { print(wrapper(1)); }
+        main();
+        "#,
+        "generic parameter 'T' is missing the bound ': PartialEq'",
+    );
+}
+
+/// The bound's argument reaches a MEMBER through the caller's parameter, not
+/// just the bound check: `T: Show` arriving intact means `value.show()` inside
+/// the callee resolves to the caller's impl. A `T` bound to the impl's own
+/// unbound parameter had no `show` at all, so this is the same defect read from
+/// the other end — and it RUNS, so the value is the caller's too.
+#[test]
+fn a_bare_parameter_bound_carries_the_callers_member_into_the_callee() {
+    assert_compiles_and_runs(
+        r#"
+        import std::reactive::{ Signal, Source };
+
+        trait Show { fun show(self): str; }
+        impl i32 with Show { fun show(self): str { i"[{self}]" } }
+
+        fun consume<T: Show, S: Source<T>>(source: S): str {
+            source.get().show()
+        }
+
+        fun wrapper<T: Show>(value: T): str {
+            let cell: Signal<T> = Signal::new(value);
+            consume(cell)
+        }
+
+        fun main() { print(wrapper(7)); }
+        main();
+        "#,
+        "[7]\n",
+    );
+}
+
+/// The MULTI-PARAMETER edge: two bare-parameter bounds in one signature, each
+/// carrying a different bound, over an impl that writes its binders in the
+/// OTHER order (`impl Pair<type A, type B> with Feed<B>`). Orienting by
+/// position rather than by identity would swap them here; orienting to the
+/// binder each pair actually names does not.
+#[test]
+fn two_bare_parameter_bounds_bind_their_own_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        trait First { fun first(self): str; }
+        trait Second { fun second(self): str; }
+        impl i32 with First { fun first(self): str { i"first {self}" } }
+        impl str with Second { fun second(self): str { i"second {self}" } }
+
+        trait Feed<T> { fun feed(self): T; }
+
+        struct Pair<A, B> { left: A, right: B }
+
+        impl Pair<type A, type B> with Feed<B> {
+            fun feed(self): B { self.right }
+        }
+
+        impl Pair<type A, type B> {
+            fun new(left: A, right: B): Pair<A, B> { Pair { left, right } }
+        }
+
+        fun consume<X: First, Y: Second, F: Feed<Y>>(feeder: F, marker: X): str {
+            i"{marker.first()} / {feeder.feed().second()}"
+        }
+
+        fun wrapper<X: First, Y: Second>(marker: X, value: Y): str {
+            let pair: Pair<X, Y> = Pair::new(marker, value);
+            consume(pair, marker)
+        }
+
+        fun main() { print(wrapper(1, "two")); }
+        main();
+        "#,
+        "first 1 / second two\n",
+    );
+}
+
+/// The NESTED edge: the bound's argument travels two generic bodies deep, each
+/// re-wrapping the value. Every hop is a fresh receiver/subject reconciliation
+/// with generics on both sides, so a fix that repaired only the first hop shows
+/// up here.
+#[test]
+fn a_bare_parameter_bound_survives_two_generic_bodies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::reactive::{ Signal, Source };
+
+        fun inner<T: PartialEq, S: Source<T>>(source: S): T {
+            source.get()
+        }
+
+        fun middle<T: PartialEq, S: Source<T>>(source: S): T {
+            let cell: Signal<T> = Signal::new(source.get());
+            inner(cell)
+        }
+
+        fun outer<T: PartialEq>(value: T): T {
+            let cell: Signal<T> = Signal::new(value);
+            middle(cell)
+        }
+
+        fun main() { print(outer(5)); }
+        main();
+        "#,
+        "5\n",
+    );
+}
+
+/// A BLANKET impl reached from a generic body: the subject IS the binder, so
+/// the reconciliation has a generic on both sides at the TOP level rather than
+/// inside a nominal type's arguments. B168 fixed this half — before it, the
+/// error was `'T' is missing the bound ': Tag'`, the callee's `T` resolved to
+/// the impl's own binder — and left a DIFFERENT one open, which is what this
+/// pin now names: `W: Wrap<T>` is checked against the caller's `T`, and
+/// `satisfies_trait_bound` answers for a `Type::Generic` value from its
+/// DECLARED bounds alone, never from an impl. A blanket impl covers every type
+/// including an abstract parameter, so the bound holds and the check cannot see
+/// it. Un-ignore when a generic value is allowed to satisfy a blanket impl.
+#[test]
+#[ignore = "B168 tail: `satisfies_trait_bound` answers a `Type::Generic` value \
+            from its declared bounds alone, so a blanket `impl type T with \
+            Wrap<T>` cannot satisfy `W: Wrap<T>` when `W` is bound to the \
+            caller's own parameter. A concrete caller passes; B168's own defect \
+            (the callee's `T` resolving to the impl's binder) is gone."]
+fn a_blanket_impl_bound_resolves_from_a_generic_body() {
+    assert_compiles_and_runs(
+        r#"
+        trait Tag { fun tag(self): str; }
+        impl i32 with Tag { fun tag(self): str { i"<{self}>" } }
+
+        trait Wrap<T> { fun unwrap(self): T; }
+        impl type T with Wrap<T> { fun unwrap(self): T { self } }
+
+        fun consume<T: Tag, W: Wrap<T>>(wrapped: W): str {
+            wrapped.unwrap().tag()
+        }
+
+        fun wrapper<T: Tag>(value: T): str {
+            consume(value)
+        }
+
+        fun main() { print(wrapper(3)); }
+        main();
+        "#,
+        "<3>\n",
     );
 }
