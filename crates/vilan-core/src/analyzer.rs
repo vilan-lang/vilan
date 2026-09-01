@@ -24060,6 +24060,47 @@ impl<'src> Analyzer<'src> {
                                 );
                             }
                         }
+                        // B175: the same specialization for an ASSOCIATED
+                        // function reached through a BOUND — the impl-path form
+                        // of B162's `Trait::func`. `T::default()` under
+                        // `T: Default` resolves to the trait's own
+                        // `fun default(): Self`, and an associated function has
+                        // no `self`, so the receiver-driven branch above cannot
+                        // fire: `self_trait` is read off the first parameter and
+                        // there is none. The call therefore typed as the BOUND
+                        // (`Default`) instead of as the binder (`T`) the path
+                        // named. std's `List::sum`/`product` are the exhibit —
+                        // `mut total = T::default()` made `total` trait-typed,
+                        // so `total += item` reached the operator check with a
+                        // `Type::Trait` left operand, which is the only reason
+                        // B170 had to put that shape on the check's skip list.
+                        //
+                        // The binder is what the path named, so the binder is
+                        // what `Self` stands for. The accessor recorded both
+                        // halves when it resolved through the bound — the
+                        // constraint (`generic_dispatch`) and the trait that
+                        // provided the member (`bound_dispatch_traits`) — and
+                        // the same structural substitution the receiver branch
+                        // performs maps `Self`, nested occurrences included,
+                        // onto `Type::Generic(constraint)`. A `Trait::func()`
+                        // path is untouched: its subject is the trait itself,
+                        // not a bound binder, so it records no constraint here
+                        // and keeps typing as the trait (B162's ruling).
+                        if self_trait.is_none()
+                            && let Some(GenericDispatch::OnConstraint(constraint_id, _)) =
+                                self.generic_dispatch.get(&subject_id).copied()
+                            && let Some((bound_trait, _)) =
+                                self.bound_dispatch_traits.get(&subject_id).cloned()
+                            && self.mentions_self_trait(&return_type, bound_trait, 0)
+                        {
+                            let binder = Type::Generic(constraint_id).get_type_id(self);
+                            return self.substitute_member_type(
+                                &return_type,
+                                bound_trait,
+                                binder,
+                                &SubstitutionContext::default(),
+                            );
+                        }
                         return_type
                     }
                     // Not callable. The user-facing "cannot call a non-function
@@ -33476,13 +33517,30 @@ impl<'src> Analyzer<'src> {
             // `Mapped` is still symbolic, and a `Module` is not a value —
             // naming one as an operand is already someone else's diagnostic.
             //
-            // `Trait` skips for a reason of its own, and a census found it:
-            // std's `List<T: Add + Default>::sum` writes `mut total =
-            // T::default()`, and the multi-bound `T::default()` infers as the
-            // BOUND (`Default`) rather than as `T`, so `total += item` arrives
-            // here with a trait-typed left operand. Judging it would refuse
-            // std's own `sum`/`product` over an inference wart in a different
-            // subsystem, so the shape is left as it was and filed instead.
+            // B175 REMOVED `Trait` from that list. It skipped for a reason of
+            // its own — std's `List<T: Add + Default>::sum` wrote `mut total =
+            // T::default()`, and the bound-path `T::default()` inferred as the
+            // BOUND (`Default`) rather than as `T`, so `total += item` reached
+            // here with a trait-typed left operand and judging it would have
+            // refused std's own `sum`/`product` over an inference wart in a
+            // different subsystem. The wart is fixed (the `Self` return of an
+            // associated function reached through a bound now specializes to
+            // the binder), so the shape is judged like every other: a value
+            // typed as a BARE trait has no concrete type to dispatch to, and
+            // an operator on it is refused by the no-impl branch below.
+            //
+            // ONE trait-typed shape still skips, and it is the one with no
+            // actionable verdict to give: `self` inside a trait DEFAULT body is
+            // also `Type::Trait` (the same distinction `is_in_trait_default`
+            // draws for the method path). `self + self` in a default over a
+            // supertrait `Add` miscompiles today — it emits the host's `+` over
+            // two lowered structs — but refusing it would be advice nobody can
+            // act on: the explicit spelling `self.add(self)` does not resolve
+            // there either, and the binary emitter has no `OnType(None)` case
+            // to dispatch a default body's operand on the type being
+            // specialized. Both halves are one deeper defect (filed), and
+            // B170's own rule applies until it closes: a refusal a reader
+            // cannot act on is barely a refusal.
             if matches!(
                 lhs_type,
                 Type::Any
@@ -33491,8 +33549,8 @@ impl<'src> Analyzer<'src> {
                     | Type::Unresolved
                     | Type::Module(_)
                     | Type::Mapped(_, _, _)
-                    | Type::Trait(_, _)
-            ) {
+            ) || (matches!(lhs_type, Type::Trait(_, _)) && self.is_in_trait_default(binary_id))
+            {
                 continue;
             }
             if let Some((method_id, impl_subject_id)) = self.operator_method(op, &lhs_type) {
@@ -33614,6 +33672,21 @@ impl<'src> Analyzer<'src> {
                                  rendered this one with `.to_string()`"
                             )
                         }
+                        // B175: the shape B170 had to skip. A bare trait is the
+                        // one operand whose refusal must NOT name an impl: an
+                        // `impl Maker with Add` is not a thing that can be
+                        // written, so the standard advice would send the reader
+                        // after a declaration the language has no syntax for.
+                        // The rule is B4's — a trait is a bound, not a type —
+                        // and the register is B72's: name the rule, then the
+                        // declaration that works.
+                        (Type::Trait(_, _), _) => format!(
+                            "`{symbol}` models `{trait_name}`, and this operand is the bare trait \
+                             `{type_name}`: a trait is a bound, not a value type (vilan has no \
+                             trait objects), so there is no concrete type here for `{required}` to \
+                             dispatch to. Hold the value in a generic bounded by the trait \
+                             (`<T: {type_name}>`) and the operator resolves at each instantiation"
+                        ),
                         (Type::Void, _) => format!(
                             "`{symbol}` needs a value on the left, and this operand is `void`: the \
                              expression it comes from produces no value — a function that returns \
