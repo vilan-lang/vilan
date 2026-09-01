@@ -271,7 +271,8 @@ fn bundled_name(path: &str, function: &str) -> Result<String, String> {
             },
             _ => {
                 return Err(format!(
-                    "`{function}` paths resolve inside the package root; `{path}` escapes it"
+                    "`{function}` paths stay inside the package root as written; \
+                     `{path}` leaves it"
                 ));
             }
         }
@@ -332,6 +333,17 @@ fn bundled_target(url: &str) -> Result<String, String> {
 /// `asset::read_dir`, `asset::read_dir_all` and `asset::digest` — one fence,
 /// named for whichever of them the program wrote.
 ///
+/// **The fence is on the SPELLING, and symlinks are not its business** (G19,
+/// ruled; the doctrine is written at `spec/const.md` §9.2). A link is a
+/// supported spelling of project layout — an ordinary way a static tree gets
+/// its name inside a package, which is what G15 settled for the freshness
+/// stamp — so `asset::read("icons/check.svg")` reads what that name points at,
+/// wherever the filesystem keeps it, and the build tracks it as the input it
+/// is. What is refused here is a path that *says* it is leaving: an absolute
+/// path, or a `..`. Nothing here resolves, and the messages no longer claim to
+/// — they used to read "paths resolve inside the package root", a resolution
+/// this function does not perform and, per the ruling, should not.
+///
 /// Deliberately NOT [`bundled_name`]'s fence, which also refuses a backslash:
 /// these arguments address a file to READ and never become derived output, and
 /// `a\b` is a legal filename on Linux, so refusing it there would refuse a real
@@ -348,7 +360,8 @@ fn contained_input(path: &str, function: &str) -> Result<PathBuf, String> {
         .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
     {
         return Err(format!(
-            "`{function}` paths resolve inside the package root; `{path}` escapes it"
+            "`{function}` paths stay inside the package root as written; \
+             `{path}` leaves it"
         ));
     }
     Ok(requested.to_path_buf())

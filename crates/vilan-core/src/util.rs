@@ -207,6 +207,35 @@ pub fn canonical_path(path: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+/// The path as it was **spelled**, made absolute and lexically normalized —
+/// symlinks deliberately left unresolved. [`canonical_path`]'s complement: same
+/// folding of `.` and `..`, same comparability, but it answers *how did the
+/// caller reach this file* rather than *what is this file really*.
+///
+/// A symlink gives one file two honest ancestries, and both are project layout
+/// (`const.md` §9.2's symlink doctrine, G19): the tree it was reached through
+/// and the tree it lives in. A rule that has to find the manifest ABOVE a file
+/// needs the spelled ancestry — a package declaring `generated = "src/icons"`
+/// over a link out of its own tree is never found by climbing the resolved path
+/// — while every containment COMPARISON stays canonical, so the two paths that
+/// name one file always answer alike. That pairing is what
+/// `manifest::generated_root_covering` is built from.
+///
+/// A relative path is made absolute against the working directory, since an
+/// ancestry is exactly what a relative path does not carry. When even that is
+/// unreadable the path is normalized where it is, which is the same degradation
+/// [`canonical_path`] takes.
+pub fn spelled_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        return normalize_components(path);
+    }
+    match std::env::current_dir() {
+        Ok(working_directory) => normalize_components(&working_directory.join(path)),
+        Err(_) => normalize_components(path),
+    }
+}
+
 /// Verifies that every component of `relative` names an on-disk entry under
 /// `root` **byte-for-byte**, and reports the first that does not as
 /// `(requested, on-disk)`.

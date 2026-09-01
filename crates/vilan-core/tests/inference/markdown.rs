@@ -4579,7 +4579,7 @@ fn a_bundle_path_escaping_the_package_root_is_refused() {
         }
         main();
         "#,
-        "`asset::bundle` paths resolve inside the package root; `../outside.png` escapes it",
+        "`asset::bundle` paths stay inside the package root as written; `../outside.png` leaves it",
     );
 }
 
@@ -5013,7 +5013,7 @@ fn a_listing_path_outside_the_package_root_is_refused() {
         }
         main();
         "#,
-        "`asset::read_dir_all` paths resolve inside the package root; `../outside` escapes it",
+        "`asset::read_dir_all` paths stay inside the package root as written; `../outside` leaves it",
     );
 }
 

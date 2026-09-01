@@ -751,7 +751,10 @@ to the **package root** — the directory imports resolve under, never the
 directory the compiler happens to run from — and the message shows where
 the resolution landed. An absolute path, or one that escapes the package
 root (`../…`), is refused before any read: the file channel reads the
-project, so the build can track every input it depends on.
+project, so the build can track every input it depends on. The refusal
+is on the path as *written* — a symlink inside the package is ordinary
+layout and is followed, so a name that resolves elsewhere is not an
+escape ([Const evaluation](../spec/const.md#92-the-const-environment)).
 
 **"… is compile-time-only; call it directly inside a `const` expression — a
 compile-time-only function has no runtime value form"**

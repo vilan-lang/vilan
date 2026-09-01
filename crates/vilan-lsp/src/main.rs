@@ -1808,6 +1808,49 @@ mod formatting_gate_tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // G17, the editor half. A `generated` root declared through a symlink is
+    // the case format-on-save most has to get right: the CLI can at least be
+    // re-run, while this handler fires on a file the developer merely opened.
+    // The predicate used to climb the file's CANONICAL path only, so a link out
+    // of the package left the manifest unfindable and the handler formatted the
+    // product — §12.1's loop, started by nobody typing a command.
+    //
+    // `cfg(unix)`: creating a symlink needs a privilege Windows does not grant
+    // by default (audit run 7 owns the Windows half). The FIX is platform-neutral.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_root_declared_through_a_symlink_is_declined_too() {
+        let dir = std::env::temp_dir().join(format!(
+            "vilan_lsp_genlink_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let package = dir.join("package");
+        let outside = dir.join("outside/icons");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(
+            package.join("vilan.toml"),
+            "[package]\nname = \"gated\"\ngenerated = \"src/icons\"\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../../outside/icons", package.join("src/icons")).unwrap();
+        let product = package.join("src/icons/lib.vl");
+        let source = package.join("src/main.vl");
+        std::fs::write(&product, "fun generated(): i32 { 41 }\n").unwrap();
+        std::fs::write(&source, "fun main() {}\n").unwrap();
+        assert!(
+            formatting_declined(&product),
+            "a product behind a symlinked root is declined whole"
+        );
+        assert!(
+            !formatting_declined(&source),
+            "and the hand-written module beside it still formats"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[tower_lsp::async_trait]

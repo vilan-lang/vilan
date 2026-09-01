@@ -1797,6 +1797,234 @@ fn without_a_generated_root_a_format_re_stales_the_hook_forever() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── S7: symlinks are project layout, not an escape (G17/G18/G19) ──
+//
+// The doctrine the owner ruled (G19, and `const.md` §9.2): a symlink is a
+// SUPPORTED SPELLING of project layout. Resolve links honestly, apply every
+// fence and scope to the RESOLVED tree, guard against cycles — and never say a
+// link is illegitimate. These pins are the terminal half of that; the predicate
+// itself is pinned over paths in `vilan-core::manifest`, and the editor half in
+// `vilan-lsp`.
+//
+// All `cfg(unix)`, like every other symlink pin in the tree: creating a link
+// needs a privilege Windows does not grant by default. The FIXES are
+// platform-neutral — the Windows half of symlink behavior is chartered for
+// audit run 7 / Order 24, and nothing here is a statement about it.
+
+/// G17's tree: the package's declared `generated` root is a LINK to a tree
+/// outside it, which is how a shared icon set or a sibling generator's output
+/// gets its name inside a package. Returns `(outer, package)` — the products
+/// live at `outer/outside/icons`, reachable as `package/src/icons`.
+#[cfg(unix)]
+fn symlinked_generated_project(tag: &str) -> (PathBuf, PathBuf) {
+    let outer = temp_project(tag);
+    let package = outer.join("package");
+    std::fs::create_dir_all(outer.join("outside/icons")).unwrap();
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    write(
+        &package,
+        "vilan.toml",
+        &format!(
+            "[package]\nname = \"app\"\ngenerated = \"src/icons\"\n\n[[build.hook]]\n\
+             name = \"icons\"\nrun = [{}, {}]\ninputs = \"icons.lock\"\n\
+             outputs = \"src/icons/lib.vl\"\n",
+            toml_string(&append("ran.txt")),
+            toml_string(&generate_module("src/icons/lib.vl"))
+        ),
+    );
+    write(
+        &package,
+        "src/main.vl",
+        "import std::io::print;\nimport pkg::icons::generated;\n\
+         fun main() { print(generated() + 1) }\nmain();\n",
+    );
+    write(&package, "icons.lock", "v1\n");
+    std::os::unix::fs::symlink("../../outside/icons", package.join("src/icons")).unwrap();
+    (outer, package)
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_leaves_a_product_under_a_symlinked_generated_root_alone() {
+    // G17, audit run 6's F5: the containment check missed through a link and
+    // the exclusion FAILED OPEN — `vilan fmt` rewrote the product, re-staling
+    // the hook that digests it, which is §12.1's loop live again. Both spellings
+    // are pinned, because both consumers exist: the walk that finds the file
+    // under the directory, and the explicit path (the shape format-on-save
+    // reaches a file by).
+    let (outer, package) = symlinked_generated_project("fmt_link");
+    build(&package);
+    let product = package.join("src/icons/lib.vl");
+    let before = std::fs::read(&product).unwrap();
+
+    let output = fmt(&package);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read(&product).unwrap(),
+        before,
+        "a product behind a symlinked root is not formatted:\n{text}"
+    );
+    assert!(
+        text.contains("generated file") && text.contains("not formatted"),
+        "and the exclusion says so — silence is how the loop came back:\n{text}"
+    );
+
+    let named = vilan(&["fmt", product.to_str().unwrap()]);
+    let text = combined(&named);
+    assert!(named.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read(&product).unwrap(),
+        before,
+        "however the file is reached, links included:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&outer);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hook_writing_through_a_symlinked_generated_root_stays_fresh_across_a_format() {
+    // The loop itself, over a link: build, format, build. This is the pin the
+    // FIX exists for — without it the second build re-runs the generator, and
+    // keeps re-running it forever.
+    let (outer, package) = symlinked_generated_project("loop_link");
+    build(&package);
+    assert_eq!(runs(&package, "ran.txt"), 1);
+
+    assert!(fmt(&package).status.success());
+    let text = build(&package);
+    assert_eq!(
+        runs(&package, "ran.txt"),
+        1,
+        "a format does not re-stale a generator writing through a link:\n{text}"
+    );
+    assert!(text.contains("Fresh   icons"), "{text}");
+    let _ = std::fs::remove_dir_all(&outer);
+}
+
+/// A package with a directory link inside it, for G18's walk pins. `link` is
+/// the link's name under `src`, `target` its (relative) target.
+#[cfg(unix)]
+fn linked_walk_project(tag: &str, links: &[(&str, &str)]) -> PathBuf {
+    let dir = temp_project(tag);
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    // Deliberately unformatted, so "the walk finished" and "the walk found it"
+    // are distinguishable from the output alone.
+    write(&dir, "src/main.vl", "fun  main( ) { }\n");
+    for (link, target) in links {
+        std::os::unix::fs::symlink(target, dir.join("src").join(link)).unwrap();
+    }
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_terminates_on_a_directory_cycle_and_reports_each_file_once() {
+    // G18, audit run 6's F6. `src/l1 -> .` with a second link beside it fans the
+    // walk out exponentially and `vilan fmt --check` never returns — ZERO output,
+    // because the report comes after collection. One link alone did return, but
+    // only because the kernel's own ELOOP stopped it at forty levels, after
+    // reporting the same file forty-one times.
+    //
+    // The timeout is the instrument: this pin must prove the hang is GONE, and
+    // "the test passed" is not that proof if it could pass by hanging the
+    // harness. Generous (60 s against a walk that now visits three directories)
+    // because the suite runs it under full lane load.
+    let dir = linked_walk_project("cycle", &[("l1", "."), ("l2", ".")]);
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["fmt", "--check", dir.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run vilan fmt");
+    let output = loop {
+        match child.try_wait().expect("wait on vilan fmt") {
+            Some(_) => break child.wait_with_output().expect("collect vilan fmt"),
+            None if started.elapsed() > Duration::from_secs(60) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`vilan fmt --check` did not terminate on a directory cycle");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let text = combined(&output);
+    assert_eq!(
+        text.matches("would reformat").count(),
+        1,
+        "one file, reported once — a cycle re-walked is the same file under \
+         another name:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_stays_inside_the_project_tree_and_says_where_it_stopped() {
+    // G18's other half: an ordinary directory link ESCAPES the package, so
+    // `vilan fmt .` rewrote files in someone else's tree — measured, not
+    // theorized. The scope is the resolved PROJECT tree (G19's doctrine: fences
+    // apply to the resolved tree), and the walk says which link it stopped at
+    // rather than skipping in silence.
+    let outer = temp_project("escape");
+    let package = outer.join("package");
+    std::fs::create_dir_all(outer.join("outside")).unwrap();
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    write(&package, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&package, "src/main.vl", "fun  main( ) { }\n");
+    let stranger = outer.join("outside/other.vl");
+    std::fs::write(&stranger, "fun  other( ) { }\n").unwrap();
+    std::os::unix::fs::symlink("../../outside", package.join("src/linked")).unwrap();
+
+    let output = vilan(&["fmt", package.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&stranger).unwrap(),
+        "fun  other( ) { }\n",
+        "a tree outside the project is not this command's to rewrite:\n{text}"
+    );
+    assert_ne!(
+        std::fs::read_to_string(package.join("src/main.vl")).unwrap(),
+        "fun  main( ) { }\n",
+        "while the package's own source is formatted as always:\n{text}"
+    );
+    assert!(
+        text.contains("linked") && text.contains("outside this project"),
+        "the note names the link and the reason, and calls neither illegitimate:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&outer);
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_follows_a_directory_link_that_stays_inside_the_project() {
+    // The green negative that keeps the scope from reading as "links are
+    // refused". A link to a sibling tree INSIDE the project is ordinary layout
+    // and is walked — G19's ruling, in the one place it is observable.
+    let dir = temp_project("inside_link");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/main.vl", "fun main() {}\n");
+    write(&dir, "shared/helper.vl", "fun  helper( ) { }\n");
+    std::os::unix::fs::symlink("../shared", dir.join("src/shared")).unwrap();
+
+    let output = vilan(&["fmt", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("shared/helper.vl")).unwrap(),
+        "fun helper() {}\n",
+        "a link inside the project is layout, and its tree formats:\n{text}"
+    );
+    assert!(
+        !text.contains("outside this project"),
+        "and nothing is said about it:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_generated_root_outside_the_package_fails_the_build_naming_the_key() {
     // The refusal reaches the user, not just `Manifest::validate` (whose own

@@ -822,13 +822,36 @@ pub fn generated_root_in(directory: &Path) -> Option<PathBuf> {
 /// manifest whose generated root **contains** `path`. Climbing past a manifest
 /// that declares none is the point: a file inside a declared generated root is a
 /// product whichever manifest above it said so.
+///
+/// **Symlinks (G17, and `const.md` §9.2's doctrine).** A link is a supported
+/// spelling of project layout, not an escape, so the rule resolves honestly and
+/// compares resolved: the declared root is canonicalized before the containment
+/// test, exactly as the freshness stamp resolves a declared path. What it must
+/// *not* do is climb the resolved path only. `generated = "src/icons"` over a
+/// link to a tree outside the package puts the product's canonical path outside
+/// the package's canonical tree, so that climb never reaches the manifest, the
+/// exclusion silently stops, and §12.1's fmt↔hook loop returns with the honesty
+/// note never printing — the fail-OPEN this function had. So both ancestries are
+/// searched, spelled first (that is the one the caller reached the file through,
+/// and it is what makes "nearest manifest" mean what a reader expects), resolved
+/// second (which covers the editor opening the product by its real path). One
+/// resolution rule, both consumers: `vilan fmt` and format-on-save.
 pub fn generated_root_covering(path: &Path) -> Option<PathBuf> {
-    let path = crate::util::canonical_path(path);
-    let mut current = Some(path.as_path());
+    let resolved = crate::util::canonical_path(path);
+    let spelled = crate::util::spelled_path(path);
+    covering_from(&spelled, &resolved).or_else(|| covering_from(&resolved, &resolved))
+}
+
+/// One ladder of [`generated_root_covering`]'s search: climb from `start`, and
+/// answer with the first declared generated root that contains `resolved`. The
+/// two paths are separate because the climb and the containment test ask
+/// different questions — where the file was reached from, and what it is.
+fn covering_from(start: &Path, resolved: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
     while let Some(directory) = current {
         if let Some(root) = generated_root_in(directory) {
             let root = crate::util::canonical_path(&root);
-            if path.starts_with(&root) {
+            if resolved.starts_with(&root) {
                 return Some(root);
             }
         }
@@ -4081,6 +4104,93 @@ mod tests {
             None,
             "and neither is a sibling directory whose name merely starts the \
              same way — the test is on path COMPONENTS, not on the string"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G17, the fail-OPEN: a `generated` root that IS a symlink out of the
+    /// package. The declared root resolves to a tree with no manifest above it,
+    /// so climbing the file's CANONICAL path never reaches the package that
+    /// declared it, the exclusion silently stopped, and `vilan fmt` rewrote the
+    /// product — the loop §12.1 exists to kill, with the honesty note never
+    /// printing because nothing was skipped.
+    ///
+    /// `cfg(unix)` like every other symlink pin in the tree: creating one needs
+    /// a privilege Windows does not grant by default. The FIX is platform-neutral
+    /// — the Windows half of symlink behavior is audit run 7's charter.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_root_reached_through_a_symlink_still_covers_its_products() {
+        let root = std::env::temp_dir().join(format!("vilan-covering-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let package = root.join("package");
+        let outside = root.join("outside/icons");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(
+            package.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"src/icons\"\n",
+        )
+        .unwrap();
+        // The declared root is a LINK to a tree outside the package — an
+        // ordinary way a static tree gets its name (G15/G19), not an escape.
+        std::os::unix::fs::symlink("../../outside/icons", package.join("src/icons")).unwrap();
+        std::fs::write(outside.join("lib.vl"), "").unwrap();
+        std::fs::write(outside.join("deep/more.vl"), "").unwrap();
+        std::fs::write(package.join("src/hand_written.vl"), "").unwrap();
+        let expected = Some(crate::util::canonical_path(&outside));
+
+        // Through the link — the spelling `vilan fmt`'s walk and an explicit
+        // path both produce.
+        assert_eq!(
+            generated_root_covering(&package.join("src/icons/lib.vl")),
+            expected,
+            "a product under a symlinked generated root is still a product"
+        );
+        assert_eq!(
+            generated_root_covering(&package.join("src/icons/deep/more.vl")),
+            expected,
+            "at any depth behind the link"
+        );
+        assert_eq!(
+            generated_root_covering(&package.join("src/hand_written.vl")),
+            None,
+            "a hand-written module beside the link is still authored source"
+        );
+        // The boundary, stated rather than wished away: reached by its REAL
+        // path, that file has no manifest above it at all, so nothing declares
+        // it a product and it formats. That is the documented safe direction —
+        // a tree the predicate cannot read is a tree the formatter formats —
+        // and it is why the exclusion is a statement the PACKAGE makes.
+        assert_eq!(generated_root_covering(&outside.join("lib.vl")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other ancestry, and why the search has two ladders: a product inside
+    /// an ordinary generated root, opened through a link from somewhere else.
+    /// The SPELLED climb finds no manifest there; the resolved one does, and the
+    /// file is a product however it was reached (§12.4's "however the file is
+    /// reached", now true of links too).
+    #[cfg(unix)]
+    #[test]
+    fn a_product_reached_through_a_link_from_outside_is_still_a_product() {
+        let root = std::env::temp_dir().join(format!("vilan-covering-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let package = root.join("package");
+        std::fs::create_dir_all(package.join("gen")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(
+            package.join("vilan.toml"),
+            "[package]\nname = \"app\"\ngenerated = \"gen\"\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("gen/lib.vl"), "").unwrap();
+        std::os::unix::fs::symlink("../package/gen", root.join("elsewhere/peek")).unwrap();
+
+        assert_eq!(
+            generated_root_covering(&root.join("elsewhere/peek/lib.vl")),
+            Some(crate::util::canonical_path(package.join("gen"))),
+            "the resolved ancestry carries the verdict the spelled one cannot"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
