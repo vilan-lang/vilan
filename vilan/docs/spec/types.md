@@ -576,7 +576,9 @@ off an impl. For `+` those pairs are exactly two:
 
 - `str + x`, **concatenation**, where `x` is a `str`, a numeric
   primitive, or a `bool` — the types whose value is already their
-  rendering. This is the rule an interpolated string is checked
+  rendering — or a generic parameter whose bound provides
+  `to_string(self): str`, which is that same rendering promised rather
+  than built in. This is the rule an interpolated string is checked
   against, since `i"a{x}b"` *is* a `+` chain (§2.3).
 - `T + T` for a numeric primitive `T`, ordinary addition, with no
   implicit conversions (§5.8).
@@ -590,12 +592,17 @@ backed enums, native though they are for `==` and `<`, have no `Add` at
 all — a backing value is a lowering detail, not a number to compute
 with.
 
-An **unbounded generic parameter** is one of the things "anything else"
-covers. A declaration is checked once for all its instantiations, so a
-parameter admits only what its bounds promise, and an unbounded one
-promises nothing: it is neither a string form nor the left operand's
-type. Bound it — `Display` and an explicit `to_string()` to concatenate,
-the operator's own trait to add — or take a concrete type.
+A **generic parameter** admits exactly what its bounds promise, and no
+more: a declaration is checked once for all its instantiations, so the
+bounds are the whole of what the operand is known to be. An unbounded
+one promises nothing — neither a string form nor the left operand's type
+— and is one of the things "anything else" covers. A bound providing
+`to_string(self): str` promises the string form, so the parameter
+concatenates, and the concatenation *calls* that implementation at each
+instantiation: the promise is kept, not assumed. A bound promising
+something else (`T: Add`) is refused with the unbounded case, for the
+same reason. To add rather than concatenate, bound the parameter with
+the operator's own trait, or take a concrete type.
 
 ```vilan,fragment
 "n=" + count                 // str + i32 — concatenation
@@ -606,8 +613,10 @@ count + "n="                 // error: only a `str` LEFT operand concatenates
 ```
 
 ```vilan,fragment
-fun show<T>(value: T): str { "v=" + value }              // error: `T` is unbounded
-fun show<T: Display>(value: T): str { "v=" + value.to_string() }   // the fix
+fun show<T>(value: T): str { "v=" + value }           // error: `T` is unbounded
+fun show<T: Add>(value: T): str { "v=" + value }      // error: no bound provides `to_string`
+fun show<T: Display>(value: T): str { "v=" + value }  // the impl is called
+fun show<T: Display>(value: T): str { i"v={value}" }  // the hole is the same expression
 ```
 
 `is` (§3.7 level 10) tests a value against a match pattern and yields

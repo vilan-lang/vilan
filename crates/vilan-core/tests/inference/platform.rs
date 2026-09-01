@@ -4937,6 +4937,375 @@ fn the_to_string_steer_for_a_generic_operand_compiles_and_renders() {
     );
 }
 
+// --- B176: an ADMITTED bounded generic operand emitted a raw `+` -------------
+//
+// B169 refused the UNBOUNDED parameter and left the bounded one admitted,
+// which is right: `T: Display` promises exactly the string form `str + x`
+// wants. But nothing ever KEPT the promise. `grounded` excludes every
+// `Type::Generic`, so a bounded parameter reached neither the admitted set nor
+// the refusal, fell through to the native emission, and `"v=" + value` came
+// out as the host's `+` over the value's runtime shape — `show(Point { x = 1,
+// y = 2 })` printed `v=1,2` with the `Display` impl never called. The typing
+// was right and the codegen was wrong, which is the worse half: the program
+// compiles, runs, and lies.
+//
+// The concatenation now asks the bound whether it provides `to_string` and
+// records the site, so codegen routes the operand through the impl at each
+// monomorphization — the channel `value.to_string()` already used. A bound
+// that promises something else (`T: Add`) promises no string form and is
+// refused with the rest.
+
+#[test]
+fn a_bounded_generic_concatenated_into_a_string_calls_its_display_impl() {
+    // The find itself. `T: Display` is the admission's own promise, so the
+    // emission has to call the impl rather than hand the operand to the host.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun show<T: Display>(value: T): str {
+            "v=" + value
+        }
+
+        fun main() {
+            print(show(Point { x = 1, y = 2 }));
+        }
+        "#,
+        "v=(1, 2)\n",
+    );
+}
+
+#[test]
+fn a_bounded_generic_in_an_i_string_hole_calls_its_display_impl() {
+    // The same expression by another spelling: `lexing::emit_interpolated`
+    // desugars `i"v={value}"` to `("" + "v=" + value)`, so the hole rode the
+    // identical hole and printed the identical `v=1,2`. One fix covers both,
+    // and each keeps its own pin.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun show<T: Display>(value: T): str {
+            i"v={value}"
+        }
+
+        fun main() {
+            print(show(Point { x = 1, y = 2 }));
+        }
+        "#,
+        "v=(1, 2)\n",
+    );
+}
+
+#[test]
+fn a_bounded_generic_operand_renders_in_a_non_tail_position() {
+    // The operand mid-expression: `"a" + value + "b"` parses as `("a" +
+    // value) + "b"`, so the render has to attach to the INNER binary's right
+    // operand and leave the outer concatenation alone. A fix keyed on "the
+    // last operand" would have rendered nothing here.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun wrap<T: Display>(value: T): str {
+            "a" + value + "b"
+        }
+
+        fun two<T: Display, U: Display>(first: T, second: U): str {
+            "[" + first + "|" + second + "]"
+        }
+
+        fun main() {
+            print(wrap(Point { x = 1, y = 2 }));
+            print(two(Point { x = 3, y = 4 }, 7));
+        }
+        "#,
+        "a(1, 2)b\n[(3, 4)|7]\n",
+    );
+}
+
+#[test]
+fn a_bounded_generic_operand_renders_through_a_nested_call_chain() {
+    // `show` calling `show`: the outer monomorphization binds `T = Point` and
+    // the inner one is reached THROUGH it, so the dispatch has to resolve
+    // under the active substitution rather than at the declaration.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun show<T: Display>(value: T): str {
+            "v=" + value
+        }
+
+        fun twice<T: Display>(value: T): str {
+            show(value) + " " + show(value)
+        }
+
+        fun main() {
+            print(twice(Point { x = 1, y = 2 }));
+            print(twice(5));
+        }
+        "#,
+        "v=(1, 2) v=(1, 2)\nv=5 v=5\n",
+    );
+}
+
+#[test]
+fn a_concrete_operand_keeps_its_own_routing_beside_the_generic_one() {
+    // The control, and the routing the fix reuses: a CONCRETE struct operand
+    // is still refused outright (B148) and its `.to_string()` spelling still
+    // renders, while the primitives still concatenate natively — the fix must
+    // move neither. `show(5)` proves the native instantiation of the same
+    // generic keeps the host's own rendering through the `impl i32 with
+    // Display`, which is itself `i"{self}"`.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun show<T: Display>(value: T): str {
+            "v=" + value
+        }
+
+        fun main() {
+            let p = Point { x = 1, y = 2 };
+            print("c=" + p.to_string());
+            print("n=" + 3 + "/" + 1.5 + "/" + true);
+            print(show(5));
+            print(show("s"));
+        }
+        "#,
+        "c=(1, 2)\nn=3/1.5/true\nv=5\nv=s\n",
+    );
+}
+
+#[test]
+fn a_concrete_struct_operand_is_still_refused_beside_the_bounded_generic() {
+    // The other half of the control: admitting the bounded parameter must not
+    // admit the concrete struct it instantiates to. The refusal B148 wrote
+    // stands, and it is what the reader sees for the spelling that has no
+    // bound to consult.
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun main() {
+            let p = Point { x = 1, y = 2 };
+            let _text = "v=" + p;
+        }
+        "#,
+        "`+` on `str` concatenates, and `Point` has no string form",
+    );
+}
+
+#[test]
+fn a_generic_bounded_to_something_other_than_display_is_rejected() {
+    // The admission is the BOUND's promise, so a bound that promises
+    // something else promises no string form. `T: Add` compiled and
+    // `label(Point { … })` printed `v=1,2` for the same reason the unbounded
+    // case did — the parameter was never asked what it could render.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        fun label<T: Add>(value: T): str {
+            "v=" + value
+        }
+
+        fun main() {
+            let _text = label(1);
+        }
+        "#,
+        r#""v=" + value"#,
+        "no bound on `T` provides `to_string`",
+    );
+}
+
+#[test]
+fn a_generic_bounded_to_something_other_than_display_is_rejected_in_a_hole() {
+    // The hole is the same concatenation, so the same bound is required of
+    // it — the pair the refusal's own wording promises.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        fun label<T: Add>(value: T): str {
+            i"v={value}"
+        }
+
+        fun main() {
+            let _text = label(1);
+        }
+        "#,
+        "no bound on `T` provides `to_string`",
+    );
+}
+
+#[test]
+fn a_compound_append_of_a_bounded_generic_renders() {
+    // `text += value` is `text = text + value`, and the desugar SYNTHESIZES
+    // its own binary from a second registration site — the spelling B148 had
+    // to reach separately, so the routing has to reach it separately too. It
+    // is also the one most likely to be written in a loop, where a wrong
+    // rendering repeats.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        fun lines<T: Display>(first: T, second: T): str {
+            mut text = "";
+            text += first;
+            text += "/";
+            text += second;
+            text
+        }
+
+        fun main() {
+            print(lines(Point { x = 1, y = 2 }, Point { x = 3, y = 4 }));
+        }
+        "#,
+        "(1, 2)/(3, 4)\n",
+    );
+}
+
+#[test]
+fn a_display_bound_reached_through_a_supertrait_still_renders() {
+    // The bound need not name `Display` itself: `to_string` reached through a
+    // supertrait is the same promise, and the lookup walks the chain the way
+    // every other bound-member lookup does.
+    assert_compiles_and_runs(
+        r#"
+        import std::display::Display;
+
+        trait Labelled with Display {
+            fun label(self): str;
+        }
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Display {
+            fun to_string(self): str {
+                i"({self.x}, {self.y})"
+            }
+        }
+
+        impl Point with Labelled {
+            fun label(self): str {
+                "point"
+            }
+        }
+
+        fun show<T: Labelled>(value: T): str {
+            value.label() + "=" + value
+        }
+
+        fun main() {
+            print(show(Point { x = 1, y = 2 }));
+        }
+        "#,
+        "point=(1, 2)\n",
+    );
+}
+
+#[test]
+#[ignore = "B176's numeric sibling, found by the b176 lane and awaiting an \
+            item of its own: a BOUNDED generic right operand of a NATIVE \
+            numeric `+` is still admitted unchecked, and no bound can promise \
+            what that position needs"]
+fn a_bounded_generic_added_to_a_number_is_rejected() {
+    // KNOWN BUG. B169 closed the unbounded case here and B176 closed the
+    // concatenating case for a bound; this is the square neither covers.
+    // `bump(1, Point { x = 1, y = 2 })` prints `11,2` — a string, typed as an
+    // `i32` — exactly the unbounded sibling's garbage, from a declaration that
+    // carries a bound.
+    //
+    // The concatenation could be fixed by ROUTING because a bound can promise
+    // a string form. This position cannot: a native left operand never
+    // dispatches, so the only admissible right operand is one known to BE
+    // `i32`, and `T: Add` does not say that — `Add`'s `B` defaults to `Self`,
+    // which is `T`, not the left operand's type. So the answer is a refusal,
+    // and refusing here is a ruling about what a bound on the right of a
+    // native operator may mean, not a codegen fix.
+    assert_fails_spanning(
+        r#"
+        import std::operators::Add;
+
+        struct Point { x: i32, y: i32 }
+
+        impl Point with Add {
+            fun add(self, other: Point): Point {
+                Point { x = self.x + other.x, y = self.y + other.y }
+            }
+        }
+
+        fun bump<T: Add>(total: i32, value: T): i32 {
+            total + value
+        }
+
+        fun main() {
+            print(bump(1, Point { x = 1, y = 2 }));
+        }
+        "#,
+        "total + value",
+        "the operands are `i32` and `T`",
+    );
+}
+
 // --- B170: `+` skipped its check when the LEFT operand was non-nominal -------
 //
 // B148 closed the hole for a NATIVE left operand and the dispatch loop's own

@@ -2745,6 +2745,12 @@ pub struct Analyzer<'src> {
     // matching operator trait: the resolved method id, so codegen emits
     // `add(lhs, rhs)` instead of `lhs + rhs`.
     binary_op_dispatch: HashMap<Id, Id>,
+    // B176: `str + value` binaries whose right operand is a generic parameter
+    // whose BOUND provides the string form (`to_string`): the constraint and
+    // the trait that provides it, so codegen routes the operand through that
+    // impl at each monomorphization instead of handing the value's runtime
+    // shape to the host's `+`.
+    concat_render_dispatch: HashMap<Id, (TypeId, Id)>,
     // Bitwise/shift binaries whose operands are `u32` — either settled here
     // (`true` entries via the set) or generic, resolved per monomorphization by
     // the transformer (the constraint's TypeId). Drives the `>>>`-based
@@ -3297,6 +3303,13 @@ const NATIVE_OPERATOR_PRIMITIVES: &[&str] = &[
     "i32", "u32", "f64", "BigInt", "str", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
 ];
 
+/// The member a `str` concatenation routes a non-native operand through —
+/// `Display`'s, and the one the refusal's own steer names. Kept as a name
+/// rather than a trait id because the promise is the SIGNATURE: any bound
+/// declaring `to_string(self): str` carries it, whether it is `Display`, a
+/// trait with `Display` as a supertrait, or a program's own.
+pub(crate) const RENDER_MEMBER: &str = "to_string";
+
 fn is_overloadable_operator(op: BinaryOp) -> bool {
     operator_trait_method(op).is_some()
 }
@@ -3532,6 +3545,7 @@ impl<'src> Analyzer<'src> {
             closure_parameter_fill_sites: HashMap::default(),
             prepped_binder_inheritance: Vec::new(),
             binary_op_dispatch: HashMap::default(),
+            concat_render_dispatch: HashMap::default(),
             bitwise_u32: HashSet::default(),
             bitwise_generic_lhs: HashMap::default(),
             integer_division: HashSet::default(),
@@ -13410,6 +13424,41 @@ impl<'src> Analyzer<'src> {
             Type::Enum(id, _) => self.bool_enum_id == Some(*id),
             _ => false,
         }
+    }
+
+    /// The bound that gives a generic parameter a string form: the trait among
+    /// `constraint_id`'s bounds (or their supertraits) declaring
+    /// `to_string(self): str`. A parameter renders into nothing on its own —
+    /// `renders_into_a_string` is false for every `Type::Generic` — but a bound
+    /// is a promise, and this is the promise the `str` concatenation wants
+    /// (B176). `None` for an unbounded parameter and for one whose bounds
+    /// promise something else: `T: Add` says nothing about a string form.
+    fn string_render_bound(&self, constraint_id: TypeId) -> Option<Id> {
+        self.generic_bound_trait_ids(constraint_id)
+            .into_iter()
+            .find(|trait_id| {
+                self.method_member_in_trait(*trait_id, RENDER_MEMBER)
+                    .is_some_and(|member_id| self.member_returns_str(member_id))
+            })
+    }
+
+    /// Whether a member DECLARES a `str` return. The render bound is a promise
+    /// about the string form specifically, so a same-named method returning
+    /// something else does not carry it — routing an operand through that
+    /// would swap one wrong rendering for another.
+    fn member_returns_str(&self, member_id: Id) -> bool {
+        let return_type_id = match self.expr_id_to_expr_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => self
+                .functions
+                .get(function_id)
+                .and_then(|function| function.return_type_id),
+            Some(Expr::ExternalFunction(function_id)) => self
+                .external_functions
+                .get(function_id)
+                .map(|external| external.return_type_id),
+            _ => None,
+        };
+        return_type_id.is_some_and(|type_id| self.is_str_type(&type_id.get_type(self)))
     }
 
     /// Resolves the operator method for `op` on `subject_type` — the `add`/`sub`/
@@ -33043,13 +33092,43 @@ impl<'src> Analyzer<'src> {
                         Type::Generic(constraint_id)
                             if self.generic_bound_trait_ids(*constraint_id).is_empty()
                     );
+                    // B176: and a bound is a promise that has to be KEPT. The
+                    // bounded parameter was admitted here and then emitted as
+                    // a raw host `+` — `grounded` excludes every
+                    // `Type::Generic`, so it reached neither this set nor the
+                    // refusal — and `fun show<T: Display>(value: T): str
+                    // { "v=" + value }` printed `v=1,2` with the impl never
+                    // called: the typing right, the output silently wrong.
+                    //
+                    // So the concatenation asks the bound what it promises. A
+                    // bound providing `to_string(self): str` IS the string
+                    // form the admitted set wants, and the site is recorded so
+                    // codegen routes the operand through that impl at each
+                    // monomorphization. A bound promising anything else
+                    // (`T: Add`) promises no string form and is refused with
+                    // the unbounded case, which is the same verdict for the
+                    // same reason.
+                    let render_bound = match (&rhs_type, concatenating) {
+                        (Type::Generic(constraint_id), true) => self
+                            .string_render_bound(*constraint_id)
+                            .map(|trait_id| (*constraint_id, trait_id)),
+                        _ => None,
+                    };
+                    let bounded_generic_concat = concatenating
+                        && !unbounded_generic
+                        && matches!(&rhs_type, Type::Generic(_));
                     let admitted = !unbounded_generic
                         && if concatenating {
-                            self.renders_into_a_string(&rhs_type)
+                            self.renders_into_a_string(&rhs_type) || render_bound.is_some()
                         } else {
                             self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
                         };
-                    if (grounded(&rhs_type) || unbounded_generic) && !admitted {
+                    if let Some(recorded) = render_bound {
+                        self.concat_render_dispatch.insert(binary_id, recorded);
+                    }
+                    if (grounded(&rhs_type) || unbounded_generic || bounded_generic_concat)
+                        && !admitted
+                    {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
                         let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
                         let msg = if unbounded_generic && concatenating {
@@ -33069,6 +33148,22 @@ impl<'src> Analyzer<'src> {
                                  its bounds promise, and this one is unbounded — nothing says it \
                                  is `{lhs_label}`. Bound it (`<{rhs_label}: Add>`), or take a \
                                  concrete type"
+                            )
+                        } else if bounded_generic_concat {
+                            // B176: bounded, but bounded to the wrong promise.
+                            // The parameter has bounds, so the unbounded
+                            // wording ("this one is unbounded") would read as
+                            // wrong to someone looking straight at `T: Add` —
+                            // the missing thing is a `to_string`, and that is
+                            // what the sentence has to say.
+                            format!(
+                                "`+` on `str` concatenates, and `{rhs_label}` has no string form: \
+                                 a parameter promises only what its bounds promise, and no bound \
+                                 on `{rhs_label}` provides `to_string`, so every instantiation \
+                                 would concatenate the value's runtime shape — a struct as a \
+                                 tuple, an enum a tagged array. Add a `Display` bound \
+                                 (`<{rhs_label}: Display>`); an i-string hole is this same \
+                                 concatenation, so it needs the same bound"
                             )
                         } else if concatenating {
                             // Not "or interpolate it": an i-string hole lexes to
@@ -34784,6 +34879,13 @@ pub struct Program<'src> {
     // `for e in &mut list` loop bindings → whether the element view is `&mut`.
     pub for_each_views: HashMap<Id, bool>,
     pub binary_op_dispatch: HashMap<Id, Id>,
+    /// B176: `str + value` binaries whose right operand is a generic parameter
+    /// whose bound provides the string form — `(the parameter's constraint, the
+    /// trait that provides `to_string`)`. The emission routes the operand
+    /// through that impl at each monomorphization; without it the admitted
+    /// concatenation handed the value's runtime shape to the host's `+` and the
+    /// `Display` impl was never called.
+    pub concat_render_dispatch: HashMap<Id, (TypeId, Id)>,
     pub own_generic_call_bindings: HashMap<Id, Vec<TypeId>>,
     /// Call id -> `(trait, the arguments the bound wrote)`. The arguments are
     /// empty where the site knows only the trait; an empty list constrains
@@ -40377,6 +40479,7 @@ fn analyze_over_world<'src>(
         for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
         binary_op_dispatch: analyzer.binary_op_dispatch,
+        concat_render_dispatch: analyzer.concat_render_dispatch,
         own_generic_call_bindings: analyzer.own_generic_call_bindings,
         bound_dispatch_traits: analyzer.bound_dispatch_traits,
         try_dispatch: analyzer.try_dispatch,
