@@ -1001,6 +1001,18 @@ pub struct Variable<'src> {
     pub annotated: bool,
 }
 
+/// One generic parameter as a nominal declaration WROTE it (B188): the name it
+/// bound and whether it supplied a default (`<B = Self>`). The arity check on a
+/// written type application needs both, and neither survives into
+/// `generic_parameter_constraint_ids` — that list holds constraint ids, and a
+/// defaulted parameter's entry there is the DEFAULT's type id, indistinguishable
+/// from a bound one.
+#[derive(Debug, Clone)]
+struct DeclaredGenericParameter<'src> {
+    name: &'src str,
+    has_default: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Struct<'src> {
     pub id: Id,
@@ -2879,6 +2891,10 @@ pub struct Analyzer<'src> {
     // nominal type (`Option<i32>` -> `Enum(option_id, [i32])`); empty for a bare
     // name or a generic parameter.
     prepped_type_locals: Vec<(TypeId, &'src str, Id, Span, Vec<TypeId>, SourceId)>,
+    /// The generic parameters each nominal declaration (struct / enum / trait)
+    /// WROTE, by its entity id — the record the `prepped_type_locals` drain
+    /// checks a written application's arity against (B188).
+    declared_generic_parameters: HashMap<Id, Vec<DeclaredGenericParameter<'src>>>,
     // The written spelling of every type reference `build()` has resolved —
     // the projection of `prepped_type_locals` that outlives its drain (S2):
     // conformance checking disambiguates `= Self`-defaulted positions by the
@@ -2947,6 +2963,13 @@ pub struct Analyzer<'src> {
     // Marked here rather than the reverse so the default is the safe one: a
     // type position added later is checked until it says otherwise.
     trait_position_type_ids: HashSet<TypeId>,
+    // Type ids written as a path HEAD — the subject of a `::` (`Option::None`,
+    // `List::from_json_value(..)`, `math::min(..)`, `A::pick(..)`). A head
+    // NAMES a namespace to look a member up in; it is not a written type
+    // application, so its arity is not the annotation's to supply and B188's
+    // check must not read it as an under-supply. Marked, like the trait
+    // positions above, so the default stays the checked one.
+    path_head_type_ids: HashSet<TypeId>,
     // The annotation type ids of `let` bindings, keyed to the binding they
     // annotate. B161: a trait written HERE — and only here among the value
     // positions — is a CHECKED CONSTRAINT on the binding's inferred type
@@ -3579,6 +3602,7 @@ impl<'src> Analyzer<'src> {
             trait_impl_sites: Vec::new(),
             conformance_signature_checks: Vec::new(),
             prepped_type_locals: Vec::new(),
+            declared_generic_parameters: HashMap::default(),
             written_type_spellings: Vec::new(),
             prepped_type_static_accessors: Vec::new(),
             prepped_uses: Vec::new(),
@@ -3598,6 +3622,7 @@ impl<'src> Analyzer<'src> {
             walking_trait_body: false,
             trait_body_scopes: HashSet::default(),
             trait_position_type_ids: HashSet::default(),
+            path_head_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
             binding_trait_constraints: Vec::new(),
             panic_fn_id: None,
@@ -18981,11 +19006,28 @@ impl<'src> Analyzer<'src> {
     /// Walks the optional generic parameters of a declaration into `scope_id`,
     /// registering each as a `Generic` type bound by its constraint, and
     /// returns the constraint type ids in declaration order.
+    ///
+    /// `declaration_id` is the entity the parameters belong to. What each
+    /// parameter was WRITTEN as — its name, and whether it defaulted — is
+    /// recorded against it for the arity check on a written type application
+    /// (B188); the constraint ids returned here cannot answer either question.
     fn register_generic_parameters(
         &mut self,
+        declaration_id: Id,
         generic_parameters: &'src Option<GenericParameters<'src>>,
         scope_id: Id,
     ) -> Vec<TypeId> {
+        self.declared_generic_parameters.insert(
+            declaration_id,
+            generic_parameters
+                .iter()
+                .flat_map(|generic_parameters| &generic_parameters.0)
+                .map(|parameter| DeclaredGenericParameter {
+                    name: parameter.name,
+                    has_default: parameter.default.is_some(),
+                })
+                .collect(),
+        );
         let mut generic_parameter_constraint_ids = Vec::new();
         if let Some(generic_parameters) = generic_parameters {
             for parameter in &generic_parameters.0 {
@@ -19055,6 +19097,73 @@ impl<'src> Analyzer<'src> {
                 .insert(constraint_type_id, bound_type_ids);
         }
         constraint_type_id
+    }
+
+    /// The refusal a WRITTEN type application earns when the arguments it
+    /// spells do not match the arity its declaration declares (B188), or `None`
+    /// when they do. `subject_id` is the entity the head name resolved to and
+    /// `written_count` is how many arguments the annotation wrote.
+    ///
+    /// Only a nominal declaration's OWN name is an application. Two other
+    /// spellings resolve to the same nominal types and write no arguments, and
+    /// neither is under-supplying anything: `Self`, which has a type binding
+    /// and no `Expr` at all (`register_self_type`) and already carries the
+    /// subject's arguments, and a generic parameter, an `Expr::Generic` over
+    /// whatever bound it. Keying on the ENTITY rather than on the type it
+    /// produced separates all three without asking any of them how it was
+    /// spelled — the same discriminator the bare-trait refusal beside this uses.
+    ///
+    /// A parameter with a default (`<B = Self>`) supplies itself, so an
+    /// argument missing from a defaulted position is not missing.
+    fn written_application_arity_error(
+        &self,
+        subject_id: Id,
+        subject_type: &Type,
+        name: &str,
+        written_count: usize,
+    ) -> Option<String> {
+        let declaration_id = match (subject_type, self.expr_id_to_expr_map.get(&subject_id)) {
+            (
+                Type::Struct(id, _) | Type::Enum(id, _) | Type::Trait(id, _),
+                Some(Expr::Struct(_) | Expr::Enum(_) | Expr::Trait(_)),
+            ) => *id,
+            _ => return None,
+        };
+        let declared = self.declared_generic_parameters.get(&declaration_id)?;
+        if written_count == declared.len() {
+            return None;
+        }
+        // Under-supply is forgiven exactly as far as the defaults reach: every
+        // parameter the annotation did not write must supply its own argument.
+        if written_count < declared.len()
+            && declared[written_count..]
+                .iter()
+                .all(|parameter| parameter.has_default)
+        {
+            return None;
+        }
+        // The spelling that fixes it, handed back with the declaration's own
+        // parameter names — including for the zero-arity case, where the fix is
+        // to write nothing at all rather than an empty `<>`.
+        let spelling = match declared.is_empty() {
+            true => name.to_string(),
+            false => format!(
+                "{name}<{}>",
+                declared
+                    .iter()
+                    .map(|parameter| parameter.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        Some(format!(
+            "`{name}` takes {} type argument{}, {written_count} given — write `{spelling}`",
+            declared.len(),
+            match declared.len() {
+                1 => "",
+                _ => "s",
+            },
+        ))
     }
 
     /// The declared generic-parameter constraint ids of the named type (struct,
@@ -19609,7 +19718,7 @@ impl<'src> Analyzer<'src> {
                 // trait-qualified call (`method-resolution.md` §3) and
                 // `Iterator::from_fn(..)` is B83's trait-provided static —
                 // std's own, off `impl Iterator<type T>` (`iterator.vl:137`).
-                let subject_type_id = self.walk_trait_position_type_node(subject, scope_id);
+                let subject_type_id = self.walk_path_head_type_node(subject, scope_id);
                 self.prepped_static_accessors
                     .push((id, subject_type_id, member_name));
                 None
@@ -20055,8 +20164,11 @@ impl<'src> Analyzer<'src> {
                         )
                     })
                     .collect::<Vec<_>>();
-                let generic_parameter_constraint_ids =
-                    self.register_generic_parameters(&function.generic_parameters, body_scope_id);
+                let generic_parameter_constraint_ids = self.register_generic_parameters(
+                    id,
+                    &function.generic_parameters,
+                    body_scope_id,
+                );
                 // The return type is resolved in the body scope so it can refer
                 // to the function's own generic parameters (e.g. `(): T`).
                 // An `async || T` return type peels its marker first (J2): the
@@ -20718,7 +20830,7 @@ impl<'src> Analyzer<'src> {
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 let generic_parameter_constraint_ids =
-                    self.register_generic_parameters(generic_parameters, body_scope_id);
+                    self.register_generic_parameters(id, generic_parameters, body_scope_id);
                 // A bodyless `struct Name;` is only valid when `external`; an
                 // ordinary struct must list its fields in `{ .. }` (possibly
                 // empty).
@@ -20793,7 +20905,7 @@ impl<'src> Analyzer<'src> {
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 let generic_parameter_constraint_ids =
-                    self.register_generic_parameters(generic_parameters, body_scope_id);
+                    self.register_generic_parameters(id, generic_parameters, body_scope_id);
                 // Variants live in the enum's own namespace, reachable through
                 // `use Enum::{ ... }` or `Enum::Variant` — not the outer scope.
                 let variants_scope = self.create_scope(None);
@@ -21056,7 +21168,7 @@ impl<'src> Analyzer<'src> {
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 let generic_parameter_constraint_ids =
-                    self.register_generic_parameters(generic_parameters, body_scope_id);
+                    self.register_generic_parameters(id, generic_parameters, body_scope_id);
                 let generic_parameter_names = generic_parameters
                     .as_ref()
                     .map(|parameters| {
@@ -21968,6 +22080,19 @@ impl<'src> Analyzer<'src> {
     /// mark is what the `prepped_type_locals` drain consults before refusing a
     /// trait as a value type; everything else defaults to a value position, so
     /// a type position added later is checked until it says otherwise.
+    /// `walk_type_node` for a path HEAD — the subject of a `::`
+    /// (`Option::None`, `List::from_json_value(..)`, `math::min(..)`,
+    /// `A::pick(..)`). A head selects a NAMESPACE to look a member up in: it is
+    /// not a value position, so a trait there is legitimate (B57's
+    /// trait-qualified call, B83's trait-provided static), and it is not a
+    /// written type APPLICATION either, so `Option` as a head names the enum's
+    /// namespace rather than an under-supplied `Option<T>` (B188).
+    fn walk_path_head_type_node(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
+        let type_id = self.walk_trait_position_type_node(node, scope_id);
+        self.path_head_type_ids.insert(type_id);
+        type_id
+    }
+
     fn walk_trait_position_type_node(
         &mut self,
         node: &Spanned<Node<'src>>,
@@ -22061,7 +22186,7 @@ impl<'src> Analyzer<'src> {
                 // namespace to look `member_name` up in. What the whole path
                 // resolves to is checked on its own; the head is not a value
                 // type, so a trait there is not the §12.2 mistake.
-                let subject_type_id = self.walk_trait_position_type_node(subject, scope_id);
+                let subject_type_id = self.walk_path_head_type_node(subject, scope_id);
                 self.prepped_type_static_accessors.push((
                     type_id,
                     subject_type_id,
@@ -31679,6 +31804,76 @@ impl<'src> Analyzer<'src> {
                 Some(subject_id) => {
                     let subject_type =
                         self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+                    // B188: a written application must supply the arity its
+                    // declaration DECLARES. Under-supply was the live
+                    // miscompile: the arm below only attaches arguments when
+                    // some were written, so a bare `Holder` fell through to
+                    // the declaration's own type — argument vector EMPTY, the
+                    // parameter erased rather than bound — and an empty vector
+                    // reads downstream as "nothing to check". A `Holder<str>`
+                    // then satisfied a `Holder` parameter and carried a `str`
+                    // out through a declared `i32`. Where the erased
+                    // parameter's bound was a trait, the field typed as the
+                    // abstract bound and a method call on it resolved to a
+                    // body-less requirement — the ICE twin, the same hole.
+                    //
+                    // Over-supply is the same check's other direction, and it
+                    // was never actually checked here: it only ever surfaced
+                    // downstream, as a mismatch at a USE, so an annotation
+                    // nothing used reported nothing at all. One arity check
+                    // owns both, at the annotation, where the fix goes.
+                    //
+                    // Refused HERE rather than at any use, because inference
+                    // from context is not attempted at an annotation (B161's
+                    // family: annotations are checked, never inferred) — the
+                    // missing argument has nothing to come from.
+                    //
+                    // WRITTEN is the operative word, and the two exemptions
+                    // both fall out of it. A path HEAD (`Option::None`,
+                    // `List::from_json_value(..)`) names a namespace, not a
+                    // type, so its arity is nobody's to supply. And GENERATED
+                    // code is not written by the author at all: today's derive
+                    // generators spell a subject by its bare name in every
+                    // role, so `[derive(Wire)]` on `struct Handle<T>`
+                    // (`std/src/arena.vl`) emits `impl Handle with Json` and
+                    // `Result<Handle, str>` — under-supplied applications the
+                    // erasure this fix removes is exactly what let type-check.
+                    // Refusing them would report, at a span the author cannot
+                    // edit, a defect in the GENERATOR; and making the
+                    // generators generic-aware is a ruling rather than a fix
+                    // (the reflection surface a macro sees —
+                    // `macro_std/src/meta.vl`'s `StructItem`/`EnumItem` —
+                    // carries no generic parameters at all, and a derived impl
+                    // over a parameter needs BOUNDS nothing computes:
+                    // `impl Box<type T: Json> with Json`). So the rule is total
+                    // over what a program writes, and the generator half is
+                    // filed rather than half-shipped.
+                    let written_by_the_author =
+                        source_id != DERIVED_SOURCE && !self.path_head_type_ids.contains(&type_id);
+                    let arity_error = match written_by_the_author {
+                        false => None,
+                        true => self.written_application_arity_error(
+                            subject_id,
+                            &subject_type,
+                            name,
+                            argument_type_ids.len(),
+                        ),
+                    };
+                    let refused_arity = arity_error.is_some();
+                    if let Some(message) = arity_error {
+                        // Attributed to the walk that wrote the annotation, for
+                        // the reason the unresolved arm below is (E108) — this
+                        // is the same drain, and it had the same defect.
+                        self.push_in_source(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: message,
+                            },
+                            source_id,
+                        );
+                    }
                     // Attach the written generic arguments to the nominal type
                     // (`Option<i32>` -> `Enum(option_id, [i32])`). A bare name
                     // keeps whatever the reference resolved to.
@@ -31749,7 +31944,11 @@ impl<'src> Analyzer<'src> {
                     );
                     let bare_trait_id = match &subject_type {
                         Type::Trait(trait_id, arguments)
+                            // An application already refused on its arity is
+                            // not additionally a §12.2 value-position mistake:
+                            // one report per written spelling (B188).
                             if names_the_trait
+                                && !refused_arity
                                 && !self.trait_position_type_ids.contains(&type_id) =>
                         {
                             Some((*trait_id, arguments.clone()))
@@ -31810,9 +32009,9 @@ impl<'src> Analyzer<'src> {
                     // accounting (E43).
                     self.write_type_slot(
                         type_id,
-                        match bare_trait_id {
-                            Some(_) => Type::Unknown,
-                            None => subject_type,
+                        match bare_trait_id.is_some() || refused_arity {
+                            true => Type::Unknown,
+                            false => subject_type,
                         },
                     );
                 }

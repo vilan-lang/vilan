@@ -190,8 +190,8 @@ you can store anywhere:
 
 ```vilan,fragment
 mut nodes: Arena<Node> = Arena::new();
-let a: Handle = nodes.insert(Node { … });
-let b: Handle = nodes.insert(Node { edges = [a] });
+let a: Handle<Node> = nodes.insert(Node { … });
+let b: Handle<Node> = nodes.insert(Node { edges = [a] });
 // `get` hands back a view; copy it out, add the edge, write it back.
 match nodes.get(a) {
 	Some(let node) => {

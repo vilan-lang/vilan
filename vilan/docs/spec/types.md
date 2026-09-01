@@ -476,6 +476,18 @@ against an expected type (possibly unknown), and expectations flow inward
 (a `let` annotation to its initializer, a parameter type to its argument,
 a field's declared type to its initializer value).
 
+A written **type application supplies exactly the arity its declaration
+declares**, in every position an annotation can occupy — a parameter, a
+return type, a `let` annotation, a field, a generic argument, an `impl`
+head subject, a trait bound's argument. Naming `Holder` for a
+`struct Holder<S>` is an error, not a request to infer `S`: annotations
+are checked, never inferred, so a missing argument has nothing to come
+from. A parameter with a **default** (`<B = Self>`, §5.5) supplies
+itself, so an application may omit exactly the trailing arguments whose
+parameters default. Supplying too many is the same error. The head of a
+qualified path (`Option::None`, `List::new()`) names a namespace rather
+than a type and carries no arity of its own.
+
 For a call `f(a₁ … aₙ)` where `f` has generic parameters:
 
 1. Each parameter type is unified with its argument's type; unification
@@ -825,6 +837,12 @@ Normative rejection cases (each is a compile error):
 - `Trait::func(..)` for an associated function the trait declares without
   a default body, and `Type::func(..)` for one the type's impl does not
   declare (§5.5).
+- A type application whose argument count is not the arity its
+  declaration declares — too few (`fun read(h: Holder)` for
+  `struct Holder<S>`) or too many — in any annotation position.
+  Reported at the annotation, naming the arity and the spelling that
+  fixes it (§5.6). Trailing arguments whose parameters have defaults may
+  be omitted.
 - An enum-variant pattern matched against a generic parameter of an
   enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the
