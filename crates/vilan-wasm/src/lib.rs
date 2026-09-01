@@ -27,7 +27,7 @@
 //!
 //! One thing, since K9 (`proposal/playground-completion.md` §5): the analysis
 //! the last compile produced, so that [`complete_program`] can answer a
-//! keystroke without analyzing. Every `compile_program_for` replaces it; the
+//! keystroke without analyzing. Every `compile_program_with` replaces it; the
 //! instance dying (the page's recycle) discards it; `complete_program` only
 //! reads it, leaks nothing, and answers empty when nothing is retained. The
 //! same single-threaded discipline covers it: a completion never runs
@@ -376,25 +376,118 @@ fn interned_entry(source: &str) -> &'static str {
     leaked
 }
 
+/// The ambient scope a playground compile runs under (K14, `prelude.md` §5).
+///
+/// A pasted buffer has no `vilan.toml`, so B156's weakest-scope rule has no
+/// `[package]` to hang the key on and the prelude would have nowhere to come
+/// from. The playground supplies one anyway, as a SYNTHETIC package context —
+/// the entry prelude the manifest would have declared, handed to the analyzer's
+/// existing machinery. It is emphatically not a synthesized file-head import:
+/// §9.2's mandate is that the prelude binds at the weakest layer, so a local
+/// declaration and an explicit import both still win, silently.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PlaygroundPrelude {
+    /// The mode's recommended set — [`PlaygroundPrelude::recommended_for`].
+    #[default]
+    Default,
+    /// No ambient scope at all: the toggle's OFF position. Explicit imports
+    /// required, exactly as `prelude = false` states it in a manifest — and
+    /// the position a page teaching where a name really lives wants.
+    Off,
+    /// A named prelude module, for a caller that wants to pin one rather than
+    /// take the mode's default.
+    Module(String),
+}
+
+/// The wire spelling of [`PlaygroundPrelude::Off`] — the one value the page's
+/// toggle sends that is not a module path. A module path is `root::module`
+/// (`prelude_module_scope` accepts nothing else), so a single bare segment can
+/// never collide with one.
+pub const PRELUDE_OFF: &str = "off";
+
+impl PlaygroundPrelude {
+    /// The set a mode gets when the page says nothing: the WEB set in the
+    /// browser, the BASE set on a process platform.
+    ///
+    /// The browser mode is not "a program that happens to target the browser" —
+    /// it is the playground's running mode, and what runs there is a web app.
+    /// That is the corpus §5.3 sized the web set for, and it is the one corpus
+    /// §3.3 showed the base seven never empty an import block for. The server
+    /// check mode is a process program and takes the base set, which is what
+    /// `vilan init` would give it.
+    pub fn recommended_for(platform: Platform) -> vilan_core::manifest::PreludeSpec {
+        let module = match platform {
+            Platform::Browser => vilan_core::manifest::WEB_PRELUDE,
+            _ => vilan_core::manifest::DEFAULT_PRELUDE,
+        };
+        vilan_core::manifest::PreludeSpec::Module(module.to_string())
+    }
+
+    /// The page's wire form: absent is the mode's recommended set, [`PRELUDE_OFF`]
+    /// is no prelude, anything else is a module path. Total by construction —
+    /// the binding layer below has no decision left to make, and this one is
+    /// covered by the native tests.
+    pub fn from_option(value: Option<&str>) -> PlaygroundPrelude {
+        match value {
+            None => PlaygroundPrelude::Default,
+            Some(PRELUDE_OFF) => PlaygroundPrelude::Off,
+            Some(path) => PlaygroundPrelude::Module(path.to_string()),
+        }
+    }
+
+    /// This option resolved against the mode it was asked for.
+    fn resolve(self, platform: Platform) -> vilan_core::manifest::PreludeSpec {
+        match self {
+            PlaygroundPrelude::Default => PlaygroundPrelude::recommended_for(platform),
+            PlaygroundPrelude::Off => vilan_core::manifest::PreludeSpec::Off,
+            PlaygroundPrelude::Module(path) => vilan_core::manifest::PreludeSpec::Module(path),
+        }
+    }
+}
+
 /// Compiles one Vilan source string for the browser platform — what the
-/// playground runs. See [`compile_program_for`] for the platform-explicit
-/// form behind the page's server check mode.
+/// playground runs — under the browser mode's recommended ambient scope. See
+/// [`compile_program_for`] for the platform-explicit form behind the page's
+/// server check mode, and [`compile_program_with`] for the prelude-explicit one
+/// behind its toggle.
 pub fn compile_program(source: &str) -> CompileOutput {
     compile_program_for(source, Platform::Browser)
 }
 
-/// Compiles for an explicit platform. `Platform::Browser` is the running
-/// mode; a process platform is the playground's CHECK-ONLY server mode — the
-/// diagnostics (platform coloring above all) are real, and the emitted
-/// program, while genuine, is for a process host the page does not have.
-/// Passing the platform explicitly also bypasses `infer_platform`, which
-/// probes the disk.
+/// Compiles for an explicit platform, under that mode's recommended ambient
+/// scope. `Platform::Browser` is the running mode; a process platform is the
+/// playground's CHECK-ONLY server mode — the diagnostics (platform coloring
+/// above all) are real, and the emitted program, while genuine, is for a
+/// process host the page does not have. Passing the platform explicitly also
+/// bypasses `infer_platform`, which probes the disk.
 pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
+    compile_program_with(source, platform, PlaygroundPrelude::Default)
+}
+
+/// Compiles for an explicit platform and an explicit ambient scope — the full
+/// surface, behind the page's mode toggle and its prelude toggle.
+///
+/// The prelude rides on `Workspace::entry_prelude`, which is where a manifest's
+/// `[package] prelude` lands for every other front end (`prelude.md` §6). The
+/// playground has no manifest, so this IS the synthetic package context: one
+/// field, read by the same `seed_preludes` pass that serves `vilan build`, so a
+/// pasted single-file program means what it would inside a fresh `vilan init`
+/// package. The base cache keys on it (`BaseCacheKey::entry_prelude`), so
+/// flipping the toggle or the mode never serves the other one's world.
+pub fn compile_program_with(
+    source: &str,
+    platform: Platform,
+    prelude: PlaygroundPrelude,
+) -> CompileOutput {
     boot();
 
     let entry_path = PathBuf::from(PROJECT_ROOT).join(ENTRY_NAME);
     vilan_core::analyzer::set_document_overlay(&entry_path, Some(source.to_string()));
 
+    let workspace = Workspace {
+        entry_prelude: prelude.resolve(platform),
+        ..Workspace::default()
+    };
     let leaked = interned_entry(source);
     let (program, errors) = analyze_source(
         leaked,
@@ -402,7 +495,7 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         Path::new(PROJECT_ROOT),
         &entry_path,
         Some(platform),
-        &Workspace::default(),
+        &workspace,
     );
 
     let Some(program) = program else {
@@ -773,11 +866,36 @@ mod bindings {
     /// toggle.
     #[wasm_bindgen]
     pub fn compile_for(source: String, platform: String) -> CompileResult {
-        let platform = match platform.as_str() {
+        convert(crate::compile_program_for(&source, platform_of(&platform)))
+    }
+
+    /// [`compile_for`] plus the ambient scope (K14): `prelude` is `undefined`
+    /// for the mode's recommended set (the toggle's ON position), the string
+    /// `"off"` for none (its OFF position), or a module path to pin one. The
+    /// page feature-detects this export, so a glue built before it existed
+    /// simply hides the prelude toggle and keeps compiling through
+    /// [`compile_for`] — which takes the same recommended default.
+    #[wasm_bindgen]
+    pub fn compile_with(
+        source: String,
+        platform: String,
+        prelude: Option<String>,
+    ) -> CompileResult {
+        convert(crate::compile_program_with(
+            &source,
+            platform_of(&platform),
+            crate::PlaygroundPrelude::from_option(prelude.as_deref()),
+        ))
+    }
+
+    /// The page's platform word. "node" is the server check mode; anything
+    /// else — including the word the page sends for its running mode — is the
+    /// browser.
+    fn platform_of(platform: &str) -> crate::Platform {
+        match platform {
             "node" => crate::Platform::default(), // Node, current LTS
             _ => crate::Platform::Browser,
-        };
-        convert(crate::compile_program_for(&source, platform))
+        }
     }
 
     /// Formats Vilan source; the input comes back unchanged when it cannot be

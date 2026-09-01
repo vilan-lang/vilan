@@ -913,3 +913,231 @@ fn an_auto_import_edit_is_positioned_in_the_live_text() {
         );
     }
 }
+
+// --- the ambient scope: the playground's prelude option (K14) ----------------
+
+/// A compile under an explicit ambient scope, the way the page's toggle drives
+/// it. `PlaygroundPrelude::Default` is what both `compile` and
+/// `compile_for_node` above already take, so these only ever pass the other
+/// shapes.
+fn compile_with(
+    source: &str,
+    platform: vilan_core::Platform,
+    prelude: vilan_wasm::PlaygroundPrelude,
+) -> CompileOutput {
+    let _guard = compiler();
+    on_big_stack(|| vilan_wasm::compile_program_with(source, platform, prelude))
+}
+
+fn assert_clean(output: &CompileOutput, what: &str) {
+    assert!(
+        output.diagnostics.is_empty(),
+        "{what} must compile clean, got: {:#?}",
+        output.diagnostics
+    );
+}
+
+fn assert_reports(output: &CompileOutput, needle: &str, what: &str) {
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains(needle)),
+        "{what} must report `{needle}`, got: {:#?}",
+        output.diagnostics
+    );
+}
+
+/// The charge's first pin: a hello-shaped program, pasted with no imports at
+/// all, means in the playground what it would mean inside a fresh `vilan init`
+/// package — in BOTH modes, because `print` is in both std sets.
+#[test]
+fn a_hello_shaped_program_compiles_with_a_bare_print_in_both_modes() {
+    let hello = "fun main() {\n\tprint(\"hello, vilan\");\n}\n";
+    assert_clean(&compile(hello), "the browser mode's hello");
+    assert_clean(&compile_for_node(hello), "the node mode's hello");
+}
+
+/// Browser mode takes the WEB set (`prelude.md` §5.3), because the playground's
+/// browser mode IS a web app: the ambient members and both ambient modules
+/// resolve with no import at all.
+#[test]
+fn browser_mode_seeds_the_web_set() {
+    let output = compile(
+        "fun card(label: str): View {\n\
+         \tview(\"div\").text(label)\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet count: SignalCell<i32> = Signal::new(0);\n\
+         \tlet _card = card(\"hi\");\n\
+         \tlet _display = style::Display::Flex;\n\
+         \tlet _twin = ui::view(\"span\");\n\
+         \tprint(count.get());\n\
+         }\n",
+    );
+    assert_clean(&output, "the web set's ambient names");
+}
+
+/// Node mode takes the BASE set: the web set's members are genuinely absent,
+/// and the miss is reported without pointing at a manifest the playground has
+/// not got.
+///
+/// The second half is the honesty half, and it is a pin rather than an
+/// observation. `web_prelude_steer` (`prelude.md` §11.4) answers "set
+/// `prelude = \"std::web\"` in vilan.toml", which is advice a pasted buffer
+/// cannot take — the playground's answer is its own mode toggle. It stays
+/// silent here only because the steer's std module inventory is a `read_dir`
+/// (`analyzer.rs`, `std_module_files`) and the playground has no filesystem, so
+/// an overlay-aware inventory would light up exactly that misdirection. This
+/// pin is what such a change has to meet.
+#[test]
+fn node_mode_takes_the_base_set_and_names_no_manifest() {
+    assert_clean(
+        &compile_for_node("fun main() {\n\tprint(1);\n}\n"),
+        "the base set in node mode",
+    );
+    let output = compile_for_node("fun main() {\n\tlet count = Signal::new(0);\n}\n");
+    let miss = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Signal"))
+        .expect("node mode must report the absent web-set name");
+    assert!(
+        !miss.message.contains("vilan.toml"),
+        "a pasted buffer has no manifest to edit: {}",
+        miss.message
+    );
+}
+
+/// The toggle's OFF position restores today's behavior exactly: no ambient
+/// scope, explicit imports required, and the removed-alias steer still naming
+/// the real path (`prelude.md` §10.2).
+#[test]
+fn the_prelude_off_position_requires_the_explicit_import() {
+    let off = vilan_wasm::PlaygroundPrelude::Off;
+    assert_reports(
+        &compile_with(
+            "fun main() {\n\tprint(1);\n}\n",
+            vilan_core::Platform::Browser,
+            off.clone(),
+        ),
+        "cannot find 'print'",
+        "with the prelude off, `print` is an import away",
+    );
+    assert_clean(
+        &compile_with(
+            "import std::io::print;\n\nfun main() {\n\tprint(1);\n}\n",
+            vilan_core::Platform::Browser,
+            off.clone(),
+        ),
+        "the explicit spelling with the prelude off",
+    );
+    assert_reports(
+        &compile_with(
+            "import std::print;\n\nfun main() {\n\tprint(1);\n}\n",
+            vilan_core::Platform::Browser,
+            off,
+        ),
+        "its module path is `std::io::print`",
+        "the removed-alias steer",
+    );
+}
+
+/// The shadowing pin's twin, on the playground's side: an explicit import beats
+/// the ambient binding, and the cost the paper records (§4.1) is paid here too.
+/// A name has ONE binding, so within one file you take the ambient MODULE
+/// `style` or the imported FUNCTION `style`, never both.
+#[test]
+fn an_explicit_import_beats_the_ambient_name() {
+    // No import: `style` is the ambient MODULE, and the function it contains is
+    // not ambient — only the module's own name is (§5.2).
+    let ambient = compile("fun main() {\n\tlet _display = style::Display::Flex;\n}\n");
+    assert_clean(&ambient, "the ambient module `style`");
+    assert_reports(
+        &compile("fun main() {\n\tlet _builder = style();\n}\n"),
+        "`style` is a module, not a value",
+        "the ambient module publishes its own name, not its members",
+    );
+
+    // Imported: the FUNCTION wins the name, silently…
+    assert_clean(
+        &compile("import std::style::style;\n\nfun main() {\n\tlet _builder = style();\n}\n"),
+        "the imported function `style`",
+    );
+    // …and the qualified spelling that ambient module bought is gone with it.
+    assert_reports(
+        &compile(
+            "import std::style::style;\n\nfun main() {\n\tlet _display = style::Display::Flex;\n}\n",
+        ),
+        "is not a module",
+        "an imported member costs the file its ambient module",
+    );
+}
+
+/// A local declaration is stronger still (`prelude.md` §9.1): the file's own
+/// `enum Signal` wins over the web set's ambient one, silently — the exact
+/// collision §4.1's census found in the estate, met here in a pasted buffer.
+#[test]
+fn a_local_declaration_shadows_an_ambient_prelude_name() {
+    let output = compile(
+        "enum Signal {\n\
+         \tQuit,\n\
+         \tFinished,\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet state = Signal::Quit;\n\
+         \tmatch state {\n\
+         \t\tSignal::Quit => print(\"quit\"),\n\
+         \t\tSignal::Finished => print(\"done\"),\n\
+         \t}\n\
+         }\n",
+    );
+    assert_clean(&output, "a local `enum Signal` under the web set");
+}
+
+/// The page's wire, mapped: absent is the mode's recommended set, the `"off"`
+/// word is no prelude, and anything else is a module path — which is how the
+/// browser mode can be asked for the BASE set even though the web one is what
+/// it recommends. The whole decision lives here rather than in the
+/// `wasm_bindgen` layer, which the native tests cannot reach.
+#[test]
+fn the_prelude_wire_maps_absent_off_and_a_module_path() {
+    use vilan_wasm::PlaygroundPrelude;
+    assert_eq!(
+        PlaygroundPrelude::from_option(None),
+        PlaygroundPrelude::Default,
+        "the page saying nothing takes the mode's set"
+    );
+    assert_eq!(
+        PlaygroundPrelude::from_option(Some(vilan_wasm::PRELUDE_OFF)),
+        PlaygroundPrelude::Off
+    );
+    assert_eq!(
+        PlaygroundPrelude::from_option(Some("std::prelude")),
+        PlaygroundPrelude::Module("std::prelude".to_string())
+    );
+    assert_eq!(
+        PlaygroundPrelude::recommended_for(vilan_core::Platform::Browser),
+        vilan_core::manifest::PreludeSpec::Module("std::web".to_string()),
+        "the playground's browser mode IS a web app"
+    );
+    assert_eq!(
+        PlaygroundPrelude::recommended_for(vilan_core::Platform::default()),
+        vilan_core::manifest::PreludeSpec::Module("std::prelude".to_string()),
+        "the server check mode is a process program"
+    );
+
+    // And the pinned path is really the one that binds: the base set in the
+    // browser leaves the web set's names exactly as absent as node mode does.
+    assert_reports(
+        &compile_with(
+            "fun main() {\n\tlet count = Signal::new(0);\n}\n",
+            vilan_core::Platform::Browser,
+            PlaygroundPrelude::Module("std::prelude".to_string()),
+        ),
+        "Signal",
+        "a pinned base prelude in the browser",
+    );
+}
