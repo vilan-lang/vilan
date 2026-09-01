@@ -24,8 +24,12 @@ quoted here.
 The name isn't visible here. Usually a missing `import` — though the
 basics (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) are in the
 prelude and need none. If you did import it, check for a typo or a
-shadowing local.
-→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md)
+shadowing local. One case that reads as a compiler mistake and isn't: an
+`is` capture is in scope only where its test is known to have **passed** —
+the then-branch and the rest of the condition after an `&&` — so naming
+it in the `else`, after the `if`, or in the other arm of a `||` is this
+error. Move the read inside the branch, or use `match`.
+→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md), [spec §5.7](../spec/types.md)
 
 **"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
 The name (`Signal`, `view`, `View`) is one std's **web**

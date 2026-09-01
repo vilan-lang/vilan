@@ -679,8 +679,23 @@ fun sum<T: Add>(first: T, second: T): T { first + second }     // the parameter 
 ```
 
 `is` (§3.7 level 10) tests a value against a match pattern and yields
-`bool`; bindings inside an `is` pattern are scoped to nothing (use
-`match` to bind).
+`bool`, and a `let` binding inside the pattern **captures**. Its scope is
+everywhere the test is known to have passed, and nowhere else: the
+**then-branch**, and the rest of the condition **to the right of an
+`&&`**. Not the `else` branch, where the test failed; not after the `if`,
+where nothing is known; and not the other arm of a `||`, which runs
+exactly when the test failed — nor, for a capture under a `||`, the
+then-branch, since reaching it proves only that *some* arm was true.
+Outside its scope the name is simply unbound, and reading it is the
+ordinary "cannot find" error.
+
+```vilan,fragment
+if slot is Some(let n) { use(n); }                // yes: the test passed
+if slot is Some(let n) && n > 0 { use(n); }       // yes: `&&` short-circuits
+if slot is Some(let n) { … } else { use(n); }     // error: unbound here
+if slot is Some(let n) || n > 0 { … }             // error: unbound here
+if slot is Some(let n) { … } use(n);              // error: the `if` ended
+```
 
 A pattern is checked against the type of the value it matches, so an
 enum-variant pattern requires that type to be that enum. A **generic

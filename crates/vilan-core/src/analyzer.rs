@@ -2221,6 +2221,48 @@ impl CallSubjectConstraint {
     }
 }
 
+/// One positional declaration of a value name inside a scope: the entity, and
+/// the byte range of the file over which the name resolves to it.
+///
+/// The START is `proposal/local-shadowing.md` §2 — the end of the declaring
+/// construct, so an initializer never reads the binding it declares. The END is
+/// B171: almost every binding runs to the end of its scope
+/// ([`LocalDeclaration::FOREVER`]), and the one exception is a pattern capture
+/// bound inside an operand of `||`, whose test is not known to have passed
+/// anywhere outside that operand.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalDeclaration {
+    /// Where the name starts resolving to this entity.
+    pub visible_from: usize,
+    /// Where it stops — EXCLUSIVE, so a use at exactly this offset already
+    /// misses. [`LocalDeclaration::FOREVER`] for everything but a `||`-arm
+    /// capture.
+    pub visible_until: usize,
+    pub id: Id,
+}
+
+impl LocalDeclaration {
+    /// "To the end of the scope" — what every binding but a `||`-arm capture
+    /// gets, and what the rule was for all of them before B171.
+    pub const FOREVER: usize = usize::MAX;
+
+    /// Whether a use at `offset` resolves to this declaration.
+    fn covers(&self, offset: usize) -> bool {
+        self.visible_from <= offset && offset < self.visible_until
+    }
+}
+
+/// The tighter of an enclosing `||` operand's end and this one's (B171). `||`
+/// operands nest, so the inner one is normally the smaller — but taking the
+/// minimum rather than assuming it keeps a recovered tree with a widened span
+/// from ever WIDENING a capture's visibility.
+fn min_operand_end(outer: Option<usize>, inner: usize) -> usize {
+    match outer {
+        Some(outer) => outer.min(inner),
+        None => inner,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Scope<'src> {
     pub id: Id,
@@ -2231,15 +2273,15 @@ pub struct Scope<'src> {
     /// so markers live here regardless of item collisions. Feeds editor
     /// navigation and macro-name imports; expansion scoping stays syntactic.
     pub macro_name_to_id: IndexMap<&'src str, Id>,
-    /// Value bindings in declaration order, each visible from the byte offset
-    /// where its declaring construct ends (proposal/local-shadowing.md §2): a
-    /// later same-name binding shadows the earlier one from its own visibility
-    /// point onward, and an initializer never sees the binding it declares.
+    /// Value bindings in declaration order, each visible over a byte RANGE of
+    /// the scope's text (proposal/local-shadowing.md §2, B171): a later
+    /// same-name binding shadows the earlier one from its own visibility point
+    /// onward, and an initializer never sees the binding it declares.
     /// Populated only in non-module scopes — module-level bindings stay
     /// order-independent (B33). `name_to_id_map` still records the last
     /// declaration, so map consumers (completions, emission order, the
     /// parent-scope memo) are untouched.
-    pub local_value_declarations: IndexMap<&'src str, Vec<(usize, Id)>>,
+    pub local_value_declarations: IndexMap<&'src str, Vec<LocalDeclaration>>,
     /// Item declarations in walk order, EVERY one of them — where
     /// `name_to_id_map` keeps only the last of a repeated name (B84). The map
     /// is a lookup index and cannot hold two entries for one name, so reading
@@ -2470,6 +2512,12 @@ pub struct Analyzer<'src> {
     // The file currently being walked, so type references (which aren't entities)
     // can be tagged with their source for the language server.
     current_source_id: SourceId,
+    /// B171: while walking an OPERAND of `||`, that operand's end offset — the
+    /// point past which a pattern capture bound inside it is no longer visible,
+    /// because `||` short-circuits and the other arm proves nothing about this
+    /// arm's test. `None` outside a `||`. Set to the INNERMOST operand's end
+    /// (operand spans nest), and restored on the way out.
+    or_operand_end: Option<usize>,
     // Diagnostic source attribution (backlog E1): `(index, source)` marks — a
     // diagnostic at index `i` belongs to the source of the last mark with
     // `index <= i` (default: the entry, `SourceId(0)`). Marks are dropped at
@@ -3491,6 +3539,7 @@ impl<'src> Analyzer<'src> {
             member_name_spans: HashMap::default(),
             struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
+            or_operand_end: None,
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: HashSet::default(),
@@ -13893,6 +13942,20 @@ impl<'src> Analyzer<'src> {
     /// (proposal/local-shadowing.md §2). Module-level bindings stay
     /// order-independent (B33), so module scopes record no positional entry.
     fn declare_scope_value(&mut self, scope_id: Id, name: &'src str, id: Id, visible_from: usize) {
+        self.declare_scope_value_until(scope_id, name, id, visible_from, LocalDeclaration::FOREVER);
+    }
+
+    /// [`Analyzer::declare_scope_value`] with an explicit end to the name's
+    /// visibility (B171). Only a pattern capture inside a `||` operand passes
+    /// anything but [`LocalDeclaration::FOREVER`].
+    fn declare_scope_value_until(
+        &mut self,
+        scope_id: Id,
+        name: &'src str,
+        id: Id,
+        visible_from: usize,
+        visible_until: usize,
+    ) {
         let positional = !self.module_scope_ids.contains(&scope_id);
         let scope = self.mut_scope_for_scope_id(scope_id);
         scope.name_to_id_map.insert(name, id);
@@ -13901,7 +13964,11 @@ impl<'src> Analyzer<'src> {
                 .local_value_declarations
                 .entry(name)
                 .or_default()
-                .push((visible_from, id));
+                .push(LocalDeclaration {
+                    visible_from,
+                    visible_until,
+                    id,
+                });
         }
     }
 
@@ -18847,15 +18914,13 @@ impl<'src> Analyzer<'src> {
         let scope = self.scopes.get(&scope_id)?;
         let parent_id = scope.parent_id;
         if let Some(entries) = scope.local_value_declarations.get(name) {
-            if let Some((_, id)) = entries
-                .iter()
-                .rev()
-                .find(|(visible_from, _)| *visible_from <= use_offset)
-            {
-                return Some(*id);
+            if let Some(declaration) = entries.iter().rev().find(|entry| entry.covers(use_offset)) {
+                return Some(declaration.id);
             }
-            // Declared here, but only later: resolve outward without caching —
-            // this scope's map slot belongs to its own (later) declaration.
+            // Declared here, but not covering this use — only later, or (B171)
+            // only inside a `||` operand this use is outside of. Resolve
+            // outward without caching: this scope's map slot belongs to its own
+            // declaration.
             return parent_id.and_then(|parent_scope_id| {
                 self.resolve_value_name_at(name, parent_scope_id, use_offset)
             });
@@ -18874,21 +18939,20 @@ impl<'src> Analyzer<'src> {
     /// The nearest declaration of `name` that a use at `use_offset` cannot see
     /// *yet* — a positional entry later in the use's scope chain. Feeds the
     /// declared-later note on the `cannot find` diagnostic.
+    ///
+    /// Strictly LATER, never merely out of range: a B171 capture whose `||`
+    /// operand this use sits after is not a use-before-declaration, and telling
+    /// its author "declared here, later in the scope" would be false.
     fn later_local_declaration(&self, name: &str, scope_id: Id, use_offset: usize) -> Option<Id> {
         let mut current = Some(scope_id);
         while let Some(id) = current {
             let scope = self.scopes.get(&id)?;
-            if let Some((_, later_id)) =
-                scope
-                    .local_value_declarations
-                    .get(name)
-                    .and_then(|entries| {
-                        entries
-                            .iter()
-                            .find(|(visible_from, _)| *visible_from > use_offset)
-                    })
+            if let Some(later) = scope
+                .local_value_declarations
+                .get(name)
+                .and_then(|entries| entries.iter().find(|entry| entry.visible_from > use_offset))
             {
-                return Some(*later_id);
+                return Some(later.id);
             }
             current = scope.parent_id;
         }
@@ -20490,8 +20554,25 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::TryAssert(receiver_id))
             }
             Node::Binary(op, lhs, rhs) => {
-                let lhs_id = self.walk_expr_node(lhs, scope_id);
-                let rhs_id = self.walk_expr_node(rhs, scope_id);
+                // B171: `||` short-circuits, so a pattern capture bound in one
+                // operand is bound only where THAT operand's test ran and
+                // passed. Cap each operand's captures at its own end — which
+                // takes in the other arm and everything after the condition,
+                // the then-branch included, since reaching either of those
+                // proves nothing about this arm.
+                let (lhs_id, rhs_id) = if matches!(op, BinaryOp::Or) {
+                    let outer = self.or_operand_end;
+                    self.or_operand_end = Some(min_operand_end(outer, lhs.1.end));
+                    let lhs_id = self.walk_expr_node(lhs, scope_id);
+                    self.or_operand_end = Some(min_operand_end(outer, rhs.1.end));
+                    let rhs_id = self.walk_expr_node(rhs, scope_id);
+                    self.or_operand_end = outer;
+                    (lhs_id, rhs_id)
+                } else {
+                    let lhs_id = self.walk_expr_node(lhs, scope_id);
+                    let rhs_id = self.walk_expr_node(rhs, scope_id);
+                    (lhs_id, rhs_id)
+                };
                 // Overloadable operators dispatch; orderings and `&&`/`||`
                 // aren't overloadable but their operands are checked (B24).
                 if is_overloadable_operator(*op)
@@ -21551,7 +21632,19 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(capture_id).or_insert(0);
                 // `_` eats the value: it matches but is never referenceable.
                 if name != "_" {
-                    self.declare_scope_value(scope_id, name, capture_id, visible_from);
+                    // B171: inside a `||` operand the capture dies with the
+                    // operand. Everywhere else it runs to the end of its scope,
+                    // which for an `is` capture is the `if`'s own scope — the
+                    // condition and the then-branch, never the `else` (its own
+                    // sibling scope) and never after the `if`.
+                    let visible_until = self.or_operand_end.unwrap_or(LocalDeclaration::FOREVER);
+                    self.declare_scope_value_until(
+                        scope_id,
+                        name,
+                        capture_id,
+                        visible_from,
+                        visible_until,
+                    );
                 }
                 WalkPattern::Binding(capture_id)
             }
