@@ -519,6 +519,25 @@ pub struct Document {
     /// can enumerate modules the `Program` never loaded. `None` on the degraded
     /// internal-error document, which resolved nothing.
     import_roots: Option<ImportRoots>,
+    /// The server's world revision this analysis READ (E117), stamped by the
+    /// caller through [`Document::stamp_analysis`] — every buffer change bumps
+    /// it, so a larger number is a strictly later view of every open file.
+    ///
+    /// `text_hash` answers "is this analysis of my own current text", which is
+    /// enough for the file being typed in and vacuous for every other one: a
+    /// DEPENDENT's buffer does not move when the module it imports does, so two
+    /// of its analyses — one that read the module mid-edit, one that read it
+    /// restored — are text-identical and both would land, in either order. This
+    /// is what separates them. Zero on a document nobody stamped (every test
+    /// fixture, and the degraded internal-error document), which keeps the
+    /// comparison a no-op there.
+    analysis_revision: u64,
+    /// The `pkg::` source root this analysis resolved under, canonicalized —
+    /// `None` when the file belongs to no project at all. E116's identity: two
+    /// open documents sharing a root are colored by ONE import graph, so an
+    /// edit that changes which entry reaches a file has to invalidate every one
+    /// of them, not only the ones that import the edited file.
+    package_root: Option<PathBuf>,
 }
 
 /// The analyzed `Program` together with the allocations it borrows for
@@ -726,12 +745,14 @@ pub struct PublishedHop {
 }
 
 /// The markup spans of a raw parse (element-syntax S5): tag names (open and
-/// close), attribute and event names, and the desugar-scaffolding spans whose
-/// analyzed tokens the markup replaces.
+/// close), the angle brackets around them, attribute and event names, and the
+/// desugar-scaffolding spans whose analyzed tokens the markup replaces.
 #[derive(Default)]
 struct MarkupSpans {
     scaffolding: Vec<Span>,
     tags: Vec<Span>,
+    /// The elements' angle brackets — `<`, `>`, `</`, `/>` (E115).
+    punctuation: Vec<Span>,
     attributes: Vec<Span>,
 }
 
@@ -743,6 +764,7 @@ fn collect_markup_spans(
     if let Node::Element(body) = &node.0 {
         out.scaffolding.push((node.1.start..body.tag.end).into());
         out.tags.push(body.tag);
+        out.punctuation.extend(body.punctuation.iter().copied());
         if let Some(close) = body.close_tag {
             out.tags.push(close);
         }
@@ -892,6 +914,8 @@ impl Document {
             manifest_problem: None,
             shared_diagnostics: Vec::new(),
             import_roots: None,
+            analysis_revision: 0,
+            package_root: None,
         }
     }
 
@@ -914,6 +938,14 @@ impl Document {
         // rooting `pkg::` at the file's own directory.
         let context = resolve_project_context(entry_path);
         let manifest_problem = context.manifest_problem;
+        // E116: the DECLARED root, canonicalized, kept as the file's package
+        // identity. Deliberately not the fallback below — a file with no
+        // project has no package to be colored by, and rooting it at its own
+        // directory would make unrelated neighbours look like siblings.
+        let package_root = context
+            .pkg_root
+            .as_deref()
+            .map(vilan_core::util::canonical_path);
         let pkg_root = context
             .pkg_root
             .unwrap_or_else(|| pkg_root_fallback(entry_path));
@@ -1044,6 +1076,8 @@ impl Document {
             manifest_problem,
             shared_diagnostics,
             import_roots: Some(import_roots),
+            analysis_revision: 0,
+            package_root,
         }
     }
 
@@ -1410,6 +1444,58 @@ impl Document {
         self.analyzed_index.offset(position)
     }
 
+    /// Record the world revision this analysis read (E117). Called on a fresh
+    /// [`Document::analyze`] result before it is landed; the value travels with
+    /// the analysis through [`Document::adopt_analysis`].
+    pub fn stamp_analysis(&mut self, revision: u64) {
+        self.analysis_revision = revision;
+    }
+
+    /// The world revision the current analysis read — the ordering key that
+    /// says which of two results is the later view (see the field).
+    pub fn analysis_revision(&self) -> u64 {
+        self.analysis_revision
+    }
+
+    /// The canonical `pkg::` source root this analysis resolved under — the
+    /// package whose import graph colors this file (E116). `None` for a file
+    /// that belongs to no project: it shares a package with nobody, so it is
+    /// never swept as a peer and never sweeps one.
+    pub fn package_root(&self) -> Option<&Path> {
+        self.package_root.as_deref()
+    }
+
+    /// A fingerprint of the package modules this analysis reached: every
+    /// `canonical_sources` entry under the package root, order-independent.
+    ///
+    /// E116: a file's platform color is decided by which ENTRY reaches it
+    /// (`platform_color::file_platforms` walks the `pkg::` graph), so an
+    /// `import pkg::a` written anywhere in the package can re-color a file that
+    /// imports nothing and is imported by nobody the editor knows about. That
+    /// edit is invisible to the dependency-edge gate — the unreached file does
+    /// not depend on the entry, the entry depends on IT — which is why the
+    /// color stuck until a restart. A change in this fingerprint is the signal
+    /// that the graph moved, and the package's other open documents are swept.
+    /// Std and dependency sources are excluded: they cannot change which of
+    /// this package's entries reaches this package's files.
+    pub fn package_graph_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let (Some(program), Some(root)) = (self.program.as_ref(), self.package_root.as_ref())
+        else {
+            return 0;
+        };
+        let mut reached: Vec<&Path> = program
+            .canonical_sources
+            .iter()
+            .filter(|source| source.starts_with(root))
+            .map(PathBuf::as_path)
+            .collect();
+        reached.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        reached.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Whether the live buffer has advanced past the analyzed text — i.e. an
     /// analysis is pending and program answers describe an older text.
     ///
@@ -1476,6 +1562,8 @@ impl Document {
             manifest_problem,
             shared_diagnostics,
             import_roots,
+            analysis_revision,
+            package_root,
         } = analysis;
         // The analysis side, in full. `program` is the pair of the new
         // program and the allocations it borrows; assigning it drops the
@@ -1495,6 +1583,8 @@ impl Document {
         self.manifest_problem = manifest_problem;
         self.shared_diagnostics = shared_diagnostics;
         self.import_roots = import_roots;
+        self.analysis_revision = analysis_revision;
+        self.package_root = package_root;
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
@@ -2088,6 +2178,18 @@ impl Document {
             for span in markup.tags {
                 tokens.push((span, TokenKind::Tag, 0));
             }
+            // E115: the angle brackets paint as the tag they belong to. Until
+            // now the analyzed stream said nothing about them and the TextMate
+            // grammar was the only thing coloring them — which is fine for a
+            // one-line head and wrong the moment attributes spread out, because
+            // a grammar rule is matched one line at a time and a `>` that lands
+            // on a line of its own has no `<tag` in front of it to be part of.
+            // It fell through to the operator list and read as a comparison.
+            // The parse knows exactly where these are whatever shape the head
+            // was written in, so the two sources agree by construction.
+            for span in markup.punctuation {
+                tokens.push((span, TokenKind::Tag, 0));
+            }
             for span in markup.attributes {
                 tokens.push((span, TokenKind::Property, 0));
             }
@@ -2573,6 +2675,45 @@ impl Document {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The top-level import leaves nothing in this file uses (E114) — the spans
+    /// the editor FADES, in the analyzed text's coordinates.
+    ///
+    /// Paint, not a warning: an unused import is a tidiness observation, so it
+    /// publishes at hint severity with `DiagnosticTag::Unnecessary` and never
+    /// enters a count or gates anything (see `publish::diagnostic_groups`).
+    ///
+    /// It is the ORGANIZER's answer, not a second one: the same leaf walk
+    /// (`formatter::import_leaf_name_spans`) and the same usage test
+    /// ([`Document::import_leaf_is_used`], which counts type positions, value
+    /// positions and struct constructors, and counts references from code
+    /// generated out of this file so a derive-only import survives). Whatever
+    /// Organize Imports would prune is what fades, which is the only honest
+    /// relationship between a mark and the fix offered for it.
+    ///
+    /// Conservative in exactly the organizer's two ways, because a mark that
+    /// lies is worse than no mark: nothing fades while the buffer is ahead of
+    /// the analysis, and nothing fades in a file that carries a diagnostic — a
+    /// half-typed name might be about to use the very import in question.
+    /// Re-exports are not leaves here at all.
+    pub fn unused_import_spans(&self) -> Vec<Span> {
+        let Some(program) = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())
+        else {
+            return Vec::new();
+        };
+        // The ANALYZED text, so the spans this returns are in the coordinates
+        // the publisher converts through — and equal to the live text anyway,
+        // since a stale document decides nothing above.
+        let source = self.analyzed_text();
+        let import_spans = vilan_core::formatter::import_statement_spans(source);
+        vilan_core::formatter::import_leaf_name_spans(source)
+            .into_iter()
+            .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans))
+            .collect()
     }
 
     /// Whether the top-level import whose terminal name occupies `leaf_span` is
@@ -5887,6 +6028,13 @@ pub(crate) mod tests {
         );
         // The `<div` scaffolding Function token is suppressed.
         assert_eq!(kind_of("<div", 0), None, "{tokens:?}");
+        // E115: the angle brackets themselves paint too, as the tag they
+        // belong to — the open `<`, the head's `>`, a `/>`, and the close
+        // tag's `</` and `>`.
+        assert_eq!(kind_of("<", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of(">", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("/>", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("</", 0), Some(TokenKind::Tag), "{tokens:?}");
         // The invariant the sweep guarantees, re-checked over markup.
         let mut last_end = 0usize;
         for (span, _, _) in &tokens {
@@ -5897,6 +6045,45 @@ pub(crate) mod tests {
             );
             last_end = range.end;
         }
+    }
+
+    // E115: the owner's report — a head whose attributes span lines, with the
+    // closing `>` on a line of its own, loses that bracket's highlight. The
+    // rule this pins is that the SHAPE of the head cannot change the tokens:
+    // the same head written one-line and multi-line paints the same things, in
+    // the same order, with the same kinds. That is a property only a
+    // parse-driven source can have — a TextMate rule is matched one line at a
+    // time, so the `>` is out of its reach the moment it leaves the tag's line.
+    #[test]
+    fn a_multi_line_element_head_paints_what_a_one_line_head_paints() {
+        let prelude = "import std::ui::{ view, View };\n\nfun page(): View {\n";
+        let one_line =
+            format!("{prelude}\t<div aria-label(\"x\") on:click(handle)>\"hi\"</div>\n}}\n");
+        let multi_line = format!(
+            "{prelude}\t<div\n\t\taria-label(\"x\")\n\t\ton:click(handle)\n\t>\"hi\"</div>\n}}\n"
+        );
+        // Each token as (the source text it covers, its kind) — the shape a
+        // reader sees painted, independent of where the bytes landed.
+        let painted = |text: &str| -> Vec<(String, TokenKind)> {
+            let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+            document
+                .semantic_tokens()
+                .into_iter()
+                .map(|(span, kind, _)| (text[span.into_range()].to_string(), kind))
+                .collect()
+        };
+        let flat = painted(&one_line);
+        assert_eq!(
+            flat,
+            painted(&multi_line),
+            "the head's shape must not change what is painted",
+        );
+        // …and the terminator is in there, painted as its tag rather than left
+        // to fall through to the operator list as a comparison.
+        assert!(
+            flat.contains(&(">".to_string(), TokenKind::Tag)),
+            "the head's closing `>` is painted: {flat:?}",
+        );
     }
 
     #[test]
@@ -9232,6 +9419,89 @@ pub(crate) mod tests {
             result,
             "import pkg::helper::alpha;\nimport pkg::helper::beta;\nfun main() {\n\talpha();\n\tbeta();\n}\n",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E114: the same answer, as PAINT ──────────────────────────────────────
+    //
+    // "Graying out dead code generally looks better to me" — the owner. The
+    // spans the editor fades are the organizer's own verdict rather than a
+    // second opinion, so what is faded is exactly what Organize Imports would
+    // remove. These pin that identity, and the conservatism that comes with it.
+
+    /// The name of the leaf each unused span covers, so a pin reads as the
+    /// import the user would see faded.
+    fn faded(document: &Document) -> Vec<String> {
+        let text = document.analyzed_text().to_string();
+        document
+            .unused_import_spans()
+            .into_iter()
+            .map(|span| text[span.into_range()].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn an_unused_import_leaf_is_faded_and_a_used_one_is_not() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::{ alpha, beta };\nfun main() {\n\talpha();\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert_eq!(faded(&document), vec!["beta".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_re_export_is_never_faded() {
+        // `export import` binds a name for somebody ELSE. This file not using
+        // it is the point of writing it, so fading it would be a lie — and the
+        // organizer never prunes one either, which is the same rule.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "export import pkg::helper::beta;\nfun main() {}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_type_only_import_is_not_faded() {
+        // The honesty case the organizer already had to get right: a name used
+        // only in a TYPE position has no value reference at all, and a fade
+        // driven by value uses alone would gray a live import.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::Widget;\nfun main() {\n\tlet w: Widget = Widget {};\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_faded_while_the_file_carries_a_diagnostic() {
+        // A half-typed name might be about to use the very import in question,
+        // so a broken file fades nothing. A mark that lies is worse than no
+        // mark, and this is the same gate the organizer's pruning takes.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::beta;\nfun main() {\n\tmissing_name();\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the fixture must actually be broken",
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

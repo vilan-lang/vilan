@@ -27,7 +27,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, Range, Url,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location, Range,
+    Url,
 };
 
 use crate::document::{Document, PublishedDiagnostic};
@@ -53,6 +54,13 @@ pub struct PublishState {
     /// bounded by the files that have carried a diagnostic this session, and an
     /// entry is only ever read for a key that is publishing again.
     minted_addresses: BTreeMap<Url, Url>,
+    /// Key → the world revision (`Document::analysis_revision`) of the newest
+    /// analysis of that owner this planner has already published. E117: two
+    /// analyses of one owner can be in flight and finish in either order, and
+    /// the loser must not repaint the editor with what it saw — a plan older
+    /// than the last accepted one is dropped rather than merged. Dropped with
+    /// the owner on close, so a reopened file starts from zero again.
+    published_revisions: BTreeMap<Url, u64>,
     /// Whether to apply the Windows drive-letter rule when keying. `cfg!(windows)`
     /// in production; a test can plan for the other platform (see `uri`).
     windows: bool,
@@ -68,6 +76,7 @@ impl PublishState {
             owned: BTreeMap::new(),
             open_spellings: BTreeMap::new(),
             minted_addresses: BTreeMap::new(),
+            published_revisions: BTreeMap::new(),
             windows,
         }
     }
@@ -77,12 +86,30 @@ impl PublishState {
     /// change touches — including targets the owner dropped since last
     /// time, which get the remaining owners' merged view (possibly empty),
     /// so nothing goes stale.
+    ///
+    /// A SUPERSEDED analysis plans nothing (E117, the ghost diagnostic): the
+    /// document carries the world revision its analysis read, and a plan older
+    /// than the last one accepted for this owner is dropped whole — neither
+    /// recorded nor sent. Publishing it would repaint the editor with a view
+    /// the world has already moved past, which is exactly the error that
+    /// flashes back after a comment/uncomment round trip. Equal revisions still
+    /// publish: two analyses of one world say the same thing, and a re-publish
+    /// of the same content is what a dependent's sweep legitimately does.
     pub fn plan_publish(
         &mut self,
         owner: &Url,
         document: &Document,
     ) -> Vec<(Url, Vec<Diagnostic>)> {
         let owner_key = self.key(owner);
+        let revision = document.analysis_revision();
+        if self
+            .published_revisions
+            .get(&owner_key)
+            .is_some_and(|published| revision < *published)
+        {
+            return Vec::new();
+        }
+        self.published_revisions.insert(owner_key.clone(), revision);
         // Clear before rebuild, deliberately (backlog E97). This planner is
         // reached under a poison-RECOVERING lock, and it is the one place here
         // that a caught panic could leave behind something worse than an absent
@@ -129,6 +156,7 @@ impl PublishState {
     /// owners' merged view, empty where it was the only contributor.
     pub fn plan_close(&mut self, owner: &Url) -> Vec<(Url, Vec<Diagnostic>)> {
         let owner_key = self.key(owner);
+        self.published_revisions.remove(&owner_key);
         let Some(previous) = self.owned.remove(&owner_key) else {
             self.open_spellings.remove(&owner_key);
             return Vec::new();
@@ -471,6 +499,24 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
             }
         }
     }
+    // E114, the gray-out: an import nothing uses is FADED rather than
+    // squiggled. `DiagnosticTag::Unnecessary` at HINT severity is the
+    // protocol's own door for this — VS Code dims the range and leaves the
+    // Problems count, the error badge and every gate alone, which is the
+    // owner's posture exactly: paint, not a warning. Appended here rather than
+    // folded into `published_diagnostics` for the same reason: this is the one
+    // place where what goes ON THE WIRE is assembled, so nothing that counts
+    // diagnostics can accidentally count these.
+    for span in document.unused_import_spans() {
+        entry_group.push(Diagnostic {
+            range: document.analyzed_range(&span),
+            severity: Some(DiagnosticSeverity::HINT),
+            source: Some("vilan".to_string()),
+            message: "unused import".to_string(),
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
+    }
     let mut groups = vec![(owner.clone(), entry_group)];
     groups.extend(extra_groups);
     groups
@@ -607,6 +653,106 @@ mod tests {
                 .iter()
                 .any(|(target, group)| *target == uri && !group.is_empty()),
             "the next request plans its diagnostics through the recovered guard: {actions:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E117, the publish half of the ghost diagnostic. Two analyses of one
+    /// owner can be in flight — the comment/uncomment round trip is the owner's
+    /// own exhibit — and they finish in either order. The planner must not let
+    /// the loser repaint the editor: a plan whose analysis read an OLDER world
+    /// than the last one accepted for this owner is dropped whole, so the error
+    /// from the state the user already undid can never be the last thing
+    /// published.
+    #[test]
+    fn a_superseded_analysis_publishes_nothing_over_the_newer_one() {
+        let directory = std::env::temp_dir().join(format!("vilan_ghost_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("entry.vl");
+        let uri = Url::from_file_path(&path).expect("a file URL");
+        // The commented-out state, which does not type-check…
+        let mut commented = Document::analyze(
+            "fun main() {\n\tlet wrong: i32 = \"text\";\n}\n",
+            &std_root(),
+            &path,
+        );
+        commented.stamp_analysis(3);
+        // …and the restored one, which does.
+        let mut restored = Document::analyze(
+            "fun main() {\n\tlet right: i32 = 1;\n}\n",
+            &std_root(),
+            &path,
+        );
+        restored.stamp_analysis(5);
+        assert!(
+            !commented.diagnostics.is_empty(),
+            "the fixture's superseded state must actually have an error to leave behind",
+        );
+
+        let mut state = PublishState::new();
+        let mut editor: BTreeMap<Url, Vec<Diagnostic>> = BTreeMap::new();
+        // The restored analysis finishes first…
+        apply(&mut editor, state.plan_publish(&uri, &restored));
+        assert!(visible(&editor).is_empty(), "the restored state is clean");
+        // …and the superseded one lands afterwards.
+        let late = state.plan_publish(&uri, &commented);
+        assert!(
+            late.is_empty(),
+            "a superseded analysis plans nothing at all: {late:#?}",
+        );
+        apply(&mut editor, late);
+        assert!(
+            visible(&editor).is_empty(),
+            "the ghost must not be the last thing published: {editor:#?}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E114 at the wire: an unused import is published as PAINT. The protocol's
+    /// door is `DiagnosticTag::Unnecessary` on a HINT-severity diagnostic — VS
+    /// Code dims the range and leaves the Problems count, the error badge and
+    /// every gate alone. The severity is the whole posture, so it is pinned
+    /// here rather than trusted: an unused import that arrived as a Warning
+    /// would enter the count the owner asked it to stay out of.
+    #[test]
+    fn an_unused_import_publishes_as_a_hint_tagged_unnecessary() {
+        let (directory, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::{ alpha, beta };\nfun main() {\n\talpha();\n}\n",
+            ),
+            ("helper.vl", "fun alpha() {}\nfun beta() {}\n"),
+        ]);
+        let uri = Url::from_file_path(directory.join("main.vl")).expect("a file URL");
+        let published = PublishState::new()
+            .plan_publish(&uri, &document)
+            .into_iter()
+            .find(|(target, _)| *target == uri)
+            .map(|(_, group)| group)
+            .expect("the entry publishes");
+        let faded: Vec<&Diagnostic> = published
+            .iter()
+            .filter(|item| item.tags.as_deref() == Some(&[DiagnosticTag::UNNECESSARY]))
+            .collect();
+        assert_eq!(faded.len(), 1, "one faded import: {published:#?}");
+        assert_eq!(faded[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(faded[0].message, "unused import");
+        assert_eq!(
+            faded[0].range,
+            range_of(
+                &std::fs::read_to_string(directory.join("main.vl")).expect("readable"),
+                "beta",
+                0
+            ),
+            "over the leaf, not the whole statement",
+        );
+        // …and nothing else is published: the fade must not come with a
+        // squiggle, and must not be counted as one.
+        assert!(
+            published
+                .iter()
+                .all(|item| item.severity == Some(DiagnosticSeverity::HINT)),
+            "a clean file with an unused import has no errors or warnings: {published:#?}",
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

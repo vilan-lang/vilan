@@ -97,6 +97,9 @@ fn build_chain<'src>(
         children,
         self_closing: _,
         close_tag: _,
+        // The desugar retires the element before analysis; the angle brackets
+        // it recorded are read from the RAW tree by the editor (E115).
+        punctuation: _,
     } = body;
     let tag_text = &source[tag.into_range()];
     // The generated `view` accessor spans `<tag` — an unresolved `view` (the

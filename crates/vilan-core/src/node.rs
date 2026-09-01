@@ -268,6 +268,17 @@ pub struct ElementBody<'src> {
     /// one — the language server's matching-tag features read it. `None` for a
     /// self-closing element.
     pub close_tag: Option<Span>,
+    /// Every angle-bracket span the element wrote, in source order: the opening
+    /// `<`, the `>` or `/>` that closes the head, and — when the element has a
+    /// close tag — its `</` and its `>`.
+    ///
+    /// Recorded because the editor's two highlight sources have to agree about
+    /// this punctuation and only the parser knows where it is (E115). A
+    /// TextMate rule is matched one line at a time, so a head whose attributes
+    /// span lines puts its `>` on a line with no `<tag` on it, out of the
+    /// rule's reach — the parser has no such limit, and the semantic-token pass
+    /// paints from these spans whatever shape the head was written in.
+    pub punctuation: Vec<Span>,
 }
 
 /// One child of an element. The distinction is TOKEN-carrying, not semantic —

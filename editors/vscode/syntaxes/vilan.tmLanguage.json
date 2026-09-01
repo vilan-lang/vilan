@@ -390,6 +390,15 @@
      }
     },
     {
+     "comment": "A multi-line element head's terminator (E115). The rule above is a `match`, and a TextMate `match` sees one line at a time \u2014 so when a head's attributes are written one per line and the `>` lands on a line of its own, that rule cannot reach it and the operator list painted it as a comparison. A `>` or `/>` alone on its line is that terminator: the formatter breaks AFTER a binary operator and never before one, so no formatted line begins with a bare `>`. The language server paints the same bracket from the parse, which is the authority whenever it is running; this is what the file looks like without it.",
+     "match": "^\\s*(/?>)",
+     "captures": {
+      "1": {
+       "name": "punctuation.definition.tag.vilan"
+      }
+     }
+    },
+    {
      "comment": "The event form `on:click(\u2026)`.",
      "match": "\\bon:([a-z][a-zA-Z0-9_]*)",
      "captures": {

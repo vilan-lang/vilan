@@ -15,7 +15,7 @@ mod uri;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -482,9 +482,12 @@ struct Backend {
     /// *stale* rather than merely absent, which is why `plan_publish` drops the
     /// re-planning owner's entry before it computes the new one — see there.
     publish_state: Arc<std::sync::Mutex<PublishState>>,
-    /// `std` files don't change during a session, so cache their line indices
-    /// rather than re-reading the file on every cross-file definition/reference.
-    line_indices: Arc<DashMap<PathBuf, Arc<LineIndex>>>,
+    /// Line indices for files that are on disk and not buffered — `std`, and
+    /// the workspace files a cross-file definition or reference reaches — so a
+    /// query does not re-read and re-index one on every lookup. Each entry
+    /// carries the [`FileStamp`] it was built from and is only served while the
+    /// file still matches it (E112).
+    line_indices: Arc<DashMap<PathBuf, (FileStamp, Arc<LineIndex>)>>,
     /// The client's feature settings, seeded from `initializationOptions` and
     /// updated live by `workspace/didChangeConfiguration`. Read per request
     /// (`inlay_hint`, `semantic_tokens_full`, …) so a toggle takes effect without
@@ -497,6 +500,47 @@ struct Backend {
     /// the session); when absent, call-shaped completions degrade to plain text
     /// (WO-3).
     snippet_support: Arc<AtomicBool>,
+    /// The WORLD revision (E117): bumped by every notification that changes what
+    /// an analysis would read — an open, an edit, a close, a save. An analysis
+    /// is stamped with the value it started from
+    /// ([`Document::stamp_analysis`]), which orders two results that finish out
+    /// of order even when neither document's own text moved: a dependent's
+    /// buffer is unchanged by an edit in the module it imports, so text equality
+    /// cannot separate "read the module mid-edit" from "read it restored", and
+    /// the loser used to publish last. That is the ghost diagnostic.
+    revision: Arc<AtomicU64>,
+    /// Serializes a publish's PLAN with its SEND (E117). The planner is a
+    /// synchronous mutex, so plan order is well defined; without this gate the
+    /// `publish_diagnostics` awaits of two publishes could still interleave and
+    /// deliver the older plan last, which is the same ghost by a different
+    /// route. Held across the sends and nothing else — the analyses themselves
+    /// stay fully concurrent.
+    publish_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// What a cached read of a file is only valid for: the file's length and its
+/// modification time, as one comparable value (E112).
+///
+/// This is the whole invalidation rule for [`Backend::line_indices`]. It is
+/// deliberately not a content hash — the point of the cache is to avoid reading
+/// the file, and a `metadata` call is orders of magnitude cheaper than a read
+/// plus an index build, so the cache keeps the win it exists for and stops
+/// answering for text that is gone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileStamp {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// The current stamp of the file at `path`, or `None` when it cannot be
+/// stat-ed — which is the "do not cache this" answer: an entry with no stamp
+/// could never be invalidated, which is the bug.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// Locate the `std` package directory: `$VILAN_STD`, else the nearest ancestor
@@ -1296,12 +1340,18 @@ async fn analyze_and_publish(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
+    publish_gate: &tokio::sync::Mutex<()>,
+    revision: &AtomicU64,
     uri: Url,
     text: String,
 ) -> bool {
     let path = uri.to_file_path().unwrap_or_default();
     let std_dir = discover_std_dir(&path);
-    let analysis = match tokio::task::spawn_blocking(move || {
+    // E117: the world this analysis is about to read, sampled BEFORE it starts.
+    // A later notification bumps the counter, so a result stamped lower is by
+    // construction a view of an older world — whatever its own text says.
+    let started_at = revision.load(Ordering::SeqCst);
+    let mut analysis = match tokio::task::spawn_blocking(move || {
         Document::analyze(&text, &std_dir, &path)
     })
     .await
@@ -1309,10 +1359,11 @@ async fn analyze_and_publish(
         Ok(analysis) => analysis,
         Err(_) => return false,
     };
+    analysis.stamp_analysis(started_at);
     if !land(documents, &uri, analysis) {
         return false;
     }
-    publish_document(documents, client, publish_state, &uri).await;
+    publish_document(documents, client, publish_state, publish_gate, &uri).await;
     true
 }
 
@@ -1336,6 +1387,16 @@ async fn analyze_and_publish(
 ///   implies a later `did_change` whose own debounced task (or an
 ///   already-landed fresher analysis) covers the buffer.
 ///
+/// - **The world moved on** (E117). The analysis read an older world than the
+///   one already adopted here: some file it loaded has been edited since it
+///   started. Text equality cannot see this — it is the DEPENDENT's case, where
+///   this document's own buffer never moved and both of its in-flight analyses
+///   match it — so the [`Backend::revision`] stamp decides. Without it, the
+///   analysis that read a module mid-edit could land (and publish) after the
+///   one that read it restored, and the editor kept the error from a state the
+///   user had already undone. Older strictly: an equal stamp is a second look
+///   at the same world and lands normally.
+///
 /// So the analyzed snapshot only ever advances to *the* live text, never
 /// sideways to a different stale one. `adopt_analysis` keeps its own
 /// keep-the-live-side guard all the same — two independent layers: this one
@@ -1348,6 +1409,9 @@ fn land(documents: &DashMap<Url, Document>, uri: &Url, analysis: Document) -> bo
         return false;
     };
     if document.text != analysis.text {
+        return false;
+    }
+    if analysis.analysis_revision() < document.analysis_revision() {
         return false;
     }
     document.adopt_analysis(analysis);
@@ -1363,8 +1427,14 @@ async fn publish_document(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
+    publish_gate: &tokio::sync::Mutex<()>,
     uri: &Url,
 ) {
+    // E117: plan and send as one step. The plan is already ordered (the planner
+    // is a mutex, and it drops a superseded owner's plan outright); the gate is
+    // what stops two publishes' `publish_diagnostics` awaits from interleaving
+    // and delivering the older plan last.
+    let _sending = publish_gate.lock().await;
     // Plan before the first await (neither the map guard nor the planner
     // lock may be held across one).
     let actions = {
@@ -1393,27 +1463,102 @@ async fn publish_document(
 /// a changed URL that is not a file path sweeps everyone — both are the old
 /// behavior, kept exactly where its reason still holds. Returns whether any
 /// of them landed an analysis.
+///
+/// `recolored` widens the sweep to a whole package (E116): every open document
+/// whose package root is at or under that path is swept, dependency edge or
+/// not. The edge is the right gate for DIAGNOSTICS — a file that never loaded
+/// the edited one cannot see the edit — and the wrong one for platform COLOR,
+/// which is decided by which entry REACHES a file. That relation points the
+/// other way: writing `import pkg::a` in the entry re-colors `a.vl`, and
+/// `a.vl` depends on nothing, so the edge swept it never and the process
+/// fallback stuck until the server restarted.
+///
+/// A saved MANIFEST arrives here the same way, and had the same hole from the
+/// other end: `vilan.toml` is in no program's `canonical_sources`, so once the
+/// sweep was gated on the edge (B39a) a manifest save re-analyzed nothing at
+/// all — a target change, a new entry, a fixed dependency all sat there until
+/// a restart. It passes its own directory, which every package root beneath it
+/// is under.
 async fn reanalyze_dependents(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
+    publish_gate: &tokio::sync::Mutex<()>,
+    revision: &AtomicU64,
     changed: &Url,
+    recolored: Option<&Path>,
 ) -> bool {
     let changed_path = changed.to_file_path().ok();
     let dependents: Vec<(Url, String)> = documents
         .iter()
         .filter(|entry| entry.key() != changed)
-        .filter(|entry| match &changed_path {
-            Some(path) => entry.value().depends_on(path),
-            None => true,
+        .filter(|entry| {
+            if let Some(recolored) = recolored
+                && entry
+                    .value()
+                    .package_root()
+                    .is_some_and(|root| root.starts_with(recolored))
+            {
+                return true;
+            }
+            match &changed_path {
+                Some(path) => entry.value().depends_on(path),
+                None => true,
+            }
         })
         .map(|entry| (entry.key().clone(), entry.value().text.clone()))
         .collect();
     let mut landed = false;
     for (uri, text) in dependents {
-        landed |= analyze_and_publish(documents, client, publish_state, uri, text).await;
+        landed |= analyze_and_publish(
+            documents,
+            client,
+            publish_state,
+            publish_gate,
+            revision,
+            uri,
+            text,
+        )
+        .await;
     }
     landed
+}
+
+/// How far the open document at `uri` reaches through its own package, and
+/// which package that is (E116) — the two facts [`recolored_package`] compares
+/// across a re-analysis. A closed or never-opened document reaches nothing.
+///
+/// Read synchronously; the guard is taken and dropped here, never held across
+/// the caller's await.
+fn package_reach(documents: &DashMap<Url, Document>, uri: &Url) -> Option<(u64, PathBuf)> {
+    let document = documents.get(uri)?;
+    let root = document.package_root()?;
+    Some((document.package_graph_fingerprint(), root.to_path_buf()))
+}
+
+/// The package whose platform coloring a re-analysis invalidated, if any
+/// (E116): its root when the set of package modules the edited file reaches
+/// MOVED, `None` when the import graph is where it was.
+///
+/// The `pkg::` graph is what `platform_color::file_platforms` walks to decide
+/// which entry reaches — and therefore colors — each file, so a change in it
+/// can re-color files this one neither imports nor is imported by. Nothing
+/// else in the file can: a body edit, a rename, a new `std` import all leave
+/// the reach identical and skip the sweep.
+///
+/// Separated from its effects so the decision is testable without a server.
+fn recolored_package(
+    before: Option<(u64, PathBuf)>,
+    after: Option<(u64, PathBuf)>,
+) -> Option<PathBuf> {
+    let (after_reach, root) = after?;
+    match before {
+        // The same package, reaching the same modules: nothing to re-color.
+        Some((before_reach, before_root)) if before_reach == after_reach && before_root == root => {
+            None
+        }
+        _ => Some(root),
+    }
 }
 
 /// One thing the server asks the client to re-request after a sweep of
@@ -1572,6 +1717,8 @@ impl Backend {
         let documents = Arc::clone(&self.documents);
         let pending = Arc::clone(&self.pending);
         let publish_state = Arc::clone(&self.publish_state);
+        let publish_gate = Arc::clone(&self.publish_gate);
+        let revision = Arc::clone(&self.revision);
         let client = self.client.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
@@ -1588,12 +1735,30 @@ impl Backend {
                 PauseAction::Superseded | PauseAction::Unchanged => return,
                 PauseAction::Analyze => {}
             }
-            let landed =
-                analyze_and_publish(&documents, &client, &publish_state, uri.clone(), text).await;
+            let reach_before = package_reach(&documents, &uri);
+            let landed = analyze_and_publish(
+                &documents,
+                &client,
+                &publish_state,
+                &publish_gate,
+                &revision,
+                uri.clone(),
+                text,
+            )
+            .await;
             // The edit may change what other open files see (they import this
             // one, or a file it re-exports) — bring their diagnostics up to date.
-            let dependents_landed =
-                reanalyze_dependents(&documents, &client, &publish_state, &uri).await;
+            let recolored = recolored_package(reach_before, package_reach(&documents, &uri));
+            let dependents_landed = reanalyze_dependents(
+                &documents,
+                &client,
+                &publish_state,
+                &publish_gate,
+                &revision,
+                &uri,
+                recolored.as_deref(),
+            )
+            .await;
             // The analyzed snapshot moved under the client's highlighting and
             // hints; ask for them again (S5). Every guard is long dropped here.
             send_refreshes(&client, refresh_plan(landed || dependents_landed)).await;
@@ -1603,18 +1768,31 @@ impl Backend {
     /// The line index for a file another source's span points into, cached by
     /// path so a cross-file query doesn't re-read and re-index on every lookup.
     ///
-    /// The cache holds only files whose text is STABLE for the session — which
-    /// is what "on disk, not open in the editor" means. A path with a buffer
-    /// registered is indexed fresh every time and never stored: its text is one
-    /// keystroke old, so a stored index would misplace every range it converts
-    /// from the next edit onward. (The session cache has no invalidation, by
-    /// design — it was written for `std`, whose files genuinely do not change.
-    /// Once `read_source` began answering from the overlay, "never invalidate"
-    /// stopped being safe for anything else, so the fix is to not cache those.)
+    /// A path with a buffer registered is indexed fresh every time and never
+    /// stored: its text is one keystroke old, so a stored index would misplace
+    /// every range it converts from the next edit onward.
+    ///
+    /// Every other entry is validated against the file's [`FileStamp`] (E112).
+    /// The cache used to have no invalidation at all, documented as safe
+    /// because it was written for `std`, "whose files genuinely do not change".
+    /// That was never a property of the KEY — it is a property of std, and the
+    /// map holds whatever a cross-file query asks for. A workspace file is
+    /// exempt from the cache only while it is buffered, so CLOSING a document
+    /// makes it cacheable; a file cached before it was ever opened kept its
+    /// pre-edit index across the whole open/edit/save/close cycle, and every
+    /// later reference into it converted through the wrong line breaks. So the
+    /// invariant is made true instead of assumed: a hit must match the file's
+    /// current length and modification time, and anything else re-reads. That
+    /// also covers what no did-close hook could — a change made outside the
+    /// editor entirely, a `git checkout` or a generator's rewrite.
     fn line_index_for(&self, path: &Path) -> Option<Arc<LineIndex>> {
         let buffered = vilan_core::analyzer::document_overlay_contains(path);
-        if !buffered && let Some(cached) = self.line_indices.get(path) {
-            return Some(Arc::clone(cached.value()));
+        let stamp = if buffered { None } else { file_stamp(path) };
+        if let Some(stamp) = stamp
+            && let Some(cached) = self.line_indices.get(path)
+            && cached.value().0 == stamp
+        {
+            return Some(Arc::clone(&cached.value().1));
         }
         // A disk read is BOM-stripped, matching the analyzer's read of the same
         // file (windows-support.md §2); a buffer comes back verbatim. Either
@@ -1622,9 +1800,12 @@ impl Backend {
         // analyzer saw, which is the whole point.
         let text = vilan_core::util::read_source(path).ok()?;
         let line_index = Arc::new(LineIndex::new(&text));
-        if !buffered {
+        // Stamped with what was read BEFORE the read, so a file that changed
+        // during it looks stale on the next lookup and is read again — the
+        // conservative direction, and the only one that cannot answer wrong.
+        if let Some(stamp) = stamp {
             self.line_indices
-                .insert(path.to_path_buf(), Arc::clone(&line_index));
+                .insert(path.to_path_buf(), (stamp, Arc::clone(&line_index)));
         }
         Some(line_index)
     }
@@ -1944,8 +2125,11 @@ impl LanguageServer for Backend {
                 &path,
                 Some(params.text_document.text.clone()),
             );
+            // The overlay just changed what every analysis reads (E117).
+            let started_at = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
             let std_dir = discover_std_dir(&path);
-            let document = Document::analyze(&params.text_document.text, &std_dir, &path);
+            let mut document = Document::analyze(&params.text_document.text, &std_dir, &path);
+            document.stamp_analysis(started_at);
             // The ONLY place a document enters the map. Every later analysis lands
             // by merge onto what is here (`land`), which is what lets a result
             // arriving after `did_close` be dropped instead of resurrecting the
@@ -1954,7 +2138,14 @@ impl LanguageServer for Backend {
             true
         });
         if publish {
-            publish_document(&self.documents, &self.client, &self.publish_state, &uri).await;
+            publish_document(
+                &self.documents,
+                &self.client,
+                &self.publish_state,
+                &self.publish_gate,
+                &uri,
+            )
+            .await;
         }
     }
 
@@ -2006,6 +2197,11 @@ impl LanguageServer for Backend {
             if let Ok(path) = uri.to_file_path() {
                 vilan_core::analyzer::set_document_overlay(&path, Some(text.clone()));
             }
+            // The world every analysis reads has moved (E117) — bump BEFORE the
+            // debounced task samples it, so an analysis already in flight is
+            // stamped with the world it actually read and this edit's own
+            // analysis is stamped strictly higher.
+            self.revision.fetch_add(1, Ordering::SeqCst);
             self.on_change(uri, text);
         })
     }
@@ -2014,6 +2210,19 @@ impl LanguageServer for Backend {
         // A save changes what OTHER documents' analyses read from disk (module
         // loading is disk-backed), so re-analyze every open document.
         let saved = params.text_document.uri;
+        // A save changes what a disk read answers, so it moves the world too
+        // (E117) — a manifest save especially, which re-colors every open file.
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        // E116: a saved `vilan.toml` is the coloring input itself — its target,
+        // its entries, its `default-entry` all decide what every file under it
+        // analyzes as — and it is in no program's `canonical_sources`, so the
+        // dependency edge alone finds nothing to sweep. Its own directory
+        // stands for the packages beneath it.
+        let saved_manifest_directory = is_manifest(&saved)
+            .then(|| saved.to_file_path().ok())
+            .flatten()
+            .and_then(|path| path.parent().map(vilan_core::util::canonical_path));
+        let reach_before = package_reach(&self.documents, &saved);
         // `.map` consumes the map guard inside the closure, so nothing is held
         // across the awaits below (which take the same key for writing).
         let mut landed = false;
@@ -2026,13 +2235,25 @@ impl LanguageServer for Backend {
                 &self.documents,
                 &self.client,
                 &self.publish_state,
+                &self.publish_gate,
+                &self.revision,
                 uri,
                 text,
             )
             .await;
         }
-        landed |=
-            reanalyze_dependents(&self.documents, &self.client, &self.publish_state, &saved).await;
+        let recolored = saved_manifest_directory
+            .or_else(|| recolored_package(reach_before, package_reach(&self.documents, &saved)));
+        landed |= reanalyze_dependents(
+            &self.documents,
+            &self.client,
+            &self.publish_state,
+            &self.publish_gate,
+            &self.revision,
+            &saved,
+            recolored.as_deref(),
+        )
+        .await;
         // Same sweep rule as a typing pause (S5).
         send_refreshes(&self.client, refresh_plan(landed)).await;
     }
@@ -2051,13 +2272,18 @@ impl LanguageServer for Backend {
         if let Ok(path) = uri.to_file_path() {
             vilan_core::analyzer::set_document_overlay(&path, None);
         }
+        // Dropping the overlay changes what every other analysis reads (E117).
+        self.revision.fetch_add(1, Ordering::SeqCst);
         self.documents.remove(&uri);
         self.semantic_token_cache.remove(&uri);
         // Drop the edit generation so any in-flight debounced analysis bails.
         self.pending.remove(&uri);
         // Clear this document's diagnostics AND the ones it published onto
         // other files — each target republishes as the remaining owners'
-        // merged view (empty where this was the only contributor).
+        // merged view (empty where this was the only contributor). Under the
+        // same plan-with-send gate every other publish takes (E117), so a
+        // concurrent analysis's sends cannot land in the middle of the clear.
+        let _sending = self.publish_gate.lock().await;
         let actions = self
             .publish_state
             .lock()
@@ -2847,6 +3073,8 @@ mod snapshot_consistency_tests {
             line_indices: Arc::new(DashMap::new()),
             config: Arc::new(std::sync::RwLock::new(Config::default())),
             snippet_support: Arc::new(AtomicBool::new(false)),
+            revision: Arc::new(AtomicU64::new(0)),
+            publish_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -4082,6 +4310,53 @@ mod snapshot_consistency_tests {
             "the snapshot stays consistent at the last adopted analysis",
         );
     }
+
+    // E117, the ghost diagnostic. The two guards above are both text
+    // comparisons, and text is exactly what a DEPENDENT's buffer does not
+    // change: an edit in a module it imports leaves this file byte-identical,
+    // so both of its in-flight analyses match the live text and both land — in
+    // whichever order they finish. The one that read the module mid-edit could
+    // therefore land, and publish, after the one that read it restored, which
+    // is the error that flashes back after a comment/uncomment round trip. The
+    // world revision each analysis READ is what separates them.
+    #[test]
+    fn an_analysis_of_an_older_world_is_dropped_though_its_text_still_matches() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        documents.insert(uri.clone(), document(SOURCE));
+        // The analysis that read the RESTORED world finishes first.
+        let mut newer = document(SOURCE);
+        newer.stamp_analysis(5);
+        assert!(land(&documents, &uri, newer), "the later world lands");
+        // The one that read the module mid-edit finishes second.
+        let mut older = document(SOURCE);
+        older.stamp_analysis(3);
+        assert!(
+            !land(&documents, &uri, older),
+            "an older world is dropped even though the buffer never moved",
+        );
+        assert_eq!(
+            documents.get(&uri).expect("still open").analysis_revision(),
+            5,
+            "the adopted snapshot is not regressed to the superseded world",
+        );
+    }
+
+    // …and the ordering is STRICT on older only: two analyses stamped with the
+    // same world say the same thing, and a dependents' sweep legitimately
+    // re-runs a document within one world. Dropping an equal stamp would make
+    // that sweep a no-op and leave the dependent's diagnostics stale.
+    #[test]
+    fn an_analysis_of_the_same_world_still_lands() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        let mut opened = document(SOURCE);
+        opened.stamp_analysis(4);
+        documents.insert(uri.clone(), opened);
+        let mut resweep = document(SOURCE);
+        resweep.stamp_analysis(4);
+        assert!(land(&documents, &uri, resweep));
+    }
 }
 
 /// kolt.local 034: the cross-document reach of references and rename at the
@@ -4212,6 +4487,8 @@ async fn main() {
         line_indices: Arc::new(DashMap::new()),
         config: Arc::new(std::sync::RwLock::new(Config::default())),
         snippet_support: Arc::new(AtomicBool::new(false)),
+        revision: Arc::new(AtomicU64::new(0)),
+        publish_gate: Arc::new(tokio::sync::Mutex::new(())),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
@@ -4524,7 +4801,7 @@ mod session_leak_tests {
 
     const PROGRAM: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
 
-    fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
+    pub(crate) fn open_params(uri: &Url, text: &str) -> DidOpenTextDocumentParams {
         DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
@@ -4535,7 +4812,11 @@ mod session_leak_tests {
         }
     }
 
-    fn whole_file_change(uri: &Url, version: i32, text: &str) -> DidChangeTextDocumentParams {
+    pub(crate) fn whole_file_change(
+        uri: &Url,
+        version: i32,
+        text: &str,
+    ) -> DidChangeTextDocumentParams {
         DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: uri.clone(),
@@ -4648,6 +4929,263 @@ mod session_leak_tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// E116: a file's platform color is decided by which ENTRY reaches it, and the
+/// reachability walk is per-analysis — so the coloring only moves when the file
+/// is re-analyzed, and nothing used to re-analyze a file because SOMEONE ELSE'S
+/// import graph changed. The owner's report: an unreferenced file falls back to
+/// the process layer (E113's designated-entry rule, correct), then keeps that
+/// color after the import that reaches it is written, until the server is
+/// restarted.
+///
+/// Driven through the real notification handlers, because the bug is entirely
+/// in which documents the server chooses to re-analyze.
+#[cfg(test)]
+mod package_recolor_tests {
+    use super::session_leak_tests::{open_params, whole_file_change};
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// The kolt shape: a browser `client`, a node `server`, the process side
+    /// designated — so a module NO entry reaches falls back to process.
+    const MANIFEST: &str = "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+         [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+    /// A module using the BROWSER `View`'s `element` field: clean under
+    /// `browser`, "no field 'element'" under any process target.
+    const WIDGET: &str = "import std::ui::{ View, view };\n\n\
+         fun attach(): View {\n\tlet root = view(\"div\");\n\t\
+         root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
+    const CLIENT_WITHOUT_IMPORT: &str =
+        "import std::io::print;\n\nfun main() {\n\tprint(\"client\");\n}\n";
+    const CLIENT_WITH_IMPORT: &str =
+        "import pkg::widget::attach;\n\nfun main() {\n\tattach();\n}\n";
+    const SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+
+    /// The fixture package on disk, and the URIs of the two files the editor
+    /// opens. Uniquified per test process and per thread, like every other
+    /// workspace fixture here.
+    fn workspace(name: &str) -> (PathBuf, Url, Url) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-recolor-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).expect("a scratch directory");
+        for (relative, contents) in [
+            ("vilan.toml", MANIFEST),
+            ("src/widget.vl", WIDGET),
+            ("src/client.vl", CLIENT_WITHOUT_IMPORT),
+            ("src/server.vl", SERVER),
+        ] {
+            std::fs::write(directory.join(relative), contents).expect("a source file");
+        }
+        let widget = Url::from_file_path(directory.join("src/widget.vl")).expect("a file url");
+        let client = Url::from_file_path(directory.join("src/client.vl")).expect("a file url");
+        (directory, widget, client)
+    }
+
+    /// Whether the open document at `uri` is currently publishing the
+    /// process-`View` error — the exact squiggle the owner sees on a
+    /// browser-only file colored as process.
+    fn colored_as_process(backend: &Backend, uri: &Url) -> bool {
+        backend
+            .documents
+            .get(uri)
+            .expect("open")
+            .published_diagnostics()
+            .iter()
+            .any(|item| item.message.contains("has no field 'element'"))
+    }
+
+    /// Wait for the debounced analysis and the sweep it triggers to settle.
+    /// Polls rather than sleeping a fixed span: the analysis is real work on a
+    /// blocking thread, and a loaded machine is exactly when a fixed sleep
+    /// turns a pin into a flake.
+    async fn settled(backend: &Backend, uri: &Url, expected: bool) -> bool {
+        for _ in 0..200 {
+            if colored_as_process(backend, uri) == expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_package_import_edit_recolors_the_open_file_it_reaches() {
+        let (directory, widget_uri, client_uri) = workspace("import");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend
+            .did_open(open_params(&client_uri, CLIENT_WITHOUT_IMPORT))
+            .await;
+        assert!(
+            colored_as_process(backend, &widget_uri),
+            "no entry reaches the widget yet, so `default-entry = \"server\"` colors it process \
+             — E113's fallback, and the premise of this pin",
+        );
+
+        // The entry gains the import that reaches it. The widget's own buffer
+        // does not move, and it does not depend on the entry — the entry
+        // depends on IT — so the dependency-edge sweep finds nothing to do.
+        backend
+            .did_change(whole_file_change(&client_uri, 2, CLIENT_WITH_IMPORT))
+            .await;
+        assert!(
+            settled(backend, &widget_uri, false).await,
+            "the error must clear without a restart: the widget is now reached by the browser \
+             entry, so it analyzes as browser",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn removing_the_import_colors_the_file_back() {
+        // The mirror, so the sweep is not one-way: deleting the import makes
+        // the widget unreached again and the process fallback returns. A fix
+        // that only ever re-colored TOWARD browser would pass the first pin
+        // and fail this one.
+        let (directory, widget_uri, client_uri) = workspace("removal");
+        std::fs::write(directory.join("src/client.vl"), CLIENT_WITH_IMPORT).expect("a source file");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        backend.did_open(open_params(&widget_uri, WIDGET)).await;
+        backend
+            .did_open(open_params(&client_uri, CLIENT_WITH_IMPORT))
+            .await;
+        assert!(
+            !colored_as_process(backend, &widget_uri),
+            "the browser entry reaches it, so it starts clean",
+        );
+        backend
+            .did_change(whole_file_change(&client_uri, 2, CLIENT_WITHOUT_IMPORT))
+            .await;
+        assert!(
+            settled(backend, &widget_uri, true).await,
+            "unreached again: the designated process entry colors it once more",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The decision itself, without a server. An ordinary body edit leaves the
+    /// `pkg::` graph exactly where it was, so it must NOT drag every open file
+    /// in the package through a re-analysis — the sweep is the expensive half
+    /// of a typing pause, and widening it unconditionally would undo B39a.
+    #[test]
+    fn an_edit_that_does_not_move_the_graph_recolors_nothing() {
+        let root = PathBuf::from("/pkg/src");
+        assert_eq!(
+            recolored_package(Some((7, root.clone())), Some((7, root.clone()))),
+            None,
+            "same package, same reach",
+        );
+        assert_eq!(
+            recolored_package(Some((7, root.clone())), Some((9, root.clone()))),
+            Some(root.clone()),
+            "the reach moved: the whole package is re-colored",
+        );
+        assert_eq!(
+            recolored_package(None, Some((7, root.clone()))),
+            Some(root.clone()),
+            "a file that had no package and now has one re-colors it",
+        );
+        assert_eq!(
+            recolored_package(Some((7, root)), None),
+            None,
+            "a file with no package of its own sweeps nobody",
+        );
+    }
+}
+
+/// E112: `line_indices` is a by-path cache of files that are on disk and not
+/// buffered, and it had no invalidation — documented as safe because it was
+/// "written for `std`, whose files do not change". Stability was never a
+/// property of the key. A workspace file is exempt only while a buffer is
+/// registered for it, so a file cached before it was ever opened kept its
+/// pre-edit index across the whole open/edit/save/close cycle, and every later
+/// cross-file reference into it converted spans through the wrong line breaks.
+/// Correctness, not perf — a wrong position, published.
+#[cfg(test)]
+mod line_index_cache_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// A scratch file with `contents`, in a directory unique to this test.
+    fn scratch(name: &str, contents: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-line-index-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("module.vl");
+        std::fs::write(&path, contents).expect("a source file");
+        (directory, path)
+    }
+
+    #[test]
+    fn a_file_that_changed_on_disk_is_re_indexed() {
+        // One line, then three: the line breaks the index converts through move,
+        // which is exactly what a stale entry gets wrong.
+        let (directory, path) = scratch("stale", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let first = backend.line_index_for(&path).expect("readable");
+        assert_eq!(
+            first.position(20).line,
+            0,
+            "the one-line file puts every offset on line 0",
+        );
+        // The file is rewritten under the server — a save from another window,
+        // a `git checkout`, a generator. Nothing notifies it.
+        std::fs::write(&path, "fun answer(): i32 {\n\t1\n}\n").expect("a rewrite");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert_eq!(
+            second.position(21).line,
+            1,
+            "the index must describe the file that is there now, not the one that was",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unchanged_file_still_answers_from_the_cache() {
+        // The other half: the validation must not turn the cache off. An
+        // unchanged file answers with the very same `Arc` — no re-read, no
+        // re-index, which is the whole reason the map exists.
+        let (directory, path) = scratch("cached", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let first = backend.line_index_for(&path).expect("readable");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged file is served from the cache",
+        );
+        assert_eq!(backend.line_indices.len(), 1, "one entry, not two");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_buffered_file_is_never_cached() {
+        // Unchanged from before, and re-pinned here because the stamp must not
+        // become an excuse to start caching a buffer: its text is one keystroke
+        // old on disk, and the overlay is the truth.
+        let (directory, path) = scratch("buffered", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        vilan_core::analyzer::set_document_overlay(&path, Some("fun answer(): i32 { 2 }\n".into()));
+        let first = backend.line_index_for(&path).expect("readable");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert!(!Arc::ptr_eq(&first, &second), "indexed fresh every time");
+        assert!(backend.line_indices.is_empty(), "and never stored");
+        vilan_core::analyzer::set_document_overlay(&path, None);
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

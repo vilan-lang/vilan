@@ -3269,18 +3269,29 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// [`Parser::parse_element`]'s body, past the depth bound.
     fn parse_element_inner(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        // E115: the angle brackets are recorded as they are consumed — this is
+        // the only place their positions are known, and the editor's
+        // semantic-token pass needs them to paint a head that spans lines.
+        let mut punctuation = vec![self.here_span()];
         self.expect_ctrl('<')?;
         let (tag, tag_tokens) = self.parse_element_name()?;
         let mut head = Vec::new();
         let children = loop {
             // `/>` — self-closing (span-adjacent, like `<<`).
             if self.peek_is_op("/") && self.peek_at_is_ctrl(1, '>') && self.tokens_adjacent(0, 1) {
+                let slash = self.here_span();
                 self.bump();
+                let angle = self.here_span();
                 self.bump();
+                punctuation.push((slash.start..angle.end).into());
                 break (Vec::new(), true, None);
             }
-            if self.eat_ctrl('>') {
-                let (children, close_tag) = self.parse_element_children(&tag_tokens)?;
+            if self.peek_is_ctrl('>') {
+                punctuation.push(self.here_span());
+                self.bump();
+                let (children, close_tag, close_punctuation) =
+                    self.parse_element_children(&tag_tokens)?;
+                punctuation.extend(close_punctuation);
                 break (children, false, Some(close_tag));
             }
             if self.at_end() {
@@ -3298,6 +3309,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             children,
             self_closing,
             close_tag,
+            punctuation,
         };
         Some((Node::Element(body), self.span_from(start)))
     }
@@ -3375,16 +3387,21 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// Children up to the matching `</tag>`: nested elements, quoted strings
     /// (an i-string arrives as its lexed paren group), and `{expression}`
     /// holes. Bare text is a parse error that teaches the quoted form.
+    ///
+    /// Returns the children, the close tag's NAME span, and the close tag's own
+    /// two angle-bracket spans — its `</` and its `>` (E115).
     fn parse_element_children(
         &mut self,
         open_tokens: &std::ops::Range<usize>,
-    ) -> Option<(Vec<ElementChild<'src>>, Span)> {
+    ) -> Option<(Vec<ElementChild<'src>>, Span, [Span; 2])> {
         let mut children: Vec<ElementChild<'src>> = Vec::new();
         loop {
             // `</tag>` — the close (span-adjacent `</`), name-matched against
             // the opener token-by-token.
             if self.peek_is_ctrl('<') && self.peek_at_is_op(1, "/") && self.tokens_adjacent(0, 1) {
+                let angle = self.here_span();
                 self.bump();
+                let slash = self.here_span();
                 self.bump();
                 let close = self.parse_element_name();
                 let matches_open = close.as_ref().is_some_and(|(_, close_tokens)| {
@@ -3399,9 +3416,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                     self.note_expected(&format!("`</{open_name}>`"));
                     return None;
                 }
+                let closing_angle = self.here_span();
                 self.expect_ctrl('>')?;
                 let (close_span, _) = close.expect("matched above");
-                return Some((children, close_span));
+                return Some((
+                    children,
+                    close_span,
+                    [(angle.start..slash.end).into(), closing_angle],
+                ));
             }
             if self.at_end() {
                 let open_name = self.element_name_text(open_tokens);
