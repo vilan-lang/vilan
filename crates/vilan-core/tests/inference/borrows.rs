@@ -7194,3 +7194,303 @@ fn b171_an_is_binding_does_not_outlive_its_if() {
         "cannot find 'n' in this scope",
     );
 }
+
+// --- B195: an `is` capture under a NEGATION ----------------------------------
+//
+// B171 ruled the scope of an unnegated capture. A negated one is the case that
+// sentence did not reach, and it was LIVE UNSOUND: `if !(maybe is Some(let n))
+// { print(n); }` compiled to `if (!($a[0] === 0)) { console.log($a[1]); }` and
+// printed `undefined` — the payload slot read exactly when the pattern did not
+// match.
+//
+// The rule, which is B171's then-branch rule MIRRORED: `!(x is P)` is true
+// where `P` failed, so the capture is not in the then-branch; it is true's
+// opposite in the ELSE branch, which runs precisely when `P` matched, so the
+// capture IS bound there (and on down an `else if` chain). Two negations cancel.
+// A capture under a `||` stays unbound in both branches (B171's cap, untouched).
+// The guard-clause shape — `if !(x is P) { ret; }` then reading the capture
+// after the `if` — stays refused in both places; B187 decides it.
+
+#[test]
+fn b195_a_negated_is_capture_is_not_visible_in_the_then_branch() {
+    // The bug itself. Before the fix this compiled and printed `undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_is_capture_is_visible_in_the_else_branch() {
+    // And the branch it IS bound in — run, not merely compiled, because the
+    // whole family is a miscompile: the emitted `else` reads the payload slot
+    // exactly where the subject has one, and the `if` side never reads it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun pick(flag: bool): Option<i32> { if flag { Some(2) } else { None } }
+        fun main() {
+            let hit = pick(true);
+            let miss = pick(false);
+            if !(hit is Some(let n)) { print("miss"); } else { print(n); }
+            if !(miss is Some(let m)) { print("miss"); } else { print(m); }
+        }
+        "#,
+        "2\nmiss\n",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_reaches_an_else_if_branch() {
+    // The else of an `else if` chain is still the previous condition's false
+    // path, so the capture is bound through the chain — condition and body.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print("miss"); }
+            else if n > 1 { print(n); }
+            else { print(0); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b195_a_later_let_in_the_else_branch_still_shadows_the_capture() {
+    // The inherited declaration covers the else branch from its start, so an
+    // ordinary `let` of the same name inside it shadows from its own point on —
+    // the positional rule, unchanged by where the declaration came from.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print("miss"); } else { print(n); let n = 9; print(n); }
+        }
+        "#,
+        "2\n9\n",
+    );
+}
+
+#[test]
+fn b195_a_double_negation_cancels() {
+    // `!` is a swap of the two branches, so applying it twice is the identity:
+    // `!(!(x is P))` is the plain test, with B171's plain answer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(!(maybe is Some(let n))) { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b195_a_double_negation_does_not_reach_the_else_branch() {
+    // The other half of the cancellation, and the one that would catch a fix
+    // that only ever ADDED the else branch: two negations put the capture back
+    // in the then-branch and take it out of the else.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(!(maybe is Some(let n))) { print("y"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_capture_under_a_negated_and_is_not_visible_in_the_then_branch() {
+    // `!(a is X && b)` is true when the `&&` was false, which the failed test
+    // is one way of causing — so the then-branch proves nothing.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n) && n > 1) { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_and_still_binds_its_own_right_operand() {
+    // Inside the negation the `&&` short-circuit is untouched: reaching `n > 1`
+    // still means the test passed, negation or no negation. (The condition is
+    // therefore false here and the `else` runs.)
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n) && n > 1) { print("no"); } else { print("yes"); }
+        }
+        "#,
+        "yes\n",
+    );
+}
+
+#[test]
+fn b195_a_negated_and_binds_the_else_branch() {
+    // `!(a is X && b)` FALSE means the `&&` was true, and a true `&&` ran and
+    // passed its left operand — so the else branch has the payload.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n) && n > 1) { print("no"); } else { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_does_not_reach_the_and_right_operand() {
+    // The mirror of B171's `&&` rule: `&&` carries its left operand's TRUE
+    // side, and a negated capture is bound on the FALSE side, so it dies with
+    // the operand rather than crossing into the right one.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) && n > 1 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negation_inside_an_and_does_not_bind_the_rest_of_the_and() {
+    // The nesting that a plain parity counter gets wrong: the capture sits
+    // under two `!`s, but the inner one is the left operand of an `&&`, whose
+    // right operand runs when that operand was TRUE — that is, when the test
+    // FAILED. Before the fix this compiled and read the missing payload.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(!(maybe is Some(let n)) && n > 1) { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_under_an_or_stays_capped() {
+    // B171's `||` cap swallows the negation: an operand of a `||` proves
+    // nothing outside itself either way, so neither branch gets the capture.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) || n > 1 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_negated_capture_under_an_or_does_not_reach_the_else_branch() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let flag = false;
+            if !(maybe is Some(let n)) || flag { print("hit"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_the_guard_clause_shape_is_refused_in_both_places() {
+    // `if !(x is P) { ret; }` — the then-branch is refused by the rule above,
+    // and the CONTINUATION after the `if` stays refused too: making the binding
+    // live on past a diverging then-branch is B187's design to rule, not this
+    // fix's to smuggle in.
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { print(n); ret; }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if !(maybe is Some(let n)) { ret; }
+            print(n);
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b195_a_capture_off_the_conditions_boolean_spine_keeps_its_b171_answer() {
+    // The negation bookkeeping travels `!`, `&&`/`||` and the `is` test, and
+    // stops there: a capture inside a CALL ARGUMENT is bound by an evaluation
+    // the condition's truth says nothing about, so it gets neither a negated
+    // cut nor an else-branch declaration — it keeps exactly the answer B171
+    // gave it. (The then-branch read that leaves standing is B171's own
+    // approximation, not this fix's.)
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun negate(flag: bool): bool { !flag }
+        fun main() {
+            let maybe = Some(2);
+            if negate(maybe is Some(let n)) { print("hit"); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}

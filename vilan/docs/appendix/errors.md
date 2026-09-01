@@ -28,7 +28,11 @@ shadowing local. One case that reads as a compiler mistake and isn't: an
 `is` capture is in scope only where its test is known to have **passed** —
 the then-branch and the rest of the condition after an `&&` — so naming
 it in the `else`, after the `if`, or in the other arm of a `||` is this
-error. Move the read inside the branch, or use `match`.
+error. Move the read inside the branch, or use `match`. A NEGATED test
+swaps which branch that is: `if !(x is Some(let n))` runs its then-branch
+when the pattern *didn't* match, so `n` is this error there and is in
+scope in the `else` — read it there, or drop the `!` and swap the two
+branches.
 → [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md), [spec §5.7](../spec/types.md)
 
 **"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
