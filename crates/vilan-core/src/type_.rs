@@ -25,7 +25,12 @@ pub const NUMERIC_SUFFIXES: &[&str] = &[
     "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f", "f32", "f64", "n",
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Hash` because the resolved type is a memo KEY: impl selection over a
+// `TypeId` is a pure function of the `Type` that id resolves to (the id's
+// identity never enters the walk — see `dispatch_refine::refined_edges`), and
+// a program mints one id per expression, so keying a selection memo on the id
+// would memoize nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Any,
     // The type of expressions that never produce a value: `panic(..)`,

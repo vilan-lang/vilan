@@ -31,6 +31,17 @@ fn phase_timing_survives_a_warm_second_analysis() {
     // before the first analysis (which is what caches the flag).
     unsafe { std::env::set_var("VILAN_PHASE_TIMING", "1") };
 
+    // The switch is PUBLIC (E106): the language server adds its own phases —
+    // project resolution, the editor tables, a shared module's further legs,
+    // all of them outside `analyze` and so invisible to the line below — to the
+    // same output under this one variable. A front end that could not ask would
+    // need a second switch, and two half-pictures is what the split exists to
+    // avoid. Read here, before any analysis, because the answer is cached.
+    assert!(
+        vilan_core::phase_timing_enabled(),
+        "the switch a front end reads must answer for the variable that is set"
+    );
+
     let source = r#"
         import std::io::print;
         fun main() { print("warm"); }

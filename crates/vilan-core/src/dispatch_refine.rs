@@ -73,6 +73,32 @@ pub struct RefinedEdge {
     pub callee: Id,
 }
 
+thread_local! {
+    /// How many impl SELECTIONS [`refined_edges`] has evaluated on this thread
+    /// since [`reset_selection_count`] — the memo's instrument, and the only
+    /// thing that can see it working. A selection is the expensive unit here
+    /// (a scan of every implementation, each entry of which may recurse into
+    /// another such scan), the memo changes no output whatsoever, and a
+    /// timing assertion on a shared machine is not a test — so the count is
+    /// what the pin reads, exactly as `call_graph::build_count` pins the
+    /// one-graph-per-analysis invariant it could not otherwise observe.
+    ///
+    /// Thread-local for that same reason: an analysis is single-threaded, and
+    /// plain `cargo test` runs analyses concurrently in one process.
+    static SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of impl selections [`refined_edges`] has evaluated on this
+/// thread since the last [`reset_selection_count`]. See [`SELECTION_COUNT`].
+pub fn selection_count() -> usize {
+    SELECTION_COUNT.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`selection_count`].
+pub fn reset_selection_count() {
+    SELECTION_COUNT.with(|count| count.set(0));
+}
+
 /// The trait-member name a call's dispatch record names, when the call also
 /// has a `function_calls` entry. This is the `context` pass's historical site
 /// gate — an iterator-protocol `for` loop records its dispatch on the loop id
@@ -419,13 +445,42 @@ pub fn refined_edges(
         // Concrete resolution → the impl members the type selects; an
         // empty selection (defensive — the bound audit rejects no-impl
         // types) falls back to every candidate.
-        let selected_for = |resolved: TypeId| -> Vec<Id> {
+        //
+        // Memoized on the RESOLVED TYPE, not the type id (M19/E106). The
+        // selection scans every implementation, and each scan may recurse
+        // through `impl_select::provides_trait` — itself a scan of every
+        // implementation — so one call is O(impls²); the walk below asks once
+        // per ENTRY of the dispatching function, and an entry count is a
+        // program-size quantity. kolt's generated icon module made that
+        // concrete: 17,895 selections per pass, run twice per analysis (the
+        // context pass and the const-only check both refine the same sites),
+        // for **32** distinct (type, member) answers — 2.5 s of a 5 s
+        // keystroke. Keying on the id memoizes nothing (a program mints one
+        // id per expression: 17,802 distinct ids for those 32 answers), and
+        // keying on the type is exact: `impl_members_for_bound` reads the id
+        // only through `type_id_to_type_map`, and every walk under it
+        // (`subject_shape_matches`, `bind_subject`, `provides_trait`) recurses
+        // through the argument ids the resolved `Type` itself carries — so two
+        // ids resolving to equal `Type`s drive an identical walk.
+        let mut selection_memo: HashMap<Type, Vec<Id>> = HashMap::default();
+        let mut selected_for = |resolved: TypeId| -> Vec<Id> {
+            // An id with no resolved type selects nothing and falls back, the
+            // same answer `impl_members_for_bound`'s own guard gives.
+            let Some(key) = program.type_id_to_type_map.get(&resolved) else {
+                return site.candidates.clone();
+            };
+            if let Some(selected) = selection_memo.get(key) {
+                return selected.clone();
+            }
+            SELECTION_COUNT.with(|count| count.set(count.get() + 1));
             let selected = impl_members_for_bound(program, resolved, member, &constraint_traits);
-            if selected.is_empty() {
+            let selected = if selected.is_empty() {
                 site.candidates.clone()
             } else {
                 selected
-            }
+            };
+            selection_memo.insert(key.clone(), selected.clone());
+            selected
         };
         let root = match site.owner {
             RefinedCaller::Node(owner) => enclosing_function(owner),
