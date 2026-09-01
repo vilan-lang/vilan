@@ -352,6 +352,31 @@ impl SignalCell<type T> with MaybeSignal<T> {      // signals, reactively
 fun badge<V: MaybeSignal<str>>(label: V) { … }  // takes both, no ceremony
 ```
 
+A blanket implementation is reachable from a **concrete** type this way,
+and never from an **abstract** one. Whether a generic parameter satisfies
+a bound is answered from that parameter's own **declared bounds alone** —
+no impl is consulted, blanket or otherwise:
+
+```vilan,fragment
+trait Wrap<T> { fun unwrap(self): T; }
+impl type T with Wrap<T> { fun unwrap(self): T { self } }
+
+fun consume<T: Tag, W: Wrap<T>>(wrapped: W): str { wrapped.unwrap().tag() }
+
+fun main() { consume(3); }                             // fine: `i32` is concrete
+fun wrapper<T: Tag>(value: T): str { consume(value) }  // error: `T` lacks `: Wrap<T>`
+fun ok<T: Tag + Wrap<T>>(value: T): str { consume(value) }   // declare it, and it holds
+```
+
+The blanket covers `T` at every instantiation, so reading it as satisfied
+in the abstract body would be sound only until a *more specific* impl
+appears — and the specificity order above ranks the blanket last, so the
+body would have been checked against an implementation the call does not
+reach. Monomorphization is where the question has a real answer, so the
+concrete check is the one that counts and a declared bound is what an
+abstract call may lean on. The refusal names the parameter and the bound
+it lacks, which is the edit that fixes it.
+
 Because the instantiation is decided first, a `SignalCell<str>` reaches the
 `Signal` impl under a `MaybeSignal<str>` bound and the blanket under a
 `MaybeSignal<SignalCell<str>>` bound, where it is a static value of that

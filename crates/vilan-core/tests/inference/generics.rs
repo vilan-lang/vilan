@@ -4430,24 +4430,28 @@ fn a_bare_parameter_bound_survives_two_generic_bodies() {
     );
 }
 
-/// A BLANKET impl reached from a generic body: the subject IS the binder, so
-/// the reconciliation has a generic on both sides at the TOP level rather than
-/// inside a nominal type's arguments. B168 fixed this half — before it, the
-/// error was `'T' is missing the bound ': Tag'`, the callee's `T` resolved to
-/// the impl's own binder — and left a DIFFERENT one open, which is what this
-/// pin now names: `W: Wrap<T>` is checked against the caller's `T`, and
-/// `satisfies_trait_bound` answers for a `Type::Generic` value from its
-/// DECLARED bounds alone, never from an impl. A blanket impl covers every type
-/// including an abstract parameter, so the bound holds and the check cannot see
-/// it. Un-ignore when a generic value is allowed to satisfy a blanket impl.
+/// B173, RULED REFUSED: an ABSTRACT parameter never satisfies a bound through a
+/// blanket impl — **the refusal is the promise**, so this is a negative pin and
+/// not an `#[ignore]`d wish.
+///
+/// A blanket impl reached from a generic body puts a generic on both sides at
+/// the TOP level rather than inside a nominal type's arguments. B168 fixed one
+/// half — before it the error was `'T' is missing the bound ': Tag'`, the
+/// callee's `T` resolved to the impl's own binder — and left this one, which
+/// the ruling settles rather than fixes: `satisfies_trait_bound` answers for a
+/// `Type::Generic` value from its DECLARED bounds alone, and that is correct.
+/// Answering "satisfied, via the blanket" at ABSTRACT time is an
+/// over-approximation a more specific impl at instantiation can contradict
+/// (§5.4 ranks the blanket last), and monomorphization means the concrete check
+/// is the one that counts. So the declared bound is the only answer, and the
+/// author's fix is to declare it.
+///
+/// What the message must keep saying: the abstract parameter (`T`) and the
+/// bound it lacks (`Wrap<T>`) — the two things that tell an author which
+/// `<..>` list to widen.
 #[test]
-#[ignore = "B173: `satisfies_trait_bound` answers a `Type::Generic` value \
-            from its declared bounds alone, so a blanket `impl type T with \
-            Wrap<T>` cannot satisfy `W: Wrap<T>` when `W` is bound to the \
-            caller's own parameter. A concrete caller passes; whether an \
-            abstract parameter may satisfy a blanket impl is B173's ruling."]
-fn a_blanket_impl_bound_resolves_from_a_generic_body() {
-    assert_compiles_and_runs(
+fn a_blanket_impl_never_satisfies_a_bound_for_an_abstract_parameter() {
+    assert_fails_with(
         r#"
         trait Tag { fun tag(self): str; }
         impl i32 with Tag { fun tag(self): str { i"<{self}>" } }
@@ -4460,6 +4464,60 @@ fn a_blanket_impl_bound_resolves_from_a_generic_body() {
         }
 
         fun wrapper<T: Tag>(value: T): str {
+            consume(value)
+        }
+
+        fun main() { print(wrapper(3)); }
+        main();
+        "#,
+        "generic parameter 'T' is missing the bound ': Wrap<T>' required by this call",
+    );
+}
+
+/// The other side of B173's ruling, and what makes the refusal above a rule
+/// about ABSTRACTION rather than about blanket impls: a CONCRETE caller of the
+/// very same `consume` passes through the blanket and runs. Monomorphization is
+/// where the question is asked, and there it has a real answer.
+#[test]
+fn a_blanket_impl_satisfies_a_bound_for_a_concrete_caller() {
+    assert_compiles_and_runs(
+        r#"
+        trait Tag { fun tag(self): str; }
+        impl i32 with Tag { fun tag(self): str { i"<{self}>" } }
+
+        trait Wrap<T> { fun unwrap(self): T; }
+        impl type T with Wrap<T> { fun unwrap(self): T { self } }
+
+        fun consume<T: Tag, W: Wrap<T>>(wrapped: W): str {
+            wrapped.unwrap().tag()
+        }
+
+        fun main() { print(consume(3)); }
+        main();
+        "#,
+        "<3>\n",
+    );
+}
+
+/// And the way FORWARD the refusal steers to: declaring the bound at the outer
+/// parameter list makes the abstract call legal, because the declared bounds
+/// are the only thing an abstract-time check reads. A program that wants the
+/// blanket through a generic body writes this.
+#[test]
+fn declaring_the_bound_admits_the_abstract_call_b173_refuses() {
+    assert_compiles_and_runs(
+        r#"
+        trait Tag { fun tag(self): str; }
+        impl i32 with Tag { fun tag(self): str { i"<{self}>" } }
+
+        trait Wrap<T> { fun unwrap(self): T; }
+        impl type T with Wrap<T> { fun unwrap(self): T { self } }
+
+        fun consume<T: Tag, W: Wrap<T>>(wrapped: W): str {
+            wrapped.unwrap().tag()
+        }
+
+        fun wrapper<T: Tag + Wrap<T>>(value: T): str {
             consume(value)
         }
 

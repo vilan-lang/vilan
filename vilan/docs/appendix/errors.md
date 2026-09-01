@@ -103,8 +103,12 @@ no implicit conversions. Suffix it (`stamp + 1000i53`).
 **"generic parameter '…' is missing the bound ': …' required by this call"**
 You called something that needs a capability (say `PartialEq`) with a
 generic parameter that doesn't declare it. Add the bound to *your*
-signature: `fun caller<U: PartialEq>(…)`.
-→ [Data and traits](../tour/data-and-traits.md)
+signature: `fun caller<U: PartialEq>(…)`. A **blanket impl** covering the
+trait does not spare you this: a generic parameter's bounds are answered
+from what it *declares*, never from an impl, so the same call that
+compiles for a concrete `i32` is refused for a `T` — declare it and it
+holds.
+→ [Data and traits](../tour/data-and-traits.md), [spec §5.4](../spec/types.md)
 
 **"cannot call method '…' on …"**
 The value's type doesn't have that method. If the type is a generic

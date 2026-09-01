@@ -3733,6 +3733,15 @@ impl<'src> Analyzer<'src> {
         if depth > MAX_DEPTH {
             return true;
         }
+        // An ABSTRACT value's declared bounds are the ONLY answer — never an
+        // impl (B173, RULED refused; spec §5.4). A blanket `impl type T with
+        // Wrap<T>` covers every type including this parameter, so searching the
+        // impls here would answer "satisfied" at abstract time — an
+        // over-approximation a more specific impl can contradict at
+        // instantiation, where §5.4 ranks the blanket last. Monomorphization is
+        // where the question has a real answer, so the concrete check is the one
+        // that counts and the declared bound is what an abstract call may lean
+        // on. The refusal below is the promise; declaring the bound is the fix.
         if let Type::Generic(inner_constraint_id) = value_type {
             return self
                 .generic_bound_trait_ids(*inner_constraint_id)
