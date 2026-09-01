@@ -431,53 +431,53 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         // for one line. One error per binding, at its first `await`: further
         // awaits in the same initializer are the same defect with the same
         // fix.
-        if initializer_refusals.len() == refusals_before {
-            if let Some(&await_id) = graph.initializer_awaits_of(binding).first() {
-                let binding_name = program
-                    .variables
-                    .get(&binding)
-                    .map(|variable| variable.name)
-                    .unwrap_or("_");
-                // Two steers, both true of what the user wrote. When the
-                // operand names a module-level binding it is already there
-                // and already initialized (B33 orders it first), so the fix
-                // is to move only the `await`. Otherwise the operand is an
-                // expression — a spawn, or a call returning a `Task` — and
-                // the fix is to bind it first.
-                let awaited_binding = match program.entity_map.get(&await_id) {
-                    Some(Expr::Await(operand_id)) => match program.entity_map.get(operand_id) {
-                        Some(Expr::Local(target) | Expr::Variable(target))
-                            if module_bindings.contains(target) =>
-                        {
-                            program.variables.get(target).map(|variable| variable.name)
-                        }
-                        _ => None,
-                    },
+        if initializer_refusals.len() == refusals_before
+            && let Some(&await_id) = graph.initializer_awaits_of(binding).first()
+        {
+            let binding_name = program
+                .variables
+                .get(&binding)
+                .map(|variable| variable.name)
+                .unwrap_or("_");
+            // Two steers, both true of what the user wrote. When the
+            // operand names a module-level binding it is already there
+            // and already initialized (B33 orders it first), so the fix
+            // is to move only the `await`. Otherwise the operand is an
+            // expression — a spawn, or a call returning a `Task` — and
+            // the fix is to bind it first.
+            let awaited_binding = match program.entity_map.get(&await_id) {
+                Some(Expr::Await(operand_id)) => match program.entity_map.get(operand_id) {
+                    Some(Expr::Local(target) | Expr::Variable(target))
+                        if module_bindings.contains(target) =>
+                    {
+                        program.variables.get(target).map(|variable| variable.name)
+                    }
                     _ => None,
-                };
-                // The trailing clause is a general fact about module-level
-                // spawning, not a claim about the operand — `await` on a
-                // non-`Task` is legal too, and the steer must stay true there.
-                let steer = match awaited_binding {
-                    Some(name) => format!(
-                        "hold `{name}` here and `await` it in `main` — spawning at module \
+                },
+                _ => None,
+            };
+            // The trailing clause is a general fact about module-level
+            // spawning, not a claim about the operand — `await` on a
+            // non-`Task` is legal too, and the steer must stay true there.
+            let steer = match awaited_binding {
+                Some(name) => format!(
+                    "hold `{name}` here and `await` it in `main` — spawning at module \
                          level does not suspend, so the work still starts at load"
-                    ),
-                    None => "bind the `Task` here (`let pending: Task<T> = async …;`) and \
+                ),
+                None => "bind the `Task` here (`let pending: Task<T> = async …;`) and \
                              `await` it in `main` — spawning at module level does not \
                              suspend, so the work still starts at load"
-                        .to_string(),
-                };
-                initializer_refusals.push(anchored(
-                    program,
-                    await_id,
-                    format!(
-                        "the initializer of `{binding_name}` awaits: a module-level binding \
+                    .to_string(),
+            };
+            initializer_refusals.push(anchored(
+                program,
+                await_id,
+                format!(
+                    "the initializer of `{binding_name}` awaits: a module-level binding \
                          cannot suspend (module initialization is synchronous)"
-                    ),
-                    Some(crate::error::Note::here(span_of(program, await_id), steer)),
-                ));
-            }
+                ),
+                Some(crate::error::Note::here(span_of(program, await_id), steer)),
+            ));
         }
     }
     for (error, source) in initializer_refusals {
@@ -1413,7 +1413,6 @@ fn span_of(program: &Program, id: Id) -> crate::span::Span {
 /// Transitive `sync` violations at one call: an argument async ONLY through
 /// the instance's bits flowing into a `sync`-contract parameter. (The direct
 /// case — async at the call site itself — is the global divergence check's.)
-#[allow(clippy::too_many_arguments)]
 fn sync_violations_at(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
@@ -1481,7 +1480,6 @@ fn sync_violations_at(
 /// Transitive host-boundary violations: an argument async only through the
 /// instance's bits flowing into an `external` function's value-returning
 /// closure parameter.
-#[allow(clippy::too_many_arguments)]
 fn extern_violations_at(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
@@ -1554,7 +1552,6 @@ fn extern_violations_at(
 /// instantiation) — an async closure argument at such a call is refused
 /// unless every candidate's parameter at that position is `async`-declared
 /// (the typed channel, which works today).
-#[allow(clippy::too_many_arguments)]
 fn dispatch_refusals_at(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
@@ -1629,7 +1626,6 @@ fn dispatch_refusals_at(
 /// callee's own parameter ids and the flags are this component's own members,
 /// so a position outside the instance cannot pass both halves. The direct case
 /// is the global check's, exactly as `sync_violations_at` leaves it.
-#[allow(clippy::too_many_arguments)]
 fn escape_violations_in(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,
@@ -1740,7 +1736,6 @@ fn value_async_in(
 
 /// The callee's adapted-parameter set for one call, in an instance's
 /// context — empty when nothing adapts.
-#[allow(clippy::too_many_arguments)]
 fn bits_for_call(
     program: &Program,
     held_values: &HashMap<Id, Vec<Id>>,

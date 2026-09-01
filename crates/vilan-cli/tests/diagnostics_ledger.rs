@@ -759,7 +759,7 @@ fn every_appendix_entry_carries_a_quoted_head() {
         let is_entry_head = line.starts_with("**")
             && line
                 .trim_end()
-                .trim_end_matches(|c: char| c == ')' || c == '*' || c == '(')
+                .trim_end_matches([')', '*', '('])
                 .ends_with("**")
             || line.starts_with("**") && line.trim_end().ends_with("**");
         if !is_entry_head || line.starts_with("**\"") {

@@ -9,6 +9,46 @@ members = [
     "crates/vilan-wasm",
 ]
 
+# The clippy gate's exception list (backlog N21). `cargo clippy --workspace
+# --all-targets -- -D warnings` is a CI leg, so every finding is an error and an
+# exception has to be WRITTEN DOWN — which is the point of collecting them here
+# rather than scattering `#[allow]`s. Each entry is a decision about the SHAPE OF
+# THIS CODEBASE, one no individual site could answer differently; a lint whose
+# verdict is a per-site judgment stays live and gets its allow at the site, with
+# its reason (`platform_color.rs`'s borrow-ending copy, `interpreter.rs`'s
+# `to_js_string` receiver, `tests/support/boot.rs`'s try_wait loop are the three
+# today). `#![allow(clippy::all)]` is deliberately not what this is.
+#
+# Each crate opts in with `[lints] workspace = true`, which covers its every
+# target — lib, bin, tests, build script.
+[workspace.lints.clippy]
+# The compiler threads explicit context through its entry points instead of
+# bundling it into a parameter struct: a `&mut Analyzer` plus the ids, spans and
+# substitution maps one step needs, passed on. The tree carried 22 per-site
+# allows for this one threshold before this line existed, across the analyzer,
+# the macro world, async inference and bindgen — that is a decision about the
+# codebase, not 22 decisions, and a parameter struct assembled per call would
+# hide which of its fields a callee actually reads.
+too_many_arguments = "allow"
+# Return tuples and callback types in the compiler ARE the shape of the data:
+# `(Type, Vec<(TypeId, TypeId)>)` says what reconciliation yields, where a named
+# alias would say `Reconciled` and send every reader to its definition. The lint
+# asks for indirection at exactly the sites where the shape is the documentation.
+# Two per-site allows for it are deleted with the 22 above.
+type_complexity = "allow"
+# The recursive walkers over patterns, types and values are METHODS because they
+# belong beside their siblings on `Analyzer` / `Interpreter`, and a leaf case
+# that happens not to touch `self` does not change where the code lives. Taking
+# the lint's advice would move a handful of arms out to free functions and split
+# one walk across two namespaces.
+only_used_in_recursion = "allow"
+# `Node`, the parser's type forms and the formatter's layout enum are hot AST
+# enums matched in the innermost loops of every phase. Boxing the large variant
+# to even the sizes trades a memcpy the profiler never showed for a pointer chase
+# on every match — a performance decision, made in the other direction, that the
+# lint is not in a position to make.
+large_enum_variant = "allow"
+
 # Distributed binaries carry no symbol tables (smaller, and fewer places for
 # build-machine paths to hide — release CI also remaps, and checks).
 [profile.release]

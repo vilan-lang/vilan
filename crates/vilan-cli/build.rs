@@ -20,13 +20,13 @@ fn main() {
             "cargo:rerun-if-changed={}",
             git_dir.join("packed-refs").display()
         );
-        if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
-            if let Some(reference) = head.trim().strip_prefix("ref: ") {
-                println!(
-                    "cargo:rerun-if-changed={}",
-                    git_dir.join(reference).display()
-                );
-            }
+        if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD"))
+            && let Some(reference) = head.trim().strip_prefix("ref: ")
+        {
+            println!(
+                "cargo:rerun-if-changed={}",
+                git_dir.join(reference).display()
+            );
         }
     }
 

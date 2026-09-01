@@ -1197,7 +1197,7 @@ impl<'a> Interpreter<'a> {
                         Value::BigInt(n) => n
                             .checked_neg()
                             .map(Value::BigInt)
-                            .ok_or_else(|| bigint_overflow()),
+                            .ok_or_else(bigint_overflow),
                         other => Err(Failure::internal(format!(
                             "unary `-` on {}",
                             type_name(&other)
@@ -1254,10 +1254,10 @@ impl<'a> Interpreter<'a> {
         // `console.log(..)` / `process.exit(..)` are Property calls on free
         // names; everything else host-side is a dotted `Local` name.
         if let js::Node::Property(receiver, method) = subject {
-            if let js::Node::Local(base) = &**receiver {
-                if lookup(env, base).is_none() {
-                    return self.call_host_property(base, method, arguments, env);
-                }
+            if let js::Node::Local(base) = &**receiver
+                && lookup(env, base).is_none()
+            {
+                return self.call_host_property(base, method, arguments, env);
             }
             let receiver = self.eval(receiver, env)?;
             let mut values = Vec::with_capacity(arguments.len());
@@ -1266,14 +1266,14 @@ impl<'a> Interpreter<'a> {
             }
             return self.call_method(&receiver, method, values);
         }
-        if let js::Node::Local(name) = subject {
-            if lookup(env, name).is_none() {
-                let mut values = Vec::with_capacity(arguments.len());
-                for argument in arguments {
-                    values.push(self.eval(argument, env)?);
-                }
-                return self.call_host(name, values);
+        if let js::Node::Local(name) = subject
+            && lookup(env, name).is_none()
+        {
+            let mut values = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                values.push(self.eval(argument, env)?);
             }
+            return self.call_host(name, values);
         }
         let callee = self.eval(subject, env)?;
         let mut values = Vec::with_capacity(arguments.len());
@@ -2319,7 +2319,7 @@ impl<'a> Interpreter<'a> {
                 } else {
                     s.encode_utf16().count() as f64
                 };
-                str_result(substring_checked(&s, start, end)?)
+                str_result(substring_checked(s, start, end)?)
             }
             other => Err(Failure::unsupported(format!("the string method `{other}`"))),
         }
@@ -2569,6 +2569,15 @@ impl<'a> Interpreter<'a> {
     // --- Conversions & printing ---
 
     /// JS `ToString` — string concatenation and `String(x)`.
+    ///
+    /// `self` is the interpreter, not the subject: the value being converted is
+    /// the PARAMETER, and the receiver is taken by `&mut` because a conversion
+    /// can fail into the interpreter's failure path. `wrong_self_convention`
+    /// reads the `to_` prefix as a claim about the receiver, which it is not.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "`self` is the interpreter, the subject is `value`"
+    )]
     fn to_js_string(&mut self, value: &Value) -> Result<String, Failure> {
         Ok(match value {
             Value::Undefined => "undefined".to_string(),
@@ -2865,7 +2874,6 @@ fn expect_array<'a>(value: &Value<'a>) -> Result<Rc<RefCell<Vec<Value<'a>>>>, Fa
     }
 }
 
-#[allow(clippy::type_complexity)]
 fn expect_map<'a>(
     value: &Value<'a>,
 ) -> Result<Rc<RefCell<IndexMap<Key, (Value<'a>, Value<'a>)>>>, Failure> {

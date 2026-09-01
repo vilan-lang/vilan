@@ -1875,10 +1875,7 @@ mod tests {
             leg("probe", false, "p0", None),
             leg("client", true, "c0", None),
         ];
-        assert_eq!(
-            classify(&previous, &next_server, Some("server")).restart_server,
-            true
-        );
+        assert!(classify(&previous, &next_server, Some("server")).restart_server);
     }
 
     #[test]

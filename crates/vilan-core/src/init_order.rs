@@ -995,10 +995,10 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
         while let Some(unit) = pending.pop() {
             reached.push(unit);
             for call in self.graph.calls_of(unit) {
-                if let CallTarget::Function(callee) | CallTarget::Closure(callee) = call.target {
-                    if seen.insert(callee) {
-                        pending.push(callee);
-                    }
+                if let CallTarget::Function(callee) | CallTarget::Closure(callee) = call.target
+                    && seen.insert(callee)
+                {
+                    pending.push(callee);
                 }
             }
         }

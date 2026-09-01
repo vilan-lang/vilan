@@ -2194,16 +2194,12 @@ impl<'src> Transformer<'src> {
             .as_ref()
             .map(|gate| vec![gate.swap_split, gate.preload])
             .unwrap_or_default();
-        let reachable_bindings = crate::platform_color::reachable_bindings(
-            self.program,
-            &graph,
-            main_fn.id,
-            &gate_roots,
-        );
+        let reachable_bindings =
+            crate::platform_color::reachable_bindings(self.program, graph, main_fn.id, &gate_roots);
         let binding_nodes: Vec<(Id, Vec<js::Node<'src>>)> = global_variables
             .iter()
             .filter(|binding| reachable_bindings.contains(binding))
-            .map(|&binding| (binding, self.walk_list(&vec![binding])))
+            .map(|&binding| (binding, self.walk_list(&[binding])))
             .collect();
 
         let saved_instance = self.enter_instance(main_fn.id, Vec::new());
@@ -2257,24 +2253,24 @@ impl<'src> Transformer<'src> {
             // void tail (e.g. a block ending in a loop) exits normally. The browser has
             // no exit code, so the tail is emitted as a plain statement — its side
             // effects still run (a `main` that ends in `render()`), the value discarded.
-            if let Some(value) = self.walk_entity(main_fn.body.1, &mut t_main_fn_body) {
-                if !matches!(value, js::Node::Void) {
-                    // A host with `process.exit` (Node) forwards `main`'s result as the
-                    // exit code; the browser (and the host-less `none`, which the CLI
-                    // refuses to *build*) has none, so the tail is a plain statement.
-                    let statement = if self.program.platform.has_process_exit() {
-                        js::Node::Call(
-                            Box::new(js::Node::Property(
-                                Box::new(js::Node::Local("process".to_string())),
-                                "exit".to_string(),
-                            )),
-                            vec![value],
-                        )
-                    } else {
-                        value
-                    };
-                    t_main_fn_body.push(statement);
-                }
+            if let Some(value) = self.walk_entity(main_fn.body.1, &mut t_main_fn_body)
+                && !matches!(value, js::Node::Void)
+            {
+                // A host with `process.exit` (Node) forwards `main`'s result as the
+                // exit code; the browser (and the host-less `none`, which the CLI
+                // refuses to *build*) has none, so the tail is a plain statement.
+                let statement = if self.program.platform.has_process_exit() {
+                    js::Node::Call(
+                        Box::new(js::Node::Property(
+                            Box::new(js::Node::Local("process".to_string())),
+                            "exit".to_string(),
+                        )),
+                        vec![value],
+                    )
+                } else {
+                    value
+                };
+                t_main_fn_body.push(statement);
             }
             t_main_fn_body
         };
@@ -3621,34 +3617,33 @@ impl<'src> Transformer<'src> {
                     .generic_dispatch
                     .get(&function_call.subject_id)
                     .copied()
+                    && let Some(&concrete_type_id) = self.current_substitution.get(&constraint_id)
                 {
-                    if let Some(&concrete_type_id) = self.current_substitution.get(&constraint_id) {
-                        let own_values = self
-                            .program
-                            .own_generic_call_bindings
-                            .get(id)
-                            .cloned()
-                            .unwrap_or_default();
-                        // A static's trait was recorded against the ACCESSOR
-                        // (the call id wasn't known at resolution).
-                        let preferred = self
-                            .program
-                            .bound_dispatch_traits
-                            .get(id)
-                            .or_else(|| {
-                                self.program
-                                    .bound_dispatch_traits
-                                    .get(&function_call.subject_id)
-                            })
-                            .cloned();
-                        if let Some(dispatch) = self.resolve_dispatch_with(
-                            concrete_type_id,
-                            member_name,
-                            &own_values,
-                            preferred,
-                        ) {
-                            return Some(self.emit_dispatch(dispatch, args, Some(*id)));
-                        }
+                    let own_values = self
+                        .program
+                        .own_generic_call_bindings
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_default();
+                    // A static's trait was recorded against the ACCESSOR
+                    // (the call id wasn't known at resolution).
+                    let preferred = self
+                        .program
+                        .bound_dispatch_traits
+                        .get(id)
+                        .or_else(|| {
+                            self.program
+                                .bound_dispatch_traits
+                                .get(&function_call.subject_id)
+                        })
+                        .cloned();
+                    if let Some(dispatch) = self.resolve_dispatch_with(
+                        concrete_type_id,
+                        member_name,
+                        &own_values,
+                        preferred,
+                    ) {
+                        return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                     }
                 }
 
@@ -3659,23 +3654,22 @@ impl<'src> Transformer<'src> {
                 // fall through to a normal emit.
                 if let Some(GenericDispatch::OnConstraint(constraint_id, member_name)) =
                     self.program.generic_dispatch.get(id).copied()
+                    && let Some(&concrete_type_id) = self.current_substitution.get(&constraint_id)
                 {
-                    if let Some(&concrete_type_id) = self.current_substitution.get(&constraint_id) {
-                        let own_values = self
-                            .program
-                            .own_generic_call_bindings
-                            .get(id)
-                            .cloned()
-                            .unwrap_or_default();
-                        let preferred = self.program.bound_dispatch_traits.get(id).cloned();
-                        if let Some(dispatch) = self.resolve_dispatch_with(
-                            concrete_type_id,
-                            member_name,
-                            &own_values,
-                            preferred,
-                        ) {
-                            return Some(self.emit_dispatch(dispatch, args, Some(*id)));
-                        }
+                    let own_values = self
+                        .program
+                        .own_generic_call_bindings
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let preferred = self.program.bound_dispatch_traits.get(id).cloned();
+                    if let Some(dispatch) = self.resolve_dispatch_with(
+                        concrete_type_id,
+                        member_name,
+                        &own_values,
+                        preferred,
+                    ) {
+                        return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                     }
                 }
 
@@ -3685,18 +3679,17 @@ impl<'src> Transformer<'src> {
                 // dispatched on the type the default is being specialized for).
                 if let Some(GenericDispatch::OnType(concrete_type, member_name)) =
                     self.program.generic_dispatch.get(id).copied()
+                    && let Some(type_id) = concrete_type.or(self.current_self_type)
                 {
-                    if let Some(type_id) = concrete_type.or(self.current_self_type) {
-                        // A `Trait::member(receiver, ..)` call names the trait to
-                        // dispatch on (B57 §3.1) — without it, two traits whose
-                        // DEFAULTS share a name both resolve to whichever the
-                        // by-name lookup reaches first.
-                        let preferred = self.program.bound_dispatch_traits.get(id).cloned();
-                        if let Some(dispatch) =
-                            self.resolve_dispatch_with(type_id, member_name, &[], preferred)
-                        {
-                            return Some(self.emit_dispatch(dispatch, args, Some(*id)));
-                        }
+                    // A `Trait::member(receiver, ..)` call names the trait to
+                    // dispatch on (B57 §3.1) — without it, two traits whose
+                    // DEFAULTS share a name both resolve to whichever the
+                    // by-name lookup reaches first.
+                    let preferred = self.program.bound_dispatch_traits.get(id).cloned();
+                    if let Some(dispatch) =
+                        self.resolve_dispatch_with(type_id, member_name, &[], preferred)
+                    {
+                        return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                     }
                 }
 
@@ -4345,25 +4338,25 @@ impl<'src> Transformer<'src> {
                     self.program.generic_dispatch.get(&id).copied()
                 {
                     let concrete = self.resolve_type_id(receiver_type_id);
-                    if !self.compares_natively(concrete) {
-                        if let Some(dispatch) = self.resolve_dispatch(concrete, member_name) {
-                            let substitution = self
-                                .program
-                                .method_call_substitution
-                                .get(&id)
-                                .cloned()
-                                .unwrap_or_default();
-                            let saved = self.current_substitution.clone();
-                            self.current_substitution.extend(substitution);
-                            let call =
-                                self.emit_dispatch(dispatch, vec![lhs.clone(), rhs.clone()], None);
-                            self.current_substitution = saved;
-                            return Some(if matches!(*op, BinaryOp::NotEq) {
-                                js::Node::Unary('!', Box::new(call))
-                            } else {
-                                call
-                            });
-                        }
+                    if !self.compares_natively(concrete)
+                        && let Some(dispatch) = self.resolve_dispatch(concrete, member_name)
+                    {
+                        let substitution = self
+                            .program
+                            .method_call_substitution
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default();
+                        let saved = self.current_substitution.clone();
+                        self.current_substitution.extend(substitution);
+                        let call =
+                            self.emit_dispatch(dispatch, vec![lhs.clone(), rhs.clone()], None);
+                        self.current_substitution = saved;
+                        return Some(if matches!(*op, BinaryOp::NotEq) {
+                            js::Node::Unary('!', Box::new(call))
+                        } else {
+                            call
+                        });
                     }
                 }
                 if let Some(GenericDispatch::OnConstraint(constraint_id, member_name)) =
@@ -4377,16 +4370,14 @@ impl<'src> Transformer<'src> {
                     // native `===`/`!==`; only an aggregate (`Option<Point>`)
                     // dispatches to its `eq` impl.
                     if let Some(concrete_type_id) = concrete.filter(|t| !self.compares_natively(*t))
+                        && let Some(dispatch) = self.resolve_dispatch(concrete_type_id, member_name)
                     {
-                        if let Some(dispatch) = self.resolve_dispatch(concrete_type_id, member_name)
-                        {
-                            let call = self.emit_dispatch(dispatch, vec![lhs, rhs], None);
-                            return Some(if matches!(*op, BinaryOp::NotEq) {
-                                js::Node::Unary('!', Box::new(call))
-                            } else {
-                                call
-                            });
-                        }
+                        let call = self.emit_dispatch(dispatch, vec![lhs, rhs], None);
+                        return Some(if matches!(*op, BinaryOp::NotEq) {
+                            js::Node::Unary('!', Box::new(call))
+                        } else {
+                            call
+                        });
                     }
                 }
                 // An overloaded operator (`a + b` where `a`'s type implements
@@ -4759,30 +4750,29 @@ impl<'src> Transformer<'src> {
                 // the const-eval interpreter runs them like any other write.
                 if let Some(&Expr::TupleIndex(subject_id, offset, width)) =
                     self.program.entity_map.get(target_id)
+                    && width > 1
                 {
-                    if width > 1 {
-                        let subject = self
-                            .walk_entity(subject_id, block)
-                            .unwrap_or(js::Node::Void);
-                        let value_name = self.ng.next_name();
-                        block.push(js::Node::ConstVariable(js::Variable {
-                            name: value_name.clone(),
-                            value: Box::new(value),
-                        }));
-                        for slot in 0..width {
-                            block.push(js::Node::Assignment(
-                                Box::new(js::Node::PropertyIndex(
-                                    Box::new(subject.clone()),
-                                    Box::new(js::Node::Number((offset + slot).to_string(), None)),
-                                )),
-                                Box::new(js::Node::PropertyIndex(
-                                    Box::new(js::Node::Local(value_name.clone())),
-                                    Box::new(js::Node::Number(slot.to_string(), None)),
-                                )),
-                            ));
-                        }
-                        return None;
+                    let subject = self
+                        .walk_entity(subject_id, block)
+                        .unwrap_or(js::Node::Void);
+                    let value_name = self.ng.next_name();
+                    block.push(js::Node::ConstVariable(js::Variable {
+                        name: value_name.clone(),
+                        value: Box::new(value),
+                    }));
+                    for slot in 0..width {
+                        block.push(js::Node::Assignment(
+                            Box::new(js::Node::PropertyIndex(
+                                Box::new(subject.clone()),
+                                Box::new(js::Node::Number((offset + slot).to_string(), None)),
+                            )),
+                            Box::new(js::Node::PropertyIndex(
+                                Box::new(js::Node::Local(value_name.clone())),
+                                Box::new(js::Node::Number(slot.to_string(), None)),
+                            )),
+                        ));
                     }
+                    return None;
                 }
                 // `list[i] = v` — the checked write (`__at_put`): writing never
                 // creates a slot (growth is `push`), so an out-of-bounds write
@@ -6827,10 +6817,10 @@ impl<'src> Transformer<'src> {
     /// every requirement, memo hit or fresh emission alike (`const-eval.md`
     /// §10.6). A no-op outside the const pass.
     fn record_require(&mut self, key: Option<EmissionId>) {
-        if let (Some(recorder), Some(key)) = (&mut self.recorder, key) {
-            if let Some(frame) = recorder.frames.last_mut() {
-                frame.requires.push(key);
-            }
+        if let (Some(recorder), Some(key)) = (&mut self.recorder, key)
+            && let Some(frame) = recorder.frames.last_mut()
+        {
+            frame.requires.push(key);
         }
     }
 
@@ -7129,15 +7119,15 @@ impl<'src> Transformer<'src> {
         }
         let mut substitution = HashMap::default();
         self.bind_generics(impl_subject, type_id, &mut substitution);
-        if !own_generic_values.is_empty() {
-            if let Some(function) = self.program.functions.get(&member_id) {
-                for (constraint_id, value) in function
-                    .generic_parameter_constraint_ids
-                    .iter()
-                    .zip(own_generic_values.iter())
-                {
-                    substitution.insert(*constraint_id, *value);
-                }
+        if !own_generic_values.is_empty()
+            && let Some(function) = self.program.functions.get(&member_id)
+        {
+            for (constraint_id, value) in function
+                .generic_parameter_constraint_ids
+                .iter()
+                .zip(own_generic_values.iter())
+            {
+                substitution.insert(*constraint_id, *value);
             }
         }
         let name = if substitution.is_empty() {
@@ -7220,7 +7210,7 @@ impl<'src> Transformer<'src> {
                 recorder.defaults.insert(key.clone(), id);
             });
             let substitution = self.trait_parameter_substitution(default_id, type_id);
-            let saved_self = std::mem::replace(&mut self.current_self_type, Some(type_id));
+            let saved_self = self.current_self_type.replace(type_id);
             let saved_substitution =
                 std::mem::replace(&mut self.current_substitution, substitution);
             let frame = self.record_enter();
@@ -7242,10 +7232,10 @@ impl<'src> Transformer<'src> {
             if let Some(shared) = shared {
                 self.default_instances
                     .insert(key.clone(), shared.name.clone());
-                if let Some(recorder) = self.recorder.as_mut() {
-                    if let Some(emission) = shared.emission {
-                        recorder.defaults.insert(key, emission);
-                    }
+                if let Some(recorder) = self.recorder.as_mut()
+                    && let Some(emission) = shared.emission
+                {
+                    recorder.defaults.insert(key, emission);
                 }
                 self.record_require(shared.emission);
                 return shared.name;
@@ -7628,10 +7618,10 @@ impl<'src> Transformer<'src> {
             match self.program.entity_map.get(&tail) {
                 Some(Expr::Void) | None => {}
                 Some(_) => {
-                    if let Some(node) = self.walk_entity(tail, &mut body) {
-                        if !matches!(node, js::Node::Void) {
-                            body.push(node);
-                        }
+                    if let Some(node) = self.walk_entity(tail, &mut body)
+                        && !matches!(node, js::Node::Void)
+                    {
+                        body.push(node);
                     }
                 }
             }
@@ -8008,10 +7998,10 @@ impl<'src> Transformer<'src> {
             let Some(trait_) = self.program.traits.get(&id) else {
                 continue;
             };
-            if let Some(&member_id) = trait_.declarations.get(member) {
-                if self.function_has_body(member_id) {
-                    return Some(member_id);
-                }
+            if let Some(&member_id) = trait_.declarations.get(member)
+                && self.function_has_body(member_id)
+            {
+                return Some(member_id);
             }
             for supertrait_type_id in &trait_.supertraits {
                 if let Some(Type::Trait(super_id, _)) =
@@ -8162,10 +8152,10 @@ impl<'src> Transformer<'src> {
     /// name and therefore the one that must carry the body into its program.
     fn take_shared_body(&mut self, key: (Id, Vec<String>, Vec<Id>), shared: SharedBody) -> String {
         self.instances.insert(key.clone(), shared.name.clone());
-        if let Some(recorder) = self.recorder.as_mut() {
-            if let Some(emission) = shared.emission {
-                recorder.instances.insert(key, emission);
-            }
+        if let Some(recorder) = self.recorder.as_mut()
+            && let Some(emission) = shared.emission
+        {
+            recorder.instances.insert(key, emission);
         }
         self.record_require(shared.emission);
         shared.name
@@ -9727,10 +9717,10 @@ fn collect_reserved_names(program: &Program) -> HashSet<String> {
     let mut reserved: HashSet<String> =
         RESERVED_NAMES.iter().map(|name| name.to_string()).collect();
     for external in program.external_functions.values() {
-        if let Some(ExternBinding::Function { symbol, .. }) = &external.extern_binding {
-            if let Some(root) = symbol.split('.').next() {
-                reserved.insert(root.to_string());
-            }
+        if let Some(ExternBinding::Function { symbol, .. }) = &external.extern_binding
+            && let Some(root) = symbol.split('.').next()
+        {
+            reserved.insert(root.to_string());
         }
     }
     reserved

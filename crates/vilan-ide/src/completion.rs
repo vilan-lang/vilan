@@ -570,10 +570,11 @@ fn innermost_open_tag_end(
             Node::Error => error_tag_name_end(source, span.start, span.end),
             _ => None,
         };
-        if let Some(tag_end) = tag_end {
-            if tag_end <= offset && best.is_none_or(|(width, _)| span.end - span.start <= width) {
-                *best = Some((span.end - span.start, tag_end));
-            }
+        if let Some(tag_end) = tag_end
+            && tag_end <= offset
+            && best.is_none_or(|(width, _)| span.end - span.start <= width)
+        {
+            *best = Some((span.end - span.start, tag_end));
         }
     }
     node.0
@@ -1689,12 +1690,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
             self.push_methods(namespace, false, &mut items);
         } else if program.structs.contains_key(&namespace) {
             self.push_methods(namespace, false, &mut items);
-        } else if let Some(module) = program.modules.get(&namespace) {
-            if let Some(scope) = program.scopes.get(&module.body.1) {
-                for (name, id) in &scope.name_to_id_map {
-                    let kind = self.kind_of(*id);
-                    items.push(self.entity_completion(name.to_string(), *id, kind));
-                }
+        } else if let Some(module) = program.modules.get(&namespace)
+            && let Some(scope) = program.scopes.get(&module.body.1)
+        {
+            for (name, id) in &scope.name_to_id_map {
+                let kind = self.kind_of(*id);
+                items.push(self.entity_completion(name.to_string(), *id, kind));
             }
         }
         items

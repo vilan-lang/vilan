@@ -189,10 +189,10 @@ pub(crate) fn scope_for<'r>(
                     })
             }
         };
-        if let Some(target) = target {
-            if let Some(def) = registry.module(&target).and_then(|macros| macros.get(leaf)) {
-                names.insert(leaf.to_string(), def);
-            }
+        if let Some(target) = target
+            && let Some(def) = registry.module(&target).and_then(|macros| macros.get(leaf))
+        {
+            names.insert(leaf.to_string(), def);
         }
     }
     // 3. The file's own macros (highest precedence).
@@ -1526,7 +1526,6 @@ impl Expander<'_, '_> {
     /// Runs one macro call: the raw-text expansion cache, per-site gensym
     /// stamping, parsing (as items, or as one expression for an expression
     /// site), and the nested-expansion recursion.
-    #[allow(clippy::too_many_arguments)]
     fn expand_call(
         &mut self,
         def: &MacroDef,
@@ -2016,7 +2015,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                     string_literal(name.0),
                     array(variants),
                     string_literal(
-                        &crate::analyzer::backed_enum_backing_type_of(item).unwrap_or_default(),
+                        crate::analyzer::backed_enum_backing_type_of(item).unwrap_or_default(),
                     ),
                 ]),
             ])

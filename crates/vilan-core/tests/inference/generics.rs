@@ -4109,7 +4109,7 @@ fn client_connect_enforces_the_contract_and_wires_mirrors() {
     // the ranges Hyper-V/WSL reserve outright (windows-support.md §4), and a
     // probe-then-substitute port keeps a TOCTOU window the OS can close for us.
     assert_compiles_and_runs(
-        &r#"
+        r#"
 import std::io::print;
         import std::process::exit;
         import std::time::sleep;

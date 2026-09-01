@@ -886,7 +886,7 @@ fn textmate_operator_regex() -> String {
                 .iter()
                 .map(|(sequence, _)| *sequence),
         )
-        .map(|sequence| escape_regex_literal(sequence))
+        .map(escape_regex_literal)
         .collect();
     format!(
         "{}|{}",

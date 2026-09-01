@@ -26,6 +26,14 @@ pub struct Boot {
 /// holds the event loop for as long as anything lets it, so the wait is bounded
 /// and a child still alive at the deadline is killed BY THE HARNESS and reported
 /// as a started server rather than left to outlive the suite.
+// The child IS reaped on both paths — the `try_wait` loop below reaps a server
+// that exited on its own, and the `started` branch kills and `wait`s one that
+// did not. `zombie_processes` cannot follow a `try_wait` through a loop, so it
+// sees only the spawn.
+#[allow(
+    clippy::zombie_processes,
+    reason = "reaped by the try_wait loop or by the kill/wait below"
+)]
 pub fn boot(staged: &Path) -> Boot {
     let log = staged.join("boot.log");
     let file = std::fs::File::create(&log).expect("create the boot log");

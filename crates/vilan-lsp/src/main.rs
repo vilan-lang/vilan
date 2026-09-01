@@ -2114,7 +2114,7 @@ impl LanguageServer for Backend {
                         }
                         None => position >= range.start && position <= range.end,
                     };
-                    visible.then(|| InlayHint {
+                    visible.then_some(InlayHint {
                         position,
                         label: InlayHintLabel::String(label),
                         kind: Some(InlayHintKind::TYPE),
@@ -2509,10 +2509,10 @@ impl LanguageServer for Backend {
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         self.fenced("formatting", Err(handler_panicked()), || {
             let uri = params.text_document.uri;
-            if let Ok(path) = uri.to_file_path() {
-                if formatting_declined(&path) {
-                    return Ok(None);
-                }
+            if let Ok(path) = uri.to_file_path()
+                && formatting_declined(&path)
+            {
+                return Ok(None);
             }
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
@@ -2653,26 +2653,26 @@ impl LanguageServer for Backend {
                         }));
                     }
                 }
-                if wants_fix_all_imports {
-                    if let Some((span, new_text)) = document.add_all_missing_imports_edit(program) {
-                        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-                        changes.insert(
-                            uri.clone(),
-                            vec![TextEdit {
-                                range: document.line_index.range(&span),
-                                new_text,
-                            }],
-                        );
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: "Add All Missing Imports".to_string(),
-                            kind: Some(fix_all_imports_kind()),
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            }),
+                if wants_fix_all_imports
+                    && let Some((span, new_text)) = document.add_all_missing_imports_edit(program)
+                {
+                    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                    changes.insert(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: document.line_index.range(&span),
+                            new_text,
+                        }],
+                    );
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Add All Missing Imports".to_string(),
+                        kind: Some(fix_all_imports_kind()),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
                             ..Default::default()
-                        }));
-                    }
+                        }),
+                        ..Default::default()
+                    }));
                 }
             }
             if actions.is_empty() {

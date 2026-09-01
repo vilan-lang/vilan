@@ -2,7 +2,8 @@
 //! `proposal/frontend.md`).
 //!
 //! Through the arc, `parse_expr_differential.rs` compared the handwritten parser
-//! against the chumsky ORACLE over these fixtures (`parse_expr_fixtures.rs`),
+//! against the chumsky ORACLE over these fixtures
+//! (`parse_expr_regression/fixtures.rs`),
 //! wrapping each in `let __probe = <expr>;` / `if <cond> { }` and `Debug`-comparing
 //! the extracted subtree — the fine-grained precedence/grouping coverage the
 //! whole-file corpus sweep (`parse_differential.rs`) cannot isolate, since no corpus
@@ -286,4 +287,8 @@ const SNAP_COND_SHL_GT: &str = "(Binary(Gt, (Binary(Shl, (Accessor(\"a\"), 3..4)
 const SNAP_COND_IS_OR: &str = "(Binary(Or, (Is((Accessor(\"a\"), 3..4), (Variant([\"None\"], None), 8..12)), 3..12), (Is((Accessor(\"b\"), 16..17), (Variant([\"None\"], None), 21..25)), 16..25)), 3..25)";
 const SNAP_COND_PAREN_STRUCT: &str = "(StructInitializer(\"Foo\", None, ([((\"x\", Some((Number(\"1\", None, None), 14..15))), 10..15)], 8..17)), 4..17)";
 
-include!("parse_expr_fixtures.rs");
+// The fixture arrays live in a SUBDIRECTORY, not beside this file: cargo makes a
+// test target out of every `tests/*.rs`, so a fixtures file at the top level was
+// also compiled as a target of its own — a binary with no tests in it, whose only
+// output was four "never used" warnings against the arrays this file consumes.
+include!("parse_expr_regression/fixtures.rs");

@@ -11,3 +11,7 @@ description = "The editor-facing queries the language server and the playground 
 # cannot follow (proposal/playground-completion.md §3).
 [dependencies]
 vilan-core = { path = "../vilan-core" }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

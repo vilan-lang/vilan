@@ -122,7 +122,6 @@ fn run_node(path: &Path, limit: Duration) -> Result<(String, i32), String> {
 
 /// Runs `source` through the pipeline once, then both execution paths.
 /// Returns `(node stdout, node exit code, interpreter result)`.
-#[allow(clippy::type_complexity)]
 /// A corpus program's package root is the corpus DIRECTORY, not the process
 /// working directory. Every runner over the corpus has to say so: a corpus
 /// program may name a project file — `const asset::bundle` carries a resource
