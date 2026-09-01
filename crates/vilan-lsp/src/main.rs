@@ -482,9 +482,12 @@ struct Backend {
     /// *stale* rather than merely absent, which is why `plan_publish` drops the
     /// re-planning owner's entry before it computes the new one — see there.
     publish_state: Arc<std::sync::Mutex<PublishState>>,
-    /// `std` files don't change during a session, so cache their line indices
-    /// rather than re-reading the file on every cross-file definition/reference.
-    line_indices: Arc<DashMap<PathBuf, Arc<LineIndex>>>,
+    /// Line indices for files that are on disk and not buffered — `std`, and
+    /// the workspace files a cross-file definition or reference reaches — so a
+    /// query does not re-read and re-index one on every lookup. Each entry
+    /// carries the [`FileStamp`] it was built from and is only served while the
+    /// file still matches it (E112).
+    line_indices: Arc<DashMap<PathBuf, (FileStamp, Arc<LineIndex>)>>,
     /// The client's feature settings, seeded from `initializationOptions` and
     /// updated live by `workspace/didChangeConfiguration`. Read per request
     /// (`inlay_hint`, `semantic_tokens_full`, …) so a toggle takes effect without
@@ -513,6 +516,31 @@ struct Backend {
     /// route. Held across the sends and nothing else — the analyses themselves
     /// stay fully concurrent.
     publish_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// What a cached read of a file is only valid for: the file's length and its
+/// modification time, as one comparable value (E112).
+///
+/// This is the whole invalidation rule for [`Backend::line_indices`]. It is
+/// deliberately not a content hash — the point of the cache is to avoid reading
+/// the file, and a `metadata` call is orders of magnitude cheaper than a read
+/// plus an index build, so the cache keeps the win it exists for and stops
+/// answering for text that is gone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileStamp {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// The current stamp of the file at `path`, or `None` when it cannot be
+/// stat-ed — which is the "do not cache this" answer: an entry with no stamp
+/// could never be invalidated, which is the bug.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// Locate the `std` package directory: `$VILAN_STD`, else the nearest ancestor
@@ -1740,18 +1768,31 @@ impl Backend {
     /// The line index for a file another source's span points into, cached by
     /// path so a cross-file query doesn't re-read and re-index on every lookup.
     ///
-    /// The cache holds only files whose text is STABLE for the session — which
-    /// is what "on disk, not open in the editor" means. A path with a buffer
-    /// registered is indexed fresh every time and never stored: its text is one
-    /// keystroke old, so a stored index would misplace every range it converts
-    /// from the next edit onward. (The session cache has no invalidation, by
-    /// design — it was written for `std`, whose files genuinely do not change.
-    /// Once `read_source` began answering from the overlay, "never invalidate"
-    /// stopped being safe for anything else, so the fix is to not cache those.)
+    /// A path with a buffer registered is indexed fresh every time and never
+    /// stored: its text is one keystroke old, so a stored index would misplace
+    /// every range it converts from the next edit onward.
+    ///
+    /// Every other entry is validated against the file's [`FileStamp`] (E112).
+    /// The cache used to have no invalidation at all, documented as safe
+    /// because it was written for `std`, "whose files genuinely do not change".
+    /// That was never a property of the KEY — it is a property of std, and the
+    /// map holds whatever a cross-file query asks for. A workspace file is
+    /// exempt from the cache only while it is buffered, so CLOSING a document
+    /// makes it cacheable; a file cached before it was ever opened kept its
+    /// pre-edit index across the whole open/edit/save/close cycle, and every
+    /// later reference into it converted through the wrong line breaks. So the
+    /// invariant is made true instead of assumed: a hit must match the file's
+    /// current length and modification time, and anything else re-reads. That
+    /// also covers what no did-close hook could — a change made outside the
+    /// editor entirely, a `git checkout` or a generator's rewrite.
     fn line_index_for(&self, path: &Path) -> Option<Arc<LineIndex>> {
         let buffered = vilan_core::analyzer::document_overlay_contains(path);
-        if !buffered && let Some(cached) = self.line_indices.get(path) {
-            return Some(Arc::clone(cached.value()));
+        let stamp = if buffered { None } else { file_stamp(path) };
+        if let Some(stamp) = stamp
+            && let Some(cached) = self.line_indices.get(path)
+            && cached.value().0 == stamp
+        {
+            return Some(Arc::clone(&cached.value().1));
         }
         // A disk read is BOM-stripped, matching the analyzer's read of the same
         // file (windows-support.md §2); a buffer comes back verbatim. Either
@@ -1759,9 +1800,12 @@ impl Backend {
         // analyzer saw, which is the whole point.
         let text = vilan_core::util::read_source(path).ok()?;
         let line_index = Arc::new(LineIndex::new(&text));
-        if !buffered {
+        // Stamped with what was read BEFORE the read, so a file that changed
+        // during it looks stale on the next lookup and is read again — the
+        // conservative direction, and the only one that cannot answer wrong.
+        if let Some(stamp) = stamp {
             self.line_indices
-                .insert(path.to_path_buf(), Arc::clone(&line_index));
+                .insert(path.to_path_buf(), (stamp, Arc::clone(&line_index)));
         }
         Some(line_index)
     }
@@ -5055,5 +5099,93 @@ mod package_recolor_tests {
             None,
             "a file with no package of its own sweeps nobody",
         );
+    }
+}
+
+/// E112: `line_indices` is a by-path cache of files that are on disk and not
+/// buffered, and it had no invalidation — documented as safe because it was
+/// "written for `std`, whose files do not change". Stability was never a
+/// property of the key. A workspace file is exempt only while a buffer is
+/// registered for it, so a file cached before it was ever opened kept its
+/// pre-edit index across the whole open/edit/save/close cycle, and every later
+/// cross-file reference into it converted spans through the wrong line breaks.
+/// Correctness, not perf — a wrong position, published.
+#[cfg(test)]
+mod line_index_cache_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+
+    /// A scratch file with `contents`, in a directory unique to this test.
+    fn scratch(name: &str, contents: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-line-index-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("module.vl");
+        std::fs::write(&path, contents).expect("a source file");
+        (directory, path)
+    }
+
+    #[test]
+    fn a_file_that_changed_on_disk_is_re_indexed() {
+        // One line, then three: the line breaks the index converts through move,
+        // which is exactly what a stale entry gets wrong.
+        let (directory, path) = scratch("stale", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let first = backend.line_index_for(&path).expect("readable");
+        assert_eq!(
+            first.position(20).line,
+            0,
+            "the one-line file puts every offset on line 0",
+        );
+        // The file is rewritten under the server — a save from another window,
+        // a `git checkout`, a generator. Nothing notifies it.
+        std::fs::write(&path, "fun answer(): i32 {\n\t1\n}\n").expect("a rewrite");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert_eq!(
+            second.position(21).line,
+            1,
+            "the index must describe the file that is there now, not the one that was",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unchanged_file_still_answers_from_the_cache() {
+        // The other half: the validation must not turn the cache off. An
+        // unchanged file answers with the very same `Arc` — no re-read, no
+        // re-index, which is the whole reason the map exists.
+        let (directory, path) = scratch("cached", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let first = backend.line_index_for(&path).expect("readable");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged file is served from the cache",
+        );
+        assert_eq!(backend.line_indices.len(), 1, "one entry, not two");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_buffered_file_is_never_cached() {
+        // Unchanged from before, and re-pinned here because the stamp must not
+        // become an excuse to start caching a buffer: its text is one keystroke
+        // old on disk, and the overlay is the truth.
+        let (directory, path) = scratch("buffered", "fun answer(): i32 { 1 }\n");
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        vilan_core::analyzer::set_document_overlay(&path, Some("fun answer(): i32 { 2 }\n".into()));
+        let first = backend.line_index_for(&path).expect("readable");
+        let second = backend.line_index_for(&path).expect("readable");
+        assert!(!Arc::ptr_eq(&first, &second), "indexed fresh every time");
+        assert!(backend.line_indices.is_empty(), "and never stored");
+        vilan_core::analyzer::set_document_overlay(&path, None);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
