@@ -2047,22 +2047,42 @@ fn split_needs_a_browser_leg(key: &str, declared: &str) -> String {
 /// owner from an impostor, and a library's own name — unlike a dependency key
 /// — never binds an import root.
 pub(crate) fn reserved_package_name(name: &str) -> Option<&'static str> {
-    match name {
-        "std" => Some("the standard library owns it"),
-        "pkg" => Some("it always means the importing package's own modules"),
-        "macro_std" => Some("the macro standard library owns it"),
-        "vilan" => Some("the language owns its own name"),
-        _ => None,
-    }
+    RESERVED_PACKAGE_NAMES
+        .iter()
+        .find(|(reserved, _)| *reserved == name)
+        .map(|(_, reason)| *reason)
 }
+
+/// The reserved set and why each name is reserved — the one enumerable copy,
+/// which is what lets the sentence below be checked rather than believed.
+const RESERVED_PACKAGE_NAMES: [(&str, &str); 4] = [
+    ("std", "the standard library owns it"),
+    ("pkg", "it always means the importing package's own modules"),
+    ("macro_std", "the macro standard library owns it"),
+    ("vilan", "the language owns its own name"),
+];
+
+/// The clause every reserved-name refusal carries: the whole set, so a reader
+/// who hit one name learns the rule rather than the instance.
+///
+/// It is a CONSTANT because it forked once (N38). `vilan` joined the set at
+/// Order 11, and only the manifest's refusal learned it: the analyzer's
+/// sibling refusal — the one for a staged dependency EDGE — went on naming
+/// three of the four for two releases, so the same rule reached a reader as two
+/// different rules depending on which layer refused. One string, read by both,
+/// and [`the_reserved_clause_names_the_whole_set`] holds it against
+/// [`RESERVED_PACKAGE_NAMES`] so the set cannot grow past its own sentence
+/// again.
+pub(crate) const RESERVED_PACKAGE_NAMES_CLAUSE: &str =
+    "`std`, `pkg`, `macro_std`, and `vilan` are all reserved";
 
 /// The refusal for a reserved package name: the rule, the whole reserved set,
 /// and the one fix (`renamed` names the thing to rename — the package or the
 /// dependency).
 fn reserved_name_refusal(name: &str, reason: &str, renamed: &str) -> String {
     format!(
-        "`{name}` is a reserved package name: {reason} (`std`, `pkg`, \
-         `macro_std`, and `vilan` are all reserved); rename the {renamed}"
+        "`{name}` is a reserved package name: {reason} \
+         ({RESERVED_PACKAGE_NAMES_CLAUSE}); rename the {renamed}"
     )
 }
 
@@ -2233,11 +2253,37 @@ mod tests {
 
     /// The refusal's exact head for `name`, as [`reserved_name_refusal`]
     /// builds it — asserted verbatim so the ledger row's key stays honest.
+    ///
+    /// Deliberately a SECOND spelling of the sentence rather than a read of
+    /// `RESERVED_PACKAGE_NAMES_CLAUSE`: an independent copy is what makes these
+    /// pins say anything about the wording at all.
     fn reserved_head(name: &str, reason: &str, renamed: &str) -> String {
         format!(
             "`{name}` is a reserved package name: {reason} (`std`, `pkg`, \
              `macro_std`, and `vilan` are all reserved); rename the {renamed}"
         )
+    }
+
+    #[test]
+    fn the_reserved_clause_names_the_whole_set() {
+        // N38: the set grew and one of its two sentences did not, so the same
+        // rule reached a reader as two different rules. The sentence is now
+        // held against the set from both directions.
+        for (name, _) in RESERVED_PACKAGE_NAMES {
+            assert!(
+                RESERVED_PACKAGE_NAMES_CLAUSE.contains(&format!("`{name}`")),
+                "the reserved set contains `{name}`, but the clause every refusal \
+                 carries does not name it: {RESERVED_PACKAGE_NAMES_CLAUSE}"
+            );
+        }
+        let named = RESERVED_PACKAGE_NAMES_CLAUSE.matches('`').count() / 2;
+        assert_eq!(
+            named,
+            RESERVED_PACKAGE_NAMES.len(),
+            "the clause names {named} package name(s) and the set has {}: \
+             {RESERVED_PACKAGE_NAMES_CLAUSE}",
+            RESERVED_PACKAGE_NAMES.len()
+        );
     }
 
     #[test]

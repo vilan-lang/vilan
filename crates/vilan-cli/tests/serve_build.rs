@@ -24,11 +24,11 @@
 //!      body forces (kolt.local 022).
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod support;
 
@@ -56,8 +56,8 @@ enum Client {
     Styled,
 }
 
-fn stage(tag: &str, port: u16, client: Client, split: bool) -> PathBuf {
-    stage_serving(tag, client, split, server_source(port))
+fn stage(tag: &str, client: Client, split: bool) -> PathBuf {
+    stage_serving(tag, client, split, server_source())
 }
 
 /// [`stage`] with the server file supplied, for the pins whose subject is what
@@ -99,7 +99,13 @@ fn write_manifest(staged: &Path, split: bool) {
     .expect("write the manifest");
 }
 
-fn server_source(port: u16) -> String {
+/// The server under test, asking for port 0 and announcing what it got.
+///
+/// N40: the port used to be an ephemeral one this file bound, read and released
+/// before the build that baked it in — see `support::port` for the window that
+/// opened and why the server picking its own closes it.
+fn server_source() -> String {
+    let announce = support::port::ANNOUNCE_PORT;
     format!(
         "import std::build::require_build;\n\
          import std::http::{{ Request, Response, Server }};\n\
@@ -108,10 +114,10 @@ fn server_source(port: u16) -> String {
          async fun main() {{\n\
          \tlet build = require_build(\"client\");\n\
          \tServer::builder()\n\
-         \t\t.port({port})\n\
+         \t\t.port(0)\n\
          \t\t.serve_build(build)\n\
          \t\t.on_request(|request| Response::builder().set_header(\"Content-Type\", \"text/html\").body(\"<div id=\\\"app\\\"></div>\").build())\n\
-         \t\t.on_start(|server| print(\"listening\"))\n\
+         \t\t.on_start(|server| {announce})\n\
          \t\t.build()\n\
          \t\t.start();\n\
          }}\n"
@@ -123,7 +129,8 @@ fn server_source(port: u16) -> String {
 /// expression over the artifact's route — the stylesheet is treated as the
 /// fingerprinted tier (long-lived, no validator), everything else as the shell
 /// tier (revalidated, `no-cache`).
-fn cached_server_source(port: u16) -> String {
+fn cached_server_source() -> String {
+    let announce = support::port::ANNOUNCE_PORT;
     format!(
         "import std::build::require_build;\n\
          import std::http::{{ CachePolicy, Request, Response, Server }};\n\
@@ -132,7 +139,7 @@ fn cached_server_source(port: u16) -> String {
          async fun main() {{\n\
          \tlet build = require_build(\"client\");\n\
          \tServer::builder()\n\
-         \t\t.port({port})\n\
+         \t\t.port(0)\n\
          \t\t.serve_build(build)\n\
          \t\t.cache_build(|url| if url == \"/client.css\" {{\n\
          \t\t\tCachePolicy::none().cache_control(\"public, max-age=31536000, immutable\")\n\
@@ -140,7 +147,7 @@ fn cached_server_source(port: u16) -> String {
          \t\t\tCachePolicy::validated().cache_control(\"no-cache\")\n\
          \t\t}})\n\
          \t\t.on_request(|request| Response::builder().set_header(\"Content-Type\", \"text/html\").body(\"<div id=\\\"app\\\"></div>\").build())\n\
-         \t\t.on_start(|server| print(\"listening\"))\n\
+         \t\t.on_start(|server| {announce})\n\
          \t\t.build()\n\
          \t\t.start();\n\
          }}\n"
@@ -165,40 +172,23 @@ fn build(staged: &Path) {
     );
 }
 
-/// Bind an ephemeral port and release it — the standard small TOCTOU window
-/// this suite's server tests all take.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
-}
-
 /// Spawn the built server from the project root, with `env` applied — which is
-/// how the dev policy's two modes are told apart.
-fn serve(staged: &Path, env: &[(&str, &str)]) -> Child {
+/// how the dev policy's two modes are told apart — and wait for it to announce
+/// the port it bound.
+///
+/// Returning a *listening* server with a *reported* port is what retires this
+/// suite's `free_port` + `wait_for_port` pair (N40): there is no number to guess
+/// and nothing to wait for that the announcement has not already proven.
+fn serve(staged: &Path, env: &[(&str, &str)]) -> support::port::Server {
     let mut command = Command::new("node");
     command
         .arg("dist/server.mjs")
         .current_dir(staged)
-        .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (name, value) in env {
         command.env(name, value);
     }
-    command.spawn().expect("spawn the server")
-}
-
-fn wait_for_port(port: u16) -> bool {
-    let deadline = Instant::now() + support::run_liveness();
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
+    support::port::Server::spawn(&mut command)
 }
 
 /// [`http_get_raw`] carrying `headers` verbatim on the wire — each line must
@@ -304,18 +294,12 @@ fn response_headers(head: &str) -> Vec<String> {
         .collect()
 }
 
-fn stop(server: &mut Child) {
-    let _ = server.kill();
-    let _ = server.wait();
-}
-
 #[test]
 fn serve_build_answers_every_artifact_and_leaves_the_rest_to_the_app() {
-    let port = free_port();
-    let staged = stage("routes", port, Client::Styled, false);
+    let staged = stage("routes", Client::Styled, false);
     build(&staged);
     let mut server = serve(&staged, &[]);
-    assert!(wait_for_port(port), "the server should bind {port}");
+    let port = server.port();
 
     let (head, body) = http_get(port, "/client.js");
     assert!(
@@ -371,7 +355,7 @@ fn serve_build_answers_every_artifact_and_leaves_the_rest_to_the_app() {
         "nothing but `/<file name>` is claimed"
     );
 
-    stop(&mut server);
+    server.stop();
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -387,11 +371,10 @@ fn serve_build_answers_every_artifact_and_leaves_the_rest_to_the_app() {
 /// policy on the chain, `Content-Type` is the only header that goes out.
 #[test]
 fn an_opted_in_serve_build_revalidates_and_carries_its_per_route_cache_control() {
-    let port = free_port();
-    let staged = stage_serving("cached", Client::Styled, false, cached_server_source(port));
+    let staged = stage_serving("cached", Client::Styled, false, cached_server_source());
     build(&staged);
     let mut server = serve(&staged, &[]);
-    assert!(wait_for_port(port), "the server should bind {port}");
+    let port = server.port();
 
     // The validating tier: a 200 with the validator, the content type, and the
     // route's own Cache-Control.
@@ -481,7 +464,7 @@ fn an_opted_in_serve_build_revalidates_and_carries_its_per_route_cache_control()
         "the hook covers the build's routes and nothing else:\n{head}"
     );
 
-    stop(&mut server);
+    server.stop();
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -491,19 +474,18 @@ fn a_leg_that_gains_split_serves_its_chunks_with_no_server_edit() {
     // the first place. The ONLY edit between the two halves of this test is
     // `split = true` in the manifest; the server file is asserted byte-identical
     // across it, so the routes can only have come from the build.
-    let port = free_port();
-    let staged = stage("split", port, Client::Router, false);
+    let staged = stage("split", Client::Router, false);
     let server_before = std::fs::read_to_string(staged.join("src/server.vl")).expect("the server");
 
     build(&staged);
     let mut server = serve(&staged, &[]);
-    assert!(wait_for_port(port), "the server should bind {port}");
+    let port = server.port();
     let (_, body) = http_get(port, "/client.Route_Home.js");
     assert!(
         body.contains("id=\"app\""),
         "with no split there is no chunk to serve, so the app's handler answers"
     );
-    stop(&mut server);
+    server.stop();
 
     // The one edit.
     write_manifest(&staged, true);
@@ -514,8 +496,10 @@ fn a_leg_that_gains_split_serves_its_chunks_with_no_server_edit() {
         "the server file must not move — that is the whole claim"
     );
 
+    // A restart is a fresh bind, so the port is asked for again — the server
+    // reports whatever the OS gave it this time.
     let mut server = serve(&staged, &[]);
-    assert!(wait_for_port(port), "the server should bind {port} again");
+    let port = server.port();
     let mut served = 0;
     for arm in ["Route_Home", "Route_Docs", "Route_NotFound"] {
         let file = format!("client.{arm}.js");
@@ -530,7 +514,7 @@ fn a_leg_that_gains_split_serves_its_chunks_with_no_server_edit() {
         served += 1;
     }
     assert_eq!(served, 3, "every arm's chunk appeared as a route");
-    stop(&mut server);
+    server.stop();
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -540,8 +524,7 @@ fn an_artifact_the_build_named_and_did_not_write_stops_the_server() {
     // than a 404 per request for the life of the process. The manifest still
     // names `client.css`, so removing the file is exactly the "the build said
     // it wrote this" case.
-    let port = free_port();
-    let staged = stage("missing", port, Client::Styled, false);
+    let staged = stage("missing", Client::Styled, false);
     build(&staged);
     std::fs::remove_file(staged.join("dist/client.css")).expect("remove the sidecar");
 
@@ -579,8 +562,7 @@ fn an_artifact_with_an_unknown_extension_is_skipped_with_a_warning_not_silently(
     // `.png` is served and would prove nothing here. An archive is still
     // outside the fence — no build emits one, and no page loads one as a
     // sub-resource — so it is what an unnamed extension looks like today.
-    let port = free_port();
-    let staged = stage("unknown_ext", port, Client::Styled, false);
+    let staged = stage("unknown_ext", Client::Styled, false);
     build(&staged);
     // Teach the manifest an artifact the table does not know — a `.zip` chunk
     // entry — with the file ON DISK, so what this test observes is the
@@ -598,14 +580,8 @@ fn an_artifact_with_an_unknown_extension_is_skipped_with_a_warning_not_silently(
     .expect("name the unknown-extension artifact");
     std::fs::write(staged.join("dist/bundle.zip"), "zip-bytes").expect("write the artifact");
 
-    let mut server = Command::new("node")
-        .arg("dist/server.mjs")
-        .current_dir(&staged)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the server");
-    assert!(wait_for_port(port), "the server should bind {port}");
+    let mut server = serve(&staged, &[]);
+    let port = server.port();
 
     // The unknown extension is still not served: the app's fallback answers.
     let (_, body) = http_get(port, "/bundle.zip");
@@ -625,13 +601,8 @@ fn an_artifact_with_an_unknown_extension_is_skipped_with_a_warning_not_silently(
         "the sidecar's route must be untouched by the skipped artifact:\n{head}"
     );
 
-    let _ = server.kill();
-    let mut boot_output = Vec::new();
-    if let Some(mut stdout) = server.stdout.take() {
-        let _ = stdout.read_to_end(&mut boot_output);
-    }
-    let _ = server.wait();
-    let boot_output = String::from_utf8_lossy(&boot_output);
+    server.stop();
+    let boot_output = server.stdout();
     assert!(
         boot_output.contains(
             "warning: the `client` build names dist/bundle.zip, whose extension \
@@ -699,8 +670,7 @@ fn a_binary_artifact_reaches_the_wire_as_the_build_wrote_it() {
     // not carry a byte-typed artifact at any point in its chain — which is why
     // kolt had to hand-roll a static layer to serve its own favicon, and why
     // a complete content-type table could not be exercised.
-    let port = free_port();
-    let staged = stage("binary", port, Client::Styled, false);
+    let staged = stage("binary", Client::Styled, false);
     build(&staged);
     let woff2 = every_byte_woff2();
     plant_artifacts(
@@ -713,7 +683,7 @@ fn a_binary_artifact_reaches_the_wire_as_the_build_wrote_it() {
     );
 
     let mut server = serve(&staged, &[]);
-    assert!(wait_for_port(port), "the server should bind {port}");
+    let port = server.port();
 
     let (head, body) = http_get_raw(port, "/favicon.png");
     assert!(
@@ -764,7 +734,7 @@ fn a_binary_artifact_reaches_the_wire_as_the_build_wrote_it() {
     let on_disk = std::fs::read(staged.join("dist/client.js")).expect("the bundle");
     assert_eq!(body, on_disk, "the bundle must be byte-identical too");
 
-    stop(&mut server);
+    server.stop();
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -776,8 +746,7 @@ fn a_text_artifact_spells_its_charset_and_a_json_one_does_not() {
     // where naming a charset is the error rather than the fix — and
     // `.webmanifest` needs its own media type because Chrome rejects a manifest
     // served as anything else.
-    let port = free_port();
-    let staged = stage("charset", port, Client::Styled, false);
+    let staged = stage("charset", Client::Styled, false);
     build(&staged);
     plant_artifacts(
         &staged,
@@ -788,7 +757,7 @@ fn a_text_artifact_spells_its_charset_and_a_json_one_does_not() {
     );
 
     let mut server = serve(&staged, &[]);
-    assert!(wait_for_port(port), "the server should bind {port}");
+    let port = server.port();
 
     for (path, expected) in [
         ("/client.js", "Content-Type: text/javascript; charset=utf-8"),
@@ -820,7 +789,7 @@ fn a_text_artifact_spells_its_charset_and_a_json_one_does_not() {
          `application/manifest+json`:\n{head}"
     );
 
-    stop(&mut server);
+    server.stop();
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -831,15 +800,14 @@ fn the_dev_policy_revalidates_only_while_watching() {
     // the process, so bytes that move on disk under a running server were served
     // stale forever. `serve_build` re-reads per request while `run --watch` owns
     // the process, and serves the boot-time copy otherwise.
-    let port = free_port();
-    let staged = stage("fresh", port, Client::Styled, false);
+    let staged = stage("fresh", Client::Styled, false);
     build(&staged);
     let bundle = staged.join("dist/client.js");
     let original = std::fs::read_to_string(&bundle).expect("the bundle");
 
     // Release: the boot-time copy, whatever happens on disk afterwards.
     let mut server = serve(&staged, &[]);
-    assert!(wait_for_port(port), "the server should bind {port}");
+    let port = server.port();
     let (_, before) = http_get(port, "/client.js");
     assert_eq!(before, original);
     std::fs::write(&bundle, "// MOVED\n").expect("move the bytes");
@@ -848,12 +816,12 @@ fn the_dev_policy_revalidates_only_while_watching() {
         after, original,
         "outside a watch the server serves what it read at boot — no syscall per request"
     );
-    stop(&mut server);
+    server.stop();
     std::fs::write(&bundle, &original).expect("restore the bundle");
 
     // Watching: fresh, per request, with no restart and no signalling protocol.
     let mut server = serve(&staged, &[("VILAN_WATCHING", "1")]);
-    assert!(wait_for_port(port), "the watched server should bind {port}");
+    let port = server.port();
     let (_, before) = http_get(port, "/client.js");
     assert_eq!(before, original);
     std::fs::write(&bundle, "// MOVED\n").expect("move the bytes");
@@ -862,7 +830,7 @@ fn the_dev_policy_revalidates_only_while_watching() {
         after, "// MOVED\n",
         "under `run --watch` every request is an opportunity to be fresh"
     );
-    stop(&mut server);
+    server.stop();
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -871,12 +839,14 @@ fn is_watching_is_false_outside_a_watch() {
     // Uniform (`dev-refresh.md` §5's scope ruling): DEFINED under every run,
     // `true` only under one — so a program branches on it without knowing how
     // it was started.
-    let staged = stage("plainrun", free_port(), Client::Styled, false);
-    std::fs::write(
-        staged.join("src/server.vl"),
-        "import std::io::print;\nimport std::watch::is_watching;\n\nfun main() {\n\tprint(i\"watching={is_watching()}\");\n}\n",
-    )
-    .expect("write the probe");
+    // The probe IS the server here — it never binds, so it is staged directly
+    // rather than staged as a server and then overwritten.
+    let staged = stage_serving(
+        "plainrun",
+        Client::Styled,
+        false,
+        "import std::io::print;\nimport std::watch::is_watching;\n\nfun main() {\n\tprint(i\"watching={is_watching()}\");\n}\n".to_string(),
+    );
     let output = vilan(&["run", staged.to_str().expect("utf-8 temp path")]);
     let report = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -892,7 +862,6 @@ fn run_watch_tells_its_child_it_is_watching() {
     // The other half: the watcher really does set the signal on the child it
     // spawns. Without this the policy above is a claim about an environment
     // variable nobody sets.
-    let staged = stage("watchrun", free_port(), Client::Styled, false);
     // The probe stays alive only long enough for the harness to read its
     // marker, then SELF-EXPIRES: kill_watcher cannot reap the watcher's node
     // grandchild (the E60 mechanism), so an unbounded sleep here leaked one
@@ -900,12 +869,16 @@ fn run_watch_tells_its_child_it_is_watching() {
     // boot-time print under any load, and an orphan now dies on its own —
     // the watcher's restart loop may respawn it once inside the kill window,
     // and that respawn self-expires the same way.
-    std::fs::write(
-        staged.join("src/server.vl"),
+    //
+    // It never binds a port, so — like `plainrun` — it is staged directly.
+    let staged = stage_serving(
+        "watchrun",
+        Client::Styled,
+        false,
         "import std::io::print;\nimport std::watch::is_watching;\nimport std::time::sleep;\n\n\
-         async fun main() {\n\tprint(i\"watching={is_watching()}\");\n\tsleep(15000);\n}\n",
-    )
-    .expect("write the probe");
+         async fun main() {\n\tprint(i\"watching={is_watching()}\");\n\tsleep(15000);\n}\n"
+            .to_string(),
+    );
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args([

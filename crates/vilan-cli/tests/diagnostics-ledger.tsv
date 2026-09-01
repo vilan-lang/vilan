@@ -271,7 +271,7 @@ row	flagship	key
 245	-	a bare `ret` returns nothing, but the function's return type is inferred as {inferred} from {origin}; return a value, or declare the return type
 246	-	`{name}` is deprecated; {steer}
 247	flagship	`{old-spelling}` is deprecated; use `{new-spelling}`
-248	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, `macro_std`, and `vilan` are all reserved); rename the {package|dependency}
+248	flagship	`{name}` is a reserved package name: {reason} ({reserved}); rename the {package|dependency}
 249	-	`{name}` is never given a type: this closure is never called and its parameter is unannotated; annotate it (e.g. `|{name}: List<i32>|`)
 250	-	cannot iterate `{rendered}`: no bound on it provides `{next_method}(&mut self): Option<T>`, and a generic is not natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) or iterate a concrete container
 251	-	cannot iterate `{rendered}`: it has no `{next_method}(&mut self): Option<T>`, and {kind} is not natively iterable — the loop would walk its representation. Implement the iterator protocol on it, or iterate a `List` / `Set` / `Range` (a `Map` iterates through `entries()`, `keys()` or `values()`)
@@ -307,7 +307,7 @@ row	flagship	key
 281	flagship	'{member_name}' is ambiguous on '{type_str}': {}{} provide it; call {} to pick one
 282	-	a bare `?` needs a container with an element type; this is {rendered}
 283	flagship	'{member_name}' is not an inherent member of '{subject_str}': {} provide{} it; call {} instead
-284	flagship	`{name}` is a reserved package name: {reason} (`std`, `pkg`, and `macro_std` are all reserved); this workspace staged a dependency edge named `{name}` — the edge is ignored and `{name}::` keeps meaning the root it always names; rename the dependency
+284	flagship	`{name}` is a reserved package name: {reason} ({reserved}); this workspace staged a dependency edge named `{name}` — the edge is ignored and `{name}::` keeps meaning the root it always names; rename the dependency
 285	flagship	module `{name}` resolved to `{on_disk}` on disk, but it is imported as `{requested}`: Vilan matches module files by exact case, so this builds only where the filesystem ignores case; rename one to match the other
 286	flagship	`const` expressions form a dependency cycle
 287	flagship	`{name}` is a runtime value; a `const` expression reads only compile-time-known bindings
@@ -371,3 +371,13 @@ row	flagship	key
 345	flagship	`{symbol}` takes two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: `{rhs_label}` is wider than what `{lhs_label}` admits
 346	flagship	`{subject_label}`'s `{method_name}` accepts `{declared_label}`, but the right operand is `{rhs_label}`
 347	-	'{member_name}' in module '{module_name}' is not a type
+348	flagship	'{type_label}' does not implement trait '{trait_label}', required by the annotation on '{name}': a trait annotation on a binding is a CONSTRAINT on the value's own type, which stays '{type_label}'
+349	-	{label} is `[expose]`d, but its type `{rendered_field}` does not implement `std::Source`: only observable state can be exposed, because the client mirrors it by subscribing. Write a `SignalCell<T>` with a Wire `T`, or implement `std::Source<T>` for this type
+350	flagship	'{trait_name}::{member_name}' has no default body, so '{trait_name}::{member_name}(..)' has nothing to call: an associated function without one is a per-impl requirement. Call it through an implementing type — '<Type>::{member_name}(..)' — or give '{member_name}' a default body on '{trait_name}'
+351	-	internal: this concatenation was admitted on a generic parameter's `{RENDER_MEMBER}` bound, but no implementation could be resolved for it here — concatenating the operand directly would print the value's runtime shape; please report this program
+352	-	`+` on `str` concatenates, and `{rhs_label}` has no string form: a parameter promises only what its bounds promise, and this one is unbounded, so every instantiation would concatenate the value's runtime shape — a struct as a tuple, an enum as a tagged array. Bound it with `Display` and concatenate `value.to_string()`; an i-string hole is this same concatenation, so it needs the same pair
+353	flagship	`+` adds two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: `{rhs_label}` is wider than what `{lhs_label}`'s `add` accepts. That set is `{lhs_label}` itself, and no trait names it, so no bound on `{rhs_label}` can prove membership — a bound promises a trait's methods, never that the parameter IS `{lhs_label}`. Convert the value explicitly and declare the operand `{lhs_label}`, or put a left operand there whose `Add` declares a `B` that admits `{rhs_label}`
+354	-	`+` on `str` concatenates, and `{rhs_label}` has no string form: a parameter promises only what its bounds promise, and no bound on `{rhs_label}` provides `to_string`, so every instantiation would concatenate the value's runtime shape — a struct as a tuple, an enum a tagged array. Add a `Display` bound (`<{rhs_label}: Display>`); an i-string hole is this same concatenation, so it needs the same bound
+355	flagship	`+` on `str` concatenates, and `{rhs_label}` has no string form: concatenating it renders the value's runtime shape — a struct is a tuple, an enum a tagged array — not the value. Call `.to_string()` on it, implementing `Display` for its type if it has none; an i-string hole is this same concatenation, so it needs the same call
+356	flagship	`+` on `{lhs_label}` adds, and `str` is not a number: only a `str` LEFT operand concatenates, because the expression takes its type from the left. Put the string first (`"…" + value`), or convert this operand with `.to_string()`
+357	flagship	`+` adds two values of the same type, but the operands are `{lhs_label}` and `{rhs_label}`: there are no implicit conversions; suffix the literal or convert with `as_*`

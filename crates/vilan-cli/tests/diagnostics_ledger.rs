@@ -52,7 +52,10 @@
 //!   `not_callable_message`, the lexer's rule constants), a forwarded one — is
 //!   not enumerated, nor are std's runtime refusals, nor CLI output text. Those
 //!   rows exist and check (2) holds them, so a REWORD of one still reds; but a
-//!   brand-new message in one of those families escapes check (3).
+//!   brand-new message in one of those families escapes check (3). The largest
+//!   such family is the `let msg = if … { format!(…) }` ladder handed over by
+//!   field shorthand: its rows are listed, and the choice not to widen the walk
+//!   to reach them argued, on [`ROWS_THE_ENUMERATION_CANNOT_REACH`].
 //! - **`Note { .. msg: .. }` sites are deliberately not rowed.** A C3 note is
 //!   recorded inside its primary's row, which is the convention every ledger
 //!   batch has used. They are enumerated only to be skipped.
@@ -84,6 +87,37 @@ const KEYS_WITHOUT_A_FRAGMENT: &[(&str, &str)] = &[(
      headlines (`const evaluation failed`, `const evaluation did not finish \
      within the compile-time budget`) are separate literals in `const_eval.rs`",
 )];
+
+/// Rows the enumeration cannot reach, ROWED BY HAND, with why the walk does
+/// not get to each (N41).
+///
+/// `anchored_messages` reads the literal written AT its anchor. The `+`
+/// operator's refusal ladder writes none: it builds its six arms into a
+/// `let msg = if … { format!(…) } else if …`, then hands the binding over by
+/// field shorthand (`Error { .., msg }`), which is neither the `msg:` anchor
+/// nor a literal. So check (3) has never seen any of the six — the family the
+/// errors appendix documents most heavily.
+///
+/// Extending the walk one assignment upstream was the alternative and is NOT
+/// what shipped. It would reach these six, and with them every arm of the
+/// eighteen other `let msg` ladders in `analyzer.rs` and its neighbours —
+/// scores of messages, each owing a ledger row whose PROSE lives in the
+/// proposals repository. Landing the index half here without the prose half
+/// there splits the one record this file's header says must land together, so
+/// the walk stays where it is and the six are rowed by hand instead. The hole
+/// is now named rather than silent, and [`every_hand_rowed_row_is_in_the_index`]
+/// keeps the naming honest.
+const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
+    (
+        "352",
+        "the `+` ladder's unbounded-parameter concatenation arm (`analyzer.rs`)",
+    ),
+    ("353", "its B179 arm — a parameter right of a number's `+`"),
+    ("354", "its B176 arm — bounded, but to the wrong promise"),
+    ("355", "its plain no-string-form arm"),
+    ("356", "its `str`-on-the-right arm"),
+    ("357", "its same-type arm, the ladder's fallthrough"),
+];
 
 /// Ledger rows with no key at all, and so absent from the index, with the
 /// reason. Both are recorded in the ledger itself.
@@ -644,16 +678,35 @@ fn every_indexed_row_still_lives_in_the_tree() {
 
 #[test]
 fn every_diagnostic_the_compiler_builds_is_indexed() {
-    let rows = index();
+    // N41: a key with no literal run of its own is ALL SLOTS, and
+    // `key_describes` lets a leading slot skip — so row 291's
+    // `{headline}{subject}: {}` describes any message containing `": "`, and
+    // silently held five enumerated sites it has nothing to do with. Check (2)
+    // already refuses to search for such a key; check (3) now refuses to let one
+    // describe a message. What a fragment-less row may still hold is its OWN
+    // site: the envelope literal it is keyed on, verbatim. Anything looser is
+    // the catch-all again.
+    let rows: Vec<(Row, bool)> = index()
+        .into_iter()
+        .map(|row| {
+            let composed = KEYS_WITHOUT_A_FRAGMENT
+                .iter()
+                .any(|(number, _)| *number == row.number.to_string());
+            (row, composed)
+        })
+        .collect();
     let mut unrowed = Vec::new();
     for site in enumerated_sites() {
         if site.is_note {
             continue;
         }
-        if rows
-            .iter()
-            .any(|row| key_describes(&row.key, &site.message))
-        {
+        if rows.iter().any(|(row, composed)| {
+            if *composed {
+                row.key == site.message
+            } else {
+                key_describes(&row.key, &site.message)
+            }
+        }) {
             continue;
         }
         unrowed.push(format!(
@@ -780,6 +833,25 @@ fn every_appendix_entry_carries_a_quoted_head() {
          entry that names a CONDITION instead belongs in \
          HEADS_THAT_ARE_NOT_MESSAGES, with the reason:\n{}",
         headless.join("\n")
+    );
+}
+
+#[test]
+fn every_hand_rowed_row_is_in_the_index() {
+    // The exemption above is only worth its ink while the rows it names are
+    // real: a hand-rowed message that loses its row loses ALL coverage, since
+    // the enumeration never reached it to begin with.
+    let rows = index();
+    let missing: Vec<&str> = ROWS_THE_ENUMERATION_CANNOT_REACH
+        .iter()
+        .map(|(number, _)| *number)
+        .filter(|number| !rows.iter().any(|row| row.number.to_string() == *number))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "row(s) {missing:?} are recorded in ROWS_THE_ENUMERATION_CANNOT_REACH but \
+         are not in `{INDEX}`. A message the enumeration cannot see is held by \
+         its row and nothing else, so dropping the row drops the message."
     );
 }
 

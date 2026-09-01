@@ -105,10 +105,6 @@ const TOKEN_CLASSES_NOT_IN_LEXICAL: &[(&str, &str)] = &[
         "`an identifier or any keyword` — §3.6's element-name rule defines it          in its own fence comment, because it is a §3 concept",
     ),
     (
-        "ISTRING",
-        "`i\"...\"`, the single-line interpolated string. §2 describes it in          prose (§2.4) and declares only its multiline twin          (INTERPOLATED_MULTILINE); a production there would be better",
-    ),
-    (
         "TOKEN",
         "`any token but \";\", \"{\", \"}\"` — the css-block value scanner's          meta-class, defined in §3.6's own fence comment",
     ),

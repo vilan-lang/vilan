@@ -38974,10 +38974,11 @@ fn drop_reserved_dependency_edges(workspace: &Workspace) -> (Option<Workspace>, 
             note: None,
             span: EMPTY_SPAN,
             msg: format!(
-                "`{name}` is a reserved package name: {reason} (`std`, `pkg`, and \
-                 `macro_std` are all reserved); this workspace staged a dependency \
-                 edge named `{name}` — the edge is ignored and `{name}::` keeps \
-                 meaning the root it always names; rename the dependency"
+                "`{name}` is a reserved package name: {reason} ({clause}); this \
+                 workspace staged a dependency edge named `{name}` — the edge is \
+                 ignored and `{name}::` keeps meaning the root it always names; \
+                 rename the dependency",
+                clause = crate::manifest::RESERVED_PACKAGE_NAMES_CLAUSE,
             ),
         }
     };

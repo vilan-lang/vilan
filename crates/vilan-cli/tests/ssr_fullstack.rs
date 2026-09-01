@@ -26,14 +26,16 @@
 //! House process hygiene: the server never exits on its own, so it is killed at
 //! the end (inside a `catch_unwind` so a failed assertion still tears it down);
 //! the client leg is a quick-exit node run. The example is copied to a temp dir
-//! and given a free port, so the test is hermetic and parallel-safe.
+//! and asks for port 0, so the test is hermetic and parallel-safe.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+mod support;
 
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -76,16 +78,6 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Bind an ephemeral port, then release it — a free port for the server (a small
-/// TOCTOU window, standard for this kind of test).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn build(dir: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["build", dir.to_str().unwrap()])
@@ -98,18 +90,6 @@ fn build(dir: &Path) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-/// Poll until the server accepts a connection (or the deadline passes).
-fn wait_for_port(port: u16, deadline: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 /// A plain HTTP GET, returning the response body bytes.
@@ -253,13 +233,23 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
     let dir = temp_project("fullstack");
     copy_tree(&example_dir(), &dir);
 
-    // A free port injected into the server source (both the `.port(..)` and the
-    // cosmetic banner) so the test is hermetic and parallel-safe.
-    let port = free_port();
+    // The SERVER picks the port: `.port(0)` asks the OS, and the banner is
+    // rewritten to announce what it got, which is how the harness learns it.
+    // N40 — the example's literal used to be replaced by a port this test bound
+    // and released before the build, a race under parallel suites; there is no
+    // release now, because the bind is the server's own.
     let server_source = dir.join("src/server.vl");
     let patched = std::fs::read_to_string(&server_source)
         .unwrap()
-        .replace("8791", &port.to_string());
+        .replace(".port(8791)", ".port(0)")
+        .replace(
+            r#"print("ssr example: http://localhost:8791/")"#,
+            support::port::ANNOUNCE_PORT,
+        );
+    assert!(
+        patched.contains(".port(0)") && patched.contains(support::port::ANNOUNCE_PORT),
+        "the example's port literal and banner moved under this test:\n{patched}"
+    );
     std::fs::write(&server_source, patched).unwrap();
 
     write(&dir, "boot_harness.js", BOOT_HARNESS);
@@ -267,20 +257,12 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
 
     // The server runs from the project root (it reads `dist/client.js` and
     // `src/app.html` by relative path).
-    let mut server = Command::new("node")
-        .arg("dist/server.mjs")
-        .current_dir(&dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn node server");
+    let mut command = Command::new("node");
+    command.arg("dist/server.mjs").current_dir(&dir);
+    let mut server = support::port::Server::spawn(&mut command);
+    let port = server.port();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert!(
-            wait_for_port(port, Duration::from_secs(20)),
-            "the SSR server should accept connections on port {port}"
-        );
-
         // --- Phase 1: the served HTML carries the rendered content, pre-JS. ---
         let page = String::from_utf8_lossy(&http_get(port, "/")).to_string();
         assert!(
@@ -341,8 +323,7 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
         );
     }));
 
-    let _ = server.kill();
-    let _ = server.wait();
+    server.stop();
     if outcome.is_ok() {
         let _ = std::fs::remove_dir_all(&dir);
     }

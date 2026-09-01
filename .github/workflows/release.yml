@@ -84,8 +84,60 @@ jobs:
       - name: The doc-tests are green
         run: cargo test --workspace --doc
 
+  # ── ci.yml's other three legs, on the release side ──────────────────────────
+  #
+  # The suite legs above carry a two-sided rule ("change these two legs and
+  # ci.yml's together") because a release gate weaker than the CI gate is how
+  # v0.32.0 published on a tree ci.yml was red on. The same argument reaches
+  # further than the suite: `fmt`, `clippy` and `audit` each decide a commit is
+  # green on an ordinary push, and until now none of them decided a RELEASE was
+  # publishable. A tag can be pushed from a commit no PR ever saw, so a tree
+  # that is unformatted, carries a clippy finding, or links a crate with a
+  # RustSec advisory could reach five publishing channels, several one-way,
+  # with nothing in this file to stop it.
+  #
+  # Each is ci.yml's job character for character below its key. Separate JOBS
+  # rather than steps in `gate`, for two halves of one reason: `gate` is a
+  # two-OS matrix and all three legs are ubuntu-only there (formatting and
+  # lints are platform-independent, and the advisory database is a property of
+  # `Cargo.lock`), and `gate` declares `RUSTUP_TOOLCHAIN: stable` while `fmt`
+  # and `clippy` must carry NONE — they resolve through rust-toolchain.toml,
+  # whose pinned toolchain is exactly what makes their answer byte-stable
+  # across a rustfmt or clippy release. Folding them into `gate` would silently
+  # change both things.
+  #
+  # No `needs:` or `if:` on any of them: ci.yml gates these on its `changes`
+  # job, which has no analogue on a tag push. A release runs every leg, every
+  # time. `crates/vilan-cli/tests/release_gate.rs` holds all of this.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The tree is formatted
+        run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The tree is clippy-clean
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The same installer the suite legs use for nextest, same pin.
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-audit
+      - name: No advisory against the dependency tree
+        run: cargo audit --deny unsound
+
   build:
-    needs: gate
+    needs: [gate, fmt, clippy, audit]
     strategy:
       matrix:
         include:
@@ -203,7 +255,7 @@ jobs:
           if-no-files-found: error
 
   vsix:
-    needs: gate
+    needs: [gate, fmt, clippy, audit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -226,7 +278,7 @@ jobs:
   # downloads install.sh, so the site job stays free of Rust — the property
   # 53aa11d bought and this deliberately does not spend.
   wasm:
-    needs: gate
+    needs: [gate, fmt, clippy, audit]
     runs-on: ubuntu-latest
     # Same reason as `build`: the wasm32 target belongs to the action's
     # toolchain, not rust-toolchain.toml's pinned channel.
