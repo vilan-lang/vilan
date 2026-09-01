@@ -690,6 +690,12 @@ Normative rejection cases (each is a compile error):
   `jump`) are `Never` and don't participate (§5.1).
 - An `i53`/`i32` operand mix (no implicit widening; suffix the
   literal).
+- A value written into a struct field it does not match, through either
+  door: the literal `S { field = v }` and the assignment `s.field = v`
+  are governed by ONE rule, and a place chain of any depth (`a.b.c = v`,
+  `list[i].f = v`) is the same door. A compound `s.field op= v` is
+  checked on what lands — the result of `op` (§5.7) — not on `v`. The
+  error is reported at the value.
 
 *Implementation note (tracked gaps): a closure bound to a local and
 called directly does not infer its parameter types from the call, and

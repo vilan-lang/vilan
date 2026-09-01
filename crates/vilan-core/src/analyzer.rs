@@ -1922,6 +1922,20 @@ enum Constraint<'src> {
     /// definition, infers its type arguments from the values, and records the
     /// initializer once every field value's type is known.
     StructInitializer(StructInitializerConstraint<'src>),
+    /// `place.field = value` — the ASSIGNMENT door into a struct field, which
+    /// checked nothing at all before B166. Once the target resolves, the stored
+    /// value is checked against the field's declared type by the SAME rule the
+    /// literal door uses (`check_field_value`). Vacuous for any target that is
+    /// not a field: those places are checked by the kind that owns them.
+    FieldAssignment {
+        target_id: Id,
+        /// The value that LANDS in the field — for a compound `f += v` this is
+        /// the synthesized `f + v`, which is what the field ends up holding.
+        value_id: Id,
+        /// The written value's span: a mismatch anchors there (E7), exactly as
+        /// the literal door anchors on its field's value.
+        value_span: Span,
+    },
     /// `match subject { .. }` — once the subject type is known, resolves the leg
     /// patterns and guards, checks exhaustiveness, and types the match as the
     /// unification of its leg bodies.
@@ -2033,6 +2047,7 @@ impl Constraint<'_> {
             Constraint::Comprehension { id, .. } => *id,
             Constraint::FieldAccessor(constraint) => constraint.id,
             Constraint::StructInitializer(constraint) => constraint.initializer_id,
+            Constraint::FieldAssignment { target_id, .. } => *target_id,
             Constraint::Match(prepped) => prepped.id,
             Constraint::IfArms { id, .. } => *id,
             Constraint::Variable(constraint) => constraint.variable_id,
@@ -2091,6 +2106,10 @@ impl Constraint<'_> {
             // it can wait until every value-typing kind has landed and read
             // settled arm types instead of deferring on each of them.
             Constraint::IfArms { .. } => 12,
+            // Last, for `IfArms`'s reason: a pure CHECK nothing downstream
+            // consumes, so it reads a settled target and a settled value
+            // instead of deferring on each of them in turn.
+            Constraint::FieldAssignment { .. } => 12,
         }
     }
 }
@@ -2102,6 +2121,17 @@ enum Resolution {
     Resolved,
     Deferred,
     Failed,
+}
+
+/// The outcome of [`Analyzer::check_field_value`] — the one rule both
+/// struct-field doors go through. `Refused` has already pushed its diagnostic
+/// at the value's span; `Accepted` carries the generic bindings the
+/// reconciliation inferred, which the literal door folds into its
+/// substitution context.
+enum FieldValueVerdict {
+    Deferred,
+    Accepted(Vec<(TypeId, TypeId)>),
+    Refused,
 }
 
 /// The outcome of [`Analyzer::check_return_position`] (S3, editing-dx.md
@@ -20413,6 +20443,18 @@ impl<'src> Analyzer<'src> {
                     None => value_id,
                 };
                 self.prepped_assignments.push((target_id, stored_value_id));
+                // B166: `prepped_assignments` above only wires targets that
+                // resolve to a LOCAL — a field target fell straight through it,
+                // so the assignment door into a struct field checked nothing.
+                // This constraint is that missing check; it defers until the
+                // target resolves and is vacuous when the target turns out not
+                // to be a field. The value's own span anchors a mismatch (E7),
+                // which for a compound `f += v` is the written `v`.
+                self.constraints.push(Constraint::FieldAssignment {
+                    target_id,
+                    value_id: stored_value_id,
+                    value_span: value.1,
+                });
                 Some(Expr::Assignment(target_id, stored_value_id))
             }
             Node::Struct(name, generic_parameters, external, resource, body) => {
@@ -25899,6 +25941,11 @@ impl<'src> Analyzer<'src> {
             Constraint::StructInitializer(constraint) => {
                 self.resolve_struct_initializer(constraint)
             }
+            Constraint::FieldAssignment {
+                target_id,
+                value_id,
+                value_span,
+            } => self.resolve_field_assignment(*target_id, *value_id, *value_span),
             Constraint::Match(prepped) => self.resolve_match(prepped),
             Constraint::IfArms { id, span } => self.resolve_if_arms(*id, *span),
             Constraint::Variable(constraint) => self.resolve_variable(constraint),
@@ -30331,6 +30378,90 @@ impl<'src> Analyzer<'src> {
         (format!("{head}."), fields_span)
     }
 
+    /// **The** rule for whether a value may land in a struct field, shared by
+    /// the two doors that write one: the literal `S { field = value }` and the
+    /// assignment statement `s.field = value`. One rule, both doors.
+    ///
+    /// B166: the assignment door checked *nothing at all* — `b.value = "text"`
+    /// into an `i32` field compiled and `b.value + 1` printed `text1`, and a
+    /// bare closure assigned into an `Option<|E| void>` field ran with its
+    /// `is Some` test silently never matching. The literal door had always
+    /// checked, so the two doors disagreed; routing both through this one
+    /// function is what makes disagreement impossible rather than merely
+    /// unlikely.
+    ///
+    /// The value is inferred AGAINST the declared field type (so an integer
+    /// literal reads as `f64` in an `f64` field, and a bare closure is checked
+    /// against the field's closure type), then reconciled with it. A mismatch
+    /// is reported at the value's own span (E7); the caller decides what else
+    /// to record.
+    fn check_field_value(
+        &mut self,
+        value_id: Id,
+        field_type: &Type,
+        substitution_context: &SubstitutionContext,
+        value_span: Span,
+    ) -> FieldValueVerdict {
+        let value_type = self.infer_type(value_id, field_type, substitution_context);
+        if let Type::Unresolved = value_type {
+            return FieldValueVerdict::Deferred;
+        }
+        match self.reconcile_type(&value_type, field_type, substitution_context) {
+            Some((_unified, bindings)) => FieldValueVerdict::Accepted(bindings),
+            None => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: value_span,
+                    msg: format!(
+                        "Expected {}, but got {} instead.",
+                        self.pretty_print_type(field_type, substitution_context),
+                        self.pretty_print_type(&value_type, substitution_context),
+                    ),
+                });
+                FieldValueVerdict::Refused
+            }
+        }
+    }
+
+    /// `place.field = value` (and the compound `place.field += value`, whose
+    /// stored value is the synthesized `field + value`): the ASSIGNMENT door
+    /// into a struct field. Defers until the target has resolved, then — if it
+    /// resolved to a FIELD — checks the stored value through
+    /// [`Self::check_field_value`], the same rule the literal door uses.
+    ///
+    /// A target that resolved to anything else (a local, a tuple position, a
+    /// subscript, a failed accessor already carrying its own diagnostic) is
+    /// vacuous here: the kind that owns that place checks it. The field's type
+    /// is read off the TARGET, which `resolve_field_accessor` already recorded
+    /// with the subject's type arguments substituted in — so a field reached
+    /// through `Wrap<Doubler>` is checked against `Doubler`, not the struct's
+    /// abstract parameter.
+    fn resolve_field_assignment(
+        &mut self,
+        target_id: Id,
+        value_id: Id,
+        value_span: Span,
+    ) -> Resolution {
+        match self.expr_id_to_expr_map.get(&target_id) {
+            Some(Expr::Field(_, _, _)) => {}
+            Some(_) => return Resolution::Resolved,
+            None => return Resolution::Deferred,
+        }
+        let Some(field_type_id) = self.expr_id_to_type_id_map.get(&target_id).copied() else {
+            return Resolution::Deferred;
+        };
+        let field_type = field_type_id.get_type(self);
+        if let Type::Unresolved = field_type {
+            return Resolution::Deferred;
+        }
+        match self.check_field_value(value_id, &field_type, &HashMap::default(), value_span) {
+            FieldValueVerdict::Deferred => Resolution::Deferred,
+            FieldValueVerdict::Accepted(_) => Resolution::Resolved,
+            FieldValueVerdict::Refused => Resolution::Failed,
+        }
+    }
+
     /// `Struct { field = value, .. }`: resolve the struct by name (lexically),
     /// check field count, infer each value against its declared field type
     /// (binding the struct's type arguments), and record the initializer. Defers
@@ -30471,39 +30602,34 @@ impl<'src> Analyzer<'src> {
                 ));
             }
             let struct_field_type = struct_field.type_id.get_type(self);
-            // Infer the value against the declared field type so that, e.g., an
-            // integer literal is treated as `f64` when the field is `f64`.
-            let value_type =
-                self.infer_type(*field_value, &struct_field_type, &substitution_context);
-            if let Type::Unresolved = value_type {
-                deferred = true;
-                break;
-            }
-            if let Some((_unified, bindings)) =
-                self.reconcile_type(&value_type, &struct_field_type, &substitution_context)
-            {
-                for (constraint_id, type_id) in bindings {
-                    substitution_context.insert(constraint_id, type_id);
+            // THE field-value rule — shared with the assignment door
+            // (`resolve_field_assignment`), so `S { field = value }` and
+            // `s.field = value` cannot disagree about what fits (B166).
+            match self.check_field_value(
+                *field_value,
+                &struct_field_type,
+                &substitution_context,
+                *field_value_span,
+            ) {
+                FieldValueVerdict::Deferred => {
+                    deferred = true;
+                    break;
                 }
-                initializer_fields.insert(struct_field_index, *field_value);
-            } else {
-                // Type mismatch: emit a diagnostic (anchored at THIS field's
-                // value, not the whole `{ .. }` block — E7) but still record
-                // the type for downstream consumers.
-                self.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: *field_value_span,
-                    msg: format!(
-                        "Expected {}, but got {} instead.",
-                        self.pretty_print_type(&struct_field_type, &substitution_context),
-                        self.pretty_print_type(&value_type, &substitution_context),
-                    ),
-                });
-                let type_id = Type::Struct(struct_id, Vec::new()).get_type_id(self);
-                self.resolved_types.insert(initializer_id, type_id);
-                self.struct_initializer_to_def
-                    .insert(initializer_id, struct_id);
+                FieldValueVerdict::Accepted(bindings) => {
+                    for (constraint_id, type_id) in bindings {
+                        substitution_context.insert(constraint_id, type_id);
+                    }
+                    initializer_fields.insert(struct_field_index, *field_value);
+                }
+                FieldValueVerdict::Refused => {
+                    // The diagnostic is already anchored at THIS field's value
+                    // (not the whole `{ .. }` block — E7); still record the
+                    // type for downstream consumers.
+                    let type_id = Type::Struct(struct_id, Vec::new()).get_type_id(self);
+                    self.resolved_types.insert(initializer_id, type_id);
+                    self.struct_initializer_to_def
+                        .insert(initializer_id, struct_id);
+                }
             }
         }
         // Always store the initializer expression so `infer_type` can find it.

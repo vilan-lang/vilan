@@ -5812,3 +5812,198 @@ fn a_direct_call_respects_annotated_parameters() {
         "42\n",
     );
 }
+
+// --- B166: the struct-field ASSIGNMENT door is checked, by the literal's rule -
+//
+// `s.field = value` checked NOTHING. `b.value = "text"` into an `i32` field
+// compiled and `b.value + 1` printed `text1`; a bare closure assigned into an
+// `Option<|E| void>` field ran with its `is Some` test silently never matching.
+// The literal door (`S { field = value }`) had always checked, so the two doors
+// disagreed about the same value. Both now go through `check_field_value` —
+// one rule, both doors — so every shape below is refused at the value's span
+// (E7), the same anchor the literal door uses.
+
+#[test]
+fn a_str_assigned_into_an_i32_field_is_refused() {
+    // The generalized form of the owner's find: accepted, and then `+ 1`
+    // computed on it printed `text1`.
+    assert_fails_spanning(
+        r#"
+        struct Box { value: i32 }
+
+        fun main() {
+            mut b = Box { value = 0 };
+            b.value = "text";
+            print(b.value + 1);
+        }
+        "#,
+        "\"text\"",
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn a_bool_assigned_into_an_i32_field_is_refused() {
+    // Scalar into scalar: no operand check stands in the way here, so this
+    // shape reached the field with nothing between it and the store.
+    assert_fails_with(
+        r#"
+        struct Box { value: i32 }
+
+        fun main() {
+            mut b = Box { value = 0 };
+            b.value = true;
+        }
+        "#,
+        "Expected i32, but got bool instead.",
+    );
+}
+
+#[test]
+fn a_bare_value_assigned_into_an_option_field_is_refused() {
+    // The silent half: the value lands unwrapped, so the `is Some` test that
+    // reads it back never matches and the program takes the wrong branch
+    // without a word.
+    assert_fails_with(
+        r#"
+        struct Box { value: Option<i32> }
+
+        fun main() {
+            mut b = Box { value = None };
+            b.value = 5;
+        }
+        "#,
+        "Expected Option<i32>, but got i32 instead.",
+    );
+}
+
+#[test]
+fn a_bare_closure_assigned_into_an_option_closure_field_is_refused() {
+    // The owner's original exhibit (kolt's `DragHandler`): a builder storing
+    // its handler with `self.field = handler` where the field is
+    // `Option<|E| void>`. It ran, and the `is Some` never matched — the
+    // refusal steers to the `Some(handler)` he meant to write.
+    assert_fails_with(
+        r#"
+        struct Handler { on_move: Option<|i32| void> }
+
+        impl Handler {
+            fun new(): Handler {
+                Handler { on_move = None }
+            }
+
+            fun on_move(own self, handler: |i32| void): Handler {
+                self.on_move = handler;
+                self
+            }
+        }
+
+        fun main() {
+            let _ = Handler::new().on_move(|n| print(n));
+        }
+        "#,
+        "Expected Option<|i32| void>, but got |i32| void instead.",
+    );
+}
+
+#[test]
+fn a_nested_field_assignment_is_checked() {
+    // `a.b.c = v` — the place chain is deeper, but it is still a field
+    // target, so the same rule reaches it.
+    assert_fails_spanning(
+        r#"
+        struct Inner { n: i32 }
+        struct Outer { inner: Inner }
+
+        fun main() {
+            mut o = Outer { inner = Inner { n = 1 } };
+            o.inner.n = "text";
+        }
+        "#,
+        "\"text\"",
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn an_indexed_field_assignment_is_checked() {
+    // `list[i].f = v` — the subject is a subscript rather than a local, and
+    // the check keys on the TARGET resolving to a field, not on the shape of
+    // what it is rooted in.
+    assert_fails_spanning(
+        r#"
+        struct Cell { n: i32 }
+
+        fun main() {
+            mut cells = [Cell { n = 1 }];
+            cells[0].n = "text";
+        }
+        "#,
+        "\"text\"",
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn a_compound_assignment_into_a_field_checks_the_value_that_lands() {
+    // `b.text += 5` desugars to `b.text = b.text + 5`, and it is the SUM that
+    // lands in the field — `str + i32` is `str`, so this is well typed and
+    // must still run. Checking the written `5` instead of the sum (the
+    // obvious wrong way to register the constraint) refuses it with
+    // "Expected str, but got i32", which is what makes this pin bite.
+    //
+    // No compound shape can land the WRONG type today: every overloadable
+    // operator's trait returns `Self`, so a compound that type-checks as a
+    // binary at all yields the field's own type. The check is there; it
+    // simply has nothing to catch until an operator can widen.
+    assert_compiles_and_runs(
+        r#"
+        struct Box { text: str }
+
+        fun main() {
+            mut b = Box { text = "a" };
+            b.text += 5;
+            print(b.text);
+        }
+        "#,
+        "a5\n",
+    );
+}
+
+#[test]
+fn a_well_typed_field_assignment_still_stores_what_the_pattern_reads_back() {
+    // The green half of the Option shape: written `Some(..)`, the `is Some`
+    // matches — which is what the silent version was supposed to do.
+    assert_compiles_and_runs(
+        r#"
+        struct Box { value: Option<i32> }
+
+        fun main() {
+            mut b = Box { value = None };
+            b.value = Some(5);
+            if b.value is Some(let n) {
+                print(n);
+            }
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn the_literal_door_control_refuses_the_same_value_it_always_did() {
+    // The control: the literal door has always refused this, and routing it
+    // through the shared rule must not have moved it — same message, same
+    // anchor on the field's value.
+    assert_fails_spanning(
+        r#"
+        struct Box { value: i32 }
+
+        fun main() {
+            let _ = Box { value = "text" };
+        }
+        "#,
+        "\"text\"",
+        "Expected i32, but got str instead.",
+    );
+}
