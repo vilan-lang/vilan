@@ -25576,6 +25576,29 @@ impl<'src> Analyzer<'src> {
                             self.compare_type_rigid(&l, &r, substitution_context, rigid)
                         })
             }
+            // B177: an array is STRUCTURAL here too, and it was the one
+            // composite shape with no arm of its own — so it fell through to
+            // the `a == b` fallback at the bottom, which compares
+            // `Type::Array`'s ELEMENT TYPE ID. Ids are minted fresh per
+            // spelling and deliberately not interned (`type_id_for_type` says
+            // why: inference resolves a type in place, so a mutated id must
+            // stay unshared), which made an array type unequal to ITSELF
+            // written twice. `impl [i32; 2] with Add<i32>` was refused with
+            // "`type`'s `add` returns `[i32; 2]`, but `Add` declares
+            // `[i32; 2]`" — the same spelling on both sides — and no array
+            // impl could be written at all, while a tuple impl of the same
+            // shape passed on the arm above. Every other comparator already
+            // resolved the ids before comparing (`reconcile_type`'s array arm,
+            // `same_impl_type`'s, `impl_subject_matches`'s); this one now does
+            // too. The LENGTH is part of the type — `[i32; 3]` is not
+            // `[i32; 4]` — so it is compared first, by value.
+            (Type::Array(l_element, l_length), Type::Array(r_element, r_length)) => {
+                l_length == r_length && {
+                    let l = l_element.get_type(self);
+                    let r = r_element.get_type(self);
+                    self.compare_type_rigid(&l, &r, substitution_context, rigid)
+                }
+            }
             // Same nominal type: compatible when the arguments are (a side with
             // no arguments is an erased/abstract `List`/`Option`, compatible with
             // any instantiation).
@@ -32458,14 +32481,26 @@ impl<'src> Analyzer<'src> {
                         .map(move |(name, _)| (*name, declaring_trait_id))
                 })
                 .collect();
-            let subject_name = match check.subject_type_id.get_type(self) {
+            // B177: a conformance diagnostic that cannot say WHOSE member it
+            // means is barely a diagnostic (B170's rule, on the impl side). A
+            // non-struct subject used to fall back to the literal word "type",
+            // so an array impl's return mismatch read "`type`'s `add` returns
+            // …" — and every non-nominal subject reported as the same anonymous
+            // "type". A nominal subject is named by its declaration; everything
+            // else has a spelling, which is what `pretty_print_type` produces:
+            // `[i32; 2]`, `(i32, i32)`, `|i32| i32`.
+            let subject_type = check.subject_type_id.get_type(self);
+            let subject_name = match &subject_type {
                 Type::Struct(struct_id, _) => self
                     .structs
-                    .get(&struct_id)
-                    .map(|s| s.name)
-                    .unwrap_or("type"),
-                _ => "type",
-            };
+                    .get(struct_id)
+                    .map(|struct_| struct_.name.to_string()),
+                Type::Enum(enum_id, _) => {
+                    self.enums.get(enum_id).map(|enum_| enum_.name.to_string())
+                }
+                _ => None,
+            }
+            .unwrap_or_else(|| self.pretty_print_type(&subject_type, &HashMap::default()));
             let check_subject_type = check.subject_type_id.get_type(self);
             // Record a signature-conformance check for EVERY trait/supertrait
             // member the impl provides by name — required members AND overrides

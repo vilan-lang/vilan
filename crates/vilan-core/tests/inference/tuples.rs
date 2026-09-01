@@ -5357,3 +5357,169 @@ fn transitive_adaptation_still_rides_past_a_store_free_body() {
         "11\n",
     );
 }
+
+// --- B177: an array impl's conformance check compared array types by ID ------
+//
+// `impl [i32; 2] with Add<i32>` was refused with "`type`'s `add` returns
+// `[i32; 2]`, but `Add` declares `[i32; 2]`" — the same spelling on both sides,
+// so the message contradicted itself and no array impl could be written at all.
+//
+// `compare_type_rigid` had an arm for every composite shape but the array, so
+// two arrays fell to its `a == b` fallback, which compares `Type::Array`'s
+// element TYPE ID. Ids are minted fresh per spelling and deliberately not
+// interned, so an array type was unequal to itself written twice — while a
+// tuple impl of the identical shape passed, because tuples had an arm.
+//
+// The subject NAME was the other half of the illegible message: a non-struct
+// subject reported as the literal word "type". It now reports its spelling.
+
+#[test]
+fn b177_an_array_impl_of_an_operator_trait_compiles_and_runs() {
+    // The exhibit, end to end: the impl is accepted, the operator DISPATCHES to
+    // it (B170 made a non-nominal left operand reach the lookup), and the body
+    // runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl [i32; 2] with Add<i32> {
+            fun add(self, other: i32): [i32; 2] {
+                [self[0] + other, self[1] + other]
+            }
+        }
+
+        fun main() {
+            let base: [i32; 2] = [1, 2];
+            let shifted = base + 3;
+            print(shifted[0]);
+            print(shifted[1]);
+        }
+        "#,
+        "4\n5\n",
+    );
+}
+
+#[test]
+fn b177_an_array_impl_with_a_wrong_return_length_is_still_refused() {
+    // The check has to keep CHECKING. A length is part of an array's type, so
+    // `[i32; 3]` does not satisfy a `Self` return of `[i32; 2]` — and the
+    // message must name two DIFFERENT types, which is exactly what the bug
+    // made impossible.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        impl [i32; 2] with Add<i32> {
+            fun add(self, other: i32): [i32; 3] {
+                [self[0] + other, self[1] + other, other]
+            }
+        }
+
+        fun main() { print(1); }
+        "#,
+        "`[i32; 2]`'s `add` returns `[i32; 3]`, but `Add` declares `[i32; 2]`",
+    );
+}
+
+#[test]
+fn b177_an_array_impl_with_a_wrong_element_type_is_still_refused() {
+    // The other half of an array's identity: same length, different element.
+    // The fallback compared ids, so this case was "caught" only by accident —
+    // it reported the same self-contradiction as the correct impl did.
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+
+        impl [i32; 2] with Add<i32> {
+            fun add(self, other: i32): [str; 2] {
+                ["a", "b"]
+            }
+        }
+
+        fun main() { print(1); }
+        "#,
+        "`[i32; 2]`'s `add` returns `[str; 2]`, but `Add` declares `[i32; 2]`",
+    );
+}
+
+#[test]
+fn b177_a_nested_array_impl_compiles_and_runs() {
+    // The arm recurses, so an array OF arrays is compared element-structurally
+    // too — the shape the flat fix would have missed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl [[i32; 2]; 2] with Add<i32> {
+            fun add(self, other: i32): [[i32; 2]; 2] {
+                [[self[0][0] + other, self[0][1] + other],
+                 [self[1][0] + other, self[1][1] + other]]
+            }
+        }
+
+        fun main() {
+            let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+            let shifted = grid + 10;
+            print(shifted[0][0]);
+            print(shifted[1][1]);
+        }
+        "#,
+        "11\n14\n",
+    );
+}
+
+#[test]
+fn b177_an_array_impl_of_equality_compiles_and_runs() {
+    // Not just `Add`: the conformance check is one path, so every operator
+    // trait was equally unwritable on an array. `==` also exercises the
+    // `bool` return, which never mentions the array at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+
+        impl [i32; 2] with PartialEq {
+            fun eq(self, other: [i32; 2]): bool {
+                self[0] == other[0] && self[1] == other[1]
+            }
+        }
+
+        fun main() {
+            let left: [i32; 2] = [1, 2];
+            let right: [i32; 2] = [1, 2];
+            let other: [i32; 2] = [1, 3];
+            print(left == right);
+            print(left == other);
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b177_a_tuple_impl_of_the_same_shape_still_compiles_and_runs() {
+    // The control the item named: a tuple impl passed all along, because
+    // tuples had the structural arm arrays lacked. It must not move.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        impl (i32, i32) with Add<i32> {
+            fun add(self, other: i32): (i32, i32) {
+                (self.0 + other, self.1 + other)
+            }
+        }
+
+        fun main() {
+            let base = (1, 2);
+            let shifted = base + 3;
+            print(shifted.0);
+            print(shifted.1);
+        }
+        "#,
+        "4\n5\n",
+    );
+}
