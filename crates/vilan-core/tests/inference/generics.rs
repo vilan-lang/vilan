@@ -4382,11 +4382,11 @@ fn a_bare_parameter_bound_survives_two_generic_bodies() {
 /// including an abstract parameter, so the bound holds and the check cannot see
 /// it. Un-ignore when a generic value is allowed to satisfy a blanket impl.
 #[test]
-#[ignore = "B168 tail: `satisfies_trait_bound` answers a `Type::Generic` value \
+#[ignore = "B173: `satisfies_trait_bound` answers a `Type::Generic` value \
             from its declared bounds alone, so a blanket `impl type T with \
             Wrap<T>` cannot satisfy `W: Wrap<T>` when `W` is bound to the \
-            caller's own parameter. A concrete caller passes; B168's own defect \
-            (the callee's `T` resolving to the impl's binder) is gone."]
+            caller's own parameter. A concrete caller passes; whether an \
+            abstract parameter may satisfy a blanket impl is B173's ruling."]
 fn a_blanket_impl_bound_resolves_from_a_generic_body() {
     assert_compiles_and_runs(
         r#"
