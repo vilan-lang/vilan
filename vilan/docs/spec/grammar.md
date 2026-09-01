@@ -491,11 +491,11 @@ recognized between two operands.
 type = "&" [ "mut" ] type                       (* view type *)
      | "type" IDENT [ ":" bound-list ]          (* impl-subject binder *)
      | [ "async" | "sync" ] closure-type [ context-clause ]
-     | IDENT generic-args                        (* nominal, generic *)
-     | IDENT                                     (* nominal *)
+     | type-path                                 (* nominal *)
      | "(" IDENT "in" type ":" type ")"          (* mapped tuple, §5.9 *)
      | "(" [ type { "," type } [ "," ] ] ")"     (* tuple type *)
      ;
+type-path      = IDENT { "::" IDENT } [ generic-args ] ;
 closure-type   = ( "||" | "|" [ [IDENT ":"] type { "," [IDENT ":"] type } "|" )
                  [ type ] ;
 context-clause = "context" ( IDENT | "(" IDENT { "," IDENT } [ "," ] ")" ) ;
@@ -506,6 +506,20 @@ on closure types, checked semantically (§8.5). `sync` is likewise
 contextual (§7.4: the synchronous contract; parameters only). A closure
 type's parameters may carry documentation names (`|value: T| U`); only
 the types are significant.
+
+A `type-path` names a type, optionally through the modules that declare
+it: `Style`, `List<T>`, `style::Style`, `std::reactive::SignalCell<i32>`.
+Every segment but the last selects a namespace, and the resolution is the
+one an expression path uses (§4.2, §4.6) — so a module in scope reaches
+its types exactly as it reaches its values. Generic arguments belong to
+the LAST segment, the only one that names a type; there is no
+`List<str>::Item` in type position (a generic path head, §3.6, is an
+expression form).
+
+Every type position takes a `type-path`: a return type, a `let`
+annotation, a parameter, a struct field, an `impl` subject, a trait
+bound, a generic argument, and any of these nested inside another type
+form.
 
 ## 3.10 Patterns (match)
 

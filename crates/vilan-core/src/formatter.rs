@@ -10,8 +10,8 @@
 use std::cell::Cell;
 
 use crate::node::{
-    BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
-    NodeList, Pattern, StructInitializerField,
+    BinaryOp, Convention, ExternBinding, Func, GenericArguments, GenericParameters, ImportBranch,
+    Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -2463,14 +2463,18 @@ impl<'src> Printer<'src> {
             Node::Accessor(name) => self.out.push_str(name),
             Node::AccessorWithGenerics(name, arguments) => {
                 self.out.push_str(name);
-                self.out.push('<');
-                for (index, (argument, _)) in arguments.0.iter().enumerate() {
-                    if index > 0 {
-                        self.out.push_str(", ");
-                    }
-                    self.print_type(argument);
+                self.print_type_arguments(arguments);
+            }
+            // `style::Style`, `std::reactive::SignalCell<i32>` — a nominal type
+            // reached through the modules that declare it (B172). The spine is
+            // `StaticAccessor`s, the arguments (if any) sit on the last segment.
+            Node::StaticAccessor(namespace, name, arguments) => {
+                self.print_type(&namespace.0);
+                self.out.push_str("::");
+                self.out.push_str(name);
+                if let Some(arguments) = arguments {
+                    self.print_type_arguments(arguments);
                 }
-                self.out.push('>');
             }
             Node::Reference(mutable, inner) => {
                 self.out.push('&');
@@ -2582,6 +2586,18 @@ impl<'src> Printer<'src> {
             }
             _ => self.bailed = true,
         }
+    }
+
+    /// Prints a `<A, B>` generic-argument list on a nominal type.
+    fn print_type_arguments(&mut self, arguments: &GenericArguments<'src>) {
+        self.out.push('<');
+        for (index, (argument, _)) in arguments.0.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(", ");
+            }
+            self.print_type(argument);
+        }
+        self.out.push('>');
     }
 
     /// Prints a `: A + B` trait-bound list, or nothing when `bounds` is empty.
@@ -4217,7 +4233,10 @@ impl<'src> Printer<'src> {
                 self.split = split;
                 self.print_expr(member);
             }
-            Node::StaticAccessor(subject, member) => {
+            // An expression path never carries generic arguments on its member
+            // (they belong to the call that follows), so there are none to print
+            // here; the type printer below has the arm that does.
+            Node::StaticAccessor(subject, member, _) => {
                 self.print_operand(subject, 100);
                 self.out.push_str("::");
                 self.out.push_str(member);
@@ -5052,6 +5071,31 @@ mod reformats {
             "impl Option<type T> { fun map<U>(self, fn: |T| U): Option<U> { match self { Some(let x)=>Some(fn(x)), None=>None } } }\n",
             "impl Option<type T> {\n\tfun map<U>(self, fn: |T| U): Option<U> {\n\t\tmatch self {\n\t\t\tSome(let x) => Some(fn(x)),\n\t\t\tNone => None\n\t\t}\n\t}\n}\n",
         );
+    }
+
+    /// A module-qualified TYPE path (B172) reprints as written, in every
+    /// position the type printer is reached from. The printer BAILS on a form
+    /// it does not know — falling the whole file back to its source, silently —
+    /// so a new type form without an arm here is a file that stops being
+    /// formatted rather than a failure anyone sees.
+    #[test]
+    fn a_module_qualified_type_path_round_trips() {
+        let source = "import std::reactive;\nimport std::style;\n\n\
+             struct Card {\n\
+             \tstyle: style::Style,\n\
+             \thits: reactive::SignalCell<i32>,\n\
+             \tdeep: List<std::style::Style>,\n\
+             }\n\n\
+             impl style::Style {\n\
+             \tfun tag(&self): str {\n\
+             \t\t\"s\"\n\
+             \t}\n\
+             }\n\n\
+             fun render(card: &Card, shape: (style::Style, i32)): style::Style {\n\
+             \tlet held: style::Style = card.style;\n\
+             \tshape.0\n\
+             }\n";
+        assert_formats(source, source);
     }
 }
 

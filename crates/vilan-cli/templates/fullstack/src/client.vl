@@ -16,14 +16,13 @@
 // vilan.toml puts them in scope with no import, along with the MODULES `style`
 // and `ui` — which is why the chain below writes `style::Display::Flex` and
 // the mount writes `ui::mount_root`. The prelude carries the module, not its
-// members, so you qualify; import a member explicitly wherever you would
-// rather write it bare, since an explicit import always beats the prelude.
-// `Style` is imported for exactly that reason: a TYPE is written bare.
+// members, so you qualify, in type position (`style::Style`) exactly as in
+// value position; import a member explicitly wherever you would rather write it
+// bare, since an explicit import always beats the prelude.
 
-import std::style::Style;
 import pkg::shared::greeting;
 
-fun card_style(): Style {
+fun card_style(): style::Style {
 	style::style()
 		.display(style::Display::Flex)
 		.flex_direction(style::FlexDirection::Column)

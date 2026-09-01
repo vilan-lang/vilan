@@ -122,6 +122,14 @@ Consequently a local variable named `Signal` does not break `let s:
 SignalCell<i32>` annotations in the same scope, but relying on this is poor
 style.
 
+A type may also be **qualified** by the modules that declare it —
+`style::Style`, `std::reactive::SignalCell<i32>` — in any type position
+(grammar §3.9, types §5.1). The namespace segments resolve as §4.2's
+paths do, so an imported module reaches its types as it reaches its
+values. The preference above does not apply to a qualified path: it
+addresses exactly what that one namespace declares, so a member that is
+not a type is an error there rather than a reason to keep looking.
+
 ## 4.6 Statics and members
 
 `Type::member` (§3.6) resolves `member` in `Type`'s namespace: enum
