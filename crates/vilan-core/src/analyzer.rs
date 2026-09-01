@@ -38260,16 +38260,29 @@ fn analyze_inner<'src>(
             if let Some((requested, on_disk)) =
                 crate::util::case_exact_mismatch(&resolution.root, &resolution.relative)
             {
-                analyzer.diagnostics.push(Error {
-                    trace: Vec::new(),
-                    note: None,
-                    span: EMPTY_SPAN,
-                    msg: format!(
+                // A removed std alias outranks the case telling: on a
+                // case-ignoring filesystem `std::Default` resolves to std's
+                // own `default.vl`, and "rename one to match the other"
+                // would point the user at std's tree. This arm is dead on a
+                // case-sensitive filesystem (the resolution never happens),
+                // so its end-to-end check is the Windows CI leg.
+                let removed = match origin {
+                    Origin::Std => removed_std_alias("std", name, true),
+                    _ => None,
+                };
+                let msg = removed.unwrap_or_else(|| {
+                    format!(
                         "module `{name}` resolved to `{on_disk}` on disk, but it is imported as \
                          `{requested}`: Vilan matches module files by exact case, so this \
                          builds only where the filesystem ignores case; rename one to match \
                          the other"
-                    ),
+                    )
+                });
+                analyzer.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: EMPTY_SPAN,
+                    msg,
                 });
             }
             let is_entry_module = crate::util::canonical_path(&module_path)
