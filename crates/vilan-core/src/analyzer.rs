@@ -23077,11 +23077,35 @@ impl<'src> Analyzer<'src> {
     /// whose type slot is still `Unknown`. The post-fixpoint starved-parameter
     /// refusal (B131) reports against this id — its span is the parameter
     /// itself, the one place the fix (an annotation) goes.
+    ///
+    /// REBINDINGS count (B185). `mut next = values` inside `|values| ..` is a
+    /// binding whose own type is still `Unknown` *because* the parameter's is,
+    /// so every consulting resolver must wait on the parameter exactly as it
+    /// waits on a direct mention of it — and a chain of rebindings with it. A
+    /// binding that has already ground stops the walk: its `Unknown`, if any,
+    /// is an answer rather than a "not yet".
+    ///
+    /// Following initializers means the walk can meet a module-level binding
+    /// CYCLE (`let a = b; let b = a;`, legal to write because module bindings
+    /// resolve in any order), so the bindings already stepped through end it.
+    /// The set stays empty on the overwhelmingly common path — a direct
+    /// mention of the parameter, which takes no binding hop at all.
     fn unfilled_closure_parameter(&self, expr_id: Id) -> Option<Id> {
         let mut id = expr_id;
+        let mut bindings_seen: Vec<Id> = Vec::new();
         loop {
             match self.expr_id_to_expr_map.get(&id) {
                 Some(Expr::Local(target_id)) => id = *target_id,
+                Some(Expr::Variable(variable_id)) => {
+                    let variable = self.variables.get(variable_id)?;
+                    if !matches!(variable.type_id.get_type(self), Type::Unknown)
+                        || bindings_seen.contains(variable_id)
+                    {
+                        return None;
+                    }
+                    bindings_seen.push(*variable_id);
+                    id = variable.initial?;
+                }
                 Some(Expr::Parameter(parameter_id)) => {
                     let parameter = self.parameters.get(parameter_id)?;
                     return (self.closures.contains_key(&parameter.function_id)
@@ -28433,6 +28457,25 @@ impl<'src> Analyzer<'src> {
             })
             .unwrap_or(true);
         if !first_ready {
+            return Resolution::Deferred;
+        }
+
+        // An UNANNOTATED binding over an unfilled closure parameter reads
+        // `Unknown` — and that `Unknown` is a "not yet", not an answer: B13's
+        // channel fills the parameter's slot once the call site infers the
+        // closure against the callee's signature. Grounding on it here is
+        // permanent and silently wrong twice over (B185): every later use
+        // refuses ("cannot call method 'push' on unknown"), and where nothing
+        // refuses, the transformer reads the untyped binding as a scalar and
+        // drops the value-COPY a `mut` rebinding of a List or a struct owes —
+        // the caller's value is mutated in place. Defer, like every other
+        // resolver does on the same condition. An ANNOTATED binding is not
+        // waiting on anything: the annotation is its type.
+        if matches!(initial_type_id.get_type(self), Type::Unknown)
+            && value_ids
+                .first()
+                .is_some_and(|&value_id| self.is_unknown_closure_parameter(value_id))
+        {
             return Resolution::Deferred;
         }
 
@@ -33816,6 +33859,13 @@ impl<'src> Analyzer<'src> {
                     Constraint::ForEachItem { iterable_id, .. } => consulted.push(*iterable_id),
                     Constraint::Comprehension { source_id, .. } => consulted.push(*source_id),
                     Constraint::Match(prepped) => consulted.push(prepped.subject_id),
+                    // A binding grounding on the parameter (`mut next =
+                    // values`) defers on the same condition (B185), so its
+                    // leftover names the same starved parameter — the
+                    // annotation goes there, not on the rebinding.
+                    Constraint::Variable(constraint) => {
+                        consulted.extend(constraint.value_ids.first().copied());
+                    }
                     _ => {}
                 }
                 for id in consulted {
