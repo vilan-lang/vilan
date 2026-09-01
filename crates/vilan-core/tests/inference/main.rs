@@ -33,4 +33,5 @@ mod resources;
 mod returns;
 mod std_surface;
 mod styling;
+mod traits;
 mod tuples;

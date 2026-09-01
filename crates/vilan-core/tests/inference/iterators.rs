@@ -3706,13 +3706,19 @@ fn b83_two_impls_of_one_trait_do_not_make_a_static_ambiguous() {
 }
 
 #[test]
-fn b83_a_trait_declared_static_is_not_reachable_through_the_trait() {
-    // PROBED, and recorded rather than built: `Trait::static()` does not
-    // resolve, with or without a default body on the trait's declaration. It
-    // cannot, on today's design — `Trait::method(receiver)` picks an impl
-    // through the receiver's type, and a static offers nothing to pick with.
-    // This is why B83's ambiguity diagnostic names an inherent declaration as
-    // the fix rather than a qualified path.
+fn b83_a_trait_declared_static_is_reachable_through_the_trait_when_it_has_a_body() {
+    // SUPERSEDED BY B162 (was
+    // `b83_a_trait_declared_static_is_not_reachable_through_the_trait`, which
+    // RECORDED the probe rather than building it). B83 read the gap right —
+    // `Trait::method(receiver)` picks an impl through the receiver, and a
+    // static offers nothing to pick with — and drew the wrong conclusion from
+    // it: with nothing to pick, there is nothing to pick BETWEEN, so the
+    // trait's own default body is the answer, not an ambiguity. That is what
+    // B162 ships.
+    //
+    // What B83 got right survives on the half without a body: a requirement
+    // has no body to be the answer, and the call is refused — by a message
+    // that now names both spellings rather than the bare "cannot find".
     assert_fails_with(
         r#"
         import std::io::print;
@@ -3723,9 +3729,9 @@ fn b83_a_trait_declared_static_is_not_reachable_through_the_trait() {
 
         fun main() { print(Alpha::spawn().n); }
         "#,
-        "cannot find 'spawn' in Alpha",
+        "'Alpha::spawn' has no default body",
     );
-    assert_fails_with(
+    assert_compiles_and_runs(
         r#"
         import std::io::print;
 
@@ -3733,8 +3739,9 @@ fn b83_a_trait_declared_static_is_not_reachable_through_the_trait() {
         trait Alpha { fun spawn(): Bag { Bag { n = 3 } } }
 
         fun main() { print(Alpha::spawn().n); }
+        main();
         "#,
-        "cannot find 'spawn' in Alpha",
+        "3\n",
     );
 }
 

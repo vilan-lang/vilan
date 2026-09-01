@@ -278,8 +278,67 @@ Holder<Dog>` and `impl DogBox with Holder<Cat>` would both be fine.
 Traits are like interfaces, with two differences. They're implemented
 explicitly (`impl Robot with Greet`), never structurally. And they
 appear as *bounds* on generics (`T: Greet`) rather than as standalone
-types: `let x: Greet = …` is a compile error. When you want
-"one of several things at runtime", use an enum.
+types: `fun f(v: Greet)`, `fun make(): Greet` and `struct H { item:
+Greet }` are all compile errors. When you want "one of several things at
+runtime", use an enum.
+
+## A trait on a binding is a constraint
+
+The one place a trait's name reads well in an annotation is a `let`, and
+there it means something narrower than it looks: a **constraint** on the
+value, not the value's type.
+
+```vilan
+trait Greet {
+	fun greet(self): str;
+}
+
+struct Robot { id: i32 }
+impl Robot with Greet {
+	fun greet(self): str { "beep" }
+}
+
+fun main() {
+	// `unit` is a `Robot`. The annotation only checks that `Robot`
+	// implements `Greet` — it does not hide the type behind it.
+	let unit: Greet = Robot { id = 1 };
+	print(unit.id);      // a Robot's own field, still readable
+	print(unit.greet());
+}
+```
+
+Write it when you want the compiler to hold a value to a trait while you
+keep working with its real type. Because the type stays concrete, two
+`if` arms of *different* types are still an error, even when both
+implement the trait — there is no widening for them to meet in. And a
+trait nested inside the annotation (`List<Greet>`) is an ordinary value
+position, so it is still refused: there are no heterogeneous containers.
+
+## Associated functions
+
+A trait `fun` with no `self` is an **associated function** — a name in
+the trait's namespace rather than a method. Give it a default body and it
+becomes callable on the trait itself:
+
+```vilan
+struct Counter { value: i32 }
+
+trait Source {
+	fun new(initial: i32): Counter { Counter { value = initial } }
+}
+impl Counter with Source {}
+
+fun main() {
+	print(Source::new(7).value);
+}
+```
+
+`Source::new(..)` always runs the trait's own body. An impl may declare
+its own `new` to override it, and that one is reached the way any of a
+type's own statics is — `Counter::new(..)`. There is no receiver here for
+the compiler to pick an implementation with, which is why the two
+spellings mean two different bodies rather than one dispatch, and why a
+declaration with *no* default body can only be called through a type.
 
 Operators are traits too. `+` dispatches through `Add`, `==` through
 `PartialEq`, `<` through `PartialOrd`, and so on. Implement the trait and

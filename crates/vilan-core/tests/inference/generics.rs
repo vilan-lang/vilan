@@ -983,21 +983,29 @@ fn generic_mut_view_aggregate_pointee_copies_in_place() {
 }
 
 #[test]
-fn bare_trait_value_method_call_is_rejected() {
-    // Calling a method on a value typed as a *bare trait* (`let x: Display = 5`)
-    // has no concrete type to dispatch to — vilan has no trait objects — and used
-    // to silently lower to the empty abstract method (`undefined`). It is now a
-    // clean compile error pointing at the generic-parameter / concrete-type fix
-    // (backlog B4). The legitimate use of a bare-trait type is a *bound*
-    // (`<T: Display>`), exercised by `generic_dispatch_to_extern_impl` et al.
-    assert_fails(
+fn a_trait_annotated_binding_dispatches_on_its_concrete_type() {
+    // SUPERSEDED BY B161 (was `bare_trait_value_method_call_is_rejected`).
+    // `let x: Display = 5` used to have no concrete type to dispatch to — the
+    // call lowered to the empty abstract method (`undefined`), then was made a
+    // clean compile error at the annotation (B4/B72). B161 keeps the hole shut
+    // by a different route: the annotation is a CONSTRAINT, not the type, so
+    // `x` is an `i32` and `x.to_string()` is `i32`'s. There was never a trait
+    // value here to dispatch on, and now there is not even the appearance of
+    // one. The legitimate use of a bare trait as a TYPE is still nowhere — a
+    // bound (`<T: Display>`) is exercised by `generic_dispatch_to_extern_impl`
+    // et al., and every other value position still refuses (see
+    // `traits.rs`'s narrowing pins).
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         import std::display::Display;
         fun main() {
             let x: Display = 5;
-            let s = x.to_string();
+            print(x.to_string());
         }
+        main();
         "#,
+        "5\n",
     );
 }
 
