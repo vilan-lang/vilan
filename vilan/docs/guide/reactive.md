@@ -412,7 +412,9 @@ not enough for the usual case: a button that should grey out while its
 write is in flight, and a banner that should say why it failed.
 
 `Optimistic::over(signal)` wraps the signal you already have — no binding
-changes — and adds a `state` signal to bind:
+changes — and adds a `state` signal to bind. Any `Signal<T>` fits, your own
+implementations included; the cell's type carries the signal's
+(`Optimistic<T, S>`), and inference fills both in from the call:
 
 ```vilan
 import std::reactive::{ Signal, SignalCell, Optimistic, WriteState };

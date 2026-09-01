@@ -1067,9 +1067,14 @@ enum WriteState {
 	Rejected(str),
 }
 
-struct Optimistic<T> {
+// The cell is generic over the SIGNAL as well as its value (B186): a field
+// must name a real type, so widening `over` past the canonical cell means
+// naming the signal's type, and `S` is that name. A33's write-back class is
+// what makes it worth the arity — a clamped or persisted cell of the user's
+// own is now wrappable, where before only `SignalCell` was.
+struct Optimistic<T, S: Signal<T>> {
 	// The signal being written — the one handed to `over`. Bind it.
-	value: SignalCell<T>,
+	value: S,
 	// The lifecycle, for the UI.
 	state: SignalCell<WriteState>,
 	// The last value the server confirmed: the ROLLBACK TARGET, and the
@@ -1082,17 +1087,17 @@ struct Optimistic<T> {
 	confirmed_generation: Shared<i32>,
 }
 
-impl Optimistic<type T> {
+impl Optimistic<type T, type S: Signal<T>> {
 	/// Wrap `signal` in an optimistic-write cell, seeded with its current
 	/// value as the confirmed truth — the value the cell is handed is, by
 	/// definition, the last thing anyone confirmed.
 	///
-	/// Concrete `SignalCell`, not the trait: `Optimistic` STORES the signal in
-	/// a field, and a field must name a real type (B161 admits a trait at a
-	/// `let` annotation only). Widening it means making `Optimistic` generic
-	/// over the signal type, which changes its arity everywhere — recorded on
-	/// A32 rather than taken here.
-	fun over(signal: SignalCell<T>): Optimistic<T> {
+	/// Any `Signal<T>` serves, not only the canonical cell (A32's write-back
+	/// class, with `optimistic` and `ui`'s `bind_value`): the cell WRITES, and
+	/// `Source` declares `get`/`sub` and no `set`. `S` is written out rather
+	/// than sugared, because the return type names it — B186's implicit
+	/// generic is a parameter's bound, and this one is the struct's.
+	fun over(signal: S): Optimistic<T, S> {
 		Optimistic {
 			value = signal,
 			state = SignalCell::new(WriteState::Confirmed),

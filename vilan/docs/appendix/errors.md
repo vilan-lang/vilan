@@ -119,16 +119,18 @@ demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is a trait, not a type: a trait is not a value type (vilan has no trait objects)"**
-A trait's name was written where a type belongs — a parameter, a return
-type, a struct field, or a generic argument like `List<Display>`. Traits
-are **bounds**, not types, so no value can ever have that type: the impl
-is fine, the signature is not. Write the generic the message spells out —
-`fun show<T: A>(v: T)` — or, inside the trait's own declaration, write
-`Self`, which is what a trait naming itself in a return position always
-meant. The note points at the trait, which may live in another module.
-For "one of several things at runtime", use an enum. A `let` binding's
-own annotation is not this error: there a trait is a *constraint* on the
-inferred type, see the next entry.
+A trait's name was written where a type belongs — a return type, a struct
+field, or a generic argument like `List<Display>`. Traits are **bounds**,
+not types, so no value can ever have that type: the impl is fine, the
+signature is not. Write the generic the message spells out —
+`struct Holder<T: A> { v: T }` — or, inside the trait's own declaration,
+write `Self`, which is what a trait naming itself in a return position
+always meant. The note points at the trait, which may live in another
+module. For "one of several things at runtime", use an enum. Two
+annotations are not this error and the message names them both: a
+**parameter**, where a trait is an implicit generic (`fun f(x: A)` is
+`fun f<T: A>(x: T)`), and a `let` binding's own annotation, where it is a
+*constraint* on the inferred type — see the next entry.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' does not implement trait '…', required by the annotation on '…'"**

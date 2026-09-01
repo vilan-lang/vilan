@@ -192,8 +192,9 @@ alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
 `<p>{stored}</p>` and `<a href(stored)>` work for any source. What asks for a
 `Signal` is what **writes**: `bind_value` and its SSR twin bound on
 `Signal<str>`, and `optimistic` on `Signal<T>`, so a custom implementation with
-its own `set` drives them. `Optimistic::over` still asks for the cell, because
-`Optimistic` STORES it in a field and a field must name a real type.
+its own `set` drives them. `Optimistic::over` takes any `Signal<T>` too — the
+cell STORES it in a field, and a field must name a real type, so the cell names
+it: `Optimistic<T, S>` carries the signal's type as a second parameter.
 
 ## Writing a Signal
 
@@ -379,7 +380,7 @@ an id that cannot collide with a subscriber's (`fresh_id()` mints one).
 ## optimistic
 
 ```vilan,fragment
-fun optimistic<T, E>(signal: SignalCell<T>, value: T, commit: async || Result<T, E>): Result<T, E>
+fun optimistic<T, E, S: Signal<T>>(signal: S, value: T, commit: async || Result<T, E>): Result<T, E>
 ```
 
 Paint `value` into `signal` now, await `commit`, then reconcile: the
@@ -402,17 +403,23 @@ enum WriteState {
 	Rejected(str),  // the newest write was refused; the cell rolled back
 }
 
-struct Optimistic<T> {
-	value: SignalCell<T>,           // the signal you handed to `over`; bind it
+struct Optimistic<T, S: Signal<T>> {
+	value: S,                       // the signal you handed to `over`; bind it
 	state: SignalCell<WriteState>,  // bind a spinner, a disabled button, a banner
 	…                           // internals: the confirmed shadow, two generations
 }
 
-impl Optimistic<type T> {
-	fun over(signal: SignalCell<T>): Optimistic<T>
+impl Optimistic<type T, type S: Signal<T>> {
+	fun over(signal: S): Optimistic<T, S>
 	fun write(self, value: T, commit: async || Result<T, str>): Result<T, str>
 }
 ```
+
+The second parameter is the **signal's own type**. A field must name a real
+type, so widening the cell past `SignalCell` means naming what it holds — and
+inference binds both from the call, so `Optimistic::over(title)` needs nothing
+written. You only spell `S` where you write the cell's type out: a field or a
+return, `Optimistic<str, SignalCell<str>>`.
 
 The same lifecycle as `optimistic`, with the two things a free function has
 nowhere to keep.

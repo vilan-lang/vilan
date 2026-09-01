@@ -2952,12 +2952,34 @@ pub struct Analyzer<'src> {
     // positions — is a CHECKED CONSTRAINT on the binding's inferred type
     // rather than a refusal; the map is what the `prepped_type_locals` drain
     // consults to tell the one position from the rest. A nested spelling
-    // (`&Trait`, `List<Trait>`) mints its own inner type id, which is not in
-    // this map and stays refused.
+    // (`List<Trait>`) mints its own inner type id, which is not in this map
+    // and stays refused. `&Trait` is NOT such a spelling and never was: `&` is
+    // a call convention, erased by `walk_type_node`, which returns the
+    // operand's own id — so the annotation this map holds IS the trait's and
+    // `let seen: &Greet = & dog` is the constraint reading over a view.
     binding_annotation_type_ids: HashMap<TypeId, Id>,
     // The constraints those annotations recorded, checked after `build()` —
     // where the binding's own type has settled (B161).
     binding_trait_constraints: Vec<BindingTraitConstraint>,
+    // The annotation type ids of a declared function's PARAMETERS, to the
+    // declaration that owns them and the scope its generics live in. B186: a
+    // trait written HERE is an IMPLICIT GENERIC — `fun f(x: Trait)` is
+    // `fun f<T: Trait>(x: T)` — so the same drain that refuses a trait
+    // everywhere else desugars it here. Recorded by type id for B161's reason:
+    // whether the annotation names a trait is the drain's to discover, and a
+    // NESTED spelling (`List<Trait>`) mints its own inner id, which is not in
+    // this map and stays refused — `&Trait` is the erased view convention, not
+    // a nesting, and reads as the sugar over a view exactly as it reads as
+    // B161's constraint over one. A CLOSURE's parameters are absent
+    // deliberately: a closure has no generic list to append to.
+    parameter_annotation_type_ids: HashMap<TypeId, (Id, Id)>,
+    // The constraint ids the sugar minted, to the scope whose declaration
+    // binds them (B186). An implicit generic has no NAME, so the two
+    // "is this parameter fixed by an enclosing binder?" tests — which resolve
+    // an ordinary generic by name up the scope chain — ask this instead. It is
+    // the same question keyed structurally, and shadowing cannot arise for a
+    // parameter that was never spelled.
+    implicit_generic_scopes: HashMap<TypeId, Id>,
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
@@ -3600,6 +3622,8 @@ impl<'src> Analyzer<'src> {
             trait_position_type_ids: HashSet::default(),
             binding_annotation_type_ids: HashMap::default(),
             binding_trait_constraints: Vec::new(),
+            parameter_annotation_type_ids: HashMap::default(),
+            implicit_generic_scopes: HashMap::default(),
             panic_fn_id: None,
             source_trait_id: None,
             print_fn_id: None,
@@ -3688,8 +3712,16 @@ impl<'src> Analyzer<'src> {
     ///
     /// Resolved by NAME up the call's scope chain, so the first binder of that
     /// name decides (shadowing-correct) and a same-named parameter of some
-    /// *other* declaration — a distinct constraint id — never matches.
+    /// *other* declaration — a distinct constraint id — never matches. B186's
+    /// implicit generics have no name to resolve, so they answer from the scope
+    /// their declaration owns; nothing can shadow a parameter nobody wrote.
     fn generic_is_enclosing_binder(&self, constraint_id: TypeId, id: Id) -> bool {
+        if let Some(owner_scope_id) = self.implicit_generic_scopes.get(&constraint_id).copied() {
+            return self
+                .expr_id_to_scope_id_map
+                .get(&id)
+                .is_some_and(|scope_id| self.scope_encloses(owner_scope_id, *scope_id));
+        }
         let Some(name) = self.generic_constraint_names.get(&constraint_id).copied() else {
             return false;
         };
@@ -13225,7 +13257,18 @@ impl<'src> Analyzer<'src> {
 
     /// The generic-parameter list of a declaration (`<T: Greeter, U>`), empty
     /// string when there are none.
+    ///
+    /// B186's implicit generics are skipped: the declaration they belong to has
+    /// no `<…>` list in the source, and rendering one back at the author —
+    /// `fun describe<Greet: Greet>(subject: Greet)` — would show a signature
+    /// nobody can type. The bound is already visible where it was written, on
+    /// the parameter.
     fn generic_list_label(&self, constraint_ids: &[TypeId]) -> String {
+        let constraint_ids: Vec<TypeId> = constraint_ids
+            .iter()
+            .copied()
+            .filter(|constraint_id| !self.implicit_generic_scopes.contains_key(constraint_id))
+            .collect();
         if constraint_ids.is_empty() {
             return String::new();
         }
@@ -18957,8 +19000,12 @@ impl<'src> Analyzer<'src> {
     ///
     /// The lookup is by name through the scope chain and stops at the first
     /// binding of that name, so a nearer parameter shadowing this one answers
-    /// `false` — the conservative direction.
+    /// `false` — the conservative direction. B186's implicit generics answer
+    /// structurally instead: they have no name, and none can shadow them.
     fn generic_declared_by_enclosing_scope(&self, constraint_id: TypeId, scope_id: Id) -> bool {
+        if let Some(owner_scope_id) = self.implicit_generic_scopes.get(&constraint_id).copied() {
+            return self.scope_encloses(owner_scope_id, scope_id);
+        }
         let Some(name) = self.generic_constraint_names.get(&constraint_id).copied() else {
             return false;
         };
@@ -19055,6 +19102,67 @@ impl<'src> Analyzer<'src> {
                 .insert(constraint_type_id, bound_type_ids);
         }
         constraint_type_id
+    }
+
+    /// Mints B186's IMPLICIT generic: the parameter written `x: Trait` gets a
+    /// generic parameter bound by that trait, appended to `owner_id`'s declared
+    /// list. Returns its constraint id, which the caller writes into the
+    /// annotation's own type slot — that is the whole desugaring.
+    ///
+    /// Three things differ from [`register_binder`], and each is the point:
+    ///
+    /// - the constraint id is a FRESH mint per annotation (types are not
+    ///   interned), so `fun f(a: Show, b: Show)` is two independent generics;
+    /// - it is APPENDED, after every generic the author wrote, so a call's
+    ///   explicit generic arguments — which zip positionally against this list
+    ///   — keep binding the parameters they always bound;
+    /// - it is registered under NO name. There is no name to register: the
+    ///   author wrote a trait, not a binder, and inserting one would either
+    ///   collide with the parameter's own name in the body scope or invent a
+    ///   spelling the program does not contain. `implicit_generic_scopes`
+    ///   carries what the name would have carried.
+    ///
+    /// The display name is the TRAIT's, which is what the author wrote and what
+    /// a mismatch at a call site should say; the generic-parameter LIST a
+    /// signature renders skips these, because the signature has no `<…>` in it.
+    fn mint_implicit_generic(
+        &mut self,
+        trait_id: Id,
+        arguments: Vec<TypeId>,
+        owner_id: Id,
+        owner_scope_id: Id,
+    ) -> TypeId {
+        let constraint_id = self.type_id_for_type(Type::Trait(trait_id, arguments));
+        if let Some(trait_) = self.traits.get(&trait_id) {
+            self.generic_constraint_names
+                .insert(constraint_id, trait_.name);
+        }
+        self.implicit_generic_scopes
+            .insert(constraint_id, owner_scope_id);
+        if let Some(function) = self.functions.get_mut(&owner_id) {
+            function
+                .generic_parameter_constraint_ids
+                .push(constraint_id);
+        } else if let Some(function) = self.external_functions.get_mut(&owner_id) {
+            function
+                .generic_parameter_constraint_ids
+                .push(constraint_id);
+        }
+        constraint_id
+    }
+
+    /// Whether `scope_id` is `ancestor_scope_id` or lies inside it — the
+    /// structural half of "declared by an enclosing binder", for B186's
+    /// implicit generics, which have no name to resolve up the chain.
+    fn scope_encloses(&self, ancestor_scope_id: Id, scope_id: Id) -> bool {
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            if id == ancestor_scope_id {
+                return true;
+            }
+            current = self.scopes.get(&id).and_then(|scope| scope.parent_id);
+        }
+        false
     }
 
     /// The declared generic-parameter constraint ids of the named type (struct,
@@ -20051,6 +20159,7 @@ impl<'src> Analyzer<'src> {
                             id,
                             body_scope_id,
                             body_scope_id,
+                            Some(id),
                             &mut parameter_destructures,
                         )
                     })
@@ -21167,6 +21276,9 @@ impl<'src> Analyzer<'src> {
                             id,
                             body_scope_id,
                             scope_id,
+                            // A closure has no generic list, so B186's sugar
+                            // stops here and the trait refusal stands.
+                            None,
                             &mut parameter_destructures,
                         )
                     })
@@ -21349,12 +21461,17 @@ impl<'src> Analyzer<'src> {
     /// parameter plus a `Destructure` prelude (collected into `destructures`)
     /// that binds its elements in the body scope — exactly like a destructuring
     /// `let` whose value is that parameter.
+    ///
+    /// `implicit_generic_owner` is the DECLARATION whose generic list an
+    /// implicit generic would be appended to (B186) — `Some` for a `fun`,
+    /// `None` for a closure, which has no such list and keeps the refusal.
     fn walk_parameter(
         &mut self,
         parameter: &'src crate::node::Parameter<'src>,
         function_id: Id,
         body_scope_id: Id,
         type_scope_id: Id,
+        implicit_generic_owner: Option<Id>,
         destructures: &mut Vec<Id>,
     ) -> Id {
         let crate::node::Parameter {
@@ -21430,7 +21547,18 @@ impl<'src> Analyzer<'src> {
             _ => {}
         }
         let type_id = match (pattern, declared_type) {
-            (_, Some(type_node)) => self.walk_type_node(type_node, type_scope_id),
+            (_, Some(type_node)) => {
+                let type_id = self.walk_type_node(type_node, type_scope_id);
+                // B186: the second value position where a trait is a reading
+                // rather than an error. Recorded by type id because the name
+                // has not resolved yet — whether the annotation names a trait
+                // is the drain's to discover, exactly as B161's `let` is.
+                if let Some(owner_id) = implicit_generic_owner {
+                    self.parameter_annotation_type_ids
+                        .insert(type_id, (owner_id, type_scope_id));
+                }
+                type_id
+            }
             // A bare `self` (incl. `&self` / `&mut self`) takes the enclosing
             // `Self` type.
             (Pattern::Binding(name, _, _), None) if *name == "self" => self
@@ -22740,7 +22868,7 @@ impl<'src> Analyzer<'src> {
         substitution: &mut SubstitutionContext,
     ) -> bool {
         let mut unresolved_closure_argument = false;
-        let Some((parameter_ids, own_generics)) = self.method_signature(member_id) else {
+        let Some((parameter_ids, _)) = self.method_signature(member_id) else {
             return unresolved_closure_argument;
         };
         let bindable = self.callee_bindable_generics(member_id);
@@ -22780,10 +22908,20 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
-        // An own generic that appears only in another own generic's parameterized bound
+        // A generic that appears only in another generic's parameterized bound
         // (`m<T, S: Source<T>>(source: S)`): recover `T` from the concrete `S`'s impl,
         // the same as the free-function path in `resolve_call_subject`.
-        self.derive_generics_from_bounds(&own_generics, &own_generics, substitution);
+        //
+        // Over the whole BINDABLE set, not the callee's own generics alone: an
+        // IMPL's binders have exactly the same shape and exactly the same one
+        // recovery channel. `impl Optimistic<type T, type S: Signal<T>> { fun
+        // over(signal: S): Optimistic<T, S> }` binds `S` from the argument and
+        // could reach `T` nowhere — the static's own generic list is empty, so
+        // the derivation ran over nothing and `T` stayed abstract into the
+        // return type. Recording into `bindable` is what B102 sanctions: it is
+        // the set the callee's body can mention, and the set a call's
+        // substitution keys on.
+        self.derive_generics_from_bounds(&bindable, &bindable, substitution);
         unresolved_closure_argument
     }
 
@@ -26522,10 +26660,17 @@ impl<'src> Analyzer<'src> {
             msg: format!("'{trait_name}' is declared here, as a trait"),
             source: self.source_of_id(trait_.id),
         });
+        // The steer names the two positions that DO take the spelling — a
+        // parameter (B186's implicit generic) and a binding (B161's checked
+        // constraint) — because a reader who wrote a trait here almost always
+        // meant one of them, and the old text's `<T: Trait>` recipe is now the
+        // answer only for a field or a return.
         let mut message = format!(
             "'{trait_name}' is a trait, not a type: a trait is not a value type (vilan has \
-             no trait objects), so no value can have this type. Declare a generic parameter \
-             bounded by the trait instead — `<T: {trait_name}>` — and write 'T' here."
+             no trait objects), so no value can have this type. Here a trait names a \
+             parameter's bound, not a value type; write `fun f(x: {trait_name})` for a \
+             parameter, or a generic for a field/return — `<T: {trait_name}>`, with 'T' \
+             written here."
         );
         // `Self` in scope, resolving to this very trait, means the annotation
         // sits inside the trait's own declaration. The lookup is by the type
@@ -31765,38 +31910,58 @@ impl<'src> Analyzer<'src> {
                     // is dropped) while the one position that reads as an
                     // intention rather than a mistake gets that reading.
                     //
+                    // B186: a trait in a PARAMETER's annotation is not the
+                    // mistake either. There it is an IMPLICIT GENERIC —
+                    // `fun f(x: Trait)` is `fun f<T: Trait>(x: T)` — so the
+                    // annotation resolves to that generic and the declaration
+                    // gains a parameter the author did not write. Each
+                    // annotation mints its OWN constraint id, so two
+                    // parameters of one trait are two independent generics
+                    // (§7.3's honest "against"), and the id is APPENDED so an
+                    // explicit generic argument still binds the written
+                    // parameter it always bound.
+                    //
                     // NARROWED, not repealed: the refusal still stands at every
-                    // other value position — a parameter, a return type, a
-                    // field — and at every NESTED spelling here (`&Trait`,
+                    // other value position — a return type, a field, a closure
+                    // parameter — and at every NESTED spelling here (`&Trait`,
                     // `List<Trait>`), whose inner type ids were never annotation
                     // ids to begin with.
+                    let mut implicit_generic_id = None;
                     if let Some((trait_id, arguments)) = &bare_trait_id {
-                        match self.binding_annotation_type_ids.get(&type_id).copied() {
-                            Some(variable_id) => {
-                                self.binding_trait_constraints.push(BindingTraitConstraint {
-                                    variable_id,
-                                    trait_id: *trait_id,
-                                    arguments: arguments.clone(),
+                        if let Some(variable_id) =
+                            self.binding_annotation_type_ids.get(&type_id).copied()
+                        {
+                            self.binding_trait_constraints.push(BindingTraitConstraint {
+                                variable_id,
+                                trait_id: *trait_id,
+                                arguments: arguments.clone(),
+                                span,
+                            });
+                        } else if let Some((owner_id, owner_scope_id)) =
+                            self.parameter_annotation_type_ids.get(&type_id).copied()
+                        {
+                            implicit_generic_id = Some(self.mint_implicit_generic(
+                                *trait_id,
+                                arguments.clone(),
+                                owner_id,
+                                owner_scope_id,
+                            ));
+                        } else {
+                            let (message, note) =
+                                self.bare_trait_in_value_position(*trait_id, scope_id);
+                            // Attributed to the walk that wrote the
+                            // annotation, for the reason the unresolved arm
+                            // below is (E108) — this is the same drain, and
+                            // it had the same defect.
+                            self.push_in_source(
+                                Error {
+                                    trace: Vec::new(),
+                                    note,
                                     span,
-                                });
-                            }
-                            None => {
-                                let (message, note) =
-                                    self.bare_trait_in_value_position(*trait_id, scope_id);
-                                // Attributed to the walk that wrote the
-                                // annotation, for the reason the unresolved arm
-                                // below is (E108) — this is the same drain, and
-                                // it had the same defect.
-                                self.push_in_source(
-                                    Error {
-                                        trace: Vec::new(),
-                                        note,
-                                        span,
-                                        msg: message,
-                                    },
-                                    source_id,
-                                );
-                            }
+                                    msg: message,
+                                },
+                                source_id,
+                            );
                         }
                     }
                     // A refused annotation resolves to `Unknown`, so the one
@@ -31805,14 +31970,17 @@ impl<'src> Analyzer<'src> {
                     // CONSTRAINT annotation resolves to `Unknown` for the
                     // opposite reason: it never was the binding's type, so the
                     // binding grounds from its initializer exactly as an
-                    // unannotated one does. The write goes through
-                    // `write_type_slot`, which owns the solver's progress
-                    // accounting (E43).
+                    // unannotated one does. A PARAMETER's annotation resolves
+                    // to the implicit generic itself (B186): the parameter's
+                    // type IS that generic, which is the whole desugaring. The
+                    // write goes through `write_type_slot`, which owns the
+                    // solver's progress accounting (E43).
                     self.write_type_slot(
                         type_id,
-                        match bare_trait_id {
-                            Some(_) => Type::Unknown,
-                            None => subject_type,
+                        match (&bare_trait_id, implicit_generic_id) {
+                            (Some(_), Some(constraint_id)) => Type::Generic(constraint_id),
+                            (Some(_), None) => Type::Unknown,
+                            (None, _) => subject_type,
                         },
                     );
                 }

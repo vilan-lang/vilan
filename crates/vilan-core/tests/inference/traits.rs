@@ -8,6 +8,10 @@
 //!   CONSTRAINT on the binding's inferred type, not the binding's type — no
 //!   `dyn`, no widening. The binding keeps its concrete type; the annotation
 //!   only checks that type implements the trait.
+//! - B186: a TRAIT written as a PARAMETER's annotation is an IMPLICIT GENERIC
+//!   — `fun f(x: Trait)` is `fun f<T: Trait>(x: T)`, appended after the
+//!   written generics and monomorphized per call like any other. Return
+//!   position, struct fields and every nested spelling stay refused.
 //!
 //! One subject module of the `inference` test binary; the harness it is
 //! written against lives in `support.rs`.
@@ -364,20 +368,6 @@ fn a_trait_nested_in_a_binding_annotation_is_still_refused() {
 }
 
 #[test]
-fn a_trait_in_parameter_position_is_still_refused() {
-    assert_fails_with(
-        &format!(
-            r#"{GREET}
-            fun describe(subject: Greet): str {{ subject.greet() }}
-            fun main() {{ print(describe(Dog {{ name = "rex" }})); }}
-            main();
-            "#
-        ),
-        "'Greet' is a trait, not a type",
-    );
-}
-
-#[test]
 fn a_trait_in_return_position_is_still_refused() {
     assert_fails_with(
         &format!(
@@ -402,5 +392,461 @@ fn a_trait_in_struct_field_position_is_still_refused() {
             "#
         ),
         "'Greet' is a trait, not a type",
+    );
+}
+
+// --- B186: a trait on a PARAMETER is an implicit generic --------------------
+//
+// The reactive paper's §7.3, ruled WANTED. `fun f(x: Trait)` reads as
+// `fun f<T: Trait>(x: T)` — a generic parameter the author did not write,
+// appended after the ones they did, monomorphized per call like any other.
+//
+// The difference from B161's `let` is worth stating, because the two are one
+// family and their bodies do NOT see the same thing. A `let`'s initializer
+// gives one concrete type at one site, so the binding keeps it and the body
+// reads the impl's own surface. A parameter's body is checked ONCE for every
+// call site, so what it sees is the BOUND — exactly what a written
+// `<T: Trait>` sees. Both readings are "no widening, no `dyn`, static
+// dispatch"; only the parameter's is quantified.
+
+/// A parameterized trait over a generic cell, so the trait's ARGUMENT is what
+/// separates one instantiation from another — the argument-binding pins.
+const HOLDS: &str = r#"
+    import std::io::print;
+    trait Holds<T> { fun value(self): T; }
+    struct Cell<T> { inner: T }
+    impl Cell<type T> with Holds<T> { fun value(self): T { self.inner } }
+"#;
+
+#[test]
+fn b186_a_trait_parameter_annotation_is_an_implicit_generic() {
+    // The basic sugar: the position B161 left refused now compiles, and the
+    // bound's member dispatches statically to the argument's own impl.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{GREET}
+            fun describe(subject: Greet): str {{ subject.greet() }}
+            fun main() {{
+                print(describe(Dog {{ name = "rex" }}));
+                print(describe(Fox {{ name = "vix" }}));
+            }}
+            main();
+            "#
+        ),
+        "woof\nring\n",
+    );
+}
+
+#[test]
+fn b186_a_trait_parameter_body_sees_the_bound_not_the_argument() {
+    // The quantified half, pinned so the family difference cannot drift: the
+    // body is checked once against `Greet`, so `Dog`'s own field is NOT
+    // readable through it — the same answer a written `<T: Greet>` gives.
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun describe(subject: Greet): str {{ subject.name }}
+            fun main() {{ print(describe(Dog {{ name = "rex" }})); }}
+            main();
+            "#
+        ),
+        "cannot access field 'name' on type Greet",
+    );
+}
+
+#[test]
+fn b186_an_argument_whose_type_lacks_the_trait_is_refused() {
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun describe(subject: Greet): str {{ subject.greet() }}
+            fun main() {{ print(describe(Cat {{ name = "tom" }})); }}
+            main();
+            "#
+        ),
+        "'Cat' does not implement trait 'Greet', required by a generic bound of this call",
+    );
+}
+
+#[test]
+fn b186_two_parameters_of_one_trait_are_independent_generics() {
+    // §7.3's honest "against": `fun f(a: Greet, b: Greet)` is TWO type
+    // parameters, so the two arguments may be different types. A function
+    // that needs them equal must say so with one written generic.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{GREET}
+            fun pair(a: Greet, b: Greet): str {{ a.greet() + "-" + b.greet() }}
+            fun main() {{
+                print(pair(Dog {{ name = "rex" }}, Fox {{ name = "vix" }}));
+            }}
+            main();
+            "#
+        ),
+        "woof-ring\n",
+    );
+}
+
+#[test]
+fn b186_one_written_generic_still_forces_two_parameters_to_agree() {
+    // The control for the pin above: the explicit spelling keeps its meaning,
+    // so the escape hatch §7.3 promises the guide is really there.
+    assert_fails(&format!(
+        r#"{GREET}
+        fun pair<T: Greet>(a: T, b: T): str {{ a.greet() + "-" + b.greet() }}
+        fun main() {{
+            print(pair(Dog {{ name = "rex" }}, Fox {{ name = "vix" }}));
+        }}
+        main();
+        "#
+    ));
+}
+
+#[test]
+fn b186_a_parameterized_trait_parameter_binds_the_traits_arguments() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{HOLDS}
+            fun read(cell: Holds<i32>): i32 {{ cell.value() }}
+            fun main() {{ print(read(Cell {{ inner = 7 }})); }}
+            main();
+            "#
+        ),
+        "7\n",
+    );
+}
+
+#[test]
+fn b186_a_parameterized_trait_parameter_checks_its_arguments() {
+    assert_fails_with(
+        &format!(
+            r#"{HOLDS}
+            fun read(cell: Holds<i32>): i32 {{ cell.value() }}
+            fun main() {{ print(read(Cell {{ inner = "x" }})); }}
+            main();
+            "#
+        ),
+        "'Cell<str>' does not implement trait 'Holds<i32>'",
+    );
+}
+
+#[test]
+fn b186_the_sugar_mixes_with_written_generics() {
+    assert_compiles_and_runs(
+        &format!(
+            r#"{GREET}
+            fun tag<T: Greet>(label: T, subject: Greet): str {{
+                label.greet() + "/" + subject.greet()
+            }}
+            fun main() {{
+                print(tag(Dog {{ name = "rex" }}, Fox {{ name = "vix" }}));
+            }}
+            main();
+            "#
+        ),
+        "woof/ring\n",
+    );
+}
+
+#[test]
+fn b186_an_implicit_generic_is_appended_after_the_written_ones() {
+    // ORDERING, and the reason it is a pin of its own: the explicit
+    // generic-argument spelling this language has is positional
+    // (`tag<Dog, Fox>(..)`, no `::<>`), so WHERE the sugar's parameter lands
+    // in the list is observable. Appended, `Dog` binds the written `T` and
+    // `Fox` the implicit one, and the call runs. Prepended, `Dog` would bind
+    // `subject` and `Fox` the label — and both arguments would be refused.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{GREET}
+            fun tag<T: Greet>(label: T, subject: Greet): str {{
+                label.greet() + "/" + subject.greet()
+            }}
+            fun main() {{
+                print(tag<Dog, Fox>(Dog {{ name = "rex" }}, Fox {{ name = "vix" }}));
+            }}
+            main();
+            "#
+        ),
+        "woof/ring\n",
+    );
+}
+
+#[test]
+#[ignore = "B186 found this and did not cause it: a PARTIAL generic-argument \
+            list leaves the unsupplied parameters uninferred, and reaches \
+            emission abstract. Pre-existing — it reproduces on two WRITTEN \
+            generics with no sugar in sight — and reported as found-not-fixed \
+            for an item of its own."]
+fn a_partial_generic_argument_list_still_infers_the_rest() {
+    // `tag<Dog>` on a `<T, U>` function supplies one of two. Supplying NONE
+    // works (inference from the arguments) and supplying BOTH works; supplying
+    // one leaves `U` abstract into emission, where it surfaces as the
+    // "resolved to a requirement, which has no body" internal error. B186's
+    // sugar reaches the same hole through `tag<Dog>(label, subject: Greet)`,
+    // which is how it was found.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{GREET}
+            fun tag<T: Greet, U: Greet>(label: T, subject: U): str {{
+                label.greet() + "/" + subject.greet()
+            }}
+            fun main() {{
+                print(tag<Dog>(Dog {{ name = "rex" }}, Fox {{ name = "vix" }}));
+            }}
+            main();
+            "#
+        ),
+        "woof/ring\n",
+    );
+}
+
+#[test]
+fn b186_a_trait_on_a_closure_parameter_is_still_refused() {
+    // A closure is not a declaration and has no generic list to append to, so
+    // the sugar stops at the one position that can carry it.
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun main() {{
+                let describe = |subject: Greet| subject.greet();
+                print(describe(Dog {{ name = "rex" }}));
+            }}
+            main();
+            "#
+        ),
+        "'Greet' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
+    // One error identity, a steer that now names the position that WORKS.
+    let steer = "a trait names a parameter's bound, not a value type";
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun get(): Greet {{ Dog {{ name = "rex" }} }}
+            fun main() {{ print(get().name); }}
+            main();
+            "#
+        ),
+        steer,
+    );
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            struct Kennel {{ inner: Greet }}
+            fun main() {{ print(Kennel {{ inner = Dog {{ name = "rex" }} }}.inner.name); }}
+            main();
+            "#
+        ),
+        steer,
+    );
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun main() {{
+                let pack: List<Greet> = [Dog {{ name = "a" }}];
+                print(pack.length());
+            }}
+            main();
+            "#
+        ),
+        steer,
+    );
+}
+
+#[test]
+fn b186_a_nested_trait_spelling_on_a_parameter_is_still_refused() {
+    // The sugar is the parameter's OWN annotation, not any trait spelled
+    // under it — `List<Greet>` mints an inner type id the sugar never sees,
+    // exactly as B161's nested case does.
+    assert_fails_with(
+        &format!(
+            r#"{GREET}
+            fun describe(pack: List<Greet>): i32 {{ pack.length() }}
+            fun main() {{ print(describe([Dog {{ name = "a" }}])); }}
+            main();
+            "#
+        ),
+        "'Greet' is a trait, not a type",
+    );
+}
+
+#[test]
+fn a_view_annotation_is_transparent_to_the_trait_reading_at_both_positions() {
+    // `&` is a CALL CONVENTION, not a type constructor: `walk_type_node`
+    // erases it and returns the operand's own type id, so there is no
+    // `Reference` type for a trait to be nested inside. `&Greet` is therefore
+    // "a view of something implementing Greet" at both annotations, not a
+    // nested spelling — the `let` half is B161 as shipped (the binding keeps
+    // `Dog`, so `seen.name` reads), and the parameter half is B186 reading the
+    // same annotation the same way. Pinned in one test because the two answers
+    // have to agree: they are one erasure, and a change to it would move both.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{GREET}
+            fun describe(subject: &Greet): str {{ subject.greet() }}
+            fun main() {{
+                let dog = Dog {{ name = "rex" }};
+                let seen: &Greet = & dog;
+                print(seen.greet());
+                print(seen.name);
+                print(describe(& dog));
+            }}
+            main();
+            "#
+        ),
+        "woof\nrex\nwoof\n",
+    );
+}
+
+// --- B186: the emission census -----------------------------------------------
+//
+// §7.3's honest "against": the sugar makes a function SILENTLY generic, so the
+// paper asks what that costs in emitted copies. The answer is that it costs
+// exactly what writing the generic out costs — the sugar is a surface, and
+// M16's emitted-body sharing does the rest. Both halves are pinned: a
+// T-dependent body still gets one copy per type, a T-independent one still
+// gets one copy in total, and the counts match the written spelling's.
+
+/// The three estate sites the census was taken on, shaped like `std::ui`'s
+/// A33-widened bindings (`fun bind_text<S: Source<str>>(self, source: S)`):
+/// a T-DEPENDENT body (the bound's member is resolved per impl), a
+/// T-INDEPENDENT one, and a two-parameter site. `{bound}` is spliced with the
+/// written spelling or with the sugar, and nothing else differs.
+fn census_source(bound: &str) -> String {
+    let (declaration, annotation) = match bound {
+        "written" => ("<S: Greet>", "S"),
+        _ => ("", "Greet"),
+    };
+    format!(
+        r#"{GREET}
+        // Site 1 — T-DEPENDENT: `greet` resolves to a different function per impl.
+        fun bind_text{declaration}(source: {annotation}): str {{
+            let painted = source.greet();
+            "[" + painted + "]"
+        }}
+        // Site 2 — T-INDEPENDENT: the body never mentions the bound.
+        fun bind_attr{declaration}(name: str, _source: {annotation}): str {{
+            let attribute = name + "=1";
+            attribute
+        }}
+        // Site 3 — two sites of the same shape, to show the count is per TYPE
+        // and not per call.
+        fun bind_class{declaration}(source: {annotation}): str {{
+            let classed = source.greet();
+            classed + "!"
+        }}
+        fun main() {{
+            let dog = Dog {{ name = "rex" }};
+            let fox = Fox {{ name = "vix" }};
+            print(bind_text(dog));
+            print(bind_text(fox));
+            print(bind_attr("a", dog));
+            print(bind_attr("b", fox));
+            print(bind_class(dog));
+            print(bind_class(fox));
+        }}
+        main();
+        "#
+    )
+}
+
+#[test]
+fn b186_the_sugar_emits_exactly_what_the_written_generic_emits() {
+    let sugared = compile(&census_source("sugar")).expect("the sugar compiles");
+    let written = compile(&census_source("written")).expect("the written form compiles");
+
+    // T-dependent: one copy per type, both spellings.
+    assert_eq!(
+        emitted_bodies_containing(&sugared, "const painted ="),
+        2,
+        "a T-dependent sugared body monomorphizes per type:\n{sugared}"
+    );
+    assert_eq!(
+        emitted_bodies_containing(&written, "const painted ="),
+        emitted_bodies_containing(&sugared, "const painted ="),
+        "the sugar must cost what the written generic costs"
+    );
+
+    // T-independent: M16 shares ONE body across both types, both spellings.
+    assert_eq!(
+        emitted_bodies_containing(&sugared, "const attribute ="),
+        1,
+        "a T-independent sugared body is shared by M16:\n{sugared}"
+    );
+    assert_eq!(
+        emitted_bodies_containing(&written, "const attribute ="),
+        emitted_bodies_containing(&sugared, "const attribute ="),
+        "the sugar must cost what the written generic costs"
+    );
+
+    assert_eq!(
+        emitted_bodies_containing(&sugared, "const classed ="),
+        2,
+        "the third site monomorphizes per type, not per call:\n{sugared}"
+    );
+    assert_eq!(
+        emitted_bodies_containing(&written, "const classed ="),
+        emitted_bodies_containing(&sugared, "const classed ="),
+        "the sugar must cost what the written generic costs"
+    );
+}
+
+#[test]
+fn b186_the_sugared_estate_runs() {
+    // The emission counts cannot say the shared body is CORRECT at every type
+    // it was shared across; running it can.
+    assert_compiles_and_runs(
+        &census_source("sugar"),
+        "[woof]\n[ring]\na=1\nb=1\nwoof!\nring!\n",
+    );
+}
+
+#[test]
+fn b186_a_kolt_shaped_view_extension_takes_a_source_parameter() {
+    // The exhibit the owner will write next: a `View` extension bound on
+    // `Source<i32>` without a `<S: ..>` list, against the real `std::ui` and
+    // the real `std::reactive` — the shape A33 widened `bind_text` into, now
+    // spelled the way §7.3 says it should be.
+    assert_compiles_browser(
+        r#"
+        import std::ui::{ View, view, mount_root };
+        import std::reactive::{ Signal, SignalCell, Source, Subscription, observe };
+        import std::display::Display;
+
+        // A user's own `Source` (A33's motivating shape), so the extension is
+        // exercised at two unrelated implementations of the trait.
+        struct Doubled { inner: SignalCell<i32> }
+        impl Doubled with Source<i32> {
+            fun get(self): i32 { self.inner.get() * 2 }
+            [must_use]
+            fun sub(self, observer: |i32| void): Subscription {
+                let subscription = observe(self.inner, |value| { observer(value * 2); });
+                observer(self.get());
+                subscription
+            }
+        }
+
+        impl View {
+            fun on_interact(self, source: Source<i32>): View {
+                let element = self.element;
+                source.effect(|value| {
+                    element.set_attribute("data-count", value.to_string());
+                });
+                self
+            }
+        }
+
+        fun main() {
+            let _owner = mount_root("app", || {
+                let count = Signal::new(0);
+                let doubled = Doubled { inner = count };
+                view("div").on_interact(count).on_interact(doubled)
+            });
+        }
+        "#,
     );
 }
