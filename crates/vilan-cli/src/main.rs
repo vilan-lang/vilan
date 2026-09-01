@@ -1,8 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Mutex,
     time::{Duration, SystemTime},
 };
 
@@ -3685,6 +3686,12 @@ fn check_single(
     emit_debug: bool,
     goal: CompileGoal,
 ) -> RoundOutcome {
+    // The same one-report-per-round ledger `check_workspace` arms, for the same
+    // reason (B182): several colors over ONE file is several analyses of one
+    // source tree, and a refusal that holds under every leg is one refusal. A
+    // diagnostic only ONE color raises still renders — the key carries the
+    // reason, so two colors' answers are two errors.
+    let _round = RoundReports::arm();
     let mut ok = true;
     for platform in platforms {
         ok &= compile_unit(unit, *platform, goal, emit_debug, false, None, None).is_ok();
@@ -3870,8 +3877,16 @@ fn build_workspace_artifacts(
 }
 
 /// Type-checks every member of a workspace (each for its own platform; a `none`
-/// library against the base layer).
+/// library against the base layer) — and every ENTRY of a multi-entry package,
+/// which reaches here as its own member.
+///
+/// One round, one report per distinct error (B182). The members share a source
+/// tree: a module several legs reach is analyzed once per leg and yields the
+/// same diagnostics each time, and reading the same refusal three times says
+/// nothing the first did not. [`RoundReports`] scopes the ledger to this loop —
+/// each `check` starts with an empty one, so a `--watch` round always reports.
 fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
+    let _round = RoundReports::arm();
     let mut ok = true;
     for (unit, platform) in members {
         ok &= compile_unit(
@@ -5117,6 +5132,10 @@ fn compile_to_js(
     // separately (they still count against a clean build via `noted_errors`).
     let mut analyzer_errors: Vec<(SourceId, std::ops::Range<usize>, String)> = Vec::new();
     let mut noted_errors = 0usize;
+    // Diagnostics this round already rendered for an earlier entry (B182). They
+    // are not shown again and they still count: the leg is broken, and only the
+    // repetition was dropped.
+    let mut repeated_errors = 0usize;
     // The same diagnostics, captured as structured items for the HMR overlay
     // (only assembled into text when `overlay` is `Some`). Populated alongside
     // the terminal path — never in place of it — reusing each message verbatim.
@@ -5271,6 +5290,14 @@ fn compile_to_js(
                 )
                 .with_trace(overlay_trace),
             );
+            // B182: a module every leg of a package reaches is analyzed once
+            // per leg, so its errors arrive once per leg. Render the first,
+            // COUNT the rest — the leg still failed, and dropping it from the
+            // verdict would let a second entry emit over a broken module.
+            if !first_report_this_round(overlay_name, &error.span.into_range(), &error.msg) {
+                repeated_errors += 1;
+                continue;
+            }
             // A diagnostic carrying secondary locations — an E78 requirement
             // trace and/or a C3 note — renders directly (multi-label; the
             // shared ariadne path has nowhere to put them); plain ones keep
@@ -5337,7 +5364,11 @@ fn compile_to_js(
         // nobody wrote. (`clean` below already refuses to RETURN the output; this
         // is what stops it being produced, and with it every transformer panic a
         // salvaged tree could provoke.)
-        if analyzer_errors.is_empty() && noted_errors == 0 && parse_errors.is_empty() {
+        if analyzer_errors.is_empty()
+            && noted_errors == 0
+            && repeated_errors == 0
+            && parse_errors.is_empty()
+        {
             // `--print-chunks` (bundle-splitting.md S1): report what a split
             // build would chunk. Analysis-only — the emitted JavaScript below
             // is untouched — and gated on a clean analysis, so a failing build
@@ -5456,7 +5487,10 @@ fn compile_to_js(
         }
     }
 
-    let clean = analyzer_errors.is_empty() && parse_errors.is_empty() && noted_errors == 0;
+    let clean = analyzer_errors.is_empty()
+        && parse_errors.is_empty()
+        && noted_errors == 0
+        && repeated_errors == 0;
     // The overlay's copy of this leg's diagnostics (hmr.md §§2/§6): the analyzer/
     // codegen items captured above, plus the parse errors rendered with the SAME
     // `render` the terminal `report` uses — only the location prefix and framing
@@ -5765,6 +5799,64 @@ fn char_range(text: &str, span: &std::ops::Range<usize>) -> std::ops::Range<usiz
     }
     let start = text[..span.start].chars().count();
     start..start + text[span.start..span.end].chars().count()
+}
+
+/// The diagnostics already RENDERED this round, keyed exactly the way the
+/// module loader's two-seams dedup keys its own (E102,
+/// `report_module_parse_errors`): **file, position and reason** — all three of
+/// what an error *is*. Not the file alone (two modules can hold the same reason
+/// at the same offset), not the position alone (two different refusals land on
+/// one offset), not the reason alone (the same reason recurs down a file).
+///
+/// `None` — the default — means DISARMED: every diagnostic renders, which is
+/// right for every single-analysis path, where nothing can repeat.
+///
+/// [`check_workspace`] and [`check_single`] arm it, because a multi-entry
+/// package's check is several analyses of ONE source tree (B182). A module
+/// every leg reaches is analyzed once per leg and produces the same errors each
+/// time, so kolt's two refused fields' one report each arrived three times
+/// over — the entry is the same seam the loader already deduplicates, one level
+/// up. Process-global rather than threaded because the rendering sits several
+/// frames below the loop that knows a round is running; scoped by
+/// [`RoundReports`], so a watch round starts clean and a single-unit build
+/// never consults it at all.
+static RENDERED_THIS_ROUND: Mutex<Option<HashSet<(String, usize, usize, String)>>> =
+    Mutex::new(None);
+
+/// Arms [`RENDERED_THIS_ROUND`] for the lifetime of one multi-unit round.
+struct RoundReports;
+
+impl RoundReports {
+    fn arm() -> Self {
+        *RENDERED_THIS_ROUND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HashSet::new());
+        RoundReports
+    }
+}
+
+impl Drop for RoundReports {
+    fn drop(&mut self) {
+        *RENDERED_THIS_ROUND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Whether this diagnostic has not been rendered yet this round — always true
+/// while the ledger is disarmed. Recording is the same call, as
+/// `HashSet::insert` already answers both halves.
+fn first_report_this_round(file: &str, span: &std::ops::Range<usize>, message: &str) -> bool {
+    match RENDERED_THIS_ROUND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        Some(rendered) => {
+            rendered.insert((file.to_string(), span.start, span.end, message.to_string()))
+        }
+        None => true,
+    }
 }
 
 /// Renders parser diagnostics (via the handwritten frontend's `render`) and
