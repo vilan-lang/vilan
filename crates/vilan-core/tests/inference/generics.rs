@@ -4993,3 +4993,340 @@ fn b185_a_rebinding_walk_terminates_on_a_module_level_binding_cycle() {
         "#,
     );
 }
+
+// --- B188: an under-supplied type application is refused, never erased ------
+
+#[test]
+fn b188_an_under_supplied_parameter_annotation_refuses() {
+    // THE MISCOMPILE. `struct Holder<S>` written bare as `Holder` in a
+    // parameter annotation used to resolve to the declaration's OWN type,
+    // whose argument vector is empty — the parameter erased rather than
+    // bound. The empty vector then reads downstream as "nothing to check", so
+    // a `Holder<str>` passed to a `Holder` parameter unified, `h.inner` typed
+    // as the unbounded parameter, and the declared `i32` return carried a
+    // `str` out: the emitted `console.log("seven" + 1)` printed `seven1`.
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        fun read(h: Holder): i32 { h.inner }
+        fun main() {
+            let n = read(Holder { inner = "seven" });
+            print(n + 1);
+        }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_the_under_supply_refusal_names_the_written_spelling() {
+    // The message hands back the spelling that fixes it, so the parameter
+    // names are the declaration's own.
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        fun read(h: Holder): i32 { h.inner }
+        fun main() { print(read(Holder { inner = 7 })); }
+        "#,
+        "write `Holder<S>`",
+    );
+}
+
+#[test]
+fn b188_an_erased_parameter_reaching_a_bodyless_requirement_refuses_not_ices() {
+    // THE ICE TWIN, and the same root. With the parameter erased, `h.inner`
+    // typed as its BOUND, so `.take()` resolved to `Get`'s body-less
+    // requirement and the transformer — which cannot emit a signature — bailed
+    // with "please report this program". Refusing the annotation removes the
+    // erasure that put an abstract receiver there at all.
+    assert_fails_with(
+        r#"
+        trait Get<T> { fun take(self): T; }
+        struct Cell { v: i32 }
+        impl Cell with Get<i32> { fun take(self): i32 { self.v } }
+        struct Holder<S: Get<i32>> { inner: S }
+        fun read(h: Holder): i32 { h.inner.take() }
+        fun main() { print(read(Holder { inner = Cell { v = 7 } })); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_the_ice_shape_no_longer_reports_an_internal_error() {
+    // The point is that the internal error is GONE, not merely that a better
+    // diagnostic was added beside it.
+    assert_fails_without(
+        r#"
+        trait Get<T> { fun take(self): T; }
+        struct Cell { v: i32 }
+        impl Cell with Get<i32> { fun take(self): i32 { self.v } }
+        struct Holder<S: Get<i32>> { inner: S }
+        fun read(h: Holder): i32 { h.inner.take() }
+        fun main() { print(read(Holder { inner = Cell { v = 7 } })); }
+        "#,
+        "please report this program",
+    );
+}
+
+#[test]
+fn b188_under_supply_refuses_in_a_return_annotation() {
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        fun make(): Holder { Holder { inner = 7 } }
+        fun main() { print(make().inner); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_under_supply_refuses_in_a_let_annotation() {
+    // B161 narrowed the bare-TRAIT refusal at a `let` annotation, because a
+    // trait there is a constraint the initializer still grounds through. An
+    // under-supplied nominal application is not that: annotations are checked,
+    // never inferred, so the missing argument is a missing argument here too.
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        fun main() { let h: Holder = Holder { inner = 7 }; print(h.inner); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_under_supply_refuses_in_a_field_annotation() {
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        struct Outer { h: Holder }
+        fun main() { let o = Outer { h = Holder { inner = 7 } }; print(o.h.inner); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_under_supply_refuses_nested_in_a_generic_argument() {
+    // The arguments of an application are themselves walked annotations, so
+    // the check reaches `List<Holder>` at the inner spelling.
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        fun read(items: List<Holder>): i32 { items.len() }
+        fun main() { print(read([])); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_under_supply_refuses_in_an_impl_head_subject() {
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        trait Show { fun show(self): i32; }
+        impl Holder with Show { fun show(self): i32 { 1 } }
+        fun main() { print(Holder { inner = 7 }.show()); }
+        "#,
+        "`Holder` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_under_supply_refuses_in_a_trait_bound_argument() {
+    // A bound is a trait-position annotation, and an under-supplied trait
+    // application there erased the trait's own parameter the same way.
+    assert_fails_with(
+        r#"
+        trait Get<T> { fun take(self): T; }
+        struct Cell { v: i32 }
+        impl Cell with Get<i32> { fun take(self): i32 { self.v } }
+        fun read<S: Get>(c: S): i32 { c.take() }
+        fun main() { print(read(Cell { v = 7 })); }
+        "#,
+        "`Get` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_under_supply_refuses_for_an_enum_application() {
+    // Enums apply arguments the same way structs do, and the prelude's
+    // `Option` is the one a program is most likely to write bare.
+    assert_fails_with(
+        r#"
+        fun read(o: Option): i32 { 1 }
+        fun main() { print(read(Option::Some("x"))); }
+        "#,
+        "`Option` takes 1 type argument, 0 given",
+    );
+}
+
+#[test]
+fn b188_a_partially_supplied_application_names_the_full_arity() {
+    // Under-supply is not only the bare spelling: `Pair<i32>` for a two
+    // parameter declaration leaves `B` erased in exactly the same way.
+    assert_fails_with(
+        r#"
+        struct Pair<A, B> { a: A, b: B }
+        fun read(p: Pair<i32>): i32 { p.a }
+        fun main() { print(read(Pair { a = 1, b = "x" })); }
+        "#,
+        "`Pair` takes 2 type arguments, 1 given — write `Pair<A, B>`",
+    );
+}
+
+#[test]
+fn b188_a_bare_two_parameter_application_refuses() {
+    assert_fails_with(
+        r#"
+        struct Pair<A, B> { a: A, b: B }
+        fun read(p: Pair): i32 { p.a }
+        fun main() { print(read(Pair { a = 1, b = "x" })); }
+        "#,
+        "`Pair` takes 2 type arguments, 0 given",
+    );
+}
+
+#[test]
+fn b188_over_supply_is_still_refused() {
+    // The control, and the half that was already caught — though only ever
+    // downstream, by a mismatch at a use. An annotation nothing uses reported
+    // nothing at all, so the arity check owns both directions now.
+    assert_fails_with(
+        r#"
+        struct Holder<S> { inner: S }
+        fun read(h: Holder<i32, str>): i32 { h.inner }
+        fun main() { print(1); }
+        "#,
+        "`Holder` takes 1 type argument, 2 given",
+    );
+}
+
+#[test]
+fn b188_a_correctly_supplied_application_still_compiles_and_runs() {
+    // The control that keeps the refusal honest: the written argument binds,
+    // the field types through it, and the program runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder<S> { inner: S }
+        fun read(h: Holder<i32>): i32 { h.inner }
+        fun main() { print(read(Holder { inner = 7 }) + 1); }
+        main();
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn b188_a_defaulted_parameter_still_fills_a_bare_application() {
+    // A parameter with a default (`<S = i32>`) is supplied by the
+    // declaration, so the bare spelling is complete — and still CHECKED: a
+    // `str` in the defaulted position is refused on the type, not the arity.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder<S = i32> { inner: S }
+        fun read(h: Holder): i32 { h.inner }
+        fun main() { print(read(Holder { inner = 7 })); }
+        main();
+        "#,
+        "7\n",
+    );
+    assert_fails_without(
+        r#"
+        struct Holder<S = i32> { inner: S }
+        fun read(h: Holder): i32 { h.inner }
+        fun main() { print(read(Holder { inner = "seven" })); }
+        "#,
+        "type argument",
+    );
+}
+
+#[test]
+fn b188_self_and_a_generic_binder_are_not_under_supplied_applications() {
+    // `Self` inside a generic impl resolves to the subject WITH its arguments
+    // and writes none of them, and a generic parameter names no declaration at
+    // all. Neither is a written application, so neither may be counted.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder<S> { inner: S }
+        impl Holder<type S> { fun me(self): Self { self } }
+        fun read<S>(h: Holder<S>): S { h.me().inner }
+        fun main() { print(read(Holder { inner = 7 })); }
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b188_a_non_generic_type_is_untouched() {
+    // The check keys on the DECLARATION's arity, so a plain struct written
+    // bare — the overwhelmingly common spelling — is not an under-supply.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Cell { v: i32 }
+        fun read(c: Cell): i32 { c.v }
+        fun main() { print(read(Cell { v = 7 })); }
+        main();
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b188_generated_code_is_not_held_to_the_written_arity() {
+    // The boundary, and it is deliberate. The derive generators spell a
+    // subject by its bare name in every role — `[derive(PartialEq)]` on
+    // `struct Holder<T>` emits `impl Holder with PartialEq` and
+    // `fun eq(self, other: Holder)` — so the erasure this fix removes is
+    // precisely what let the generated impls type-check. Refusing them would
+    // report a GENERATOR's defect at a `[derive(..)]` the author cannot edit,
+    // and making the generators generic-aware is a ruling rather than a fix:
+    // the reflection surface a macro sees carries no generic parameters, and a
+    // derived impl over a parameter needs bounds nothing computes. So the rule
+    // covers what a program WRITES, and this shape keeps working meanwhile.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [derive(PartialEq)]
+        struct Holder<T> {
+            value: T,
+        }
+
+        fun main() {
+            let h = Holder { value = 3 };
+            print(Holder<i32> { value = 3 } == h);
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b188_a_path_head_is_not_an_under_supplied_application() {
+    // `Option::None` and `List::new()` name a NAMESPACE to look a member up
+    // in, not a type, so the head's arity is nobody's to supply — std writes
+    // these everywhere and none of them is a written application.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() {
+            let empty: Option<i32> = Option::None;
+            mut items: List<i32> = List::new();
+            items.push(1);
+            print(items.len());
+        }
+        main();
+        "#,
+        "1\n",
+    );
+}
