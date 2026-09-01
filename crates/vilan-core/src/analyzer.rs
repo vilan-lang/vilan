@@ -33148,17 +33148,35 @@ impl<'src> Analyzer<'src> {
                     // printed `v=1,2`, and `total + value` against an `i32`
                     // emitted the host's `+` over whatever was passed.
                     //
-                    // A BOUND is a promise and keeps its leniency: `T: Add` on
-                    // the right of `a + b` is `B = Self` through the dispatch,
-                    // and a parameter bound to the left operand's own type is
-                    // exactly what the admitted set wants. Only the unbounded
-                    // case promises nothing — and nothing is neither a string
-                    // form nor the left operand's type.
+                    // B179 rules what a BOUND may mean in this position, and
+                    // the answer is the same principle the whole family turns
+                    // on: the right operand has to be a MEMBER of what the
+                    // LEFT operand's `add` accepts, and a bound can prove
+                    // membership only where that set is trait-characterizable.
+                    // `str`'s is — the set is "everything with a string form",
+                    // and B176's render bound names it exactly. A number's is
+                    // not: `i32`'s `add` accepts `i32` and nothing else, no
+                    // trait names that set, and a bound promises a trait's
+                    // METHODS, never that the parameter IS `i32` (`Add`'s `B`
+                    // defaults to `Self`, which is the parameter). So every
+                    // generic right operand of a NUMERIC `+` refuses —
+                    // unbounded or bounded, and whatever the bound promises.
+                    let generic_rhs = matches!(&rhs_type, Type::Generic(_));
                     let unbounded_generic = matches!(
                         &rhs_type,
                         Type::Generic(constraint_id)
                             if self.generic_bound_trait_ids(*constraint_id).is_empty()
                     );
+                    // The square B169 (unbounded) and B176 (bounded, but
+                    // concatenating) left open, and a live miscompile until
+                    // B179: `fun bump<T: Add>(total: i32, value: T): i32
+                    // { total + value }` compiled, and `bump(1, Point { x = 1,
+                    // y = 2 })` printed `11,2` — a string, typed `i32`.
+                    // `grounded` excludes every `Type::Generic`, so a bounded
+                    // parameter reached neither the admitted set nor a
+                    // refusal, and `compare_type` would have admitted it
+                    // anyway: a parameter compares equal to whatever is asked.
+                    let generic_rhs_of_a_number = generic_rhs && !concatenating;
                     // B176: and a bound is a promise that has to be KEPT. The
                     // bounded parameter was admitted here and then emitted as
                     // a raw host `+` — `grounded` excludes every
@@ -33181,10 +33199,9 @@ impl<'src> Analyzer<'src> {
                             .map(|trait_id| (*constraint_id, trait_id)),
                         _ => None,
                     };
-                    let bounded_generic_concat = concatenating
-                        && !unbounded_generic
-                        && matches!(&rhs_type, Type::Generic(_));
+                    let bounded_generic_concat = concatenating && !unbounded_generic && generic_rhs;
                     let admitted = !unbounded_generic
+                        && !generic_rhs_of_a_number
                         && if concatenating {
                             self.renders_into_a_string(&rhs_type) || render_bound.is_some()
                         } else {
@@ -33193,7 +33210,10 @@ impl<'src> Analyzer<'src> {
                     if let Some(recorded) = render_bound {
                         self.concat_render_dispatch.insert(binary_id, recorded);
                     }
-                    if (grounded(&rhs_type) || unbounded_generic || bounded_generic_concat)
+                    if (grounded(&rhs_type)
+                        || unbounded_generic
+                        || bounded_generic_concat
+                        || generic_rhs_of_a_number)
                         && !admitted
                     {
                         let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
@@ -33208,13 +33228,22 @@ impl<'src> Analyzer<'src> {
                                  `value.to_string()`; an i-string hole is this same \
                                  concatenation, so it needs the same pair"
                             )
-                        } else if unbounded_generic {
+                        } else if generic_rhs_of_a_number {
+                            // B179. One sentence for the bounded and the
+                            // unbounded parameter alike, because the ruling is
+                            // that the bound is IRRELEVANT here — the
+                            // pre-B179 wording steered the author to "bound it
+                            // (`<T: Add>`)", which is exactly the program that
+                            // printed `11,2`.
                             format!(
                                 "`+` adds two values of the same type, but the operands are \
-                                 `{lhs_label}` and `{rhs_label}`: a parameter promises only what \
-                                 its bounds promise, and this one is unbounded — nothing says it \
-                                 is `{lhs_label}`. Bound it (`<{rhs_label}: Add>`), or take a \
-                                 concrete type"
+                                 `{lhs_label}` and `{rhs_label}`: `{rhs_label}` is wider than what \
+                                 `{lhs_label}`'s `add` accepts. That set is `{lhs_label}` itself, \
+                                 and no trait names it, so no bound on `{rhs_label}` can prove \
+                                 membership — a bound promises a trait's methods, never that the \
+                                 parameter IS `{lhs_label}`. Convert the value explicitly and \
+                                 declare the operand `{lhs_label}`, or put a left operand there \
+                                 whose `Add` declares a `B` that admits `{rhs_label}`"
                             )
                         } else if bounded_generic_concat {
                             // B176: bounded, but bounded to the wrong promise.
@@ -33269,6 +33298,55 @@ impl<'src> Analyzer<'src> {
                                 note: None,
                                 span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                                 msg,
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
+                }
+                // B179, the REST of the native family. `+` is ruled above,
+                // where `str` earns the one exception: its admitted set is
+                // trait-characterizable, so B176's render bound can prove a
+                // parameter belongs to it. No other native operator has such a
+                // set. `-`, `*`, `/`, `%`, the bitwise and shift pair, `==`,
+                // `!=` and the orderings all take the left operand's own type
+                // as their `B`, a native left operand never DISPATCHES (an
+                // `impl i32 with Add` is not consulted — native JS is the
+                // operator's semantics), and no trait names "is `i32`". So a
+                // parameter on the right is never a provable member, whatever
+                // it is bounded to, and the hole was the same miscompile in
+                // every one: against `total: i32` and a `value: T` bound to
+                // anything, `total - value` and `total * value` emitted `NaN`,
+                // `total & value` emitted `0`, and `total < value` and
+                // `total == value` emitted a plausible `false` — each typed as
+                // if the operator had been checked. B170 routed every left
+                // SHAPE through the check; this routes every right one.
+                //
+                // The LEFT operand being a parameter is the other half of the
+                // frame and is deliberately untouched (B174): a trait default
+                // body writes `self.once() + self.once()` over the trait's own
+                // parameter today, so refusing it is a breaking generics
+                // change with a migration, not this miscompile fix.
+                if native_left && !matches!(op, BinaryOp::Add) {
+                    let rhs_type = self.infer_type(rhs_id, &lhs_type, &HashMap::default());
+                    if matches!(rhs_type, Type::Generic(_)) {
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "`{symbol}` takes two values of the same type, but the \
+                                     operands are `{lhs_label}` and `{rhs_label}`: `{rhs_label}` \
+                                     is wider than what `{lhs_label}` admits. A native left \
+                                     operand never dispatches, and no trait names `{lhs_label}`'s \
+                                     set, so no bound on `{rhs_label}` can prove membership — a \
+                                     bound promises a trait's methods, never that the parameter \
+                                     IS `{lhs_label}`. Convert the value explicitly and declare \
+                                     the operand `{lhs_label}`"
+                                ),
                             },
                             binary_id,
                         );
