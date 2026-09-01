@@ -2677,6 +2677,45 @@ impl Document {
             .unwrap_or_default()
     }
 
+    /// The top-level import leaves nothing in this file uses (E114) — the spans
+    /// the editor FADES, in the analyzed text's coordinates.
+    ///
+    /// Paint, not a warning: an unused import is a tidiness observation, so it
+    /// publishes at hint severity with `DiagnosticTag::Unnecessary` and never
+    /// enters a count or gates anything (see `publish::diagnostic_groups`).
+    ///
+    /// It is the ORGANIZER's answer, not a second one: the same leaf walk
+    /// (`formatter::import_leaf_name_spans`) and the same usage test
+    /// ([`Document::import_leaf_is_used`], which counts type positions, value
+    /// positions and struct constructors, and counts references from code
+    /// generated out of this file so a derive-only import survives). Whatever
+    /// Organize Imports would prune is what fades, which is the only honest
+    /// relationship between a mark and the fix offered for it.
+    ///
+    /// Conservative in exactly the organizer's two ways, because a mark that
+    /// lies is worse than no mark: nothing fades while the buffer is ahead of
+    /// the analysis, and nothing fades in a file that carries a diagnostic — a
+    /// half-typed name might be about to use the very import in question.
+    /// Re-exports are not leaves here at all.
+    pub fn unused_import_spans(&self) -> Vec<Span> {
+        let Some(program) = self
+            .program
+            .as_ref()
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale())
+        else {
+            return Vec::new();
+        };
+        // The ANALYZED text, so the spans this returns are in the coordinates
+        // the publisher converts through — and equal to the live text anyway,
+        // since a stale document decides nothing above.
+        let source = self.analyzed_text();
+        let import_spans = vilan_core::formatter::import_statement_spans(source);
+        vilan_core::formatter::import_leaf_name_spans(source)
+            .into_iter()
+            .filter(|leaf| !self.import_leaf_is_used(program, *leaf, &import_spans))
+            .collect()
+    }
+
     /// Whether the top-level import whose terminal name occupies `leaf_span` is
     /// used, so the organizer keeps it. Maps the leaf to the definition it binds
     /// (`resolve_import` records the leaf as a reference at its own span — see
@@ -9380,6 +9419,89 @@ pub(crate) mod tests {
             result,
             "import pkg::helper::alpha;\nimport pkg::helper::beta;\nfun main() {\n\talpha();\n\tbeta();\n}\n",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E114: the same answer, as PAINT ──────────────────────────────────────
+    //
+    // "Graying out dead code generally looks better to me" — the owner. The
+    // spans the editor fades are the organizer's own verdict rather than a
+    // second opinion, so what is faded is exactly what Organize Imports would
+    // remove. These pin that identity, and the conservatism that comes with it.
+
+    /// The name of the leaf each unused span covers, so a pin reads as the
+    /// import the user would see faded.
+    fn faded(document: &Document) -> Vec<String> {
+        let text = document.analyzed_text().to_string();
+        document
+            .unused_import_spans()
+            .into_iter()
+            .map(|span| text[span.into_range()].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn an_unused_import_leaf_is_faded_and_a_used_one_is_not() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::{ alpha, beta };\nfun main() {\n\talpha();\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert_eq!(faded(&document), vec!["beta".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_re_export_is_never_faded() {
+        // `export import` binds a name for somebody ELSE. This file not using
+        // it is the point of writing it, so fading it would be a lie — and the
+        // organizer never prunes one either, which is the same rule.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "export import pkg::helper::beta;\nfun main() {}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_type_only_import_is_not_faded() {
+        // The honesty case the organizer already had to get right: a name used
+        // only in a TYPE position has no value reference at all, and a fade
+        // driven by value uses alone would gray a live import.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::Widget;\nfun main() {\n\tlet w: Widget = Widget {};\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_faded_while_the_file_carries_a_diagnostic() {
+        // A half-typed name might be about to use the very import in question,
+        // so a broken file fades nothing. A mark that lies is worse than no
+        // mark, and this is the same gate the organizer's pruning takes.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::beta;\nfun main() {\n\tmissing_name();\n}\n",
+            ),
+            ("helper.vl", ORGANIZE_HELPER),
+        ]);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the fixture must actually be broken",
+        );
+        assert!(faded(&document).is_empty(), "{:?}", faded(&document));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1239,6 +1239,50 @@ pub fn import_statement_spans(source: &str) -> Vec<Span> {
         .collect()
 }
 
+/// Every top-level import LEAF's terminal-name span, in source order — the
+/// spans an editor asks about when it fades the imports nobody uses (E114).
+///
+/// The walk is [`prune_import_branch`]'s, so the editor and the organizer are
+/// asking about exactly one set of leaves: what the organizer would prune is
+/// what the editor fades, and nothing else can drift between them. A RE-EXPORT
+/// is excluded here for the same reason the organizer never prunes one —
+/// `export import` binds a name for somebody else, so this file not using it is
+/// the whole point rather than a mistake.
+///
+/// Empty when the source does not parse, which the caller reads as "decide
+/// nothing" — the same contract [`import_statement_spans`] has.
+pub fn import_leaf_name_spans(source: &str) -> Vec<Span> {
+    let Some(items) = parse(source) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    for item in items.iter() {
+        if matches!(item.0, Node::Export(_)) {
+            continue;
+        }
+        let Some((_, branch)) = import_kind_and_branch(&item.0) else {
+            continue;
+        };
+        collect_import_leaf_spans(branch, &mut spans);
+    }
+    spans
+}
+
+/// [`import_leaf_name_spans`]' recursion: a `Path` with a `::` continuation
+/// defers to the continuation, a brace `Set` yields every member's leaf, and a
+/// terminal `Path` IS the leaf.
+fn collect_import_leaf_spans(branch: &ImportBranch<'_>, out: &mut Vec<Span>) {
+    match branch {
+        ImportBranch::Path(_, span, None) => out.push(*span),
+        ImportBranch::Path(_, _, Some(child)) => collect_import_leaf_spans(child, out),
+        ImportBranch::Set(branches) => {
+            for branch in branches {
+                collect_import_leaf_spans(branch, out);
+            }
+        }
+    }
+}
+
 /// Organizes a file's *top-level* import runs: sorts each into canonical order
 /// (the shared [`import_sort_key`], identical to `vilan fmt`) and, per `keep`,
 /// prunes unused leaves. Returns one [`ImportRunEdit`] per run whose canonical

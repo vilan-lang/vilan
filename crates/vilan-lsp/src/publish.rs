@@ -27,7 +27,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, Range, Url,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location, Range,
+    Url,
 };
 
 use crate::document::{Document, PublishedDiagnostic};
@@ -498,6 +499,24 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
             }
         }
     }
+    // E114, the gray-out: an import nothing uses is FADED rather than
+    // squiggled. `DiagnosticTag::Unnecessary` at HINT severity is the
+    // protocol's own door for this — VS Code dims the range and leaves the
+    // Problems count, the error badge and every gate alone, which is the
+    // owner's posture exactly: paint, not a warning. Appended here rather than
+    // folded into `published_diagnostics` for the same reason: this is the one
+    // place where what goes ON THE WIRE is assembled, so nothing that counts
+    // diagnostics can accidentally count these.
+    for span in document.unused_import_spans() {
+        entry_group.push(Diagnostic {
+            range: document.analyzed_range(&span),
+            severity: Some(DiagnosticSeverity::HINT),
+            source: Some("vilan".to_string()),
+            message: "unused import".to_string(),
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
+    }
     let mut groups = vec![(owner.clone(), entry_group)];
     groups.extend(extra_groups);
     groups
@@ -685,6 +704,55 @@ mod tests {
         assert!(
             visible(&editor).is_empty(),
             "the ghost must not be the last thing published: {editor:#?}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// E114 at the wire: an unused import is published as PAINT. The protocol's
+    /// door is `DiagnosticTag::Unnecessary` on a HINT-severity diagnostic — VS
+    /// Code dims the range and leaves the Problems count, the error badge and
+    /// every gate alone. The severity is the whole posture, so it is pinned
+    /// here rather than trusted: an unused import that arrived as a Warning
+    /// would enter the count the owner asked it to stay out of.
+    #[test]
+    fn an_unused_import_publishes_as_a_hint_tagged_unnecessary() {
+        let (directory, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::{ alpha, beta };\nfun main() {\n\talpha();\n}\n",
+            ),
+            ("helper.vl", "fun alpha() {}\nfun beta() {}\n"),
+        ]);
+        let uri = Url::from_file_path(directory.join("main.vl")).expect("a file URL");
+        let published = PublishState::new()
+            .plan_publish(&uri, &document)
+            .into_iter()
+            .find(|(target, _)| *target == uri)
+            .map(|(_, group)| group)
+            .expect("the entry publishes");
+        let faded: Vec<&Diagnostic> = published
+            .iter()
+            .filter(|item| item.tags.as_deref() == Some(&[DiagnosticTag::UNNECESSARY]))
+            .collect();
+        assert_eq!(faded.len(), 1, "one faded import: {published:#?}");
+        assert_eq!(faded[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(faded[0].message, "unused import");
+        assert_eq!(
+            faded[0].range,
+            range_of(
+                &std::fs::read_to_string(directory.join("main.vl")).expect("readable"),
+                "beta",
+                0
+            ),
+            "over the leaf, not the whole statement",
+        );
+        // …and nothing else is published: the fade must not come with a
+        // squiggle, and must not be counted as one.
+        assert!(
+            published
+                .iter()
+                .all(|item| item.severity == Some(DiagnosticSeverity::HINT)),
+            "a clean file with an unused import has no errors or warnings: {published:#?}",
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
