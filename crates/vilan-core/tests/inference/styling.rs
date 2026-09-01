@@ -5410,6 +5410,20 @@ fn a_bare_hex_colour_refuses_naming_the_hole() {
         "#,
         "Color::hex",
     );
+    // The steer, compiled (audit run 7's steer sweep, ledger row 335): the
+    // message hands back a whole declaration — `color: {Color::hex("#333")};` —
+    // and a lex error's fix is worth nothing if the spelling it names does not
+    // itself lex, parse and route through `Color`'s `:root` line.
+    // (`r##"…"##`: the steered spelling contains `"#`, which closes an `r#"`.)
+    assert_compiles(
+        r##"
+        import std::style::style;
+        import std::style::Color;
+        let _s = const css { color: {Color::hex("#333")}; };
+        fun main() {}
+        main();
+        "##,
+    );
 }
 
 #[test]

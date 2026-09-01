@@ -3890,6 +3890,88 @@ fn b57_a_type_qualified_call_does_not_fall_through_to_a_trait() {
         "'pick' is not an inherent member of 'Bag': 'A' provides it; \
          call 'A::pick(..)' instead",
     );
+    // The steered spelling, compiled and run: the claim the message makes is
+    // the program that follows it.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun pick(self): str; }
+        impl Bag with A { fun pick(self): str { "A" } }
+        fun main() { print(A::pick(Bag { x = 1 })); }
+        "#,
+        "A\n",
+    );
+}
+
+/// Audit run 7 (F5): the same refusal on an impl that takes the trait's DEFAULT
+/// BODY. `method_member_candidates` scans what an impl DECLARES, so an impl
+/// whose body is empty contributed no candidate and the steer fell silent —
+/// the author got a bare "cannot find 'pick' in Bag" on the one shape where the
+/// fix the steer names is exactly the same one. A default body is provision.
+#[test]
+fn b57_a_type_qualified_call_steers_when_the_provision_is_a_default_body() {
+    assert_fails_spanning(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "A" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        fun main() { print(Bag::pick(Bag { x = 1 })); }
+        "#,
+        "Bag::pick",
+        "'pick' is not an inherent member of 'Bag': 'A' provides it; \
+         call 'A::pick(..)' instead",
+    );
+    // And the spelling it blesses compiles and runs — B162's ruling that
+    // `Trait::func` IS the default body, reached through the steer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "A" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        fun main() { print(A::pick(Bag { x = 1 })); }
+        "#,
+        "A\n",
+    );
+}
+
+#[test]
+fn b57_a_default_bodied_provision_names_every_providing_trait() {
+    // Two traits, both providing by default body, neither declared in its impl:
+    // the steer names both, the way it always did for declared provision.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "from-A" } }
+        trait B { fun mark(self): str; fun pick(self): str { "from-B" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        impl Bag with B { fun mark(self): str { "m" } }
+        fun main() { print(Bag::pick(Bag { x = 1 })); }
+        "#,
+        "'pick' is not an inherent member of 'Bag': 'A' and 'B' provide it; \
+         call 'A::pick(..)' or 'B::pick(..)' instead",
+    );
+}
+
+#[test]
+fn b57_a_trait_only_default_body_keeps_its_own_steer() {
+    // The exclusion the new provision has to respect: a `[trait_only]` member
+    // is not reached by `Trait::member(receiver)` either, so pointing at that
+    // spelling would be the very defect F5 is about. Its own steer — reach it
+    // through a bound — still stands.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        trait A { fun tag(self): str; [trait_only] fun pick(self): str { "from-A" } }
+        struct Bag { x: i32 }
+        impl Bag with A { fun tag(self): str { "t" } }
+        fun main() { print(Bag::pick(Bag { x = 1 })); }
+        "#,
+        "it is `[trait_only]` on trait `A`",
+    );
 }
 
 /// The disambiguator against an INHERITED DEFAULT: the impl declares nothing,
@@ -5174,11 +5256,65 @@ fn b178_a_parameterized_main_is_refused() {
 fn b178_the_refusal_steers_to_process_args() {
     // The message is the whole point of the ruling: refusing without naming the
     // argument door leaves the author with no way forward at all.
+    //
+    // Audit run 7 (F2/F3): naming `std::process::args()` was not naming the
+    // door. That spelling is a NAMESPACE path, refused in an expression, and
+    // the bare `process::args()` under it is refused too until the module is
+    // imported — so the steer led into a second refusal whichever way the
+    // author read it. The working spelling is two lines, and the message names
+    // both; the two pins below hold the refusals it used to walk into.
+    //
+    // A steer is a claim, so the claim is checked and then COMPILED: the
+    // program the refusal draws, with the message's own spelling applied.
     assert_fails_with(
         r#"
         fun main(first: str, second: str) { }
         "#,
-        "read them with `std::process::args()`",
+        "read them with `import std::process;` at the top and `process::args()` in the body",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() {
+            let arguments = process::args();
+            print(arguments.len());
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b178_the_inline_namespace_path_is_not_the_steer() {
+    // F3's first refusal, and the reason the message no longer spells the call
+    // `std::process::args()`: a namespace root is not a binding, so a
+    // fully-qualified path is not an expression the language has. That is B52's
+    // rule holding (`path::name` addresses what a NAMESPACE declares, and `std`
+    // declares modules, not values) and it is unchanged here — only the steer
+    // moved. The resolution rule's own diagnostic is what an author who writes
+    // it meets.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() { print(std::process::args().len()); }
+        "#,
+        "`std` is a namespace, not a value",
+    );
+}
+
+#[test]
+fn b178_process_args_without_the_import_is_refused() {
+    // F3's second refusal: dropping to the bare `process::args()` — the form
+    // the errors appendix and `vilan help run` used to show with the import
+    // left unnamed — refuses too, because `process` is a module name only once
+    // something imports it. Which is why the steer names BOTH lines.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main() { print(process::args().len()); }
+        "#,
+        "cannot find type 'process'",
     );
 }
 

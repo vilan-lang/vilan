@@ -1002,15 +1002,19 @@ pub struct Variable<'src> {
 }
 
 /// One generic parameter as a nominal declaration WROTE it (B188): the name it
-/// bound and whether it supplied a default (`<B = Self>`). The arity check on a
-/// written type application needs both, and neither survives into
-/// `generic_parameter_constraint_ids` — that list holds constraint ids, and a
-/// defaulted parameter's entry there is the DEFAULT's type id, indistinguishable
-/// from a bound one.
+/// bound, whether it supplied a default (`<B = Self>`), and whether it carried a
+/// bound. The arity check on a written type application needs all three, and
+/// none survives into `generic_parameter_constraint_ids` — that list holds
+/// constraint ids, and a defaulted parameter's entry there is the DEFAULT's type
+/// id, indistinguishable from a bound one.
 #[derive(Debug, Clone)]
 struct DeclaredGenericParameter<'src> {
     name: &'src str,
     has_default: bool,
+    /// `T: A + B`, or a tuple bound (`T: (2..)`). The arity refusal offers a
+    /// CONCRETE example argument, and may only do so where one exists to name:
+    /// a type picked blind satisfies no bound (audit run 7, F4).
+    is_bounded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -14073,6 +14077,51 @@ impl<'src> Analyzer<'src> {
         })
     }
 
+    /// The traits `subject_type` implements that provide `member_name` as a
+    /// `self` METHOD with a DEFAULT BODY — provision the impl block itself does
+    /// not declare (audit run 7, F5).
+    ///
+    /// `method_member_candidates` scans what an impl DECLARES, so
+    /// `impl Dog with Greet { }` over a `Greet` that carries `fun hi(self)`'s
+    /// body contributed no candidate at all, and `Dog::hi(..)` fell past the
+    /// "not an inherent member" steer into a bare "cannot find 'hi' in Dog" —
+    /// on the one shape whose fix is the very `Greet::hi(..)` the steer names
+    /// (B162: `Trait::func` IS the default body). Taking the default body is
+    /// provision; the steer now says so.
+    ///
+    /// `[trait_only]` provision is excluded, and must be: that member is not
+    /// reachable through `Trait::member(receiver)` either, so steering there
+    /// would be this same defect again. Its own steer — reach it through a
+    /// bound — is written at the call site below.
+    fn default_bodied_method_providers(&self, subject_type: &Type, member_name: &str) -> Vec<Id> {
+        let implemented: Vec<Id> = self
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                self.compare_type(
+                    subject_type,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
+            .flat_map(|implementation| implementation.trait_ids.clone())
+            .collect();
+        let mut providers: Vec<Id> = Vec::new();
+        for trait_id in implemented {
+            let Some(member_id) = self.method_member_in_trait(trait_id, member_name) else {
+                continue;
+            };
+            if self.declaration_is_trait_only(member_id) || !self.member_has_default_body(member_id)
+            {
+                continue;
+            }
+            if !providers.contains(&trait_id) {
+                providers.push(trait_id);
+            }
+        }
+        providers
+    }
+
     /// [`method_member_in_trait`] with the arguments the trait is used AT, and
     /// returning the trait that DECLARES the member together with the
     /// arguments THAT trait is reached with — the pair a caller needs to
@@ -18726,9 +18775,17 @@ impl<'src> Analyzer<'src> {
     /// `ReferenceError: condition is not defined` at the first statement.
     ///
     /// The way forward is a real argument door rather than a parameter list:
-    /// `std::process::args()` hands back the argv tail as a `List<str>`, a value
+    /// `process::args()` hands back the argv tail as a `List<str>`, a value
     /// whose type is always right where a hand-written parameter list is a
     /// guess at what the shell will send.
+    ///
+    /// The steer names the door in TWO lines, which is what it takes to open it
+    /// (audit run 7, F2/F3). `std::process::args()` inline is not a spelling the
+    /// language has — a namespace root is not a binding, so it earns `` `std` is
+    /// a namespace, not a value `` — and the bare `process::args()` under it
+    /// earns "cannot find type 'process'" until something imports the module. A
+    /// steer that names one line of a two-line fix is a steer into a second
+    /// refusal, so both are written out.
     ///
     /// Keyed on the GLOBAL scope's `main`, which is the same lookup the
     /// transformer's entry discovery makes — a module's own `main`, or a method
@@ -18763,8 +18820,8 @@ impl<'src> Analyzer<'src> {
                 span: Span::new((), start..end),
                 msg: "`main` takes no parameters: the shell owns what is passed to a \
                       program, so nothing can call the entry with arguments — read them \
-                      with `std::process::args()`, which hands back the argument tail as \
-                      a `List<str>`"
+                      with `import std::process;` at the top and `process::args()` in the \
+                      body, which hands back the argument tail as a `List<str>`"
                     .to_string(),
             },
             main_id,
@@ -19714,6 +19771,7 @@ impl<'src> Analyzer<'src> {
                 .map(|parameter| DeclaredGenericParameter {
                     name: parameter.name,
                     has_default: parameter.default.is_some(),
+                    is_bounded: !parameter.bounds.is_empty() || parameter.tuple_bound.is_some(),
                 })
                 .collect(),
         );
@@ -19865,6 +19923,10 @@ impl<'src> Analyzer<'src> {
     ///
     /// A parameter with a default (`<B = Self>`) supplies itself, so an
     /// argument missing from a defaulted position is not missing.
+    ///
+    /// The message steers, so it owes a spelling that COMPILES: see the comment
+    /// on the format below for why naming the declaration's parameter and
+    /// stopping there was not one.
     fn written_application_arity_error(
         &self,
         subject_id: Id,
@@ -19892,26 +19954,49 @@ impl<'src> Analyzer<'src> {
         {
             return None;
         }
+        let plural_arguments = match declared.len() {
+            1 => "",
+            _ => "s",
+        };
+        // The zero-arity case has nothing to supply: the fix is to write the
+        // bare name rather than an empty `<>`, and there is no steer past it.
+        if declared.is_empty() {
+            return Some(format!(
+                "`{name}` takes 0 type arguments, {written_count} given — write `{name}`"
+            ));
+        }
         // The spelling that fixes it, handed back with the declaration's own
-        // parameter names — including for the zero-arity case, where the fix is
-        // to write nothing at all rather than an empty `<>`.
-        let spelling = match declared.is_empty() {
-            true => name.to_string(),
-            false => format!(
-                "{name}<{}>",
-                declared
-                    .iter()
-                    .map(|parameter| parameter.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+        // parameter names — and then, since those names are the DECLARATION's,
+        // where an argument for them comes from (audit run 7, F4). `write
+        // `Holder<S>`` alone steered into a second refusal: `S` is in scope in
+        // `struct Holder<S>` and nowhere else, so an author who wrote what the
+        // message said met "cannot find type 'S'". The spelling still leads,
+        // because it is the shape the annotation has to take; the clause after
+        // it names the two ways to fill the shape, and both are pinned.
+        let names: Vec<&str> = declared.iter().map(|parameter| parameter.name).collect();
+        let list = names.join(", ");
+        let one = names.len() == 1;
+        // The concrete example is offered only where it is TRUE. Any type fills
+        // an unbounded parameter, so `i32` is a real answer there; a bounded one
+        // is not fillable by a type named blind, and that case says what the
+        // argument has to satisfy rather than naming one that may not.
+        let concrete = match (declared.iter().all(|parameter| !parameter.is_bounded), one) {
+            (true, true) => format!("a concrete type (`{name}<i32>`)"),
+            (true, false) => format!(
+                "concrete types (`{name}<{}>`)",
+                vec!["i32"; names.len()].join(", ")
             ),
+            (false, true) => "a concrete type that satisfies its bound".to_string(),
+            (false, false) => "concrete types that satisfy their bounds".to_string(),
         };
         Some(format!(
-            "`{name}` takes {} type argument{}, {written_count} given — write `{spelling}`",
+            "`{name}` takes {} type argument{plural_arguments}, {written_count} given — write \
+             `{name}<{list}>` with `{list}` supplied here: {concrete}, or {} this signature \
+             declares (add `<{list}>` to its generics)",
             declared.len(),
-            match declared.len() {
-                1 => "",
-                _ => "s",
+            match one {
+                true => "a parameter",
+                false => "parameters",
             },
         ))
     }
@@ -33397,6 +33482,14 @@ impl<'src> Analyzer<'src> {
                                 .insert(id, (trait_id, member_name));
                             Some((member, None))
                         });
+                    // Provision by DEFAULT BODY, which the candidate scan above
+                    // cannot see (audit run 7, F5). Computed only on the way to
+                    // a refusal — nothing resolved, and the subject is a
+                    // concrete type — so the resolved path pays nothing.
+                    let default_bodied_providers = match member_id.is_none() && !subject_is_trait {
+                        true => self.default_bodied_method_providers(&subject_type, member_name),
+                        false => Vec::new(),
+                    };
                     match member_id {
                         Some((member_id, impl_subject)) => {
                             let rc = self.reference_count.entry(member_id).or_insert(0);
@@ -33508,8 +33601,13 @@ impl<'src> Analyzer<'src> {
                         }
                         // Every candidate belongs to a trait: `Type::member` no
                         // longer reaches them (§3.1), and the fix is to name the
-                        // trait at the path head.
-                        None if !method_candidates.is_empty() => {
+                        // trait at the path head. A trait whose DEFAULT BODY is
+                        // what provides the member declares nothing in the impl
+                        // and so raises no candidate — it is named here too
+                        // (F5), because the fix it needs is the same one.
+                        None if !method_candidates.is_empty()
+                            || !default_bodied_providers.is_empty() =>
+                        {
                             let subject_str =
                                 self.pretty_print_type(&subject_type, &HashMap::default());
                             let mut homes: Vec<Id> = Vec::new();
@@ -33518,6 +33616,11 @@ impl<'src> Analyzer<'src> {
                                     && !homes.contains(&trait_id)
                                 {
                                     homes.push(trait_id);
+                                }
+                            }
+                            for trait_id in &default_bodied_providers {
+                                if !homes.contains(trait_id) {
+                                    homes.push(*trait_id);
                                 }
                             }
                             let providers: Vec<String> = homes

@@ -4158,6 +4158,22 @@ fn expression_lift_result_receivers_need_one_error_type() {
         "#,
         "Convert the error first with `.map_err(…)`",
     );
+    // Ledger row 87's steer, compiled: `.map_err(…)` on the odd receiver puts
+    // the region back on one error type, and the program runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+        struct Wrapped { msg: str }
+        fun a(): Result<i32, str> { Ok(1) }
+        fun b(): Result<i32, Wrapped> { Ok(2) }
+        fun main() {
+            let sum: Result<i32, str> = a()? + b().map_err(|w| w.msg)?;
+            match sum { Ok(let n) => print(n), Err(let e) => print(e) }
+        }
+        "#,
+        "3\n",
+    );
 }
 
 #[test]
@@ -4173,6 +4189,70 @@ fn expression_lift_mixed_containers_are_rejected() {
         }
         "#,
         "must split the same container",
+    );
+    // The steer, and the spelling it blesses, compiled and run on the very
+    // program the refusal draws (audit run 7's steer sweep, ledger row 86):
+    // `.ok_or(err)` is only named when both sides are the std pair, so it is a
+    // claim about THIS region and it has to hold.
+    assert_fails_with(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        import std::result::Result::{ self, Ok, Err };
+        fun main() {
+            let opt = Some(1);
+            let res: Result<i32, str> = Ok(2);
+            let sum = opt? + res?;
+        }
+        "#,
+        "Convert first: `.ok_or(err)` turns an `Option` into a `Result`.",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::result::Result::{ self, Ok, Err };
+        fun main() {
+            let opt = Some(1);
+            let res: Result<i32, str> = Ok(2);
+            let sum: Result<i32, str> = opt.ok_or("none")? + res?;
+            match sum { Ok(let n) => print(n), Err(let e) => print(e) }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn expression_lift_flatten_error_mismatch_steers_to_map_err() {
+    // Ledger row 88, which the steer sweep found pinned by nothing at all — the
+    // `?.` chain's near-identical message (row 84) has pins, this one had none.
+    // The body's container IS the region's, so the two error types have to
+    // agree, and `.map_err(…)` on the BODY is what makes them.
+    assert_fails_with(
+        r#"
+        import std::result::Result::{ self, Ok, Err };
+        struct Wrapped { msg: str }
+        fun rows(): Result<List<Result<i32, Wrapped>>, str> { Ok([Ok(7)]) }
+        fun main() {
+            let x = rows()?[0];
+        }
+        "#,
+        "this lifted expression flattens into its own `Result`, so the error \
+         types must match: the receivers' is str, the body yields Wrapped. \
+         Convert the error first with `.map_err(…)`.",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+        struct Wrapped { msg: str }
+        fun rows(): Result<List<Result<i32, Wrapped>>, str> { Ok([Ok(7)]) }
+        fun main() {
+            let x: Result<i32, str> = rows()?[0].map_err(|w| w.msg);
+            match x { Ok(let n) => print(n), Err(let e) => print(e) }
+        }
+        "#,
+        "7\n",
     );
 }
 
