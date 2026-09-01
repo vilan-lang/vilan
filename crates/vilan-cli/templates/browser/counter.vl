@@ -9,19 +9,25 @@
 // evaluates the chain at build time and writes real CSS into `app.css` beside
 // the bundle. `.styled(..)` only puts the generated class names on the element
 // — `index.html` links the sidecar.
+//
+// `Signal`, `view` and `View` are ambient: `prelude = "std::web"` in
+// vilan.toml puts them in scope with no import, along with the MODULES `style`
+// and `ui` — which is why the chain below writes `style::Display::Flex` and
+// imports nothing for it. The prelude carries the module, not its members, so
+// you qualify; import a member explicitly wherever you would rather write it
+// bare, since an explicit import always beats the prelude. `Style` is imported
+// for exactly that reason: a TYPE is written bare, not qualified.
 
-import std::reactive::Signal;
-import std::style::{ Color, Display, FlexDirection, Style, space, style };
-import std::ui::{ View, view };
+import std::style::Style;
 
 fun card_style(): Style {
-	style()
-		.display(Display::Flex)
-		.flex_direction(FlexDirection::Column)
-		.gap(space(3))
-		.padding(space(4))
-		.background(Color::gray(100))
-		.radius(space(2))
+	style::style()
+		.display(style::Display::Flex)
+		.flex_direction(style::FlexDirection::Column)
+		.gap(style::space(3))
+		.padding(style::space(4))
+		.background(style::Color::gray(100))
+		.radius(style::space(2))
 }
 
 fun counter(): View {

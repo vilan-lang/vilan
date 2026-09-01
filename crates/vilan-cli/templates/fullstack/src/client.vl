@@ -8,25 +8,31 @@
 //
 // The `const` style chain is evaluated at build time into dist/client.css,
 // which src/server.vl serves and src/app.html links.
+//
+// `Signal`, `view` and `View` are ambient: `prelude = "std::web"` in
+// vilan.toml puts them in scope with no import, along with the MODULES `style`
+// and `ui` — which is why the chain below writes `style::Display::Flex` and
+// the mount writes `ui::mount_root`. The prelude carries the module, not its
+// members, so you qualify; import a member explicitly wherever you would
+// rather write it bare, since an explicit import always beats the prelude.
+// `Style` is imported for exactly that reason: a TYPE is written bare.
 
-import std::reactive::Signal;
-import std::style::{ Color, Display, FlexDirection, Style, space, style };
-import std::ui::{ mount_root, view };
+import std::style::Style;
 import pkg::shared::greeting;
 
 fun card_style(): Style {
-	style()
-		.display(Display::Flex)
-		.flex_direction(FlexDirection::Column)
-		.gap(space(3))
-		.padding(space(4))
-		.background(Color::gray(100))
-		.radius(space(2))
+	style::style()
+		.display(style::Display::Flex)
+		.flex_direction(style::FlexDirection::Column)
+		.gap(style::space(3))
+		.padding(style::space(4))
+		.background(style::Color::gray(100))
+		.radius(style::space(2))
 }
 
 fun main() {
 	let card = const card_style();
-	let _root = mount_root("app", || {
+	let _root = ui::mount_root("app", || {
 		let count = Signal::new(0);
 		view("main")
 			.styled(card)

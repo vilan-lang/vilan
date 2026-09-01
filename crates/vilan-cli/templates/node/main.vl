@@ -1,6 +1,7 @@
 // The entry. `fun main` runs on start — there is no `main()` call at the
-// bottom of the file. `print` needs no import — it is in the default
-// prelude; everything outside the prelude is imported explicitly.
+// bottom of the file. `print` needs no import — it is one of the seven names
+// `prelude = "std::prelude"` puts in scope (vilan.toml); everything outside
+// the prelude is imported explicitly.
 
 import pkg::greeting::greeting;
 
