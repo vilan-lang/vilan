@@ -949,6 +949,26 @@ say which directory the server actually ran from instead of guessing. It is
 *not* a project-root finder — walking up to `vilan.toml` is a separate,
 undecided helper, and `cwd()` does not preempt it.
 
+`args()` is the program's **only** argument door, and it is deliberately
+the only one: `fun main` takes no parameters, and writing any is a
+compile error that says so. A parameter list declares what values a
+function accepts, and the entry accepts none — the shell decides what is
+passed, so nothing in the language could call `main` with arguments, and
+a parameter list there is a guess at what will arrive rather than a
+promise about it. `args()`'s `List<str>` is always the right type for
+what the shell actually sent.
+
+```vilan,norun
+import std::io::print;
+import std::process;
+
+fun main() {
+	let tail = process::args();          // `vilan run p.vl a b` → ["a", "b"]
+	if tail.len() == 0 { print("usage: p <name>"); ret; }
+	print(tail.get(0).unwrap_or("?"));
+}
+```
+
 Server-side hot-swapping of code is not a thing
 here and is not planned — the node leg restarts.
 

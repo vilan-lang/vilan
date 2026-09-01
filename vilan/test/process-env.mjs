@@ -22,8 +22,8 @@ function $c(self, fallback) {
 	}
 	return $e;
 }
-const arguments = __args();
-console.log(arguments.length);
+const arguments2 = __args();
+console.log(arguments2.length);
 const $a = __env("VILAN_TEST_VAR");
 let $b = null;
 if ($a[0] === 0) {

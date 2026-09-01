@@ -92,6 +92,17 @@ pattern as a boolean:
 let present = entry.map(|current| current is Some(let _task));
 ```
 
+A `let` inside the pattern **captures**, and the capture is in scope
+wherever the test is known to have passed: the then-branch, and the rest
+of the condition after an `&&`. It is not in scope in the `else`, after
+the `if`, or in the other arm of a `||` — each of those is reached
+exactly when the test *didn't* pass, so there is no payload to name:
+
+```vilan,fragment
+if slot is Some(let task) && task.ready { start(task); }   // both fine
+if slot is Some(let task) { … } else { start(task); }      // error: unbound
+```
+
 One edge to know: a `match` can't sit directly inside a larger operator
 expression. Bind it to a local first.
 

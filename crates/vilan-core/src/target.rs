@@ -114,6 +114,20 @@ impl Platform {
         }
     }
 
+    /// The RUNTIME's name without its version (`node` / `deno` / `bun` /
+    /// `browser` / `none`) — what a sentence about which overlay a file is
+    /// analyzed under wants (E119). The version is what distinguishes two
+    /// builds for the same runtime, and it distinguishes no overlay.
+    pub fn runtime_name(self) -> &'static str {
+        match self {
+            Platform::Node { .. } => "node",
+            Platform::Deno { .. } => "deno",
+            Platform::Bun { .. } => "bun",
+            Platform::Browser => "browser",
+            Platform::None => "none",
+        }
+    }
+
     /// Whether this is the host-less `none` platform (check-only).
     pub fn is_none(self) -> bool {
         matches!(self, Platform::None)

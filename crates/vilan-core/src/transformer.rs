@@ -9638,6 +9638,14 @@ const RESERVED_NAMES: &[&str] = &[
     "private",
     "protected",
     "public",
+    // Strict mode forbids BINDING these two, and an ES module is always strict
+    // — so emitting `const arguments = …` is a `SyntaxError` at load, before a
+    // line of the program runs. Found shipping B178's `process::args()` pin:
+    // `let arguments = args()` is the obvious spelling and it compiled to a
+    // module node refused to parse ("Unexpected eval or arguments in strict
+    // mode"). They are not reserved WORDS, which is why they were missing here.
+    "arguments",
+    "eval",
     // Globals the runtime helpers / codegen reference as free identifiers.
     "console",
     "process",

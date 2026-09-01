@@ -7049,3 +7049,148 @@ fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
         "a view cannot escape its scope",
     );
 }
+
+// --- B171: what an `is` binding's scope IS ------------------------------------
+//
+// The spec used to say "bindings inside an `is` pattern are scoped to nothing
+// (use `match` to bind)", which was false three ways. RULED 2026-09-01, and the
+// four pins below are the whole sentence:
+//
+//   then-branch          YES — the test passed, so the payload is there
+//   `&&`-right operand   YES — the same, and short-circuit guarantees it ran
+//   `||` arms            NO  — `||` short-circuits, so the other arm proves
+//                              nothing about this arm's test (and neither does
+//                              anything after the condition, then-branch
+//                              included)
+//   else-branch          NO  — the test FAILED there
+//
+// The two refusals are the ordinary unresolved-name error: nothing bound the
+// name, so nothing special needs saying. `if !(x is Some(let y)) { return }`
+// binding the continuation is a separate design item (B187) and is NOT this.
+
+#[test]
+fn b171_an_is_binding_is_visible_in_the_then_branch() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b171_an_is_binding_is_visible_in_the_and_right_operand() {
+    // The condition's own right-hand side, which the tracker item verified by
+    // probe and the spec sentence denied. `&&` short-circuits, so the right
+    // operand is evaluated only where the `is` test already passed.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) && n > 1 { print(n); }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b171_an_is_binding_is_not_visible_in_an_or_arm() {
+    // The other arm of a `||` runs precisely when the `is` test FAILED, so the
+    // payload is not there. Before the ruling this compiled and emitted
+    // `$a[0] === 0 || $a[1] > 1` — a read of a payload slot the subject does
+    // not have, which JavaScript answers `undefined` and compares `false`: a
+    // silent wrong answer rather than a crash.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) || n > 1 { print("hit"); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+#[test]
+fn b171_an_is_binding_is_not_visible_in_the_else_branch() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) { print(n); } else { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+/// The consequence of the `||` rule that the four boundaries do not state on
+/// their own, and the reason the cap is the OPERAND rather than the `||` node:
+/// reaching the then-branch of a condition whose `is` sits under a `||` proves
+/// only that *some* arm was true, so the binding is not there either.
+#[test]
+fn b171_an_or_arm_capture_does_not_reach_the_then_branch() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let flag = false;
+            if maybe is Some(let n) || flag { print(n); }
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}
+
+/// The control that keeps the `||` cap from swallowing the `&&` rule: an `is`
+/// and its use inside ONE operand of a `||` are both inside that operand, so
+/// the capture is visible exactly where it was before.
+#[test]
+fn b171_an_and_inside_an_or_arm_still_sees_its_own_capture() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            let flag = false;
+            if (maybe is Some(let n) && n > 1) || flag { print("hit"); }
+        }
+        "#,
+        "hit\n",
+    );
+}
+
+/// And the binding dies with the `if`: after it, the name is unresolved in the
+/// enclosing scope, which never had it. (The `is` capture lives in the `if`'s
+/// own scope — shared with the condition and the then-branch, and a sibling of
+/// the `else`'s.)
+#[test]
+fn b171_an_is_binding_does_not_outlive_its_if() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let maybe = Some(2);
+            if maybe is Some(let n) { print(n); }
+            print(n);
+        }
+        "#,
+        "cannot find 'n' in this scope",
+    );
+}

@@ -345,6 +345,7 @@ fn analyze_workspace_files(
         entry_dependencies,
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
 
     let source = std::fs::read_to_string(&entry_path).unwrap();
@@ -444,6 +445,7 @@ fn dependency_pkg_self_reference_is_isolated() {
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let entry_path = app_dir.join("main.vl");
     let source = std::fs::read_to_string(&entry_path).unwrap();
@@ -677,6 +679,7 @@ fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let source = std::fs::read_to_string(&entry_path).unwrap();
     let leaked: &'static str = Box::leak(source.into_boxed_str());
@@ -781,6 +784,7 @@ fn base_lib_reexporting_a_layer_module_errors() {
         entry_dependencies: vec![("plat".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let source = std::fs::read_to_string(&entry_path).unwrap();
     let leaked: &'static str = Box::leak(source.into_boxed_str());
@@ -2208,6 +2212,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: Default::default(),
+        ..Workspace::default()
     };
     let overlaid = "fun dep_value(): i32 { 424242 }\n".to_string();
     let overlaid_bytes = overlaid.len();
@@ -3166,6 +3171,7 @@ fn a_dependency_resolves_under_its_own_prelude_not_the_consumers() {
         entry_dependencies: vec![("common".to_string(), 0)],
         macro_limits: MacroLimits::default(),
         entry_prelude: web_prelude(),
+        ..Workspace::default()
     };
     let entry_path = app_dir.join("main.vl");
     let source = std::fs::read_to_string(&entry_path).unwrap();

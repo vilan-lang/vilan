@@ -1820,6 +1820,183 @@ fn file_mode_falls_back_to_the_default_entry_for_an_unreached_module() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── E119: a miss on an OVERLAID std type names the overlay and WHY ──
+//
+// E113 gets the colour right. That leaves the case where the colour is right
+// and the author still cannot read the message: the platform selects `std`'s
+// layer overlay, so it decides what `View` IS, and `struct 'View' has no field
+// 'element'` says nothing about WHICH `View` or why this file is under it. The
+// colour is a conclusion the author did not write — which entry reaches the
+// file, or which one the manifest designates — so the reason has to be printed
+// beside the type, and it comes from the same function that chose the colour.
+
+#[test]
+fn an_unreached_module_names_the_default_entry_fallback_it_took() {
+    // The E119 report itself: nothing loads `orphan.vl`, so the designated
+    // `default-entry` colours it — and the process twin's `View` has no
+    // `element`. The refusal is correct; without the reason it reads as a
+    // compiler mistake, because the file imports `std::ui` and uses it exactly
+    // as the browser leg would.
+    let dir = temp_project("e119_unreached_reason");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/orphan.vl", BROWSER_ONLY_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/orphan.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("has no field 'element'"),
+        "the miss itself is unchanged:\n{text}"
+    );
+    assert!(
+        text.contains("`View` here is std's process twin"),
+        "the overlay is named:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "this file is analyzed under node: no entry reaches it (default-entry is `server`)"
+        ),
+        "and the fallback and the entry it designates:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_reached_module_names_the_leg_that_reaches_it() {
+    // The other half: a module BOTH legs load is reported under each, and the
+    // browser leg's verdict is the one that fails. `client` is why this file is
+    // being read as browser, and naming it is what tells the author which leg's
+    // rules the line has to satisfy.
+    let dir = temp_project("e119_reached_reason");
+    let reach = "import pkg::shared::labelled;\n\nfun main() {\n\tlabelled(\"app\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            (
+                "src/shared.vl",
+                "import std::ui::{ View, view };\n\n\
+                 export fun labelled(text: str): str {\n\tlet root = view(text);\n\t\
+                 root.tag\n}\n",
+            ),
+            ("src/client.vl", reach),
+            ("src/server.vl", reach),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/shared.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`View` here is std's browser twin"),
+        "the browser overlay is named:\n{text}"
+    );
+    assert!(
+        text.contains("this file is analyzed under browser: the `client` entry reaches it"),
+        "and the leg that put it there:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_explicit_platform_flag_is_its_own_reason() {
+    // `--platform` overrides the colouring, so it is also the whole answer to
+    // "why this platform" — reporting the file's own situation there would name
+    // a rule that did not apply.
+    let dir = temp_project("e119_flag_reason");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "client",
+        &[
+            ("src/orphan.vl", BROWSER_ONLY_MODULE),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&[
+        "check",
+        "--platform",
+        "node",
+        dir.join("src/orphan.vl").to_str().unwrap(),
+    ]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("this file is analyzed under node: `--platform` was passed"),
+        "the flag is the reason:\n{text}"
+    );
+    assert!(
+        !text.contains("default-entry"),
+        "and the designation it overrode is not offered as one:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_single_entry_package_names_its_target() {
+    // The classic form: the package's own `target` colours every file under the
+    // root, whatever reaches what. The author DID write this one, so the clause
+    // is short — but it still says which of the four rules answered.
+    let dir = temp_project("e119_single_entry_reason");
+    write(&dir, "vilan.toml", "[package]\nname = \"solo\"\n");
+    write(&dir, "src/widget.vl", BROWSER_ONLY_MODULE);
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n",
+    );
+    let output = vilan_plain(&["check", dir.join("src/widget.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "this file is analyzed under node: the package's `target` colors every file in it"
+        ),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_users_own_type_gets_no_overlay_note() {
+    // The control the note rests on: the overlay touches `std`'s LAYER modules
+    // and nothing else, so an ordinary field mistake on the author's own struct
+    // is an ordinary field mistake and must not be told about platforms.
+    let dir = temp_project("e119_own_type_control");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            (
+                "src/orphan.vl",
+                "struct Box { width: i32 }\n\n\
+                 export fun grow(): i32 {\n\tlet b = Box { width = 1 };\n\tb.height\n}\n",
+            ),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/orphan.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("has no field 'height'"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("twin") && !text.contains("analyzed under"),
+        "a user struct has no overlay to name:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn package_mode_still_checks_every_leg() {
     // The invariant beside the fix: `vilan check .` is unchanged — one compile

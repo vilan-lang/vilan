@@ -397,6 +397,31 @@ impl SignalCell<type T> with MaybeSignal<T> {      // signals, reactively
 fun badge<V: MaybeSignal<str>>(label: V) { … }  // takes both, no ceremony
 ```
 
+A blanket implementation is reachable from a **concrete** type this way,
+and never from an **abstract** one. Whether a generic parameter satisfies
+a bound is answered from that parameter's own **declared bounds alone** —
+no impl is consulted, blanket or otherwise:
+
+```vilan,fragment
+trait Wrap<T> { fun unwrap(self): T; }
+impl type T with Wrap<T> { fun unwrap(self): T { self } }
+
+fun consume<T: Tag, W: Wrap<T>>(wrapped: W): str { wrapped.unwrap().tag() }
+
+fun main() { consume(3); }                             // fine: `i32` is concrete
+fun wrapper<T: Tag>(value: T): str { consume(value) }  // error: `T` lacks `: Wrap<T>`
+fun ok<T: Tag + Wrap<T>>(value: T): str { consume(value) }   // declare it, and it holds
+```
+
+The blanket covers `T` at every instantiation, so reading it as satisfied
+in the abstract body would be sound only until a *more specific* impl
+appears — and the specificity order above ranks the blanket last, so the
+body would have been checked against an implementation the call does not
+reach. Monomorphization is where the question has a real answer, so the
+concrete check is the one that counts and a declared bound is what an
+abstract call may lean on. The refusal names the parameter and the bound
+it lacks, which is the edit that fixes it.
+
 Because the instantiation is decided first, a `SignalCell<str>` reaches the
 `Signal` impl under a `MaybeSignal<str>` bound and the blanket under a
 `MaybeSignal<SignalCell<str>>` bound, where it is a static value of that
@@ -774,8 +799,23 @@ fun bump<T: Add>(bag: Bag<T>, value: T): Bag<T> { bag + value }
 ```
 
 `is` (§3.7 level 10) tests a value against a match pattern and yields
-`bool`; bindings inside an `is` pattern are scoped to nothing (use
-`match` to bind).
+`bool`, and a `let` binding inside the pattern **captures**. Its scope is
+everywhere the test is known to have passed, and nowhere else: the
+**then-branch**, and the rest of the condition **to the right of an
+`&&`**. Not the `else` branch, where the test failed; not after the `if`,
+where nothing is known; and not the other arm of a `||`, which runs
+exactly when the test failed — nor, for a capture under a `||`, the
+then-branch, since reaching it proves only that *some* arm was true.
+Outside its scope the name is simply unbound, and reading it is the
+ordinary "cannot find" error.
+
+```vilan,fragment
+if slot is Some(let n) { use(n); }                // yes: the test passed
+if slot is Some(let n) && n > 0 { use(n); }       // yes: `&&` short-circuits
+if slot is Some(let n) { … } else { use(n); }     // error: unbound here
+if slot is Some(let n) || n > 0 { … }             // error: unbound here
+if slot is Some(let n) { … } use(n);              // error: the `if` ended
+```
 
 A pattern is checked against the type of the value it matches, so an
 enum-variant pattern requires that type to be that enum. A **generic

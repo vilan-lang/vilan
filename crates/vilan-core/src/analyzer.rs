@@ -2259,6 +2259,48 @@ impl CallSubjectConstraint {
     }
 }
 
+/// One positional declaration of a value name inside a scope: the entity, and
+/// the byte range of the file over which the name resolves to it.
+///
+/// The START is `proposal/local-shadowing.md` §2 — the end of the declaring
+/// construct, so an initializer never reads the binding it declares. The END is
+/// B171: almost every binding runs to the end of its scope
+/// ([`LocalDeclaration::FOREVER`]), and the one exception is a pattern capture
+/// bound inside an operand of `||`, whose test is not known to have passed
+/// anywhere outside that operand.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalDeclaration {
+    /// Where the name starts resolving to this entity.
+    pub visible_from: usize,
+    /// Where it stops — EXCLUSIVE, so a use at exactly this offset already
+    /// misses. [`LocalDeclaration::FOREVER`] for everything but a `||`-arm
+    /// capture.
+    pub visible_until: usize,
+    pub id: Id,
+}
+
+impl LocalDeclaration {
+    /// "To the end of the scope" — what every binding but a `||`-arm capture
+    /// gets, and what the rule was for all of them before B171.
+    pub const FOREVER: usize = usize::MAX;
+
+    /// Whether a use at `offset` resolves to this declaration.
+    fn covers(&self, offset: usize) -> bool {
+        self.visible_from <= offset && offset < self.visible_until
+    }
+}
+
+/// The tighter of an enclosing `||` operand's end and this one's (B171). `||`
+/// operands nest, so the inner one is normally the smaller — but taking the
+/// minimum rather than assuming it keeps a recovered tree with a widened span
+/// from ever WIDENING a capture's visibility.
+fn min_operand_end(outer: Option<usize>, inner: usize) -> usize {
+    match outer {
+        Some(outer) => outer.min(inner),
+        None => inner,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Scope<'src> {
     pub id: Id,
@@ -2269,15 +2311,15 @@ pub struct Scope<'src> {
     /// so markers live here regardless of item collisions. Feeds editor
     /// navigation and macro-name imports; expansion scoping stays syntactic.
     pub macro_name_to_id: IndexMap<&'src str, Id>,
-    /// Value bindings in declaration order, each visible from the byte offset
-    /// where its declaring construct ends (proposal/local-shadowing.md §2): a
-    /// later same-name binding shadows the earlier one from its own visibility
-    /// point onward, and an initializer never sees the binding it declares.
+    /// Value bindings in declaration order, each visible over a byte RANGE of
+    /// the scope's text (proposal/local-shadowing.md §2, B171): a later
+    /// same-name binding shadows the earlier one from its own visibility point
+    /// onward, and an initializer never sees the binding it declares.
     /// Populated only in non-module scopes — module-level bindings stay
     /// order-independent (B33). `name_to_id_map` still records the last
     /// declaration, so map consumers (completions, emission order, the
     /// parent-scope memo) are untouched.
-    pub local_value_declarations: IndexMap<&'src str, Vec<(usize, Id)>>,
+    pub local_value_declarations: IndexMap<&'src str, Vec<LocalDeclaration>>,
     /// Item declarations in walk order, EVERY one of them — where
     /// `name_to_id_map` keeps only the last of a repeated name (B84). The map
     /// is a lookup index and cannot hold two entries for one name, so reading
@@ -2505,9 +2547,20 @@ pub struct Analyzer<'src> {
     // keyed by the access expr id — the precise use-site span for rename/nav.
     member_name_spans: HashMap<Id, Span>,
     struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
+    /// E119: the platform this analysis runs under, and why (the latter already
+    /// rendered) — copied off the call's arguments and the `Workspace` so the
+    /// diagnostic sites can read both without threading either.
+    platform: Platform,
+    platform_reason: Option<String>,
     // The file currently being walked, so type references (which aren't entities)
     // can be tagged with their source for the language server.
     current_source_id: SourceId,
+    /// B171: while walking an OPERAND of `||`, that operand's end offset — the
+    /// point past which a pattern capture bound inside it is no longer visible,
+    /// because `||` short-circuits and the other arm proves nothing about this
+    /// arm's test. `None` outside a `||`. Set to the INNERMOST operand's end
+    /// (operand spans nest), and restored on the way out.
+    or_operand_end: Option<usize>,
     // Diagnostic source attribution (backlog E1): `(index, source)` marks — a
     // diagnostic at index `i` belongs to the source of the last mark with
     // `index <= i` (default: the entry, `SourceId(0)`). Marks are dropped at
@@ -2526,6 +2579,14 @@ pub struct Analyzer<'src> {
     // these sources via `frozen_entity`; the std-clean invariant that makes
     // that sound is pinned in `check_scope_differential.rs`.
     std_sources: HashSet<SourceId>,
+    /// E119: the std sources that live in a platform LAYER root rather than in
+    /// the base root, with that layer's name (`process`, `browser`). These are
+    /// the OVERLAID files — the ones whose `View`, `Element` and friends are one
+    /// type under this build's platform and a different type under the other, so
+    /// a miss on one of them is the miss that needs the overlay named. A std
+    /// module in the BASE root is not here: it is the same type under every
+    /// platform and has no twin to name.
+    std_layer_sources: HashMap<SourceId, String>,
     // The dependency packages' sources loaded from DISK (E84,
     // diagnostics-standard.md C3a): code the user did not write, whether
     // fetched (git) or path-linked. The context-coverage pass demotes and
@@ -3580,9 +3641,13 @@ impl<'src> Analyzer<'src> {
             member_name_spans: HashMap::default(),
             struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
+            or_operand_end: None,
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: HashSet::default(),
+            std_layer_sources: HashMap::default(),
+            platform: Platform::default(),
+            platform_reason: None,
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
             frozen_ranges: Vec::new(),
@@ -3836,6 +3901,15 @@ impl<'src> Analyzer<'src> {
         if depth > MAX_DEPTH {
             return true;
         }
+        // An ABSTRACT value's declared bounds are the ONLY answer — never an
+        // impl (B173, RULED refused; spec §5.4). A blanket `impl type T with
+        // Wrap<T>` covers every type including this parameter, so searching the
+        // impls here would answer "satisfied" at abstract time — an
+        // over-approximation a more specific impl can contradict at
+        // instantiation, where §5.4 ranks the blanket last. Monomorphization is
+        // where the question has a real answer, so the concrete check is the one
+        // that counts and the declared bound is what an abstract call may lean
+        // on. The refusal below is the promise; declaring the bound is the fix.
         if let Type::Generic(inner_constraint_id) = value_type {
             return self
                 .generic_bound_trait_ids(*inner_constraint_id)
@@ -14179,6 +14253,20 @@ impl<'src> Analyzer<'src> {
     /// (proposal/local-shadowing.md §2). Module-level bindings stay
     /// order-independent (B33), so module scopes record no positional entry.
     fn declare_scope_value(&mut self, scope_id: Id, name: &'src str, id: Id, visible_from: usize) {
+        self.declare_scope_value_until(scope_id, name, id, visible_from, LocalDeclaration::FOREVER);
+    }
+
+    /// [`Analyzer::declare_scope_value`] with an explicit end to the name's
+    /// visibility (B171). Only a pattern capture inside a `||` operand passes
+    /// anything but [`LocalDeclaration::FOREVER`].
+    fn declare_scope_value_until(
+        &mut self,
+        scope_id: Id,
+        name: &'src str,
+        id: Id,
+        visible_from: usize,
+        visible_until: usize,
+    ) {
         let positional = !self.module_scope_ids.contains(&scope_id);
         let scope = self.mut_scope_for_scope_id(scope_id);
         scope.name_to_id_map.insert(name, id);
@@ -14187,7 +14275,11 @@ impl<'src> Analyzer<'src> {
                 .local_value_declarations
                 .entry(name)
                 .or_default()
-                .push((visible_from, id));
+                .push(LocalDeclaration {
+                    visible_from,
+                    visible_until,
+                    id,
+                });
         }
     }
 
@@ -18354,6 +18446,82 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
+    /// E119: a miss on a type that came from an OVERLAID `std` layer names the
+    /// overlay and why THIS file is analyzed under it.
+    ///
+    /// The platform decides more than which functions may run: it selects
+    /// `std`'s layer overlay, so it decides what a name like `View` IS. Under
+    /// the process overlay a `View` is `{ tag, attributes, children, text }` and
+    /// under the browser one it is `{ element }` — so `self.element` on a
+    /// browser module colored `node` draws `struct 'View' has no field
+    /// 'element'` on correct code. E113 fixed the COLOR; this fixes what the
+    /// message says when the color is right and the author still cannot see it,
+    /// which is every time the color came from something other than the file
+    /// itself: an unreached module taking the `default-entry`'s leg, a shared
+    /// module reported under a leg the author was not thinking about.
+    ///
+    /// Fires only for a type defined in a std LAYER source (`std_layer_sources`)
+    /// — a base-root std type is the same under every platform and has no twin
+    /// to name — and never for the user's own types, which the overlay does not
+    /// touch. `platform_reason` is the front end's; without one (a bare file, a
+    /// test harness) the note still names the overlay and the platform, which is
+    /// the half that is always knowable here.
+    fn overlaid_std_type_note(&self, definition_id: Id, type_name: &str) -> Option<Note> {
+        let source = self.source_of_id(definition_id)?;
+        let layer = self.std_layer_sources.get(&source)?;
+        let span = **self.span_map.get(&definition_id)?;
+        let platform = self.platform.runtime_name();
+        let head = format!(
+            "`{type_name}` here is std's {layer} twin — this file is analyzed under {platform}"
+        );
+        let msg = match &self.platform_reason {
+            Some(reason) => format!("{head}: {reason}"),
+            None => head,
+        };
+        Some(Note {
+            span,
+            msg,
+            source: Some(source),
+        })
+    }
+
+    /// A35, the SHADOWED twin of [`Analyzer::element_view_import_note`]: the
+    /// element desugar's callee is a bare `view`, so a user item of that name
+    /// captures it, and every `<tag />` in the file then reports
+    /// `` `view` expects 0 arguments, but got 1 instead `` against the element —
+    /// a message about an arity nobody wrote, with the shadowing item shown only
+    /// as "declared here". Any generator over an external name set walks into
+    /// this (lucide ships an icon called `view`); RULED 2026-09-01 to be named
+    /// in the diagnostic rather than fixed by making the desugar hygienic —
+    /// shadowing a name is a ruled feature, and this is a curated message for
+    /// the one name where the shadow is invisible in the source.
+    ///
+    /// Same detection as the absent case: the SUBJECT's span is markup — it
+    /// starts with `<`, a span only the element desugar gives an accessor — so
+    /// a hand-written `view(..)` call, whose subject span is the ident, keeps
+    /// the ordinary arity message. `None` for everything else, including a
+    /// `view` that resolved to std's own (which takes its argument and never
+    /// reaches an arity failure).
+    fn element_view_shadow_message(&self, subject_id: Id, callee_id: Id) -> Option<String> {
+        if self.functions.get(&callee_id)?.name != "view" {
+            return None;
+        }
+        let span = **self.span_map.get(&subject_id)?;
+        let source = self.source_of_id(subject_id).unwrap_or(SourceId(0));
+        if !self
+            .source_text(source)?
+            .get(span.into_range())?
+            .starts_with('<')
+        {
+            return None;
+        }
+        Some(
+            "element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` \
+             — rename it, or write this element as its lowered call, `ui::view(…)`"
+                .to_string(),
+        )
+    }
+
     /// A `css { … }` block lowers to `std::style::style` (css-block.md §5.1,
     /// S4): an unresolved `style` whose span is the `css` KEYWORD — the one
     /// span the block's desugar gives a generated accessor on purpose, so the
@@ -18447,6 +18615,62 @@ impl<'src> Analyzer<'src> {
     /// result (`let s = …`, `let _ = …`, or passing it as an argument like
     /// `owner.take(…)`) consumes it and is fine: those are not bare block
     /// statements. Non-fatal — pushed to `warnings`, not `diagnostics`.
+    /// B178: the entry `main` takes NO parameters.
+    ///
+    /// A parameter declares what values a function accepts, and the entry
+    /// accepts none: the shell owns what is passed to a program, so nothing in
+    /// the language can call `main` with arguments. The transformer inlines
+    /// `main`'s body as the program's top-level statements, which is why a
+    /// parameter was not merely useless but broken — `fun main(condition: bool)`
+    /// compiled and the emitted program read a free `condition`, dying with
+    /// `ReferenceError: condition is not defined` at the first statement.
+    ///
+    /// The way forward is a real argument door rather than a parameter list:
+    /// `std::process::args()` hands back the argv tail as a `List<str>`, a value
+    /// whose type is always right where a hand-written parameter list is a
+    /// guess at what the shell will send.
+    ///
+    /// Keyed on the GLOBAL scope's `main`, which is the same lookup the
+    /// transformer's entry discovery makes — a module's own `main`, or a method
+    /// named `main`, lives in its own scope and is nobody's entry.
+    fn check_entry_main_parameters(&mut self, global_scope_id: Id) {
+        let Some(main_id) = self
+            .scopes
+            .get(&global_scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("main"))
+            .copied()
+        else {
+            return;
+        };
+        let Some(main) = self.functions.get(&main_id) else {
+            return;
+        };
+        let parameters = main.parameters.clone();
+        let (Some(first), Some(last)) = (parameters.first(), parameters.last()) else {
+            return;
+        };
+        // The whole parameter LIST is what has to go, so the squiggle covers it
+        // rather than one name — and it is the exact text a fix deletes.
+        let start = self.span_map.get(first).map(|span| span.start);
+        let end = self.span_map.get(last).map(|span| span.end);
+        let (Some(start), Some(end)) = (start, end) else {
+            return;
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: Span::new((), start..end),
+                msg: "`main` takes no parameters: the shell owns what is passed to a \
+                      program, so nothing can call the entry with arguments — read them \
+                      with `std::process::args()`, which hands back the argument tail as \
+                      a `List<str>`"
+                    .to_string(),
+            },
+            main_id,
+        );
+    }
+
     fn check_must_use(&mut self) {
         // Value-discarded statements: every non-tail entry of a function body
         // (`body.0`; the tail `body.1` is the return value) and of every inner
@@ -19214,15 +19438,13 @@ impl<'src> Analyzer<'src> {
         let scope = self.scopes.get(&scope_id)?;
         let parent_id = scope.parent_id;
         if let Some(entries) = scope.local_value_declarations.get(name) {
-            if let Some((_, id)) = entries
-                .iter()
-                .rev()
-                .find(|(visible_from, _)| *visible_from <= use_offset)
-            {
-                return Some(*id);
+            if let Some(declaration) = entries.iter().rev().find(|entry| entry.covers(use_offset)) {
+                return Some(declaration.id);
             }
-            // Declared here, but only later: resolve outward without caching —
-            // this scope's map slot belongs to its own (later) declaration.
+            // Declared here, but not covering this use — only later, or (B171)
+            // only inside a `||` operand this use is outside of. Resolve
+            // outward without caching: this scope's map slot belongs to its own
+            // declaration.
             return parent_id.and_then(|parent_scope_id| {
                 self.resolve_value_name_at(name, parent_scope_id, use_offset)
             });
@@ -19241,21 +19463,20 @@ impl<'src> Analyzer<'src> {
     /// The nearest declaration of `name` that a use at `use_offset` cannot see
     /// *yet* — a positional entry later in the use's scope chain. Feeds the
     /// declared-later note on the `cannot find` diagnostic.
+    ///
+    /// Strictly LATER, never merely out of range: a B171 capture whose `||`
+    /// operand this use sits after is not a use-before-declaration, and telling
+    /// its author "declared here, later in the scope" would be false.
     fn later_local_declaration(&self, name: &str, scope_id: Id, use_offset: usize) -> Option<Id> {
         let mut current = Some(scope_id);
         while let Some(id) = current {
             let scope = self.scopes.get(&id)?;
-            if let Some((_, later_id)) =
-                scope
-                    .local_value_declarations
-                    .get(name)
-                    .and_then(|entries| {
-                        entries
-                            .iter()
-                            .find(|(visible_from, _)| *visible_from > use_offset)
-                    })
+            if let Some(later) = scope
+                .local_value_declarations
+                .get(name)
+                .and_then(|entries| entries.iter().find(|entry| entry.visible_from > use_offset))
             {
-                return Some(*later_id);
+                return Some(later.id);
             }
             current = scope.parent_id;
         }
@@ -21026,8 +21247,25 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::TryAssert(receiver_id))
             }
             Node::Binary(op, lhs, rhs) => {
-                let lhs_id = self.walk_expr_node(lhs, scope_id);
-                let rhs_id = self.walk_expr_node(rhs, scope_id);
+                // B171: `||` short-circuits, so a pattern capture bound in one
+                // operand is bound only where THAT operand's test ran and
+                // passed. Cap each operand's captures at its own end — which
+                // takes in the other arm and everything after the condition,
+                // the then-branch included, since reaching either of those
+                // proves nothing about this arm.
+                let (lhs_id, rhs_id) = if matches!(op, BinaryOp::Or) {
+                    let outer = self.or_operand_end;
+                    self.or_operand_end = Some(min_operand_end(outer, lhs.1.end));
+                    let lhs_id = self.walk_expr_node(lhs, scope_id);
+                    self.or_operand_end = Some(min_operand_end(outer, rhs.1.end));
+                    let rhs_id = self.walk_expr_node(rhs, scope_id);
+                    self.or_operand_end = outer;
+                    (lhs_id, rhs_id)
+                } else {
+                    let lhs_id = self.walk_expr_node(lhs, scope_id);
+                    let rhs_id = self.walk_expr_node(rhs, scope_id);
+                    (lhs_id, rhs_id)
+                };
                 // Overloadable operators dispatch; orderings and `&&`/`||`
                 // aren't overloadable but their operands are checked (B24).
                 if is_overloadable_operator(*op)
@@ -22106,7 +22344,19 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(capture_id).or_insert(0);
                 // `_` eats the value: it matches but is never referenceable.
                 if name != "_" {
-                    self.declare_scope_value(scope_id, name, capture_id, visible_from);
+                    // B171: inside a `||` operand the capture dies with the
+                    // operand. Everywhere else it runs to the end of its scope,
+                    // which for an `is` capture is the `if`'s own scope — the
+                    // condition and the then-branch, never the `else` (its own
+                    // sibling scope) and never after the `if`.
+                    let visible_until = self.or_operand_end.unwrap_or(LocalDeclaration::FOREVER);
+                    self.declare_scope_value_until(
+                        scope_id,
+                        name,
+                        capture_id,
+                        visible_from,
+                        visible_until,
+                    );
                 }
                 WalkPattern::Binding(capture_id)
             }
@@ -27857,15 +28107,23 @@ impl<'src> Analyzer<'src> {
                         None => argument_ids,
                     };
                     if argument_ids.len() != parameters.len() {
+                        // A35: the one arity failure whose count is nobody's
+                        // mistake — the element desugar's `view` captured by a
+                        // user item — gets a message about the capture instead.
+                        let msg = self
+                            .element_view_shadow_message(subject_id, function_id)
+                            .unwrap_or_else(|| {
+                                self.argument_count_message(
+                                    self.callable_name(function_id),
+                                    &parameters,
+                                    argument_ids.len(),
+                                )
+                            });
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
                             note: self.declared_here_note(function_id),
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
-                            msg: self.argument_count_message(
-                                self.callable_name(function_id),
-                                &parameters,
-                                argument_ids.len(),
-                            ),
+                            msg,
                         });
                         return Resolution::Failed;
                     }
@@ -28907,9 +29165,22 @@ impl<'src> Analyzer<'src> {
                     return Resolution::Failed;
                 }
                 let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
+                // E119, the METHOD half of the same story: a `View` under the
+                // wrong overlay is missing methods as well as fields, and the
+                // answer is the same one — which twin this is, and why.
+                let note = match subject_type {
+                    Type::Struct(struct_id, _) => {
+                        let name = self
+                            .structs
+                            .get(&struct_id)
+                            .map(|struct_| struct_.name.to_string());
+                        name.and_then(|name| self.overlaid_std_type_note(struct_id, &name))
+                    }
+                    _ => None,
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
-                    note: None,
+                    note,
                     span: self
                         .member_name_spans
                         .get(&id)
@@ -31890,7 +32161,10 @@ impl<'src> Analyzer<'src> {
                     None => {
                         self.diagnostics.push(Error {
                             trace: Vec::new(),
-                            note: None,
+                            // E119: when the struct came from an overlaid std
+                            // layer, the miss is usually about WHICH `View` this
+                            // is, not about the field.
+                            note: self.overlaid_std_type_note(struct_id, struct_name),
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!("struct '{}' has no field '{}'", struct_name, member_name),
                         });
@@ -38967,6 +39241,19 @@ pub struct Workspace {
     /// rather than on a `PackageSpec` because the entry package has no spec in
     /// `packages` — that slice is its dependencies.
     pub entry_prelude: crate::manifest::PreludeSpec,
+    /// WHY this analysis runs under the platform it does (E119), already
+    /// rendered by [`crate::platform_color::PlatformReason::clause`] — "no entry
+    /// reaches it (default-entry is `server`)". `None` when the front end has no
+    /// project to answer from (a bare file, a test harness), and the diagnostic
+    /// that reads it then says only which platform it is under.
+    ///
+    /// It lives here, on the resolved project context the front end hands to the
+    /// analysis, for the same reason `entry_prelude` does: it is a fact about
+    /// THIS program that only the front end knows, and every entry point already
+    /// threads a `Workspace`. It is deliberately not part of what the base cache
+    /// keys on — the reason does not change which modules load, resolve, or
+    /// expand, only what one diagnostic says about them.
+    pub platform_reason: Option<String>,
 }
 
 /// A package loaded during analysis: its source root, the namespace its modules
@@ -40271,6 +40558,23 @@ fn analyze_inner<'src>(
                     if matches!(origin, Origin::Std) && !document_overlay_contains(&module_path) {
                         analyzer.std_sources.insert(SourceId(sources.len() as u32));
                     }
+                    // E119: a std module under a platform LAYER root is an
+                    // OVERLAID file — its types are this platform's twin of a
+                    // name the other platform spells differently. Recorded for
+                    // every std layer module, overlaid buffer included: an open
+                    // `ui.vl` is still the process twin. Canonical on both sides
+                    // (`windows-support.md` §5), like every other containment
+                    // test over a library root.
+                    if matches!(origin, Origin::Std) {
+                        let canonical = crate::util::canonical_path(&module_path);
+                        if let Some(layer) = std.layers.iter().find(|layer| {
+                            canonical.starts_with(crate::util::canonical_path(&layer.root))
+                        }) {
+                            analyzer
+                                .std_layer_sources
+                                .insert(SourceId(sources.len() as u32), layer.name.clone());
+                        }
+                    }
                     // A dependency package's module is code the user did not
                     // write (E84, diagnostics-standard.md C3a): the
                     // context-coverage walk demotes and traces it exactly
@@ -41103,6 +41407,11 @@ fn analyze_over_world<'src>(
         owned_nursery_struct_id,
         phase_marks,
     } = world;
+    // E119: set AFTER the world is unpacked — a world can come from the base
+    // cache, whose analyzer carries whatever the analysis that stored it had,
+    // and the color and its reason belong to THIS call.
+    analyzer.platform = platform;
+    analyzer.platform_reason = workspace.platform_reason.clone();
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);
@@ -41246,6 +41555,10 @@ fn analyze_over_world<'src>(
     // Record `Some(let v)` captures over wrapped-scalar-view calls before the
     // checks + view classification consult them.
     analyzer.wrapped_view_captures = analyzer.compute_wrapped_view_captures();
+    // B178: the entry takes no parameters — a whole-program shape check, so it
+    // rides here with the rest rather than at the declaration's walk (where
+    // "which `main` is the entry" is not yet a question the walk can answer).
+    analyzer.check_entry_main_parameters(global_scope_id);
     analyzer.check_readonly_mutation();
     analyzer.check_mutable_arguments();
     analyzer.check_mutable_references();

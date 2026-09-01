@@ -461,7 +461,7 @@ fn note_refused_dependency_hooks(project: &Project) {
 fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> RoundOutcome {
     with_project(file, |project| match project {
         Project::Single {
-            unit,
+            mut unit,
             platform: package_platform,
             shared_platforms,
             module_file,
@@ -478,6 +478,14 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
                 let mut platforms = vec![first];
                 if platform.is_none() {
                     platforms.extend(shared_platforms);
+                } else {
+                    // The flag overrode the coloring, so it is also the whole
+                    // answer to "why this platform" (E119). Nothing the file's
+                    // own situation says still applies.
+                    unit.platform_reasons = vec![(
+                        first,
+                        vilan_core::platform_color::PlatformReason::Flag.clause(),
+                    )];
                 }
                 check_single(&unit, &platforms, debug, goal)
             }
@@ -2132,6 +2140,13 @@ struct Unit {
     /// beside the bundle. The manifest has already refused it off a browser leg.
     split: bool,
     options: BuildOptions,
+    /// E119: per platform, WHY this unit is compiled under it — the clause
+    /// [`vilan_core::platform_color::PlatformReason::clause`] renders. Only FILE
+    /// mode fills it, because only there is the colour a conclusion the author
+    /// did not write; a package leg is compiled under its own declared target,
+    /// which the manifest already says out loud. Empty means "nothing to
+    /// explain", and the diagnostic then names the overlay alone.
+    platform_reasons: Vec<(Platform, String)>,
 }
 
 /// The `[build] run` hooks of the addressed manifest (A9): external commands —
@@ -3052,6 +3067,9 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             package_dir: None,
             split: false,
             options: BuildOptions::default(),
+            // No project to colour it: the CLI's `node` default answers, and
+            // there is nothing about the file's own situation to explain.
+            platform_reasons: Vec::new(),
         },
         platform: None,
         shared_platforms: Vec::new(),
@@ -3078,8 +3096,16 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
     // designated `default-entry` answers. A file outside the source root is not
     // the package's to color — it still resolves `pkg::` and the dependencies,
     // which is what it needs.
-    let mut platforms =
-        vilan_core::platform_color::file_platforms(&pkg_root, &manifest, &entry).into_iter();
+    // Each colour with the REASON it was chosen (E119): a file addressed by path
+    // is coloured by something the author did not write — which entry reaches
+    // it, or which one the manifest designates — and a type-level diagnostic
+    // that follows from the colour is unreadable without it.
+    let choices = vilan_core::platform_color::file_platform_choices(&pkg_root, &manifest, &entry);
+    let platform_reasons: Vec<(Platform, String)> = choices
+        .iter()
+        .map(|choice| (choice.platform, choice.reason.clause()))
+        .collect();
+    let mut platforms = choices.into_iter().map(|choice| choice.platform);
     let platform = platforms.next();
     let shared_platforms: Vec<Platform> = platforms.collect();
     let module_file = is_package_module(&pkg_root, &manifest, &entry);
@@ -3091,6 +3117,7 @@ fn file_project(entry: PathBuf) -> Result<Project, String> {
             package_dir: Some(directory),
             split: false,
             options,
+            platform_reasons,
         },
         platform,
         shared_platforms,
@@ -3226,6 +3253,9 @@ fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions)
         package_dir: Some(directory.to_path_buf()),
         split: package.splits(),
         options,
+        // A package leg is compiled under its own declared `target`, which the
+        // manifest says out loud — nothing for E119 to explain.
+        platform_reasons: Vec::new(),
     }
 }
 
@@ -3257,6 +3287,9 @@ fn package_units(
                     package_dir: Some(directory.to_path_buf()),
                     split: entry.splits(),
                     options,
+                    // As above: this leg's `[entry.<name>] target` IS the
+                    // explanation, and the author wrote it.
+                    platform_reasons: Vec::new(),
                 },
                 entry.resolved_target().unwrap_or_default(),
             )
@@ -3558,13 +3591,21 @@ fn compile_unit(
     // decision and nothing else.
     chunks: Option<(&str, &mut Vec<EmittedChunk>)>,
 ) -> Result<Compiled, ExitCode> {
-    let workspace = match resolve_workspace(unit) {
+    let mut workspace = match resolve_workspace(unit) {
         Ok(workspace) => workspace,
         Err(message) => {
             eprintln!("{} {message}", paint::error_prefix());
             return Err(ExitCode::FAILURE);
         }
     };
+    // E119: why THIS compile is coloured the way it is, for the diagnostics that
+    // follow from the colour. Keyed on the platform, because a shared module is
+    // compiled once per leg and each leg has its own answer.
+    workspace.platform_reason = unit
+        .platform_reasons
+        .iter()
+        .find(|(colored, _)| *colored == platform)
+        .map(|(_, reason)| reason.clone());
     // HMR instrumentation is opt-in per compile (an HMR-active `run --watch`,
     // browser legs only) — every other caller passes `false`, so `build`/`run`/
     // `check` output stays byte-identical.
@@ -6234,6 +6275,7 @@ mod tests {
                 package_dir: None,
                 split: false,
                 options: BuildOptions::default(),
+                platform_reasons: Vec::new(),
             },
             platform,
         )

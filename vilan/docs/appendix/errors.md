@@ -24,8 +24,12 @@ quoted here.
 The name isn't visible here. Usually a missing `import` — though the
 basics (`print`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`) are in the
 prelude and need none. If you did import it, check for a typo or a
-shadowing local.
-→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md)
+shadowing local. One case that reads as a compiler mistake and isn't: an
+`is` capture is in scope only where its test is known to have **passed** —
+the then-branch and the rest of the condition after an `&&` — so naming
+it in the `else`, after the `if`, or in the other arm of a `||` is this
+error. Move the read inside the branch, or use `match`.
+→ [Hello Vilan](../tour/hello-vilan.md), [spec §4.7](../spec/names.md), [spec §5.7](../spec/types.md)
 
 **"… is in the prelude of the web set — set `prelude = \"std::web\"`"**
 The name (`Signal`, `SignalCell`, `view`, `View`) is one std's **web**
@@ -91,6 +95,17 @@ byte (§4.2), so this would fail to build on a case-sensitive
 filesystem. Rename the file or the import so the two agree.
 → [Names, modules, and packages](../spec/names.md)
 
+**"`main` takes no parameters: the shell owns what is passed to a program …"**
+A parameter list declares what values a function accepts, and the entry
+accepts none — nothing in the language can call `main`, so a parameter
+there is a guess about what the shell will send rather than a promise
+about it. Delete the list and read the arguments with
+`process::args()`, a `List<str>` of everything after the script path,
+whose type is always right. (This shape used to compile: the entry's
+body becomes the program's top-level statements, so the parameter was a
+free name and the program died at its first use.)
+→ [Process modules](../std/process.md)
+
 ## Types and generics
 
 **"Expected …, but got … instead."**
@@ -102,8 +117,12 @@ no implicit conversions. Suffix it (`stamp + 1000i53`).
 **"generic parameter '…' is missing the bound ': …' required by this call"**
 You called something that needs a capability (say `PartialEq`) with a
 generic parameter that doesn't declare it. Add the bound to *your*
-signature: `fun caller<U: PartialEq>(…)`.
-→ [Data and traits](../tour/data-and-traits.md)
+signature: `fun caller<U: PartialEq>(…)`. A **blanket impl** covering the
+trait does not spare you this: a generic parameter's bounds are answered
+from what it *declares*, never from an impl, so the same call that
+compiles for a concrete `i32` is refused for a `T` — declare it and it
+holds.
+→ [Data and traits](../tour/data-and-traits.md), [spec §5.4](../spec/types.md)
 
 **"cannot call method '…' on …"**
 The value's type doesn't have that method. If the type is a generic
@@ -265,6 +284,23 @@ turns it into a "Change to `entries`" quickfix that rewrites the name.
 Close enough is a real threshold: `"entires"` suggests `"entries"`, and
 `"x"` suggests nothing at all.
 → [Control flow](../tour/control-flow.md)
+
+**"`…` here is std's … twin — this file is analyzed under …"** *(a note)*
+This rides under a field or method miss on a **std** type, and it is
+usually the whole story. A build's platform selects `std`'s layer
+overlay, so it decides what a name like `View` *is*: `{ element }` in
+the browser layer, `{ tag, attributes, children, text }` in the process
+one. If your file is being analyzed under the platform you did not have
+in mind, correct code reports a field that does not exist. The note
+names which twin you got and **why that platform** — one of four: the
+entry that reaches this file, the `default-entry` that answers when no
+entry reaches it, an explicit `--platform`, or a single-entry package's
+own `target`. Fix the situation the reason names rather than the line:
+if a module should be browser code, have the browser entry reach it
+(import it from that entry, directly or transitively); if it is shared
+between legs, it must type-check under *every* leg that loads it, and
+the note tells you which one is complaining.
+→ [Platforms](../tour/platforms.md), [Building UI](../guide/ui.md)
 
 **"`…` expects N arguments, but got M instead: `…` is missing."** ·
 **"`…` expects N fields, but got M instead: `…` is not a field of `…`."**
@@ -760,6 +796,21 @@ workspace is yours: a member package your project root's `packages`
 declares reports exactly like your entry's modules — the read anchors
 at itself, in the member's file.)
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
+
+**"element syntax lowers to `std::ui::view`, and `view` here is your own `fun view` …"**
+`<tag />` is sugar for a `view("tag")` call, and something in this file
+declares its own `view`, which captured the callee — so every element in
+the file resolves to your function instead of the library's. Shadowing a
+name is allowed on purpose, and the desugar's callee is an ordinary name
+like any other; what this message exists for is that the capture is
+*invisible* in the element, which otherwise reports an argument count
+nobody wrote. Two ways out: rename your `view` (what a generator over an
+external name set should do — `lucide` ships an icon called `view`), or
+write the element as the call it lowers to, `ui::view(…)`, whose
+qualified path no local name can capture. If the message you got instead
+is `cannot find 'view' in this scope`, nothing is shadowing — you just
+need `import std::ui::{ view, View };`.
+→ [Building UI](../guide/ui.md)
 
 **"`…` reads context `…`, so it can't be used as a value"**
 A function that reads an ambient context (like the current owner) can't

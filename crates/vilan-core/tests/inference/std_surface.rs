@@ -5144,3 +5144,123 @@ fn b74_a_static_still_resolves_when_it_is_the_only_one() {
         "4\nbag\n",
     );
 }
+
+// --- B178: the entry takes no parameters, and `process::args()` is the door --
+//
+// RULED 2026-09-01. A parameter list declares what values a function accepts,
+// and the entry accepts none — the shell owns what is passed to a program, so
+// nothing in the language can call `main` with arguments. Before the ruling
+// `fun main(condition: bool)` COMPILED and the emitted program read a free
+// `condition` (the transformer inlines `main`'s body as the top-level
+// statements), dying with `ReferenceError: condition is not defined`.
+//
+// The refusal steers to `std::process::args()`, whose result type is always
+// right where a hand-written parameter list is a guess.
+
+#[test]
+fn b178_a_parameterized_main_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun main(condition: bool) {
+            if condition { print("yes"); } else { print("no"); }
+        }
+        "#,
+        "`main` takes no parameters",
+    );
+}
+
+#[test]
+fn b178_the_refusal_steers_to_process_args() {
+    // The message is the whole point of the ruling: refusing without naming the
+    // argument door leaves the author with no way forward at all.
+    assert_fails_with(
+        r#"
+        fun main(first: str, second: str) { }
+        "#,
+        "read them with `std::process::args()`",
+    );
+}
+
+#[test]
+fn b178_a_parameterless_main_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun main() { print("entry"); }
+        "#,
+        "entry\n",
+    );
+}
+
+#[test]
+fn b178_a_function_named_main_that_is_not_the_entry_may_take_parameters() {
+    // The check keys on the GLOBAL scope's `main`, which is the same lookup the
+    // transformer's entry discovery makes. A method named `main` is nobody's
+    // entry and keeps its parameters.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct App { }
+        impl App {
+            fun main(self, label: str): str { label }
+        }
+        fun main() { print(App { }.main("run")); }
+        "#,
+        "run\n",
+    );
+}
+
+#[test]
+fn b178_process_args_runs_and_yields_the_argument_tail() {
+    // The argument door itself: `process::args()` is a `List<str>` of the tail
+    // past the runtime and the script path, so a program invoked with none
+    // reads an empty list rather than a `null` or a panic.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() {
+            let tail = process::args();
+            print(tail.len());
+            for argument in tail { print(argument); }
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b178_a_local_named_arguments_survives_strict_mode() {
+    // `arguments` (and `eval`) cannot be BOUND in strict mode, and an ES module
+    // is always strict — so emitting `const arguments = …` is a `SyntaxError`
+    // at load, before a line runs. They are not reserved WORDS, which is how
+    // they escaped the emitter's list; `let arguments = args()` is the obvious
+    // spelling of the very call B178 steers to, which is where this surfaced.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() {
+            let arguments = process::args();
+            let eval = arguments.len();
+            print(eval);
+        }
+        "#,
+        "0\n",
+    );
+}
+
+#[test]
+fn b178_process_args_is_refused_on_the_browser_leg() {
+    // Platform coloring holds it like every other process-only name — the
+    // browser has no argv, and `args()` is declared in std's `process` layer.
+    assert_fails_browser_with(
+        r#"
+        import std::io::print;
+        import std::process;
+        fun main() { print(process::args().len()); }
+        "#,
+        "requires the `process` layer of `std` and cannot run on `browser`",
+    );
+}
