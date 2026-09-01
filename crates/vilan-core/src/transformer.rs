@@ -1729,6 +1729,14 @@ struct Transformer<'src> {
     // records a type whose destruction is a complete no-op (no `Drop` impl, no
     // resource members) so callers skip it; `Some(name)` is the emitted helper.
     drop_helpers: HashMap<String, Option<String>>,
+    // Emitted instance BODIES, by their subject and their canonical text
+    // (backlog M16). The memos above key on the instantiation, which is the
+    // right question for "have I emitted this instantiation" and the wrong one
+    // for "have I emitted this code": a generic body that does not depend on
+    // `T` renders identically at every `T` and used to be copied per
+    // instantiation. `Transformer::push_or_share` owns the entries and states
+    // when a body may join them.
+    shared_bodies: HashMap<(SharedBodySubject, String), SharedBody>,
     monomorphized: Vec<js::Node<'src>>,
     // Captures introduced by an `is` test, aliased to the subject's payload
     // slots (e.g. `t[1]`) since they can't be JS bindings in expression position.
@@ -1809,6 +1817,51 @@ enum EmissionId {
     Keyed(usize),
 }
 
+/// What an emitted body is offered for SHARING under (backlog M16) — the thing
+/// being instantiated, so two instances of one generic function can share a
+/// body and two unrelated functions that happen to render alike cannot. The
+/// two constructors keep the two keyed-emission paths from colliding on a
+/// shared `Id` space.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum SharedBodySubject {
+    /// A generic function's monomorphized instance.
+    Instance(Id),
+    /// A trait default method specialized for a concrete type.
+    Default(Id),
+}
+
+/// An emitted body a later, identical emission may point at instead of
+/// pushing its own copy (backlog M16).
+#[derive(Clone)]
+struct SharedBody {
+    /// The surviving instance's emitted name.
+    name: String,
+    /// Its keyed identity, so the const pass's site accounting can require the
+    /// body that survived. `None` outside the const pass, where there is no
+    /// accounting to do.
+    emission: Option<EmissionId>,
+}
+
+/// One emitted instance body as text, with the instance's OWN name normalized
+/// away — the key [`Transformer::push_or_share`] compares bodies by.
+///
+/// The name is removed through the same [`rename_node`] walk the release
+/// rename uses, not by substituting text: a string LITERAL that happened to
+/// contain another instance's name would make two different bodies look alike
+/// to a textual swap, and that would be a miscompile rather than a missed
+/// optimization. `@` is not an identifier character, so the placeholder cannot
+/// collide with a real name.
+fn canonical_instance_body(node: &js::Node, name: &str) -> String {
+    let mut probe = node.clone();
+    let mut rename: HashMap<String, String> = HashMap::default();
+    rename.insert(name.to_string(), "@".to_string());
+    rename_node(&mut probe, &rename);
+    // The tightest rendering: whitespace options are a fact about the output
+    // file, and two bodies are the same body or not regardless of how they
+    // will be printed.
+    Formatter::from_options(false, false).node(&probe, "", 0)
+}
+
 /// What one emission contributed DIRECTLY, recorded the first — and, in the
 /// shared world, only — time it is lowered (`const-eval.md` §10.6).
 ///
@@ -1872,6 +1925,42 @@ pub fn const_lowering_count() -> usize {
 /// Zeroes this thread's [`const_lowering_count`].
 pub fn reset_const_lowering_count() {
     CONST_LOWERING_COUNT.with(|count| count.set(0));
+}
+
+thread_local! {
+    /// The source name of every generic function a monomorphization INSTANCE
+    /// was minted for on this thread since [`reset_instance_log`] — one entry
+    /// per distinct instance KEY, memo hits excluded.
+    ///
+    /// The instrument the B95/B102 pins need since backlog M16 (`push_or_share`).
+    /// Those pins ask whether the instance key discriminates two
+    /// instantiations, and they used to ask it by counting how many copies of
+    /// a distinctive body the emission carried — a faithful proxy only while
+    /// one key meant one emitted copy. It no longer does: a body that renders
+    /// the same at every `T` is now emitted ONCE however many keys reach it,
+    /// which is the whole point of M16 and would have quietly turned every one
+    /// of those pins into a tautology. So the question is asked of the memo
+    /// directly, exactly as the const pass's name-seed and call-graph pins ask
+    /// theirs of a counter rather than of the output.
+    ///
+    /// One `String` push per minted instance, against building a whole JS
+    /// function body — the same always-on argument `leak_tally` makes, and for
+    /// the same reason: a `cfg(test)` instrument would not survive
+    /// `vilan-core` being built as a non-test dependency of another crate's
+    /// test binary.
+    static INSTANCE_LOG: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The functions this thread minted monomorphization instances for since the
+/// last [`reset_instance_log`], in mint order. See [`INSTANCE_LOG`].
+pub fn instance_log() -> Vec<String> {
+    INSTANCE_LOG.with(|log| log.borrow().clone())
+}
+
+/// Empties this thread's [`instance_log`].
+pub fn reset_instance_log() {
+    INSTANCE_LOG.with(|log| log.borrow_mut().clear());
 }
 
 /// The three accumulating sets a frame borrows while it is open.
@@ -1988,6 +2077,7 @@ impl<'src> Transformer<'src> {
             current_self_type: None,
             default_instances: HashMap::default(),
             drop_helpers: HashMap::default(),
+            shared_bodies: HashMap::default(),
             monomorphized: Vec::new(),
             is_bindings: HashMap::default(),
             hoisted_values: HashMap::default(),
@@ -6702,6 +6792,71 @@ impl<'src> Transformer<'src> {
         self.record_require(key);
     }
 
+    /// Pushes a freshly emitted instance body, or — when it turns out to be a
+    /// copy of one already emitted for the same subject — shares that one and
+    /// pushes nothing (backlog M16, audit run 6's F18).
+    ///
+    /// A generic function whose emitted body does not depend on `T` gets one
+    /// byte-identical JS copy per instantiation: the five `with_file*` forms
+    /// share one `scoped_file<T>` and `file.mjs` carried two copies of its
+    /// nine-line helper. The memo key upstream is the type substitution, which
+    /// is the right key for "have I emitted THIS instantiation" and the wrong
+    /// one for "have I emitted this CODE" — so the question is asked again
+    /// here, of the thing that actually matters, the emitted body.
+    ///
+    /// **T-independence is decided by the body rather than inferred from the
+    /// types**, and the decision is exact rather than conservative: two bodies
+    /// that render identically once each is stripped of its own name ARE the
+    /// same function, whatever the substitution did on the way. Nothing has to
+    /// reason about which of the transformer's dozens of
+    /// per-monomorphization decisions the body consulted.
+    ///
+    /// **The safety condition is `landed_before`**, and it is what makes the
+    /// share sound rather than merely plausible. A body may be shared only if
+    /// walking it pushed NO new keyed emission of its own. If it pushed none,
+    /// every name the body mentions was already emitted before this instance
+    /// existed, so an identical earlier body calls exactly the same functions
+    /// and swapping one for the other cannot change what runs. If it pushed
+    /// one, that emission's freshly minted name would be in this body and not
+    /// in the earlier one — the two could not render identically — except in
+    /// the one shape where it could: a mutually recursive emission that
+    /// mentions THIS instance's name, which the condition also refuses. The
+    /// duplicate is always the LATER instance, whose nested requirements are
+    /// all memo hits, so the condition costs the optimization nothing.
+    ///
+    /// The name this instance minted is spent either way. That is not waste
+    /// but the recursion contract one seam up: an instance's identity is
+    /// reserved BEFORE its body is walked, so a self-recursive body can call
+    /// itself, and the body cannot be rendered — let alone compared — until
+    /// the name exists. Spending it also keeps every LATER name where it was,
+    /// so what a shared body does to the emitted file is exactly "one function
+    /// fewer, its callers pointed at the survivor" and nothing else.
+    fn push_or_share(
+        &mut self,
+        subject: SharedBodySubject,
+        name: &str,
+        js_function: js::Node<'src>,
+        emission: Option<EmissionId>,
+        landed_before: usize,
+    ) -> Option<SharedBody> {
+        if self.monomorphized.len() == landed_before {
+            let body = canonical_instance_body(&js_function, name);
+            if let Some(shared) = self.shared_bodies.get(&(subject, body.clone())) {
+                return Some(shared.clone());
+            }
+            self.shared_bodies.insert(
+                (subject, body),
+                SharedBody {
+                    name: name.to_string(),
+                    emission,
+                },
+            );
+        }
+        self.monomorphized.push(js_function);
+        self.record_landed(emission);
+        None
+    }
+
     /// Records where a keyed emission's node landed, once it is pushed.
     fn record_landed(&mut self, key: Option<EmissionId>) {
         let slot = self.monomorphized.len().checked_sub(1);
@@ -6993,19 +7148,39 @@ impl<'src> Transformer<'src> {
         self.default_instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&default_id) {
             let emission = self.record_keyed(|recorder, id| {
-                recorder.defaults.insert(key, id);
+                recorder.defaults.insert(key.clone(), id);
             });
             let substitution = self.trait_parameter_substitution(default_id, type_id);
             let saved_self = std::mem::replace(&mut self.current_self_type, Some(type_id));
             let saved_substitution =
                 std::mem::replace(&mut self.current_substitution, substitution);
             let frame = self.record_enter();
+            let landed_before = self.monomorphized.len();
             let js_function = self.function_with_name(function, name.clone());
             self.current_self_type = saved_self;
             self.current_substitution = saved_substitution;
-            self.monomorphized.push(js_function);
-            self.record_landed(emission);
+            // A trait default's body is specialized per type exactly as a
+            // generic body is per `T`, and pays the same per-instantiation
+            // copy when it does not depend on the type (backlog M16).
+            let shared = self.push_or_share(
+                SharedBodySubject::Default(default_id),
+                &name,
+                js_function,
+                emission,
+                landed_before,
+            );
             self.record_leave(frame, emission);
+            if let Some(shared) = shared {
+                self.default_instances
+                    .insert(key.clone(), shared.name.clone());
+                if let Some(recorder) = self.recorder.as_mut() {
+                    if let Some(emission) = shared.emission {
+                        recorder.defaults.insert(key, emission);
+                    }
+                }
+                self.record_require(shared.emission);
+                return shared.name;
+            }
         }
         name
     }
@@ -7874,23 +8049,57 @@ impl<'src> Transformer<'src> {
             return name;
         }
         let substitution: HashMap<TypeId, TypeId> = entries.into_iter().collect();
+        // One entry per distinct instance KEY (see [`INSTANCE_LOG`]): the memo
+        // hit above returned, so reaching here is a mint.
+        if let Some(function) = self.program.functions.get(&function_id) {
+            let logged = function.name.to_string();
+            INSTANCE_LOG.with(|log| log.borrow_mut().push(logged));
+        }
         let name = self.ng.next_name();
         self.instances.insert(key.clone(), name.clone());
         if let Some(function) = self.program.functions.get(&function_id) {
             let emission = self.record_keyed(|recorder, id| {
-                recorder.instances.insert(key, id);
+                recorder.instances.insert(key.clone(), id);
             });
             let saved = std::mem::replace(&mut self.current_substitution, substitution);
             let saved_instance = self.enter_instance(function_id, bits.to_vec());
             let frame = self.record_enter();
+            let landed_before = self.monomorphized.len();
             let js_function = self.function_with_name(function, name.clone());
             self.restore_instance(saved_instance);
             self.current_substitution = saved;
-            self.monomorphized.push(js_function);
-            self.record_landed(emission);
+            let shared = self.push_or_share(
+                SharedBodySubject::Instance(function_id),
+                &name,
+                js_function,
+                emission,
+                landed_before,
+            );
             self.record_leave(frame, emission);
+            if let Some(shared) = shared {
+                return self.take_shared_body(key, shared);
+            }
         }
         name
+    }
+
+    /// Redirects a keyed emission at the body it turned out to duplicate
+    /// (backlog M16): the memo answers with the surviving name from here on,
+    /// and the const pass's site accounting asks for the surviving emission
+    /// rather than the one that was never pushed.
+    ///
+    /// Called after `record_leave`, so the requirement lands on the frame that
+    /// ASKED for this instance — which is the frame that will call the shared
+    /// name and therefore the one that must carry the body into its program.
+    fn take_shared_body(&mut self, key: (Id, Vec<String>, Vec<Id>), shared: SharedBody) -> String {
+        self.instances.insert(key.clone(), shared.name.clone());
+        if let Some(recorder) = self.recorder.as_mut() {
+            if let Some(emission) = shared.emission {
+                recorder.instances.insert(key, emission);
+            }
+        }
+        self.record_require(shared.emission);
+        shared.name
     }
 
     /// Swap in the adapted-instance context for a body about to be emitted;

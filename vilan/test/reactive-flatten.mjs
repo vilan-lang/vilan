@@ -121,14 +121,7 @@ function $a(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
-function $b(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
 function $f(self) {
-	return self[0].v;
-}
-function $g(self) {
 	return self[0].v;
 }
 function $u(self) {
@@ -174,20 +167,11 @@ function $z(signal, observer) {
 }
 function $y(self, observer) {
 	const subscription = $z(self, observer);
-	observer($g(self));
+	observer($f(self));
 	return subscription;
 }
-function $B(signal, observer) {
-	const id = fresh_id();
-	const cell = signal[0];
-	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
-}
 function $A(self, observer) {
-	const subscription = $B(self, observer);
+	const subscription = $z(self, observer);
 	observer($f(self));
 	return subscription;
 }
@@ -199,7 +183,7 @@ function $G(self, item, $H) {
 	return __clone(item);
 }
 function $c(self, $d, $e) {
-	const derived = $a($g($f(self)));
+	const derived = $a($f($f(self)));
 	const inner_subscription = __shared_new([ 1 ]);
 	register_with_owner($A(self, (inner) => {
 		const $h = inner_subscription.v;
@@ -257,7 +241,7 @@ function $N(self, value, $p) {
 	$O(self, $p);
 }
 function $T(self, transform, $U, $V) {
-	const derived = $a(transform($g(self)));
+	const derived = $a(transform($f(self)));
 	register_with_owner($z(self, (value) => {
 		$o(derived, transform(value), $U);
 		return;
@@ -268,19 +252,19 @@ const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 const first = $a(1);
 const second = $a(10);
-const outer = $b(first);
+const outer = $a(first);
 const joined = $c(outer, [ 1 ], [ 1 ]);
-console.log($g(joined));
+console.log($f(joined));
 $o(first, 2, [ 1 ]);
-console.log($g(joined));
+console.log($f(joined));
 $N(outer, second, [ 1 ]);
-console.log($g(joined));
+console.log($f(joined));
 $o(first, 99, [ 1 ]);
-console.log($g(joined));
+console.log($f(joined));
 $o(second, 11, [ 1 ]);
-console.log($g(joined));
+console.log($f(joined));
 const doubled = $T(joined, (value) => {
 	return value * 2;
 }, [ 1 ], [ 1 ]);
 $o(second, 21, [ 1 ]);
-console.log($g(doubled));
+console.log($f(doubled));

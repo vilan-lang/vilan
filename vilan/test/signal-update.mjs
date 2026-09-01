@@ -147,10 +147,6 @@ function $b(self, mutate, $c) {
 function $l(self) {
 	return self[0].v;
 }
-function $m(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
 function $n(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
@@ -180,15 +176,8 @@ function $o(self, mutate, $c) {
 	mutate(self[0].v);
 	$p(self, $c);
 }
-function $u(self) {
-	return self[0].v;
-}
 function $v(self) {
 	return self[0].size;
-}
-function $w(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $y(self, $e) {
 	const $z = $e;
@@ -215,9 +204,6 @@ function $y(self, $e) {
 function $x(self, mutate, $c) {
 	mutate([ self[0], "v" ]);
 	$y(self, $c);
-}
-function $D(self) {
-	return self[0].v;
 }
 function $F(signal, observer) {
 	const id = fresh_id();
@@ -260,7 +246,7 @@ function $U(self, value, $V) {
 	$y(self, $V);
 }
 function $S(self, transform, $T) {
-	$U(self, transform($D(self)), $T);
+	$U(self, transform($l(self)), $T);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -271,19 +257,19 @@ $b(todos, (list) => {
 	return;
 }, [ 1 ]);
 console.log($l(todos).length);
-const scores = $m(new2());
+const scores = $a(new2());
 $o(scores, (entries) => {
 	$n(entries, "a", 1);
 	$n(entries, "b", 2);
 	return;
 }, [ 1 ]);
-console.log($v($u(scores)));
-const count = $w(1);
+console.log($v($l(scores)));
+const count = $a(1);
 $x(count, (value) => {
 	value[0][value[1]] = value[0][value[1]] + 10;
 	return;
 }, [ 1 ]);
-console.log($D(count));
+console.log($l(count));
 const watched = $a([ 0 ]);
 $G(owner, $E(watched, (list) => {
 	return console.log("len " + list.length);
@@ -317,4 +303,4 @@ $b(todos, (list) => {
 $S(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
-console.log($D(count));
+console.log($l(count));

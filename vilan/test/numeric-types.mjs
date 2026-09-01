@@ -97,9 +97,6 @@ function $a(value, divisor) {
 function $b(value, divisor) {
 	return Math.trunc(value / divisor);
 }
-function $c(value, divisor) {
-	return Math.trunc(value / divisor);
-}
 const byte = 0xFF;
 const short = 60000;
 const wide = 9007199254740992;
@@ -119,7 +116,7 @@ counter = Math.trunc(counter / 2);
 console.log(counter);
 console.log($a(100, 8));
 console.log($b(7, 2));
-console.log($c(9, 4));
+console.log($b(9, 4));
 console.log(as_u8(300));
 console.log(as_u8(-(1)));
 console.log(as_i8(130));

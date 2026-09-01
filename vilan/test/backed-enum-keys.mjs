@@ -67,10 +67,6 @@ function $m(self, value) {
 function $n(self) {
 	return self[0].size;
 }
-function $o() {
-	const table = new Map();
-	return [ table ];
-}
 function $p(self, value) {
 	self[0].set(hash3(value), value);
 }
@@ -90,7 +86,7 @@ $l(levels, 1);
 console.log($m(levels, 1));
 console.log($m(levels, 0));
 console.log($n(levels));
-let walked = $o();
+let walked = $k();
 $p(walked, 6);
 console.log($q(walked, 6));
 console.log($q(walked, 7));

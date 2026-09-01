@@ -125,11 +125,8 @@ function $i(self, value, $j) {
 	self[0].v = value;
 	$k(self, $j);
 }
-function $t(self, react) {
-	react(self);
-}
 function $s(slot) {
-	$t(slot, (inner) => {
+	$b(slot, (inner) => {
 		return console.log("holder " + $h(inner));
 	});
 }

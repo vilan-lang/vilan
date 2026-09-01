@@ -95,9 +95,6 @@ function $p(self) {
 	const $q = self;
 	return $q[0] === 0;
 }
-function $r() {
-	return [ [  ], [  ], 0 ];
-}
 function $s(self, value) {
 	const $t = __list_pop(self[1]);
 	let $u = null;
@@ -112,12 +109,9 @@ function $s(self, value) {
 	}
 	return $u;
 }
-function $w(self, handle) {
-	return handle[0] < self[0].length && __at(self[0], handle[0])[0] === handle[1];
-}
 function $v(self, handle) {
 	let $x = null;
-	if ($w(self, handle)) {
+	if ($g(self, handle)) {
 		$x = [ 0, __at(self[0], handle[0])[1] ];
 	} else {
 		$x = [ 1 ];
@@ -137,7 +131,7 @@ const c = $b(numbers, 30);
 console.log($i($f(numbers, c), -(1)));
 console.log($p($f(numbers, b)));
 console.log($i($f(numbers, a), -(1)));
-let graph = $r();
+let graph = $a();
 const leaf1 = $s(graph, [ 2, [  ] ]);
 const leaf2 = $s(graph, [ 3, [  ] ]);
 let root_edges = [  ];

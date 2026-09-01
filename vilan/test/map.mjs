@@ -67,10 +67,6 @@ function $m(self, key2) {
 function $n(self) {
 	return $c(self) === 0;
 }
-function $o() {
-	const table = new Map();
-	return [ table ];
-}
 function $p(self, key2, value2) {
 	self[0].set(hash2(key2), [ __clone(key2), __clone(value2) ]);
 }
@@ -142,7 +138,7 @@ let copy = __clone(scores);
 $b(copy, "dave", 4);
 console.log($d(scores, "dave"));
 console.log($d(copy, "dave"));
-let names = $o();
+let names = $a();
 $p(names, 1, "one");
 $p(names, 2, "two");
 console.log($t($q(names, 1), "?"));

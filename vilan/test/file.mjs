@@ -66,17 +66,8 @@ async function $f(file, body) {
 async function $e(path, body) {
 	return await ($f(await (open2(path)), body));
 }
-async function $h(file, body) {
-	try {
-		const result = await (body(file));
-		await (__fs_close_awaited(file));
-		return result;
-	} finally {
-		$a(file);
-	}
-}
 async function $g(path, body) {
-	return await ($h(await (create(path)), body));
+	return await ($f(await (create(path)), body));
 }
 function $i($j) {
 	$a($j[0]);

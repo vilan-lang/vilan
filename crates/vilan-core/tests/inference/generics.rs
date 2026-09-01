@@ -4230,3 +4230,128 @@ fn a_constructed_source_bound_resolves_inside_a_generic_body() {
         "3\n",
     );
 }
+
+// --- M16: a T-independent generic body is emitted ONCE ----------------------
+
+/// Counts the top-level `function` declarations in `js` whose body — the lines
+/// up to the closing brace at column 0 — contains `needle`.
+fn emitted_bodies_containing(js: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut lines = js.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !(line.starts_with("function ") || line.starts_with("async function ")) {
+            continue;
+        }
+        let mut body = String::new();
+        for inner in lines.by_ref() {
+            if inner == "}" {
+                break;
+            }
+            body.push_str(inner);
+            body.push('\n');
+        }
+        if body.contains(needle) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// M16 (audit run 6's F18). A generic function whose EMITTED body does not
+/// depend on `T` is one function, however many types it is instantiated at —
+/// and it used to be one byte-identical JS copy per instantiation.
+///
+/// The subject is the shape the item was filed on: `scoped_file<T>` behind the
+/// five `with_file*` forms, whose nine emitted lines mention no type at all
+/// and which `file.mjs` carried two copies of. Nothing here reasons about
+/// which of the transformer's per-monomorphization decisions the body
+/// consulted — the bodies are compared as EMITTED, which is exact where a
+/// T-independence analysis would have to be conservative.
+#[test]
+fn a_t_independent_generic_body_is_emitted_once_for_all_its_instantiations() {
+    let js = compile(
+        r#"
+        import std::io::print;
+
+        fun apply_twice<T>(value: T, step: |T| T): T {
+            let once = step(value);
+            step(once)
+        }
+
+        fun main() {
+            print(apply_twice(1, |n| n + 1));
+            print(apply_twice("a", |s| s + "!"));
+            print(apply_twice(true, |b| b));
+        }
+        main();
+        "#,
+    )
+    .expect("compiles");
+    assert_eq!(
+        emitted_bodies_containing(&js, "const once = step(value);"),
+        1,
+        "three instantiations of a T-independent body must share ONE emission:\n{js}"
+    );
+}
+
+/// The control, and the thing that keeps the pin above from being a claim that
+/// generics stopped monomorphizing: a body that DOES resolve differently per
+/// type still gets one emission per type. Here each `T`'s `to_string` is a
+/// different function, so the two bodies do not render alike and neither may
+/// stand in for the other.
+#[test]
+fn a_t_dependent_generic_body_is_still_emitted_once_per_instantiation() {
+    let js = compile(
+        r#"
+        import std::io::print;
+        import std::display::{ Display, format };
+
+        struct Metres { value: i32 }
+        struct Seconds { value: i32 }
+
+        impl Metres with Display { fun to_string(self): str { format(self.value) + "m" } }
+        impl Seconds with Display { fun to_string(self): str { format(self.value) + "s" } }
+
+        fun label<T: Display>(value: T): str {
+            let rendered = value.to_string();
+            "[" + rendered + "]"
+        }
+
+        fun main() {
+            print(label(Metres { value = 3 }));
+            print(label(Seconds { value = 4 }));
+        }
+        main();
+        "#,
+    )
+    .expect("compiles");
+    assert_eq!(
+        emitted_bodies_containing(&js, "const rendered ="),
+        2,
+        "two instantiations that resolve to DIFFERENT code must stay two \
+         emissions:\n{js}"
+    );
+}
+
+/// And the shared body has to RUN at every type it was shared across — the
+/// assertion the emission count cannot make.
+#[test]
+fn a_shared_generic_body_runs_at_every_type_it_was_shared_across() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun apply_twice<T>(value: T, step: |T| T): T {
+            let once = step(value);
+            step(once)
+        }
+
+        fun main() {
+            print(apply_twice(1, |n| n + 1));
+            print(apply_twice("a", |s| s + "!"));
+        }
+        main();
+        "#,
+        "3\na!!\n",
+    );
+}

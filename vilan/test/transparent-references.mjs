@@ -10,9 +10,6 @@ function slot(self) {
 function $j(v3, x) {
 	v3[0][v3[1]] = x;
 }
-function $k(v3, x) {
-	v3[0][v3[1]] = x;
-}
 let a = [ 10 ];
 const b = [ a, 0 ];
 const c = b;
@@ -76,5 +73,5 @@ let count = [ 1 ];
 $j([ count, 0 ], 42);
 console.log(count[0]);
 let ready = [ false ];
-$k([ ready, 0 ], true);
+$j([ ready, 0 ], true);
 console.log(ready[0]);
