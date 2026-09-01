@@ -1463,3 +1463,148 @@ fn cross_package_emission_is_byte_identical_under_import_permutation() {
     );
     let _ = std::fs::remove_dir_all(&shuffled);
 }
+
+// ── File mode: which package owns a file addressed by path (G20) ──
+//
+// `resolve_project` has three shapes — a directory, the working directory's
+// project, and an explicit FILE — and until G20 the third one read no manifest
+// at all. Every answer that depends on the manifest was therefore a lie in file
+// mode, and each one below is measured from audit run 6's F11 repro rather than
+// imagined. The fix is `test_context`'s rule generalized: a file is a file *of*
+// its package, whichever command names it.
+
+#[test]
+fn file_mode_honors_the_packages_declared_prelude() {
+    // Lie 1, the web set. A package on `prelude = "std::web"` has `view`
+    // ambient; file mode had no manifest, so the name failed to resolve and the
+    // steer told the author to make the edit their manifest already carries.
+    let dir = temp_project("file_prelude_web");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"browser\"\nprelude = \"std::web\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "fun main() { let v = view(\"div\"); }\n",
+    );
+    let output = vilan_plain(&["check", dir.join("src/main.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "an ambient name of the package's own prelude resolves in file mode:\n{text}"
+    );
+    assert!(
+        !text.contains("prelude of the web set"),
+        "and nobody is steered to an edit they already made:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_mode_honors_prelude_false() {
+    // Lie 2, the other direction, and the one that matters more: `prelude =
+    // false` is a package REMOVING names, so a file mode that ignored it
+    // reported a program clean that the build refuses. Silence in the direction
+    // of "it compiles" is the worst answer a checker can give.
+    let dir = temp_project("file_prelude_off");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\nprelude = false\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "fun main() { print(\"hi\") }\nmain();\n",
+    );
+    let file = vilan_plain(&["check", dir.join("src/main.vl").to_str().unwrap()]);
+    let file_text = combined(&file);
+    assert!(
+        !file.status.success() && file_text.contains("cannot find 'print'"),
+        "file mode answers what directory mode answers:\n{file_text}"
+    );
+    let directory = vilan_plain(&["check", dir.to_str().unwrap()]);
+    assert!(!directory.status.success(), "{}", combined(&directory));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_mode_refuses_a_manifest_the_validator_refuses() {
+    // Lie 3. A manifest directory mode fails the build on passed file-mode
+    // check WORDLESSLY — so `vilan check <file>` in CI was green over a project
+    // that cannot be built at all.
+    let dir = temp_project("file_bad_manifest");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\nprelude = \"std\"\n",
+    );
+    write(&dir, "src/main.vl", "fun main() {}\n");
+    let output = vilan_plain(&["check", dir.join("src/main.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("invalid") && text.contains("`[package] prelude`"),
+        "the refusal is the manifest's own, in the wording directory mode uses:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_mode_resolves_pkg_siblings_and_dependencies_through_the_manifest() {
+    // The positive the three lies are symptoms of: a file compiled by path is a
+    // file OF its package, so a declared `root`, its `pkg::` siblings and its
+    // dependencies all resolve — which is exactly what `vilan test` has done
+    // for a test file since distribution.md §7's S4.
+    let dir = temp_project("file_pkg_root");
+    write(&dir, "common/vilan.toml", "[library]\nname = \"common\"\n");
+    write(
+        &dir,
+        "common/src/lib.vl",
+        "export fun greeting(): str { \"hi\" }\n",
+    );
+    write(
+        &dir,
+        "app/vilan.toml",
+        "[package]\nname = \"app\"\nroot = \"lib\"\n\n[package.dependencies]\n\
+         common = { path = \"../common\" }\n",
+    );
+    write(
+        &dir,
+        "app/lib/helper.vl",
+        "export fun helper(): i32 { 7 }\n",
+    );
+    write(
+        &dir,
+        "app/lib/main.vl",
+        "import std::io::print;\nimport pkg::helper::helper;\nimport common::greeting;\n\
+         fun main() { print(greeting()); print(helper()) }\nmain();\n",
+    );
+    let output = vilan_plain(&["check", dir.join("app/lib/main.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "`pkg::` resolves against the declared root, not the file's directory:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_file_with_no_manifest_above_it_keeps_its_manifest_less_context() {
+    // The boundary, kept: a scratch program outside any project still compiles
+    // and runs from its own directory, with the default prelude and no
+    // dependencies. Adopting a manifest is what a file IN a package does; there
+    // is no manifest here to adopt and nothing about that is an error.
+    let dir = temp_project("file_bare");
+    write(
+        &dir,
+        "scratch.vl",
+        "import std::io::print;\nfun main() { print(\"ok\") }\nmain();\n",
+    );
+    let output = vilan_plain(&["check", dir.join("scratch.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

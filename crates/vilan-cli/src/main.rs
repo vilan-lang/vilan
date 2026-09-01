@@ -544,25 +544,66 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// being readable would leave the loop silently blind to every recorded input.
 /// An unwind can only ever leave this set holding a subset of one round's
 /// paths, which the next round re-records.
-static RECORDED_INPUT_PATHS: std::sync::Mutex<BTreeSet<PathBuf>> =
-    std::sync::Mutex::new(BTreeSet::new());
+static RECORDED_INPUT_PATHS: std::sync::Mutex<BTreeMap<PathBuf, InputReading>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
-/// Adds `paths` to the watcher's recorded-input set — the one door into
-/// [`RECORDED_INPUT_PATHS`], so every producer records the same way.
-fn record_watched_inputs(paths: impl IntoIterator<Item = PathBuf>) {
-    let mut paths = paths.into_iter().peekable();
-    if paths.peek().is_none() {
-        return;
-    }
-    RECORDED_INPUT_PATHS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .extend(paths);
+/// What a recorded input MEANS when it names a directory (G21, audit run 6's
+/// F23) — the reading its recorder keys on, carried on the row the way G16 put
+/// the entry KIND on the freshness stamp's rows, and for the same reason: two
+/// consumers of one path have to agree about what the path says.
+///
+/// The two producers do not agree, because their gates do not. A
+/// `[[build.hook]]`'s declared directory is digested as its WHOLE TREE
+/// ([`file_digest`]), so an edit anywhere inside it re-runs the hook and must
+/// wake a round. The const channel's listing verbs key a directory on its
+/// IMMEDIATE membership and nothing else ([`vilan_core::const_eval::directory_input_hash`]
+/// — the listing reads names, never bytes, and a file whose contents matter is
+/// tracked in its own right by the `read`/`bundle`/`digest` that touched it, and
+/// a nested directory by the `read_dir_all` that walked it). Recording both as
+/// trees woke rounds the const key provably could not have moved for: editing a
+/// listed file's content, or any file deeper in the tree. Harmless — the leg
+/// then re-keys the directory, finds it unchanged and skips — but a round that
+/// reliably does nothing is the watcher reading a declaration differently from
+/// the gate it wakes.
+///
+/// Ordered so that [`InputReading::Tree`] wins when one path is recorded under
+/// both: the tree is the superset, and the safe direction here is the spurious
+/// round, never the missed one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum InputReading {
+    /// The const channel's listing (`asset::read_dir`, `asset::read_dir_all`):
+    /// a directory contributes its own entry alone.
+    Listing,
+    /// A `[[build.hook]]` `inputs` declaration: a directory contributes its own
+    /// entry plus one per member of its tree.
+    Tree,
 }
 
-/// Records a compile's `asset::read` inputs for the watcher.
+/// Adds `inputs` to the watcher's recorded-input set — the one door into
+/// [`RECORDED_INPUT_PATHS`], so every producer records the same way, and now
+/// says which way that is.
+fn record_watched_inputs(inputs: impl IntoIterator<Item = (PathBuf, InputReading)>) {
+    let mut inputs = inputs.into_iter().peekable();
+    if inputs.peek().is_none() {
+        return;
+    }
+    let mut recorded = RECORDED_INPUT_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (path, reading) in inputs {
+        let entry = recorded.entry(path).or_insert(reading);
+        *entry = (*entry).max(reading);
+    }
+}
+
+/// Records a compile's `const asset::…` inputs for the watcher, under the
+/// channel's own reading of a directory: its immediate membership.
 fn record_const_inputs(inputs: &[(PathBuf, Option<u64>)]) {
-    record_watched_inputs(inputs.iter().map(|(path, _)| path.clone()));
+    record_watched_inputs(
+        inputs
+            .iter()
+            .map(|(path, _)| (path.clone(), InputReading::Listing)),
+    );
 }
 
 /// [`scan_vl`] plus the recorded build inputs: the full watched set. A recorded
@@ -570,38 +611,39 @@ fn record_const_inputs(inputs: &[(PathBuf, Option<u64>)]) {
 /// an entry, which is exactly the snapshot difference that fires a round.
 fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
     let mut files = scan_vl(roots);
-    for path in RECORDED_INPUT_PATHS
+    for (path, reading) in RECORDED_INPUT_PATHS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
     {
-        insert_watched_input(path, &mut files);
+        insert_watched_input(path, *reading, &mut files);
     }
     files
 }
 
-/// Adds one recorded input to the snapshot: its modification time, or — when it
-/// is a **directory** — an entry for the directory itself plus one per file in
-/// its tree.
+/// Adds one recorded input to the snapshot: its modification time, and — when
+/// it is a **directory** the recorder reads as a [`InputReading::Tree`] — one
+/// entry per member of that tree.
 ///
-/// A directory means its tree because that is what the declaration already
-/// means to the freshness stamp ([`file_digest`] digests a directory as its
-/// whole tree, which is why `inputs = ["src/static"]` reads the way it looks):
-/// one reading of the manifest, both consumers. The tree alone would not do
-/// either, which is N30: a directory contributed only its FILES, so a
-/// recorded-missing directory that APPEARS EMPTY added no entry at all and
-/// started no round — while the compile that failed on it (`asset::read_dir`
-/// records the miss) would now succeed against the empty listing. The first
-/// file created inside it fired; the appearance itself did not.
+/// Every recorded path gets its OWN entry whatever the reading, and that half is
+/// N30: a directory contributed only its FILES, so a recorded-missing directory
+/// that APPEARS EMPTY added no entry at all and started no round — while the
+/// compile that failed on it (`asset::read_dir` records the miss) would now
+/// succeed against the empty listing. The first file created inside it fired;
+/// the appearance itself did not. The directory's value is its own mtime rather
+/// than a rendering of its membership, because mtime is the instrument every
+/// other entry in this map already uses, and a directory's mtime moves precisely
+/// when a direct entry is added or removed — which is also exactly what the
+/// const channel's listing key is a function of.
 ///
-/// So a directory contributes both, and each half answers what the other
-/// cannot: the directory's own entry is what makes its EXISTENCE observable,
-/// and its files' entries are what make an edit INSIDE it observable — a
-/// directory's own mtime does not move for that. The directory's value is its
-/// own mtime rather than a rendering of its membership, because mtime is the
-/// instrument every other entry in this map already uses and a directory's
-/// mtime moves precisely when a direct entry is added or removed; membership
-/// changes deeper down are carried by the file entries themselves.
+/// The TREE half belongs only to the declaration that reads a directory as one:
+/// a `[[build.hook]]`'s `inputs`, which [`file_digest`] digests as the whole
+/// tree, so an edit anywhere inside it re-runs the hook and must therefore wake
+/// a round. Giving the const channel's directories the same expansion was G21:
+/// it woke rounds for edits its gate keys nothing on. The reading now travels
+/// with the row ([`InputReading`]), so one declaration is read one way by the
+/// gate and by the watcher — the alignment G16 made for the stamp, on the other
+/// producer.
 ///
 /// The top-level path is resolved through a symlink (`fs::metadata`), matching
 /// both the `asset::read` inputs this set has always carried and the stamp,
@@ -611,14 +653,18 @@ fn watch_snapshot(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
 /// claiming the match is what let it stand. Inside a tree, a symlink is never
 /// followed: the stamp digests the link's own target path there, and following
 /// one could walk out of the tree or into a cycle.
-fn insert_watched_input(path: &Path, files: &mut BTreeMap<PathBuf, SystemTime>) {
+fn insert_watched_input(
+    path: &Path,
+    reading: InputReading,
+    files: &mut BTreeMap<PathBuf, SystemTime>,
+) {
     let Ok(metadata) = fs::metadata(path) else {
         return;
     };
     if let Ok(modified) = metadata.modified() {
         files.insert(path.to_path_buf(), modified);
     }
-    if metadata.is_dir() {
+    if metadata.is_dir() && reading == InputReading::Tree {
         collect_input_tree(path, files);
     }
 }
@@ -730,7 +776,9 @@ fn watch_roots(file: &Option<PathBuf>) -> Vec<PathBuf> {
 fn scan_vl(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
     let mut files = Vec::new();
     for root in roots {
-        collect_vl_files(root, &mut files);
+        // A link out of the project is not this session's to watch either, and
+        // saying so 3 times a second is not honesty. `fmt` carries the note.
+        let _outside = collect_vl_files(root, &mut files);
     }
     files
         .into_iter()
@@ -1451,24 +1499,21 @@ fn hmr_round(
 /// alike — a dependency's manifest changes its dependents' output too) and
 /// hashes each path + content (unreadable ⇒ `None`), so an added, removed, or
 /// edited manifest all shift the value.
+///
+/// The walk is [`TreeWalk`]'s, the same one `.vl` collection uses (G18): it
+/// followed directory links unguarded too, so a cycle hung the watch round
+/// before it started and a link out of the project put a stranger's manifests
+/// into this project's fingerprint.
 fn manifest_fingerprint(root: &Path) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    fn collect_manifests(directory: &Path, found: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(directory) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_manifests(&path, found);
-            } else if path.file_name().and_then(|name| name.to_str()) == Some("vilan.toml") {
-                found.push(path);
-            }
-        }
-    }
     let mut manifests = Vec::new();
-    collect_manifests(root, &mut manifests);
+    let mut walk = TreeWalk::rooted_at(root);
+    walk.walk(root, &mut |path| {
+        if path.file_name().and_then(|name| name.to_str()) == Some("vilan.toml") {
+            manifests.push(path.to_path_buf());
+        }
+    });
     manifests.sort();
     let mut hasher = DefaultHasher::new();
     for path in manifests {
@@ -1742,9 +1787,11 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
         paths.to_vec()
     };
     let mut files = Vec::new();
+    let mut outside: BTreeSet<PathBuf> = BTreeSet::new();
     for root in &roots {
-        collect_vl_files(root, &mut files);
+        outside.extend(collect_vl_files(root, &mut files));
     }
+    report_links_outside_the_project(&outside);
     exclude_generated(&mut files);
     let mut changed = 0;
     let mut failed = false;
@@ -1859,6 +1906,31 @@ fn exclude_generated(files: &mut Vec<PathBuf>) {
     }
 }
 
+/// Says which directory links the walk stopped at, and why (G18/G19).
+///
+/// One dim line per link, spending the same honesty budget `exclude_generated`
+/// does and for the same reason: a tool that quietly stops doing what it was
+/// asked is the failure mode this design cannot afford, and here it was doing
+/// too MUCH — `vilan fmt .` rewrote a stranger's tree through a link. Never a
+/// warning, and never a word implying the link is illegitimate: a symlink is a
+/// supported spelling of project layout (G19), and what this says is where the
+/// command's own scope ends.
+fn report_links_outside_the_project(links: &BTreeSet<PathBuf>) {
+    for link in links {
+        eprintln!(
+            "{}",
+            paint::err(
+                paint::Style::DIM,
+                &format!(
+                    "note: `{}` resolves outside this project and was not walked; \
+                     format that tree where it lives",
+                    display_relative(link).display()
+                )
+            )
+        );
+    }
+}
+
 /// `path` relative to the working directory when it is under it, else `path` —
 /// so a note about a root the user is standing in reads as they spelled it,
 /// rather than as an absolute path resolution happened to produce.
@@ -1873,20 +1945,153 @@ fn display_relative(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-/// Collects every `.vl` file under `path` (recursing into directories), in a
-/// stable (sorted) order.
-fn collect_vl_files(path: &Path, out: &mut Vec<PathBuf>) {
-    if path.is_dir() {
-        if let Ok(entries) = fs::read_dir(path) {
-            let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-            paths.sort();
-            for entry in paths {
-                collect_vl_files(&entry, out);
-            }
+/// A directory's identity for [`TreeWalk`]'s cycle guard: `(device, inode)` on
+/// unix, which answers "the same directory" whatever chain of names reached it,
+/// and the resolved path elsewhere — the portable spelling of the same question,
+/// since Windows exposes no stable inode through `std`. Either way the key is
+/// the DIRECTORY and never its name, which is the whole point: a cycle is one
+/// directory wearing many names.
+#[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+#[cfg(not(unix))]
+type DirectoryIdentity = PathBuf;
+
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    Some(vilan_core::util::canonical_path(path))
+}
+
+/// One walk of a project tree, with the two guards a link-following walk needs
+/// (G18, audit run 6's F6).
+///
+/// Symlinks are a SUPPORTED SPELLING of project layout — the owner's ruling, and
+/// the doctrine `const.md` §9.2 now carries — so this walk **follows** a
+/// directory link rather than fencing it off. Following is what needed the
+/// guards, and it had neither:
+///
+/// * **A cycle.** `src/l1 -> .` fanned the walk out forever; with a second link
+///   beside it `vilan fmt --check` never returned, and reported nothing at all,
+///   since the report comes after collection. One link alone terminated only
+///   because the kernel refused the fortieth resolution, after handing the same
+///   file back forty-one times. The [`visited`](Self::visited) set keys on
+///   directory identity, so a directory re-reached under another name is
+///   recognized as one already walked.
+/// * **An escape.** An ordinary directory link walked straight out of the
+///   package, and `vilan fmt .` rewrote files in someone else's tree. Resolving
+///   honestly is exactly what makes the scope checkable: a link is followed when
+///   the tree it names is inside the resolved project, and reported (never
+///   refused as illegitimate) when it is not.
+///
+/// The scope is the enclosing **project** — the nearest `vilan.toml` at or above
+/// the walk root — rather than the walk root itself, so `vilan fmt src` still
+/// follows `src/icons -> ../build/icons`, which is layout the package chose. A
+/// root with no manifest above it scopes to itself: a bare directory of `.vl`
+/// files is still a tree, and still not a licence to leave it.
+struct TreeWalk {
+    /// The resolved tree the walk may not leave.
+    scope: PathBuf,
+    visited: BTreeSet<DirectoryIdentity>,
+    /// Directory links whose target resolves outside [`scope`](Self::scope), in
+    /// the spelling they were reached by — what a command tells the user about
+    /// rather than skipping in silence.
+    outside: Vec<PathBuf>,
+}
+
+impl TreeWalk {
+    fn rooted_at(root: &Path) -> TreeWalk {
+        let resolved = vilan_core::util::canonical_path(root);
+        let start = if resolved.is_dir() {
+            resolved
+        } else {
+            resolved
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| resolved.clone())
+        };
+        TreeWalk {
+            scope: find_project_root(&start).unwrap_or(start),
+            visited: BTreeSet::new(),
+            outside: Vec::new(),
         }
-    } else if path.extension().and_then(|extension| extension.to_str()) == Some("vl") {
-        out.push(path.to_path_buf());
     }
+
+    /// Whether a link is part of this project — the one question the walk asks
+    /// before following one. Two ways to be: the tree it resolves to is inside
+    /// the resolved project, or a manifest DECLARED it as a package's
+    /// `generated` root, which is a package saying that tree is its own however
+    /// the filesystem spells the path there.
+    ///
+    /// The second arm is not a loophole in the first, it is the same rule read
+    /// off the manifest instead of off the directory layout — and the watcher
+    /// needs it: a generated `.vl` behind a link is a source input, and a scan
+    /// that stopped at the link would compile stale bytes forever. `fmt` needs
+    /// it too, for the note — those files are skipped as PRODUCTS
+    /// ([`exclude_generated`]), which is what the user has to be told, rather
+    /// than as a tree this command does not speak for.
+    fn belongs_to_the_project(&self, link: &Path) -> bool {
+        vilan_core::util::canonical_path(link).starts_with(&self.scope)
+            || vilan_core::manifest::generated_root_covering(link).is_some()
+    }
+
+    /// Walks `path`, calling `visit` for every non-directory entry beneath it,
+    /// in a stable (sorted) order.
+    fn walk(&mut self, path: &Path, visit: &mut impl FnMut(&Path)) {
+        let Ok(entry) = fs::symlink_metadata(path) else {
+            return;
+        };
+        let metadata = if entry.is_symlink() {
+            if !self.belongs_to_the_project(path) {
+                self.outside.push(path.to_path_buf());
+                return;
+            }
+            // A broken link resolves to nothing and is simply not there.
+            let Ok(followed) = fs::metadata(path) else {
+                return;
+            };
+            followed
+        } else {
+            entry
+        };
+        if !metadata.is_dir() {
+            visit(path);
+            return;
+        }
+        let Some(identity) = directory_identity(path) else {
+            return;
+        };
+        if !self.visited.insert(identity) {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        let mut children: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        children.sort();
+        for child in children {
+            self.walk(&child, visit);
+        }
+    }
+}
+
+/// Collects every `.vl` file under `path` (recursing into directories), in a
+/// stable (sorted) order. Answers with the directory links the walk did not
+/// follow because they leave the project ([`TreeWalk`]) — which `fmt` reports
+/// and the watcher's scan ignores.
+fn collect_vl_files(path: &Path, out: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut walk = TreeWalk::rooted_at(path);
+    walk.walk(path, &mut |file| {
+        if file.extension().and_then(|extension| extension.to_str()) == Some("vl") {
+            out.push(file.to_path_buf());
+        }
+    });
+    walk.outside
 }
 
 /// A buildable unit — a workspace member, a lone package, or a bare file: the
@@ -2310,12 +2515,17 @@ impl BuildHooks {
     /// is stamped.
     ///
     /// `outputs` are not recorded, on purpose — see [`RECORDED_INPUT_PATHS`].
+    ///
+    /// Recorded as [`InputReading::Tree`], which is the declaration's own
+    /// reading: [`file_digest`] hashes a declared directory as its whole tree,
+    /// so `inputs = ["src/static"]` means what it looks like it means, and the
+    /// round has to wake for every edit that re-stales the hook.
     fn record_watched_inputs(&self) {
         record_watched_inputs(
             self.declared
                 .iter()
                 .flat_map(|hook| hook.inputs.iter())
-                .map(|declared| self.dir.join(declared)),
+                .map(|declared| (self.dir.join(declared), InputReading::Tree)),
         );
     }
 
@@ -2742,21 +2952,9 @@ fn resolve_project(path: Option<PathBuf>) -> Result<Project, String> {
         // An explicit directory: the project rooted there.
         Some(path) if path.is_dir() => project_from_manifest(&path),
         // An explicit file (or a not-yet-existing path, so `compile` can report
-        // the read error): a single entry, compiled directly with default options
-        // (there's no manifest to read `[build]`/`target`/dependencies from).
-        Some(path) => Ok(Project::Single {
-            unit: Unit {
-                name: String::new(),
-                pkg_root: pkg_root_of(&path),
-                entry: path,
-                package_dir: None,
-                split: false,
-                options: BuildOptions::default(),
-            },
-            platform: None,
-            // A bare file has no manifest, so it declares no hooks.
-            hooks: BuildHooks::default(),
-        }),
+        // the read error): a single entry, compiled as a file OF the package
+        // that owns it.
+        Some(path) => file_project(path),
         // No path: find the enclosing project from the working directory.
         None => {
             let working_dir = env::current_dir()
@@ -2769,6 +2967,107 @@ fn resolve_project(path: Option<PathBuf>) -> Result<Project, String> {
             project_from_manifest(&root)
         }
     }
+}
+
+/// The package that owns a file addressed by path: the nearest `vilan.toml` at
+/// or above its directory, read and **validated**, with the directory holding
+/// it. `Ok(None)` is a genuinely manifest-less file — a scratch program outside
+/// any project.
+///
+/// One discovery for every path-addressed command, so `vilan check src/main.vl`,
+/// `vilan build src/main.vl` and `vilan test src/main_test.vl` cannot come to
+/// three different answers about which package a file belongs to. `vilan test`
+/// has resolved a test file this way since distribution.md §7's S4 — a test file
+/// is a file *of* its package — and G20 is what that leaves: every other file
+/// mode still built a package-less unit.
+fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
+    let Some(directory) = file.parent().and_then(find_project_root) else {
+        return Ok(None);
+    };
+    let (manifest, _warnings) = read_manifest_quietly(&directory)?;
+    Ok(Some((directory, manifest)))
+}
+
+/// The project a file addressed by path compiles under (G20, audit run 6's F11).
+///
+/// Before this, an explicit file built a `Unit` with **no** `package_dir`, so the
+/// manifest was never read in file mode — and every answer that depends on it
+/// was a lie the user could not see. Three, measured: a package already on
+/// `prelude = "std::web"` was steered to "set `prelude = \"std::web\"`", the edit
+/// it had already made; `prelude = false` was silently ineffective, so a name the
+/// package removed still resolved; and a manifest the validator refuses passed
+/// file-mode check wordlessly while directory mode failed the build on it.
+///
+/// What the file adopts is what the package IS — its source root, dependency
+/// workspace, prelude, build options, and (the language server's rule, so the
+/// editor and the terminal agree) its platform when the file lives under the
+/// package's source root. What it does not adopt is what addressing the
+/// DIRECTORY means: `[build]` hooks do not run, because naming one file is a
+/// request to compile that file and not to drive the package's build pipeline,
+/// and a shell command is not a side effect to acquire by accident.
+///
+/// A file with no manifest above it keeps its old context exactly: its own
+/// directory as the package root, no dependencies, default options — and so does
+/// a file under a `[project]` or `[library]` root, which has no `[package]` to
+/// belong to.
+fn file_project(entry: PathBuf) -> Result<Project, String> {
+    let bare = |entry: PathBuf| Project::Single {
+        unit: Unit {
+            name: String::new(),
+            pkg_root: pkg_root_of(&entry),
+            entry,
+            package_dir: None,
+            split: false,
+            options: BuildOptions::default(),
+        },
+        platform: None,
+        hooks: BuildHooks::default(),
+    };
+    let Some((directory, manifest)) = owning_package(&entry)? else {
+        return Ok(bare(entry));
+    };
+    let Some(package) = manifest.package.as_ref() else {
+        return Ok(bare(entry));
+    };
+    let options = manifest
+        .build_options()
+        .map_err(|error| format!("invalid {}/vilan.toml: {error}", directory.display()))?;
+    let pkg_root = directory.join(package.root());
+    // The platform, by the language server's rule (`document.rs`'s
+    // `resolve_project_context`): the classic single-entry form colors every
+    // file under its source root; a multi-entry package colors an ENTRY file by
+    // its own target and leaves anything else to inference, since a module
+    // reached from several entries has no one target. A file outside the source
+    // root is not the package's to color either — it still resolves `pkg::` and
+    // the dependencies, which is what it needs.
+    //
+    // Compared canonically on both sides, never textually: `./src/main.vl` and
+    // `src/main.vl` name one file and must get one answer, and — the symlink
+    // doctrine, `spec/const.md` §9.2 — so must a source root reached through a
+    // link.
+    let resolved_entry = vilan_core::util::canonical_path(&entry);
+    let platform = if manifest.entries.is_empty() {
+        resolved_entry
+            .starts_with(vilan_core::util::canonical_path(&pkg_root))
+            .then(|| package.resolved_target().unwrap_or_default())
+    } else {
+        manifest.entries.iter().find_map(|(name, declared)| {
+            (vilan_core::util::canonical_path(pkg_root.join(declared.path(name))) == resolved_entry)
+                .then(|| declared.resolved_target().unwrap_or_default())
+        })
+    };
+    Ok(Project::Single {
+        unit: Unit {
+            name: String::new(),
+            entry,
+            pkg_root,
+            package_dir: Some(directory),
+            split: false,
+            options,
+        },
+        platform,
+        hooks: BuildHooks::default(),
+    })
 }
 
 /// Reads, parses, validates, and reports warnings for the `vilan.toml` in
@@ -3718,10 +4017,9 @@ fn test_context(file: &Path) -> Result<(PathBuf, Workspace, BuildOptions), Strin
             BuildOptions::default(),
         )
     };
-    let Some(directory) = file.parent().and_then(find_project_root) else {
+    let Some((directory, manifest)) = owning_package(file)? else {
         return Ok(bare());
     };
-    let (manifest, _warnings) = read_manifest_quietly(&directory)?;
     let root = match (&manifest.package, &manifest.library) {
         (Some(package), _) => package.root(),
         (None, Some(library)) => library.base_root(),
@@ -4352,6 +4650,16 @@ impl LegNamespace {
 /// through different spellings, and a symlinked resource is still the file it
 /// points at. A path that cannot be canonicalized (the destination usually does
 /// not exist yet) is not the same file as anything.
+///
+/// Resolving BOTH sides means a `dist/` entry that is a link back at the source
+/// answers "already copied", and the build carries it without rewriting bytes.
+/// Recorded (audit run 6's F24) and **settled** rather than fenced: under G19's
+/// ruling a symlink is a supported spelling of project layout, in the output
+/// directory as anywhere else, and the alternative — comparing the destination
+/// unresolved — would make `vilan build` overwrite a link somebody put there on
+/// purpose, which is the outcome this predicate exists to prevent for the source
+/// itself. The copy is a build product either way, and the sweep that removes a
+/// resource no leg names any more removes it by the name it recorded.
 fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
     match (fs::canonicalize(left), fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
@@ -5914,7 +6222,7 @@ mod tests {
         fs::create_dir_all(dir.join("icons/svg")).unwrap();
         let nested = dir.join("icons/svg/check.svg");
         fs::write(&nested, "<svg/>\n").unwrap();
-        record_watched_inputs([dir.join("icons")]);
+        record_watched_inputs([(dir.join("icons"), InputReading::Tree)]);
         let roots = vec![dir.clone()];
 
         let snapshot = watch_snapshot(&roots);
@@ -5965,6 +6273,95 @@ mod tests {
             "an EMPTY directory appearing is a snapshot change: {appeared:?}"
         );
         assert_ne!(appeared, missing);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_const_listed_directory_is_watched_by_its_membership_not_its_tree() {
+        // G21 (audit run 6's F23). `asset::read_dir` keys a directory on its
+        // IMMEDIATE NAMES, so the watcher must wake for a name appearing or
+        // vanishing there and for nothing else. Expanding it to the whole tree
+        // — the hook declaration's reading — woke rounds the const key provably
+        // did not move for: a listed file's CONTENT, and any file deeper in.
+        //
+        // The rounds were harmless (the leg re-keys the directory, finds it
+        // unchanged and skips), which is why this sat unnoticed; the defect is
+        // that the watcher read a declaration differently from the gate it woke.
+        let dir = env::temp_dir().join(format!("vilan-watch-listing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("icons/svg")).unwrap();
+        let listed = dir.join("icons/check.svg");
+        let nested = dir.join("icons/svg/deep.svg");
+        fs::write(&listed, "<svg/>\n").unwrap();
+        fs::write(&nested, "<svg/>\n").unwrap();
+        record_const_inputs(&[(dir.join("icons"), Some(1))]);
+        let roots = vec![dir.clone()];
+        // [`RECORDED_INPUT_PATHS`] is process-global and the tests around this
+        // one record into it in parallel, so a whole-map comparison would be
+        // reading their fixtures. Compare this fixture's own rows.
+        let mine = |roots: &[PathBuf]| -> BTreeMap<PathBuf, SystemTime> {
+            watch_snapshot(roots)
+                .into_iter()
+                .filter(|(path, _)| path.starts_with(&dir))
+                .collect()
+        };
+
+        let snapshot = mine(&roots);
+        assert!(
+            snapshot.contains_key(&dir.join("icons")),
+            "the listed directory is watched in its own right (N30): {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key(&listed),
+            "but a file it merely LISTED is not — the listing read its name, \
+             never its bytes: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains_key(&nested),
+            "and neither is a file the listing never named at all: {snapshot:?}"
+        );
+
+        // Editing a listed file's content moves no key the const gate holds.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&listed, "<svg viewBox=\"0 0 1 1\"/>\n").unwrap();
+        assert_eq!(
+            mine(&roots),
+            snapshot,
+            "an edit inside a listed directory is not a change to its listing"
+        );
+
+        // A name appearing IS, and it reaches the snapshot through the
+        // directory's own mtime — which is the same thing the listing key is a
+        // function of.
+        fs::write(dir.join("icons/x.svg"), "<svg/>\n").unwrap();
+        assert_ne!(
+            mine(&roots),
+            snapshot,
+            "a file appearing in the listed directory starts a round"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_path_recorded_under_both_readings_keeps_the_tree() {
+        // The overlap, ruled: a directory a hook DECLARES and the const channel
+        // also lists is read as a tree, because the tree is the superset and the
+        // safe direction here is the spurious round rather than the missed one —
+        // the hook's freshness gate really does depend on every byte inside.
+        let dir = env::temp_dir().join(format!("vilan-watch-both-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("shared")).unwrap();
+        let inside = dir.join("shared/a.txt");
+        fs::write(&inside, "one\n").unwrap();
+        record_const_inputs(&[(dir.join("shared"), Some(1))]);
+        record_watched_inputs([(dir.join("shared"), InputReading::Tree)]);
+
+        let snapshot = watch_snapshot(&[dir.clone()]);
+        assert!(
+            snapshot.contains_key(&inside),
+            "the tree reading wins whichever order the two recorders ran in: \
+             {snapshot:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

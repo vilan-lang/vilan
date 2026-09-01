@@ -53,6 +53,14 @@ of them has moved, and says `Fresh <name>` instead
 ([the dev loop](../guide/dev-loop.md#running-something-alongside-the-build)).
 A *dependency* that declares hooks gets a `note:` line and no execution.
 
+**A file named by path is a file of its package.** The nearest `vilan.toml`
+above it supplies its source root, dependencies, prelude and build options,
+exactly as addressing the directory would — so `vilan check src/main.vl`
+answers about that file what `vilan check .` answers. What it does *not* do is
+run the package's `[build]` hooks: naming one file asks for that file, not for
+the package's build pipeline. A file with no `vilan.toml` above it compiles on
+its own, with the default prelude and no dependencies.
+
 - `--stdout`: print the JavaScript instead of writing a file.
 - `--rerun-hooks`: run every `[[build.hook]]` even if it is fresh — the
   escape for a hook that reads something it did not declare. (`rm -rf
@@ -290,6 +298,15 @@ one of them byte-identical, in `--check` too. It prints one dim `note:` line
 per run saying how many it skipped and which root they were under; the exit
 code doesn't move, because skipping a product is the right answer rather than
 a degraded one.
+
+**Directory symlinks are walked**, because a link is ordinary project layout —
+`src/icons` pointing at a generator's output tree, `src/shared` at a sibling.
+Two limits, both about the walk and neither about the link: a directory already
+walked under another name is not walked again (so a cycle terminates and every
+file is reported once), and a link whose target resolves outside the project is
+not followed — `vilan fmt` prints one dim `note:` naming it, since that is where
+this command's scope ends. Format that tree where it lives. A `generated` root
+declared through a link is still the package's products, and is skipped as such.
 
 The exclusion holds however the file is reached, naming it on the command line
 included, and your editor's format-on-save honors it through the same rule.
