@@ -175,16 +175,16 @@ impl CompletionItem {
         let mut detail = completion.detail;
         let (mut insert, mut is_snippet) = (completion.label.clone(), false);
         let mut boost = 0;
-        if let Some(parameters) = &completion.call_parameters {
-            if let Some(call) = vilan_ide::call_insertion(
+        if let Some(parameters) = &completion.call_parameters
+            && let Some(call) = vilan_ide::call_insertion(
                 &completion.label,
                 parameters,
                 vilan_ide::CompletionFunctionCall::Full,
                 true,
-            ) {
-                insert = call.text;
-                is_snippet = call.is_snippet;
-            }
+            )
+        {
+            insert = call.text;
+            is_snippet = call.is_snippet;
         }
         if let Some(snippet) = completion.snippet {
             insert = snippet.body;

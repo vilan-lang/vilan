@@ -16,4 +16,9 @@
 # job and every local `cargo` run do.
 [toolchain]
 channel = "1.90.0"
-components = ["rustfmt"]
+# `clippy` is pinned for the same reason `rustfmt` is: clippy gains and widens
+# lints every six weeks, and the `clippy` job denies warnings, so a floating
+# channel would turn a tree nobody edited red on whatever Tuesday the new stable
+# ships. Pinned, a lint sweep is part of the deliberate bump commit — the same
+# bargain the formatter makes above.
+components = ["rustfmt", "clippy"]

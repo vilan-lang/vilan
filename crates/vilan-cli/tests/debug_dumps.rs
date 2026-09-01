@@ -8,7 +8,7 @@
 //! between them, because a dump that showed the same tree twice would be worth
 //! nothing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Writes a one-package project into a fresh temp directory and returns its
@@ -27,7 +27,7 @@ fn stage_project(tag: &str, entry: &str) -> PathBuf {
     source
 }
 
-fn build(project_source: &PathBuf, arguments: &[&str]) -> String {
+fn build(project_source: &Path, arguments: &[&str]) -> String {
     let project = project_source.parent().expect("project root");
     let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
     command

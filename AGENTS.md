@@ -84,6 +84,14 @@ Rust workspace, six crates, plus the language's own tree:
 5. **`cargo fmt` after every Rust change.** It may reformat neighboring code —
    expected and desired. 4-space indent in Rust; full variable names (`parameter`,
    never `p`).
+6. **`cargo clippy --workspace --all-targets -- -D warnings` before you call a Rust
+   change done** — the exact CI leg (backlog N21), and it denies rustc's warnings
+   too, so a helper you left behind is a failure rather than a log line. Exceptions
+   live in ONE place, the root `Cargo.toml`'s `[workspace.lints.clippy]`, each with
+   its reason; a per-site `#[allow]` carries a `reason = "…"`. Both this and
+   `cargo fmt` run under `rust-toolchain.toml`'s pin, which is what makes your
+   answer and CI's the same answer. A dependency change also owes
+   `cargo audit --deny unsound` (its own CI leg) alongside the notices gate.
 
 ## Invariants and scar tissue (each of these has bitten before)
 

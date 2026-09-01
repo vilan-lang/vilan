@@ -533,7 +533,7 @@ fn write_bytes_round_trips_a_binary_payload_byte_identically() {
     // The fixture really is one a text round trip would corrupt — otherwise
     // this test would pass over a `write_file` that decoded.
     assert_ne!(
-        String::from_utf8_lossy(&payload).as_bytes().len(),
+        String::from_utf8_lossy(&payload).len(),
         payload.len(),
         "the fixture must be a payload UTF-8 cannot survive, or it proves nothing"
     );

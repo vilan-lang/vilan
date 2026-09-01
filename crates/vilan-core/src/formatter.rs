@@ -1144,13 +1144,12 @@ pub fn sort_css_blocks<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
         // can reach here in a file that formatted.
         if matches!(tokens.get(index), Some(Token::Css))
             && matches!(tokens.get(index + 1), Some(Token::Ctrl('{')))
+            && let Some((body, past)) = sorted_css_body(&tokens, index + 1)
         {
-            if let Some((body, past)) = sorted_css_body(&tokens, index + 1) {
-                result.push(Token::Css);
-                result.extend(body);
-                index = past;
-                continue;
-            }
+            result.push(Token::Css);
+            result.extend(body);
+            index = past;
+            continue;
         }
         result.push(tokens[index].clone());
         index += 1;
@@ -1206,7 +1205,7 @@ fn prune_import_branch<'src>(
 ) -> Option<ImportBranch<'src>> {
     match branch {
         ImportBranch::Path(name, span, None) => {
-            keep(*span).then(|| ImportBranch::Path(name, *span, None))
+            keep(*span).then_some(ImportBranch::Path(name, *span, None))
         }
         ImportBranch::Path(name, span, Some(child)) => prune_import_branch(child, keep)
             .map(|pruned| ImportBranch::Path(name, *span, Some(Box::new(pruned)))),
@@ -2371,12 +2370,13 @@ impl<'src> Printer<'src> {
                 // `Option`), and a comment inside them, which is anchored to the
                 // set's split form. `emit_branch_tokens` mirrors this collapse so
                 // the safety net reduces both spellings to the same tokens.
-                if let [only] = order.as_slice() {
-                    if !inside_comment && !matches!(only, ImportBranch::Path("self", ..)) {
-                        self.split = split;
-                        self.print_import_branch(only, sort);
-                        return;
-                    }
+                if let [only] = order.as_slice()
+                    && !inside_comment
+                    && !matches!(only, ImportBranch::Path("self", ..))
+                {
+                    self.split = split;
+                    self.print_import_branch(only, sort);
+                    return;
                 }
                 if !order.is_empty() && (split != Split::Off || inside_comment) {
                     let open = self
@@ -3129,14 +3129,11 @@ impl<'src> Printer<'src> {
     ) -> (&'ast Spanned<Node<'src>>, Vec<&'ast Spanned<Node<'src>>>) {
         let mut spine = Vec::new();
         let mut subject = expr;
-        loop {
-            let inner = match &subject.0 {
-                Node::MemberAccessor(inner, _)
-                | Node::Index(inner, _)
-                | Node::TryAssert(inner)
-                | Node::Lifted(inner) => inner,
-                _ => break,
-            };
+        while let Node::MemberAccessor(inner, _)
+        | Node::Index(inner, _)
+        | Node::TryAssert(inner)
+        | Node::Lifted(inner) = &subject.0
+        {
             spine.push(subject);
             subject = inner;
         }
@@ -3856,10 +3853,10 @@ impl<'src> Printer<'src> {
         let (subject, spine) = Self::postfix_spine(expr);
         let mut spans = vec![subject.1];
         for step in spine {
-            if let Node::MemberAccessor(_, member) = &step.0 {
-                if matches!(member.0, Node::Call(_, _, _)) {
-                    spans.push(member.1);
-                }
+            if let Node::MemberAccessor(_, member) = &step.0
+                && matches!(member.0, Node::Call(_, _, _))
+            {
+                spans.push(member.1);
             }
         }
         spans

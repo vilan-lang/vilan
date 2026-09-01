@@ -9,3 +9,7 @@ indexmap = "2.14.0"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

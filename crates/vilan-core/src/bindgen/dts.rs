@@ -195,7 +195,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
         }
         if let Some(punctuation) = SINGLE_CHARACTER_PUNCTUATION
             .iter()
-            .find(|candidate| candidate.chars().next() == Some(character))
+            .find(|candidate| candidate.starts_with(character))
         {
             index += 1;
             tokens.push(Token {
@@ -1124,13 +1124,14 @@ impl<'source> Parser<'source> {
         self.eat_punctuation(":");
         let key_type = self.parse_type();
         self.eat_punctuation("]");
-        let value = self
-            .eat_punctuation(":")
-            .then(|| self.parse_type())
-            .unwrap_or(TsType::Reference {
+        let value = if self.eat_punctuation(":") {
+            self.parse_type()
+        } else {
+            TsType::Reference {
                 name: "any".to_string(),
                 arguments: Vec::new(),
-            });
+            }
+        };
         let end_token = self.position;
         self.skip_member_tail();
         let key = match &key_type {

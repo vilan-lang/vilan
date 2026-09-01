@@ -131,7 +131,7 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
         if !eager.insert(node) {
             continue;
         }
-        for next in expand(program, &graph, node, &held_out) {
+        for next in expand(program, graph, node, &held_out) {
             queue.push(next);
         }
     }
@@ -146,7 +146,7 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
                 if !reach.insert(node) {
                     continue;
                 }
-                for next in expand(program, &graph, node, &[]) {
+                for next in expand(program, graph, node, &[]) {
                     queue.push(next);
                 }
             }

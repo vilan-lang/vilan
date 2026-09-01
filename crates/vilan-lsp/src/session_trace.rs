@@ -105,16 +105,22 @@ impl RequestTally {
                  (request {count} of this method; slowest so far {max_ms} ms)"
             ));
         }
-        if self.total_requests % SUMMARY_EVERY_REQUESTS == 0 {
+        if self.total_requests.is_multiple_of(SUMMARY_EVERY_REQUESTS) {
             return TraceEvent::Summarize;
         }
         TraceEvent::Quiet
     }
 
+    // The two read-only views onto the tally, driven by this module's own pins.
+    // The server never reads either — it only ever `record`s and asks for a
+    // summary — so they are compiled with the tests that use them rather than
+    // carried dead in the shipped binary.
+    #[cfg(test)]
     pub fn total_requests(&self) -> u64 {
         self.total_requests
     }
 
+    #[cfg(test)]
     pub fn stat(&self, request: &str) -> Option<RequestStat> {
         self.methods.get(request).copied()
     }

@@ -110,10 +110,10 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
         }
         // Every implementation's override of this trait's member.
         for implementation in &program.implementations {
-            if implementation.trait_ids.contains(&trait_.id) {
-                if let Some(&member_id) = implementation.declarations.get(name) {
-                    candidates.push(member_id);
-                }
+            if implementation.trait_ids.contains(&trait_.id)
+                && let Some(&member_id) = implementation.declarations.get(name)
+            {
+                candidates.push(member_id);
             }
         }
     }

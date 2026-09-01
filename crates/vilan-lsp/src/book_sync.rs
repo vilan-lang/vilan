@@ -187,22 +187,22 @@ fn heading_plain_text(text: &str) -> String {
             }
             continue;
         }
-        if character == '<' {
-            if let Some(close) = chars[index..].iter().position(|c| *c == '>') {
-                index += close + 1;
-                continue;
-            }
+        if character == '<'
+            && let Some(close) = chars[index..].iter().position(|c| *c == '>')
+        {
+            index += close + 1;
+            continue;
         }
         if character == '[' || (character == '!' && chars.get(index + 1) == Some(&'[')) {
             let open = if character == '!' { index + 1 } else { index };
             if let Some(close) = chars[open..].iter().position(|c| *c == ']') {
                 let close = open + close;
-                if chars.get(close + 1) == Some(&'(') {
-                    if let Some(end) = chars[close + 1..].iter().position(|c| *c == ')') {
-                        plain.extend(&chars[open + 1..close]);
-                        index = close + 1 + end + 1;
-                        continue;
-                    }
+                if chars.get(close + 1) == Some(&'(')
+                    && let Some(end) = chars[close + 1..].iter().position(|c| *c == ')')
+                {
+                    plain.extend(&chars[open + 1..close]);
+                    index = close + 1 + end + 1;
+                    continue;
                 }
             }
         }

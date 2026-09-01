@@ -952,15 +952,14 @@ impl Manifest {
         // A workspace's default entry names a MEMBER package, whose name is
         // validated in that member's own manifest — all this one can check is
         // the shape (a name that isn't an identifier could never match).
-        if let Some(project) = &self.project {
-            if let Some(name) = &project.default_entry {
-                if !is_identifier(name) {
-                    errors.push(format!(
-                        "`[project] default-entry` must name a member package \
+        if let Some(project) = &self.project
+            && let Some(name) = &project.default_entry
+            && !is_identifier(name)
+        {
+            errors.push(format!(
+                "`[project] default-entry` must name a member package \
                          (got `{name}`)"
-                    ));
-                }
-            }
+            ));
         }
         // The `[project.dependencies]` table is the one members inherit FROM,
         // so it is the one table that cannot itself inherit.
@@ -987,12 +986,12 @@ impl Manifest {
             validate_dependencies(table, inheritable, dependencies, &mut errors);
         }
         if let Some(build) = &self.build {
-            if let Some(preset) = &build.preset {
-                if Preset::parse(preset).is_none() {
-                    errors.push(format!(
-                        "unknown build preset `{preset}` (expected `debug` or `release`)"
-                    ));
-                }
+            if let Some(preset) = &build.preset
+                && Preset::parse(preset).is_none()
+            {
+                errors.push(format!(
+                    "unknown build preset `{preset}` (expected `debug` or `release`)"
+                ));
             }
             // A blank hook would spawn a shell to do nothing, and fail
             // confusingly; a declaration that does nothing is what a manifest
@@ -1025,10 +1024,10 @@ impl Manifest {
                 }
             }
         }
-        if let Some(target) = &package.target {
-            if let Err(error) = Platform::parse(target) {
-                errors.push(format!("invalid `[package] target`: {error}"));
-            }
+        if let Some(target) = &package.target
+            && let Err(error) = Platform::parse(target)
+        {
+            errors.push(format!("invalid `[package] target`: {error}"));
         }
         if let Some(generated) = &package.generated {
             errors.extend(generated_root_problem(
@@ -1082,15 +1081,15 @@ impl Manifest {
                     .to_string(),
             );
         }
-        if let Some(package) = &self.package {
-            if package.entry.is_some() || package.target.is_some() || package.split.is_some() {
-                errors.push(
-                    "`[package] entry`/`target`/`split` can't be combined with \
+        if let Some(package) = &self.package
+            && (package.entry.is_some() || package.target.is_some() || package.split.is_some())
+        {
+            errors.push(
+                "`[package] entry`/`target`/`split` can't be combined with \
                      `[entry.<name>]` sections: with multiple entries, each \
                      declares its own `path`, `target` and `split`"
-                        .to_string(),
-                );
-            }
+                    .to_string(),
+            );
         }
         for (name, entry) in &self.entries {
             if !is_identifier(name) {
@@ -1609,15 +1608,14 @@ pub fn resolve_library(dir: &Path) -> PackageSpec {
     // not change the editor: the language server deliberately never REGISTERS a
     // `vilan.toml` overlay (a manifest edit is meant to take effect on save),
     // so the lookup misses and this falls through to disk exactly as before.
-    if let Ok(contents) = crate::util::read_source(dir.join("vilan.toml")) {
-        if let Ok((manifest, _)) = Manifest::parse(&contents) {
-            if let Some(library) = manifest.library {
-                // A library's OWN spec (std's, a contract check's) is never a
-                // workspace member — membership is a property of the entry's
-                // workspace, decided during `resolve_workspace` (E90).
-                return library_spec(dir, &library, Vec::new(), false);
-            }
-        }
+    if let Ok(contents) = crate::util::read_source(dir.join("vilan.toml"))
+        && let Ok((manifest, _)) = Manifest::parse(&contents)
+        && let Some(library) = manifest.library
+    {
+        // A library's OWN spec (std's, a contract check's) is never a
+        // workspace member — membership is a property of the entry's
+        // workspace, decided during `resolve_workspace` (E90).
+        return library_spec(dir, &library, Vec::new(), false);
     }
     PackageSpec {
         base_root: dir.to_path_buf(),
@@ -1640,15 +1638,15 @@ pub fn resolve_library(dir: &Path) -> PackageSpec {
 /// `std::rpc_server`, ...) silently fails to resolve — a wall of import
 /// errors instead of one fixable mistake.
 pub fn resolve_std(std_dir: &Path) -> PackageSpec {
-    if !std_dir.join("vilan.toml").exists() {
-        if let Some(parent) = std_dir.parent() {
-            let is_library = std::fs::read_to_string(parent.join("vilan.toml"))
-                .ok()
-                .and_then(|contents| Manifest::parse(&contents).ok())
-                .is_some_and(|(manifest, _)| manifest.library.is_some());
-            if is_library {
-                return resolve_library(parent);
-            }
+    if !std_dir.join("vilan.toml").exists()
+        && let Some(parent) = std_dir.parent()
+    {
+        let is_library = std::fs::read_to_string(parent.join("vilan.toml"))
+            .ok()
+            .and_then(|contents| Manifest::parse(&contents).ok())
+            .is_some_and(|(manifest, _)| manifest.library.is_some());
+        if is_library {
+            return resolve_library(parent);
         }
     }
     resolve_library(std_dir)
@@ -1788,7 +1786,7 @@ fn workspace_member_dirs(package_dir: &Path) -> Result<HashSet<PathBuf>, Workspa
         Some((project_dir, project)) => project
             .packages
             .iter()
-            .map(|member| crate::util::canonical_path(&project_dir.join(member)))
+            .map(|member| crate::util::canonical_path(project_dir.join(member)))
             .collect(),
         None => HashSet::new(),
     })
@@ -2543,7 +2541,7 @@ mod tests {
     fn serves(spec: &PackageSpec, pattern: PlatformPattern) -> bool {
         spec.layers
             .iter()
-            .any(|layer| layer.patterns.iter().any(|p| *p == pattern))
+            .any(|layer| layer.patterns.contains(&pattern))
     }
 
     #[test]

@@ -206,6 +206,67 @@ jobs:
       - name: The tree is formatted
         run: cargo fmt --all --check
 
+  # The second of backlog N21's three legs, and the `fmt` job's twin in every way
+  # that matters. `--all-targets` so the tests, the build script and the benches are
+  # held to the same bar as the library; `-D warnings` so a finding is a failure
+  # rather than a line in a log nobody reads — which is what the rustc warnings
+  # this leg also inherits (`dead_code` and friends) had been for releases.
+  #
+  # NO `RUSTUP_TOOLCHAIN`, deliberately, exactly as `fmt` carries none: this
+  # resolves through `rust-toolchain.toml`, which pins `clippy` alongside
+  # `rustfmt` for the same reason — the lint set moves every six weeks, and an
+  # unpinned gate that denies warnings would go red for a tree nobody edited. The
+  # exceptions the tree does claim are collected in one place, the root
+  # `Cargo.toml`'s `[workspace.lints.clippy]`, each with its reason; the handful
+  # that are per-site judgments carry their reason at the site.
+  #
+  # ubuntu only: the lints are platform-independent, and the `cfg`-gated windows
+  # code they cannot see from here is covered by the windows `test` leg
+  # compiling it.
+  clippy:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The tree is clippy-clean
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # N21's last leg: the dependency tree against the RustSec advisory
+  # database. The one leg here whose answer is not a property of the tree alone —
+  # an advisory published against an unchanged `Cargo.lock` turns this red for a
+  # commit nobody wrote. That is the OPPOSITE of the `fmt`/`clippy` pin argument
+  # and it is why it is wired anyway: a rustfmt default moving is a false alarm,
+  # while a vulnerability landing in a dependency of a shipped compiler is a TRUE
+  # finding that happens to arrive on someone else's schedule. It feeds `check`
+  # like every other leg, so it stops the line, which is the point.
+  #
+  # Strictness, chosen rather than inherited: a vulnerability fails (cargo-audit's
+  # default) and so does an `unsound` advisory, because a memory-safety defect in
+  # a crate this compiler links is the same class of problem whatever RustSec
+  # calls the row. `unmaintained` and `yanked` stay WARNINGS — they are printed
+  # and read, but neither is a defect, and an upstream maintainer stepping away
+  # must not block a PR that changed a comment. `--deny warnings` would do that.
+  #
+  # `RUSTUP_TOOLCHAIN: stable` for the reason the suite legs declare it, arrived
+  # at from the other side: the verdict is a property of `Cargo.lock` and the
+  # advisory database, not of a compiler, so there is no reason to make this job
+  # fetch the formatter's pinned toolchain to shell out to a standalone binary.
+  audit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The same installer the suite legs use for nextest, same pin.
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-audit
+      - name: No advisory against the dependency tree
+        run: cargo audit --deny unsound
+
   # **This is the job to make a required status check** (process.md §2.5, where
   # it is called `ci`; the context reads `ci / check`). Everything above it can
   # legitimately not run; this cannot, which is the entire point — a required
@@ -220,12 +281,12 @@ jobs:
   #   cancelled-> FAIL    the result is unknown, and unknown is not green
   #
   # So a docs-only or root-prose-only push takes the cheap path — `changes`
-  # runs, `test`, `wasm` and `fmt` skip, `check` is green — and any red leg
-  # turns `check` red. `changes` is in `needs` on purpose: if the filter
-  # itself fails, the expensive legs skip, and without this the aggregate
-  # would call that a pass.
+  # runs, `test`, `wasm`, `fmt`, `clippy` and `audit` skip, `check` is green —
+  # and any red leg turns `check` red. `changes` is in `needs` on purpose: if
+  # the filter itself fails, the expensive legs skip, and without this the
+  # aggregate would call that a pass.
   check:
-    needs: [changes, test, wasm, fmt]
+    needs: [changes, test, wasm, fmt, clippy, audit]
     if: always()
     runs-on: ubuntu-latest
     steps:

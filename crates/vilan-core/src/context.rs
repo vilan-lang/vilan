@@ -466,9 +466,10 @@ fn analyze(
         return if errors.is_empty() {
             // No reads, no runs — but `Context::new()` calls still lower to
             // their opaque value (previously they emitted a dangling call).
-            let mut plan = Plan::default();
-            plan.news = news;
-            Ok(plan)
+            Ok(Plan {
+                news,
+                ..Default::default()
+            })
         } else {
             Err(errors)
         };
@@ -491,14 +492,16 @@ fn analyze(
         }
     }
 
-    let mut plan = Plan::default();
-    plan.contexts = {
-        let mut sorted: Vec<Id> = contexts.iter().copied().collect();
-        sorted.sort_by_key(|id| id.0);
-        sorted
+    let mut plan = Plan {
+        contexts: {
+            let mut sorted: Vec<Id> = contexts.iter().copied().collect();
+            sorted.sort_by_key(|id| id.0);
+            sorted
+        },
+        news,
+        runs,
+        ..Default::default()
     };
-    plan.news = news;
-    plan.runs = runs;
 
     // --- Dispatch edges the shared graph deliberately leaves indirect
     // (backlog B14): a call the analyzer routed through trait dispatch — a
@@ -833,14 +836,13 @@ fn analyze(
                     continue;
                 };
                 if let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id)
+                    && let Some(clause) = value_contexts.get(target)
                 {
-                    if let Some(clause) = value_contexts.get(target) {
-                        for &context in clause {
-                            injected_calls
-                                .entry(context)
-                                .or_default()
-                                .push((*node, call.call_id));
-                        }
+                    for &context in clause {
+                        injected_calls
+                            .entry(context)
+                            .or_default()
+                            .push((*node, call.call_id));
                     }
                 }
             }
@@ -926,12 +928,11 @@ fn analyze(
                     worklist.push(*caller);
                 }
             }
-            if !own_param_closure(id) {
-                if let Some(parent) = graph.closure_parent_of(id) {
-                    if needs.insert(parent) {
-                        worklist.push(parent);
-                    }
-                }
+            if !own_param_closure(id)
+                && let Some(parent) = graph.closure_parent_of(id)
+                && needs.insert(parent)
+            {
+                worklist.push(parent);
             }
         }
 
@@ -968,12 +969,11 @@ fn analyze(
                         strict_worklist.push(*caller);
                     }
                 }
-                if !own_param_closure(id) {
-                    if let Some(parent) = graph.closure_parent_of(id) {
-                        if strict.insert(parent) {
-                            strict_worklist.push(parent);
-                        }
-                    }
+                if !own_param_closure(id)
+                    && let Some(parent) = graph.closure_parent_of(id)
+                    && strict.insert(parent)
+                {
+                    strict_worklist.push(parent);
                 }
             }
             // A dispatch site whose needy candidates MIX flavors would need
@@ -1139,10 +1139,10 @@ fn analyze(
                 }
                 // The capture hop: an unbound closure's uncovered-ness came
                 // through its defining scope.
-                if let Some(parent) = graph.closure_parent_of(node) {
-                    if !bound.contains(&parent) {
-                        walk.push(parent);
-                    }
+                if let Some(parent) = graph.closure_parent_of(node)
+                    && !bound.contains(&parent)
+                {
+                    walk.push(parent);
                 }
             }
             // One dispatch site reaches the walk once per visited candidate;
@@ -1214,10 +1214,10 @@ fn analyze(
                         });
                     }
                 }
-                if let Some(parent) = graph.closure_parent_of(node) {
-                    if !bound.contains(&parent) {
-                        frontier.push_back((parent, depth));
-                    }
+                if let Some(parent) = graph.closure_parent_of(node)
+                    && !bound.contains(&parent)
+                {
+                    frontier.push_back((parent, depth));
                 }
             }
             hops
@@ -1378,22 +1378,23 @@ fn analyze(
             .map(|call| call.subject_id)
             .collect();
         for (&entity_id, expr) in &program.entity_map {
-            if let Expr::Local(target) = expr {
-                if needs_functions.contains(target) && !call_subjects.contains(&entity_id) {
-                    errors.push(anchored(
-                        program,
-                        entity_id,
-                        format!(
-                            "`{}` reads context `{}`, so it can't be used as a value",
-                            program
-                                .functions
-                                .get(target)
-                                .map(|function| function.name)
-                                .unwrap_or("function"),
-                            context_name(program, context)
-                        ),
-                    ));
-                }
+            if let Expr::Local(target) = expr
+                && needs_functions.contains(target)
+                && !call_subjects.contains(&entity_id)
+            {
+                errors.push(anchored(
+                    program,
+                    entity_id,
+                    format!(
+                        "`{}` reads context `{}`, so it can't be used as a value",
+                        program
+                            .functions
+                            .get(target)
+                            .map(|function| function.name)
+                            .unwrap_or("function"),
+                        context_name(program, context)
+                    ),
+                ));
             }
         }
 
@@ -1413,10 +1414,10 @@ fn analyze(
         // no hidden parameter), and any closure whose provider chain roots at
         // it — their safe reads and threads become literal `None`s.
         let mut none_rooted: HashSet<Id> = HashSet::default();
-        if let Some(main) = entry_main {
-            if needs.contains(&main) {
-                none_rooted.insert(main);
-            }
+        if let Some(main) = entry_main
+            && needs.contains(&main)
+        {
+            none_rooted.insert(main);
         }
         for &id in &needs {
             if entry_main == Some(id) {
@@ -1510,28 +1511,28 @@ fn analyze(
                 continue;
             };
             for call in graph.calls_of(node_id) {
-                if let CallTarget::Function(callee) = call.target {
-                    if needs.contains(&callee) {
-                        if none_rooted.contains(&node_id) {
-                            // No value here: safe callees get `None` (a
-                            // strict callee under a None root already
-                            // fenced).
-                            if !strict.contains(&callee) {
-                                plan.thread_calls.push((
-                                    call.call_id,
-                                    context,
-                                    ThreadForm::NoneLiteral,
-                                ));
-                            }
-                            continue;
+                if let CallTarget::Function(callee) = call.target
+                    && needs.contains(&callee)
+                {
+                    if none_rooted.contains(&node_id) {
+                        // No value here: safe callees get `None` (a
+                        // strict callee under a None root already
+                        // fenced).
+                        if !strict.contains(&callee) {
+                            plan.thread_calls.push((
+                                call.call_id,
+                                context,
+                                ThreadForm::NoneLiteral,
+                            ));
                         }
-                        let form = if !strict.contains(&callee) && holds_bare(node_id) {
-                            ThreadForm::WrapSome { owner }
-                        } else {
-                            ThreadForm::Param { owner }
-                        };
-                        plan.thread_calls.push((call.call_id, context, form));
+                        continue;
                     }
+                    let form = if !strict.contains(&callee) && holds_bare(node_id) {
+                        ThreadForm::WrapSome { owner }
+                    } else {
+                        ThreadForm::Param { owner }
+                    };
+                    plan.thread_calls.push((call.call_id, context, form));
                 }
             }
         }

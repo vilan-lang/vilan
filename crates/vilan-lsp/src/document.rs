@@ -781,35 +781,17 @@ fn find_linked_tags(
     out: &mut Option<(Span, Span)>,
 ) {
     use vilan_core::node::Node;
-    if let Node::Element(body) = &node.0 {
-        if let Some(close) = body.close_tag {
-            let open = body.tag;
-            let touches = |span: Span| span.start <= offset && offset <= span.end;
-            if touches(open) || touches(close) {
-                *out = Some((open, close));
-            }
+    if let Node::Element(body) = &node.0
+        && let Some(close) = body.close_tag
+    {
+        let open = body.tag;
+        let touches = |span: Span| span.start <= offset && offset <= span.end;
+        if touches(open) || touches(close) {
+            *out = Some((open, close));
         }
     }
     node.0
         .for_each_child(&mut |child| find_linked_tags(child, offset, out));
-}
-
-/// Whether an expression is a value-position use of the definition `def_id` — the
-/// forms the entity map records for a resolved name (a call subject, a bare value,
-/// an enum variant). Used by the Organize Imports prune to keep a value-used
-/// import. An enum-variant expression carries its enum's Id.
-fn expr_references_definition(expr: &Expr, def_id: Id) -> bool {
-    match expr {
-        Expr::Local(id)
-        | Expr::Function(id)
-        | Expr::ExternalFunction(id)
-        | Expr::Struct(id)
-        | Expr::Enum(id)
-        | Expr::Trait(id)
-        | Expr::Module(id)
-        | Expr::EnumVariant(id, _) => *id == def_id,
-        _ => false,
-    }
 }
 
 impl Document {
@@ -1474,10 +1456,10 @@ impl Document {
         let program = self.program.as_ref()?;
         // A type name in type position: the full declaration when known.
         if let Some((definition, label)) = self.type_reference_at(program, offset) {
-            if let Some(definition) = definition {
-                if let Some(declaration) = program.declaration_labels.get(&definition) {
-                    return Some(self.compose_hover(program, definition, declaration, None));
-                }
+            if let Some(definition) = definition
+                && let Some(declaration) = program.declaration_labels.get(&definition)
+            {
+                return Some(self.compose_hover(program, definition, declaration, None));
             }
             return Some(label);
         }
@@ -1496,10 +1478,10 @@ impl Document {
             }
         }
         // A struct/enum name in value position (a constructor, a variant).
-        if let Some(definition) = self.type_declaration_target(program, id) {
-            if let Some(declaration) = program.declaration_labels.get(&definition) {
-                return Some(self.compose_hover(program, definition, declaration, None));
-            }
+        if let Some(definition) = self.type_declaration_target(program, id)
+            && let Some(declaration) = program.declaration_labels.get(&definition)
+        {
+            return Some(self.compose_hover(program, definition, declaration, None));
         }
         // A variable (`let`/`mut`, local or module-level, or a destructured
         // binder) or a parameter: its typed declaration; a member read: the
@@ -2118,6 +2100,12 @@ impl Document {
     /// from, so resolution and enumeration cannot disagree — a symbol kind the
     /// index can find is necessarily one it can also enumerate. An empty result
     /// means the cursor is not on an identifier, and nothing else.
+    ///
+    /// The single-document face, driven by this crate's pins: the server always
+    /// answers through [`Self::references_across`] (kolt.local 034's
+    /// cross-document union), so this is compiled with the tests rather than
+    /// carried dead in the shipped binary.
+    #[cfg(test)]
     pub fn references(&self, offset: usize) -> Vec<(SourceId, Span)> {
         let Some((definition, _)) = self.reference_target(offset) else {
             return Vec::new();
@@ -2247,6 +2235,11 @@ impl Document {
     /// layer adds only what rename needs beyond finding: that the new name is
     /// spellable, that every reference sits in a file this project may edit, and
     /// that none are known to be missing.
+    ///
+    /// The single-document face, driven by this crate's pins, exactly as
+    /// [`Self::references`] is: the server renames through
+    /// [`Self::rename_edits_across`].
+    #[cfg(test)]
     pub fn rename_edits(
         &self,
         offset: usize,
@@ -2519,34 +2512,22 @@ impl Document {
         if matches!(
             crate::references::kind_of(program, definition),
             Some(crate::references::DefinitionKind::Module)
-        ) {
-            if let Some(home) = program.source_of(definition_id) {
-                // A module whose file is this one brings nothing new, and would
-                // otherwise match every local declaration and never prune.
-                if home != entry {
-                    return self
-                        .reference_index
-                        .occurrences_in(entry)
-                        .any(|occurrence| {
-                            !written_in_an_import(occurrence.span)
-                                && crate::references::declaration_source(
-                                    program,
-                                    occurrence.definition,
-                                ) == Some(home)
-                        });
-                }
+        ) && let Some(home) = program.source_of(definition_id)
+        {
+            // A module whose file is this one brings nothing new, and would
+            // otherwise match every local declaration and never prune.
+            if home != entry {
+                return self
+                    .reference_index
+                    .occurrences_in(entry)
+                    .any(|occurrence| {
+                        !written_in_an_import(occurrence.span)
+                            && crate::references::declaration_source(program, occurrence.definition)
+                                == Some(home)
+                    });
             }
         }
         false
-    }
-
-    /// Whether a use site belongs to the entry file or to code generated from it
-    /// (a derive expansion) — the two sources whose references keep an import.
-    fn use_in_entry_or_generated(&self, program: &Program, use_id: Id) -> bool {
-        matches!(
-            program.source_of(use_id),
-            Some(SourceId(0)) | Some(DERIVED_SOURCE)
-        )
     }
 
     // --- Quickfixes: add-import, closest-name field rename (E54, E58) ------
@@ -2583,13 +2564,12 @@ impl Document {
             let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
                 continue;
             };
-            if let Some(surface_path) = &surface {
-                if vilan_core::analyzer::module_importables(surface_path)
+            if let Some(surface_path) = &surface
+                && vilan_core::analyzer::module_importables(surface_path)
                     .iter()
                     .any(|importable| importable.name == name)
-                {
-                    candidates.push(vec![origin.clone()]);
-                }
+            {
+                candidates.push(vec![origin.clone()]);
             }
             let mut seen_modules: HashSet<String> = HashSet::new();
             for root in &module_roots {
@@ -2811,10 +2791,10 @@ impl Document {
             {
                 continue;
             }
-            if let Some(name) = unresolved_name(&diagnostic.msg) {
-                if !names.contains(&name) {
-                    names.push(name);
-                }
+            if let Some(name) = unresolved_name(&diagnostic.msg)
+                && !names.contains(&name)
+            {
+                names.push(name);
             }
         }
         let mut working = self.text.clone();
@@ -2946,10 +2926,10 @@ pub struct QuickFix {
 /// closest-name primitive applies here too).
 fn unresolved_name(message: &str) -> Option<&str> {
     for prefix in ["cannot find '", "cannot find type '"] {
-        if let Some(rest) = message.strip_prefix(prefix) {
-            if let Some(end) = rest.find('\'') {
-                return Some(&rest[..end]);
-            }
+        if let Some(rest) = message.strip_prefix(prefix)
+            && let Some(end) = rest.find('\'')
+        {
+            return Some(&rest[..end]);
         }
     }
     None
@@ -6282,7 +6262,7 @@ pub(crate) mod tests {
             program.entity_map.get(binding)
         );
         assert!(
-            program.expr_types.get(binding).is_none(),
+            !program.expr_types.contains_key(binding),
             "and carry no type"
         );
         // The pin is the RETURN: this call used to recurse to a stack
@@ -6367,7 +6347,7 @@ pub(crate) mod tests {
         let offset = text.rfind("width").unwrap() + 1;
         let id = document.entity_at(offset).expect("the use entity");
         assert!(
-            program.expr_types.get(&id).is_none(),
+            !program.expr_types.contains_key(&id),
             "the use must carry no type of its own, or this pins nothing"
         );
         assert_eq!(
@@ -10031,7 +10011,7 @@ pub(crate) mod tests {
         replaced.apply_change(Some(range_at(1, 5, 8)), "x");
         let inside = replaced.live_offset(20).expect("mappable");
         assert!(
-            inside >= 18 && inside <= 19,
+            (18..=19).contains(&inside),
             "clamped into the replacement, got {inside}"
         );
         // A broken map answers None; adoption restores identity.
@@ -11991,7 +11971,7 @@ mod perf_baseline {
 
     /// The same `PERF {…}` line shape the CLI harness emits, so a run's rows
     /// from both binaries concatenate into one diffable summary.
-    fn report(corpus: &str, note: &str, samples: &mut Vec<Duration>) {
+    fn report(corpus: &str, note: &str, samples: &mut [Duration]) {
         samples.sort_unstable();
         let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
         println!(

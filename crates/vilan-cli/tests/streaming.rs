@@ -89,7 +89,7 @@ fn a_streaming_response_delivers_chunks_until_close() {
     write(
         &dir,
         "src/main.vl",
-        &r#"import std::io::print;
+        r#"import std::io::print;
 import std::process::exit;
 import std::time::sleep;
 import std::http::{ Server, Response };

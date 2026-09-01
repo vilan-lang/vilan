@@ -331,9 +331,7 @@ pub fn bind_subject(
 /// recovered from the receiver — shallow by construction, since a trait
 /// argument is either a binder or a type built from them.
 fn ground(program: &Program, type_id: TypeId, bindings: &HashMap<TypeId, TypeId>) -> Option<Type> {
-    let Some(_guard) = crate::util::RecursionGuard::enter() else {
-        return None;
-    };
+    let _guard = crate::util::RecursionGuard::enter()?;
     match program.type_id_to_type_map.get(&type_id)? {
         Type::Generic(constraint_id) => match bindings.get(constraint_id) {
             Some(bound) => program.type_id_to_type_map.get(bound).cloned(),

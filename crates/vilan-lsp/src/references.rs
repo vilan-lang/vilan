@@ -205,6 +205,7 @@ fn narrow(span: Span, name: &str, anchor: Anchor) -> Option<Span> {
 }
 
 /// The reference index for one analyzed program.
+#[derive(Default)]
 pub struct ReferenceIndex {
     /// Every identifier occurrence, deduplicated and sorted by `(source, span)`
     /// so a positional lookup is a binary search and a rename's edit set comes
@@ -216,16 +217,6 @@ pub struct ReferenceIndex {
     /// onto an identifier, per definition. A rename over a definition with a
     /// non-zero tally cannot produce a complete edit set and must refuse.
     dropped: HashMap<Definition, usize>,
-}
-
-impl Default for ReferenceIndex {
-    fn default() -> Self {
-        ReferenceIndex {
-            occurrences: Vec::new(),
-            by_definition: HashMap::new(),
-            dropped: HashMap::new(),
-        }
-    }
 }
 
 impl ReferenceIndex {

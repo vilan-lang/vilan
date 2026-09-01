@@ -987,10 +987,11 @@ impl<'a, 'src> Parser<'a, 'src> {
                 expected: vec![expected.to_string()],
                 context: self.context_stack.clone(),
             });
-        } else if let Some(failure) = &mut self.farthest_failure {
-            if position == failure.position && !failure.expected.iter().any(|e| e == expected) {
-                failure.expected.push(expected.to_string());
-            }
+        } else if let Some(failure) = &mut self.farthest_failure
+            && position == failure.position
+            && !failure.expected.iter().any(|e| e == expected)
+        {
+            failure.expected.push(expected.to_string());
         }
     }
 
@@ -1704,15 +1705,30 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// loop can stop and a trailing block value can be taken instead.
     ///
     /// The chumsky order (parser.rs `statement.define`):
-    /// 1. `[derive(..)] struct|enum`, 2. `[service(..)] struct`,
-    /// 3. `[<user>(..)] struct|enum|fun`, 4. `macro fun`, 5. `macro { } ;?`,
-    /// 6. `macro name(..) ;?`, 7. `export <stmt>`, 8. `expression ;`,
-    /// 9-11. `if`/`for`/`match` without `;` (not-block-end), 12. `fun`,
-    /// 13. `struct`, 14. `enum`, 15. misplaced-`resource` steer, 16. `impl`,
-    /// 17. `trait`, 18. `mod`, 19. `import ;`, 20. `use ;`, 21. `{ } block`
-    /// without `;` (not-block-end). Items 8-11 and 21 are fused into one
-    /// expression attempt (an expression carries the block-bearing forms and the
-    /// bare block already), exactly as S2 did.
+    ///
+    /// 1. `[derive(..)] struct|enum`
+    /// 2. `[service(..)] struct`
+    /// 3. `[<user>(..)] struct|enum|fun`
+    /// 4. `macro fun`
+    /// 5. `macro { } ;?`
+    /// 6. `macro name(..) ;?`
+    /// 7. `export <stmt>`
+    /// 8. `expression ;`
+    /// 9. through 11: `if` / `for` / `match` without `;` (not-block-end)
+    /// 12. `fun`
+    /// 13. `struct`
+    /// 14. `enum`
+    /// 15. misplaced-`resource` steer
+    /// 16. `impl`
+    /// 17. `trait`
+    /// 18. `mod`
+    /// 19. `import ;`
+    /// 20. `use ;`
+    /// 21. `{ } block` without `;` (not-block-end)
+    ///
+    /// Items 8-11 and 21 are fused into one expression attempt (an expression
+    /// carries the block-bearing forms and the bare block already), exactly as
+    /// S2 did.
     fn parse_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         // Item nesting is its own recursive grammar and reaches no expression
         // rule (B142): `fun a() { fun a() { .. } }`, `mod`, `impl`, `trait` and
@@ -2407,7 +2423,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// case). Returns `None` when no member follows (the recovery site).
     fn parse_member_call(&mut self) -> Option<Spanned<Node<'src>>> {
         if let Some(Token::Number(whole, fraction, suffix)) = self.peek() {
-            let node = Node::Number(*whole, *fraction, *suffix);
+            let node = Node::Number(whole, *fraction, *suffix);
             let span = self.here_span();
             self.bump();
             return Some((node, span));
@@ -2669,15 +2685,15 @@ impl<'a, 'src> Parser<'a, 'src> {
                 return Some((Node::Error, span));
             }
         }
-        if self.peek_is_ctrl('[') {
-            if let Some(list) = self.parse_bracket_atom() {
-                return Some(list);
-            }
+        if self.peek_is_ctrl('[')
+            && let Some(list) = self.parse_bracket_atom()
+        {
+            return Some(list);
         }
-        if self.peek_is_ctrl('(') {
-            if let Some(paren) = self.parse_paren_atom() {
-                return Some(paren);
-            }
+        if self.peek_is_ctrl('(')
+            && let Some(paren) = self.parse_paren_atom()
+        {
+            return Some(paren);
         }
         // Recovery: the two chained `recover_with` on the chumsky `atom` choice — a
         // balanced-but-garbled `(...)` (site 4) / `[...]` (site 5) recovers to a
@@ -2703,7 +2719,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let node = match self.peek()? {
             Token::Null => Node::Null,
             Token::Bool(value) => Node::Bool(*value),
-            Token::Number(whole, fraction, suffix) => Node::Number(*whole, *fraction, *suffix),
+            Token::Number(whole, fraction, suffix) => Node::Number(whole, *fraction, *suffix),
             Token::String(text) => Node::String(text),
             Token::MultilineString(text) => Node::MultilineString(text),
             Token::Ident("void") => Node::Void,
@@ -3904,7 +3920,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             Some(Token::String(text)) => Some(Node::String(text)),
             Some(Token::MultilineString(text)) => Some(Node::MultilineString(text)),
             Some(Token::Number(whole, fraction, suffix)) => {
-                Some(Node::Number(*whole, *fraction, *suffix))
+                Some(Node::Number(whole, *fraction, *suffix))
             }
             _ => None,
         };
@@ -3989,10 +4005,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// local (`List<T>`), a plain local, a mapped tuple type (`(U in T: F<U>)`), or a
     /// tuple type. Tried in the chumsky order.
     fn parse_type_atom(&mut self) -> Option<Spanned<Node<'src>>> {
-        if self.peek_is_ctrl('[') {
-            if let Some(array) = self.parse_array_type() {
-                return Some(array);
-            }
+        if self.peek_is_ctrl('[')
+            && let Some(array) = self.parse_array_type()
+        {
+            return Some(array);
         }
         if self.peek_is_op("&") {
             return self.parse_reference_type();
@@ -4041,7 +4057,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// An array-type length: an integer (numeric) literal.
     fn parse_array_length(&mut self) -> Option<Spanned<Node<'src>>> {
         if let Some(Token::Number(whole, fraction, suffix)) = self.peek() {
-            let node = Node::Number(*whole, *fraction, *suffix);
+            let node = Node::Number(whole, *fraction, *suffix);
             let span = self.here_span();
             self.bump();
             Some((node, span))

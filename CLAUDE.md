@@ -27,6 +27,7 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
 - Use 4 spaces for indentation.
 - Use full variable names like `parameter` over abbreviations like `p`.
 - Run `cargo fmt` after every change. It may reformat pre-existing code that was not part of the change — that is expected and desired.
+- Run `cargo clippy --workspace --all-targets -- -D warnings` before calling a Rust change done. That is the exact CI leg, and it denies rustc's warnings too (`dead_code` and friends), so a leftover helper is a failure rather than a line in a log. Its exception list is the root `Cargo.toml`'s `[workspace.lints.clippy]` — one place, one reason per entry; a per-site `#[allow]` needs its own `reason = "…"` beside it. Both this and `cargo fmt` resolve through `rust-toolchain.toml`'s pinned toolchain, which is what makes the local answer and CI's the same answer.
 - Clean up surrounding code when it's reasonable to do so (rename unclear identifiers, remove dead code, simplify logic, etc.).
 
 ## Testing
@@ -64,7 +65,9 @@ equivalent.
   the suite costs minutes:
   - added or bumped a dependency → `cargo test -p vilan-cli --test third_party_notices`
     (the lockfile must stay covered by `THIRD-PARTY-NOTICES.txt`; regenerate with
-    `cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt`)
+    `cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt`), and
+    `cargo audit --deny unsound` (the CI leg: a vulnerability or an unsound
+    advisory fails, `unmaintained` and `yanked` are printed and read)
   - touched the transformer / codegen → `cargo test -p vilan-cli --test corpus`
   - touched the analyzer / type solver → `cargo test -p vilan-core --test inference`
   - touched std, a framework, or the language → `cargo test -p vilan-core --test docs`

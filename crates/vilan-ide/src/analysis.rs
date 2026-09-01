@@ -242,13 +242,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
     fn source_text(&self, source: SourceId) -> Option<Ref<'_, str>> {
         {
             let mut texts = self.source_texts.borrow_mut();
-            if !texts.contains_key(&source) {
-                let text = self
-                    .program
+            texts.entry(source).or_insert_with(|| {
+                self.program
                     .source_path(source)
-                    .and_then(|path| vilan_core::util::read_source(path).ok());
-                texts.insert(source, text);
-            }
+                    .and_then(|path| vilan_core::util::read_source(path).ok())
+            });
         }
         Ref::filter_map(self.source_texts.borrow(), |texts| {
             texts.get(&source).and_then(|text| text.as_deref())

@@ -329,29 +329,29 @@ impl<'a, 'src> Traversal<'a, 'src> {
             self.reached_bindings.insert(node);
         }
 
-        if let Some(platform) = self.platform {
-            if let Some(requirement) = requirement_of(self.program, node) {
-                let admitted = requirement
-                    .patterns
-                    .iter()
-                    .any(|pattern| platform.matches(*pattern).is_some());
-                if !admitted {
-                    // Report the BOUNDARY — the first off-platform function
-                    // reached from admissible code — and do not descend:
-                    // everything beneath it lives in the same layer, and one
-                    // chain tells the story.
-                    let error = violation(
-                        self.program,
-                        platform,
-                        &self.trail,
-                        node,
-                        requirement,
-                        &self.origin,
-                    );
-                    self.diagnostics.push(error);
-                    self.trail.pop();
-                    return;
-                }
+        if let Some(platform) = self.platform
+            && let Some(requirement) = requirement_of(self.program, node)
+        {
+            let admitted = requirement
+                .patterns
+                .iter()
+                .any(|pattern| platform.matches(*pattern).is_some());
+            if !admitted {
+                // Report the BOUNDARY — the first off-platform function
+                // reached from admissible code — and do not descend:
+                // everything beneath it lives in the same layer, and one
+                // chain tells the story.
+                let error = violation(
+                    self.program,
+                    platform,
+                    &self.trail,
+                    node,
+                    requirement,
+                    &self.origin,
+                );
+                self.diagnostics.push(error);
+                self.trail.pop();
+                return;
             }
         }
 
@@ -405,6 +405,10 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
         // Creating a closure charges its body (v1 creator rule); a closure
         // inherits its creator's bindings — its body uses the enclosing `T`s.
+        // The copy is load-bearing, not a convenience: `closure_children_of`
+        // hands back a slice borrowed from `self.graph`, and `walk` takes
+        // `&mut self` — iterating the borrow directly does not compile.
+        #[allow(clippy::unnecessary_to_owned, reason = "ends the graph borrow")]
         if let Some(children) = self.graph.closure_children_of(node) {
             for closure in children.to_vec() {
                 self.walk(closure, &substitution.clone(), None);
@@ -459,22 +463,18 @@ impl<'a, 'src> Traversal<'a, 'src> {
         callee: Id,
         incoming: &SubstitutionContext,
     ) -> SubstitutionContext {
-        if let Some(function) = self.program.functions.get(&callee) {
-            if !function.generic_parameter_constraint_ids.is_empty() {
-                if let Some(function_call) = self.program.function_calls.get(&call_id) {
-                    if !function_call.generic_argument_ids.is_empty() {
-                        return function
-                            .generic_parameter_constraint_ids
-                            .iter()
-                            .copied()
-                            .zip(function_call.generic_argument_ids.iter().copied())
-                            .map(|(constraint, bound)| {
-                                (constraint, self.resolve_type_id(bound, incoming))
-                            })
-                            .collect();
-                    }
-                }
-            }
+        if let Some(function) = self.program.functions.get(&callee)
+            && !function.generic_parameter_constraint_ids.is_empty()
+            && let Some(function_call) = self.program.function_calls.get(&call_id)
+            && !function_call.generic_argument_ids.is_empty()
+        {
+            return function
+                .generic_parameter_constraint_ids
+                .iter()
+                .copied()
+                .zip(function_call.generic_argument_ids.iter().copied())
+                .map(|(constraint, bound)| (constraint, self.resolve_type_id(bound, incoming)))
+                .collect();
         }
         if let Some(recorded) = self.program.method_call_substitution.get(&call_id) {
             return recorded

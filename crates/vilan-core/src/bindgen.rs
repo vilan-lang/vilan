@@ -573,13 +573,13 @@ impl<'options> Emitter<'options> {
             if let Some(name) = declaration_name(declaration) {
                 by_name.entry(name).or_default().push(index);
             }
-            if let Declaration::Variable(variable) = declaration {
-                if let Some(subject) = self.constructor_global_subjects.get(&variable.name) {
-                    constructors_of
-                        .entry(subject.as_str())
-                        .or_default()
-                        .push(index);
-                }
+            if let Declaration::Variable(variable) = declaration
+                && let Some(subject) = self.constructor_global_subjects.get(&variable.name)
+            {
+                constructors_of
+                    .entry(subject.as_str())
+                    .or_default()
+                    .push(index);
             }
         }
 
@@ -599,10 +599,10 @@ impl<'options> Emitter<'options> {
                 continue;
             }
             let declaration = &file.declarations[index];
-            if let Some(name) = declaration_name(declaration) {
-                if let Some(indices) = constructors_of.get(name) {
-                    work.extend(indices.iter().copied());
-                }
+            if let Some(name) = declaration_name(declaration)
+                && let Some(indices) = constructors_of.get(name)
+            {
+                work.extend(indices.iter().copied());
             }
             references.clear();
             self.declaration_references(declaration, &mut references);
@@ -764,13 +764,13 @@ impl<'options> Emitter<'options> {
         let retains = |index: usize| retained.is_none_or(|set| set.contains(&index));
         let mut overloads: HashMap<&str, Vec<&Signature>> = HashMap::new();
         for (index, declaration) in file.declarations.iter().enumerate() {
-            if let Declaration::Function(signature) = declaration {
-                if retains(index) {
-                    overloads
-                        .entry(signature.name.as_str())
-                        .or_default()
-                        .push(signature);
-                }
+            if let Declaration::Function(signature) = declaration
+                && retains(index)
+            {
+                overloads
+                    .entry(signature.name.as_str())
+                    .or_default()
+                    .push(signature);
             }
         }
         let mut emitted_functions: HashSet<&str> = HashSet::new();
@@ -1545,7 +1545,6 @@ impl<'options> Emitter<'options> {
     /// Emits one binding: the attributes, the `external fun`, and — when a
     /// parameter is a closed string set — the private raw extern plus the
     /// match-wrapper that speaks the enum (§3.3).
-    #[allow(clippy::too_many_arguments)]
     fn emit_function(
         &mut self,
         owner: &str,
@@ -1697,7 +1696,6 @@ impl<'options> Emitter<'options> {
     /// has to guard it at the boundary — and `Enum::parse` remains the shape
     /// to hand-edit toward when a value outside the set is an expected input
     /// rather than a bug.
-    #[allow(clippy::too_many_arguments)]
     fn emit_one_binding(
         &mut self,
         name: &str,
@@ -1847,8 +1845,7 @@ impl<'options> Emitter<'options> {
             TsType::Union(members) => self.map_union(members, position, context),
             TsType::Intersection(members) => {
                 self.coverage.note_todo("intersection type");
-                let rendered: Vec<String> =
-                    members.iter().map(|member| describe_type(member)).collect();
+                let rendered: Vec<String> = members.iter().map(describe_type).collect();
                 Mapped::todo(
                     "any",
                     format!(
@@ -2491,10 +2488,10 @@ fn flatten_base(
         .collect();
     for member in &interface.members {
         let member = substitute_member(member, &substitution);
-        if let Some(key) = member_key(&member) {
-            if !seen.insert(key) {
-                continue;
-            }
+        if let Some(key) = member_key(&member)
+            && !seen.insert(key)
+        {
+            continue;
         }
         into.push(member);
     }

@@ -89,8 +89,10 @@ pub fn compile_browser_with_hmr(source: &str, hmr: bool) -> Result<String, Vec<S
                 );
                 match program {
                     Some(program) if errors.is_empty() => {
-                        let mut options = BuildOptions::default();
-                        options.hmr = hmr;
+                        let options = BuildOptions {
+                            hmr,
+                            ..Default::default()
+                        };
                         transform(&program, &options).map_err(|error| vec![error.msg])
                     }
                     _ => Err(errors.into_iter().map(|error| error.msg).collect()),

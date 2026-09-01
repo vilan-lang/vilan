@@ -136,9 +136,13 @@ fn the_required_check_does_not_wait_on_the_advisory_leg() {
         .expect("`check` declares its needed jobs on one line");
     assert_eq!(
         needs.trim(),
-        "needs: [changes, test, wasm, fmt]",
+        "needs: [changes, test, wasm, fmt, clippy, audit]",
         "`check` gained or lost a needed job — if the advisory ignored-pins leg is in \
-         there, a weekly report can now block a PR"
+         there, a weekly report can now block a PR. (Two senses of the word meet in \
+         this file: `ci.yml`'s `audit` job is N21's RustSec leg, which is BLOCKING on \
+         purpose — a vulnerability in a dependency of a shipped compiler stops the \
+         line — while `ignored-pins.yml` is the ADVISORY leg this test keeps out. \
+         Extending this list is a deliberate act; that is what the pin is for.)"
     );
     assert!(
         !ci.contains("ignored-pins"),

@@ -1194,7 +1194,7 @@ fn hmr_round(
             .filter(|(_, platform)| !platform.is_none())
             .filter_map(|(unit, _)| {
                 let previous = state.legs.iter().find(|leg| leg.name == unit.name)?;
-                hmr::leg_is_current(&previous.sources, &current_hash).then(|| unit.name.clone())
+                hmr::leg_is_current(&previous.sources, current_hash).then(|| unit.name.clone())
             })
             .collect()
     };
@@ -1536,14 +1536,14 @@ fn watch_script_path() -> PathBuf {
 /// (`windows-support.md` §5). A missing file is success.
 fn remove_watch_script() {
     let script = watch_script_path();
-    if let Err(error) = fs::remove_file(&script) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "{} cannot remove {}: {error}",
-                paint::warning_prefix(),
-                script.display()
-            );
-        }
+    if let Err(error) = fs::remove_file(&script)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "{} cannot remove {}: {error}",
+            paint::warning_prefix(),
+            script.display()
+        );
     }
 }
 
@@ -1762,10 +1762,10 @@ fn pkg_root_of(entry: &Path) -> PathBuf {
 /// deliberately not checked: they are how this machine was invoked, not part of
 /// the program.
 fn entry_case_mismatch(entry: &Path, pkg_root: &Path) -> Option<(String, String)> {
-    if let Ok(relative) = entry.strip_prefix(pkg_root) {
-        if !relative.as_os_str().is_empty() {
-            return vilan_core::util::case_exact_mismatch(pkg_root, relative);
-        }
+    if let Ok(relative) = entry.strip_prefix(pkg_root)
+        && !relative.as_os_str().is_empty()
+    {
+        return vilan_core::util::case_exact_mismatch(pkg_root, relative);
     }
     let name = entry.file_name()?;
     vilan_core::util::case_exact_mismatch(&pkg_root_of(entry), Path::new(name))
@@ -2633,14 +2633,14 @@ fn read_hook_stamp(path: &Path) -> BTreeMap<String, HookFingerprint> {
 /// grows no directory it did not have before.
 fn write_hook_stamp(path: &Path, stamps: &BTreeMap<String, HookFingerprint>) {
     if stamps.is_empty() {
-        if path.is_file() {
-            if let Err(error) = fs::remove_file(path) {
-                eprintln!(
-                    "{} cannot remove the hook stamp {}: {error}",
-                    paint::warning_prefix(),
-                    path.display()
-                );
-            }
+        if path.is_file()
+            && let Err(error) = fs::remove_file(path)
+        {
+            eprintln!(
+                "{} cannot remove the hook stamp {}: {error}",
+                paint::warning_prefix(),
+                path.display()
+            );
         }
         return;
     }
@@ -2683,15 +2683,15 @@ fn write_hook_stamp(path: &Path, stamps: &BTreeMap<String, HookFingerprint>) {
         "{{\n\t\"version\": {},\n\t\"hooks\": {{\n{entries}\n\t}}\n}}\n",
         json_string(HOOK_STAMP_VERSION)
     );
-    if let Some(directory) = path.parent() {
-        if let Err(error) = fs::create_dir_all(directory) {
-            eprintln!(
-                "{} cannot create {}: {error}",
-                paint::warning_prefix(),
-                directory.display()
-            );
-            return;
-        }
+    if let Some(directory) = path.parent()
+        && let Err(error) = fs::create_dir_all(directory)
+    {
+        eprintln!(
+            "{} cannot create {}: {error}",
+            paint::warning_prefix(),
+            directory.display()
+        );
+        return;
     }
     if let Err(error) = fs::write(path, text) {
         eprintln!(
@@ -3732,7 +3732,7 @@ fn build_workspace_artifacts(
             note_split_ignored(unit);
         }
         let mut chunks = Vec::new();
-        let sink = (emission == Emission::AsDeclared).then(|| (unit.name.as_str(), &mut chunks));
+        let sink = (emission == Emission::AsDeclared).then_some((unit.name.as_str(), &mut chunks));
         let mut compiled =
             compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
         // Before the writers, which record the files this leg's facts explain.
@@ -4315,14 +4315,14 @@ fn write_leg_record(path: &std::path::Path, mut entries: Vec<(String, String)>, 
     entries.sort();
     entries.dedup();
     if entries.is_empty() {
-        if path.is_file() {
-            if let Err(error) = fs::remove_file(path) {
-                eprintln!(
-                    "{} cannot remove the {noun} {}: {error}",
-                    paint::warning_prefix(),
-                    path.display()
-                );
-            }
+        if path.is_file()
+            && let Err(error) = fs::remove_file(path)
+        {
+            eprintln!(
+                "{} cannot remove the {noun} {}: {error}",
+                paint::warning_prefix(),
+                path.display()
+            );
         }
         return;
     }
@@ -5364,23 +5364,22 @@ fn compile_to_js(
     // `render` the terminal `report` uses — only the location prefix and framing
     // are added here. Assembled only when a caller asked for it and the build
     // failed.
-    if let Some(sink) = overlay {
-        if !clean {
-            for error in &parse_errors {
-                // The entry's own parse errors: located in the entry (a module
-                // that fails to parse reports through the analyzer path above,
-                // carrying its own source).
-                overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
-                    &filename,
-                    source_ref,
-                    error.span.into_range(),
-                    vilan_core::parsing::render(error),
-                    None,
-                ));
-            }
-            *sink =
-                hmr::render_overlay(&filename, &overlay_diagnostics, hmr::OVERLAY_DIAGNOSTIC_CAP);
+    if let Some(sink) = overlay
+        && !clean
+    {
+        for error in &parse_errors {
+            // The entry's own parse errors: located in the entry (a module
+            // that fails to parse reports through the analyzer path above,
+            // carrying its own source).
+            overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
+                &filename,
+                source_ref,
+                error.span.into_range(),
+                vilan_core::parsing::render(error),
+                None,
+            ));
         }
+        *sink = hmr::render_overlay(&filename, &overlay_diagnostics, hmr::OVERLAY_DIAGNOSTIC_CAP);
     }
     // The entry's parse errors belong to the entry; the analyzer's carry their
     // own source.
@@ -5772,10 +5771,10 @@ fn report_error_with_labels(
     // innocent code (see [`snippet`]).
     let mut files: Vec<(String, String)> = vec![(filename.to_string(), src.to_string())];
     for (_, file) in located {
-        if let Some((name, text)) = file {
-            if !files.iter().any(|(existing, _)| existing == name) {
-                files.push((name.to_string(), text.to_string()));
-            }
+        if let Some((name, text)) = file
+            && !files.iter().any(|(existing, _)| existing == name)
+        {
+            files.push((name.to_string(), text.to_string()));
         }
     }
     for (name, text) in &mut files {
@@ -6356,7 +6355,7 @@ mod tests {
         record_const_inputs(&[(dir.join("shared"), Some(1))]);
         record_watched_inputs([(dir.join("shared"), InputReading::Tree)]);
 
-        let snapshot = watch_snapshot(&[dir.clone()]);
+        let snapshot = watch_snapshot(std::slice::from_ref(&dir));
         assert!(
             snapshot.contains_key(&inside),
             "the tree reading wins whichever order the two recorders ran in: \
