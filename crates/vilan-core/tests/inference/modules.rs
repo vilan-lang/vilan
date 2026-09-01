@@ -5636,3 +5636,223 @@ fn an_entry_global_does_not_satisfy_a_std_import_path() {
         "#,
     );
 }
+
+// --- B172: a module-qualified path is a type in every type position ----------
+//
+// `style::Style` used to be a PARSE error wherever a type is written, while
+// `style::style()` and `style::Display::Flex` resolved and ran: the type
+// grammar's nominal form was a bare `IDENT`, so the `::` never belonged to the
+// type and whatever the position demanded next found it instead. That made the
+// `std::web` prelude — which carries `style` and `ui` as MODULE names — able to
+// reach every VALUE in `std::style` and no TYPE in it, and both web templates
+// carried a forced `import std::style::Style;` to work around it.
+//
+// The positions below are the whole list a type can be written in. Each one is
+// its own pin, per file policy: a class of positions closed on one
+// representative is how a "closed" item turns out never to have been covered.
+
+/// The module every position pin qualifies through: a struct, a trait it
+/// implements, and a function — so a path can name a type, a bound, and a
+/// non-type member in the same namespace.
+const SHAPES: &str = r#"
+        mod shapes {
+            trait Named {
+                fun name(&self): str;
+            }
+
+            struct Dot {
+                x: i32,
+            }
+
+            impl Dot with Named {
+                fun name(&self): str { "dot" }
+            }
+
+            fun make(): Dot {
+                Dot { x = 1 }
+            }
+        }
+"#;
+
+/// `SHAPES` followed by `rest` — the two-part source every pin below builds.
+fn with_shapes(rest: &str) -> String {
+    format!("{SHAPES}\n{rest}\n")
+}
+
+#[test]
+fn a_qualified_path_is_a_return_type() {
+    assert_compiles(&with_shapes(
+        "fun first(): shapes::Dot { shapes::make() }\n\
+         fun main() { let d = first(); print(i\"{d.x}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_let_annotation() {
+    assert_compiles(&with_shapes(
+        "fun main() { let d: shapes::Dot = shapes::make(); print(i\"{d.x}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_parameter_type() {
+    assert_compiles(&with_shapes(
+        "fun width(d: shapes::Dot): i32 { d.x }\n\
+         fun main() { print(i\"{width(shapes::make())}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_struct_field_type() {
+    assert_compiles(&with_shapes(
+        "struct Holder {\n\tinner: shapes::Dot,\n}\n\
+         fun main() { let h = Holder { inner = shapes::make() }; print(i\"{h.inner.x}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_an_impl_subject() {
+    assert_compiles(&with_shapes(
+        "impl shapes::Dot {\n\tfun doubled(&self): i32 { self.x * 2 }\n}\n\
+         fun main() { print(i\"{shapes::make().doubled()}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_trait_bound() {
+    assert_compiles(&with_shapes(
+        "fun label<T: shapes::Named>(value: &T): str { value.name() }\n\
+         fun main() { print(label(&shapes::make())); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_is_a_generic_argument() {
+    assert_compiles(&with_shapes(
+        "fun main() { let all: List<shapes::Dot> = [shapes::make()]; print(i\"{all.len()}\"); }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_nests_inside_another_type() {
+    // The type grammar is a cycle, so the path form has to be reachable from
+    // every arm of it, not just from the position the annotation opened in.
+    assert_compiles(&with_shapes(
+        "fun main() {\n\
+         \tlet nested: List<List<shapes::Dot>> = [[shapes::make()]];\n\
+         \tlet viewed: |shapes::Dot| i32 = |d: shapes::Dot| d.x;\n\
+         \tlet pair: (shapes::Dot, i32) = (shapes::make(), 2);\n\
+         \tlet boxed: [shapes::Dot; 1] = [shapes::make(); 1];\n\
+         \tlet seen: &shapes::Dot = &pair.0;\n\
+         \tprint(i\"{nested.len()}{viewed(shapes::make())}{boxed.len()}{seen.x}\");\n\
+         }",
+    ));
+}
+
+#[test]
+fn a_qualified_path_carries_generic_arguments_on_its_last_segment() {
+    // `std::reactive::SignalCell<i32>` — a path of any depth whose tail is a
+    // generic application. The arguments parameterize the type the path names,
+    // exactly as they do on a bare `SignalCell<i32>`.
+    assert_compiles(
+        r#"
+        import std::reactive;
+        fun main() {
+            let cell: reactive::SignalCell<i32> = reactive::Signal::new(1);
+            print(i"{cell.get()}");
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_qualified_path_reaches_through_several_modules() {
+    assert_compiles(
+        r#"
+        mod outer {
+            mod inner {
+                struct Dot {
+                    x: i32,
+                }
+
+                fun make(): Dot {
+                    Dot { x = 3 }
+                }
+            }
+        }
+        fun main() {
+            let d: outer::inner::Dot = outer::inner::make();
+            print(i"{d.x}");
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_qualified_path_to_a_non_type_member_is_refused() {
+    // The negative the positive needs: the path resolves — `make` IS in
+    // `shapes` — and still is not a type. Before this the member's own type
+    // (a closure) was written into the annotation's slot and the mistake
+    // surfaced, if at all, as a mismatch at the initializer.
+    assert_fails_with(
+        &with_shapes("fun main() { let d: shapes::make = 1; print(i\"{d}\"); }"),
+        "'make' in module 'shapes' is not a type",
+    );
+}
+
+#[test]
+fn a_qualified_path_to_a_missing_member_is_refused() {
+    assert_fails_with(
+        &with_shapes("fun main() { let d: shapes::Blob = 1; print(i\"{d}\"); }"),
+        "cannot find 'Blob' in module 'shapes'",
+    );
+}
+
+#[test]
+fn a_qualified_path_through_a_non_module_is_refused() {
+    assert_fails_with(
+        &with_shapes("fun main() { let d: shapes::Dot::Inner = 1; print(i\"{d}\"); }"),
+        "is not a module",
+    );
+}
+
+#[test]
+fn a_qualified_path_refusal_is_attributed_to_the_module_that_wrote_it() {
+    // E108's rule, extended to the drain this item gave diagnostics to. These
+    // are raised in `build()`, after every per-file walk, so an unattributed
+    // push keeps whatever `current_source_id` the last walk left — std's
+    // `lib.vl` — and the span then indexes a file the author never opened.
+    const ALPHA: &str = "mod shapes {\n\
+        \tfun make(): i32 {\n\
+        \t\t1\n\
+        \t}\n\
+        }\n\n\
+        fun size(): shapes::make {\n\
+        \t0\n\
+        }\n";
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::alpha::size;\nfun main() { size(); }\n",
+            ),
+            ("alpha.vl", ALPHA),
+        ],
+        "main.vl",
+    );
+    let (message, span, file) = outcome
+        .diagnostics
+        .iter()
+        .find(|(message, _, _)| message.contains("'make' in module 'shapes' is not a type"))
+        .expect("the non-type path member is refused");
+    let start = ALPHA.find("shapes::make").unwrap();
+    assert_eq!(
+        (file.as_deref(), span.clone()),
+        (Some("alpha.vl"), start..start + "shapes::make".len()),
+        "the refusal belongs to the module that wrote the annotation: {message}"
+    );
+}
+
+// The web-prelude half of B172 — that a module-carried name reaches its TYPES
+// as well as its values — needs a manifest prelude, so it is pinned beside the
+// prelude harness in `tests/module_resolution.rs`.

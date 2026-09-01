@@ -567,7 +567,20 @@ pub enum Node<'src> {
     Null,
     // The whole part, an optional fractional part, and an optional type suffix.
     Number(&'src str, Option<&'src str>, Option<&'src str>),
-    StaticAccessor(Box<Spanned<Self>>, &'src str),
+    // `subject::member` — one step of a `::` path: the namespace to look
+    // `member` up in, and the name. Paths of any depth nest to the left
+    // (`a::b::C` is `StaticAccessor(StaticAccessor(a, "b"), "C")`).
+    //
+    // The generic arguments are the ones written directly ON `member`, which
+    // only TYPE position offers: `std::reactive::SignalCell<i32>` names a
+    // parameterized type, while in expression position a `<...>` belongs to the
+    // CALL that follows (`math::min<i32>(a, b)` is a `Call`'s generics, folded
+    // by `parse_call`), so an expression's path always carries `None`.
+    StaticAccessor(
+        Box<Spanned<Self>>,
+        &'src str,
+        Option<GenericArguments<'src>>,
+    ),
     String(&'src str),
     // A triple-quoted string's raw inner text; trimmed to its content by
     // `util::trim_multiline_string` (validated in the analyzer, trimmed in the
@@ -772,12 +785,17 @@ impl<'src> Node<'src> {
             | Node::Export(inner)
             | Node::Reference(_, inner)
             | Node::Service(_, inner)
-            | Node::StaticAccessor(inner, _)
             | Node::TryAssert(inner)
             | Node::Lifted(inner)
             | Node::LiftGroup(inner)
             | Node::Spread(inner)
             | Node::Unary(_, inner) => visit(inner),
+            Node::StaticAccessor(subject, _, generic_arguments) => {
+                visit(subject);
+                for argument in generic_arguments.iter().flat_map(|arguments| &arguments.0) {
+                    visit(argument);
+                }
+            }
             Node::LiftRegion(steps, body) => {
                 for (step, _) in steps {
                     visit(step);

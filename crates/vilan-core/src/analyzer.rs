@@ -1777,6 +1777,32 @@ struct TraitImplSite {
     span: Span,
 }
 
+/// One module-qualified type reference (`style::Style`,
+/// `std::reactive::SignalCell<i32>` — B172), deferred to the `build()` drain
+/// because the namespace it reaches through is itself a deferred reference.
+///
+/// The unqualified twin is `prepped_type_locals`, whose head is a NAME resolved
+/// in a lexical scope; here the head is a walked type that must turn out to be a
+/// module, and the member is looked up in what that module declares.
+#[derive(Clone, Debug)]
+struct PreppedTypePath<'src> {
+    /// The type slot this path fills once it resolves.
+    type_id: TypeId,
+    /// The namespace the member is looked up in — the walked path prefix.
+    subject_type_id: TypeId,
+    /// The last segment: the name of the type being reached.
+    member_name: &'src str,
+    /// The generic arguments written on that last segment (`<i32>`), which
+    /// parameterize the nominal type it names. Empty when none were written.
+    argument_type_ids: Vec<TypeId>,
+    /// The path as written, minus any generic arguments — what a refusal
+    /// underlines.
+    span: Span,
+    /// The file the path was walked from, so a refusal raised out of the drain
+    /// is attributed to it rather than to whatever walked last (E108).
+    source_id: SourceId,
+}
+
 /// One required trait member the impl provides by NAME, recorded during the
 /// conformance loop so its full SIGNATURE can be checked against the trait's
 /// declaration (B29): receiver convention, arity, per-position conventions and
@@ -2886,7 +2912,10 @@ pub struct Analyzer<'src> {
     // across builds, matching the drain-once contract.
     written_type_spellings: Vec<(TypeId, &'src str)>,
     prepped_uses: Vec<(Vec<(&'src str, Span)>, &'src str, Id, Span, Span, SourceId)>,
-    prepped_type_static_accessors: Vec<(TypeId, TypeId, &'src str, Span)>,
+    // Deferred module-qualified type references (`style::Style`), drained after
+    // `prepped_type_locals` so a path's namespace head has resolved by the time
+    // its member is looked up in it.
+    prepped_type_static_accessors: Vec<PreppedTypePath<'src>>,
     reference_count: HashMap<Id, u32>,
     /// The last-use liveness dataflow (`liveness.rs`, `lifetimes.md` §6/S2) —
     /// filled once the tree is final (after the view-assignment rewrite) and
@@ -18925,26 +18954,39 @@ impl<'src> Analyzer<'src> {
         let mut current = Some(scope_id);
         while let Some(scope_id) = current {
             let scope = self.scopes.get(&scope_id)?;
-            if let Some(entity_id) = scope.name_to_id_map.get(name).copied() {
-                let is_type = match self.expr_id_to_expr_map.get(&entity_id) {
-                    Some(
-                        Expr::Struct(_)
-                        | Expr::Enum(_)
-                        | Expr::Trait(_)
-                        | Expr::Module(_)
-                        | Expr::Generic(_),
-                    ) => true,
-                    Some(_) => false,
-                    // No expression but a type id (e.g. the implicit `Self`).
-                    None => self.expr_id_to_type_id_map.contains_key(&entity_id),
-                };
-                if is_type {
-                    return Some(entity_id);
-                }
+            if let Some(entity_id) = scope.name_to_id_map.get(name).copied()
+                && self.entity_denotes_a_type(entity_id)
+            {
+                return Some(entity_id);
             }
             current = scope.parent_id;
         }
         None
+    }
+
+    /// Whether the entity `entity_id` is something a TYPE position may name: a
+    /// struct, an enum, a trait, a module (a namespace to reach further
+    /// through), or a generic parameter — plus the implicit `Self`, which has a
+    /// type id and no expression at all. A `fun`, a `let` or a `const` is not,
+    /// however well its name reads as one.
+    ///
+    /// Shared by the name lookup above, which SKIPS a non-type binding and keeps
+    /// walking outward, and by the qualified-path drain, which cannot: a path
+    /// addresses exactly what one namespace declares (B52), so a member that is
+    /// not a type is the end of the search and a refusal (B172).
+    fn entity_denotes_a_type(&self, entity_id: Id) -> bool {
+        match self.expr_id_to_expr_map.get(&entity_id) {
+            Some(
+                Expr::Struct(_)
+                | Expr::Enum(_)
+                | Expr::Trait(_)
+                | Expr::Module(_)
+                | Expr::Generic(_),
+            ) => true,
+            Some(_) => false,
+            // No expression but a type id (e.g. the implicit `Self`).
+            None => self.expr_id_to_type_id_map.contains_key(&entity_id),
+        }
     }
 
     /// Whether `constraint_id` names a generic parameter declared by a scope
@@ -19603,7 +19645,10 @@ impl<'src> Analyzer<'src> {
                 }
                 None
             }
-            Node::StaticAccessor(subject, member_name) => {
+            // The generic arguments are `None` for every path the expression
+            // grammar builds — a `<...>` there is the following call's, folded
+            // by `parse_call` — so there is nothing to walk here.
+            Node::StaticAccessor(subject, member_name, _) => {
                 // A path HEAD selects a namespace; it is not a value position,
                 // and it may legitimately be a trait. `A::pick(bag)` is B57's
                 // trait-qualified call (`method-resolution.md` §3) and
@@ -22056,18 +22101,45 @@ impl<'src> Analyzer<'src> {
                 ));
                 None
             }
-            Node::StaticAccessor(subject, member_name) => {
+            // `style::Style`, `std::reactive::SignalCell<i32>` — a nominal type
+            // named through the modules that declare it (B172).
+            Node::StaticAccessor(subject, member_name, generic_arguments) => {
                 // As in expression position above: a path head selects a
                 // namespace to look `member_name` up in. What the whole path
                 // resolves to is checked on its own; the head is not a value
                 // type, so a trait there is not the §12.2 mistake.
                 let subject_type_id = self.walk_trait_position_type_node(subject, scope_id);
-                self.prepped_type_static_accessors.push((
+                // The arguments written on the last segment parameterize the
+                // type it names, exactly as they do on an unqualified
+                // `SignalCell<i32>` — the drain applies them the same way.
+                let argument_type_ids: Vec<TypeId> = generic_arguments
+                    .iter()
+                    .flat_map(|arguments| &arguments.0)
+                    .map(|argument| self.walk_type_node(argument, scope_id))
+                    .collect();
+                if generic_arguments.is_some() {
+                    // R10 (destruction.md §4), as on the unqualified form: a
+                    // written generic application is a candidate for the
+                    // native-container / external-generic resource reject.
+                    self.generic_type_applications
+                        .push((type_id, node.1, self.current_source_id));
+                }
+                // A refusal underlines the PATH, not the arguments after it —
+                // those were just walked and are refused on their own terms.
+                let span = match generic_arguments {
+                    Some(arguments) => {
+                        (node.1.into_range().start..arguments.1.into_range().start).into()
+                    }
+                    None => node.1,
+                };
+                self.prepped_type_static_accessors.push(PreppedTypePath {
                     type_id,
                     subject_type_id,
                     member_name,
-                    node.1,
-                ));
+                    argument_type_ids,
+                    span,
+                    source_id: self.current_source_id,
+                });
                 None
             }
             // `(T)` is grouping, not a one-tuple — it types as the inner `T`
@@ -31851,30 +31923,73 @@ impl<'src> Analyzer<'src> {
             }
         }
 
-        for (type_id, subject_type_id, member_name, span) in
-            std::mem::take(&mut self.prepped_type_static_accessors)
-        {
+        for path in std::mem::take(&mut self.prepped_type_static_accessors) {
+            let PreppedTypePath {
+                type_id,
+                subject_type_id,
+                member_name,
+                argument_type_ids,
+                span,
+                source_id,
+            } = path;
             match subject_type_id.get_type(self) {
                 Type::Module(module_id) => {
                     let module = self.modules.get(&module_id).unwrap();
                     let module_scope_id = module.body.1;
                     let module_name = module.name;
                     match self.member_in_namespace(member_name, module_scope_id) {
+                        // A member that is not a TYPE ends the search here
+                        // (B172). The unqualified twin above may skip a value
+                        // binding and keep walking outward; a path cannot —
+                        // `module::name` addresses exactly what that module
+                        // declares (B52) — so writing a `fun` where a type
+                        // belongs is a mistake with nowhere left to go. Without
+                        // this the member's own type went into the annotation's
+                        // slot and the mistake surfaced, if at all, as a
+                        // mismatch wherever the annotated thing was next used.
+                        Some(member_id) if !self.entity_denotes_a_type(member_id) => {
+                            self.push_in_source(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: format!(
+                                        "'{member_name}' in module '{module_name}' is not a type"
+                                    ),
+                                },
+                                source_id,
+                            );
+                            self.write_type_slot(type_id, Type::Unknown);
+                        }
                         Some(member_id) => {
                             let member_type =
                                 self.infer_type(member_id, &Type::Unknown, &HashMap::default());
+                            // The arguments written on the path's last segment
+                            // parameterize the nominal type it names —
+                            // `reactive::SignalCell<i32>` is `Struct(cell, [i32])`
+                            // — the same attachment `prepped_type_locals` makes
+                            // for the unqualified spelling.
+                            let member_type = match (member_type, argument_type_ids.is_empty()) {
+                                (Type::Enum(id, _), false) => Type::Enum(id, argument_type_ids),
+                                (Type::Struct(id, _), false) => Type::Struct(id, argument_type_ids),
+                                (Type::Trait(id, _), false) => Type::Trait(id, argument_type_ids),
+                                (other, _) => other,
+                            };
                             self.write_type_slot(type_id, member_type);
                         }
                         None => {
-                            self.diagnostics.push(Error {
-                                trace: Vec::new(),
-                                note: None,
-                                span,
-                                msg: format!(
-                                    "cannot find '{}' in module '{}'",
-                                    member_name, module_name
-                                ),
-                            });
+                            self.push_in_source(
+                                Error {
+                                    trace: Vec::new(),
+                                    note: None,
+                                    span,
+                                    msg: format!(
+                                        "cannot find '{}' in module '{}'",
+                                        member_name, module_name
+                                    ),
+                                },
+                                source_id,
+                            );
                             self.write_type_slot(type_id, Type::Unknown);
                         }
                     }
@@ -31889,14 +32004,17 @@ impl<'src> Analyzer<'src> {
                     if !matches!(subject_type, Type::Unknown | Type::Unresolved) {
                         let subject_str =
                             self.pretty_print_type(&subject_type, &HashMap::default());
-                        self.diagnostics.push(Error {
-                            trace: Vec::new(),
-                            note: None,
-                            span,
-                            msg: format!(
-                                "cannot resolve `{member_name}` here: {subject_str} is not a module"
-                            ),
-                        });
+                        self.push_in_source(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span,
+                                msg: format!(
+                                    "cannot resolve `{member_name}` here: {subject_str} is not a module"
+                                ),
+                            },
+                            source_id,
+                        );
                     }
                     self.write_type_slot(type_id, Type::Unknown);
                 }

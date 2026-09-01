@@ -32,6 +32,51 @@ The type forms (grammar §3.9) denote:
 - **Generics**: a bound type parameter in scope (`T`) is a type; it is
   abstract within its binder's body.
 
+### Naming a type through a module
+
+A nominal type is written as a **path** (grammar §3.9's `type-path`):
+either a bare name, or the name qualified by the modules that declare it.
+`Style`, `style::Style` and `std::style::Style` name the same type; the
+segments before the last select namespaces and are resolved exactly as an
+expression path's are (names §4.2), so a module in scope reaches its
+types the way it reaches its values. This holds in **every** type
+position — return type, `let` annotation, parameter, struct field, `impl`
+subject, trait bound, generic argument, and nested inside another type
+form:
+
+```vilan
+import std::reactive;
+import std::style;
+
+struct Card {
+    style: style::Style,
+    hits: reactive::SignalCell<i32>,
+}
+
+fun render(card: &Card): style::Style {
+    card.style
+}
+
+fun main() {
+    let card = Card {
+        style = style::style(),
+        hits = reactive::Signal::new(0),
+    };
+    print(render(&card).class_list());
+}
+```
+
+Generic arguments attach to the last segment, the only one that names a
+type (`reactive::SignalCell<i32>`); earlier segments are modules and take
+none.
+
+A path addresses exactly what its namespace declares, so a segment
+naming a member that is not a type — a `fun`, a `let` — is refused where
+it stands rather than resolving to that member's own type. The
+unqualified form differs here: a bare name in type position may skip a
+value binding and keep looking outward (names §4.5), which a qualified
+one has nowhere to do.
+
 ## 5.2 `null`
 
 `null` is not a member of ordinary types. It exists for host

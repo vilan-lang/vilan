@@ -2507,8 +2507,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             match self.eat_ident() {
                 Some(member) => {
+                    // No generic arguments: in expression position a `<...>`
+                    // after the member belongs to the CALL that follows, which
+                    // `parse_call`'s fold takes. See `Node::StaticAccessor`.
                     current = (
-                        Node::StaticAccessor(Box::new(current), member),
+                        Node::StaticAccessor(Box::new(current), member, None),
                         self.span_from(start),
                     );
                 }
@@ -4001,9 +4004,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// A type without the context suffix: `[T; n]`, `&T`/`&mut T`, a `type` binder,
-    /// a closure type (with the optional `async`/`sync` marker), a generic-applied
-    /// local (`List<T>`), a plain local, a mapped tuple type (`(U in T: F<U>)`), or a
-    /// tuple type. Tried in the chumsky order.
+    /// a closure type (with the optional `async`/`sync` marker), a nominal path
+    /// (`Dot`, `List<T>`, `style::Style`, `std::reactive::SignalCell<i32>`), a
+    /// mapped tuple type (`(U in T: F<U>)`), or a tuple type. Tried in the chumsky
+    /// order.
     fn parse_type_atom(&mut self) -> Option<Spanned<Node<'src>>> {
         if self.peek_is_ctrl('[')
             && let Some(array) = self.parse_array_type()
@@ -4019,12 +4023,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         if let Some(closure) = self.parse_closure_type() {
             return Some(closure);
         }
-        if let Some(local) = self.parse_local_type() {
-            return Some(local);
-        }
-        if let Some(name) = self.eat_ident() {
-            let span = self.span_from(self.position - 1);
-            return Some((Node::Accessor(name), span));
+        if let Some(path) = self.parse_path_type() {
+            return Some(path);
         }
         if self.peek_is_ctrl('(') {
             if let Some(mapped) = self.parse_mapped_type() {
@@ -4169,18 +4169,44 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((name, Box::new(type_)))
     }
 
-    /// `Name<Args>` in type position — a generic-applied local (before the plain
-    /// local so the generics are consumed as part of the type).
-    fn parse_local_type(&mut self) -> Option<Spanned<Node<'src>>> {
-        self.attempt(|parser| {
-            let start = parser.position;
-            let name = parser.eat_ident()?;
-            let generic_arguments = parser.parse_generic_arguments()?;
-            Some((
-                Node::AccessorWithGenerics(name, generic_arguments),
-                parser.span_from(start),
-            ))
-        })
+    /// `IDENT { "::" IDENT } generic-args?` — the nominal type form: a name,
+    /// optionally reached through the modules that declare it, optionally applied
+    /// to generic arguments. `Dot`, `List<T>`, `style::Style` and
+    /// `std::reactive::SignalCell<i32>` are all this production (B172).
+    ///
+    /// The namespace spine folds into `StaticAccessor` nodes — the very shape an
+    /// expression path builds — so a qualified type resolves through the same
+    /// module-member lookup `style::style()` does, and nothing downstream needs a
+    /// second notion of what a path is.
+    ///
+    /// Generic arguments belong to the LAST segment, which is the only one that
+    /// names a type; the earlier ones name modules, which take none.
+    fn parse_path_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let mut name = self.eat_ident()?;
+        let mut namespace: Option<Spanned<Node<'src>>> = None;
+        // A `::` continues the path only when a NAME follows it. Probing BOTH
+        // tokens before committing is what keeps a trailing `::` — one that
+        // belongs to whatever the caller parses next — exactly where it was,
+        // without the backtracking an `eat_op` here would need.
+        while self.peek_is_op("::") && matches!(self.peek_at(1), Some(Token::Ident(_))) {
+            let span = self.span_from(start);
+            namespace = Some(match namespace {
+                Some(inner) => (Node::StaticAccessor(Box::new(inner), name, None), span),
+                None => (Node::Accessor(name), span),
+            });
+            self.bump(); // `::`
+            name = self.eat_ident().expect("peeked as an identifier");
+        }
+        let generic_arguments = self.attempt(Self::parse_generic_arguments);
+        let node = match namespace {
+            Some(namespace) => Node::StaticAccessor(Box::new(namespace), name, generic_arguments),
+            None => match generic_arguments {
+                Some(generic_arguments) => Node::AccessorWithGenerics(name, generic_arguments),
+                None => Node::Accessor(name),
+            },
+        };
+        Some((node, self.span_from(start)))
     }
 
     /// `(U in T: F<U>)` — a mapped tuple type (tried before the plain tuple type,
@@ -4490,7 +4516,30 @@ impl<'a, 'src> Parser<'a, 'src> {
             let outer_member_body = std::mem::take(&mut self.in_member_body);
             let block = self.parse_block();
             self.in_member_body = outer_member_body;
-            Some(block?)
+            match block {
+                Some(block) => Some(block),
+                None => {
+                    // A COMMITTED demand, noted so the failure is located
+                    // (B172): `fun` + a name + `(params)` is a function and
+                    // nothing else in the grammar, so once the head has parsed
+                    // there is no alternative reading left to be quiet for. An
+                    // opening `{` is otherwise a silent head-check
+                    // (`expect_ctrl`), which left the farthest failure with the
+                    // `expression ;` alternative tried BEFORE this one — and
+                    // that one declines on the `fun` keyword, so a function
+                    // whose body was missing reported `found 'fun' expected an
+                    // expression` at the item's own first column.
+                    //
+                    // The `;` alternative is NOT spelled `"';'"`: that is
+                    // `TERMINATOR_EXPECTED` verbatim, and `emit_failure` reads
+                    // it as a statement that lost its terminator — which would
+                    // re-anchor this failure into the preceding gap and ask for
+                    // a `;` to end a statement that is not there.
+                    self.note_expected("'{'");
+                    self.note_expected("';' for a bodyless declaration");
+                    return None;
+                }
+            }
         };
         Some((
             Node::Func(Func {
@@ -5928,7 +5977,8 @@ mod tests {
         // `List<str>::new()` — the head keeps its generics because `::` follows.
         match &expr("List<str>::new()").0 {
             Node::Call(callee, None, _) => match &callee.0 {
-                Node::StaticAccessor(head, "new") => {
+                // No tail generics: an expression path never carries them.
+                Node::StaticAccessor(head, "new", None) => {
                     assert!(matches!(head.0, Node::AccessorWithGenerics("List", _)))
                 }
                 other => panic!("expected StaticAccessor over generics, got {other:?}"),

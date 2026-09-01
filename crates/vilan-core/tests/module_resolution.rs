@@ -3283,6 +3283,31 @@ fn a_module_carried_web_name_gets_no_web_steer() {
 }
 
 #[test]
+fn a_module_carried_web_name_reaches_its_types_by_qualifying() {
+    // B172, and the reason it was load-bearing rather than cosmetic. The web
+    // set carries `style` as a MODULE, so a web-set user reached every VALUE in
+    // `std::style` (`style::style()`, `style::Display::Flex`) and no TYPE in
+    // it: `style::Style` was a PARSE error in every type position, and both web
+    // templates carried a forced `import std::style::Style;` to get around it.
+    // A qualified path is a type now, so the prelude's module name is enough.
+    let errors = analyze_under_prelude(
+        web_prelude(),
+        &[(
+            "main.vl",
+            "fun card(): style::Style {\n\
+             \tstyle::style().padding(style::space(4))\n\
+             }\n\
+             fun main() {\n\
+             \tlet _card = const card();\n\
+             }\n",
+        )],
+        "main.vl",
+        Platform::Browser,
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
 fn the_base_seven_never_steer_toward_the_web_set() {
     // Both sets carry them, so a `prelude = false` package missing `print`
     // must be told to import it, not to switch sets.

@@ -944,3 +944,26 @@ fn a_committed_separator_failure_still_reports_where_it_broke() {
         ("found ';' expected ',' or ')'".to_string(), ";".to_string())
     );
 }
+
+#[test]
+fn a_function_whose_body_is_missing_reports_at_the_gap_not_at_the_keyword() {
+    // B172's second facet. `fun` + name + `(params)` commits: nothing else in
+    // the grammar starts that way, so every demand past it is located. The body
+    // was the one that was not — an OPENING delimiter is a silent head-check —
+    // so a function that parsed to its return type and then met something that
+    // was not a body backtracked whole, and the STATEMENT alternative tried
+    // before it (`expression ;`, which declines on the `fun` keyword at column
+    // 1) was left holding the farthest failure. The reader was told the item's
+    // own first token was where an expression should be.
+    let source = "fun f(): i32 Bar {\n\t1\n}\n\nfun main() {\n\tprint(1);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert_eq!(
+        reported[0],
+        (
+            "found 'Bar' expected '{' or ';' for a bodyless declaration".to_string(),
+            "Bar".to_string()
+        ),
+        "the anchor is where the body should have started"
+    );
+}

@@ -252,6 +252,7 @@ spec/platform.md h2 114-manifests-vilantoml
 spec/platform.md h2 115-build-products
 spec/types.md h1 spec-5--the-type-system
 spec/types.md h2 51-types
+spec/types.md h3 naming-a-type-through-a-module
 spec/types.md h2 52-null
 spec/types.md h2 53-declarations
 spec/types.md h3 enum-representation
